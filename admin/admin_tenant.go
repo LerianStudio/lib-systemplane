@@ -7,11 +7,9 @@
 //	DELETE /<prefix>/:namespace/:key/tenants/:tenantID   — remove a tenant-scoped override
 //
 // The sibling file [admin.go] holds the Mount entrypoint, the mountConfig,
-// and the three legacy global-route handlers. These two files share:
-//
-//   - mounter (receiver) — defined in admin.go
-//   - mapSentinelErr (error-to-HTTP translation) — defined in admin_responses.go
-//   - authorizeTenant (middleware) — defined in admin.go
+// the shared middleware helpers, and the three legacy global-route handlers.
+// These two files share [mapSentinelErr], [authorizeTenant], and
+// [decodePutValue].
 //
 // See admin.go's package doc and [WithTenantAuthorizer] for the default-deny
 // escalation rationale for tenant-route authorization.
@@ -19,15 +17,14 @@
 package admin
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 
 	"github.com/LerianStudio/lib-commons/v5/commons/log"
 	commonshttp "github.com/LerianStudio/lib-commons/v5/commons/net/http"
-	"github.com/LerianStudio/lib-systemplane"
 	"github.com/LerianStudio/lib-commons/v5/commons/tenant-manager/core"
+	systemplane "github.com/LerianStudio/lib-systemplane"
 	"github.com/gofiber/fiber/v2"
 )
 
@@ -77,45 +74,47 @@ type tenantValueResponse struct {
 // The route does not require a :tenantID path segment; the authorizer is
 // invoked with tenantID="" so policies can distinguish the reflection-style
 // "list tenants" action from per-tenant operations.
-func (m *mounter) handleListTenants(c *fiber.Ctx) error {
-	namespace := c.Params("namespace")
-	key := c.Params("key")
+func handleListTenants(client *systemplane.Client, logger log.Logger) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		namespace := c.Params("namespace")
+		key := c.Params("key")
 
-	registered, tenantScoped := m.client.KeyStatus(namespace, key)
+		registered, tenantScoped := client.KeyStatus(namespace, key)
 
-	switch {
-	case !registered:
-		return commonshttp.RespondError(c, http.StatusNotFound, "not_found", "key not found")
-	case !tenantScoped:
-		return commonshttp.RespondError(c, http.StatusBadRequest, "validation_error", "key is not tenant-scoped")
+		switch {
+		case !registered:
+			return commonshttp.RespondError(c, http.StatusNotFound, "not_found", "key not found")
+		case !tenantScoped:
+			return commonshttp.RespondError(c, http.StatusBadRequest, "validation_error", "key is not tenant-scoped")
+		}
+
+		tenants := client.ListTenantsForKey(namespace, key)
+
+		// Client returns sorted, deduplicated results; the response mirrors that.
+		// Coalesce a nil return to an empty slice so JSON encodes `[]` not `null`.
+		if tenants == nil {
+			tenants = []string{}
+		}
+
+		if len(tenants) == 0 {
+			// Operator observability for the 200-[] case. The empty response
+			// is the correct security posture (no side-channel leakage) but
+			// operators debugging "why does my tenant not appear" benefit
+			// from a trail showing the handler served the request
+			// successfully with zero overrides.
+			logger.Log(c.UserContext(), log.LevelDebug, "admin: handleListTenants returned empty overrides",
+				log.String("namespace", namespace),
+				log.String("key", key),
+				log.String("reason", "no_overrides"),
+			)
+		}
+
+		return c.Status(fiber.StatusOK).JSON(listTenantsResponse{
+			Namespace: namespace,
+			Key:       key,
+			Tenants:   tenants,
+		})
 	}
-
-	tenants := m.client.ListTenantsForKey(namespace, key)
-
-	// Client returns sorted, deduplicated results; the response mirrors that.
-	// Coalesce a nil return to an empty slice so JSON encodes `[]` not `null`.
-	if tenants == nil {
-		tenants = []string{}
-	}
-
-	if len(tenants) == 0 {
-		// Operator observability for the 200-[] case. The empty response
-		// is the correct security posture (no side-channel leakage) but
-		// operators debugging "why does my tenant not appear" benefit
-		// from a trail showing the handler served the request
-		// successfully with zero overrides.
-		m.logger.Log(c.UserContext(), log.LevelDebug, "admin: handleListTenants returned empty overrides",
-			log.String("namespace", namespace),
-			log.String("key", key),
-			log.String("reason", "no_overrides"),
-		)
-	}
-
-	return c.Status(fiber.StatusOK).JSON(listTenantsResponse{
-		Namespace: namespace,
-		Key:       key,
-		Tenants:   tenants,
-	})
 }
 
 // handlePutTenant writes a tenant-specific override for (namespace, key).
@@ -135,104 +134,97 @@ func (m *mounter) handleListTenants(c *fiber.Ctx) error {
 // On success the response carries the just-written value with redaction
 // applied per the key's RedactPolicy, so the caller can verify the
 // post-write state without a follow-up GET.
-func (m *mounter) handlePutTenant(c *fiber.Ctx) error {
-	tenantID := c.Params("tenantID")
+func handlePutTenant(client *systemplane.Client, cfg mountConfig, logger log.Logger) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		tenantID := c.Params("tenantID")
 
-	// Validate the :tenantID after authorization (authorizeTenant runs as
-	// Fiber middleware before this handler; see admin.go Mount). Authorization
-	// failure surfaces as 403 before any tenantID inspection. On authorized
-	// paths, the regex-based validator below rejects malformed IDs — including
-	// "_global" — with a uniform 400 error that does not leak the sentinel
-	// name.
-	if err := validateTenantIDParam(tenantID); err != nil {
-		return commonshttp.RespondError(c, http.StatusBadRequest, "invalid_tenant_id", err.Error())
+		// Validate the :tenantID after authorization (authorizeTenant runs as
+		// Fiber middleware before this handler; see admin.go Mount). Authorization
+		// failure surfaces as 403 before any tenantID inspection. On authorized
+		// paths, the regex-based validator below rejects malformed IDs — including
+		// "_global" — with a uniform 400 error that does not leak the sentinel
+		// name.
+		if err := validateTenantIDParam(tenantID); err != nil {
+			return commonshttp.RespondError(c, http.StatusBadRequest, "invalid_tenant_id", err.Error())
+		}
+
+		namespace := c.Params("namespace")
+		key := c.Params("key")
+
+		value, badRequestMsg := decodePutValue(c)
+		if badRequestMsg != "" {
+			return commonshttp.RespondError(c, http.StatusBadRequest, "bad_request", badRequestMsg)
+		}
+
+		// Inject the tenant ID into the downstream context so Client.SetForTenant
+		// can extract it via core.GetTenantIDContext. The admin layer is the
+		// authoritative source of the tenant ID — it comes from the URL path,
+		// not from any ambient header or middleware (which could have been
+		// populated by an earlier tenant-discovery layer that set a DIFFERENT
+		// tenant). This keeps the admin surface independent of any particular
+		// host-auth scheme.
+		ctx := core.ContextWithTenantID(c.UserContext(), tenantID)
+		actor := cfg.actorExtractor(c)
+
+		if err := client.SetForTenant(ctx, namespace, key, value, actor); err != nil {
+			return mapSentinelErr(c, err)
+		}
+
+		// Echo the just-written value. Use the same redaction policy applied by
+		// the legacy GET handler so sensitive values never appear in the
+		// response, even at the moment of writing them.
+		policy := client.KeyRedaction(namespace, key)
+
+		// We already have the canonical value pre-write; however, the Client
+		// applies a JSON round-trip during SetForTenant and that canonical form
+		// is what reads will observe. Perform a GetForTenant here so the
+		// response matches what a subsequent read would return. On read failure
+		// we still report the write as successful and echo the caller's
+		// submitted value with redaction — best-effort, because the durable
+		// state is already committed by the SetForTenant above. The read error
+		// is logged at Debug level so operators have a trail when diagnosing
+		// transient backend blips (e.g. a lazy-mode Client whose GetForTenant
+		// timed out against the store).
+		displayValue := value
+
+		v, found, getErr := client.GetForTenant(ctx, namespace, key)
+		switch {
+		case getErr != nil:
+			logger.Log(ctx, log.LevelDebug, "handlePutTenant: GetForTenant failed after successful write, echoing submitted value",
+				log.String("namespace", namespace),
+				log.String("key", key),
+				log.String("tenant_id", tenantID),
+				log.Err(getErr),
+			)
+		case !found:
+			// Defense in depth: GetForTenant returned no error but reported the
+			// row as absent immediately after a successful SetForTenant. This
+			// is unreachable under the Client's current contract (write-through
+			// cache makes the row visible synchronously), but if a future
+			// backend refactor changes that invariant we want a loud signal
+			// rather than silently echoing stale state. The write is already
+			// durable, so we return a 500 with a generic message.
+			logger.Log(ctx, log.LevelWarn,
+				"handlePutTenant: GetForTenant returned nil error but not found — unexpected post-write state",
+				log.String("namespace", namespace),
+				log.String("key", key),
+				log.String("tenant_id", tenantID),
+			)
+
+			return commonshttp.RespondError(c, fiber.StatusInternalServerError, "internal_error", "write succeeded but post-write read failed")
+		case found:
+			displayValue = v
+		}
+
+		redacted := systemplane.ApplyRedaction(displayValue, policy)
+
+		return c.Status(fiber.StatusOK).JSON(tenantValueResponse{
+			Namespace: namespace,
+			Key:       key,
+			TenantID:  tenantID,
+			Value:     redacted,
+		})
 	}
-
-	namespace := c.Params("namespace")
-	key := c.Params("key")
-
-	var body putRequest
-	if err := c.BodyParser(&body); err != nil {
-		return commonshttp.RespondError(c, http.StatusBadRequest, "bad_request", "invalid request body")
-	}
-
-	if body.Value == nil {
-		return commonshttp.RespondError(c, http.StatusBadRequest, "bad_request", "missing value field")
-	}
-
-	var value any
-	if err := json.Unmarshal(body.Value, &value); err != nil {
-		return commonshttp.RespondError(c, http.StatusBadRequest, "bad_request", "invalid value")
-	}
-
-	// Inject the tenant ID into the downstream context so Client.SetForTenant
-	// can extract it via core.GetTenantIDContext. The admin layer is the
-	// authoritative source of the tenant ID — it comes from the URL path,
-	// not from any ambient header or middleware (which could have been
-	// populated by an earlier tenant-discovery layer that set a DIFFERENT
-	// tenant). This keeps the admin surface independent of any particular
-	// host-auth scheme.
-	ctx := core.ContextWithTenantID(c.UserContext(), tenantID)
-	actor := m.cfg.actorExtractor(c)
-
-	if err := m.client.SetForTenant(ctx, namespace, key, value, actor); err != nil {
-		return mapSentinelErr(c, err)
-	}
-
-	// Echo the just-written value. Use the same redaction policy applied by
-	// the legacy GET handler so sensitive values never appear in the
-	// response, even at the moment of writing them.
-	policy := m.client.KeyRedaction(namespace, key)
-
-	// We already have the canonical value pre-write; however, the Client
-	// applies a JSON round-trip during SetForTenant and that canonical form
-	// is what reads will observe. Perform a GetForTenant here so the
-	// response matches what a subsequent read would return. On read failure
-	// we still report the write as successful and echo the caller's
-	// submitted value with redaction — best-effort, because the durable
-	// state is already committed by the SetForTenant above. The read error
-	// is logged at Debug level so operators have a trail when diagnosing
-	// transient backend blips (e.g. a lazy-mode Client whose GetForTenant
-	// timed out against the store).
-	displayValue := value
-
-	v, found, getErr := m.client.GetForTenant(ctx, namespace, key)
-	switch {
-	case getErr != nil:
-		m.logger.Log(ctx, log.LevelDebug, "handlePutTenant: GetForTenant failed after successful write, echoing submitted value",
-			log.String("namespace", namespace),
-			log.String("key", key),
-			log.String("tenant_id", tenantID),
-			log.Err(getErr),
-		)
-	case !found:
-		// Defense in depth: GetForTenant returned no error but reported the
-		// row as absent immediately after a successful SetForTenant. This
-		// is unreachable under the Client's current contract (write-through
-		// cache makes the row visible synchronously), but if a future
-		// backend refactor changes that invariant we want a loud signal
-		// rather than silently echoing stale state. The write is already
-		// durable, so we return a 500 with a generic message.
-		m.logger.Log(ctx, log.LevelWarn,
-			"handlePutTenant: GetForTenant returned nil error but not found — unexpected post-write state",
-			log.String("namespace", namespace),
-			log.String("key", key),
-			log.String("tenant_id", tenantID),
-		)
-
-		return commonshttp.RespondError(c, fiber.StatusInternalServerError, "internal_error", "write succeeded but post-write read failed")
-	case found:
-		displayValue = v
-	}
-
-	redacted := systemplane.ApplyRedaction(displayValue, policy)
-
-	return c.Status(fiber.StatusOK).JSON(tenantValueResponse{
-		Namespace: namespace,
-		Key:       key,
-		TenantID:  tenantID,
-		Value:     redacted,
-	})
 }
 
 // handleDeleteTenant removes a tenant-specific override. The response is a
@@ -240,24 +232,26 @@ func (m *mounter) handlePutTenant(c *fiber.Ctx) error {
 // deletes. The Client's DeleteForTenant is itself idempotent (deleting a
 // non-existent override is not an error), so repeated calls always produce
 // 204 without cascading error paths.
-func (m *mounter) handleDeleteTenant(c *fiber.Ctx) error {
-	tenantID := c.Params("tenantID")
+func handleDeleteTenant(client *systemplane.Client, cfg mountConfig) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		tenantID := c.Params("tenantID")
 
-	if err := validateTenantIDParam(tenantID); err != nil {
-		return commonshttp.RespondError(c, http.StatusBadRequest, "invalid_tenant_id", err.Error())
+		if err := validateTenantIDParam(tenantID); err != nil {
+			return commonshttp.RespondError(c, http.StatusBadRequest, "invalid_tenant_id", err.Error())
+		}
+
+		namespace := c.Params("namespace")
+		key := c.Params("key")
+
+		ctx := core.ContextWithTenantID(c.UserContext(), tenantID)
+		actor := cfg.actorExtractor(c)
+
+		if err := client.DeleteForTenant(ctx, namespace, key, actor); err != nil {
+			return mapSentinelErr(c, err)
+		}
+
+		return c.SendStatus(fiber.StatusNoContent)
 	}
-
-	namespace := c.Params("namespace")
-	key := c.Params("key")
-
-	ctx := core.ContextWithTenantID(c.UserContext(), tenantID)
-	actor := m.cfg.actorExtractor(c)
-
-	if err := m.client.DeleteForTenant(ctx, namespace, key, actor); err != nil {
-		return mapSentinelErr(c, err)
-	}
-
-	return c.SendStatus(fiber.StatusNoContent)
 }
 
 // ---------------------------------------------------------------------------

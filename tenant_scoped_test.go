@@ -32,8 +32,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/LerianStudio/lib-systemplane/internal/store"
 	"github.com/LerianStudio/lib-commons/v5/commons/tenant-manager/core"
+	"github.com/LerianStudio/lib-systemplane/internal/store"
 )
 
 // ---------------------------------------------------------------------------
@@ -643,7 +643,8 @@ func TestNilClient_TenantMethods(t *testing.T) {
 // mirror of the backend phase-1 guard. When the underlying store returns
 // store.ErrTenantSchemaNotEnabled (which is aliased as
 // systemplane.ErrTenantSchemaNotEnabled), the Client wraps the error via
-// persistTenantValue and surfaces it unchanged through errors.Is — so
+// SetForTenant wraps the backend error and surfaces it unchanged through
+// errors.Is — so
 // callers can match on the public sentinel without reaching into the
 // internal store package.
 //
@@ -1321,7 +1322,7 @@ func TestDeleteForTenant_NoOpDoesNotFireSubscribers(t *testing.T) {
 
 // TestDeleteForTenant_BackendErrorSurfaces exercises the deleteTenantErr
 // injection hook (tenant_scoped_test.go:81) to verify that
-// removeTenantValue's error propagation is observable end-to-end: a backend
+// DeleteForTenant's error propagation is observable end-to-end: a backend
 // failure on DeleteTenantValue must surface to the caller, NOT be silently
 // swallowed.
 //
@@ -1346,11 +1347,11 @@ func TestDeleteForTenant_BackendErrorSurfaces(t *testing.T) {
 	err := c.DeleteForTenant(tctx("tenant-A"), "global", "fee.rate", "admin")
 	require.Error(t, err, "backend delete failure must surface to caller")
 	assert.ErrorIs(t, err, sentinel,
-		"wrapped sentinel must remain visible via errors.Is (removeTenantValue wraps but preserves)")
+		"wrapped sentinel must remain visible via errors.Is (DeleteForTenant wraps but preserves)")
 
 	// Defense-in-depth: the tenant cache still holds the override since
 	// the delete failed and the write-through cache-clear is gated behind
-	// a nil error from removeTenantValue.
+	// a nil error from DeleteForTenant.
 	v, found, gErr := c.GetForTenant(tctx("tenant-A"), "global", "fee.rate")
 	require.NoError(t, gErr)
 	assert.True(t, found)
@@ -1478,7 +1479,7 @@ func TestGetIntForTenant_Succeeds(t *testing.T) {
 
 		c, _ := buildStartedClient(t, "global", "threshold", 42)
 
-		// SetForTenant round-trips through JSON (persistTenantValue does the
+		// SetForTenant round-trips through JSON before updating the cache, so
 		// marshal + canonical unmarshal), so the cached value is float64.
 		require.NoError(t, c.SetForTenant(tctx("tenant-A"), "global", "threshold", 7, "admin"))
 

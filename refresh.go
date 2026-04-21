@@ -21,8 +21,8 @@ import (
 	"encoding/json"
 
 	"github.com/LerianStudio/lib-commons/v5/commons/log"
-	"github.com/LerianStudio/lib-systemplane/internal/store"
 	"github.com/LerianStudio/lib-commons/v5/commons/tenant-manager/core"
+	"github.com/LerianStudio/lib-systemplane/internal/store"
 )
 
 // refreshFromStoreRouted is the entry point for debounced changefeed

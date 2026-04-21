@@ -28,9 +28,9 @@ import (
 	"github.com/gofiber/fiber/v2"
 
 	commonshttp "github.com/LerianStudio/lib-commons/v5/commons/net/http"
+	"github.com/LerianStudio/lib-commons/v5/commons/tenant-manager/core"
 	"github.com/LerianStudio/lib-systemplane"
 	"github.com/LerianStudio/lib-systemplane/admin"
-	"github.com/LerianStudio/lib-commons/v5/commons/tenant-manager/core"
 )
 
 // ---------------------------------------------------------------------------

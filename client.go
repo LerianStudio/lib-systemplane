@@ -48,19 +48,6 @@ type nskey struct {
 	Key       string
 }
 
-// evtKey is the composite debouncer key for changefeed event coalescing:
-// (namespace, key, tenantID). All fields are comparable strings, so the
-// struct itself is a valid Go map key. Using a struct rather than a
-// concatenated string eliminates the per-event allocation that the
-// previous "ns + \x1f + key + \x1f + tenantID" scheme incurred on every
-// NOTIFY / change-stream event — a measurable GC-pressure source at high
-// update rates.
-type evtKey struct {
-	Namespace string
-	Key       string
-	TenantID  string
-}
-
 // subscription holds a single OnChange callback and its monotonic id.
 type subscription struct {
 	id uint64
@@ -88,7 +75,7 @@ type subscription struct {
 // get.go for the reference pattern).
 type Client struct {
 	store     store.Store
-	debouncer *debounce.Debouncer[evtKey]
+	debouncer *debounce.Debouncer[store.Event]
 	logger    log.Logger
 	telemetry *opentelemetry.Telemetry
 
@@ -230,7 +217,7 @@ func newClient(s store.Store, cfg clientConfig) *Client {
 
 	return &Client{
 		store:                s,
-		debouncer:            debounce.New[evtKey](cfg.debounce, debounce.WithLogger[evtKey](logger)),
+		debouncer:            debounce.New[store.Event](cfg.debounce, debounce.WithLogger[store.Event](logger)),
 		logger:               logger,
 		telemetry:            cfg.telemetry,
 		registry:             make(map[nskey]keyDef),
@@ -396,25 +383,12 @@ func (c *Client) Close() error {
 	return nil
 }
 
-// onEvent is the raw changefeed handler. It debounces per (namespace, key,
-// tenantID) tuple to coalesce rapid updates into a single refresh.
-//
-// The composite key is a struct (see evtKey) — structs of comparable fields
-// are valid Go map keys, so the debouncer's internal map[evtKey]*time.Timer
-// works directly. This avoids the per-event string-concat allocation the
-// prior "ns + \x1f + key + \x1f + tenantID" scheme required — visible GC
-// pressure at high update rates. The tenantID component is always populated
-// by the backend (store.SentinelGlobal "_global" for shared rows, the
-// actual tenant ID otherwise), so tenant-A and tenant-B events for the
-// same (namespace, key) never collide on the same debounce timer slot.
+// onEvent is the raw changefeed handler. It debounces per
+// (namespace, key, tenantID) tuple to coalesce rapid updates into a single
+// refresh. store.Event already carries exactly that comparable tuple, so it can
+// serve directly as the debouncer key without an extra translation layer.
 func (c *Client) onEvent(evt store.Event) {
-	key := evtKey{
-		Namespace: evt.Namespace,
-		Key:       evt.Key,
-		TenantID:  evt.TenantID,
-	}
-
-	c.debouncer.Submit(key, func() {
+	c.debouncer.Submit(evt, func() {
 		c.refreshFromStoreRouted(evt.Namespace, evt.Key, evt.TenantID)
 	})
 }

@@ -13,7 +13,7 @@ import (
 	"net/http"
 
 	commonshttp "github.com/LerianStudio/lib-commons/v5/commons/net/http"
-	"github.com/LerianStudio/lib-systemplane"
+	systemplane "github.com/LerianStudio/lib-systemplane"
 	"github.com/gofiber/fiber/v2"
 )
 
@@ -55,8 +55,7 @@ type putRequest struct {
 // carries it; this helper deliberately does not log, to keep the admin
 // package a thin HTTP adapter).
 //
-// Used by [mounter.handlePut], [mounter.handlePutTenant], and
-// [mounter.handleDeleteTenant].
+// Used by [handlePut], [handlePutTenant], and [handleDeleteTenant].
 func mapSentinelErr(c *fiber.Ctx, err error) error {
 	switch {
 	case errors.Is(err, systemplane.ErrUnknownKey):

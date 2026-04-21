@@ -6,8 +6,7 @@
 // shared extractTenantID helper. The tenant-aware subscribe surface
 // (OnTenantChange / fireTenantSubscribers) lives in tenant_onchange.go; the
 // typed accessor mirrors (GetStringForTenant, GetIntForTenant, etc.) live in
-// tenant_scoped_accessors.go. The backend-facing wrappers (span + marshaling
-// + error prefix) live in tenant_storage.go.
+// tenant_scoped_accessors.go.
 //
 // Dataflow summary (see TRD §4.1-4.5 for the full spec):
 //
@@ -23,11 +22,15 @@ package systemplane
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/LerianStudio/lib-commons/v5/commons/log"
-	"github.com/LerianStudio/lib-systemplane/internal/store"
+	"github.com/LerianStudio/lib-commons/v5/commons/opentelemetry"
 	"github.com/LerianStudio/lib-commons/v5/commons/tenant-manager/core"
+	"github.com/LerianStudio/lib-systemplane/internal/store"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // RegisterTenantScoped declares a tenant-scoped configuration key with its
@@ -260,9 +263,34 @@ func (c *Client) SetForTenant(ctx context.Context, namespace, key string, value 
 		UpdatedBy: actor,
 	}
 
-	canonical, err := c.persistTenantValue(ctx, tenantID, entry, value)
+	ctx, span, finish := c.startSpanWithAttrs(ctx, "systemplane.client.set_tenant_value",
+		attribute.String("tenant.id", tenantID),
+		attribute.String("systemplane.namespace", namespace),
+		attribute.String("systemplane.key", key),
+	)
+	defer finish()
+
+	jsonBytes, err := json.Marshal(value)
 	if err != nil {
-		return err
+		opentelemetry.HandleSpanError(span, "json marshal failed", err)
+
+		return fmt.Errorf("%w: value is not JSON-serializable: %w", ErrValidation, err)
+	}
+
+	entry.Value = jsonBytes
+	if entry.UpdatedAt.IsZero() {
+		entry.UpdatedAt = time.Now().UTC()
+	}
+
+	if err := c.store.SetTenantValue(ctx, tenantID, entry); err != nil {
+		opentelemetry.HandleSpanError(span, "store set_tenant_value failed", err)
+
+		return fmt.Errorf("systemplane: SetTenantValue: %w", err)
+	}
+
+	var canonical any
+	if err := json.Unmarshal(jsonBytes, &canonical); err != nil {
+		canonical = value
 	}
 
 	// Write-through cache: update immediately so a subsequent GetForTenant
@@ -391,13 +419,29 @@ func (c *Client) getForTenantLazyMissLocked(ctx context.Context, tenantID, names
 		fetchCtx, cancel := context.WithTimeout(ctx, tenantStoreTimeout)
 		defer cancel()
 
-		decoded, found, err := c.fetchTenantValue(fetchCtx, tenantID, namespace, key)
+		fetchCtx, span, finish := c.startSpanWithAttrs(fetchCtx, "systemplane.client.get_tenant_value",
+			attribute.String("tenant.id", tenantID),
+			attribute.String("systemplane.namespace", namespace),
+			attribute.String("systemplane.key", key),
+		)
+		defer finish()
+
+		entry, found, err := c.store.GetTenantValue(fetchCtx, tenantID, namespace, key)
 		if err != nil {
-			return sfResult{}, err
+			opentelemetry.HandleSpanError(span, "store get_tenant_value failed", err)
+
+			return sfResult{}, fmt.Errorf("systemplane: GetTenantValue: %w", err)
 		}
 
 		if !found {
 			return sfResult{found: false}, nil
+		}
+
+		var decoded any
+		if err := json.Unmarshal(entry.Value, &decoded); err != nil {
+			opentelemetry.HandleSpanError(span, "json unmarshal failed", err)
+
+			return sfResult{}, fmt.Errorf("systemplane: GetTenantValue: decode: %w", err)
 		}
 
 		// Populate the LRU under cacheMu.Lock before returning so every
@@ -473,8 +517,18 @@ func (c *Client) DeleteForTenant(ctx context.Context, namespace, key, actor stri
 		return err
 	}
 
-	if err := c.removeTenantValue(ctx, tenantID, namespace, key, actor); err != nil {
-		return err
+	ctx, span, finish := c.startSpanWithAttrs(ctx, "systemplane.client.delete_tenant_value",
+		attribute.String("tenant.id", tenantID),
+		attribute.String("systemplane.namespace", namespace),
+		attribute.String("systemplane.key", key),
+		attribute.String("systemplane.actor", actor),
+	)
+	defer finish()
+
+	if err := c.store.DeleteTenantValue(ctx, tenantID, namespace, key, actor); err != nil {
+		opentelemetry.HandleSpanError(span, "store delete_tenant_value failed", err)
+
+		return fmt.Errorf("systemplane: DeleteTenantValue: %w", err)
 	}
 
 	// Write-through cache delete: clear the override immediately so a
@@ -523,8 +577,17 @@ func (c *Client) ListTenantsForKey(namespace, key string) []string {
 	ctx, cancel := context.WithTimeout(context.Background(), tenantStoreTimeout)
 	defer cancel()
 
-	tenants, err := c.listTenantsForKey(ctx, namespace, key)
+	ctx, span, finish := c.startSpanWithAttrs(ctx, "systemplane.client.list_tenants_for_key",
+		attribute.String("systemplane.namespace", namespace),
+		attribute.String("systemplane.key", key),
+	)
+	defer finish()
+
+	tenants, err := c.store.ListTenantsForKey(ctx, namespace, key)
 	if err != nil {
+		opentelemetry.HandleSpanError(span, "store list_tenants_for_key failed", err)
+
+		err = fmt.Errorf("systemplane: ListTenantsForKey: %w", err)
 		c.logWarn(ctx, "ListTenantsForKey: backend query failed, returning empty slice",
 			registrationErrFields(namespace, key, err)...,
 		)

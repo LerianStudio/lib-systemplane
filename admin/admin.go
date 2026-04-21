@@ -31,7 +31,7 @@ import (
 
 	"github.com/LerianStudio/lib-commons/v5/commons/log"
 	commonshttp "github.com/LerianStudio/lib-commons/v5/commons/net/http"
-	"github.com/LerianStudio/lib-systemplane"
+	systemplane "github.com/LerianStudio/lib-systemplane"
 	"github.com/gofiber/fiber/v2"
 )
 
@@ -148,13 +148,6 @@ func WithActorExtractor(fn func(*fiber.Ctx) string) MountOption {
 	}
 }
 
-// mounter binds a Client and its config together for handler generation.
-type mounter struct {
-	client *systemplane.Client
-	cfg    mountConfig
-	logger log.Logger // snapshot of client.Logger() at Mount time
-}
-
 // Mount registers the admin HTTP routes on router using the given Client.
 // Nil client causes Mount to be a no-op (does not panic). Nil router causes
 // Mount to be a no-op (does not panic).
@@ -188,20 +181,19 @@ func Mount(router fiber.Router, c *systemplane.Client, opts ...MountOption) {
 	}
 
 	prefix = strings.TrimRight(prefix, "/")
-
-	m := &mounter{client: c, cfg: cfg, logger: c.Logger()}
+	logger := c.Logger()
 
 	// Legacy global routes — use WithAuthorizer.
-	router.Get(prefix+"/:namespace", m.validateNamespaceParam, m.authorize("read"), m.handleList)
-	router.Get(prefix+"/:namespace/:key", m.validatePathParams, m.authorize("read"), m.handleGetOne)
-	router.Put(prefix+"/:namespace/:key", m.validatePathParams, m.authorize("write"), m.handlePut)
+	router.Get(prefix+"/:namespace", validateNamespaceParam, authorize(cfg, logger, "read"), handleList(c))
+	router.Get(prefix+"/:namespace/:key", validatePathParams, authorize(cfg, logger, "read"), handleGetOne(c))
+	router.Put(prefix+"/:namespace/:key", validatePathParams, authorize(cfg, logger, "write"), handlePut(c, cfg))
 
 	// Tenant-scoped routes — use WithTenantAuthorizer (default-deny when absent).
 	// The tenant-list route carries no :tenantID segment; the authorizer
 	// receives "" for the tenantID argument in that case.
-	router.Get(prefix+"/:namespace/:key/tenants", m.validatePathParams, m.authorizeTenant("read"), m.handleListTenants)
-	router.Put(prefix+"/:namespace/:key/tenants/:tenantID", m.validatePathParams, m.authorizeTenant("write"), m.handlePutTenant)
-	router.Delete(prefix+"/:namespace/:key/tenants/:tenantID", m.validatePathParams, m.authorizeTenant("write"), m.handleDeleteTenant)
+	router.Get(prefix+"/:namespace/:key/tenants", validatePathParams, authorizeTenant(cfg, logger, "read"), handleListTenants(c, logger))
+	router.Put(prefix+"/:namespace/:key/tenants/:tenantID", validatePathParams, authorizeTenant(cfg, logger, "write"), handlePutTenant(c, cfg, logger))
+	router.Delete(prefix+"/:namespace/:key/tenants/:tenantID", validatePathParams, authorizeTenant(cfg, logger, "write"), handleDeleteTenant(c, cfg))
 }
 
 // authorize returns a per-route middleware that checks the configured authorizer.
@@ -212,10 +204,10 @@ func Mount(router fiber.Router, c *systemplane.Client, opts ...MountOption) {
 // unauthorized callers should not see. The original error is logged at
 // Debug level so operators can diagnose policy rejections without the
 // leak.
-func (m *mounter) authorize(action string) fiber.Handler {
+func authorize(cfg mountConfig, logger log.Logger, action string) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		if err := m.cfg.authorizer(c, action); err != nil {
-			m.logger.Log(c.UserContext(), log.LevelDebug, "admin: authorizer denied",
+		if err := cfg.authorizer(c, action); err != nil {
+			logger.Log(c.UserContext(), log.LevelDebug, "admin: authorizer denied",
 				log.String("action", action),
 				log.Err(err),
 			)
@@ -236,11 +228,11 @@ func (m *mounter) authorize(action string) fiber.Handler {
 // As with [authorize], the authorizer's error string is redacted on the
 // wire: the response body carries a fixed "forbidden" message and the
 // original error is logged at Debug level.
-func (m *mounter) authorizeTenant(action string) fiber.Handler {
+func authorizeTenant(cfg mountConfig, logger log.Logger, action string) fiber.Handler {
 	return func(c *fiber.Ctx) error {
 		tenantID := c.Params("tenantID")
-		if err := m.cfg.tenantAuthorizer(c, action, tenantID); err != nil {
-			m.logger.Log(c.UserContext(), log.LevelDebug, "admin: tenant authorizer denied",
+		if err := cfg.tenantAuthorizer(c, action, tenantID); err != nil {
+			logger.Log(c.UserContext(), log.LevelDebug, "admin: tenant authorizer denied",
 				log.String("action", action),
 				log.String("tenant_id", tenantID),
 				log.Err(err),
@@ -255,7 +247,7 @@ func (m *mounter) authorizeTenant(action string) fiber.Handler {
 
 // validateNamespaceParam rejects namespaces longer than [maxNamespaceLen].
 // Applied as middleware on routes that carry :namespace but no :key.
-func (m *mounter) validateNamespaceParam(c *fiber.Ctx) error {
+func validateNamespaceParam(c *fiber.Ctx) error {
 	if ns := c.Params("namespace"); len(ns) > maxNamespaceLen {
 		return commonshttp.RespondError(c, http.StatusBadRequest, "validation_error",
 			fmt.Sprintf("namespace exceeds maximum length of %d", maxNamespaceLen))
@@ -267,7 +259,7 @@ func (m *mounter) validateNamespaceParam(c *fiber.Ctx) error {
 // validatePathParams rejects namespaces longer than [maxNamespaceLen] and
 // keys longer than [maxKeyLen]. Applied as middleware on routes that carry
 // both :namespace and :key.
-func (m *mounter) validatePathParams(c *fiber.Ctx) error {
+func validatePathParams(c *fiber.Ctx) error {
 	if ns := c.Params("namespace"); len(ns) > maxNamespaceLen {
 		return commonshttp.RespondError(c, http.StatusBadRequest, "validation_error",
 			fmt.Sprintf("namespace exceeds maximum length of %d", maxNamespaceLen))
@@ -286,76 +278,91 @@ func (m *mounter) validatePathParams(c *fiber.Ctx) error {
 // ---------------------------------------------------------------------------
 
 // handleList returns all entries in a namespace with redaction applied.
-func (m *mounter) handleList(c *fiber.Ctx) error {
-	namespace := c.Params("namespace")
+func handleList(client *systemplane.Client) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		namespace := c.Params("namespace")
 
-	entries := m.client.List(namespace)
+		entries := client.List(namespace)
 
-	resp := listResponse{
-		Namespace: namespace,
-		Entries:   make([]entryResponse, 0, len(entries)),
+		resp := listResponse{
+			Namespace: namespace,
+			Entries:   make([]entryResponse, 0, len(entries)),
+		}
+
+		for _, e := range entries {
+			policy := client.KeyRedaction(namespace, e.Key)
+			redacted := systemplane.ApplyRedaction(e.Value, policy)
+
+			resp.Entries = append(resp.Entries, entryResponse{
+				Key:         e.Key,
+				Value:       redacted,
+				Description: e.Description,
+			})
+		}
+
+		return c.Status(fiber.StatusOK).JSON(resp)
 	}
-
-	for _, e := range entries {
-		policy := m.client.KeyRedaction(namespace, e.Key)
-		redacted := systemplane.ApplyRedaction(e.Value, policy)
-
-		resp.Entries = append(resp.Entries, entryResponse{
-			Key:         e.Key,
-			Value:       redacted,
-			Description: e.Description,
-		})
-	}
-
-	return c.Status(fiber.StatusOK).JSON(resp)
 }
 
 // handleGetOne returns a single entry with redaction applied.
-func (m *mounter) handleGetOne(c *fiber.Ctx) error {
-	namespace := c.Params("namespace")
-	key := c.Params("key")
+func handleGetOne(client *systemplane.Client) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		namespace := c.Params("namespace")
+		key := c.Params("key")
 
-	value, ok := m.client.Get(namespace, key)
-	if !ok {
-		return commonshttp.RespondError(c, http.StatusNotFound, "not_found", "key not found")
+		value, ok := client.Get(namespace, key)
+		if !ok {
+			return commonshttp.RespondError(c, http.StatusNotFound, "not_found", "key not found")
+		}
+
+		policy := client.KeyRedaction(namespace, key)
+		redacted := systemplane.ApplyRedaction(value, policy)
+
+		return c.Status(fiber.StatusOK).JSON(getResponse{
+			Namespace:   namespace,
+			Key:         key,
+			Value:       redacted,
+			Description: client.KeyDescription(namespace, key),
+		})
 	}
-
-	policy := m.client.KeyRedaction(namespace, key)
-	redacted := systemplane.ApplyRedaction(value, policy)
-
-	return c.Status(fiber.StatusOK).JSON(getResponse{
-		Namespace:   namespace,
-		Key:         key,
-		Value:       redacted,
-		Description: m.client.KeyDescription(namespace, key),
-	})
 }
 
 // handlePut writes a new value for a single key.
-func (m *mounter) handlePut(c *fiber.Ctx) error {
-	namespace := c.Params("namespace")
-	key := c.Params("key")
+func handlePut(client *systemplane.Client, cfg mountConfig) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		namespace := c.Params("namespace")
+		key := c.Params("key")
 
+		value, badRequestMsg := decodePutValue(c)
+		if badRequestMsg != "" {
+			return commonshttp.RespondError(c, http.StatusBadRequest, "bad_request", badRequestMsg)
+		}
+
+		actor := cfg.actorExtractor(c)
+
+		err := client.Set(c.UserContext(), namespace, key, value, actor)
+		if err == nil {
+			return c.SendStatus(fiber.StatusNoContent)
+		}
+
+		return mapSentinelErr(c, err)
+	}
+}
+
+func decodePutValue(c *fiber.Ctx) (any, string) {
 	var body putRequest
 	if err := c.BodyParser(&body); err != nil {
-		return commonshttp.RespondError(c, http.StatusBadRequest, "bad_request", "invalid request body")
+		return nil, "invalid request body"
 	}
 
 	if body.Value == nil {
-		return commonshttp.RespondError(c, http.StatusBadRequest, "bad_request", "missing value field")
+		return nil, "missing value field"
 	}
 
 	var value any
 	if err := json.Unmarshal(body.Value, &value); err != nil {
-		return commonshttp.RespondError(c, http.StatusBadRequest, "bad_request", "invalid value")
+		return nil, "invalid value"
 	}
 
-	actor := m.cfg.actorExtractor(c)
-
-	err := m.client.Set(c.UserContext(), namespace, key, value, actor)
-	if err == nil {
-		return c.SendStatus(fiber.StatusNoContent)
-	}
-
-	return mapSentinelErr(c, err)
+	return value, ""
 }

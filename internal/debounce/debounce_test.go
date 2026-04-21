@@ -173,7 +173,7 @@ func TestDebouncer_NilFnIgnored(t *testing.T) {
 }
 
 // TestDebouncer_StructKey verifies a plain comparable struct type works as the
-// debouncer key. This is the shape used by systemplane (evtKey) to
+// debouncer key. This is the shape used by systemplane's changefeed events to
 // avoid per-event string-concat allocations on the changefeed hot path.
 func TestDebouncer_StructKey(t *testing.T) {
 	t.Parallel()
