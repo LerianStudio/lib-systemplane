@@ -13,9 +13,9 @@ require (
 	github.com/testcontainers/testcontainers-go/modules/mongodb v0.41.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.41.0
 	go.mongodb.org/mongo-driver/v2 v2.5.0
-	go.opentelemetry.io/otel v1.42.0
-	go.opentelemetry.io/otel/metric v1.42.0
-	go.opentelemetry.io/otel/trace v1.42.0
+	go.opentelemetry.io/otel v1.43.0
+	go.opentelemetry.io/otel/metric v1.43.0
+	go.opentelemetry.io/otel/trace v1.43.0
 	golang.org/x/sync v0.20.0
 )
 
