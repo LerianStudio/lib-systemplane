@@ -1,10 +1,10 @@
 # Tenant-Scoped Systemplane — Adoption Guide
 
 This document is the consumer-facing adoption guide for the tenant-scoped
-systemplane feature landed in v5. It is additive and non-breaking: every
-existing `Register` / `Set` / `Get` / `OnChange` call continues to work
-unchanged. If you do not need per-tenant overrides, you do not need to read
-this doc.
+systemplane feature carried forward into standalone `lib-systemplane`. It is
+additive and non-breaking: every existing `Register` / `Set` / `Get` /
+`OnChange` call continues to work unchanged. If you do not need per-tenant
+overrides, you do not need to read this doc.
 
 If you are adopting tenant overrides for at least one key, this guide walks
 through:
@@ -20,7 +20,7 @@ through:
 8. A full lifecycle example.
 
 Primary audience: `plugin-br-bank-transfer` Phase 3, and any other
-downstream service consuming `commons/systemplane`.
+downstream service consuming `lib-systemplane`.
 
 ---
 
@@ -83,7 +83,7 @@ declared by `Register`, the write is rejected without touching the store.
 
 ### Registration breaking changes
 
-v5.1 tightens registration-time input validation. Keys registered via
+`lib-systemplane` v1.0 tightens registration-time input validation. Keys registered via
 `Register` or `RegisterTenantScoped` are rejected at call time (before
 `Start`) when they fail any of:
 
@@ -93,7 +93,7 @@ v5.1 tightens registration-time input validation. Keys registered via
   footgun (the path `GET /system/foo/tenants/tenants` would list
   overrides on the key `"tenants"` while `GET /system/foo/tenants`
   reads legacy global `tenants` — Fiber disambiguates by segment
-  count, but the adjacency is confusing). Any v5.0.x consumer that
+  count, but the adjacency is confusing). Any legacy `lib-commons/v5.0.x` consumer that
   registered a key literally named `"tenants"` must rename it before
   upgrading. `ErrValidation` is returned at `Register` time.
 - **U+001F (unit separator) in namespace, key, or tenant ID** — rejected
@@ -218,7 +218,7 @@ passed. This is a deliberate conservative choice:
    upgrade conscious and auditable.
 
 See the `WithTenantAuthorizer` docblock in
-`commons/systemplane/admin/admin.go` for the authoritative rationale.
+`admin/admin.go` for the authoritative rationale.
 
 ### Wiring `WithTenantAuthorizer`
 
@@ -270,9 +270,9 @@ consulting it against any policy store.
 
 The tenant-scoped schema change drops the legacy `(namespace, key)`
 primary key (Postgres) / unique index (MongoDB) and replaces it with the
-composite `(namespace, key, tenant_id)`. Pre-tenant `lib-commons`
-binaries (v5.0.x) upsert via `ON CONFLICT (namespace, key)`; if those
-binaries hit the evolved schema they fail with
+composite `(namespace, key, tenant_id)`. Pre-tenant `lib-commons/v5.0.x`
+binaries upsert via `ON CONFLICT (namespace, key)`; if those binaries hit
+the evolved schema they fail with
 `no unique or exclusion constraint matching the ON CONFLICT
 specification` on the first write. Every rolling deploy therefore needs
 a window where the old and new binaries coexist **against the legacy
@@ -283,27 +283,27 @@ default is phase 1 — compat mode. **This is deliberate: tenant writes
 are rejected with [`ErrTenantSchemaNotEnabled`](./errors.go) until you
 explicitly flip the option.**
 
-### Phase 1 — deploy v5.1 everywhere
+### Phase 1 — deploy `lib-systemplane` v1.0 everywhere
 
-1. Upgrade the library to v5.1+ across every consumer that shares the
+1. Upgrade the library to `lib-systemplane` v1.0.0+ across every consumer that shares the
    database.
 2. Use the default Client construction (no `WithTenantSchemaEnabled`).
    The backend creates the table / collection with the legacy unique
    shape, adds the `tenant_id` column with the `_global` default, and
    installs the NOTIFY trigger (Postgres) — but does **not** drop the
    legacy PK and does **not** run the MongoDB `_id` rewrite migration.
-3. Mixed-version state is safe: v5.0.x binaries continue to upsert via
+3. Mixed-version state is safe: legacy `lib-commons/v5.0.x` binaries continue to upsert via
    `ON CONFLICT (namespace, key)` against the same table/collection;
-   v5.1 binaries also upsert against `(namespace, key)` in phase 1.
+   `lib-systemplane` v1.0 binaries also upsert against `(namespace, key)` in phase 1.
 4. Tenant writes (`SetForTenant`, `DeleteForTenant`, and the admin
    `PUT /:key/tenants/:tenantID` / `DELETE /:key/tenants/:tenantID`
    routes) return `ErrTenantSchemaNotEnabled`. This is expected. Tenant
    reads (`GetForTenant`, `ListTenantsForKey`) fall through to the
    registered default because no tenant rows exist yet.
 
-### Phase transition — verify every consumer is on v5.1+
+### Phase transition — verify every consumer is on `lib-systemplane` v1.0+
 
-Before flipping phase 2, confirm that **no** v5.0.x binaries are still
+Before flipping phase 2, confirm that **no** legacy `lib-commons/v5.0.x` binaries are still
 running against this database. The inventory check is deployment-
 specific — a combination of Kubernetes image tags, service dashboards,
 and `go.mod` audits of every consumer. Any missed binary will start
@@ -349,14 +349,14 @@ Two operational points to plan for:
   this is measured in milliseconds and safe to run online. Plan a
   short write-freeze anyway if your table has grown outside those
   bounds.
-- **DELETE notification behavior change.** v5.1 widens the NOTIFY
+- **DELETE notification behavior change.** `lib-systemplane` v1.0 widens the NOTIFY
   trigger to fire on `DELETE` in addition to `INSERT`/`UPDATE`. A
-  v5.0.x binary running against a phase-1-migrated database receives
+  legacy `lib-commons/v5.0.x` binary running against a phase-1-migrated database receives
   DELETE notifications it never received before. The payload still
   parses and the subscriber resets to the registered default — effect
   is benign — but the change is observable for anyone watching
   NOTIFY traffic directly (e.g., `LISTEN systemplane_changes` from a
-  non-lib-commons client).
+  non-`lib-systemplane` client).
 
 ### Duplicate-detection errors (H6/H8)
 
@@ -376,14 +376,14 @@ and lose data.
 
 ### DO NOT flip to phase 2 until every consumer is upgraded
 
-Flipping `WithTenantSchemaEnabled()` with any v5.0.x binaries still
+Flipping `WithTenantSchemaEnabled()` with any legacy `lib-commons/v5.0.x` binaries still
 running against the database will break those binaries' upserts the
 next time they write. The legacy `ON CONFLICT (namespace, key)` clause
 has no matching unique constraint once phase 2 drops it, and the
 Postgres driver returns
 `no unique or exclusion constraint matching the ON CONFLICT
 specification`. MongoDB fails the upsert with a duplicate-key error on
-the compound `_id` because the v5.0.x binary still tries to allocate an
+the compound `_id` because the legacy binary still tries to allocate an
 `ObjectId _id`.
 
 ### Cross-references
@@ -478,7 +478,7 @@ The Client tracks two modes for tenant value caching:
 | Lazy  | Populate a bounded LRU on first read per `(tenant, key)` tuple; evict LRU when full.  | `systemplane.WithLazyTenantLoad(maxEntries)` |
 
 Observed benchmark numbers on an Apple M5 Max against an in-memory
-`TestStore` (see `commons/systemplane/bench_tenant_test.go`):
+`TestStore` (see `bench_tenant_test.go`):
 
 | Benchmark                        | Observed                          | PRD AC15 target          |
 | -------------------------------- | --------------------------------- | ------------------------ |
@@ -546,7 +546,7 @@ appropriate.
 
 ## 7.1 API migration notes (tenant-scoped surface)
 
-The tenant-scoped surface is new in v5.1 and has no external
+The tenant-scoped surface is new in standalone `lib-systemplane` v1.0 and has no external
 consumers yet, so the signatures below were tightened at introduction
 time rather than carrying through a deprecation cycle. If you are
 adopting the surface now, write against the post-tightening shape
@@ -554,7 +554,7 @@ directly.
 
 ### `OnTenantChange` callback gained a leading `ctx` parameter
 
-**Before** (initial v5.1 draft — never shipped externally):
+**Before** (initial v1.0 draft — never shipped externally):
 
 ```go
 client.OnTenantChange(ns, key,
@@ -571,11 +571,11 @@ client.OnTenantChange(ns, key,
 The `ctx` is synthesized per invocation inside `fireTenantSubscribers`
 via `core.ContextWithTenantID(context.Background(), tenantID)`, so it
 is **already scoped to the tenant whose override changed**.
-Subscribers can forward it directly into tenant-aware lib-commons
-facilities — `commons/dlq` (tenant-scoped Redis keys),
-`commons/net/http/idempotency` (tenant-scoped idempotency keys),
-`commons/webhook` — without manually wrapping the context. This
-closes an ergonomic landmine where subscribers that reached for these
+Subscribers can forward it directly into tenant-aware Lerian
+facilities — DLQ/idempotency/webhook helpers or `lib-streaming`
+emitters when those facilities accept tenant-scoped contexts — without
+manually wrapping the context. This closes an ergonomic landmine where
+subscribers that reached for these
 facilities without re-wrapping the ctx would silently fall through to
 an untenanted key space.
 
@@ -615,9 +615,9 @@ unchanged.
 
 The callback receives a `ctx` pre-scoped to the changing tenant (via
 `core.ContextWithTenantID`) alongside the raw tenantID string, so
-subscribers can immediately call tenant-aware lib-commons facilities
-(DLQ, idempotency middleware, webhook delivery) without manually
-re-propagating the tenant:
+subscribers can immediately call tenant-aware Lerian facilities
+(DLQ, idempotency middleware, webhook delivery, or `lib-streaming`
+emitters) without manually re-propagating the tenant:
 
 ```go
 unsubscribe := client.OnTenantChange("global", "fees.fail_closed_default",
@@ -626,8 +626,8 @@ unsubscribe := client.OnTenantChange("global", "fees.fail_closed_default",
             zap.String("tenant", tenantID),
             zap.Any("new", newValue))
 
-        // ctx already carries tenantID — safe to pass into tenant-aware helpers
-        // like commons/dlq or commons/webhook without re-wrapping it.
+        // ctx already carries tenantID — safe to pass into tenant-aware Lerian
+        // helpers without re-wrapping it.
     })
 defer unsubscribe()
 ```
@@ -641,7 +641,7 @@ change-stream / LISTEN-NOTIFY path (bounded by `WithDebounce`, default
 100 ms).
 
 Callbacks are invoked sequentially under panic recovery via
-`commons/runtime.RecoverAndLog`; a panicking callback does not block
+`lib-observability/runtime.RecoverAndLog`; a panicking callback does not block
 subsequent subscribers. Unsubscribe is safe to call multiple times
 (guarded by `sync.Once` internally).
 
@@ -703,12 +703,12 @@ or a `Client` restart re-hydrates from the durable store.
 
 Operators who need strict at-least-once delivery across reconnects
 should either persist the resume token externally (not currently
-exposed — would require a lib-commons API extension to thread
+exposed — would require a `lib-systemplane` API extension to thread
 `options.ChangeStream().SetResumeAfter(token)`) or schedule a
 periodic `ListTenantValues` reconciliation at the Client layer to
 cross-check the cache against the durable store.
 
-See `commons/systemplane/internal/mongodb/mongodb_changestream.go`
+See `internal/mongodb/mongodb_changestream.go`
 (`watchOnce` godoc) for the corresponding code-level note.
 
 ### Postgres NOTIFY now fires on DELETE
@@ -719,7 +719,7 @@ fired only on `INSERT` and `UPDATE` of rows in
 extending the trigger to fire on `DELETE` as well so subscribers
 can observe `DeleteForTenant`.
 
-Legacy v5.0.x consumers that subscribed to the same Postgres channel
+Legacy `lib-commons/v5.0.x` consumers that subscribed to the same Postgres channel
 with their own LISTEN handlers will now receive more notification
 fanout than before. The payload shape is unchanged (JSON with
 namespace, key, tenant_id); older clients that are JSON-tolerant of
@@ -745,8 +745,8 @@ import (
     "errors"
     "log"
 
-    "github.com/LerianStudio/lib-commons/v5/commons/systemplane"
     "github.com/LerianStudio/lib-commons/v5/commons/tenant-manager/core"
+    "github.com/LerianStudio/lib-systemplane"
 )
 
 // --- Boot path ----------------------------------------------------------
@@ -811,7 +811,8 @@ unsubscribe := c.OnTenantChange("global", "fees.fail_closed_default",
             log.Any("new_value", newValue))
 
         // cbCtx already carries the changing tenant's ID — pass it through
-        // to any tenant-aware lib-commons helpers (DLQ, webhook, idempotency)
+        // to any tenant-aware Lerian helpers (DLQ, webhook, idempotency,
+        // or lib-streaming emitters)
         // without manually calling core.ContextWithTenantID again.
         //
         // Update any local caches / feature-flag mirrors / etc. The callback

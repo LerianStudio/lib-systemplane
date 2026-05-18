@@ -6,12 +6,13 @@ This file provides repository-specific guidance for coding agents working on `li
 
 - Module: `github.com/LerianStudio/lib-systemplane`
 - Language: Go
-- Go version: `1.25.9` (see `go.mod`)
-- Current API generation: v0.1.x (extracted from `lib-commons/v5`)
+- Go version: `1.26.3` (see `go.mod`)
+- Current API generation: v1.x observability migration (extracted from `lib-commons/v5`; public observability types now come from `lib-observability`)
 
 ## Primary objective for changes
 
 - Preserve the public API contracts unless a task explicitly asks for breaking changes.
+- The current observability migration is an approved breaking change: logging, tracing, telemetry, span helpers, redaction, and panic recovery belong to `lib-observability`, not `lib-commons`.
 - Prefer explicit error returns over panic paths in production code.
 - Keep behavior nil-safe and concurrency-safe by default.
 
@@ -39,18 +40,16 @@ Scaffolding:
 - `docs/PROJECT_RULES.md` — full coding standards, architecture, conventions
 - `MIGRATION_TENANT_SCOPED.md` — tenant-scoped adoption guide
 
-## External lib-commons dependencies
+## External Lerian dependencies
 
-This module depends on `github.com/LerianStudio/lib-commons/v5` (pinned in `go.mod`) for:
+Lerian shared-library boundaries are now split across four libraries:
 
-- `commons/log` — `Logger` interface, typed `Field` constructors
-- `commons/tenant-manager/core` — tenant-ID context helpers, validation
-- `commons/opentelemetry` — span and attribute plumbing
-- `commons/runtime` — panic recovery (`RecoverAndLog`) for subscriber callbacks and background loops
-- `commons/net/http` — admin responses (`commonshttp`)
-- `commons/backoff` — exponential backoff with jitter for listen/reconnect loops
+- `github.com/LerianStudio/lib-commons/v5` — non-observability shared primitives used here: `commons/tenant-manager/core`, `commons/net/http`, and `commons/backoff`.
+- `github.com/LerianStudio/lib-observability` — canonical observability stack: `log`, `tracing`, redaction helpers, span helpers, telemetry lifecycle, and `runtime` panic recovery.
+- `github.com/LerianStudio/lib-systemplane` — this module; runtime-mutable configuration with Postgres/MongoDB backends.
+- `github.com/LerianStudio/lib-streaming` — tenant-scoped event streaming; do not introduce it here unless a task explicitly asks for streaming integration.
 
-These are external module imports. Do not rewrite them to in-repo paths.
+These are external module imports. Do not rewrite them to in-repo paths. Do not reintroduce observability imports from `lib-commons`; observability has moved to `lib-observability`.
 
 ## API invariants to respect
 
@@ -60,12 +59,12 @@ These are external module imports. Do not rewrite them to in-repo paths.
 - Client lifecycle: construct → `Register(namespace, key, default, opts...)` and/or `RegisterTenantScoped(namespace, key, default, opts...)` for each known key → `Start(ctx)` (hydrates from store, begins Subscribe) → runtime operations → `Close()`. Register after Start returns `ErrRegisterAfterStart`. Nil-receiver safe on all read paths.
 - Reads: `Get(ns, key) (any, bool)` plus typed accessors `GetString`, `GetInt`, `GetBool`, `GetFloat64`, `GetDuration`. All nil-safe; return zero values on miss.
 - Writes: `Set(ctx, ns, key, value, actor)` — last-write-wins, write-through cache for same-process read consistency, fires subscribers via the changefeed echo (not synchronously from Set).
-- Subscriptions: `OnChange(ns, key, fn)` returns an `unsubscribe` func. Callbacks invoked serially with panic recovery via `commons/runtime.RecoverAndLog`. Nil-receiver safe.
+- Subscriptions: `OnChange(ns, key, fn)` returns an `unsubscribe` func. Callbacks invoked serially with panic recovery via `lib-observability/runtime.RecoverAndLog`. Nil-receiver safe.
 - Listing/metadata: `List(namespace) []ListEntry` returns sorted entries in a namespace; `KeyRedaction(ns, key) RedactPolicy` for admin redaction.
 - Namespaces are free-text (convention: `"global"`, `"tenant:<id>"`, `"feature-flags"`). Authorization is enforced at the admin HTTP boundary, not in the Client.
 - Registered keys carry: default value, description, validator func, redaction policy (`RedactNone | RedactMask | RedactFull`). Options: `WithDescription`, `WithValidator`, `WithRedaction`.
-- Client options: `WithLogger`, `WithTelemetry`, `WithDebounce` (default 100ms), `WithListenChannel` (Postgres default `"systemplane_changes"`), `WithTable` (Postgres default `"systemplane_entries"`), `WithCollection` (MongoDB default `"systemplane_entries"`), `WithPollInterval` (MongoDB — non-zero switches from change-streams to polling; required for standalone MongoDB without a replica set), `WithLazyTenantLoad(maxEntries)` (bounded-LRU tenant cache in lazy mode; non-positive `maxEntries` falls back to eager hydration).
-- Tenant-scoped keys (additive, non-breaking): `RegisterTenantScoped(ns, key, default, opts...)` declares a key eligible for per-tenant overrides while the legacy `Get`/`OnChange`/`List` surface keeps observing only the shared `_global` row (PRD AC1/AC8). Tenant-aware methods: `GetForTenant(ctx, ns, key) (any, bool, error)`, `SetForTenant(ctx, ns, key, value, actor) error`, `DeleteForTenant(ctx, ns, key, actor) error`, `ListTenantsForKey(ns, key) []string`, `OnTenantChange(ns, key, fn func(ctx context.Context, ns, key, tenantID string, newValue any)) (unsubscribe func())` (the `ctx` is pre-scoped to `tenantID` via `core.ContextWithTenantID`, so subscribers can directly call tenant-aware lib-commons facilities like DLQ, idempotency, and webhook), plus typed accessor mirrors `GetStringForTenant`, `GetIntForTenant`, `GetBoolForTenant`, `GetFloat64ForTenant`, `GetDurationForTenant`. Tenant ID is extracted from ctx via `core.GetTenantIDContext` and validated against `core.IsValidTenantID`; fail-closed — there is no silent fallback to the shared global. `_global` is the reserved sentinel for shared rows and is rejected as a tenant ID. Delete is idempotent; when a row exists its removal fires `OnTenantChange` with `newValue = registered default`, but a no-op delete (no row to remove) emits no changefeed event and does NOT fire subscribers. `GetForTenant` resolution order: per-tenant cache → legacy global cache → registered default.
+- Client options: `WithLogger` accepts `lib-observability/log.Logger`; `WithTelemetry` accepts `*lib-observability/tracing.Telemetry`; `WithDebounce` (default 100ms), `WithListenChannel` (Postgres default `"systemplane_changes"`), `WithTable` (Postgres default `"systemplane_entries"`), `WithCollection` (MongoDB default `"systemplane_entries"`), `WithPollInterval` (MongoDB — non-zero switches from change-streams to polling; required for standalone MongoDB without a replica set), `WithLazyTenantLoad(maxEntries)` (bounded-LRU tenant cache in lazy mode; non-positive `maxEntries` falls back to eager hydration).
+- Tenant-scoped keys (additive, non-breaking): `RegisterTenantScoped(ns, key, default, opts...)` declares a key eligible for per-tenant overrides while the legacy `Get`/`OnChange`/`List` surface keeps observing only the shared `_global` row (PRD AC1/AC8). Tenant-aware methods: `GetForTenant(ctx, ns, key) (any, bool, error)`, `SetForTenant(ctx, ns, key, value, actor) error`, `DeleteForTenant(ctx, ns, key, actor) error`, `ListTenantsForKey(ns, key) []string`, `OnTenantChange(ns, key, fn func(ctx context.Context, ns, key, tenantID string, newValue any)) (unsubscribe func())` (the `ctx` is pre-scoped to `tenantID` via `core.ContextWithTenantID`, so subscribers can directly call tenant-aware Lerian facilities such as DLQ, idempotency, webhooks, or `lib-streaming` emitters when those facilities accept tenant-scoped contexts), plus typed accessor mirrors `GetStringForTenant`, `GetIntForTenant`, `GetBoolForTenant`, `GetFloat64ForTenant`, `GetDurationForTenant`. Tenant ID is extracted from ctx via `core.GetTenantIDContext` and validated against `core.IsValidTenantID`; fail-closed — there is no silent fallback to the shared global. `_global` is the reserved sentinel for shared rows and is rejected as a tenant ID. Delete is idempotent; when a row exists its removal fires `OnTenantChange` with `newValue = registered default`, but a no-op delete (no row to remove) emits no changefeed event and does NOT fire subscribers. `GetForTenant` resolution order: per-tenant cache → legacy global cache → registered default.
 - Admin HTTP surface (`admin` subpackage): `Mount(router, client, opts...)` registers six routes at a configurable prefix (default `/system`). Legacy globals: `GET :prefix/:namespace` (list), `GET :prefix/:namespace/:key` (read), `PUT :prefix/:namespace/:key` (write). Tenant-scoped: `GET :prefix/:namespace/:key/tenants` (list tenants with an override), `PUT :prefix/:namespace/:key/tenants/:tenantID` (write tenant override), `DELETE :prefix/:namespace/:key/tenants/:tenantID` (remove tenant override). Options: `WithPathPrefix`, `WithAuthorizer` (legacy routes only, hook with `"read"` / `"write"` actions), `WithTenantAuthorizer(fn func(c *fiber.Ctx, action, tenantID string) error)` (tenant routes only; default-deny when absent — the library does NOT silently fall back to `WithAuthorizer` for tenant routes to avoid silent privilege escalation), `WithActorExtractor`. Values are redacted per the registered `RedactPolicy` before responding.
 - Storage evolution: Postgres adds `tenant_id TEXT NOT NULL DEFAULT '_global'` with a composite unique index on `(namespace, key, tenant_id)`; existing rows are backfilled with `_global` by the column default. MongoDB switches to a compound BSON document `_id` `{namespace, key, tenant_id}`; first boot against a legacy `ObjectId _id` collection runs an idempotent backfill migration during store construction (inside `NewMongoDB` via `ensureSchema`, not deferred to `Start`) and is safe to resume on restart if a crash interrupts it mid-flight.
 - Internal `Store` interface (`internal/store`) has two implementations: `internal/postgres` (LISTEN/NOTIFY, pgx/v5) and `internal/mongodb` (change streams with polling fallback, mongo-driver/v2). Both satisfy a backend-agnostic contract suite in `systemplanetest.Run(t, factory)`.
@@ -81,7 +80,7 @@ These are external module imports. Do not rewrite them to in-repo paths.
 - Keep exported docs aligned with behavior.
 - Reuse existing package patterns before introducing new abstractions.
 - Avoid introducing high-cardinality telemetry labels by default.
-- Use the structured log interface (`Log(ctx, level, msg, fields...)`) — do not add printf-style methods.
+- Use the `lib-observability/log` structured log interface (`Log(ctx, level, msg, fields...)`) — do not add printf-style methods.
 
 ## Testing and validation
 

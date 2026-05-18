@@ -2,13 +2,14 @@
 
 Dual-backend (PostgreSQL / MongoDB) hot-reload runtime configuration for Lerian services. Register operational knobs (log levels, feature flags, rate limits, circuit-breaker thresholds, worker intervals) at startup, mutate them at runtime without a pod restart, and subscribe to change events through a LISTEN/NOTIFY (Postgres) or change-stream (Mongo) backed subscription. First-class support for per-tenant overrides and an optional Fiber admin HTTP surface.
 
-This library is extracted from `lib-commons/v5/commons/systemplane` and maintains the same public API.
+This library was extracted from `lib-commons/v5/commons/systemplane`. The v1 line intentionally migrates the observability surface to `lib-observability`: `WithLogger` uses `lib-observability/log.Logger`, `WithTelemetry` uses `*lib-observability/tracing.Telemetry`, and subscriber panic recovery uses `lib-observability/runtime`.
 
 ## Requirements
 
-- Go `1.25.9` or newer
+- Go `1.26.3` or newer
 - PostgreSQL 13+ **or** MongoDB 4.4+ (replica set required for change-streams; polling fallback available for standalone Mongo)
-- `github.com/LerianStudio/lib-commons/v5 v5.0.2` (pulled transitively for `log`, `tenant-manager/core`, `opentelemetry`, `runtime`, `net/http`, and `backoff`)
+- `github.com/LerianStudio/lib-commons/v5 v5.0.2` for tenant context, admin HTTP helpers, and backoff
+- `github.com/LerianStudio/lib-observability v1.0.0` for logging, tracing, telemetry, redaction, and panic recovery
 
 ## Installation
 

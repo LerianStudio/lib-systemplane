@@ -59,7 +59,7 @@ lib-systemplane/
 
 ### Go Version
 
-- **Minimum**: Go 1.25.9
+- **Minimum**: Go 1.26.3
 - Keep `go.mod` updated with latest stable Go version
 - Module path: `github.com/LerianStudio/lib-systemplane`
 
@@ -92,7 +92,7 @@ import (
     "go.uber.org/zap"
 
     // Internal packages
-    "github.com/LerianStudio/lib-commons/v5/commons/log"
+    "github.com/LerianStudio/lib-observability/log"
 )
 ```
 
@@ -317,16 +317,16 @@ func (c *Client) Connect(ctx context.Context) error {
 
 ## Dependencies
 
-### lib-commons Subpackages
+### Lerian Library Boundaries
 
-This repo depends on the following subpackages of `github.com/LerianStudio/lib-commons/v5`:
+Lerian shared-library ownership is split intentionally:
 
-- `commons/log`
-- `commons/tenant-manager/core`
-- `commons/opentelemetry`
-- `commons/runtime`
-- `commons/net/http`
-- `commons/backoff`
+- `github.com/LerianStudio/lib-commons/v5` — non-observability shared primitives. This repo uses `commons/tenant-manager/core`, `commons/net/http`, and `commons/backoff`.
+- `github.com/LerianStudio/lib-observability` — canonical observability stack. This repo uses `log`, `tracing`, and `runtime` for structured logging, telemetry, span helpers, redaction, and panic recovery.
+- `github.com/LerianStudio/lib-systemplane` — runtime-mutable configuration. Do not duplicate its functionality in service repositories.
+- `github.com/LerianStudio/lib-streaming` — tenant-scoped event streaming. Do not add it to this repo unless a task explicitly requires streaming integration.
+
+Do not reintroduce observability packages from `lib-commons`; they are being removed from that module. New observability code must use `lib-observability`.
 
 ### Key Third-Party Dependencies
 
@@ -337,7 +337,7 @@ This repo depends on the following subpackages of `github.com/LerianStudio/lib-c
 - `github.com/google/uuid` — UUID generation
 - `github.com/stretchr/testify` — Test assertions and suites
 - `github.com/testcontainers/testcontainers-go` — Ephemeral containers for integration tests
-- OpenTelemetry SDK — Tracing and metrics instrumentation
+- OpenTelemetry SDK — tracing and metrics instrumentation, normally reached through `lib-observability`
 
 ### Adding Dependencies
 
@@ -357,15 +357,15 @@ This repo depends on the following subpackages of `github.com/LerianStudio/lib-c
 3. **Mask in errors** - Never include credentials in error messages
 
 ```go
-// Use the built-in Redactor for sensitive data
-redactor := opentelemetry.NewDefaultRedactor()
+// Use the built-in lib-observability Redactor for sensitive data
+redactor := tracing.NewDefaultRedactor()
 safeValue := redactor.Redact(sensitiveField)
 ```
 
 ### Sensitive Field Detection
 
-- Use `commons/security` for sensitive field detection and handling
-- Use `commons/opentelemetry.Redactor` with `RedactionRule` patterns
+- Use `lib-observability/tracing.Redactor` with `RedactionRule` patterns for telemetry attributes
+- Use `lib-observability/log` safe logging helpers when emitting external errors
 - Constructors: `NewDefaultRedactor()` and `NewRedactor(rules, mask)`
 
 ### Input Validation
@@ -377,7 +377,7 @@ safeValue := redactor.Redact(sensitiveField)
 
 ### Log Injection Prevention
 
-- Use `commons/log/sanitizer.go` for log-injection prevention
+- Use `lib-observability/log` for production-safe logging and log-injection prevention
 - Never interpolate untrusted input into log messages without sanitization
 
 ### Environment Variables
@@ -481,7 +481,7 @@ Key API contracts that must be preserved:
 | Lifecycle | Construct → `Register`/`RegisterTenantScoped` → `Start(ctx)` → runtime ops → `Close()`. `Register` after `Start` returns `ErrRegisterAfterStart`. |
 | Read paths | `Get`, `GetString`, `GetInt`, `GetBool`, `GetFloat64`, `GetDuration` are nil-receiver safe and return zero values on miss. |
 | Write path | `Set(ctx, ns, key, value, actor)` — last-write-wins with write-through cache; subscribers fire via changefeed echo, not synchronously. |
-| Subscriptions | `OnChange(ns, key, fn)` returns an `unsubscribe` func. Callbacks invoked serially with panic recovery via `commons/runtime.RecoverAndLog`. |
+| Subscriptions | `OnChange(ns, key, fn)` returns an `unsubscribe` func. Callbacks invoked serially with panic recovery via `lib-observability/runtime.RecoverAndLog`. |
 | Tenant-scoped keys | `RegisterTenantScoped` declares per-tenant eligibility; legacy `Get`/`OnChange`/`List` continue observing only the shared `_global` row (non-breaking addition). |
 | Tenant access | `GetForTenant`, `SetForTenant`, `DeleteForTenant`, `ListTenantsForKey`, `OnTenantChange` plus typed accessor mirrors. Fail-closed — no silent fallback to global. |
 | Tenant validation | Tenant ID extracted via `core.GetTenantIDContext`, validated by `core.IsValidTenantID`. `_global` is reserved and rejected as a tenant ID. |
