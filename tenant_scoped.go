@@ -26,9 +26,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/LerianStudio/lib-commons/v5/commons/log"
-	"github.com/LerianStudio/lib-commons/v5/commons/opentelemetry"
 	"github.com/LerianStudio/lib-commons/v5/commons/tenant-manager/core"
+	"github.com/LerianStudio/lib-observability/log"
+	"github.com/LerianStudio/lib-observability/tracing"
 	"github.com/LerianStudio/lib-systemplane/internal/store"
 	"go.opentelemetry.io/otel/attribute"
 )
@@ -272,7 +272,7 @@ func (c *Client) SetForTenant(ctx context.Context, namespace, key string, value 
 
 	jsonBytes, err := json.Marshal(value)
 	if err != nil {
-		opentelemetry.HandleSpanError(span, "json marshal failed", err)
+		tracing.HandleSpanError(span, "json marshal failed", err)
 
 		return fmt.Errorf("%w: value is not JSON-serializable: %w", ErrValidation, err)
 	}
@@ -283,7 +283,7 @@ func (c *Client) SetForTenant(ctx context.Context, namespace, key string, value 
 	}
 
 	if err := c.store.SetTenantValue(ctx, tenantID, entry); err != nil {
-		opentelemetry.HandleSpanError(span, "store set_tenant_value failed", err)
+		tracing.HandleSpanError(span, "store set_tenant_value failed", err)
 
 		return fmt.Errorf("systemplane: SetTenantValue: %w", err)
 	}
@@ -428,7 +428,7 @@ func (c *Client) getForTenantLazyMissLocked(ctx context.Context, tenantID, names
 
 		entry, found, err := c.store.GetTenantValue(fetchCtx, tenantID, namespace, key)
 		if err != nil {
-			opentelemetry.HandleSpanError(span, "store get_tenant_value failed", err)
+			tracing.HandleSpanError(span, "store get_tenant_value failed", err)
 
 			return sfResult{}, fmt.Errorf("systemplane: GetTenantValue: %w", err)
 		}
@@ -439,7 +439,7 @@ func (c *Client) getForTenantLazyMissLocked(ctx context.Context, tenantID, names
 
 		var decoded any
 		if err := json.Unmarshal(entry.Value, &decoded); err != nil {
-			opentelemetry.HandleSpanError(span, "json unmarshal failed", err)
+			tracing.HandleSpanError(span, "json unmarshal failed", err)
 
 			return sfResult{}, fmt.Errorf("systemplane: GetTenantValue: decode: %w", err)
 		}
@@ -526,7 +526,7 @@ func (c *Client) DeleteForTenant(ctx context.Context, namespace, key, actor stri
 	defer finish()
 
 	if err := c.store.DeleteTenantValue(ctx, tenantID, namespace, key, actor); err != nil {
-		opentelemetry.HandleSpanError(span, "store delete_tenant_value failed", err)
+		tracing.HandleSpanError(span, "store delete_tenant_value failed", err)
 
 		return fmt.Errorf("systemplane: DeleteTenantValue: %w", err)
 	}
@@ -585,7 +585,7 @@ func (c *Client) ListTenantsForKey(namespace, key string) []string {
 
 	tenants, err := c.store.ListTenantsForKey(ctx, namespace, key)
 	if err != nil {
-		opentelemetry.HandleSpanError(span, "store list_tenants_for_key failed", err)
+		tracing.HandleSpanError(span, "store list_tenants_for_key failed", err)
 
 		err = fmt.Errorf("systemplane: ListTenantsForKey: %w", err)
 		c.logWarn(ctx, "ListTenantsForKey: backend query failed, returning empty slice",

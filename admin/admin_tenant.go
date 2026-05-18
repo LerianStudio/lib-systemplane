@@ -21,9 +21,9 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/LerianStudio/lib-commons/v5/commons/log"
 	commonshttp "github.com/LerianStudio/lib-commons/v5/commons/net/http"
 	"github.com/LerianStudio/lib-commons/v5/commons/tenant-manager/core"
+	"github.com/LerianStudio/lib-observability/log"
 	systemplane "github.com/LerianStudio/lib-systemplane"
 	"github.com/gofiber/fiber/v2"
 )

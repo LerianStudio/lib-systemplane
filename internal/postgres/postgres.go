@@ -12,8 +12,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/LerianStudio/lib-commons/v5/commons/log"
-	libOTEL "github.com/LerianStudio/lib-commons/v5/commons/opentelemetry"
+	"github.com/LerianStudio/lib-observability/log"
+	"github.com/LerianStudio/lib-observability/tracing"
 	"github.com/LerianStudio/lib-systemplane/internal/store"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -65,7 +65,7 @@ type Config struct {
 	Logger log.Logger
 
 	// Telemetry is the OpenTelemetry provider for spans and metrics.
-	Telemetry *libOTEL.Telemetry
+	Telemetry *tracing.Telemetry
 
 	// TenantSchemaEnabled opts the backend into phase-2 schema. When false
 	// (the default), ensureSchema keeps the legacy (namespace, key) primary
@@ -164,7 +164,7 @@ func (s *Store) List(ctx context.Context) ([]store.Entry, error) {
 
 	rows, err := s.cfg.DB.QueryContext(ctx, query, store.SentinelGlobal)
 	if err != nil {
-		libOTEL.HandleSpanError(span, "list query failed", err)
+		tracing.HandleSpanError(span, "list query failed", err)
 
 		return nil, fmt.Errorf("systemplane/postgres: list: %w", err)
 	}
@@ -176,7 +176,7 @@ func (s *Store) List(ctx context.Context) ([]store.Entry, error) {
 		var e store.Entry
 
 		if err := rows.Scan(&e.Namespace, &e.Key, &e.TenantID, &e.Value, &e.UpdatedAt, &e.UpdatedBy); err != nil {
-			libOTEL.HandleSpanError(span, "list scan failed", err)
+			tracing.HandleSpanError(span, "list scan failed", err)
 
 			return nil, fmt.Errorf("systemplane/postgres: list scan: %w", err)
 		}
@@ -185,7 +185,7 @@ func (s *Store) List(ctx context.Context) ([]store.Entry, error) {
 	}
 
 	if err := rows.Err(); err != nil {
-		libOTEL.HandleSpanError(span, "list rows iteration failed", err)
+		tracing.HandleSpanError(span, "list rows iteration failed", err)
 
 		return nil, fmt.Errorf("systemplane/postgres: list rows: %w", err)
 	}
@@ -228,7 +228,7 @@ func (s *Store) Get(ctx context.Context, namespace, key string) (store.Entry, bo
 	}
 
 	if err != nil {
-		libOTEL.HandleSpanError(span, "get query failed", err)
+		tracing.HandleSpanError(span, "get query failed", err)
 
 		return store.Entry{}, false, fmt.Errorf("systemplane/postgres: get: %w", err)
 	}
@@ -290,7 +290,7 @@ SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at, updated_by = EXCLU
 	)
 
 	if _, err := s.cfg.DB.ExecContext(ctx, query, e.Namespace, e.Key, store.SentinelGlobal, e.Value, e.UpdatedAt, e.UpdatedBy); err != nil {
-		libOTEL.HandleSpanError(span, "set upsert failed", err)
+		tracing.HandleSpanError(span, "set upsert failed", err)
 
 		return fmt.Errorf("systemplane/postgres: set: %w", err)
 	}

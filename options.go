@@ -4,14 +4,14 @@ package systemplane
 import (
 	"time"
 
-	"github.com/LerianStudio/lib-commons/v5/commons/log"
-	"github.com/LerianStudio/lib-commons/v5/commons/opentelemetry"
+	"github.com/LerianStudio/lib-observability/log"
+	"github.com/LerianStudio/lib-observability/tracing"
 )
 
 // clientConfig holds the merged configuration applied by Option functions.
 type clientConfig struct {
 	logger        log.Logger
-	telemetry     *opentelemetry.Telemetry
+	telemetry     *tracing.Telemetry
 	listenChannel string        // Postgres LISTEN channel name
 	pollInterval  time.Duration // MongoDB polling interval (zero = change streams)
 	debounce      time.Duration
@@ -67,7 +67,7 @@ func WithLogger(l log.Logger) Option {
 }
 
 // WithTelemetry sets the OpenTelemetry provider for spans and metrics.
-func WithTelemetry(t *opentelemetry.Telemetry) Option {
+func WithTelemetry(t *tracing.Telemetry) Option {
 	return func(cfg *clientConfig) {
 		if t != nil {
 			cfg.telemetry = t

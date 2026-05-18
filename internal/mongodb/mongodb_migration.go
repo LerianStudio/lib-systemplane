@@ -34,7 +34,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/LerianStudio/lib-commons/v5/commons/log"
+	"github.com/LerianStudio/lib-observability/log"
 	"github.com/LerianStudio/lib-systemplane/internal/store"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -127,8 +127,8 @@ func ensureSchema(ctx context.Context, coll *mongo.Collection, logger log.Logger
 func ensureLegacySchema(ctx context.Context, coll *mongo.Collection) error {
 	model := mongo.IndexModel{
 		Keys: bson.D{
-			{Key: "namespace", Value: 1},
-			{Key: "key", Value: 1},
+			{Key: fieldNamespace, Value: 1},
+			{Key: fieldKey, Value: 1},
 		},
 		Options: options.Index().SetUnique(true).SetName(legacyNamespaceKeyIndex),
 	}
@@ -158,9 +158,9 @@ func verifyNoAmbiguousTenantDocs(ctx context.Context, coll *mongo.Collection) er
 		// string — into the "__missing__" bucket so both collide with
 		// "_global" the same way.
 		{{Key: "$group", Value: bson.D{
-			{Key: "_id", Value: bson.D{
-				{Key: "namespace", Value: "$namespace"},
-				{Key: "key", Value: "$key"},
+			{Key: fieldID, Value: bson.D{
+				{Key: fieldNamespace, Value: "$namespace"},
+				{Key: fieldKey, Value: "$key"},
 			}},
 			{Key: "tenantIDs", Value: bson.D{
 				{Key: "$addToSet", Value: bson.D{
@@ -207,8 +207,8 @@ func verifyNoAmbiguousTenantDocs(ctx context.Context, coll *mongo.Collection) er
 // is absent. Safe to re-run: $exists:false matches nothing after the first
 // successful pass.
 func backfillTenantID(ctx context.Context, coll *mongo.Collection) error {
-	filter := bson.D{{Key: "tenant_id", Value: bson.D{{Key: "$exists", Value: false}}}}
-	update := bson.D{{Key: "$set", Value: bson.D{{Key: "tenant_id", Value: store.SentinelGlobal}}}}
+	filter := bson.D{{Key: fieldTenantID, Value: bson.D{{Key: "$exists", Value: false}}}}
+	update := bson.D{{Key: opSet, Value: bson.D{{Key: fieldTenantID, Value: store.SentinelGlobal}}}}
 
 	if _, err := coll.UpdateMany(ctx, filter, update); err != nil {
 		return err //nolint:wrapcheck // wrapped by ensureSchema
@@ -242,9 +242,9 @@ func dropLegacyIndex(ctx context.Context, coll *mongo.Collection) error {
 func createCompoundIndex(ctx context.Context, coll *mongo.Collection) error {
 	model := mongo.IndexModel{
 		Keys: bson.D{
-			{Key: "namespace", Value: 1},
-			{Key: "key", Value: 1},
-			{Key: "tenant_id", Value: 1},
+			{Key: fieldNamespace, Value: 1},
+			{Key: fieldKey, Value: 1},
+			{Key: fieldTenantID, Value: 1},
 		},
 		Options: options.Index().SetUnique(true),
 	}

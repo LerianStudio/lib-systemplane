@@ -196,8 +196,8 @@ func testSetThenGetRoundtrip(t *testing.T, factory Factory) {
 	ctx := context.Background()
 
 	entry := store.Entry{
-		Namespace: "global",
-		Key:       "log.level",
+		Namespace: fixtureNamespace,
+		Key:       fixtureKeyLogLevel,
 		Value:     []byte(`"info"`),
 		UpdatedAt: time.Now().UTC().Truncate(time.Millisecond),
 		UpdatedBy: "actor-1",
@@ -207,7 +207,7 @@ func testSetThenGetRoundtrip(t *testing.T, factory Factory) {
 		t.Fatalf("Set: %v", err)
 	}
 
-	got, found, err := s.Get(ctx, "global", "log.level")
+	got, found, err := s.Get(ctx, fixtureNamespace, fixtureKeyLogLevel)
 	if err != nil {
 		t.Fatalf("Get after Set: %v", err)
 	}
@@ -247,7 +247,7 @@ func testSetTwiceLastWriteWins(t *testing.T, factory Factory) {
 	ctx := context.Background()
 
 	base := store.Entry{
-		Namespace: "global",
+		Namespace: fixtureNamespace,
 		Key:       "rate_limit.rps",
 		UpdatedBy: "actor-1",
 	}
@@ -300,8 +300,8 @@ func testListReturnsAllAfterMultipleSets(t *testing.T, factory Factory) {
 	ctx := context.Background()
 
 	entries := []store.Entry{
-		{Namespace: "global", Key: "log.level", Value: []byte(`"info"`), UpdatedBy: "a"},
-		{Namespace: "global", Key: "rate_limit", Value: []byte(`100`), UpdatedBy: "b"},
+		{Namespace: fixtureNamespace, Key: fixtureKeyLogLevel, Value: []byte(`"info"`), UpdatedBy: "a"},
+		{Namespace: fixtureNamespace, Key: "rate_limit", Value: []byte(`100`), UpdatedBy: "b"},
 		{Namespace: "tenant:acme", Key: "feature.x", Value: []byte(`true`), UpdatedBy: "c"},
 	}
 
@@ -359,8 +359,8 @@ func testSubscribeReceivesEventOnSet(t *testing.T, factory Factory) {
 	time.Sleep(200 * time.Millisecond)
 
 	entry := store.Entry{
-		Namespace: "global",
-		Key:       "log.level",
+		Namespace: fixtureNamespace,
+		Key:       fixtureKeyLogLevel,
 		Value:     []byte(`"debug"`),
 		UpdatedBy: "actor-test",
 	}
@@ -537,9 +537,14 @@ func testNamespaceIsolation(t *testing.T, factory Factory) {
 // constant lets the tenant sub-suite satisfy goconst without touching the
 // Task 7 test bodies that own the upper half of this file.
 const (
-	fixtureTenantA   = "tenant-A"
-	fixtureKey       = "fee.rate"
-	fixtureNamespace = "global"
+	fixtureTenantA     = "tenant-A"
+	fixtureTenantB     = "tenant-B"
+	fixtureTenantC     = "tenant-C"
+	fixtureKey         = "fee.rate"
+	fixtureKeyLogLevel = "log.level"
+	fixtureNamespace   = "global"
+	fixtureAdmin       = "admin"
+	fixtureAdminA      = "admin-A"
 )
 
 // testTenantListOnEmpty: ListTenantValues on a fresh store returns an empty
@@ -562,7 +567,7 @@ func testTenantListOnEmpty(t *testing.T, factory Factory) {
 		t.Fatalf("expected 0 tenant entries, got %d", len(entries))
 	}
 
-	tenants, err := s.ListTenantsForKey(ctx, "global", fixtureKey)
+	tenants, err := s.ListTenantsForKey(ctx, fixtureNamespace, fixtureKey)
 	if err != nil {
 		t.Fatalf("ListTenantsForKey on empty store: %v", err)
 	}
@@ -587,17 +592,17 @@ func testSetTenantThenGetRoundtrip(t *testing.T, factory Factory) {
 	ctx := context.Background()
 
 	entry := store.Entry{
-		Namespace: "global",
+		Namespace: fixtureNamespace,
 		Key:       fixtureKey,
 		Value:     []byte(`0.05`),
-		UpdatedBy: "admin-A",
+		UpdatedBy: fixtureAdminA,
 	}
 
 	if err := s.SetTenantValue(ctx, fixtureTenantA, entry); err != nil {
 		t.Fatalf("SetTenantValue tenant-A: %v", err)
 	}
 
-	got, found, err := s.GetTenantValue(ctx, fixtureTenantA, "global", fixtureKey)
+	got, found, err := s.GetTenantValue(ctx, fixtureTenantA, fixtureNamespace, fixtureKey)
 	if err != nil {
 		t.Fatalf("GetTenantValue tenant-A: %v", err)
 	}
@@ -614,12 +619,12 @@ func testSetTenantThenGetRoundtrip(t *testing.T, factory Factory) {
 		t.Fatalf("GetTenantValue tenant-A: value=%q, want %q", got.Value, `0.05`)
 	}
 
-	if got.UpdatedBy != "admin-A" {
-		t.Fatalf("GetTenantValue tenant-A: updated_by=%q, want %q", got.UpdatedBy, "admin-A")
+	if got.UpdatedBy != fixtureAdminA {
+		t.Fatalf("GetTenantValue tenant-A: updated_by=%q, want %q", got.UpdatedBy, fixtureAdminA)
 	}
 
 	// Other tenant must NOT see tenant-A's row.
-	_, foundB, err := s.GetTenantValue(ctx, "tenant-B", "global", fixtureKey)
+	_, foundB, err := s.GetTenantValue(ctx, fixtureTenantB, fixtureNamespace, fixtureKey)
 	if err != nil {
 		t.Fatalf("GetTenantValue tenant-B: %v", err)
 	}
@@ -639,10 +644,10 @@ func testSetTenantTwiceLastWriteWins(t *testing.T, factory Factory) {
 	ctx := context.Background()
 
 	base := store.Entry{
-		Namespace: "global",
+		Namespace: fixtureNamespace,
 		Key:       fixtureKey,
 		Value:     []byte(`0.05`),
-		UpdatedBy: "admin-A",
+		UpdatedBy: fixtureAdminA,
 	}
 
 	if err := s.SetTenantValue(ctx, fixtureTenantA, base); err != nil {
@@ -656,7 +661,7 @@ func testSetTenantTwiceLastWriteWins(t *testing.T, factory Factory) {
 		t.Fatalf("SetTenantValue v2: %v", err)
 	}
 
-	got, found, err := s.GetTenantValue(ctx, fixtureTenantA, "global", fixtureKey)
+	got, found, err := s.GetTenantValue(ctx, fixtureTenantA, fixtureNamespace, fixtureKey)
 	if err != nil {
 		t.Fatalf("GetTenantValue: %v", err)
 	}
@@ -705,21 +710,21 @@ func testDeleteTenantValueReturnsMissing(t *testing.T, factory Factory) {
 	ctx := context.Background()
 
 	entry := store.Entry{
-		Namespace: "global",
+		Namespace: fixtureNamespace,
 		Key:       fixtureKey,
 		Value:     []byte(`0.05`),
-		UpdatedBy: "admin",
+		UpdatedBy: fixtureAdmin,
 	}
 
 	if err := s.SetTenantValue(ctx, fixtureTenantA, entry); err != nil {
 		t.Fatalf("SetTenantValue: %v", err)
 	}
 
-	if err := s.DeleteTenantValue(ctx, fixtureTenantA, "global", fixtureKey, "admin"); err != nil {
+	if err := s.DeleteTenantValue(ctx, fixtureTenantA, fixtureNamespace, fixtureKey, fixtureAdmin); err != nil {
 		t.Fatalf("DeleteTenantValue: %v", err)
 	}
 
-	_, found, err := s.GetTenantValue(ctx, fixtureTenantA, "global", fixtureKey)
+	_, found, err := s.GetTenantValue(ctx, fixtureTenantA, fixtureNamespace, fixtureKey)
 	if err != nil {
 		t.Fatalf("GetTenantValue after delete: %v", err)
 	}
@@ -738,21 +743,21 @@ func testDeleteTenantValueIsIdempotent(t *testing.T, factory Factory) {
 	ctx := context.Background()
 
 	// Never set anything for tenant-missing; delete must still succeed.
-	if err := s.DeleteTenantValue(ctx, "tenant-missing", "global", fixtureKey, "admin"); err != nil {
+	if err := s.DeleteTenantValue(ctx, "tenant-missing", fixtureNamespace, fixtureKey, fixtureAdmin); err != nil {
 		t.Fatalf("DeleteTenantValue on missing row: %v", err)
 	}
 
 	// Double-delete after a set should also be nil.
-	entry := store.Entry{Namespace: "global", Key: fixtureKey, Value: []byte(`0.05`), UpdatedBy: "admin"}
+	entry := store.Entry{Namespace: fixtureNamespace, Key: fixtureKey, Value: []byte(`0.05`), UpdatedBy: fixtureAdmin}
 	if err := s.SetTenantValue(ctx, fixtureTenantA, entry); err != nil {
 		t.Fatalf("SetTenantValue: %v", err)
 	}
 
-	if err := s.DeleteTenantValue(ctx, fixtureTenantA, "global", fixtureKey, "admin"); err != nil {
+	if err := s.DeleteTenantValue(ctx, fixtureTenantA, fixtureNamespace, fixtureKey, fixtureAdmin); err != nil {
 		t.Fatalf("first DeleteTenantValue: %v", err)
 	}
 
-	if err := s.DeleteTenantValue(ctx, fixtureTenantA, "global", fixtureKey, "admin"); err != nil {
+	if err := s.DeleteTenantValue(ctx, fixtureTenantA, fixtureNamespace, fixtureKey, fixtureAdmin); err != nil {
 		t.Fatalf("second DeleteTenantValue (idempotent): %v", err)
 	}
 }
@@ -766,10 +771,10 @@ func testListTenantsForKeySorted(t *testing.T, factory Factory) {
 	s := factory(t)
 	ctx := context.Background()
 
-	entry := store.Entry{Namespace: "global", Key: fixtureKey, Value: []byte(`0.05`), UpdatedBy: "admin"}
+	entry := store.Entry{Namespace: fixtureNamespace, Key: fixtureKey, Value: []byte(`0.05`), UpdatedBy: fixtureAdmin}
 
 	// Inserted deliberately out of sorted order: C, A, B, A-again.
-	for _, tid := range []string{"tenant-C", fixtureTenantA, "tenant-B", fixtureTenantA} {
+	for _, tid := range []string{fixtureTenantC, fixtureTenantA, fixtureTenantB, fixtureTenantA} {
 		if err := s.SetTenantValue(ctx, tid, entry); err != nil {
 			t.Fatalf("SetTenantValue %s: %v", tid, err)
 		}
@@ -778,15 +783,15 @@ func testListTenantsForKeySorted(t *testing.T, factory Factory) {
 	// The global row for the same (ns, key) MUST be excluded from the tenant
 	// list — store.SentinelGlobal is a sentinel, not a real tenant.
 	if err := s.Set(ctx, store.Entry{
-		Namespace: "global",
+		Namespace: fixtureNamespace,
 		Key:       fixtureKey,
 		Value:     []byte(`0.01`),
-		UpdatedBy: "admin",
+		UpdatedBy: fixtureAdmin,
 	}); err != nil {
 		t.Fatalf("Set global: %v", err)
 	}
 
-	tenants, err := s.ListTenantsForKey(ctx, "global", fixtureKey)
+	tenants, err := s.ListTenantsForKey(ctx, fixtureNamespace, fixtureKey)
 	if err != nil {
 		t.Fatalf("ListTenantsForKey: %v", err)
 	}
@@ -795,7 +800,7 @@ func testListTenantsForKeySorted(t *testing.T, factory Factory) {
 		t.Fatal("ListTenantsForKey must return a non-nil slice")
 	}
 
-	want := []string{fixtureTenantA, "tenant-B", "tenant-C"}
+	want := []string{fixtureTenantA, fixtureTenantB, fixtureTenantC}
 	if len(tenants) != len(want) {
 		t.Fatalf("tenants: got %v (len %d), want %v (len %d)", tenants, len(tenants), want, len(want))
 	}
@@ -826,14 +831,14 @@ func testGlobalAndTenantRowsCoexist(t *testing.T, factory Factory) {
 	ctx := context.Background()
 
 	globalEntry := store.Entry{
-		Namespace: "global",
+		Namespace: fixtureNamespace,
 		Key:       fixtureKey,
 		Value:     []byte(`0.01`),
-		UpdatedBy: "admin",
+		UpdatedBy: fixtureAdmin,
 	}
 
 	tenantEntry := store.Entry{
-		Namespace: "global",
+		Namespace: fixtureNamespace,
 		Key:       fixtureKey,
 		Value:     []byte(`0.05`),
 		UpdatedBy: "tenant-admin",
@@ -848,7 +853,7 @@ func testGlobalAndTenantRowsCoexist(t *testing.T, factory Factory) {
 	}
 
 	// Global-path Get returns the global value, NOT tenant-A's override.
-	got, found, err := s.Get(ctx, "global", fixtureKey)
+	got, found, err := s.Get(ctx, fixtureNamespace, fixtureKey)
 	if err != nil || !found {
 		t.Fatalf("Get global: found=%v, err=%v", found, err)
 	}
@@ -858,7 +863,7 @@ func testGlobalAndTenantRowsCoexist(t *testing.T, factory Factory) {
 	}
 
 	// Tenant-path Get returns the tenant value, NOT the global.
-	gotT, foundT, err := s.GetTenantValue(ctx, fixtureTenantA, "global", fixtureKey)
+	gotT, foundT, err := s.GetTenantValue(ctx, fixtureTenantA, fixtureNamespace, fixtureKey)
 	if err != nil || !foundT {
 		t.Fatalf("GetTenantValue tenant-A: found=%v, err=%v", foundT, err)
 	}
@@ -941,7 +946,7 @@ func testTenantSubscribeReceivesSetEvent(t *testing.T, factory Factory) {
 	time.Sleep(500 * time.Millisecond)
 
 	entry := store.Entry{
-		Namespace: "global",
+		Namespace: fixtureNamespace,
 		Key:       fixtureKey,
 		Value:     []byte(`0.05`),
 		UpdatedBy: "tenant-admin",
@@ -998,10 +1003,10 @@ func testTenantSubscribeReceivesDeleteEvent(t *testing.T, factory Factory) {
 	// event we assert on. Seeded writes that race with Subscribe setup may or
 	// may not be delivered depending on backend; we don't assert on them.
 	seed := store.Entry{
-		Namespace: "global",
+		Namespace: fixtureNamespace,
 		Key:       fixtureKey,
 		Value:     []byte(`0.05`),
-		UpdatedBy: "admin",
+		UpdatedBy: fixtureAdmin,
 	}
 
 	if err := s.SetTenantValue(ctx, fixtureTenantA, seed); err != nil {
@@ -1042,7 +1047,7 @@ drainSeed:
 		}
 	}
 
-	if err := s.DeleteTenantValue(ctx, fixtureTenantA, "global", fixtureKey, "admin"); err != nil {
+	if err := s.DeleteTenantValue(ctx, fixtureTenantA, fixtureNamespace, fixtureKey, fixtureAdmin); err != nil {
 		t.Fatalf("DeleteTenantValue: %v", err)
 	}
 
@@ -1097,8 +1102,8 @@ func testListTenantOverridesFiltersGlobals(t *testing.T, factory Factory) {
 
 	// Two global rows under the same namespace, distinct keys.
 	globals := []store.Entry{
-		{Namespace: "global", Key: "rate_limit", Value: []byte(`100`), UpdatedBy: "admin"},
-		{Namespace: "global", Key: "log.level", Value: []byte(`"info"`), UpdatedBy: "admin"},
+		{Namespace: fixtureNamespace, Key: "rate_limit", Value: []byte(`100`), UpdatedBy: fixtureAdmin},
+		{Namespace: fixtureNamespace, Key: fixtureKeyLogLevel, Value: []byte(`"info"`), UpdatedBy: fixtureAdmin},
 	}
 
 	for _, g := range globals {
@@ -1109,13 +1114,13 @@ func testListTenantOverridesFiltersGlobals(t *testing.T, factory Factory) {
 
 	// Three tenant overrides for the fixtureKey, distinct tenants.
 	tenantEntry := store.Entry{
-		Namespace: "global",
+		Namespace: fixtureNamespace,
 		Key:       fixtureKey,
 		Value:     []byte(`0.05`),
-		UpdatedBy: "admin",
+		UpdatedBy: fixtureAdmin,
 	}
 
-	for _, tid := range []string{fixtureTenantA, "tenant-B", "tenant-C"} {
+	for _, tid := range []string{fixtureTenantA, fixtureTenantB, fixtureTenantC} {
 		if err := s.SetTenantValue(ctx, tid, tenantEntry); err != nil {
 			t.Fatalf("SetTenantValue %s: %v", tid, err)
 		}
@@ -1169,7 +1174,7 @@ func testDeleteTenantValueNoOpEmitsNoEvent(t *testing.T, factory Factory) {
 
 	// Delete a row that never existed for tenant-never; the operation must
 	// succeed (idempotent) and must not emit a changefeed event.
-	if err := s.DeleteTenantValue(ctx, "tenant-never", "global", fixtureKey, "admin"); err != nil {
+	if err := s.DeleteTenantValue(ctx, "tenant-never", fixtureNamespace, fixtureKey, fixtureAdmin); err != nil {
 		t.Fatalf("DeleteTenantValue (no-op): %v", err)
 	}
 

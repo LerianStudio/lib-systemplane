@@ -25,7 +25,7 @@ import (
 
 	"go.opentelemetry.io/otel/attribute"
 
-	libOTEL "github.com/LerianStudio/lib-commons/v5/commons/opentelemetry"
+	"github.com/LerianStudio/lib-observability/tracing"
 	"github.com/LerianStudio/lib-systemplane/internal/store"
 )
 
@@ -71,7 +71,7 @@ func (s *Store) GetTenantValue(ctx context.Context, tenantID, namespace, key str
 	}
 
 	if err != nil {
-		libOTEL.HandleSpanError(span, "get_tenant_value query failed", err)
+		tracing.HandleSpanError(span, "get_tenant_value query failed", err)
 
 		return store.Entry{}, false, fmt.Errorf("systemplane/postgres: get_tenant_value: %w", err)
 	}
@@ -129,7 +129,7 @@ SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at, updated_by = EXCLU
 	)
 
 	if _, err := s.cfg.DB.ExecContext(ctx, query, e.Namespace, e.Key, tenantID, e.Value, e.UpdatedAt, e.UpdatedBy); err != nil {
-		libOTEL.HandleSpanError(span, "set_tenant_value upsert failed", err)
+		tracing.HandleSpanError(span, "set_tenant_value upsert failed", err)
 
 		return fmt.Errorf("systemplane/postgres: set_tenant_value: %w", err)
 	}
@@ -194,7 +194,7 @@ func (s *Store) DeleteTenantValue(ctx context.Context, tenantID, namespace, key,
 	// nil error. This mirrors the MongoDB backend's delete semantics and
 	// matches sql.DELETE's native per-SQL-standard idempotency.
 	if _, err := s.cfg.DB.ExecContext(ctx, query, namespace, key, tenantID); err != nil {
-		libOTEL.HandleSpanError(span, "delete_tenant_value delete failed", err)
+		tracing.HandleSpanError(span, "delete_tenant_value delete failed", err)
 
 		return fmt.Errorf("systemplane/postgres: delete_tenant_value: %w", err)
 	}
@@ -224,7 +224,7 @@ func (s *Store) ListTenantValues(ctx context.Context) ([]store.Entry, error) {
 
 	rows, err := s.cfg.DB.QueryContext(ctx, query)
 	if err != nil {
-		libOTEL.HandleSpanError(span, "list_tenant_values query failed", err)
+		tracing.HandleSpanError(span, "list_tenant_values query failed", err)
 
 		return nil, fmt.Errorf("systemplane/postgres: list_tenant_values: %w", err)
 	}
@@ -236,7 +236,7 @@ func (s *Store) ListTenantValues(ctx context.Context) ([]store.Entry, error) {
 		var e store.Entry
 
 		if err := rows.Scan(&e.Namespace, &e.Key, &e.TenantID, &e.Value, &e.UpdatedAt, &e.UpdatedBy); err != nil {
-			libOTEL.HandleSpanError(span, "list_tenant_values scan failed", err)
+			tracing.HandleSpanError(span, "list_tenant_values scan failed", err)
 
 			return nil, fmt.Errorf("systemplane/postgres: list_tenant_values scan: %w", err)
 		}
@@ -245,7 +245,7 @@ func (s *Store) ListTenantValues(ctx context.Context) ([]store.Entry, error) {
 	}
 
 	if err := rows.Err(); err != nil {
-		libOTEL.HandleSpanError(span, "list_tenant_values rows iteration failed", err)
+		tracing.HandleSpanError(span, "list_tenant_values rows iteration failed", err)
 
 		return nil, fmt.Errorf("systemplane/postgres: list_tenant_values rows: %w", err)
 	}
@@ -316,7 +316,7 @@ func (s *Store) ListTenantOverrides(
 
 	rows, err := s.cfg.DB.QueryContext(ctx, query, args...)
 	if err != nil {
-		libOTEL.HandleSpanError(span, "list_tenant_overrides query failed", err)
+		tracing.HandleSpanError(span, "list_tenant_overrides query failed", err)
 
 		return nil, fmt.Errorf("systemplane/postgres: list_tenant_overrides: %w", err)
 	}
@@ -328,7 +328,7 @@ func (s *Store) ListTenantOverrides(
 		var e store.Entry
 
 		if err := rows.Scan(&e.Namespace, &e.Key, &e.TenantID, &e.Value, &e.UpdatedAt, &e.UpdatedBy); err != nil {
-			libOTEL.HandleSpanError(span, "list_tenant_overrides scan failed", err)
+			tracing.HandleSpanError(span, "list_tenant_overrides scan failed", err)
 
 			return nil, fmt.Errorf("systemplane/postgres: list_tenant_overrides scan: %w", err)
 		}
@@ -337,7 +337,7 @@ func (s *Store) ListTenantOverrides(
 	}
 
 	if err := rows.Err(); err != nil {
-		libOTEL.HandleSpanError(span, "list_tenant_overrides rows iteration failed", err)
+		tracing.HandleSpanError(span, "list_tenant_overrides rows iteration failed", err)
 
 		return nil, fmt.Errorf("systemplane/postgres: list_tenant_overrides rows: %w", err)
 	}
@@ -372,7 +372,7 @@ func (s *Store) ListTenantsForKey(ctx context.Context, namespace, key string) ([
 
 	rows, err := s.cfg.DB.QueryContext(ctx, query, namespace, key, store.SentinelGlobal)
 	if err != nil {
-		libOTEL.HandleSpanError(span, "list_tenants_for_key query failed", err)
+		tracing.HandleSpanError(span, "list_tenants_for_key query failed", err)
 
 		return nil, fmt.Errorf("systemplane/postgres: list_tenants_for_key: %w", err)
 	}
@@ -384,7 +384,7 @@ func (s *Store) ListTenantsForKey(ctx context.Context, namespace, key string) ([
 		var tenantID string
 
 		if err := rows.Scan(&tenantID); err != nil {
-			libOTEL.HandleSpanError(span, "list_tenants_for_key scan failed", err)
+			tracing.HandleSpanError(span, "list_tenants_for_key scan failed", err)
 
 			return nil, fmt.Errorf("systemplane/postgres: list_tenants_for_key scan: %w", err)
 		}
@@ -393,7 +393,7 @@ func (s *Store) ListTenantsForKey(ctx context.Context, namespace, key string) ([
 	}
 
 	if err := rows.Err(); err != nil {
-		libOTEL.HandleSpanError(span, "list_tenants_for_key rows iteration failed", err)
+		tracing.HandleSpanError(span, "list_tenants_for_key rows iteration failed", err)
 
 		return nil, fmt.Errorf("systemplane/postgres: list_tenants_for_key rows: %w", err)
 	}

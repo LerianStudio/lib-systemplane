@@ -26,8 +26,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/LerianStudio/lib-commons/v5/commons/log"
-	"github.com/LerianStudio/lib-commons/v5/commons/opentelemetry"
+	"github.com/LerianStudio/lib-observability/log"
+	"github.com/LerianStudio/lib-observability/tracing"
 	"github.com/LerianStudio/lib-systemplane/internal/store"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -90,7 +90,7 @@ type Config struct {
 	Logger log.Logger
 
 	// Telemetry is the OpenTelemetry provider for spans and metrics.
-	Telemetry *opentelemetry.Telemetry
+	Telemetry *tracing.Telemetry
 
 	// TenantSchemaEnabled opts the backend into phase-2 schema. When false
 	// (the default), ensureSchema keeps a unique index on (namespace, key)
@@ -274,18 +274,18 @@ func (s *Store) List(ctx context.Context) ([]store.Entry, error) {
 	ctx, span := s.tracer.Start(ctx, "systemplane.mongodb.list")
 	defer span.End()
 
-	filter := bson.D{{Key: "tenant_id", Value: store.SentinelGlobal}}
+	filter := bson.D{{Key: fieldTenantID, Value: store.SentinelGlobal}}
 
 	cursor, err := s.coll.Find(ctx, filter)
 	if err != nil {
-		opentelemetry.HandleSpanError(span, "mongodb list: find failed", err)
+		tracing.HandleSpanError(span, "mongodb list: find failed", err)
 		return nil, fmt.Errorf("mongodb store list: %w", err)
 	}
 	defer cursor.Close(ctx)
 
 	var docs []entryDoc
 	if err := cursor.All(ctx, &docs); err != nil {
-		opentelemetry.HandleSpanError(span, "mongodb list: decode failed", err)
+		tracing.HandleSpanError(span, "mongodb list: decode failed", err)
 		return nil, fmt.Errorf("mongodb store list: decode: %w", err)
 	}
 
@@ -319,7 +319,7 @@ func (s *Store) Get(ctx context.Context, namespace, key string) (store.Entry, bo
 
 	doc, found, err := s.findOne(ctx, namespace, key, store.SentinelGlobal)
 	if err != nil {
-		opentelemetry.HandleSpanError(span, "mongodb get: find failed", err)
+		tracing.HandleSpanError(span, "mongodb get: find failed", err)
 		return store.Entry{}, false, fmt.Errorf("mongodb store get: %w", err)
 	}
 
@@ -351,13 +351,13 @@ func (s *Store) Set(ctx context.Context, e store.Entry) error {
 
 	if e.Namespace == "" || e.Key == "" {
 		err := errors.New("mongodb store set: namespace and key must be non-empty")
-		opentelemetry.HandleSpanBusinessErrorEvent(span, "validation failed", err)
+		tracing.HandleSpanBusinessErrorEvent(span, "validation failed", err)
 
 		return err
 	}
 
 	if err := s.upsert(ctx, e, store.SentinelGlobal); err != nil {
-		opentelemetry.HandleSpanError(span, "mongodb set: upsert failed", err)
+		tracing.HandleSpanError(span, "mongodb set: upsert failed", err)
 		return fmt.Errorf("mongodb store set: %w", err)
 	}
 

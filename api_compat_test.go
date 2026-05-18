@@ -31,8 +31,8 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
-	"github.com/LerianStudio/lib-commons/v5/commons/log"
-	"github.com/LerianStudio/lib-commons/v5/commons/opentelemetry"
+	"github.com/LerianStudio/lib-observability/log"
+	"github.com/LerianStudio/lib-observability/tracing"
 	"github.com/LerianStudio/lib-systemplane"
 	"github.com/LerianStudio/lib-systemplane/admin"
 )
@@ -135,14 +135,14 @@ var (
 // ---------------------------------------------------------------------------
 
 var (
-	_ func(l log.Logger) systemplane.Option               = systemplane.WithLogger
-	_ func(t *opentelemetry.Telemetry) systemplane.Option = systemplane.WithTelemetry
-	_ func(name string) systemplane.Option                = systemplane.WithListenChannel
-	_ func(d time.Duration) systemplane.Option            = systemplane.WithPollInterval
-	_ func(d time.Duration) systemplane.Option            = systemplane.WithDebounce
-	_ func(name string) systemplane.Option                = systemplane.WithCollection
-	_ func(name string) systemplane.Option                = systemplane.WithTable
-	_ func(maxEntries int) systemplane.Option             = systemplane.WithLazyTenantLoad
+	_ func(l log.Logger) systemplane.Option         = systemplane.WithLogger
+	_ func(t *tracing.Telemetry) systemplane.Option = systemplane.WithTelemetry
+	_ func(name string) systemplane.Option          = systemplane.WithListenChannel
+	_ func(d time.Duration) systemplane.Option      = systemplane.WithPollInterval
+	_ func(d time.Duration) systemplane.Option      = systemplane.WithDebounce
+	_ func(name string) systemplane.Option          = systemplane.WithCollection
+	_ func(name string) systemplane.Option          = systemplane.WithTable
+	_ func(maxEntries int) systemplane.Option       = systemplane.WithLazyTenantLoad
 )
 
 // ---------------------------------------------------------------------------

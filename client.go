@@ -12,9 +12,9 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"golang.org/x/sync/singleflight"
 
-	"github.com/LerianStudio/lib-commons/v5/commons/log"
-	"github.com/LerianStudio/lib-commons/v5/commons/opentelemetry"
-	"github.com/LerianStudio/lib-commons/v5/commons/runtime"
+	"github.com/LerianStudio/lib-observability/log"
+	"github.com/LerianStudio/lib-observability/runtime"
+	"github.com/LerianStudio/lib-observability/tracing"
 	"github.com/LerianStudio/lib-systemplane/internal/debounce"
 	mongoDB "github.com/LerianStudio/lib-systemplane/internal/mongodb"
 	"github.com/LerianStudio/lib-systemplane/internal/postgres"
@@ -77,7 +77,7 @@ type Client struct {
 	store     store.Store
 	debouncer *debounce.Debouncer[store.Event]
 	logger    log.Logger
-	telemetry *opentelemetry.Telemetry
+	telemetry *tracing.Telemetry
 
 	// registry is populated by Register (before Start) and read-only after Start.
 	// registryMu also guards tenantScopedRegistry — both are set together at
@@ -279,7 +279,7 @@ func (c *Client) Start(ctx context.Context) error {
 	// 2. Hydrate from persistent store: overwrite defaults with stored values.
 	entries, err := c.store.List(ctx)
 	if err != nil {
-		opentelemetry.HandleSpanError(span, "hydration failed", err)
+		tracing.HandleSpanError(span, "hydration failed", err)
 		return err
 	}
 
@@ -324,7 +324,7 @@ func (c *Client) Start(ctx context.Context) error {
 	}
 
 	// 3. Launch the Subscribe goroutine with its own cancellable context.
-	subCtx, cancel := context.WithCancel(context.Background()) //nolint:gosec // G118: cancel stored in c.cancel and invoked by Close()
+	subCtx, cancel := context.WithCancel(context.Background())
 	c.cancel = cancel
 
 	c.wg.Go(func() {

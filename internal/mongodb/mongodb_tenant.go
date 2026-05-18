@@ -16,8 +16,8 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/LerianStudio/lib-commons/v5/commons/log"
-	"github.com/LerianStudio/lib-commons/v5/commons/opentelemetry"
+	"github.com/LerianStudio/lib-observability/log"
+	"github.com/LerianStudio/lib-observability/tracing"
 	"github.com/LerianStudio/lib-systemplane/internal/store"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -62,7 +62,7 @@ func (s *Store) GetTenantValue(
 
 	if tenantID == "" {
 		err := errors.New("mongodb get_tenant_value: tenantID must not be empty")
-		opentelemetry.HandleSpanBusinessErrorEvent(span, "validation failed", err)
+		tracing.HandleSpanBusinessErrorEvent(span, "validation failed", err)
 
 		return store.Entry{}, false, err
 	}
@@ -71,14 +71,14 @@ func (s *Store) GetTenantValue(
 		// Reject "_global" on the tenant surface so a caller misuse does
 		// not silently alias to the legacy global read. The legacy Get
 		// method is the correct path for the shared row. (M-S3-7)
-		opentelemetry.HandleSpanBusinessErrorEvent(span, "validation failed", ErrInvalidTenantID)
+		tracing.HandleSpanBusinessErrorEvent(span, "validation failed", ErrInvalidTenantID)
 
 		return store.Entry{}, false, ErrInvalidTenantID
 	}
 
 	doc, found, err := s.findOne(ctx, namespace, key, tenantID)
 	if err != nil {
-		opentelemetry.HandleSpanError(span, "mongodb get_tenant_value: find failed", err)
+		tracing.HandleSpanError(span, "mongodb get_tenant_value: find failed", err)
 		return store.Entry{}, false, fmt.Errorf("mongodb store get_tenant_value: %w", err)
 	}
 
@@ -114,27 +114,27 @@ func (s *Store) SetTenantValue(ctx context.Context, tenantID string, e store.Ent
 
 	if tenantID == "" {
 		err := errors.New("mongodb set_tenant_value: tenantID must not be empty")
-		opentelemetry.HandleSpanBusinessErrorEvent(span, "validation failed", err)
+		tracing.HandleSpanBusinessErrorEvent(span, "validation failed", err)
 
 		return err
 	}
 
 	if tenantID == store.SentinelGlobal {
 		err := errors.New("mongodb set_tenant_value: tenantID must not be the '_global' sentinel")
-		opentelemetry.HandleSpanBusinessErrorEvent(span, "validation failed", err)
+		tracing.HandleSpanBusinessErrorEvent(span, "validation failed", err)
 
 		return err
 	}
 
 	if e.Namespace == "" || e.Key == "" {
 		err := errors.New("mongodb set_tenant_value: namespace and key must be non-empty")
-		opentelemetry.HandleSpanBusinessErrorEvent(span, "validation failed", err)
+		tracing.HandleSpanBusinessErrorEvent(span, "validation failed", err)
 
 		return err
 	}
 
 	if err := s.upsert(ctx, e, tenantID); err != nil {
-		opentelemetry.HandleSpanError(span, "mongodb set_tenant_value: upsert failed", err)
+		tracing.HandleSpanError(span, "mongodb set_tenant_value: upsert failed", err)
 		return fmt.Errorf("mongodb store set_tenant_value: %w", err)
 	}
 
@@ -177,19 +177,19 @@ func (s *Store) DeleteTenantValue(
 
 	if tenantID == "" {
 		err := errors.New("mongodb delete_tenant_value: tenantID must not be empty")
-		opentelemetry.HandleSpanBusinessErrorEvent(span, "validation failed", err)
+		tracing.HandleSpanBusinessErrorEvent(span, "validation failed", err)
 
 		return err
 	}
 
 	if tenantID == store.SentinelGlobal {
 		err := errors.New("mongodb delete_tenant_value: tenantID must not be the '_global' sentinel")
-		opentelemetry.HandleSpanBusinessErrorEvent(span, "validation failed", err)
+		tracing.HandleSpanBusinessErrorEvent(span, "validation failed", err)
 
 		return err
 	}
 
-	filter := bson.D{{Key: "_id", Value: compoundID{
+	filter := bson.D{{Key: fieldID, Value: compoundID{
 		Namespace: namespace,
 		Key:       key,
 		TenantID:  tenantID,
@@ -201,16 +201,16 @@ func (s *Store) DeleteTenantValue(
 	// no-op deletes.
 	res, err := s.coll.DeleteOne(ctx, filter)
 	if err != nil {
-		opentelemetry.HandleSpanError(span, "mongodb delete_tenant_value: delete failed", err)
+		tracing.HandleSpanError(span, "mongodb delete_tenant_value: delete failed", err)
 
 		return fmt.Errorf("mongodb store delete_tenant_value: %w", err)
 	}
 
 	if res.DeletedCount > 0 {
 		s.logInfo(ctx, "tenant_value_deleted",
-			log.String("tenant_id", tenantID),
-			log.String("namespace", namespace),
-			log.String("key", key),
+			log.String(fieldTenantID, tenantID),
+			log.String(fieldNamespace, namespace),
+			log.String(fieldKey, key),
 			log.String("actor", actor),
 		)
 	}
@@ -235,21 +235,21 @@ func (s *Store) ListTenantValues(ctx context.Context) ([]store.Entry, error) {
 	defer span.End()
 
 	findOpts := options.Find().SetSort(bson.D{
-		{Key: "namespace", Value: 1},
-		{Key: "key", Value: 1},
-		{Key: "tenant_id", Value: 1},
+		{Key: fieldNamespace, Value: 1},
+		{Key: fieldKey, Value: 1},
+		{Key: fieldTenantID, Value: 1},
 	})
 
 	cursor, err := s.coll.Find(ctx, bson.D{}, findOpts)
 	if err != nil {
-		opentelemetry.HandleSpanError(span, "mongodb list_tenant_values: find failed", err)
+		tracing.HandleSpanError(span, "mongodb list_tenant_values: find failed", err)
 		return nil, fmt.Errorf("mongodb store list_tenant_values: %w", err)
 	}
 	defer cursor.Close(ctx)
 
 	var docs []entryDoc
 	if err := cursor.All(ctx, &docs); err != nil {
-		opentelemetry.HandleSpanError(span, "mongodb list_tenant_values: decode failed", err)
+		tracing.HandleSpanError(span, "mongodb list_tenant_values: decode failed", err)
 		return nil, fmt.Errorf("mongodb store list_tenant_values: decode: %w", err)
 	}
 
@@ -314,20 +314,20 @@ func (s *Store) ListTenantOverrides(
 	// canonical OR-chain that matches how SQL's (a,b,c) > (x,y,z)
 	// desugars.
 	and := bson.A{
-		bson.D{{Key: "tenant_id", Value: bson.D{{Key: "$ne", Value: store.SentinelGlobal}}}},
+		bson.D{{Key: fieldTenantID, Value: bson.D{{Key: "$ne", Value: store.SentinelGlobal}}}},
 	}
 
 	if afterNamespace != "" || afterKey != "" || afterTenantID != "" {
 		and = append(and, bson.D{{Key: "$or", Value: bson.A{
-			bson.D{{Key: "namespace", Value: bson.D{{Key: "$gt", Value: afterNamespace}}}},
+			bson.D{{Key: fieldNamespace, Value: bson.D{{Key: opGt, Value: afterNamespace}}}},
 			bson.D{
-				{Key: "namespace", Value: afterNamespace},
-				{Key: "key", Value: bson.D{{Key: "$gt", Value: afterKey}}},
+				{Key: fieldNamespace, Value: afterNamespace},
+				{Key: fieldKey, Value: bson.D{{Key: opGt, Value: afterKey}}},
 			},
 			bson.D{
-				{Key: "namespace", Value: afterNamespace},
-				{Key: "key", Value: afterKey},
-				{Key: "tenant_id", Value: bson.D{{Key: "$gt", Value: afterTenantID}}},
+				{Key: fieldNamespace, Value: afterNamespace},
+				{Key: fieldKey, Value: afterKey},
+				{Key: fieldTenantID, Value: bson.D{{Key: opGt, Value: afterTenantID}}},
 			},
 		}}})
 	}
@@ -335,9 +335,9 @@ func (s *Store) ListTenantOverrides(
 	filter := bson.D{{Key: "$and", Value: and}}
 
 	findOpts := options.Find().SetSort(bson.D{
-		{Key: "namespace", Value: 1},
-		{Key: "key", Value: 1},
-		{Key: "tenant_id", Value: 1},
+		{Key: fieldNamespace, Value: 1},
+		{Key: fieldKey, Value: 1},
+		{Key: fieldTenantID, Value: 1},
 	})
 
 	if limit > 0 {
@@ -346,14 +346,14 @@ func (s *Store) ListTenantOverrides(
 
 	cursor, err := s.coll.Find(ctx, filter, findOpts)
 	if err != nil {
-		opentelemetry.HandleSpanError(span, "mongodb list_tenant_overrides: find failed", err)
+		tracing.HandleSpanError(span, "mongodb list_tenant_overrides: find failed", err)
 		return nil, fmt.Errorf("mongodb store list_tenant_overrides: %w", err)
 	}
 	defer cursor.Close(ctx)
 
 	var docs []entryDoc
 	if err := cursor.All(ctx, &docs); err != nil {
-		opentelemetry.HandleSpanError(span, "mongodb list_tenant_overrides: decode failed", err)
+		tracing.HandleSpanError(span, "mongodb list_tenant_overrides: decode failed", err)
 		return nil, fmt.Errorf("mongodb store list_tenant_overrides: decode: %w", err)
 	}
 
@@ -388,9 +388,9 @@ func (s *Store) ListTenantsForKey(
 	)
 
 	filter := bson.D{
-		{Key: "namespace", Value: namespace},
-		{Key: "key", Value: key},
-		{Key: "tenant_id", Value: bson.D{{Key: "$ne", Value: store.SentinelGlobal}}},
+		{Key: fieldNamespace, Value: namespace},
+		{Key: fieldKey, Value: key},
+		{Key: fieldTenantID, Value: bson.D{{Key: "$ne", Value: store.SentinelGlobal}}},
 	}
 
 	// Distinct is the natural operator here: one index seek, constant memory,
@@ -399,7 +399,7 @@ func (s *Store) ListTenantsForKey(
 	// failed operation (auth error, network drop mid-flight, invalid collation)
 	// would otherwise surface as a silent empty slice. Inspecting .Err() first
 	// preserves fail-closed semantics.
-	res := s.coll.Distinct(ctx, "tenant_id", filter)
+	res := s.coll.Distinct(ctx, fieldTenantID, filter)
 	if err := res.Err(); err != nil {
 		// ErrNoDocuments from a Distinct that matched nothing is benign —
 		// return an empty slice rather than propagating.
@@ -407,14 +407,14 @@ func (s *Store) ListTenantsForKey(
 			return []string{}, nil
 		}
 
-		opentelemetry.HandleSpanError(span, "mongodb list_tenants_for_key: distinct failed", err)
+		tracing.HandleSpanError(span, "mongodb list_tenants_for_key: distinct failed", err)
 
 		return nil, fmt.Errorf("mongodb store list_tenants_for_key: %w", err)
 	}
 
 	var tenantIDs []string
 	if err := res.Decode(&tenantIDs); err != nil {
-		opentelemetry.HandleSpanError(span, "mongodb list_tenants_for_key: decode failed", err)
+		tracing.HandleSpanError(span, "mongodb list_tenants_for_key: decode failed", err)
 
 		return nil, fmt.Errorf("mongodb store list_tenants_for_key: decode: %w", err)
 	}

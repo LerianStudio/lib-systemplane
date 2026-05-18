@@ -21,8 +21,8 @@ import (
 	"time"
 
 	"github.com/LerianStudio/lib-commons/v5/commons/backoff"
-	"github.com/LerianStudio/lib-commons/v5/commons/log"
-	libRuntime "github.com/LerianStudio/lib-commons/v5/commons/runtime"
+	"github.com/LerianStudio/lib-observability/log"
+	"github.com/LerianStudio/lib-observability/runtime"
 	"github.com/LerianStudio/lib-systemplane/internal/store"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -392,10 +392,10 @@ func (s *Store) pollChanges(
 	handler func(store.Event),
 ) (time.Time, error) {
 	filter := bson.D{
-		{Key: "updated_at", Value: bson.D{{Key: "$gt", Value: watermark}}},
+		{Key: fieldUpdatedAt, Value: bson.D{{Key: opGt, Value: watermark}}},
 	}
 
-	findOpts := options.Find().SetSort(bson.D{{Key: "updated_at", Value: 1}})
+	findOpts := options.Find().SetSort(bson.D{{Key: fieldUpdatedAt, Value: 1}})
 
 	cursor, err := s.coll.Find(ctx, filter, findOpts)
 	if err != nil {
@@ -438,7 +438,7 @@ func (s *Store) pollChanges(
 
 // safeInvokeHandler calls handler inside a deferred panic recovery.
 func (s *Store) safeInvokeHandler(ctx context.Context, handler func(store.Event), evt store.Event) {
-	defer libRuntime.RecoverAndLogWithContext(ctx, s.cfg.Logger, "systemplane", "mongodb.handler")
+	defer runtime.RecoverAndLogWithContext(ctx, s.cfg.Logger, "systemplane", "mongodb.handler")
 
 	handler(evt)
 }
