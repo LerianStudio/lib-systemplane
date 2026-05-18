@@ -1,4 +1,4 @@
-// OpenTelemetry instruments used by the systemplane Client.
+// OpenTelemetry metrics used by the systemplane Client.
 //
 // Instruments are lazily initialized on first access via Client.metricsOnce
 // so constructing a Client without telemetry (e.g. NewForTesting with no
@@ -10,8 +10,7 @@ import (
 	"context"
 
 	"github.com/LerianStudio/lib-observability/log"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/metric"
+	obsmetrics "github.com/LerianStudio/lib-observability/metrics"
 )
 
 // meterName is the OpenTelemetry instrumentation scope name for the Client's
@@ -19,7 +18,7 @@ import (
 // a consistent scope.
 const meterName = "systemplane.client"
 
-// clientMetrics groups the Client's OpenTelemetry instruments. Every field
+// clientMetrics groups the Client's metric builders. Every field
 // may be nil when instrumentation setup fails; accessors on the Client
 // (see recordTenantLazyFetchError) guard against nil before recording.
 type clientMetrics struct {
@@ -28,7 +27,7 @@ type clientMetrics struct {
 	// rate here with an otherwise healthy backend usually signals timeouts
 	// (tenantStoreTimeout) or transient connectivity issues. Attributes:
 	// namespace, key.
-	tenantLazyFetchErrors metric.Int64Counter
+	tenantLazyFetchErrors *obsmetrics.CounterBuilder
 }
 
 // ensureMetrics initializes the Client's metric instruments exactly once.
@@ -54,13 +53,24 @@ func (c *Client) ensureMetrics() {
 			return
 		}
 
+		factory, err := obsmetrics.NewMetricsFactory(meter, c.logger)
+		if err != nil {
+			c.logWarn(context.Background(), "systemplane: failed to create metrics factory, metrics disabled",
+				log.Err(err),
+			)
+
+			c.metrics = &clientMetrics{}
+
+			return
+		}
+
 		m := &clientMetrics{}
 
-		m.tenantLazyFetchErrors, err = meter.Int64Counter(
-			"systemplane_tenant_lazy_fetch_errors_total",
-			metric.WithDescription("Lazy-mode GetForTenant backend fetches that errored and fell through to the global/default cascade"),
-			metric.WithUnit("{error}"),
-		)
+		m.tenantLazyFetchErrors, err = factory.Counter(obsmetrics.Metric{
+			Name:        "systemplane_tenant_lazy_fetch_errors_total",
+			Description: "Lazy-mode GetForTenant backend fetches that errored and fell through to the global/default cascade",
+			Unit:        "{error}",
+		})
 		if err != nil {
 			c.logWarn(context.Background(), "systemplane: failed to create tenantLazyFetchErrors counter",
 				log.Err(err),
@@ -88,8 +98,12 @@ func (c *Client) recordTenantLazyFetchError(ctx context.Context, namespace, key 
 		return
 	}
 
-	c.metrics.tenantLazyFetchErrors.Add(ctx, 1, metric.WithAttributes(
-		attribute.String("namespace", namespace),
-		attribute.String("key", key),
-	))
+	if err := c.metrics.tenantLazyFetchErrors.WithLabels(map[string]string{
+		"namespace": namespace,
+		"key":       key,
+	}).AddOne(ctx); err != nil {
+		c.logWarn(ctx, "systemplane: failed to record tenantLazyFetchErrors counter",
+			log.Err(err),
+		)
+	}
 }

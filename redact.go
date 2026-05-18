@@ -1,5 +1,7 @@
 package systemplane
 
+import "github.com/LerianStudio/lib-observability/constants"
+
 // RedactPolicy controls how a key's value is rendered in admin endpoints and logs.
 type RedactPolicy int
 
@@ -7,10 +9,10 @@ const (
 	// RedactNone leaves the value visible as-is.
 	RedactNone RedactPolicy = iota
 
-	// RedactMask replaces the value with a fixed mask string (e.g. "****").
+	// RedactMask replaces the value with the canonical obfuscated marker.
 	RedactMask
 
-	// RedactFull hides the value entirely, replacing it with "[REDACTED]".
+	// RedactFull hides the value entirely with the canonical obfuscated marker.
 	RedactFull
 )
 
@@ -19,9 +21,9 @@ const (
 func ApplyRedaction(value any, policy RedactPolicy) any {
 	switch policy {
 	case RedactMask:
-		return "****"
+		return constants.ObfuscatedValue
 	case RedactFull:
-		return "[REDACTED]"
+		return constants.ObfuscatedValue
 	default:
 		return value
 	}

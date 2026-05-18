@@ -116,7 +116,7 @@ type Client struct {
 	sfg singleflight.Group
 
 	// metrics holds OpenTelemetry instruments lazily initialized on first
-	// use via metricsOnce. See ensureMetrics / tenant_metrics.go for the
+	// use via metricsOnce. See ensureMetrics / metrics.go for the
 	// current instrument set. nil-safe: when c.telemetry is unset every
 	// accessor no-ops.
 	metricsOnce sync.Once

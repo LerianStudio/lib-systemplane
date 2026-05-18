@@ -16,8 +16,9 @@ import (
 
 	commonshttp "github.com/LerianStudio/lib-commons/v5/commons/net/http"
 	"github.com/LerianStudio/lib-commons/v5/commons/tenant-manager/core"
+	"github.com/LerianStudio/lib-observability/constants"
 	"github.com/LerianStudio/lib-observability/log"
-	"github.com/LerianStudio/lib-systemplane"
+	systemplane "github.com/LerianStudio/lib-systemplane"
 	"github.com/LerianStudio/lib-systemplane/admin"
 	"github.com/gofiber/fiber/v2"
 )
@@ -555,12 +556,12 @@ func TestGetList_AppliesRedaction(t *testing.T) {
 		entryMap[e.Key] = e.Value
 	}
 
-	if entryMap["secret.key"] != "[REDACTED]" {
-		t.Fatalf("secret.key: expected '[REDACTED]', got %v", entryMap["secret.key"])
+	if entryMap["secret.key"] != constants.ObfuscatedValue {
+		t.Fatalf("secret.key: expected %q, got %v", constants.ObfuscatedValue, entryMap["secret.key"])
 	}
 
-	if entryMap["masked.key"] != "****" {
-		t.Fatalf("masked.key: expected '****', got %v", entryMap["masked.key"])
+	if entryMap["masked.key"] != constants.ObfuscatedValue {
+		t.Fatalf("masked.key: expected %q, got %v", constants.ObfuscatedValue, entryMap["masked.key"])
 	}
 
 	if entryMap["plain.key"] != "visible" {
@@ -1028,8 +1029,8 @@ func TestGetOne_AppliesRedaction(t *testing.T) {
 	var body getResp
 	readJSON(t, resp, &body)
 
-	if body.Value != "****" {
-		t.Fatalf("expected '****', got %v", body.Value)
+	if body.Value != constants.ObfuscatedValue {
+		t.Fatalf("expected %q, got %v", constants.ObfuscatedValue, body.Value)
 	}
 }
 
@@ -1839,7 +1840,7 @@ func TestPutTenant_AppliesRedaction(t *testing.T) {
 	var body tenantValueResp
 	readJSON(t, resp, &body)
 
-	if body.Value != "[REDACTED]" {
+	if body.Value != constants.ObfuscatedValue {
 		t.Fatalf("expected redacted response value, got %v", body.Value)
 	}
 }

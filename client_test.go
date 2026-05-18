@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LerianStudio/lib-observability/constants"
 	"github.com/LerianStudio/lib-observability/log"
 	"github.com/LerianStudio/lib-systemplane/internal/store"
 )
@@ -999,12 +1000,12 @@ func TestRedaction(t *testing.T) {
 		t.Fatalf("RedactNone: expected 'secret', got %v", v)
 	}
 
-	if v := ApplyRedaction("secret", RedactMask); v != "****" {
-		t.Fatalf("RedactMask: expected '****', got %v", v)
+	if v := ApplyRedaction("secret", RedactMask); v != constants.ObfuscatedValue {
+		t.Fatalf("RedactMask: expected %q, got %v", constants.ObfuscatedValue, v)
 	}
 
-	if v := ApplyRedaction("secret", RedactFull); v != "[REDACTED]" {
-		t.Fatalf("RedactFull: expected '[REDACTED]', got %v", v)
+	if v := ApplyRedaction("secret", RedactFull); v != constants.ObfuscatedValue {
+		t.Fatalf("RedactFull: expected %q, got %v", constants.ObfuscatedValue, v)
 	}
 }
 
