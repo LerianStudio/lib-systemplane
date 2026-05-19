@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       # Using GolangCI-Lint Module
       - name: Run GoLangCI Lint
@@ -36,35 +36,36 @@ jobs:
           lerian_ci_cd_user_gpg_key_password: ${{ secrets.LERIAN_CI_CD_USER_GPG_KEY_PASSWORD }}
           lerian_ci_cd_user_name: ${{ secrets.LERIAN_CI_CD_USER_NAME }}
           lerian_ci_cd_user_email: ${{ secrets.LERIAN_CI_CD_USER_EMAIL }}
-          go_version: '1.25'
+          go_version: '1.26.3'
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          golangci_lint_version: 'v2.11.2'
+          golangci_lint_version: 'v2.12.2'
 
   GoSec:
     name: Run GoSec to SDK
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
-          go-version: '1.25'
+          go-version: '1.26.3'
           cache: false
 
+      - name: Install gosec
+        run: go install github.com/securego/gosec/v2/cmd/gosec@v2.26.1
+
       - name: Gosec Scanner
-        uses: securego/gosec@master
-        with:
-          args: ./...
+        run: gosec ./...
 
   PerfGate:
     name: Run AC15 Perf Gate
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
-          go-version: '1.25'
+          go-version: '1.26.3'
           cache: true
 
       # AC15 perf gate is build-tagged `unit && !race` because the race detector

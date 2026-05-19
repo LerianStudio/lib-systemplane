@@ -28,14 +28,14 @@ jobs:
       name: create_release
     name: Create Release to SDK
     steps:
-      - uses: actions/create-github-app-token@v1
+      - uses: actions/create-github-app-token@v3
         id: app-token
         with:
           app-id: ${{ secrets.LERIAN_STUDIO_MIDAZ_PUSH_BOT_APP_ID }}
           private-key: ${{ secrets.LERIAN_STUDIO_MIDAZ_PUSH_BOT_PRIVATE_KEY }}
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
@@ -46,7 +46,7 @@ jobs:
           git reset --hard origin/${{ github.ref_name }}
 
       - name: Import GPG key
-        uses: crazy-max/ghaction-import-gpg@v6
+        uses: crazy-max/ghaction-import-gpg@v7
         id: import_gpg
         with:
           gpg_private_key: ${{ secrets.LERIAN_CI_CD_USER_GPG_KEY }}
@@ -57,17 +57,16 @@ jobs:
           git_user_signingkey: true
           git_commit_gpgsign: true
 
-      - name: Install plugin @semantic-release/exec
-        run: npm install --save-dev @semantic-release/exec@^6.0.3
-
       - name: Semantic Release
-        uses: cycjimmy/semantic-release-action@v4
+        uses: cycjimmy/semantic-release-action@v6.0.0
         id: semantic
         with:
           ci: false
-          semantic_version: 23.0.8
+          semantic_version: 25.0.3
           extra_plugins: |
-            conventional-changelog-conventionalcommits@v7.0.2
+            @semantic-release/exec@7.1.0
+            @semantic-release/git@10.0.1
+            conventional-changelog-conventionalcommits@v9.3.1
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
           GIT_AUTHOR_NAME: ${{ secrets.LERIAN_CI_CD_USER_NAME }}
@@ -96,7 +95,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
-          go-version: '1.25'
+          go-version: '1.26.3'
           cache: false

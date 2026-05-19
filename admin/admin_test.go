@@ -326,6 +326,7 @@ func doRequest(t *testing.T, app *fiber.App, method, path string, body string) *
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	req.Host = "example.com"
 
 	resp, err := app.Test(req, -1)
 	if err != nil {
