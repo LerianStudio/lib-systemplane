@@ -17,6 +17,7 @@ package postgres
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -42,6 +43,11 @@ const closeTimeout = 5 * time.Second
 // Uses pgx.Connect with the ListenDSN for a dedicated connection.
 // Safe to invoke multiple times concurrently; each call is its own subscription.
 func (s *Store) Subscribe(ctx context.Context, handler func(store.Event)) error {
+	return s.SubscribeReady(ctx, handler, nil)
+}
+
+// SubscribeReady is Subscribe with a setup readiness callback.
+func (s *Store) SubscribeReady(ctx context.Context, handler func(store.Event), ready func(error)) error {
 	if s == nil || s.isClosed() {
 		return store.ErrClosed
 	}
@@ -51,13 +57,13 @@ func (s *Store) Subscribe(ctx context.Context, handler func(store.Event)) error 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	go func() {
+	runtime.SafeGoWithContextAndComponent(ctx, s.cfg.Logger, "systemplane", "postgres.subscribe_cancel_bridge", runtime.KeepRunning, func(context.Context) {
 		select {
 		case <-s.ctx.Done():
 			cancel()
 		case <-ctx.Done():
 		}
-	}()
+	})
 
 	var attempt int
 
@@ -67,17 +73,32 @@ func (s *Store) Subscribe(ctx context.Context, handler func(store.Event)) error 
 	// attempt from the initial reconnect storm and pin backoff at the cap
 	// (L-S2-1). Resetting on successful establishment restarts backoff from
 	// the floor on each fresh disconnect.
-	onConnected := func() { attempt = 0 }
+	readyCalled := false
+	onConnected := func() {
+		attempt = 0
+
+		signalSubscribeReady(ready, &readyCalled, nil)
+	}
 
 	for {
 		err := s.listenLoop(ctx, handler, onConnected)
 		if err == nil {
+			signalSubscribeReady(ready, &readyCalled, nil)
+
 			return nil
 		}
 
 		// Context cancelled (either caller or store close) -- clean exit.
 		if ctx.Err() != nil {
+			signalSubscribeReady(ready, &readyCalled, ctx.Err())
+
 			return nil
+		}
+
+		if !readyCalled {
+			signalSubscribeReady(ready, &readyCalled, err)
+
+			return err
 		}
 
 		// Reconnect noise suppression: logWarn on the first attempt so
@@ -107,6 +128,18 @@ func (s *Store) Subscribe(ctx context.Context, handler func(store.Event)) error 
 	}
 }
 
+func signalSubscribeReady(ready func(error), readyCalled *bool, err error) {
+	if *readyCalled {
+		return
+	}
+
+	if ready != nil {
+		ready(err)
+	}
+
+	*readyCalled = true
+}
+
 // listenLoop establishes a single pgx connection, issues LISTEN, and processes
 // notifications until the context is cancelled or the connection fails.
 //
@@ -117,13 +150,11 @@ func (s *Store) Subscribe(ctx context.Context, handler func(store.Event)) error 
 func (s *Store) listenLoop(ctx context.Context, handler func(store.Event), onConnected func()) error {
 	conn, err := pgx.Connect(ctx, s.cfg.ListenDSN)
 	if err != nil {
-		// L-S2-sec-2: do NOT include s.cfg.ListenDSN in the wrapped error.
-		// pgx.Connect may surface the DSN via its own %w chain (with a
-		// password rendered in plain-text from URL-parsed credentials) but
-		// at minimum the systemplane layer must not re-amplify it. Keep
-		// the error message generic so aggregated logs do not become a
-		// grep target for credential harvesting.
-		return fmt.Errorf("postgres listen connect failed: %w", err)
+		// Do not wrap the raw pgx error here: depending on parse/connect failure
+		// shape it can include the password-bearing DSN. The caller only needs a
+		// setup failure signal; detailed connection diagnostics belong outside
+		// this library boundary where credentials can be redacted centrally.
+		return errors.New("postgres listen connect failed")
 	}
 
 	defer func() {

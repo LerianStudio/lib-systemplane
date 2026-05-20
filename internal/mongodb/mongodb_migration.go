@@ -33,7 +33,9 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/LerianStudio/lib-commons/v5/commons/backoff"
 	"github.com/LerianStudio/lib-observability/log"
 	"github.com/LerianStudio/lib-systemplane/internal/store"
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -61,6 +63,11 @@ const namespaceNotFoundCode = 26
 // the driver-assigned name is "namespace_1_key_1".
 const legacyNamespaceKeyIndex = "namespace_1_key_1"
 
+const (
+	compoundNamespaceKeyTenantIndex = "namespace_1_key_1_tenant_id_1"
+	pollingUpdatedAtIndex           = "updated_at_1"
+)
+
 // ensureSchema runs the phase-2 migration steps. All steps are idempotent;
 // re-running against a migrated collection is a no-op modulo the round-trip
 // cost. The pre-flight duplicate-detection runs BEFORE backfill so an
@@ -83,15 +90,16 @@ func ensureSchema(ctx context.Context, coll *mongo.Collection, logger log.Logger
 	}
 
 	if !acquired {
-		// Peer is already migrating. Nothing to do; fall through to index
-		// creation only, which is idempotent under the same shape.
+		// Peer is already migrating. Wait until the final schema is visible
+		// before returning from New; otherwise this process could accept tenant
+		// writes against a partially migrated collection.
 		if logger != nil {
 			logger.Log(ctx, log.LevelInfo,
-				"systemplane/mongodb: migration lease held by peer, skipping _id rewrite",
+				"systemplane/mongodb: migration lease held by peer, waiting for schema readiness",
 			)
 		}
 
-		return createCompoundIndex(ctx, coll)
+		return waitForSchemaMigration(ctx, coll)
 	}
 
 	defer releaseLease()
@@ -108,12 +116,29 @@ func ensureSchema(ctx context.Context, coll *mongo.Collection, logger log.Logger
 		return fmt.Errorf("rewrite _id: %w", err)
 	}
 
+	if err := rewriteEmptyCompoundTenantIDDocuments(leaseCtx, coll); err != nil {
+		return fmt.Errorf("rewrite empty tenant_id _id: %w", err)
+	}
+
 	if err := dropLegacyIndex(leaseCtx, coll); err != nil {
 		return fmt.Errorf("drop legacy index: %w", err)
 	}
 
 	if err := createCompoundIndex(leaseCtx, coll); err != nil {
 		return fmt.Errorf("create compound unique index: %w", err)
+	}
+
+	if err := createPollingIndex(leaseCtx, coll); err != nil {
+		return fmt.Errorf("create polling index: %w", err)
+	}
+
+	complete, err := schemaMigrationComplete(leaseCtx, coll)
+	if err != nil {
+		return err
+	}
+
+	if !complete {
+		return errors.New("systemplane/mongodb: schema migration incomplete after owning migration run")
 	}
 
 	return nil
@@ -137,6 +162,10 @@ func ensureLegacySchema(ctx context.Context, coll *mongo.Collection) error {
 		return fmt.Errorf("create legacy unique index: %w", err)
 	}
 
+	if err := createPollingIndex(ctx, coll); err != nil {
+		return fmt.Errorf("create polling index: %w", err)
+	}
+
 	return nil
 }
 
@@ -153,6 +182,7 @@ func ensureLegacySchema(ctx context.Context, coll *mongo.Collection) error {
 // already consistent, so the check is a no-op on fresh deployments.
 func verifyNoAmbiguousTenantDocs(ctx context.Context, coll *mongo.Collection) error {
 	pipeline := mongo.Pipeline{
+		{{Key: opMatch, Value: bson.D{{Key: fieldID, Value: bson.D{{Key: opNe, Value: migrationLeaseID}}}}}},
 		// Project a "has_tenant_id" flag so we can count each shape per group.
 		// The $cond folds two shapes — missing field ($ifNull) and empty
 		// string — into the "__missing__" bucket so both collide with
@@ -166,7 +196,7 @@ func verifyNoAmbiguousTenantDocs(ctx context.Context, coll *mongo.Collection) er
 				{Key: "$addToSet", Value: bson.D{
 					{Key: "$cond", Value: bson.D{
 						{Key: "if", Value: bson.D{
-							{Key: "$or", Value: bson.A{
+							{Key: opOr, Value: bson.A{
 								bson.D{{Key: "$eq", Value: bson.A{bson.D{{Key: "$ifNull", Value: bson.A{"$tenant_id", ""}}}, ""}}},
 							}},
 						}},
@@ -178,7 +208,7 @@ func verifyNoAmbiguousTenantDocs(ctx context.Context, coll *mongo.Collection) er
 		}}},
 		// A colliding group is one that contains BOTH the missing marker AND
 		// the _global sentinel.
-		{{Key: "$match", Value: bson.D{
+		{{Key: opMatch, Value: bson.D{
 			{Key: "tenantIDs", Value: bson.D{{Key: "$all", Value: bson.A{"__missing__", store.SentinelGlobal}}}},
 		}}},
 		{{Key: "$limit", Value: 1}},
@@ -204,14 +234,33 @@ func verifyNoAmbiguousTenantDocs(ctx context.Context, coll *mongo.Collection) er
 }
 
 // backfillTenantID sets tenant_id = "_global" for any document where the field
-// is absent. Safe to re-run: $exists:false matches nothing after the first
-// successful pass.
+// is absent or empty. Safe to re-run: the filter matches nothing after the
+// first successful pass.
 func backfillTenantID(ctx context.Context, coll *mongo.Collection) error {
-	filter := bson.D{{Key: fieldTenantID, Value: bson.D{{Key: "$exists", Value: false}}}}
+	filter := bson.D{{Key: opAnd, Value: bson.A{
+		bson.D{{Key: fieldID, Value: bson.D{{Key: opNe, Value: migrationLeaseID}}}},
+		bson.D{{Key: opOr, Value: bson.A{
+			bson.D{{Key: fieldTenantID, Value: bson.D{{Key: opExists, Value: false}}}},
+			bson.D{{Key: fieldTenantID, Value: ""}},
+		}}},
+	}}}
 	update := bson.D{{Key: opSet, Value: bson.D{{Key: fieldTenantID, Value: store.SentinelGlobal}}}}
 
 	if _, err := coll.UpdateMany(ctx, filter, update); err != nil {
 		return err //nolint:wrapcheck // wrapped by ensureSchema
+	}
+
+	return nil
+}
+
+func createPollingIndex(ctx context.Context, coll *mongo.Collection) error {
+	model := mongo.IndexModel{
+		Keys:    bson.D{{Key: fieldUpdatedAt, Value: 1}},
+		Options: options.Index().SetName(pollingUpdatedAtIndex),
+	}
+
+	if _, err := coll.Indexes().CreateOne(ctx, model); err != nil {
+		return err //nolint:wrapcheck // caller adds operation context
 	}
 
 	return nil
@@ -246,7 +295,7 @@ func createCompoundIndex(ctx context.Context, coll *mongo.Collection) error {
 			{Key: fieldKey, Value: 1},
 			{Key: fieldTenantID, Value: 1},
 		},
-		Options: options.Index().SetUnique(true),
+		Options: options.Index().SetUnique(true).SetName(compoundNamespaceKeyTenantIndex),
 	}
 
 	if _, err := coll.Indexes().CreateOne(ctx, model); err != nil {
@@ -254,6 +303,94 @@ func createCompoundIndex(ctx context.Context, coll *mongo.Collection) error {
 	}
 
 	return nil
+}
+
+func waitForSchemaMigration(ctx context.Context, coll *mongo.Collection) error {
+	attempt := 0
+
+	for {
+		complete, err := schemaMigrationComplete(ctx, coll)
+		if err != nil {
+			return err
+		}
+
+		if complete {
+			return nil
+		}
+
+		delay := min(backoff.ExponentialWithJitter(250*time.Millisecond, attempt), 5*time.Second)
+		attempt++
+
+		if err := backoff.WaitContext(ctx, delay); err != nil {
+			return fmt.Errorf("wait for schema migration: %w", err)
+		}
+	}
+}
+
+func schemaMigrationComplete(ctx context.Context, coll *mongo.Collection) (bool, error) {
+	legacyObjectIDCount, err := coll.CountDocuments(ctx, bson.D{{Key: fieldID, Value: bson.D{{Key: "$type", Value: "objectId"}}}})
+	if err != nil {
+		return false, fmt.Errorf("count legacy objectId documents: %w", err)
+	}
+
+	if legacyObjectIDCount > 0 {
+		return false, nil
+	}
+
+	missingTenantCount, err := coll.CountDocuments(ctx, bson.D{{Key: opAnd, Value: bson.A{
+		bson.D{{Key: fieldID, Value: bson.D{{Key: opNe, Value: migrationLeaseID}}}},
+		bson.D{{Key: opOr, Value: bson.A{
+			bson.D{{Key: fieldTenantID, Value: bson.D{{Key: opExists, Value: false}}}},
+			bson.D{{Key: fieldTenantID, Value: ""}},
+			bson.D{{Key: fieldID + "." + fieldTenantID, Value: ""}},
+		}}},
+	}}})
+	if err != nil {
+		return false, fmt.Errorf("count missing tenant_id documents: %w", err)
+	}
+
+	if missingTenantCount > 0 {
+		return false, nil
+	}
+
+	legacyIndex, compoundIndex, pollingIndex, err := migrationIndexState(ctx, coll)
+	if err != nil {
+		return false, err
+	}
+
+	return !legacyIndex && compoundIndex && pollingIndex, nil
+}
+
+func migrationIndexState(ctx context.Context, coll *mongo.Collection) (legacyIndex bool, compoundIndex bool, pollingIndex bool, err error) {
+	cursor, err := coll.Indexes().List(ctx)
+	if err != nil {
+		return false, false, false, fmt.Errorf("list indexes: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	for cursor.Next(ctx) {
+		var idx struct {
+			Name string `bson:"name"`
+		}
+		if err := cursor.Decode(&idx); err != nil {
+			return false, false, false, fmt.Errorf("decode index: %w", err)
+		}
+
+		switch idx.Name {
+		case legacyNamespaceKeyIndex:
+			legacyIndex = true
+		case compoundNamespaceKeyTenantIndex:
+			compoundIndex = true
+		case pollingUpdatedAtIndex:
+			pollingIndex = true
+		}
+	}
+
+	if err := cursor.Err(); err != nil {
+		return false, false, false, fmt.Errorf("index cursor: %w", err)
+	}
+
+	return legacyIndex, compoundIndex, pollingIndex, nil
 }
 
 // isIndexNotFoundErr reports whether err is the MongoDB server's

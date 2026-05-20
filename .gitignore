@@ -3,6 +3,12 @@
 .claude/
 .mcp.json
 
+# Local environment files can contain DSNs, tokens, and private keys.
+.env
+.env.*
+*.env
+!.env.reference
+
 # Test reports and coverage
 reports/
 coverage.out

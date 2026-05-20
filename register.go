@@ -44,19 +44,15 @@ type keyDef struct {
 //
 // Registering the same (namespace, key) pair twice returns [ErrDuplicateKey].
 //
-// # Mutable defaults
-//
-// Avoid mutable defaults (slices, maps, pointers to shared state). The
-// registered default is held by reference: when Get falls through to the
-// default (no persisted override yet), subsequent readers see whatever
-// mutations earlier callers applied. Prefer value types, or wrap
-// slices/maps in a defensive copy the caller owns. This caveat is shared
-// with [Client.RegisterTenantScoped], where the blast radius is wider
-// (every tenant that falls through to the default).
+// Mutable defaults are defensively cloned for cache seeding and fallback reads
+// so map/slice defaults are not shared by reference across callers.
 func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOption) error {
 	if c == nil || c.closed.Load() {
 		return ErrClosed
 	}
+
+	c.startMu.Lock()
+	defer c.startMu.Unlock()
 
 	if c.started.Load() {
 		return ErrRegisterAfterStart
@@ -70,17 +66,15 @@ func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOp
 
 	// Build the key definition from defaults + options.
 	def := keyDef{
-		defaultValue: defaultValue,
+		defaultValue: cloneValue(defaultValue),
 		redaction:    RedactNone,
 	}
 
-	for _, o := range opts {
-		o(&def)
-	}
+	applyKeyOptions(&def, opts)
 
 	// Validate the default value if a validator is set.
 	if def.validator != nil {
-		if err := def.validator(defaultValue); err != nil {
+		if err := def.validator(def.defaultValue); err != nil {
 			return fmt.Errorf("%w: default value rejected: %w", ErrValidation, err)
 		}
 	}
@@ -95,6 +89,16 @@ func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOp
 	c.registry[nk] = def
 
 	return nil
+}
+
+func applyKeyOptions(def *keyDef, opts []KeyOption) {
+	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
+
+		opt(def)
+	}
 }
 
 // validateKeyArgs enforces the shape constraints the Client relies on when

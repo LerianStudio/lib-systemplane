@@ -28,6 +28,8 @@ import (
 	"github.com/LerianStudio/lib-commons/v5/commons/tenant-manager/core"
 )
 
+var benchTenantValueSink any
+
 // benchTenantStore is a minimal, concurrency-safe TestStore used purely for
 // benchmarks. It mirrors the tenantTestStore in tenant_scoped_smoke_test.go
 // but is kept local so benchmark builds stay decoupled from the smoke test
@@ -82,6 +84,14 @@ func (s *benchTenantStore) Set(_ context.Context, e TestEntry) error {
 }
 
 func (s *benchTenantStore) Subscribe(ctx context.Context, _ func(TestEvent)) error {
+	return s.SubscribeReady(ctx, nil, nil)
+}
+
+func (s *benchTenantStore) SubscribeReady(ctx context.Context, _ func(TestEvent), ready func(error)) error {
+	if ready != nil {
+		ready(nil)
+	}
+
 	<-ctx.Done()
 
 	return nil
@@ -175,7 +185,8 @@ func newBenchClient(b *testing.B, namespace, key string, defaultValue any, opts 
 
 	ts := newBenchTenantStore()
 
-	c, err := NewForTesting(ts, opts...)
+	allOpts := append([]Option{WithTenantSchemaEnabled()}, opts...)
+	c, err := NewForTesting(ts, allOpts...)
 	if err != nil {
 		b.Fatalf("NewForTesting: %v", err)
 	}
@@ -208,12 +219,16 @@ func BenchmarkGetForTenant_Hit(b *testing.B) {
 	if err := c.SetForTenant(ctx, "global", "fee.rate", 0.10, "bench"); err != nil {
 		b.Fatalf("SetForTenant prime: %v", err)
 	}
+	assertBenchTenantValue(b, c, ctx, 0.10)
 
 	b.ReportAllocs()
 
 	for b.Loop() {
-		_, _, _ = c.GetForTenant(ctx, "global", "fee.rate")
+		got, _, _ := c.GetForTenant(ctx, "global", "fee.rate")
+		benchTenantValueSink = got
 	}
+
+	assertBenchTenantValue(b, c, ctx, 0.10)
 }
 
 // BenchmarkGetForTenant_Miss_Eager measures the eager-mode fallthrough:
@@ -230,11 +245,30 @@ func BenchmarkGetForTenant_Miss_Eager(b *testing.B) {
 	// Do NOT prime any tenant override; reads for tenant-B must fall
 	// through to the legacy global cache (which holds the default after
 	// RegisterTenantScoped seeds it at tenant_scoped.go:119-121).
+	assertBenchTenantValue(b, c, ctx, 0.05)
 
 	b.ReportAllocs()
 
 	for b.Loop() {
-		_, _, _ = c.GetForTenant(ctx, "global", "fee.rate")
+		got, _, _ := c.GetForTenant(ctx, "global", "fee.rate")
+		benchTenantValueSink = got
+	}
+
+	assertBenchTenantValue(b, c, ctx, 0.05)
+}
+
+func assertBenchTenantValue(b *testing.B, c *Client, ctx context.Context, want float64) {
+	got, found, err := c.GetForTenant(ctx, "global", "fee.rate")
+	if err != nil {
+		b.Fatalf("GetForTenant: %v", err)
+	}
+
+	if !found {
+		b.Fatal("GetForTenant: not found")
+	}
+
+	if got != want {
+		b.Fatalf("GetForTenant = %v, want %v", got, want)
 	}
 }
 

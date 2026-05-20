@@ -23,6 +23,14 @@ func (emptyTenantTestStore) Get(_ context.Context, _, _ string) (TestEntry, bool
 }
 func (emptyTenantTestStore) Set(_ context.Context, _ TestEntry) error { return nil }
 func (emptyTenantTestStore) Subscribe(ctx context.Context, _ func(TestEvent)) error {
+	return emptyTenantTestStore{}.SubscribeReady(ctx, nil, nil)
+}
+
+func (emptyTenantTestStore) SubscribeReady(ctx context.Context, _ func(TestEvent), ready func(error)) error {
+	if ready != nil {
+		ready(nil)
+	}
+
 	<-ctx.Done()
 
 	return nil
@@ -83,6 +91,15 @@ func TestRegisterTenantScoped_BeforeStart_Succeeds(t *testing.T) {
 	v, ok := c.Get("global", "fees.fail_closed_default")
 	assert.True(t, ok, "Get should find the tenant-scoped key")
 	assert.Equal(t, false, v, "Get should return the registered default")
+}
+
+func TestRegisterTenantScoped_NilKeyOptionIgnored(t *testing.T) {
+	t.Parallel()
+
+	c := newClientForTest(t)
+
+	err := c.RegisterTenantScoped("global", "fees.fail_closed_default", false, nil)
+	require.NoError(t, err)
 }
 
 func TestRegisterTenantScoped_AfterStart_ReturnsErrRegisterAfterStart(t *testing.T) {

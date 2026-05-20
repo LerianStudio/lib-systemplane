@@ -30,8 +30,13 @@ type Debouncer[K comparable] struct {
 	window time.Duration
 	logger log.Logger
 	mu     sync.Mutex
-	timers map[K]*time.Timer
+	timers map[K]timerEntry
 	closed bool
+}
+
+type timerEntry struct {
+	timer      *time.Timer
+	generation uint64
 }
 
 // Option configures a Debouncer. The type parameter matches the Debouncer
@@ -49,12 +54,12 @@ func WithLogger[K comparable](l log.Logger) Option[K] {
 
 // New creates a trailing-edge debouncer with the given quiet window.
 // A zero or negative window disables debouncing: Submit invokes fn
-// synchronously inline, with panic recovery via commons/runtime.
+// synchronously inline, with panic recovery via lib-observability/runtime.
 func New[K comparable](window time.Duration, opts ...Option[K]) *Debouncer[K] {
 	d := &Debouncer[K]{
 		window: window,
 		logger: log.NewNop(),
-		timers: make(map[K]*time.Timer),
+		timers: make(map[K]timerEntry),
 	}
 
 	for _, opt := range opts {
@@ -92,12 +97,14 @@ func (d *Debouncer[K]) Submit(key K, fn func()) {
 
 	// Stop existing timer for this key (if any) so we can reset.
 	if existing, ok := d.timers[key]; ok {
-		existing.Stop()
+		existing.timer.Stop()
 	}
 
-	d.timers[key] = time.AfterFunc(d.window, func() {
-		d.fire(key, fn)
-	})
+	generation := d.timers[key].generation + 1
+	d.timers[key] = timerEntry{
+		timer:      time.AfterFunc(d.window, func() { d.fire(key, generation, fn) }),
+		generation: generation,
+	}
 }
 
 // Close cancels all pending timers and marks the debouncer as closed.
@@ -116,8 +123,8 @@ func (d *Debouncer[K]) Close() {
 
 	d.closed = true
 
-	for key, timer := range d.timers {
-		timer.Stop()
+	for key, entry := range d.timers {
+		entry.timer.Stop()
 		delete(d.timers, key)
 	}
 }
@@ -125,10 +132,16 @@ func (d *Debouncer[K]) Close() {
 // fire removes the key from the timer map (under lock) and invokes fn
 // with panic recovery. If the debouncer has been closed between the
 // timer being scheduled and firing, the invocation is skipped.
-func (d *Debouncer[K]) fire(key K, fn func()) {
+func (d *Debouncer[K]) fire(key K, generation uint64, fn func()) {
 	d.mu.Lock()
 
 	if d.closed {
+		d.mu.Unlock()
+		return
+	}
+
+	entry, ok := d.timers[key]
+	if !ok || entry.generation != generation {
 		d.mu.Unlock()
 		return
 	}

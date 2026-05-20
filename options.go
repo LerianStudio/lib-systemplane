@@ -2,10 +2,12 @@
 package systemplane
 
 import (
+	"context"
 	"time"
 
 	"github.com/LerianStudio/lib-observability/log"
 	"github.com/LerianStudio/lib-observability/tracing"
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 // clientConfig holds the merged configuration applied by Option functions.
@@ -17,6 +19,7 @@ type clientConfig struct {
 	debounce      time.Duration
 	collection    string // MongoDB collection name
 	table         string // Postgres table name
+	tableExplicit bool
 
 	// listenChannelExplicit records whether WithListenChannel was called.
 	// postgres.New uses this to suppress the default-channel collision
@@ -37,6 +40,12 @@ type clientConfig struct {
 	// unique on (namespace, key, tenant_id), enabling tenant writes. Flip this
 	// only after every consumer process is on v5.1+.
 	tenantSchemaEnabled bool
+
+	mongoLoadResumeToken  func(context.Context) (bson.Raw, error)
+	mongoSaveResumeToken  func(context.Context, bson.Raw) error
+	mongoResumeFailClosed bool
+
+	postgresStrictIsolation bool
 }
 
 // defaultClientConfig returns sensible defaults.
@@ -125,7 +134,17 @@ func WithTable(name string) Option {
 	return func(cfg *clientConfig) {
 		if name != "" {
 			cfg.table = name
+			cfg.tableExplicit = true
 		}
+	}
+}
+
+// WithStrictPostgresIsolation makes NewPostgres reject implicit default table
+// or channel names. Use it in shared databases where accidental default
+// changefeed/table reuse would create cross-service coupling.
+func WithStrictPostgresIsolation() Option {
+	return func(cfg *clientConfig) {
+		cfg.postgresStrictIsolation = true
 	}
 }
 
@@ -158,6 +177,44 @@ func WithLazyTenantLoad(maxEntries int) Option {
 	}
 }
 
+// WithTenantLazyFailClosed keeps lazy tenant reads in the default fail-closed
+// mode: backend miss-fetch errors are returned instead of falling through to
+// the global/default value.
+func WithTenantLazyFailClosed() Option {
+	return func(*clientConfig) {}
+}
+
+// WithTenantLazyFailOpen is retained for source compatibility only.
+//
+// Deprecated: lazy tenant reads always fail closed on backend uncertainty so a
+// tenant-specific override cannot be silently bypassed during degradation. This
+// option no longer changes behavior.
+func WithTenantLazyFailOpen() Option {
+	return func(*clientConfig) {}
+}
+
+// WithMongoResumeTokenStore wires durable resume-token persistence for MongoDB
+// change streams. It is ignored by Postgres and by MongoDB polling mode.
+func WithMongoResumeTokenStore(
+	load func(context.Context) (bson.Raw, error),
+	save func(context.Context, bson.Raw) error,
+) Option {
+	return func(cfg *clientConfig) {
+		cfg.mongoLoadResumeToken = load
+		cfg.mongoSaveResumeToken = save
+	}
+}
+
+// WithMongoResumeTokenFailClosed makes MongoDB change-stream subscription setup
+// fail when loading a configured resume token fails, and terminates the stream
+// when saving a token fails. Without this option, resume-token failures keep
+// the historical warn-and-continue behavior.
+func WithMongoResumeTokenFailClosed() Option {
+	return func(cfg *clientConfig) {
+		cfg.mongoResumeFailClosed = true
+	}
+}
+
 // WithTenantSchemaEnabled opts the backend into phase-2 schema: the legacy
 // unique constraint on (namespace, key) is dropped and replaced by a composite
 // unique on (namespace, key, tenant_id). Required before [SetForTenant],
@@ -178,6 +235,16 @@ func WithLazyTenantLoad(maxEntries int) Option {
 func WithTenantSchemaEnabled() Option {
 	return func(cfg *clientConfig) {
 		cfg.tenantSchemaEnabled = true
+	}
+}
+
+func applyClientOptions(cfg *clientConfig, opts []Option) {
+	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
+
+		opt(cfg)
 	}
 }
 

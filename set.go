@@ -27,6 +27,10 @@ func (c *Client) Set(ctx context.Context, namespace, key string, value any, acto
 		return ErrClosed
 	}
 
+	if ctx == nil {
+		return ErrNilContext
+	}
+
 	if !c.started.Load() {
 		return ErrNotStarted
 	}

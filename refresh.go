@@ -79,7 +79,7 @@ func (c *Client) refreshGlobalFromStore(ns, key string) {
 	}
 
 	// 3. Resolve the new value: persisted or default.
-	newValue := def.defaultValue
+	newValue := cloneValue(def.defaultValue)
 
 	if found {
 		var decoded any
@@ -98,12 +98,12 @@ func (c *Client) refreshGlobalFromStore(ns, key string) {
 
 	// 4. Update cache.
 	c.cacheMu.Lock()
-	c.cache[nk] = newValue
+	c.cache[nk] = cloneValue(newValue)
 	c.cacheMu.Unlock()
 
 	// 5. Fire OnChange subscribers only. Tenant subscribers are untouched
 	// because a global row changed, not a per-tenant override (PRD AC8).
-	c.fireSubscribers(nk, newValue)
+	c.fireSubscribers(nk, cloneValue(newValue))
 }
 
 // refreshTenantFromStore re-reads a tenant override row from the backend.
@@ -181,10 +181,14 @@ func (c *Client) refreshTenantFromStore(ns, key, tenantID string) {
 	// subscribers see the effective post-delete value (PRD AC9 / TRD §4.4).
 	if !found {
 		c.cacheMu.Lock()
-		c.tenantCache.delete(tenantID, nk)
+		if c.tenantLoadMode == tenantLoadLazy {
+			c.tenantCache.set(tenantID, nk, tenantNoOverride)
+		} else {
+			c.tenantCache.delete(tenantID, nk)
+		}
 		c.cacheMu.Unlock()
 
-		c.fireTenantSubscribers(nk, tenantID, def.defaultValue)
+		c.fireTenantSubscribers(nk, tenantID, cloneValue(def.defaultValue))
 
 		return
 	}
@@ -203,12 +207,12 @@ func (c *Client) refreshTenantFromStore(ns, key, tenantID string) {
 
 	// 4. Update tenant cache.
 	c.cacheMu.Lock()
-	c.tenantCache.set(tenantID, nk, decoded)
+	c.tenantCache.set(tenantID, nk, cloneValue(decoded))
 	c.cacheMu.Unlock()
 
 	// 5. Fire OnTenantChange subscribers only. The legacy OnChange list is
 	// untouched — this is the AC8 invariant.
-	c.fireTenantSubscribers(nk, tenantID, decoded)
+	c.fireTenantSubscribers(nk, tenantID, cloneValue(decoded))
 }
 
 // hydrateTenantCache is implemented in tenant_hydration.go. It is invoked

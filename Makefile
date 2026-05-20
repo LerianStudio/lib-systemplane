@@ -506,7 +506,7 @@ check-tests:
 		sh ./scripts/check-tests.sh; \
 	else \
 		echo "Running basic test coverage check..."; \
-		go test -cover ./...; \
+		go test -tags=unit -cover ./...; \
 	fi
 	@echo "$(GREEN)$(BOLD)[ok]$(NC) Test coverage verification completed$(GREEN) ✔️$(NC)"
 
@@ -526,8 +526,8 @@ setup-git-hooks:
 	$(call print_title,Installing and configuring git hooks)
 	@hooks_dir=$$(git rev-parse --git-path hooks); \
 	if [ ! -d .githooks ]; then \
-		echo "No .githooks directory found, skipping"; \
-		exit 0; \
+		echo "$(RED)No .githooks directory found [MISSING] ✗$(NC)"; \
+		exit 1; \
 	fi; \
 	mkdir -p "$$hooks_dir"; \
 	for hook_dir in .githooks/*/; do \
@@ -547,6 +547,10 @@ setup-git-hooks:
 check-hooks:
 	$(call print_title,Verifying git hooks installation status)
 	@hooks_dir=$$(git rev-parse --git-path hooks); \
+	if [ ! -d .githooks ]; then \
+		echo "$(RED)No .githooks directory found [MISSING] ✗$(NC)"; \
+		exit 1; \
+	fi; \
 	err=0; \
 	for hook_dir in .githooks/*; do \
 		if [ -d "$$hook_dir" ]; then \

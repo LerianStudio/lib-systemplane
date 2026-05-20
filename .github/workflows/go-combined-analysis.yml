@@ -12,11 +12,9 @@ on:
       - reopened
 
 permissions:
-  id-token: write
   contents: read
   pull-requests: read
   actions: read
-  security-events: write
 
 jobs:
   GoLangCI-Lint:
@@ -24,29 +22,65 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      # Using GolangCI-Lint Module
-      - name: Run GoLangCI Lint
-        uses: LerianStudio/github-actions-golangci-lint@main
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
-          lerian_studio_midaz_push_bot_app_id: ${{ secrets.LERIAN_STUDIO_MIDAZ_PUSH_BOT_APP_ID }}
-          lerian_studio_midaz_push_bot_private_key: ${{ secrets.LERIAN_STUDIO_MIDAZ_PUSH_BOT_PRIVATE_KEY }}
-          lerian_ci_cd_user_gpg_key: ${{ secrets.LERIAN_CI_CD_USER_GPG_KEY }}
-          lerian_ci_cd_user_gpg_key_password: ${{ secrets.LERIAN_CI_CD_USER_GPG_KEY_PASSWORD }}
-          lerian_ci_cd_user_name: ${{ secrets.LERIAN_CI_CD_USER_NAME }}
-          lerian_ci_cd_user_email: ${{ secrets.LERIAN_CI_CD_USER_EMAIL }}
-          go_version: '1.26.3'
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          golangci_lint_version: 'v2.12.2'
+          go-version: '1.26.3'
+          cache: true
+
+      - name: Run GoLangCI Lint
+        run: |
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+          golangci-lint run --build-tags=unit ./...
+          golangci-lint run --build-tags=integration ./...
+
+  UnitAndBuild:
+    name: Run Unit Tests and Build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: '1.26.3'
+          cache: true
+
+      - name: Verify dependencies are tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: Build all packages
+        run: make build
+
+      - name: Run unit tests
+        run: make test-unit
+
+  IntegrationTests:
+    name: Run Integration Tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: '1.26.3'
+          cache: true
+
+      - name: Run integration tests
+        run: make test-integration LOW_RESOURCE=1
 
   GoSec:
     name: Run GoSec to SDK
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version: '1.26.3'
           cache: false
@@ -55,15 +89,21 @@ jobs:
         run: go install github.com/securego/gosec/v2/cmd/gosec@v2.26.1
 
       - name: Gosec Scanner
-        run: gosec ./...
+        run: gosec -fmt sarif -out gosec-report.sarif ./...
+
+      - name: Upload GoSec SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@7c1e4cf0b20d7c1872b26569c00ba908797a59bf # v4
+        with:
+          sarif_file: gosec-report.sarif
 
   PerfGate:
     name: Run AC15 Perf Gate
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version: '1.26.3'
           cache: true

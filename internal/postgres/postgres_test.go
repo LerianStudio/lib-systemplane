@@ -4,6 +4,7 @@ package postgres
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -81,6 +82,21 @@ func TestParseNotifyPayload_InvalidJSONReturnsError(t *testing.T) {
 	require.Error(t, err)
 
 	assert.Contains(t, err.Error(), "unmarshal")
+}
+
+func TestListenLoop_ConnectErrorIsSanitized(t *testing.T) {
+	t.Parallel()
+
+	s := &Store{cfg: Config{
+		ListenDSN: "postgres://user:supersecret@%zz/db",
+		Channel:   "systemplane_changes",
+	}}
+
+	err := s.listenLoop(context.Background(), func(store.Event) {}, nil)
+	require.Error(t, err)
+	assert.Equal(t, "postgres listen connect failed", err.Error())
+	assert.False(t, strings.Contains(err.Error(), "supersecret"))
+	assert.False(t, strings.Contains(err.Error(), "postgres://"))
 }
 
 // TestSetTenantValue_Phase1ReturnsErrTenantSchemaNotEnabled pins the H8

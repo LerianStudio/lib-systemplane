@@ -372,7 +372,7 @@ func TestOnChange_DoesNotFireOnTenantWrites(t *testing.T) {
 	//                          legacy Set writes (positive control).
 	fs := newTenantFakeStore()
 
-	c, err := NewForTesting(fs)
+	c, err := NewForTesting(fs, WithTenantSchemaEnabled())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
 
@@ -769,7 +769,7 @@ func TestOnTenantChange_LegacyRegisteredKeyReturnsNoOp(t *testing.T) {
 
 	fs := newTenantFakeStore()
 
-	c, err := NewForTesting(fs)
+	c, err := NewForTesting(fs, WithTenantSchemaEnabled())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
 

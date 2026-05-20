@@ -29,9 +29,16 @@ const (
 	// path's watermark and the global sort key on listing endpoints.
 	fieldUpdatedAt = "updated_at"
 
+	// fieldUpdatedBy is the BSON updated_by audit field name.
+	fieldUpdatedBy = "updated_by"
+
 	// fieldOwner is the BSON owner field name on the migration lease
 	// sentinel document (see mongodb_migration_legacy.go).
 	fieldOwner = "owner"
+
+	// fieldDeleted marks polling-mode tombstones. Active documents either omit
+	// the field or set it to false.
+	fieldDeleted = "deleted"
 
 	// opSet is the MongoDB $set update operator.
 	opSet = "$set"
@@ -39,4 +46,12 @@ const (
 	// opGt is the MongoDB $gt comparison operator used by the polling
 	// watermark filter and the tenant-override keyset cursor.
 	opGt = "$gt"
+
+	opAnd = "$and"
+	opOr  = "$or"
+
+	opMatch  = "$match"
+	opNe     = "$ne"
+	opNin    = "$nin"
+	opExists = "$exists"
 )

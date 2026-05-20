@@ -113,6 +113,10 @@ func (s *raceStore) Set(_ context.Context, e TestEntry) error {
 }
 
 func (s *raceStore) Subscribe(ctx context.Context, handler func(TestEvent)) error {
+	return s.SubscribeReady(ctx, handler, nil)
+}
+
+func (s *raceStore) SubscribeReady(ctx context.Context, handler func(TestEvent), ready func(error)) error {
 	s.hMu.Lock()
 	first := len(s.handlers) == 0
 	s.handlers = append(s.handlers, handler)
@@ -120,6 +124,10 @@ func (s *raceStore) Subscribe(ctx context.Context, handler func(TestEvent)) erro
 
 	if first {
 		close(s.subReady)
+	}
+
+	if ready != nil {
+		ready(nil)
 	}
 
 	<-ctx.Done()
@@ -240,7 +248,7 @@ func TestRace_ConcurrentSetForTenant_DistinctTenants(t *testing.T) {
 
 	ts := newRaceStore()
 
-	c, err := NewForTesting(ts)
+	c, err := NewForTesting(ts, WithTenantSchemaEnabled())
 	require.NoError(t, err, "NewForTesting")
 
 	require.NoError(t, c.RegisterTenantScoped("global", "fee.rate", 0.0), "RegisterTenantScoped")
@@ -370,7 +378,7 @@ func TestRace_ConcurrentSubscribeUnsubscribe(t *testing.T) {
 
 	ts := newRaceStore()
 
-	c, err := NewForTesting(ts)
+	c, err := NewForTesting(ts, WithTenantSchemaEnabled())
 	require.NoError(t, err, "NewForTesting")
 
 	require.NoError(t, c.RegisterTenantScoped("global", "fee.rate", 0.0), "RegisterTenantScoped")

@@ -9,33 +9,65 @@ on:
       - '.gitignore'
       - '**/*.env'
       - '*.env'
-      - '**/*.md'
-      - '*.md'
       - '**/*.txt'
       - '*.txt'
     tags-ignore:
       - '**'
 
 permissions:
-  id-token: write
-  contents: write
-  pull-requests: write
+  contents: read
 
 jobs:
-  publish_release:
+  validate_release:
     runs-on: ubuntu-24.04
+    name: Validate Release Candidate
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: '1.26.3'
+          cache: true
+
+      - name: Verify dependencies are tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: Build all packages
+        run: make build
+
+      - name: Run unit tests
+        run: make test-unit
+
+      - name: Run integration tests
+        run: make test-integration LOW_RESOURCE=1
+
+  publish_release:
+    needs: validate_release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
     environment:
       name: create_release
     name: Create Release to SDK
     steps:
-      - uses: actions/create-github-app-token@v3
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         id: app-token
         with:
           app-id: ${{ secrets.LERIAN_STUDIO_MIDAZ_PUSH_BOT_APP_ID }}
           private-key: ${{ secrets.LERIAN_STUDIO_MIDAZ_PUSH_BOT_PRIVATE_KEY }}
 
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
@@ -46,7 +78,7 @@ jobs:
           git reset --hard origin/${{ github.ref_name }}
 
       - name: Import GPG key
-        uses: crazy-max/ghaction-import-gpg@v7
+        uses: crazy-max/ghaction-import-gpg@2dc316deee8e90f13e1a351ab510b4d5bc0c82cd # v7
         id: import_gpg
         with:
           gpg_private_key: ${{ secrets.LERIAN_CI_CD_USER_GPG_KEY }}
@@ -58,12 +90,13 @@ jobs:
           git_commit_gpgsign: true
 
       - name: Semantic Release
-        uses: cycjimmy/semantic-release-action@v6.0.0
+        uses: cycjimmy/semantic-release-action@b12c8f6015dc215fe37bc154d4ad456dd3833c90 # v6.0.0
         id: semantic
         with:
           ci: false
           semantic_version: 25.0.3
           extra_plugins: |
+            @semantic-release/changelog@6.0.3
             @semantic-release/exec@7.1.0
             @semantic-release/git@10.0.1
             conventional-changelog-conventionalcommits@v9.3.1
@@ -94,8 +127,3 @@ jobs:
             --label "backmerge" || echo "PR already exists or no changes to merge"
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
-
-      - uses: actions/setup-go@v6
-        with:
-          go-version: '1.26.3'
-          cache: false

@@ -492,7 +492,7 @@ Key API contracts that must be preserved:
 | Admin authorization | `WithAuthorizer` covers legacy routes only. Tenant routes require `WithTenantAuthorizer` — default-deny when absent. Library does NOT silently fall back. |
 | Storage evolution | Postgres: `tenant_id TEXT NOT NULL DEFAULT '_global'` with composite unique index on `(namespace, key, tenant_id)`. MongoDB: compound `_id` `{namespace, key, tenant_id}` with idempotent backfill migration run during `NewMongoDB` (inside `ensureSchema`). |
 | Internal Store | `internal/store` defines the backend-agnostic contract. `internal/postgres` (LISTEN/NOTIFY, pgx/v5) and `internal/mongodb` (change streams + polling fallback, mongo-driver/v2) implement it. Both satisfy `systemplanetest.Run(t, factory)`. |
-| Sentinel errors | `ErrClosed`, `ErrNotStarted`, `ErrRegisterAfterStart`, `ErrUnknownKey`, `ErrValidation`, `ErrDuplicateKey`, `ErrMissingTenantContext`, `ErrInvalidTenantID`, `ErrTenantScopeNotRegistered`, `ErrTenantSchemaNotEnabled`. |
+| Sentinel errors | `ErrClosed`, `ErrNotStarted`, `ErrRegisterAfterStart`, `ErrUnknownKey`, `ErrValidation`, `ErrDuplicateKey`, `ErrNilContext`, `ErrMissingTenantContext`, `ErrInvalidTenantID`, `ErrTenantScopeNotRegistered`, `ErrTenantSchemaNotEnabled`. |
 | Test helper | `NewForTesting(s TestStore, opts...)` is an explicit out-of-package test helper, not a promised production API. |
 | Scope | Runtime-mutable knobs only. Bootstrap-only config (DB DSNs, secrets, TLS paths, telemetry init, server identity) should live in env vars / secret manager, not systemplane. |
 

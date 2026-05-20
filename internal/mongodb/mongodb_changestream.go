@@ -43,6 +43,8 @@ const resumeTokenBatchEvents = 100
 // hours of oplog.
 const resumeTokenBatchInterval = 5 * time.Second
 
+var errResumeTokenSaveFailed = errors.New("resume token save failed")
+
 // changeEventFullDoc captures the shape of an insert/update/replace event's
 // fullDocument — the only branch where all three scoping fields are present
 // in the payload.
@@ -83,6 +85,11 @@ type changeEvent struct {
 // stream or ticker. Store.Close cancels all in-flight Subscribe calls via
 // the internal s.ctx merge-cancel below.
 func (s *Store) Subscribe(ctx context.Context, handler func(store.Event)) error {
+	return s.SubscribeReady(ctx, handler, nil)
+}
+
+// SubscribeReady is Subscribe with a setup readiness callback.
+func (s *Store) SubscribeReady(ctx context.Context, handler func(store.Event), ready func(error)) error {
 	if s == nil || s.isClosed() {
 		return store.ErrClosed
 	}
@@ -96,19 +103,28 @@ func (s *Store) Subscribe(ctx context.Context, handler func(store.Event)) error 
 	mergedCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	go func() {
+	runtime.SafeGoWithContextAndComponent(mergedCtx, s.cfg.Logger, "systemplane", "mongodb.subscribe_cancel_bridge", runtime.KeepRunning, func(context.Context) {
 		select {
 		case <-s.ctx.Done():
 			cancel()
 		case <-mergedCtx.Done():
 		}
-	}()
+	})
 
 	if s.cfg.PollInterval > 0 {
-		return s.subscribePoll(mergedCtx, handler, time.Now().UTC())
+		// MongoDB BSON datetimes have millisecond precision. Truncating the
+		// initial watermark down prevents writes in the same millisecond as the
+		// readiness signal from sorting before the cursor and being skipped.
+		watermark := time.Now().UTC().Truncate(time.Millisecond)
+
+		if ready != nil {
+			ready(nil)
+		}
+
+		return s.subscribePoll(mergedCtx, handler, watermark)
 	}
 
-	return s.subscribeChangeStream(mergedCtx, handler)
+	return s.subscribeChangeStream(mergedCtx, handler, ready)
 }
 
 // subscribeChangeStream opens a MongoDB change stream on the collection and
@@ -116,14 +132,35 @@ func (s *Store) Subscribe(ctx context.Context, handler func(store.Event)) error 
 // On stream error, it reconnects with exponential backoff. The resume token
 // persisted by the prior watchOnce (if any) is handed to the new stream via
 // SetResumeAfter, so events during the disconnect window are recovered.
-func (s *Store) subscribeChangeStream(ctx context.Context, handler func(store.Event)) error {
+func (s *Store) subscribeChangeStream(ctx context.Context, handler func(store.Event), ready func(error)) error {
 	attempt := 0
+	readyCalled := false
 
 	for {
-		if err := s.watchOnce(ctx, handler); err != nil {
+		if err := s.watchOnce(ctx, handler, func() {
+			if !readyCalled && ready != nil {
+				ready(nil)
+			}
+
+			readyCalled = true
+		}); err != nil {
 			// Context cancelled — clean exit regardless of the watch error.
 			if ctx.Err() != nil {
+				if !readyCalled && ready != nil {
+					ready(ctx.Err())
+				}
+
 				return ctx.Err() //nolint:wrapcheck // propagate cancellation as-is
+			}
+
+			if !readyCalled && ready != nil {
+				ready(err)
+
+				return err
+			}
+
+			if errors.Is(err, errResumeTokenSaveFailed) && s.cfg.ResumeTokenFailClosed {
+				return err
 			}
 
 			// Log and reconnect with backoff.
@@ -161,17 +198,19 @@ func (s *Store) subscribeChangeStream(ctx context.Context, handler func(store.Ev
 // While the stream is running, the event loop batches ResumeToken captures
 // and invokes Config.SaveResumeToken every resumeTokenBatchEvents events or
 // every resumeTokenBatchInterval of wall-clock time, whichever comes first.
-// SaveResumeToken failures are logged at WARN and the loop continues — the
-// next successful save replaces the lost one.
+// SaveResumeToken failures are logged at WARN and, by default, the loop
+// continues — the next successful save replaces the lost one. When
+// ResumeTokenFailClosed is enabled, a save failure terminates the subscription
+// instead of reconnecting without durable cursor progress.
 //
 // Operators who want strict at-least-once delivery across reconnects should
 // wire both LoadResumeToken and SaveResumeToken to durable storage (Redis,
 // a dedicated Postgres row, etc.). Without them, idle keys may hold stale
 // values in a subscriber cache until the next write. See also
 // MIGRATION_TENANT_SCOPED.md §8.1.
-func (s *Store) watchOnce(ctx context.Context, handler func(store.Event)) error {
+func (s *Store) watchOnce(ctx context.Context, handler func(store.Event), onReady func()) error {
 	pipeline := mongo.Pipeline{
-		{{Key: "$match", Value: bson.D{
+		{{Key: opMatch, Value: bson.D{
 			{Key: "operationType", Value: bson.D{
 				{Key: "$in", Value: bson.A{"insert", "update", "replace", operationTypeDelete}},
 			}},
@@ -181,17 +220,11 @@ func (s *Store) watchOnce(ctx context.Context, handler func(store.Event)) error 
 	opts := options.ChangeStream().
 		SetFullDocument(options.UpdateLookup)
 
-	// Load the last persisted resume token, if any. A load failure or an
-	// empty (nil) token both degrade gracefully to "start from now".
-	if s.cfg.LoadResumeToken != nil {
-		token, err := s.cfg.LoadResumeToken(ctx)
-		if err != nil {
-			s.logWarn(ctx, "resume token load failed, starting from current oplog position",
-				log.Err(err),
-			)
-		} else if len(token) > 0 {
-			opts = opts.SetResumeAfter(token)
-		}
+	var err error
+
+	opts, err = s.applyResumeToken(ctx, opts)
+	if err != nil {
+		return err
 	}
 
 	stream, err := s.coll.Watch(ctx, pipeline, opts)
@@ -199,6 +232,10 @@ func (s *Store) watchOnce(ctx context.Context, handler func(store.Event)) error 
 		return fmt.Errorf("open change stream: %w", err)
 	}
 	defer stream.Close(ctx)
+
+	if onReady != nil {
+		onReady()
+	}
 
 	// Per-stream scratch space. pendingToken and the counters live across
 	// iterations so the batched-save cadence is preserved; event is
@@ -213,66 +250,46 @@ func (s *Store) watchOnce(ctx context.Context, handler func(store.Event)) error 
 		lastSaveAt    = time.Now()
 	)
 
-	flushToken := func() {
-		if s.cfg.SaveResumeToken == nil || len(pendingToken) == 0 {
-			return
+	flushToken := func() error {
+		if len(pendingToken) == 0 {
+			return nil
 		}
 
-		// Copy the token into a stable allocation — the driver reuses the
-		// underlying buffer on the next Next() call, so a save that escapes
-		// into a goroutine would otherwise read a mutated slice.
-		tokenCopy := make(bson.Raw, len(pendingToken))
-		copy(tokenCopy, pendingToken)
-
-		if saveErr := s.cfg.SaveResumeToken(ctx, tokenCopy); saveErr != nil {
-			s.logWarn(ctx, "resume token save failed, will retry on next batch",
-				log.Err(saveErr),
-			)
-
-			return
+		if err := s.saveResumeToken(ctx, pendingToken); err != nil {
+			return err
 		}
 
 		pendingToken = nil
 		eventsInBatch = 0
 		lastSaveAt = time.Now()
+
+		return nil
 	}
 
 	for stream.Next(ctx) {
-		var event changeEvent
-		if err := stream.Decode(&event); err != nil {
-			s.logWarn(ctx, "change stream decode error, skipping event", log.Err(err))
-			continue
-		}
-
-		evt, ok := extractEvent(event)
+		token, ok := s.processChangeStreamEvent(ctx, stream, handler)
 		if !ok {
-			// Count the drop so operators can spot a runaway (malformed
-			// payload, upstream bug) without grepping logs (L-S3-BL-1).
-			s.droppedEvents.Add(1)
-
-			s.logWarn(ctx, "change stream event dropped — missing identifiers",
-				log.String("operationType", event.OperationType),
-			)
-
 			continue
 		}
-
-		s.safeInvokeHandler(ctx, handler, evt)
 
 		// Capture the resume token for this event and flush on batch
 		// thresholds. ResumeToken is valid until the next Next() call so
 		// we must consume it before the next iteration.
-		pendingToken = stream.ResumeToken()
+		pendingToken = token
 		eventsInBatch++
 
 		if eventsInBatch >= resumeTokenBatchEvents || time.Since(lastSaveAt) >= resumeTokenBatchInterval {
-			flushToken()
+			if err := flushToken(); err != nil {
+				return err
+			}
 		}
 	}
 
 	// Flush any pending token on clean exit — without this, the tail end
 	// of a shutdown window would be replayed on next startup.
-	flushToken()
+	if err := flushToken(); err != nil {
+		return err
+	}
 
 	if ctx.Err() != nil {
 		return nil
@@ -283,6 +300,90 @@ func (s *Store) watchOnce(ctx context.Context, handler func(store.Event)) error 
 	}
 
 	return nil
+}
+
+func (s *Store) saveResumeToken(ctx context.Context, token bson.Raw) error {
+	if s.cfg.SaveResumeToken == nil || len(token) == 0 {
+		return nil
+	}
+
+	// Copy the token into a stable allocation — the driver reuses the
+	// underlying buffer on the next Next() call, so a save that escapes
+	// into a goroutine would otherwise read a mutated slice.
+	tokenCopy := make(bson.Raw, len(token))
+	copy(tokenCopy, token)
+
+	if saveErr := s.cfg.SaveResumeToken(ctx, tokenCopy); saveErr != nil {
+		s.logWarn(ctx, "resume token save failed, will retry on next batch",
+			log.Err(saveErr),
+		)
+
+		if s.cfg.ResumeTokenFailClosed {
+			return fmt.Errorf("%w: %w", errResumeTokenSaveFailed, saveErr)
+		}
+
+		return nil
+	}
+
+	return nil
+}
+
+func (s *Store) processChangeStreamEvent(
+	ctx context.Context,
+	stream *mongo.ChangeStream,
+	handler func(store.Event),
+) (bson.Raw, bool) {
+	var event changeEvent
+	if err := stream.Decode(&event); err != nil {
+		s.logWarn(ctx, "change stream decode error, skipping event", log.Err(err))
+
+		return nil, false
+	}
+
+	evt, ok := extractEvent(event)
+	if !ok {
+		// Count the drop so operators can spot a runaway (malformed payload,
+		// upstream bug) without grepping logs (L-S3-BL-1).
+		s.droppedEvents.Add(1)
+
+		s.logWarn(ctx, "change stream event dropped — missing identifiers",
+			log.String("operationType", event.OperationType),
+		)
+
+		return nil, false
+	}
+
+	s.safeInvokeHandler(ctx, handler, evt)
+
+	return stream.ResumeToken(), true
+}
+
+func (s *Store) applyResumeToken(
+	ctx context.Context,
+	opts *options.ChangeStreamOptionsBuilder,
+) (*options.ChangeStreamOptionsBuilder, error) {
+	if s.cfg.LoadResumeToken == nil {
+		return opts, nil
+	}
+
+	token, err := s.cfg.LoadResumeToken(ctx)
+	if err != nil {
+		s.logWarn(ctx, "resume token load failed, starting from current oplog position",
+			log.Err(err),
+		)
+
+		if s.cfg.ResumeTokenFailClosed {
+			return opts, fmt.Errorf("load resume token: %w", err)
+		}
+
+		return opts, nil
+	}
+
+	if len(token) > 0 {
+		opts = opts.SetResumeAfter(token)
+	}
+
+	return opts, nil
 }
 
 // extractEvent converts a decoded changeEvent into a store.Event.
@@ -338,102 +439,6 @@ func extractEvent(ce changeEvent) (store.Event, bool) {
 		Key:       fd.Key,
 		TenantID:  tenantID,
 	}, true
-}
-
-// subscribePoll uses a ticker to periodically query for entries updated since
-// the initial watermark and emits events for each changed entry. The polling
-// path has no native "delete" signal — deletions that happen between two
-// ticks are invisible to this path. Polling-mode consumers that need delete
-// visibility should switch to change-streams (see Config.PollInterval).
-//
-// initialWatermark is the starting point: events with updated_at <= this
-// value are NOT replayed. Callers (e.g. Client.Start) typically pass the
-// max(UpdatedAt) observed during hydration so rows written between the
-// hydration snapshot and the first tick are picked up exactly once
-// (M-S3-3). Subscribe() from this package passes time.Now(), matching the
-// change-stream "see only future events" semantic.
-func (s *Store) subscribePoll(
-	ctx context.Context,
-	handler func(store.Event),
-	initialWatermark time.Time,
-) error {
-	watermark := initialWatermark
-	ticker := time.NewTicker(s.cfg.PollInterval)
-
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
-			newWatermark, err := s.pollChanges(ctx, watermark, handler)
-			if err != nil {
-				// Transient error — log and retry on next tick.
-				s.logWarn(ctx, "poll query failed", log.Err(err))
-				continue
-			}
-
-			watermark = newWatermark
-		}
-	}
-}
-
-// pollChanges queries for documents updated after the watermark, invokes the
-// handler for each, and returns the new watermark.
-//
-// Tenant parity: the emitted Event carries doc.TenantID, which makes the
-// polling path's observable behavior consistent with the change-stream
-// path for insert/update/replace events. Delete events are a change-stream
-// exclusive.
-func (s *Store) pollChanges(
-	ctx context.Context,
-	watermark time.Time,
-	handler func(store.Event),
-) (time.Time, error) {
-	filter := bson.D{
-		{Key: fieldUpdatedAt, Value: bson.D{{Key: opGt, Value: watermark}}},
-	}
-
-	findOpts := options.Find().SetSort(bson.D{{Key: fieldUpdatedAt, Value: 1}})
-
-	cursor, err := s.coll.Find(ctx, filter, findOpts)
-	if err != nil {
-		return watermark, fmt.Errorf("poll find: %w", err)
-	}
-	defer cursor.Close(ctx)
-
-	newWatermark := watermark
-
-	for cursor.Next(ctx) {
-		var doc entryDoc
-		if err := cursor.Decode(&doc); err != nil {
-			s.logWarn(ctx, "poll decode error, skipping document", log.Err(err))
-			continue
-		}
-
-		tenantID := doc.TenantID
-		if tenantID == "" {
-			tenantID = store.SentinelGlobal
-		}
-
-		evt := store.Event{
-			Namespace: doc.Namespace,
-			Key:       doc.Key,
-			TenantID:  tenantID,
-		}
-		s.safeInvokeHandler(ctx, handler, evt)
-
-		if doc.UpdatedAt.After(newWatermark) {
-			newWatermark = doc.UpdatedAt
-		}
-	}
-
-	if err := cursor.Err(); err != nil {
-		return watermark, fmt.Errorf("poll cursor error: %w", err)
-	}
-
-	return newWatermark, nil
 }
 
 // safeInvokeHandler calls handler inside a deferred panic recovery.

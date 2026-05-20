@@ -30,7 +30,7 @@ import (
 //  1. CREATE TABLE IF NOT EXISTS with legacy PRIMARY KEY (namespace, key).
 //  2. ALTER TABLE ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT '_global'.
 //  3. UPDATE ... SET tenant_id='_global' WHERE tenant_id IS NULL OR ”.
-//  4. CREATE OR REPLACE FUNCTION systemplane_notify (emits tenant_id in payload;
+//  4. CREATE OR REPLACE FUNCTION systemplane_notify_v2 (emits tenant_id in payload;
 //     under phase 1 the emitted tenant_id is always '_global' because no
 //     tenant rows exist).
 //  5. CREATE TRIGGER systemplane_notify_trigger AFTER INSERT OR UPDATE OR DELETE.
@@ -134,29 +134,26 @@ END $$`,
 		return fmt.Errorf("backfill tenant_id: %w", err)
 	}
 
-	if s.cfg.TenantSchemaEnabled {
-		if err := s.migrateToPhase2(ctx, tx); err != nil {
-			return err
-		}
-	}
-
-	// The trigger function references the channel name literally. We have
-	// already validated it against safeIdentifierRe, so direct interpolation
-	// is safe here. The function handles INSERT/UPDATE (NEW is populated)
+	// The v2 trigger function receives the channel name from TG_ARGV[0]. Keeping
+	// the function body channel-agnostic prevents one Store construction from
+	// replacing a schema-global function body and rerouting another table's
+	// trigger notifications. The v2 name intentionally avoids replacing the
+	// legacy no-argument systemplane_notify() function during rolling deploys.
+	// The function handles INSERT/UPDATE (NEW is populated)
 	// and DELETE (OLD is populated, NEW is NULL) — branching on TG_OP keeps
 	// a single function covering all three events. Installed in both phases
 	// so the NOTIFY payload shape is consistent regardless of schema mode.
-	createFunc := fmt.Sprintf(`CREATE OR REPLACE FUNCTION systemplane_notify() RETURNS TRIGGER AS $$
+	createFunc := `CREATE OR REPLACE FUNCTION systemplane_notify_v2() RETURNS TRIGGER AS $$
 BEGIN
 	IF TG_OP = 'DELETE' THEN
-		PERFORM pg_notify('%[1]s', json_build_object(
+		PERFORM pg_notify(TG_ARGV[0], json_build_object(
 			'namespace', OLD.namespace,
 			'key', OLD.key,
 			'tenant_id', OLD.tenant_id
 		)::text);
 		RETURN OLD;
 	ELSE
-		PERFORM pg_notify('%[1]s', json_build_object(
+		PERFORM pg_notify(TG_ARGV[0], json_build_object(
 			'namespace', NEW.namespace,
 			'key', NEW.key,
 			'tenant_id', NEW.tenant_id
@@ -164,7 +161,7 @@ BEGIN
 		RETURN NEW;
 	END IF;
 END;
-$$ LANGUAGE plpgsql`, s.cfg.Channel)
+$$ LANGUAGE plpgsql`
 
 	if _, err := tx.ExecContext(ctx, createFunc); err != nil {
 		return fmt.Errorf("create function: %w", err)
@@ -192,7 +189,7 @@ $$ LANGUAGE plpgsql`, s.cfg.Channel)
 	// DELETE vs INSERT/UPDATE branches for payload construction.
 	createInsertDeleteTrigger := fmt.Sprintf(`CREATE TRIGGER systemplane_notify_trigger
 AFTER INSERT OR DELETE ON %s
-FOR EACH ROW EXECUTE FUNCTION systemplane_notify()`, s.cfg.Table) // #nosec G201 -- table name validated as Postgres identifier in New()
+FOR EACH ROW EXECUTE FUNCTION systemplane_notify_v2('%s')`, s.cfg.Table, s.cfg.Channel) // #nosec G201 -- table/channel names validated as Postgres identifiers in New()
 
 	if _, err := tx.ExecContext(ctx, createInsertDeleteTrigger); err != nil {
 		return fmt.Errorf("create trigger: %w", err)
@@ -202,7 +199,7 @@ FOR EACH ROW EXECUTE FUNCTION systemplane_notify()`, s.cfg.Table) // #nosec G201
 AFTER UPDATE ON %s
 FOR EACH ROW
 WHEN (OLD IS DISTINCT FROM NEW)
-EXECUTE FUNCTION systemplane_notify()`, s.cfg.Table) // #nosec G201 -- table name validated as Postgres identifier in New()
+EXECUTE FUNCTION systemplane_notify_v2('%s')`, s.cfg.Table, s.cfg.Channel) // #nosec G201 -- table/channel names validated as Postgres identifiers in New()
 
 	if _, err := tx.ExecContext(ctx, createUpdateTrigger); err != nil {
 		return fmt.Errorf("create update trigger: %w", err)
@@ -210,6 +207,12 @@ EXECUTE FUNCTION systemplane_notify()`, s.cfg.Table) // #nosec G201 -- table nam
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit: %w", err)
+	}
+
+	if s.cfg.TenantSchemaEnabled {
+		if err := s.migrateToPhase2(ctx); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -347,14 +350,23 @@ func (s *Store) lookupPrimaryKeyName(ctx context.Context, tx *sql.Tx) (string, e
 // TenantSchemaEnabled is true. Extracted from ensureSchema to keep its
 // cyclomatic complexity below the project's gocyclo budget.
 //
-// Maintenance-window note: CREATE UNIQUE INDEX runs inside the caller's DDL
-// transaction and therefore CANNOT use CONCURRENTLY (Postgres forbids
-// CREATE INDEX CONCURRENTLY inside a tx block). The index build holds a
-// brief SHARE lock on the table; writes block for the build's duration.
-// For small systemplane tables (< 10k rows is the design target) this is
-// milliseconds. Large deployments should run ensureSchema during a
-// maintenance window (M-S2-4).
-func (s *Store) migrateToPhase2(ctx context.Context, tx *sql.Tx) error {
+// The replacement composite index is created CONCURRENTLY outside the short
+// transaction that drops the legacy primary key, so phase-2 migration does not
+// hold write-blocking table locks while the index is built.
+func (s *Store) migrateToPhase2(ctx context.Context) error {
+	if err := s.createCompositeIndexConcurrently(ctx); err != nil {
+		return fmt.Errorf("create composite unique index concurrently: %w", err)
+	}
+
+	tx, err := s.cfg.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin phase-2 tx: %w", err)
+	}
+
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
 	// Drop the old primary key by resolved name. Postgres defaults to
 	// "<table>_pkey" when the table was created with PRIMARY KEY (...),
 	// but a table imported from pg_dump, restored from a backup, or
@@ -384,15 +396,74 @@ func (s *Store) migrateToPhase2(ctx context.Context, tx *sql.Tx) error {
 		}
 	}
 
-	// Composite unique index that replaces the old PK. This is what
-	// subsequent ON CONFLICT clauses target in phase 2.
-	createNewUnique := fmt.Sprintf(
-		`CREATE UNIQUE INDEX IF NOT EXISTS %s_pkey_v2 ON %s (namespace, key, tenant_id)`,
-		s.cfg.Table, s.cfg.Table, // #nosec G201 -- table name validated as Postgres identifier in New()
-	)
-	if _, err := tx.ExecContext(ctx, createNewUnique); err != nil {
-		return fmt.Errorf("create composite unique index: %w", err)
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit phase-2 tx: %w", err)
 	}
 
 	return nil
+}
+
+func (s *Store) createCompositeIndexConcurrently(ctx context.Context) error {
+	indexName := s.cfg.Table + "_pkey_v2"
+	if !safeIdentifierRe.MatchString(indexName) {
+		return fmt.Errorf("unsafe composite index name %q", indexName)
+	}
+
+	exists, valid, ready, err := s.compositeIndexState(ctx, indexName)
+	if err != nil {
+		return err
+	}
+
+	if exists && (!valid || !ready) {
+		dropInvalid := fmt.Sprintf( //nolint:perfsprint // keep SQL identifier interpolation under gosec's G201 nosec guard.
+			`DROP INDEX CONCURRENTLY IF EXISTS %s`,
+			indexName, // #nosec G201 -- derived from validated table identifier and re-validated above
+		)
+		if _, err := s.cfg.DB.ExecContext(ctx, dropInvalid); err != nil {
+			return fmt.Errorf("drop invalid composite index: %w", err)
+		}
+
+		exists = false
+	}
+
+	if !exists {
+		createNewUnique := fmt.Sprintf(
+			`CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS %s ON %s (namespace, key, tenant_id)`,
+			indexName, s.cfg.Table, // #nosec G201 -- table/index names validated as Postgres identifiers in New()/above
+		)
+		if _, err := s.cfg.DB.ExecContext(ctx, createNewUnique); err != nil {
+			return err //nolint:wrapcheck // caller adds operation context
+		}
+	}
+
+	exists, valid, ready, err = s.compositeIndexState(ctx, indexName)
+	if err != nil {
+		return err
+	}
+
+	if !exists || !valid || !ready {
+		return fmt.Errorf("composite index %s is not valid after creation", indexName)
+	}
+
+	return nil
+}
+
+func (s *Store) compositeIndexState(ctx context.Context, indexName string) (exists bool, valid bool, ready bool, err error) {
+	const query = `
+		SELECT i.indisvalid, i.indisready
+		FROM pg_index i
+		JOIN pg_class idx ON idx.oid = i.indexrelid
+		WHERE i.indrelid = to_regclass($1)
+		  AND idx.relname = $2`
+
+	err = s.cfg.DB.QueryRowContext(ctx, query, s.cfg.Table, indexName).Scan(&valid, &ready)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, false, false, nil
+	}
+
+	if err != nil {
+		return false, false, false, fmt.Errorf("query composite index state: %w", err)
+	}
+
+	return true, valid, ready, nil
 }

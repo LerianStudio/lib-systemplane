@@ -21,7 +21,7 @@ type ListEntry struct {
 // key for deterministic output. Keys registered but never persisted return
 // their default values. Safe to call concurrently; nil-safe.
 func (c *Client) List(namespace string) []ListEntry {
-	if c == nil {
+	if c == nil || c.closed.Load() {
 		return nil
 	}
 
@@ -47,8 +47,15 @@ func (c *Client) List(namespace string) []ListEntry {
 		return keys[i].Key < keys[j].Key
 	})
 
-	// Build the result from cache (or registry defaults).
-	entries := make([]ListEntry, 0, len(keys))
+	type listSnapshot struct {
+		key         string
+		value       any
+		description string
+	}
+
+	// Snapshot values under lock, then clone outside the critical section so
+	// large mutable config values do not block concurrent writers/read refreshes.
+	snapshots := make([]listSnapshot, 0, len(keys))
 
 	c.registryMu.RLock()
 	c.cacheMu.RLock()
@@ -67,11 +74,20 @@ func (c *Client) List(namespace string) []ListEntry {
 			desc = def.description
 		}
 
-		entries = append(entries, ListEntry{Key: nk.Key, Value: val, Description: desc})
+		snapshots = append(snapshots, listSnapshot{key: nk.Key, value: val, description: desc})
 	}
 
 	c.cacheMu.RUnlock()
 	c.registryMu.RUnlock()
+
+	entries := make([]ListEntry, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		entries = append(entries, ListEntry{
+			Key:         snapshot.key,
+			Value:       cloneValue(snapshot.value),
+			Description: snapshot.description,
+		})
+	}
 
 	return entries
 }
@@ -79,7 +95,7 @@ func (c *Client) List(namespace string) []ListEntry {
 // KeyDescription returns the human-readable description for a registered key.
 // Returns "" for unregistered keys or nil receivers.
 func (c *Client) KeyDescription(namespace, key string) string {
-	if c == nil {
+	if c == nil || c.closed.Load() {
 		return ""
 	}
 
@@ -99,7 +115,7 @@ func (c *Client) KeyDescription(namespace, key string) string {
 // KeyRedaction returns the redaction policy for a registered key. Returns
 // [RedactNone] for unregistered keys or nil receivers.
 func (c *Client) KeyRedaction(namespace, key string) RedactPolicy {
-	if c == nil {
+	if c == nil || c.closed.Load() {
 		return RedactNone
 	}
 
@@ -126,7 +142,7 @@ func (c *Client) KeyRedaction(namespace, key string) RedactPolicy {
 // exist" (404) from "key exists but is not tenant-scoped" (400) without
 // threading new sentinel errors through the write path.
 func (c *Client) KeyStatus(namespace, key string) (registered, tenantScoped bool) {
-	if c == nil {
+	if c == nil || c.closed.Load() {
 		return false, false
 	}
 
@@ -161,7 +177,7 @@ func (c *Client) Logger() log.Logger {
 // If the key is registered but absent from the cache (before Start), the
 // registered default is returned.
 func (c *Client) Get(namespace, key string) (any, bool) {
-	if c == nil {
+	if c == nil || c.closed.Load() {
 		return nil, false
 	}
 
@@ -173,7 +189,7 @@ func (c *Client) Get(namespace, key string) (any, bool) {
 	c.cacheMu.RUnlock()
 
 	if inCache {
-		return v, true
+		return cloneValue(v), true
 	}
 
 	// Fallback to the registered default (before Start or if cache was never populated).
@@ -182,7 +198,7 @@ func (c *Client) Get(namespace, key string) (any, bool) {
 	c.registryMu.RUnlock()
 
 	if registered {
-		return def.defaultValue, true
+		return cloneValue(def.defaultValue), true
 	}
 
 	return nil, false

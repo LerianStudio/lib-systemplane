@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -128,6 +129,9 @@ type Client struct {
 	closed    atomic.Bool
 	cancel    context.CancelFunc // cancels the Subscribe goroutine
 	wg        sync.WaitGroup     // tracks the Subscribe goroutine
+
+	startupEventsMu sync.Mutex
+	startupEvents   map[store.Event]struct{}
 }
 
 // tenantSubscription holds a single OnTenantChange callback and its monotonic
@@ -154,9 +158,7 @@ func NewPostgres(db *sql.DB, listenDSN string, opts ...Option) (*Client, error) 
 	}
 
 	cfg := defaultClientConfig()
-	for _, o := range opts {
-		o(&cfg)
-	}
+	applyClientOptions(&cfg, opts)
 
 	pgStore, err := postgres.New(postgres.Config{
 		DB:                  db,
@@ -164,9 +166,11 @@ func NewPostgres(db *sql.DB, listenDSN string, opts ...Option) (*Client, error) 
 		Channel:             cfg.listenChannel,
 		ChannelExplicit:     cfg.listenChannelExplicit,
 		Table:               cfg.table,
+		TableExplicit:       cfg.tableExplicit,
 		Logger:              cfg.logger,
 		Telemetry:           cfg.telemetry,
 		TenantSchemaEnabled: cfg.tenantSchemaEnabled,
+		StrictIsolation:     cfg.postgresStrictIsolation,
 	})
 	if err != nil {
 		return nil, err
@@ -184,18 +188,19 @@ func NewMongoDB(client *mongo.Client, database string, opts ...Option) (*Client,
 	}
 
 	cfg := defaultClientConfig()
-	for _, o := range opts {
-		o(&cfg)
-	}
+	applyClientOptions(&cfg, opts)
 
 	mStore, err := mongoDB.New(mongoDB.Config{
-		Client:              client,
-		Database:            database,
-		Collection:          cfg.collection,
-		PollInterval:        cfg.pollInterval,
-		Logger:              cfg.logger,
-		Telemetry:           cfg.telemetry,
-		TenantSchemaEnabled: cfg.tenantSchemaEnabled,
+		Client:                client,
+		Database:              database,
+		Collection:            cfg.collection,
+		PollInterval:          cfg.pollInterval,
+		Logger:                cfg.logger,
+		Telemetry:             cfg.telemetry,
+		TenantSchemaEnabled:   cfg.tenantSchemaEnabled,
+		LoadResumeToken:       cfg.mongoLoadResumeToken,
+		SaveResumeToken:       cfg.mongoSaveResumeToken,
+		ResumeTokenFailClosed: cfg.mongoResumeFailClosed,
 	})
 	if err != nil {
 		return nil, err
@@ -250,8 +255,8 @@ func newTenantCacheForConfig(cfg clientConfig) tenantCache {
 // for changes. It is idempotent; calling Start on an already-started Client
 // returns nil silently.
 func (c *Client) Start(ctx context.Context) error {
-	if c == nil || c.closed.Load() {
-		return ErrClosed
+	if err := c.validateStartState(ctx); err != nil {
+		return err
 	}
 
 	c.startMu.Lock()
@@ -270,16 +275,46 @@ func (c *Client) Start(ctx context.Context) error {
 
 	c.cacheMu.Lock()
 	for nk, def := range c.registry {
-		c.cache[nk] = def.defaultValue
+		c.cache[nk] = cloneValue(def.defaultValue)
 	}
 	c.cacheMu.Unlock()
 
 	c.registryMu.RUnlock()
 
-	// 2. Hydrate from persistent store: overwrite defaults with stored values.
+	// 2. Establish the changefeed before hydration. This closes the startup
+	// window where a write could land after List() but before Subscribe() was
+	// active, leaving this process permanently stale until a later write.
+	subCtx, cancel := context.WithCancel(context.Background())
+	c.cancel = cancel
+
+	ready := make(chan error, 1)
+
+	c.wg.Go(func() {
+		defer runtime.RecoverAndLog(c.logger, "systemplane.subscribe")
+
+		if err := c.store.SubscribeReady(subCtx, c.onEvent, func(err error) {
+			ready <- err
+		}); err != nil {
+			if subCtx.Err() == nil {
+				c.logWarn(subCtx, "subscribe returned error",
+					log.Err(err),
+				)
+			}
+		}
+	})
+
+	if err := c.waitForSubscribeReady(ctx, cancel, ready, span); err != nil {
+		return err
+	}
+
+	// 3. Hydrate from persistent store: overwrite defaults with stored values.
 	entries, err := c.store.List(ctx)
 	if err != nil {
-		tracing.HandleSpanError(span, "hydration failed", err)
+		cancel()
+		c.wg.Wait()
+		c.clearStartupEvents()
+		span.HandleError("hydration failed", err)
+
 		return err
 	}
 
@@ -315,33 +350,62 @@ func (c *Client) Start(ctx context.Context) error {
 
 	c.registryMu.RUnlock()
 
-	// 2b. Eager-hydrate tenant overrides. In lazy mode we skip this step and
-	// populate the LRU on miss. Hydration failures here are non-fatal: the
-	// lazy fallback semantics already handle miss-populate so a failed
-	// eager pass simply degrades to lazy-like behavior without breaking Start.
+	// 3b. Eager-hydrate tenant overrides. In lazy mode we skip this step and
+	// populate the LRU on miss. Eager hydration failures are fatal because eager
+	// mode does not consult the backend on tenant cache misses after Start.
 	if c.tenantLoadMode == tenantLoadEager {
-		c.hydrateTenantCache(ctx)
+		if err := c.hydrateTenantCache(ctx); err != nil {
+			cancel()
+			c.wg.Wait()
+			c.clearStartupEvents()
+			span.HandleError("tenant hydration failed", err)
+
+			return err
+		}
 	}
 
-	// 3. Launch the Subscribe goroutine with its own cancellable context.
-	subCtx, cancel := context.WithCancel(context.Background())
-	c.cancel = cancel
-
-	c.wg.Go(func() {
-		defer runtime.RecoverAndLog(c.logger, "systemplane.subscribe")
-
-		if err := c.store.Subscribe(subCtx, c.onEvent); err != nil {
-			if subCtx.Err() == nil {
-				c.logWarn(subCtx, "subscribe returned error",
-					log.Err(err),
-				)
-			}
-		}
-	})
-
-	c.started.Store(true)
+	c.markStartedAndReplayStartupEvents()
 
 	return nil
+}
+
+func (c *Client) validateStartState(ctx context.Context) error {
+	if c == nil || c.closed.Load() {
+		return ErrClosed
+	}
+
+	if ctx == nil {
+		return ErrNilContext
+	}
+
+	if c.store == nil || c.debouncer == nil {
+		return ErrClosed
+	}
+
+	return nil
+}
+
+func (c *Client) waitForSubscribeReady(ctx context.Context, cancel context.CancelFunc, ready <-chan error, span clientSpan) error {
+	select {
+	case err := <-ready:
+		if err == nil {
+			return nil
+		}
+
+		cancel()
+		c.wg.Wait()
+		c.clearStartupEvents()
+		span.HandleError("subscribe setup failed", err)
+
+		return fmt.Errorf("systemplane: subscribe setup: %w", err)
+	case <-ctx.Done():
+		cancel()
+		c.wg.Wait()
+		c.clearStartupEvents()
+		span.HandleError("subscribe setup canceled", ctx.Err())
+
+		return ctx.Err()
+	}
 }
 
 // Close unsubscribes from the changefeed and releases backend resources.
@@ -374,10 +438,14 @@ func (c *Client) Close() error {
 			c.logWarn(context.Background(), "timed out waiting for subscribe goroutine to exit")
 		}
 
-		c.debouncer.Close()
+		if c.debouncer != nil {
+			c.debouncer.Close()
+		}
 
 		// Close the backend store (does NOT close the externally-passed db/client).
-		_ = c.store.Close()
+		if c.store != nil {
+			_ = c.store.Close()
+		}
 	})
 
 	return nil
@@ -388,6 +456,10 @@ func (c *Client) Close() error {
 // refresh. store.Event already carries exactly that comparable tuple, so it can
 // serve directly as the debouncer key without an extra translation layer.
 func (c *Client) onEvent(evt store.Event) {
+	if c.bufferStartupEvent(evt) {
+		return
+	}
+
 	c.debouncer.Submit(evt, func() {
 		c.refreshFromStoreRouted(evt.Namespace, evt.Key, evt.TenantID)
 	})
@@ -408,10 +480,10 @@ func (c *Client) fireSubscribers(nk nskey, newValue any) {
 		func() {
 			defer runtime.RecoverAndLog(c.logger, "systemplane.onchange")
 
-			fn(newValue)
+			fn(cloneValue(newValue))
 		}()
 	}
 }
 
-// Span and logger helpers (startSpan, startSpanWithAttrs, logWarn, logDebug)
+// Span and logger helpers (startSpan, startSpanWithLabels, logWarn, logDebug)
 // live in client_telemetry.go.

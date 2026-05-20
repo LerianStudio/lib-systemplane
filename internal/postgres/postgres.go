@@ -35,6 +35,8 @@ const tracerName = "systemplane.postgres"
 // consumer of a given database must agree on the channel name.
 const defaultChannel = "systemplane_changes"
 
+const defaultTable = "systemplane_entries"
+
 // Config holds the parameters needed to construct a Postgres-backed Store.
 type Config struct {
 	// DB is the database/sql handle for reads and writes.
@@ -60,6 +62,13 @@ type Config struct {
 	// Table is the Postgres table name.
 	// Default: "systemplane_entries".
 	Table string
+
+	// TableExplicit signals that the caller deliberately selected Table.
+	TableExplicit bool
+
+	// StrictIsolation rejects implicit default table/channel names. It is useful
+	// for shared databases where accidental default reuse couples services.
+	StrictIsolation bool
 
 	// Logger is the structured logger.
 	Logger log.Logger
@@ -89,29 +98,9 @@ type Store struct {
 // New creates a Postgres-backed Store. It validates the configuration,
 // then creates the backing table and NOTIFY trigger idempotently.
 func New(cfg Config) (*Store, error) {
-	if cfg.DB == nil {
-		return nil, store.ErrNilBackend
-	}
-
-	if cfg.ListenDSN == "" {
-		return nil, errors.New("systemplane/postgres: ListenDSN is required")
-	}
-
-	usingDefaultChannel := cfg.Channel == ""
-	if usingDefaultChannel {
-		cfg.Channel = defaultChannel
-	}
-
-	if cfg.Table == "" {
-		cfg.Table = "systemplane_entries"
-	}
-
-	if !safeIdentifierRe.MatchString(cfg.Channel) {
-		return nil, fmt.Errorf("systemplane/postgres: unsafe channel name %q", cfg.Channel)
-	}
-
-	if !safeIdentifierRe.MatchString(cfg.Table) {
-		return nil, fmt.Errorf("systemplane/postgres: unsafe table name %q", cfg.Table)
+	cfg, usingDefaultChannel, err := normalizeConfig(cfg)
+	if err != nil {
+		return nil, err
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -128,7 +117,7 @@ func New(cfg Config) (*Store, error) {
 	// via a per-service channel name. Only warn when the caller did NOT
 	// explicitly select the channel (even if their explicit selection
 	// happens to match the default — their intent was deliberate).
-	if usingDefaultChannel && !cfg.ChannelExplicit && cfg.Logger != nil {
+	if usingDefaultChannel && cfg.Logger != nil {
 		s.logWarn(ctx, "Postgres LISTEN channel using default 'systemplane_changes'; multiple services sharing this database will receive each other's events. Consider setting WithListenChannel('<service_name>_systemplane_changes') to isolate changefeeds.",
 			log.String("channel", cfg.Channel),
 		)
@@ -140,6 +129,46 @@ func New(cfg Config) (*Store, error) {
 	}
 
 	return s, nil
+}
+
+func normalizeConfig(cfg Config) (Config, bool, error) {
+	if cfg.DB == nil {
+		return cfg, false, store.ErrNilBackend
+	}
+
+	if cfg.ListenDSN == "" {
+		return cfg, false, errors.New("systemplane/postgres: ListenDSN is required")
+	}
+
+	usingDefaultChannel := (cfg.Channel == "" || cfg.Channel == defaultChannel) && !cfg.ChannelExplicit
+	if usingDefaultChannel {
+		cfg.Channel = defaultChannel
+	}
+
+	usingDefaultTable := (cfg.Table == "" || cfg.Table == defaultTable) && !cfg.TableExplicit
+	if usingDefaultTable {
+		cfg.Table = defaultTable
+	}
+
+	if cfg.StrictIsolation {
+		if usingDefaultChannel && !cfg.ChannelExplicit {
+			return cfg, false, errors.New("systemplane/postgres: strict isolation requires explicit listen channel")
+		}
+
+		if usingDefaultTable && !cfg.TableExplicit {
+			return cfg, false, errors.New("systemplane/postgres: strict isolation requires explicit table")
+		}
+	}
+
+	if !safeIdentifierRe.MatchString(cfg.Channel) {
+		return cfg, false, fmt.Errorf("systemplane/postgres: unsafe channel name %q", cfg.Channel)
+	}
+
+	if !safeIdentifierRe.MatchString(cfg.Table) {
+		return cfg, false, fmt.Errorf("systemplane/postgres: unsafe table name %q", cfg.Table)
+	}
+
+	return cfg, usingDefaultChannel, nil
 }
 
 // List returns only the global (tenant_id='_global') entries from the Postgres

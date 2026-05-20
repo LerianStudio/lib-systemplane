@@ -336,6 +336,42 @@ func TestIntegration_Migration_IdempotentRerun(t *testing.T) {
 		"schema state must be identical across idempotent phase-2 opens")
 }
 
+func TestIntegration_Migration_RecreatesInvalidCompositeIndex(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	dsn, table, db := migrationSetup(ctx, t)
+
+	s := openPhase(t, dsn, table, db, true)
+	require.NoError(t, s.Close())
+
+	indexName := fmt.Sprintf("%s_pkey_v2", table)
+
+	_, err := db.ExecContext(ctx, `
+		UPDATE pg_index
+		SET indisvalid = false, indisready = false
+		WHERE indexrelid = to_regclass($1)`, indexName)
+	require.NoError(t, err)
+
+	// Reopening phase 2 must not trust an existing invalid index by name. It
+	// should drop and recreate the index before relying on tenant uniqueness.
+	s = openPhase(t, dsn, table, db, true)
+	require.NoError(t, s.Close())
+
+	var valid, ready bool
+	err = db.QueryRowContext(ctx, `
+		SELECT i.indisvalid, i.indisready
+		FROM pg_index i
+		WHERE i.indexrelid = to_regclass($1)`, indexName).Scan(&valid, &ready)
+	require.NoError(t, err)
+	assert.True(t, valid, "composite index must be valid after recovery")
+	assert.True(t, ready, "composite index must be ready after recovery")
+}
+
 // TestIntegration_Migration_PartialRecovery seeds a half-migrated state:
 // some rows have tenant_id='_global' (the migration completed), some
 // have NULL (the migration crashed before the UPDATE committed). After a

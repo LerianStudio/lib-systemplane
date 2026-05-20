@@ -20,11 +20,7 @@ import (
 // findOne runs a FindOne keyed on the compound (namespace, key, tenant_id)
 // tuple. Returns (entryDoc{}, false, nil) when no document matches.
 func (s *Store) findOne(ctx context.Context, namespace, key, tenantID string) (entryDoc, bool, error) {
-	filter := bson.D{
-		{Key: fieldNamespace, Value: namespace},
-		{Key: fieldKey, Value: key},
-		{Key: fieldTenantID, Value: tenantID},
-	}
+	filter := s.keyedReadFilter(namespace, key, tenantID)
 
 	var doc entryDoc
 
@@ -38,6 +34,44 @@ func (s *Store) findOne(ctx context.Context, namespace, key, tenantID string) (e
 	}
 
 	return doc, true, nil
+}
+
+func (s *Store) globalReadFilter() bson.D {
+	if s.cfg.TenantSchemaEnabled {
+		return bson.D{
+			{Key: fieldTenantID, Value: store.SentinelGlobal},
+			{Key: fieldDeleted, Value: bson.D{{Key: opNe, Value: true}}},
+		}
+	}
+
+	return bson.D{{Key: opAnd, Value: bson.A{
+		bson.D{{Key: fieldDeleted, Value: bson.D{{Key: opNe, Value: true}}}},
+		bson.D{{Key: opOr, Value: bson.A{
+			bson.D{{Key: fieldTenantID, Value: store.SentinelGlobal}},
+			bson.D{{Key: fieldTenantID, Value: ""}},
+			bson.D{{Key: fieldTenantID, Value: bson.D{{Key: opExists, Value: false}}}},
+		}}},
+	}}}
+}
+
+func (s *Store) keyedReadFilter(namespace, key, tenantID string) bson.D {
+	base := bson.A{
+		bson.D{{Key: fieldNamespace, Value: namespace}},
+		bson.D{{Key: fieldKey, Value: key}},
+		bson.D{{Key: fieldDeleted, Value: bson.D{{Key: opNe, Value: true}}}},
+	}
+
+	if tenantID == store.SentinelGlobal && !s.cfg.TenantSchemaEnabled {
+		base = append(base, bson.D{{Key: opOr, Value: bson.A{
+			bson.D{{Key: fieldTenantID, Value: store.SentinelGlobal}},
+			bson.D{{Key: fieldTenantID, Value: ""}},
+			bson.D{{Key: fieldTenantID, Value: bson.D{{Key: opExists, Value: false}}}},
+		}}})
+	} else {
+		base = append(base, bson.D{{Key: fieldTenantID, Value: tenantID}})
+	}
+
+	return bson.D{{Key: opAnd, Value: base}}
 }
 
 // upsert writes an entry under the given tenantID.
@@ -101,7 +135,8 @@ func (s *Store) upsert(ctx context.Context, e store.Entry, tenantID string) erro
 			{Key: fieldTenantID, Value: tenantID},
 			{Key: "value", Value: string(e.Value)},
 			{Key: fieldUpdatedAt, Value: now},
-			{Key: "updated_by", Value: e.UpdatedBy},
+			{Key: fieldUpdatedBy, Value: e.UpdatedBy},
+			{Key: fieldDeleted, Value: false},
 		}},
 		// On insert, pin _id to the compound tuple. For phase-1 hits against
 		// a legacy ObjectId row, this branch is skipped — MongoDB never

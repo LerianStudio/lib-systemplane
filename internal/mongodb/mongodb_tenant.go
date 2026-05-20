@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/LerianStudio/lib-observability/log"
 	"github.com/LerianStudio/lib-observability/tracing"
@@ -31,6 +32,13 @@ import (
 // methods MUST fail closed on it rather than silently aliasing to a global
 // read (M-S3-7).
 var ErrInvalidTenantID = errors.New("mongodb store: tenantID must not be the '_global' sentinel")
+
+func tenantOverrideOnlyFilter() bson.D {
+	return bson.D{{Key: fieldTenantID, Value: bson.D{
+		{Key: opExists, Value: true},
+		{Key: opNin, Value: bson.A{"", store.SentinelGlobal}},
+	}}}
+}
 
 // GetTenantValue returns the tenant-specific override for (namespace, key)
 // scoped to tenantID. Returns (Entry{}, false, nil) when no override row
@@ -194,19 +202,46 @@ func (s *Store) DeleteTenantValue(
 		Key:       key,
 		TenantID:  tenantID,
 	}}}
+	if s.cfg.PollInterval > 0 {
+		filter = append(filter, bson.E{Key: fieldDeleted, Value: bson.D{{Key: opNe, Value: true}}})
+	}
 
 	// DeleteOne returns DeleteResult{DeletedCount: 0} and nil when no row
 	// matches — idempotent by design. Only emit the audit log when a row
 	// actually went away, otherwise the log becomes noise on retried
 	// no-op deletes.
-	res, err := s.coll.DeleteOne(ctx, filter)
+	var (
+		deletedCount int64
+		err          error
+	)
+
+	if s.cfg.PollInterval > 0 {
+		res, updateErr := s.coll.UpdateOne(ctx, filter, bson.D{{Key: opSet, Value: bson.D{
+			{Key: fieldDeleted, Value: true},
+			{Key: fieldUpdatedAt, Value: time.Now().UTC()},
+			{Key: fieldUpdatedBy, Value: actor},
+		}}})
+		if res != nil {
+			deletedCount = res.ModifiedCount
+		}
+
+		err = updateErr
+	} else {
+		res, deleteErr := s.coll.DeleteOne(ctx, filter)
+		if res != nil {
+			deletedCount = res.DeletedCount
+		}
+
+		err = deleteErr
+	}
+
 	if err != nil {
 		tracing.HandleSpanError(span, "mongodb delete_tenant_value: delete failed", err)
 
 		return fmt.Errorf("mongodb store delete_tenant_value: %w", err)
 	}
 
-	if res.DeletedCount > 0 {
+	if deletedCount > 0 {
 		s.logInfo(ctx, "tenant_value_deleted",
 			log.String(fieldTenantID, tenantID),
 			log.String(fieldNamespace, namespace),
@@ -240,7 +275,7 @@ func (s *Store) ListTenantValues(ctx context.Context) ([]store.Entry, error) {
 		{Key: fieldTenantID, Value: 1},
 	})
 
-	cursor, err := s.coll.Find(ctx, bson.D{}, findOpts)
+	cursor, err := s.coll.Find(ctx, bson.D{{Key: fieldDeleted, Value: bson.D{{Key: opNe, Value: true}}}}, findOpts)
 	if err != nil {
 		tracing.HandleSpanError(span, "mongodb list_tenant_values: find failed", err)
 		return nil, fmt.Errorf("mongodb store list_tenant_values: %w", err)
@@ -278,13 +313,6 @@ func (s *Store) ListTenantValues(ctx context.Context) ([]store.Entry, error) {
 // The returned slice is empty (not nil) when no overrides exist after the
 // cursor. Callers detect end-of-stream when len(result) < limit on a
 // bounded page, or when the returned slice is empty on an unbounded page.
-//
-// COORDINATION NOTE: the parallel refactor on internal/store/store.go is
-// introducing a TenantEntry type and updating the Store interface signature
-// to match this shape. Until that lands, this method returns []store.Entry
-// (the existing type) — which the parallel refactor will rename / alias to
-// TenantEntry in a single rename pass across every backend. The method
-// body is the hard part; the type name is a mechanical follow-up.
 func (s *Store) ListTenantOverrides(
 	ctx context.Context,
 	afterNamespace, afterKey, afterTenantID string,
@@ -314,11 +342,12 @@ func (s *Store) ListTenantOverrides(
 	// canonical OR-chain that matches how SQL's (a,b,c) > (x,y,z)
 	// desugars.
 	and := bson.A{
-		bson.D{{Key: fieldTenantID, Value: bson.D{{Key: "$ne", Value: store.SentinelGlobal}}}},
+		tenantOverrideOnlyFilter(),
+		bson.D{{Key: fieldDeleted, Value: bson.D{{Key: opNe, Value: true}}}},
 	}
 
 	if afterNamespace != "" || afterKey != "" || afterTenantID != "" {
-		and = append(and, bson.D{{Key: "$or", Value: bson.A{
+		and = append(and, bson.D{{Key: opOr, Value: bson.A{
 			bson.D{{Key: fieldNamespace, Value: bson.D{{Key: opGt, Value: afterNamespace}}}},
 			bson.D{
 				{Key: fieldNamespace, Value: afterNamespace},
@@ -332,7 +361,7 @@ func (s *Store) ListTenantOverrides(
 		}}})
 	}
 
-	filter := bson.D{{Key: "$and", Value: and}}
+	filter := bson.D{{Key: opAnd, Value: and}}
 
 	findOpts := options.Find().SetSort(bson.D{
 		{Key: fieldNamespace, Value: 1},
@@ -390,7 +419,8 @@ func (s *Store) ListTenantsForKey(
 	filter := bson.D{
 		{Key: fieldNamespace, Value: namespace},
 		{Key: fieldKey, Value: key},
-		{Key: fieldTenantID, Value: bson.D{{Key: "$ne", Value: store.SentinelGlobal}}},
+		{Key: fieldTenantID, Value: bson.D{{Key: opExists, Value: true}, {Key: opNin, Value: bson.A{"", store.SentinelGlobal}}}},
+		{Key: fieldDeleted, Value: bson.D{{Key: opNe, Value: true}}},
 	}
 
 	// Distinct is the natural operator here: one index seek, constant memory,

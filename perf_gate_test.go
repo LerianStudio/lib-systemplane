@@ -80,6 +80,7 @@ func TestPerf_GetForTenant_HitPathUnderThreshold(t *testing.T) {
 		if err := c.SetForTenant(ctx, "global", "fee.rate", 0.10, "bench"); err != nil {
 			b.Fatalf("SetForTenant prime: %v", err)
 		}
+		assertBenchTenantValue(b, c, ctx, 0.10)
 
 		b.ReportAllocs()
 
@@ -87,8 +88,11 @@ func TestPerf_GetForTenant_HitPathUnderThreshold(t *testing.T) {
 		// pinned to Go 1.25+ in go.mod, so this is safe — but the loop form
 		// is new enough to be worth flagging.
 		for b.Loop() {
-			_, _, _ = c.GetForTenant(ctx, "global", "fee.rate")
+			got, _, _ := c.GetForTenant(ctx, "global", "fee.rate")
+			benchTenantValueSink = got
 		}
+
+		assertBenchTenantValue(b, c, ctx, 0.10)
 	})
 
 	if result.N == 0 {
@@ -120,12 +124,16 @@ func TestPerf_GetForTenant_MissPathUnderThreshold(t *testing.T) {
 		ctx := core.ContextWithTenantID(context.Background(), "tenant-B")
 		// No override written — every read falls through to the registered
 		// default on the legacy global cache.
+		assertBenchTenantValue(b, c, ctx, 0.05)
 
 		b.ReportAllocs()
 
 		for b.Loop() {
-			_, _, _ = c.GetForTenant(ctx, "global", "fee.rate")
+			got, _, _ := c.GetForTenant(ctx, "global", "fee.rate")
+			benchTenantValueSink = got
 		}
+
+		assertBenchTenantValue(b, c, ctx, 0.05)
 	})
 
 	if result.N == 0 {

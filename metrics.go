@@ -25,8 +25,9 @@ type clientMetrics struct {
 	// tenantLazyFetchErrors counts lazy-mode GetForTenant store fetches that
 	// errored and fell through to the global/default cascade. A non-zero
 	// rate here with an otherwise healthy backend usually signals timeouts
-	// (tenantStoreTimeout) or transient connectivity issues. Attributes:
-	// namespace, key.
+	// (tenantStoreTimeout) or transient connectivity issues. It intentionally
+	// records without namespace/key labels because runtime-config names are
+	// caller-defined and can become high-cardinality metric dimensions.
 	tenantLazyFetchErrors *obsmetrics.CounterBuilder
 }
 
@@ -83,11 +84,10 @@ func (c *Client) ensureMetrics() {
 	})
 }
 
-// recordTenantLazyFetchError increments the tenant_lazy_fetch_errors counter
-// with (namespace, key) attributes. No-ops when telemetry is not configured
-// or the counter failed to initialize — both are captured by a nil guard on
-// the instrument field.
-func (c *Client) recordTenantLazyFetchError(ctx context.Context, namespace, key string) {
+// recordTenantLazyFetchError increments the tenant_lazy_fetch_errors counter.
+// No-ops when telemetry is not configured or the counter failed to initialize —
+// both are captured by a nil guard on the instrument field.
+func (c *Client) recordTenantLazyFetchError(ctx context.Context) {
 	if c == nil {
 		return
 	}
@@ -98,10 +98,7 @@ func (c *Client) recordTenantLazyFetchError(ctx context.Context, namespace, key 
 		return
 	}
 
-	if err := c.metrics.tenantLazyFetchErrors.WithLabels(map[string]string{
-		"namespace": namespace,
-		"key":       key,
-	}).AddOne(ctx); err != nil {
+	if err := c.metrics.tenantLazyFetchErrors.AddOne(ctx); err != nil {
 		c.logWarn(ctx, "systemplane: failed to record tenantLazyFetchErrors counter",
 			log.Err(err),
 		)

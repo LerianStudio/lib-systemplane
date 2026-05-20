@@ -45,7 +45,7 @@ type listTenantsResponse struct {
 type tenantValueResponse struct {
 	Namespace string `json:"namespace"`
 	Key       string `json:"key"`
-	TenantID  string `json:"tenant_id"`
+	TenantID  string `json:"tenantId"`
 	Value     any    `json:"value"`
 }
 
@@ -67,9 +67,8 @@ type tenantValueResponse struct {
 // so operators can distinguish "legitimately empty" from the error paths
 // above without relying on wire-level status codes alone.
 //
-// Backend errors from ListTenantsForKey (which swallows them and returns an
-// empty slice) do NOT surface as 5xx here; the Client is the authoritative
-// error boundary and we preserve its fail-soft contract.
+// Backend errors from ListTenantsForKeyContext surface as 5xx so operators
+// can distinguish "no overrides" from "could not query overrides".
 //
 // The route does not require a :tenantID path segment; the authorizer is
 // invoked with tenantID="" so policies can distinguish the reflection-style
@@ -88,7 +87,20 @@ func handleListTenants(client *systemplane.Client, logger log.Logger) fiber.Hand
 			return commonshttp.RespondError(c, http.StatusBadRequest, "validation_error", "key is not tenant-scoped")
 		}
 
-		tenants := client.ListTenantsForKey(namespace, key)
+		tenants, err := client.ListTenantsForKeyContext(c.UserContext(), namespace, key)
+		if err != nil {
+			if errors.Is(err, systemplane.ErrClosed) || errors.Is(err, systemplane.ErrNotStarted) {
+				return mapSentinelErr(c, err)
+			}
+
+			logger.Log(c.UserContext(), log.LevelWarn, "admin: handleListTenants backend query failed",
+				log.String("namespace", namespace),
+				log.String("key", key),
+				log.Err(err),
+			)
+
+			return commonshttp.RespondError(c, http.StatusInternalServerError, "backend_error", "failed to list tenant overrides")
+		}
 
 		// Client returns sorted, deduplicated results; the response mirrors that.
 		// Coalesce a nil return to an empty slice so JSON encodes `[]` not `null`.

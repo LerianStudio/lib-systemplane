@@ -155,15 +155,14 @@ func (c *Client) fireTenantSubscribers(nk nskey, tenantID string, newValue any) 
 	copy(snapshot, subs)
 	c.tenantSubsMu.RUnlock()
 
-	ctx := core.ContextWithTenantID(context.Background(), tenantID)
-
 	for _, sub := range snapshot {
 		fn := sub.fn
 
 		func() {
 			defer runtime.RecoverAndLog(c.logger, "systemplane.ontenantchange")
 
-			fn(ctx, nk.Namespace, nk.Key, tenantID, newValue)
+			ctx := core.ContextWithTenantID(context.Background(), tenantID)
+			fn(ctx, nk.Namespace, nk.Key, tenantID, cloneValue(newValue))
 		}()
 	}
 }

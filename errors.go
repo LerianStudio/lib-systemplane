@@ -23,6 +23,11 @@ var (
 	// ErrValidation is returned when a value fails its registered validator.
 	ErrValidation = errors.New("systemplane: validation failed")
 
+	// ErrNilContext is returned when a method that requires a live context is
+	// called with a nil context. This avoids stdlib panics from context helpers
+	// and keeps the library on explicit-error semantics.
+	ErrNilContext = errors.New("systemplane: context is nil")
+
 	// ErrDuplicateKey is returned when Register is called with a (namespace, key)
 	// pair that has already been registered.
 	ErrDuplicateKey = errors.New("systemplane: duplicate key")

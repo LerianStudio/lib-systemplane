@@ -6,7 +6,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -54,6 +56,26 @@ func assertSubscribeTerminated(t *testing.T, errCh <-chan error, label string) {
 	}
 }
 
+func startMongoSubscription(t *testing.T, s *Store, ctx context.Context, handler func(store.Event)) <-chan error {
+	t.Helper()
+
+	ready := make(chan error, 1)
+	errCh := make(chan error, 1)
+
+	go func() {
+		errCh <- s.SubscribeReady(ctx, handler, func(err error) { ready <- err })
+	}()
+
+	select {
+	case err := <-ready:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for MongoDB subscription readiness")
+	}
+
+	return errCh
+}
+
 // Test timing constants. Keeping them as package-level named values makes
 // the intent obvious (settle = "wait for change stream to open"; delivery
 // = "wait for an event to arrive") and makes knob tuning a one-line
@@ -86,9 +108,13 @@ const (
 // topology negotiation that can fail when Docker internal IPs are
 // unreachable from the test host.
 func waitForReplicaSet(uri string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
 
-	for time.Now().Before(deadline) {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 
 		client, err := mongo.Connect(options.Client().ApplyURI(uri).SetDirect(true))
@@ -103,10 +129,12 @@ func waitForReplicaSet(uri string, timeout time.Duration) error {
 			return nil
 		}
 
-		time.Sleep(500 * time.Millisecond)
+		select {
+		case <-deadline.C:
+			return fmt.Errorf("mongo replica set did not become ready within %s", timeout)
+		case <-ticker.C:
+		}
 	}
-
-	return fmt.Errorf("mongo replica set did not become ready within %s", timeout)
 }
 
 // setupMongoDB starts a MongoDB container with a replica set and returns a
@@ -138,7 +166,11 @@ func setupMongoDB(t *testing.T) (*mongo.Client, string) {
 	// localhost:<mapped-port> but the replica set advertises its internal IP,
 	// making non-direct connections unreachable.
 	if err := waitForReplicaSet(uri, 90*time.Second); err != nil {
-		t.Skipf("skipping mongo integration: %v", err)
+		if os.Getenv("SYSTEMPLANE_SKIP_MONGO_INTEGRATION") == "1" {
+			t.Skipf("SYSTEMPLANE_SKIP_MONGO_INTEGRATION=1: %v", err)
+		}
+
+		t.Fatalf("mongo integration replica set not ready: %v", err)
 	}
 
 	clientOpts := options.Client().
@@ -154,7 +186,11 @@ func setupMongoDB(t *testing.T) (*mongo.Client, string) {
 
 	if pingErr := client.Ping(pingCtx, nil); pingErr != nil {
 		_ = client.Disconnect(context.Background())
-		t.Skipf("skipping mongo integration: replica set ping failed: %v", pingErr)
+		if os.Getenv("SYSTEMPLANE_SKIP_MONGO_INTEGRATION") == "1" {
+			t.Skipf("SYSTEMPLANE_SKIP_MONGO_INTEGRATION=1: replica set ping failed: %v", pingErr)
+		}
+
+		t.Fatalf("mongo integration replica set ping failed: %v", pingErr)
 	}
 
 	t.Cleanup(func() {
@@ -213,10 +249,6 @@ func TestIntegration_ContractSuite_Polling(t *testing.T) {
 	systemplanetest.Run(t, func(t *testing.T) store.Store {
 		return newTestStore(t, client, shortPollInterval) // polling mode, fast poll for tests
 	},
-		// Polling mode cannot observe inter-tick deletes; see
-		// subscribePoll godoc in mongodb_changestream.go. Skip the delete-event
-		// contract rather than silently weaken the assertion.
-		systemplanetest.SkipSubtest("TenantSubscribeReceivesDeleteEvent"),
 	)
 }
 
@@ -237,19 +269,12 @@ func TestIntegration_ChangeStreamEmitsOnInsert(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	errCh := make(chan error, 1)
-
-	go func() {
-		errCh <- s.Subscribe(ctx, func(evt store.Event) {
-			select {
-			case signalCh <- evt:
-			default:
-			}
-		})
-	}()
-
-	// Give the change stream time to open.
-	time.Sleep(streamOpenSettle)
+	errCh := startMongoSubscription(t, s, ctx, func(evt store.Event) {
+		select {
+		case signalCh <- evt:
+		default:
+		}
+	})
 
 	// Insert a new entry.
 	err := s.Set(context.Background(), store.Entry{
@@ -292,17 +317,11 @@ func TestIntegration_ChangeStreamEmitsOnUpdate(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	errCh := make(chan error, 1)
-
-	go func() {
-		errCh <- s.Subscribe(ctx, func(evt store.Event) {
-			mu.Lock()
-			received = append(received, evt)
-			mu.Unlock()
-		})
-	}()
-
-	time.Sleep(streamOpenSettle)
+	errCh := startMongoSubscription(t, s, ctx, func(evt store.Event) {
+		mu.Lock()
+		received = append(received, evt)
+		mu.Unlock()
+	})
 
 	// First write (insert).
 	err := s.Set(context.Background(), store.Entry{
@@ -388,26 +407,17 @@ func TestIntegration_PollingAndChangeStreamParity(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		csErrCh := make(chan error, 1)
-		pollErrCh := make(chan error, 1)
+		csErrCh := startMongoSubscription(t, csStore, ctx, func(evt store.Event) {
+			csMu.Lock()
+			csEvents = append(csEvents, evt)
+			csMu.Unlock()
+		})
 
-		go func() {
-			csErrCh <- csStore.Subscribe(ctx, func(evt store.Event) {
-				csMu.Lock()
-				csEvents = append(csEvents, evt)
-				csMu.Unlock()
-			})
-		}()
-
-		go func() {
-			pollErrCh <- pollStore.Subscribe(ctx, func(evt store.Event) {
-				pollMu.Lock()
-				pollEvents = append(pollEvents, evt)
-				pollMu.Unlock()
-			})
-		}()
-
-		time.Sleep(streamOpenSettle)
+		pollErrCh := startMongoSubscription(t, pollStore, ctx, func(evt store.Event) {
+			pollMu.Lock()
+			pollEvents = append(pollEvents, evt)
+			pollMu.Unlock()
+		})
 
 		// Write entries via the change-stream store (both share the collection).
 		entries := []store.Entry{
@@ -417,7 +427,6 @@ func TestIntegration_PollingAndChangeStreamParity(t *testing.T) {
 
 		for _, e := range entries {
 			require.NoError(t, csStore.Set(context.Background(), e))
-			time.Sleep(50 * time.Millisecond)
 		}
 
 		// Wait for both subscribers to receive the events.
@@ -466,12 +475,10 @@ func TestIntegration_PollingAndChangeStreamParity(t *testing.T) {
 			"change-stream and poll mode should observe the same namespace+key pairs")
 	})
 
-	t.Run("DeleteSemanticsDiverge", func(t *testing.T) {
-		// Pins the known gap: the polling path has no native delete signal,
-		// so a DeleteTenantValue that happens between two ticks is
-		// invisible to polling subscribers but delivered by change streams.
-		// Documented in subscribePoll's godoc and reflected in the
-		// systemplanetest.SkipSubtest above.
+	t.Run("DeleteSemanticsParity", func(t *testing.T) {
+		// Polling mode represents tenant deletes as tombstone updates. Both
+		// change-stream and polling subscribers should therefore observe a
+		// routed event for the deleted tenant row.
 		dbName := fmt.Sprintf("test_delete_%d", time.Now().UnixNano())
 
 		csStore, err := New(Config{Client: client, Database: dbName, TenantSchemaEnabled: true})
@@ -493,9 +500,8 @@ func TestIntegration_PollingAndChangeStreamParity(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		// Track delete events by watching for tenantID on an event against a
-		// (ns, key) we know was deleted. Polling only ever emits updates, so
-		// the post-delete count should stay at zero.
+		// Track delete/revert events by watching for tenantID on an event against
+		// a (ns, key) we know was deleted.
 		const ns = "del"
 
 		const key = "target"
@@ -509,39 +515,42 @@ func TestIntegration_PollingAndChangeStreamParity(t *testing.T) {
 		// pass silently even though the polling delivery path never
 		// executed. Surfacing the error after cancel() turns that class
 		// of regression into a loud test failure.
-		csSubErrCh := make(chan error, 1)
-		pollSubErrCh := make(chan error, 1)
+		csSubErrCh := startMongoSubscription(t, csStore, ctx, func(evt store.Event) {
+			if evt.Namespace == ns && evt.Key == key && evt.TenantID == tenant {
+				csMu.Lock()
+				csDeletes++
+				csMu.Unlock()
+			}
+		})
 
-		go func() {
-			csSubErrCh <- csStore.Subscribe(ctx, func(evt store.Event) {
-				if evt.Namespace == ns && evt.Key == key && evt.TenantID == tenant {
-					csMu.Lock()
-					csDeletes++
-					csMu.Unlock()
-				}
-			})
-		}()
-
-		go func() {
-			pollSubErrCh <- pollStore.Subscribe(ctx, func(evt store.Event) {
-				if evt.Namespace == ns && evt.Key == key {
-					pollMu.Lock()
-					pollDeletesAfter++
-					pollMu.Unlock()
-				}
-			})
-		}()
-
-		time.Sleep(streamOpenSettle)
+		pollSubErrCh := startMongoSubscription(t, pollStore, ctx, func(evt store.Event) {
+			if evt.Namespace == ns && evt.Key == key {
+				pollMu.Lock()
+				pollDeletesAfter++
+				pollMu.Unlock()
+			}
+		})
 
 		// Seed an override so there is something to delete.
-		require.NoError(t, csStore.SetTenantValue(context.Background(), tenant, store.Entry{
+		require.NoError(t, pollStore.SetTenantValue(context.Background(), tenant, store.Entry{
 			Namespace: ns, Key: key, Value: []byte(`"seed"`), UpdatedBy: "t",
 		}))
 
 		// Wait for the seed event to propagate to both subscribers so our
 		// "after" counts capture the delete wave only.
-		time.Sleep(shortPollInterval * 3)
+		require.Eventually(t, func() bool {
+			csMu.Lock()
+			defer csMu.Unlock()
+
+			return csDeletes >= 1
+		}, deliveryDeadline, 200*time.Millisecond, "change-stream should observe seed before delete baseline reset")
+
+		require.Eventually(t, func() bool {
+			pollMu.Lock()
+			defer pollMu.Unlock()
+
+			return pollDeletesAfter >= 1
+		}, deliveryDeadline, shortPollInterval, "polling should observe seed before delete baseline reset")
 
 		pollMu.Lock()
 		pollSeen := pollDeletesAfter
@@ -556,7 +565,7 @@ func TestIntegration_PollingAndChangeStreamParity(t *testing.T) {
 		csDeletes = 0
 		csMu.Unlock()
 
-		require.NoError(t, csStore.DeleteTenantValue(context.Background(), tenant, ns, key, "t"))
+		require.NoError(t, pollStore.DeleteTenantValue(context.Background(), tenant, ns, key, "t"))
 
 		require.Eventually(t, func() bool {
 			csMu.Lock()
@@ -565,22 +574,13 @@ func TestIntegration_PollingAndChangeStreamParity(t *testing.T) {
 			return csDeletes >= 1
 		}, deliveryDeadline, 200*time.Millisecond, "change-stream should surface the delete")
 
-		// Polling should NOT observe the delete — at most another update if
-		// a write races in. Give the ticker a few rotations to confirm.
-		time.Sleep(shortPollInterval * 5)
+		require.Eventually(t, func() bool {
+			pollMu.Lock()
+			defer pollMu.Unlock()
 
-		// Snapshot the counter under the mutex but release before the
-		// bounded Subscribe drain below — the drain waits up to 5s and
-		// holding pollMu that long would block the subscriber goroutine
-		// from its own final handler call (if one is in flight) and risk
-		// a self-deadlock.
-		pollMu.Lock()
-		pollGot := pollDeletesAfter
-		pollMu.Unlock()
-
-		assert.Equal(t, 0, pollGot,
-			"polling must not observe inter-tick deletes; got %d (pre-delete baseline %d)",
-			pollGot, pollSeen)
+			return pollDeletesAfter >= 1
+		}, deliveryDeadline, 200*time.Millisecond,
+			"polling should surface the tombstone update for tenant delete (pre-delete baseline %d)", pollSeen)
 
 		// Cancel the subscribers and assert both Subscribe calls return
 		// cleanly within the bounded drain window. A Subscribe that fails
@@ -654,378 +654,6 @@ func TestIntegration_UniqueIndexPreventsRaceDuplicates(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// C1: phase-1 rolling-deploy upsert against pre-existing ObjectId _id rows
-// ---------------------------------------------------------------------------
-
-// TestIntegration_Mongo_Phase1_SetOverwritesLegacyObjectIDRow pins C1: a
-// phase-1 Store (TenantSchemaEnabled=false) invoked against a collection
-// that still carries the legacy ObjectId-keyed rows from a pre-tenant
-// v5.0.x deploy MUST upsert in place rather than collide on the legacy
-// unique index on (namespace, key). The symptom of a regression is an
-// E11000 duplicate-key error thrown by the driver.
-func TestIntegration_Mongo_Phase1_SetOverwritesLegacyObjectIDRow(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
-
-	client, _ := setupMongoDB(t)
-
-	dbName := fmt.Sprintf("test_c1_%d", time.Now().UnixNano())
-	collName := defaultCollection
-
-	// Seed a legacy row directly via the driver so its _id is an ObjectId,
-	// which is the shape every pre-tenant v5.0.x upsert produced.
-	coll := client.Database(dbName).Collection(collName)
-	legacyID := bson.NewObjectID()
-
-	_, err := coll.InsertOne(context.Background(), bson.D{
-		{Key: "_id", Value: legacyID},
-		{Key: "namespace", Value: "legacy"},
-		{Key: "key", Value: "fee.rate"},
-		// tenant_id absent — phase-1 leaves legacy rows untouched.
-		{Key: "value", Value: `"0.01"`},
-		{Key: "updated_at", Value: time.Now().UTC()},
-		{Key: "updated_by", Value: "seed"},
-	})
-	require.NoError(t, err, "seeding legacy row must succeed")
-
-	// Build a phase-1 store. ensureLegacySchema creates the unique index on
-	// (namespace, key) — this is the index the pre-tenant binaries write
-	// against and the one a regression in upsert() would violate.
-	s, err := New(Config{
-		Client:              client,
-		Database:            dbName,
-		Collection:          collName,
-		TenantSchemaEnabled: false,
-	})
-	require.NoError(t, err)
-
-	t.Cleanup(func() { _ = s.Close() })
-
-	// A phase-1 Set with the same (namespace, key) MUST update the legacy
-	// row in place and MUST NOT throw E11000.
-	setErr := s.Set(context.Background(), store.Entry{
-		Namespace: "legacy",
-		Key:       "fee.rate",
-		Value:     []byte(`"0.02"`),
-		UpdatedBy: "phase1-writer",
-	})
-	require.NoError(t, setErr, "phase-1 Set against legacy ObjectId row must not collide on (namespace,key) unique index")
-
-	// The Get surface is phase-1 aware only when tenant_id == "_global", so
-	// we re-read via the driver to verify the value was actually updated in
-	// place (not inserted as a second row).
-	var got bson.M
-
-	require.NoError(t,
-		coll.FindOne(context.Background(), bson.D{
-			{Key: "namespace", Value: "legacy"},
-			{Key: "key", Value: "fee.rate"},
-		}).Decode(&got),
-	)
-
-	assert.Equal(t, `"0.02"`, got["value"], "value must be overwritten")
-	assert.Equal(t, "phase1-writer", got["updated_by"])
-
-	// Exactly one row should exist for this (namespace, key).
-	count, err := coll.CountDocuments(context.Background(), bson.D{
-		{Key: "namespace", Value: "legacy"},
-		{Key: "key", Value: "fee.rate"},
-	})
-	require.NoError(t, err)
-	assert.Equal(t, int64(1), count, "phase-1 Set must not insert a duplicate row")
-}
-
-// ---------------------------------------------------------------------------
-// C4: phase-2 migration scenarios
-// ---------------------------------------------------------------------------
-
-// TestIntegration_Mongo_Migration_FreshCollection pins the most common
-// case: a brand-new deployment where the collection does not yet exist.
-// ensureSchema must be a no-op on the unused collection and leave the
-// compound unique index in place so subsequent writes land with the
-// phase-2 shape.
-func TestIntegration_Mongo_Migration_FreshCollection(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
-
-	client, _ := setupMongoDB(t)
-
-	dbName := fmt.Sprintf("test_c4_fresh_%d", time.Now().UnixNano())
-
-	s, err := New(Config{
-		Client:              client,
-		Database:            dbName,
-		TenantSchemaEnabled: true,
-	})
-	require.NoError(t, err, "fresh collection must migrate cleanly")
-
-	t.Cleanup(func() { _ = s.Close() })
-
-	// Confirm the compound unique index is present.
-	assertCompoundIndexExists(t, client, dbName, defaultCollection)
-}
-
-// TestIntegration_Mongo_Migration_BackfillsMissingTenantID seeds a legacy
-// row that lacks the tenant_id field, then runs the migration and asserts
-// the field is filled in with "_global". This is the step-3 half of
-// ensureSchema.
-func TestIntegration_Mongo_Migration_BackfillsMissingTenantID(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
-
-	client, _ := setupMongoDB(t)
-
-	dbName := fmt.Sprintf("test_c4_bf_%d", time.Now().UnixNano())
-	coll := client.Database(dbName).Collection(defaultCollection)
-
-	// Seed a legacy row missing tenant_id entirely (represents a document
-	// inserted by a v5.0.x binary).
-	_, err := coll.InsertOne(context.Background(), bson.D{
-		{Key: "_id", Value: bson.NewObjectID()},
-		{Key: "namespace", Value: "ns"},
-		{Key: "key", Value: "k"},
-		{Key: "value", Value: `"v"`},
-		{Key: "updated_at", Value: time.Now().UTC()},
-		{Key: "updated_by", Value: "seed"},
-	})
-	require.NoError(t, err)
-
-	s, err := New(Config{
-		Client:              client,
-		Database:            dbName,
-		TenantSchemaEnabled: true,
-	})
-	require.NoError(t, err)
-
-	t.Cleanup(func() { _ = s.Close() })
-
-	// The row must now be present under the compound-id shape with
-	// tenant_id="_global".
-	entry, found, err := s.Get(context.Background(), "ns", "k")
-	require.NoError(t, err)
-	require.True(t, found, "backfilled row must be visible via phase-2 Get")
-	assert.Equal(t, store.SentinelGlobal, entry.TenantID)
-	assert.Equal(t, `"v"`, string(entry.Value))
-}
-
-// TestIntegration_Mongo_Migration_ObjectIDRewrite seeds multiple legacy
-// rows (more than one migration batch) to exercise the batched
-// InsertMany/DeleteMany path (H4), then asserts every row survives with a
-// compound _id and no duplicates remain.
-func TestIntegration_Mongo_Migration_ObjectIDRewrite(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
-
-	client, _ := setupMongoDB(t)
-
-	dbName := fmt.Sprintf("test_c4_rewrite_%d", time.Now().UnixNano())
-	coll := client.Database(dbName).Collection(defaultCollection)
-
-	// Seed enough rows to span two batches (migrationBatchSize = 500).
-	// Kept conservative at 1.5x to avoid long CI runs; the batching code
-	// path fires on any input > migrationBatchSize.
-	const seedCount = 750
-
-	docs := make([]any, 0, seedCount)
-
-	for i := range seedCount {
-		docs = append(docs, bson.D{
-			{Key: "_id", Value: bson.NewObjectID()},
-			{Key: "namespace", Value: "ns"},
-			{Key: "key", Value: fmt.Sprintf("k-%d", i)},
-			{Key: "tenant_id", Value: store.SentinelGlobal},
-			{Key: "value", Value: fmt.Sprintf(`"v-%d"`, i)},
-			{Key: "updated_at", Value: time.Now().UTC()},
-			{Key: "updated_by", Value: "seed"},
-		})
-	}
-
-	_, err := coll.InsertMany(context.Background(), docs)
-	require.NoError(t, err)
-
-	// Run the migration.
-	s, err := New(Config{
-		Client:              client,
-		Database:            dbName,
-		TenantSchemaEnabled: true,
-		SchemaInitTimeout:   2 * time.Minute, // generous for the 750-row walk
-	})
-	require.NoError(t, err)
-
-	t.Cleanup(func() { _ = s.Close() })
-
-	// No ObjectId-keyed rows should remain.
-	count, err := coll.CountDocuments(context.Background(), bson.D{
-		{Key: "_id", Value: bson.D{{Key: "$type", Value: "objectId"}}},
-	})
-	require.NoError(t, err)
-	assert.Equal(t, int64(0), count, "rewrite must eliminate every ObjectId _id")
-
-	// Every seed row must be present under its compound-id shape. Exclude
-	// the migration-lease sentinel and any other internal rows (none, but
-	// an explicit filter guards against future drift).
-	total, err := coll.CountDocuments(context.Background(), bson.D{
-		{Key: "namespace", Value: "ns"},
-	})
-	require.NoError(t, err)
-	assert.Equal(t, int64(seedCount), total, "row count must be preserved across migration")
-}
-
-// TestIntegration_Mongo_Migration_IdempotentRerun runs ensureSchema twice
-// against the same collection. The second pass must be a no-op (no new
-// writes, no E11000).
-func TestIntegration_Mongo_Migration_IdempotentRerun(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
-
-	client, _ := setupMongoDB(t)
-
-	dbName := fmt.Sprintf("test_c4_rerun_%d", time.Now().UnixNano())
-	coll := client.Database(dbName).Collection(defaultCollection)
-
-	// Seed a legacy row so the first migration has non-trivial work.
-	_, err := coll.InsertOne(context.Background(), bson.D{
-		{Key: "_id", Value: bson.NewObjectID()},
-		{Key: "namespace", Value: "ns"},
-		{Key: "key", Value: "k"},
-		{Key: "value", Value: `"v"`},
-		{Key: "updated_at", Value: time.Now().UTC()},
-	})
-	require.NoError(t, err)
-
-	// First pass.
-	s1, err := New(Config{Client: client, Database: dbName, TenantSchemaEnabled: true})
-	require.NoError(t, err)
-
-	require.NoError(t, s1.Close())
-
-	// Second pass against the same collection must not error and must not
-	// duplicate the row.
-	s2, err := New(Config{Client: client, Database: dbName, TenantSchemaEnabled: true})
-	require.NoError(t, err, "re-running ensureSchema must be idempotent")
-
-	t.Cleanup(func() { _ = s2.Close() })
-
-	total, err := coll.CountDocuments(context.Background(), bson.D{
-		{Key: "namespace", Value: "ns"},
-		{Key: "key", Value: "k"},
-	})
-	require.NoError(t, err)
-	assert.Equal(t, int64(1), total, "idempotent rerun must not duplicate rows")
-}
-
-// TestIntegration_Mongo_Migration_AmbiguousAborts seeds a (namespace, key)
-// pair with both a tenant_id-missing and a tenant_id="_global" row. The
-// pre-flight verifyNoAmbiguousTenantDocs must fail the migration with a
-// clear error instead of silently collapsing the rows at the backfill
-// step.
-func TestIntegration_Mongo_Migration_AmbiguousAborts(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
-
-	client, _ := setupMongoDB(t)
-
-	dbName := fmt.Sprintf("test_c4_ambig_%d", time.Now().UnixNano())
-	coll := client.Database(dbName).Collection(defaultCollection)
-
-	_, err := coll.InsertMany(context.Background(), []any{
-		// Missing tenant_id entirely.
-		bson.D{
-			{Key: "_id", Value: bson.NewObjectID()},
-			{Key: "namespace", Value: "ambig"},
-			{Key: "key", Value: "k"},
-			{Key: "value", Value: `"a"`},
-		},
-		// Already has tenant_id="_global".
-		bson.D{
-			{Key: "_id", Value: bson.NewObjectID()},
-			{Key: "namespace", Value: "ambig"},
-			{Key: "key", Value: "k"},
-			{Key: "tenant_id", Value: store.SentinelGlobal},
-			{Key: "value", Value: `"b"`},
-		},
-	})
-	require.NoError(t, err)
-
-	_, err = New(Config{Client: client, Database: dbName, TenantSchemaEnabled: true})
-	require.Error(t, err, "phase-2 migration must abort on ambiguous pre-migration state")
-	assert.Contains(t, err.Error(), "ambiguous pre-migration state",
-		"error message should be actionable for operators")
-}
-
-// TestIntegration_Mongo_Migration_CrashRecovery simulates H7: a partial
-// migration (some rows already converted, some still on ObjectId _id) is
-// interrupted. Re-running ensureSchema must pick up where it left off
-// without duplicates and without errors.
-//
-// The partial state is fabricated by manually inserting both shapes and
-// then running the migration once. Crashing mid-rewrite is impossible to
-// trigger deterministically from inside the same process, but the
-// rewrite path is designed so re-running it is a no-op against already-
-// migrated rows.
-func TestIntegration_Mongo_Migration_CrashRecovery(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
-
-	client, _ := setupMongoDB(t)
-
-	dbName := fmt.Sprintf("test_c4_crash_%d", time.Now().UnixNano())
-	coll := client.Database(dbName).Collection(defaultCollection)
-
-	// Already-migrated row (compound _id).
-	_, err := coll.InsertOne(context.Background(), bson.D{
-		{Key: "_id", Value: compoundID{Namespace: "ns", Key: "migrated", TenantID: store.SentinelGlobal}},
-		{Key: "namespace", Value: "ns"},
-		{Key: "key", Value: "migrated"},
-		{Key: "tenant_id", Value: store.SentinelGlobal},
-		{Key: "value", Value: `"m"`},
-		{Key: "updated_at", Value: time.Now().UTC()},
-	})
-	require.NoError(t, err)
-
-	// Not-yet-migrated row (ObjectId _id).
-	_, err = coll.InsertOne(context.Background(), bson.D{
-		{Key: "_id", Value: bson.NewObjectID()},
-		{Key: "namespace", Value: "ns"},
-		{Key: "key", Value: "pending"},
-		{Key: "tenant_id", Value: store.SentinelGlobal},
-		{Key: "value", Value: `"p"`},
-		{Key: "updated_at", Value: time.Now().UTC()},
-	})
-	require.NoError(t, err)
-
-	s, err := New(Config{Client: client, Database: dbName, TenantSchemaEnabled: true})
-	require.NoError(t, err, "crash-recovery run must complete without error")
-
-	t.Cleanup(func() { _ = s.Close() })
-
-	// Both rows must be readable via the phase-2 Get surface.
-	migrated, foundM, err := s.Get(context.Background(), "ns", "migrated")
-	require.NoError(t, err)
-	require.True(t, foundM)
-	assert.Equal(t, `"m"`, string(migrated.Value))
-
-	pending, foundP, err := s.Get(context.Background(), "ns", "pending")
-	require.NoError(t, err)
-	require.True(t, foundP)
-	assert.Equal(t, `"p"`, string(pending.Value))
-
-	// No ObjectId-_id rows should remain.
-	count, err := coll.CountDocuments(context.Background(), bson.D{
-		{Key: "_id", Value: bson.D{{Key: "$type", Value: "objectId"}}},
-	})
-	require.NoError(t, err)
-	assert.Equal(t, int64(0), count, "rewrite must eliminate every ObjectId _id on retry")
-}
-
-// ---------------------------------------------------------------------------
 // H5: change-stream reconnect after stream closure
 // ---------------------------------------------------------------------------
 
@@ -1054,17 +682,11 @@ func TestIntegration_Mongo_ChangeStream_ReconnectsAfterStreamClose(t *testing.T)
 	// (bad resume token, killed cursor on the very first cursor open, etc.)
 	// surfaces as an actionable diagnostic rather than the much less useful
 	// "first event must be delivered" timeout downstream.
-	subErrCh := make(chan error, 1)
-
-	go func() {
-		subErrCh <- s.Subscribe(ctx, func(evt store.Event) {
-			mu.Lock()
-			events = append(events, evt)
-			mu.Unlock()
-		})
-	}()
-
-	time.Sleep(streamOpenSettle)
+	subErrCh := startMongoSubscription(t, s, ctx, func(evt store.Event) {
+		mu.Lock()
+		events = append(events, evt)
+		mu.Unlock()
+	})
 
 	// First write — baseline that the stream is alive.
 	require.NoError(t, s.SetTenantValue(context.Background(), "t1", store.Entry{
@@ -1098,19 +720,30 @@ func TestIntegration_Mongo_ChangeStream_ReconnectsAfterStreamClose(t *testing.T)
 	require.NoError(t, cmdErr,
 		"failed to tear down change-stream sessions; reconnect path was not exercised")
 
-	// Give the reconnect loop time to re-establish the stream.
-	time.Sleep(streamOpenSettle)
-
-	// Second write — must be delivered through the reconnected stream.
-	require.NoError(t, s.SetTenantValue(context.Background(), "t1", store.Entry{
-		Namespace: "h5", Key: "k", Value: []byte(`"2"`), UpdatedBy: "w2",
-	}))
+	var reconnectWrites atomic.Int64
 
 	require.Eventually(t, func() bool {
 		mu.Lock()
-		defer mu.Unlock()
+		if len(events) >= 2 {
+			mu.Unlock()
 
-		return len(events) >= 2
+			return true
+		}
+		mu.Unlock()
+
+		// Keep writes on the safe side of the reconnect window without a fixed
+		// sleep. Pre-reconnect writes may be missed when no resume token store is
+		// configured; retrying periodically makes the first post-reconnect write
+		// deterministic.
+		n := reconnectWrites.Add(1)
+
+		if err := s.SetTenantValue(context.Background(), "t1", store.Entry{
+			Namespace: "h5", Key: "k", Value: []byte(fmt.Sprintf(`"%d"`, n+1)), UpdatedBy: "w2",
+		}); err != nil {
+			return false
+		}
+
+		return false
 	}, extendedDeliveryDeadline, 200*time.Millisecond,
 		"second event must be delivered after change-stream reconnect")
 
@@ -1193,4 +826,23 @@ func assertCompoundIndexExists(t *testing.T, client *mongo.Client, dbName, collN
 	}
 
 	assert.True(t, found, "unique compound (namespace, key, tenant_id) index must exist after phase-2 migration")
+}
+
+func assertIndexExists(t *testing.T, client *mongo.Client, dbName, collName, indexName string) {
+	t.Helper()
+
+	coll := client.Database(dbName).Collection(collName)
+	cursor, err := coll.Indexes().List(context.Background())
+	require.NoError(t, err)
+
+	var indexes []bson.M
+	require.NoError(t, cursor.All(context.Background(), &indexes))
+
+	for _, idx := range indexes {
+		if got, _ := idx["name"].(string); got == indexName {
+			return
+		}
+	}
+
+	t.Fatalf("index %q not found on %s.%s", indexName, dbName, collName)
 }

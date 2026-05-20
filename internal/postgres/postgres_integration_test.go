@@ -91,9 +91,8 @@ func newTestStore(t *testing.T, dsn string) *Store {
 	return s
 }
 
-// TestIntegration_ContractSuite invokes the shared contract test suite. If
-// Phase 4 hasn't landed yet, systemplanetest.Run is a no-op stub that passes
-// trivially.
+// TestIntegration_ContractSuite invokes the shared backend contract suite
+// against the Postgres implementation.
 func TestIntegration_ContractSuite(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
@@ -128,17 +127,22 @@ func TestIntegration_SetEmitsNotifyWithCorrectPayload(t *testing.T) {
 
 	subCtx, subCancel := context.WithCancel(ctx)
 	done := make(chan error, 1)
+	ready := make(chan error, 1)
 
 	go func() {
-		done <- s.Subscribe(subCtx, func(evt store.Event) {
+		done <- s.SubscribeReady(subCtx, func(evt store.Event) {
 			mu.Lock()
 			received = append(received, evt)
 			mu.Unlock()
-		})
+		}, func(err error) { ready <- err })
 	}()
 
-	// Allow the LISTEN command to register.
-	time.Sleep(500 * time.Millisecond)
+	select {
+	case err := <-ready:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for subscribe readiness")
+	}
 
 	value, err := json.Marshal("debug")
 	if err != nil {
@@ -253,6 +257,152 @@ func TestIntegration_InvalidChannelNameRejected(t *testing.T) {
 	assert.Contains(t, err.Error(), "unsafe channel name")
 }
 
+func TestIntegration_StrictIsolationRequiresExplicitChannelAndTable(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	dsn := startPostgresContainer(ctx, t)
+
+	db, err := sql.Open("pgx", dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+
+	_, err = New(Config{DB: db, ListenDSN: dsn, StrictIsolation: true})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "explicit listen channel")
+
+	_, err = New(Config{
+		DB:              db,
+		ListenDSN:       dsn,
+		Channel:         "service_changes",
+		ChannelExplicit: true,
+		StrictIsolation: true,
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "explicit table")
+
+	s, err := New(Config{
+		DB:              db,
+		ListenDSN:       dsn,
+		Channel:         defaultChannel,
+		ChannelExplicit: true,
+		Table:           defaultTable,
+		TableExplicit:   true,
+		StrictIsolation: true,
+	})
+	require.NoError(t, err, "explicit default names are allowed because the caller deliberately opted in")
+	require.NoError(t, s.Close())
+}
+
+func TestIntegration_TriggerUsesPerTableChannel(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	dsn := startPostgresContainer(ctx, t)
+
+	db, err := sql.Open("pgx", dsn)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+
+	tableA := fmt.Sprintf("sp_channel_a_%d", tableSeq.Add(1))
+	tableB := fmt.Sprintf("sp_channel_b_%d", tableSeq.Add(1))
+
+	sA, err := New(Config{
+		DB:                  db,
+		ListenDSN:           dsn,
+		Channel:             "sp_channel_a_changes",
+		ChannelExplicit:     true,
+		Table:               tableA,
+		TableExplicit:       true,
+		TenantSchemaEnabled: true,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, sA.Close()) })
+
+	// Constructing B after A used to replace the shared trigger function and
+	// reroute A's trigger notifications to B's channel. This order pins that
+	// regression directly.
+	sB, err := New(Config{
+		DB:                  db,
+		ListenDSN:           dsn,
+		Channel:             "sp_channel_b_changes",
+		ChannelExplicit:     true,
+		Table:               tableB,
+		TableExplicit:       true,
+		TenantSchemaEnabled: true,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, sB.Close()) })
+
+	subCtx, subCancel := context.WithCancel(ctx)
+	defer subCancel()
+
+	receivedA := make(chan store.Event, 1)
+	receivedB := make(chan store.Event, 1)
+	readyA := make(chan error, 1)
+	readyB := make(chan error, 1)
+	doneA := make(chan error, 1)
+	doneB := make(chan error, 1)
+
+	go func() {
+		doneA <- sA.SubscribeReady(subCtx, func(evt store.Event) { receivedA <- evt }, func(err error) { readyA <- err })
+	}()
+	go func() {
+		doneB <- sB.SubscribeReady(subCtx, func(evt store.Event) { receivedB <- evt }, func(err error) { readyB <- err })
+	}()
+
+	for _, ready := range []chan error{readyA, readyB} {
+		select {
+		case err := <-ready:
+			require.NoError(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out waiting for subscribe readiness")
+		}
+	}
+
+	value, err := json.Marshal("debug")
+	require.NoError(t, err)
+
+	require.NoError(t, sA.Set(ctx, store.Entry{
+		Namespace: "global",
+		Key:       "log.level",
+		Value:     value,
+		UpdatedBy: "test-actor",
+	}))
+
+	select {
+	case evt := <-receivedA:
+		assert.Equal(t, "global", evt.Namespace)
+		assert.Equal(t, "log.level", evt.Key)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for table A notification")
+	}
+
+	select {
+	case evt := <-receivedB:
+		t.Fatalf("table B subscriber received table A event: %+v", evt)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	subCancel()
+
+	for _, done := range []chan error{doneA, doneB} {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Subscribe did not return after context cancellation")
+		}
+	}
+}
+
 // TestIntegration_ListenReconnectsAfterConnDrop starts a Subscribe, kills the
 // LISTEN connection via pg_terminate_backend, then verifies that a subsequent
 // Set still triggers the handler after reconnection.
@@ -273,17 +423,22 @@ func TestIntegration_ListenReconnectsAfterConnDrop(t *testing.T) {
 
 	subCtx, subCancel := context.WithCancel(ctx)
 	done := make(chan error, 1)
+	ready := make(chan error, 1)
 
 	go func() {
-		done <- s.Subscribe(subCtx, func(evt store.Event) {
+		done <- s.SubscribeReady(subCtx, func(evt store.Event) {
 			mu.Lock()
 			received = append(received, evt)
 			mu.Unlock()
-		})
+		}, func(err error) { ready <- err })
 	}()
 
-	// Wait for LISTEN to be established.
-	time.Sleep(1 * time.Second)
+	select {
+	case err := <-ready:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for initial LISTEN readiness")
+	}
 
 	// Kill all non-superuser connections that are in LISTEN state by
 	// terminating backends that are not our control connection.
@@ -303,8 +458,18 @@ func TestIntegration_ListenReconnectsAfterConnDrop(t *testing.T) {
 		   AND query LIKE 'LISTEN%'`)
 	require.NoError(t, err)
 
-	// Give the subscriber time to detect the disconnection and reconnect.
-	time.Sleep(3 * time.Second)
+	require.Eventually(t, func() bool {
+		var count int
+		err := controlDB.QueryRowContext(ctx,
+			`SELECT count(*)
+			 FROM pg_stat_activity
+			 WHERE pid != pg_backend_pid()
+			   AND datname = current_database()
+			   AND state = 'idle'
+			   AND query LIKE 'LISTEN%'`).Scan(&count)
+
+		return err == nil && count > 0
+	}, 10*time.Second, 100*time.Millisecond, "subscriber should re-establish LISTEN after connection drop")
 
 	// Now issue a Set; the trigger should fire NOTIFY on the new connection.
 	value, err := json.Marshal("reconnected")

@@ -152,9 +152,8 @@ func WithActorExtractor(fn func(*fiber.Ctx) string) MountOption {
 // Nil client causes Mount to be a no-op (does not panic). Nil router causes
 // Mount to be a no-op (does not panic).
 //
-// Mount panics if called with a nil [MountOption] — this is the conventional
-// functional-options fail-fast contract and matches the systemplane Client's
-// own Option handling.
+// Nil [MountOption] values are ignored so a miswired optional option cannot
+// panic during route registration.
 //
 // By default, all routes are deny-all (every request returns 403 Forbidden).
 // Callers must supply [WithAuthorizer] to enable access to legacy routes and
@@ -170,7 +169,12 @@ func Mount(router fiber.Router, c *systemplane.Client, opts ...MountOption) {
 	}
 
 	cfg := defaultMountConfig()
+
 	for _, o := range opts {
+		if o == nil {
+			continue
+		}
+
 		o(&cfg)
 	}
 

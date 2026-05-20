@@ -39,6 +39,16 @@ package systemplane
 // tenantLoadMode selects eager vs lazy tenant cache population at Start().
 type tenantLoadMode int
 
+type tenantNoOverrideMarker struct{}
+
+var tenantNoOverride = tenantNoOverrideMarker{}
+
+func isTenantNoOverride(v any) bool {
+	_, ok := v.(tenantNoOverrideMarker)
+
+	return ok
+}
+
 const (
 	// tenantLoadEager hydrates every tenant value from the store at Start and
 	// keeps every row cached in memory. Zero DB round-trips on GetForTenant.

@@ -27,10 +27,10 @@ import (
 const hydrationPageSize = 1000
 
 // hydrateTenantCache loads every tenant-scoped row from the backing store
-// into tenantCache. Called by Start() in eager mode only. Failures here are
-// non-fatal because the lazy-mode fallback (miss-populate) already handles
-// the case where tenantCache is empty; a hydration failure simply degrades
-// to lazy-like behavior on subsequent GetForTenant calls.
+// into tenantCache. Called by Start() in eager mode only. Store failures are
+// returned to Start because eager mode does not consult the backend on later
+// tenant-cache misses; continuing would silently serve global/default values
+// for tenant overrides that already exist in the backend.
 //
 // Rows for unregistered keys or keys not registered via RegisterTenantScoped
 // are logged and skipped — they signal drift between the running binary and
@@ -49,7 +49,7 @@ const hydrationPageSize = 1000
 // the tenant-scoped registration set under a short registryMu.RLock, then
 // iterate + unmarshal outside the lock, populating tenantCache under a
 // single cacheMu.Lock window instead of N lock/unlock cycles.
-func (c *Client) hydrateTenantCache(ctx context.Context) {
+func (c *Client) hydrateTenantCache(ctx context.Context) error {
 	// Snapshot only the registry state the decode loop needs. Holding the
 	// lock just for the snapshot — not the unmarshal — keeps concurrent
 	// Register calls unblocked for O(10k) entries.
@@ -59,6 +59,12 @@ func (c *Client) hydrateTenantCache(ctx context.Context) {
 	}
 
 	c.registryMu.RLock()
+
+	if len(c.tenantScopedRegistry) == 0 {
+		c.registryMu.RUnlock()
+
+		return nil
+	}
 
 	regSnap := make(map[nskey]regState, len(c.registry))
 	for nk := range c.registry {
@@ -90,11 +96,11 @@ func (c *Client) hydrateTenantCache(ctx context.Context) {
 		// the per-row discard branch the old code ran in Go.
 		page, err := c.store.ListTenantOverrides(ctx, afterNamespace, afterKey, afterTenantID, hydrationPageSize)
 		if err != nil {
-			c.logWarn(ctx, "tenant hydration failed, falling back to miss-populate",
+			c.logWarn(ctx, "tenant hydration failed",
 				log.Err(err),
 			)
 
-			return
+			return err
 		}
 
 		for _, entry := range page {
@@ -146,7 +152,7 @@ func (c *Client) hydrateTenantCache(ctx context.Context) {
 	}
 
 	if len(batch) == 0 {
-		return
+		return nil
 	}
 
 	// Single lock window for the whole batch — avoids N lock/unlock cycles.
@@ -155,4 +161,6 @@ func (c *Client) hydrateTenantCache(ctx context.Context) {
 		c.tenantCache.set(it.tenantID, it.nk, it.value)
 	}
 	c.cacheMu.Unlock()
+
+	return nil
 }

@@ -68,6 +68,10 @@ func (f *fakeTenantTestStore) Set(_ context.Context, e TestEntry) error {
 }
 
 func (f *fakeTenantTestStore) Subscribe(ctx context.Context, handler func(TestEvent)) error {
+	return f.SubscribeReady(ctx, handler, nil)
+}
+
+func (f *fakeTenantTestStore) SubscribeReady(ctx context.Context, handler func(TestEvent), ready func(error)) error {
 	f.mu.Lock()
 	first := len(f.handlers) == 0
 	f.handlers = append(f.handlers, handler)
@@ -75,6 +79,10 @@ func (f *fakeTenantTestStore) Subscribe(ctx context.Context, handler func(TestEv
 
 	if first {
 		close(f.subReady)
+	}
+
+	if ready != nil {
+		ready(nil)
 	}
 
 	<-ctx.Done()
@@ -208,4 +216,172 @@ func TestStoreAdapter_TenantIDRoundtrips(t *testing.T) {
 
 	cancel()
 	wg.Wait()
+}
+
+func TestStoreAdapter_SubscribeReadyDelegatesAfterRegistration(t *testing.T) {
+	t.Parallel()
+
+	fs := newFakeTenantTestStore()
+	adapter := &testStoreAdapter{ts: fs}
+
+	subCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ready := make(chan error, 1)
+	registeredAtReady := make(chan bool, 1)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+
+		_ = adapter.SubscribeReady(subCtx, func(store.Event) {}, func(err error) {
+			fs.mu.Lock()
+			registeredAtReady <- len(fs.handlers) == 1
+			fs.mu.Unlock()
+
+			ready <- err
+		})
+	}()
+
+	select {
+	case err := <-ready:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for ready callback")
+	}
+
+	select {
+	case registered := <-registeredAtReady:
+		assert.True(t, registered, "ready callback must run after Subscribe handler registration")
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for registration assertion")
+	}
+
+	cancel()
+	wg.Wait()
+}
+
+type legacyReadylessTestStore struct {
+	base *fakeTenantTestStore
+}
+
+func newLegacyReadylessTestStore() *legacyReadylessTestStore {
+	return &legacyReadylessTestStore{base: newFakeTenantTestStore()}
+}
+
+func (f *legacyReadylessTestStore) List(ctx context.Context) ([]TestEntry, error) {
+	return f.base.List(ctx)
+}
+
+func (f *legacyReadylessTestStore) Get(ctx context.Context, namespace, key string) (TestEntry, bool, error) {
+	return f.base.Get(ctx, namespace, key)
+}
+
+func (f *legacyReadylessTestStore) Set(ctx context.Context, e TestEntry) error {
+	return f.base.Set(ctx, e)
+}
+func (f *legacyReadylessTestStore) Close() error { return f.base.Close() }
+func (f *legacyReadylessTestStore) GetTenantValue(ctx context.Context, tenantID, namespace, key string) (TestEntry, bool, error) {
+	return f.base.GetTenantValue(ctx, tenantID, namespace, key)
+}
+
+func (f *legacyReadylessTestStore) SetTenantValue(ctx context.Context, tenantID string, e TestEntry) error {
+	return f.base.SetTenantValue(ctx, tenantID, e)
+}
+
+func (f *legacyReadylessTestStore) DeleteTenantValue(ctx context.Context, tenantID, namespace, key, actor string) error {
+	return f.base.DeleteTenantValue(ctx, tenantID, namespace, key, actor)
+}
+
+func (f *legacyReadylessTestStore) ListTenantOverrides(ctx context.Context, afterNamespace, afterKey, afterTenantID string, limit int) ([]TestEntry, error) {
+	return f.base.ListTenantOverrides(ctx, afterNamespace, afterKey, afterTenantID, limit)
+}
+
+func (f *legacyReadylessTestStore) ListTenantsForKey(ctx context.Context, namespace, key string) ([]string, error) {
+	return f.base.ListTenantsForKey(ctx, namespace, key)
+}
+
+func (f *legacyReadylessTestStore) Subscribe(ctx context.Context, handler func(TestEvent)) error {
+	f.base.mu.Lock()
+	first := len(f.base.handlers) == 0
+	f.base.handlers = append(f.base.handlers, handler)
+	f.base.mu.Unlock()
+
+	if first {
+		close(f.base.subReady)
+	}
+
+	<-ctx.Done()
+
+	return nil
+}
+
+func TestStoreAdapter_SubscribeReadyFallsBackForLegacyTestStore(t *testing.T) {
+	t.Parallel()
+
+	fs := newLegacyReadylessTestStore()
+	adapter := &testStoreAdapter{ts: fs}
+
+	subCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ready := make(chan error, 1)
+	done := make(chan error, 1)
+
+	go func() {
+		done <- adapter.SubscribeReady(subCtx, func(store.Event) {}, func(err error) { ready <- err })
+	}()
+
+	select {
+	case err := <-ready:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for fallback ready callback")
+	}
+
+	select {
+	case <-fs.base.subReady:
+	case <-time.After(time.Second):
+		t.Fatal("legacy Subscribe did not register")
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("legacy fallback SubscribeReady did not return")
+	}
+}
+
+func TestNewForTesting_TypedNilStoreReturnsErrNilBackend(t *testing.T) {
+	t.Parallel()
+
+	var fs *fakeTenantTestStore
+
+	c, err := NewForTesting(fs)
+	require.Nil(t, c)
+	require.ErrorIs(t, err, store.ErrNilBackend)
+}
+
+func TestStoreAdapter_TenantWritesRequireSchemaEnabled(t *testing.T) {
+	t.Parallel()
+
+	fs := newFakeTenantTestStore()
+	disabled := &testStoreAdapter{ts: fs}
+
+	err := disabled.SetTenantValue(context.Background(), "tenant-A", store.Entry{Namespace: "ns", Key: "k"})
+	require.ErrorIs(t, err, store.ErrTenantSchemaNotEnabled)
+
+	err = disabled.DeleteTenantValue(context.Background(), "tenant-A", "ns", "k", "actor")
+	require.ErrorIs(t, err, store.ErrTenantSchemaNotEnabled)
+
+	enabled := &testStoreAdapter{ts: fs, tenantSchemaEnabled: true}
+	err = enabled.SetTenantValue(context.Background(), "tenant-A", store.Entry{Namespace: "ns", Key: "k"})
+	require.NoError(t, err)
+
+	err = enabled.DeleteTenantValue(context.Background(), "tenant-A", "ns", "k", "actor")
+	require.NoError(t, err)
 }

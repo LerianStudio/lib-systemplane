@@ -21,7 +21,11 @@ plugins:
       ]
     }]
 
-  # Plugin to version the CHANGELOG.md
+  - ["@semantic-release/changelog", {
+      changelogFile: "CHANGELOG.md"
+    }]
+
+  # Plugin to commit the generated CHANGELOG.md
   - ["@semantic-release/git", {
       assets: ["CHANGELOG.md"],
       message: "chore(release): ${nextRelease.version}\n\nupdated changelog."

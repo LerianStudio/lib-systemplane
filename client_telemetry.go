@@ -14,42 +14,64 @@ package systemplane
 import (
 	"context"
 
+	"github.com/LerianStudio/lib-observability/log"
+	"github.com/LerianStudio/lib-observability/tracing"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
-
-	"github.com/LerianStudio/lib-observability/log"
 )
+
+type clientSpan struct {
+	span trace.Span
+}
+
+type spanStringAttr struct {
+	key   string
+	value string
+}
+
+func spanString(key, value string) spanStringAttr {
+	return spanStringAttr{key: key, value: value}
+}
+
+func (s clientSpan) HandleError(message string, err error) {
+	tracing.HandleSpanError(s.span, message, err)
+}
 
 // startSpan creates a child span if telemetry is configured, otherwise returns
 // a no-op span. Callers MUST defer finish() to end the span.
-func (c *Client) startSpan(ctx context.Context, name string) (context.Context, trace.Span, func()) {
-	return c.startSpanWithAttrs(ctx, name)
+func (c *Client) startSpan(ctx context.Context, name string) (context.Context, clientSpan, func()) {
+	return c.startSpanWithLabels(ctx, name)
 }
 
-// startSpanWithAttrs creates a child span and (when telemetry is configured)
+// startSpanWithLabels creates a child span and (when telemetry is configured)
 // sets the provided attributes on it before returning. Callers MUST defer
 // finish() to end the span. The attributes argument is variadic so zero
 // attributes is a valid — and common — call shape, used by legacy callers
 // that do not need span attributes.
-func (c *Client) startSpanWithAttrs(ctx context.Context, name string, attrs ...attribute.KeyValue) (context.Context, trace.Span, func()) {
+func (c *Client) startSpanWithLabels(ctx context.Context, name string, attrs ...spanStringAttr) (context.Context, clientSpan, func()) {
 	noop := func() {}
 
 	if c.telemetry == nil {
-		return ctx, trace.SpanFromContext(ctx), noop
+		return ctx, clientSpan{span: trace.SpanFromContext(ctx)}, noop
 	}
 
 	tracer, err := c.telemetry.Tracer(tracerName)
 	if err != nil || tracer == nil {
-		return ctx, trace.SpanFromContext(ctx), noop
+		return ctx, clientSpan{span: trace.SpanFromContext(ctx)}, noop
 	}
 
 	ctx, span := tracer.Start(ctx, name)
 
 	if len(attrs) > 0 {
-		span.SetAttributes(attrs...)
+		otelAttrs := make([]attribute.KeyValue, 0, len(attrs))
+		for _, attr := range attrs {
+			otelAttrs = append(otelAttrs, attribute.String(attr.key, attr.value))
+		}
+
+		span.SetAttributes(otelAttrs...)
 	}
 
-	return ctx, span, func() { span.End() }
+	return ctx, clientSpan{span: span}, func() { span.End() }
 }
 
 // logWarn emits a warning-level log via the configured logger.

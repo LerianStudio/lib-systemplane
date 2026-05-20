@@ -8,13 +8,10 @@
 //     surface insert/update/replace/delete events, so the full
 //     systemplanetest.Run suite passes unmodified.
 //
-//   - Polling mode (standalone): the subscribePoll loop polls for
-//     documents updated after a watermark. It has no native delete signal
-//     — deletions that happen between two ticks are invisible to the
-//     polling path (see internal/mongodb/mongodb_changestream.go
-//     subscribePoll godoc). We opt the contract suite out of the
-//     "TenantSubscribeReceivesDeleteEvent" subtest via SkipSubtest to
-//     reflect this known limitation without lying to the contract.
+//   - Polling mode (standalone): the subscribePoll loop polls for documents
+//     updated after a watermark. Tenant deletes are represented as tombstone
+//     updates so polling subscribers observe the same tenant-revert signal as
+//     change-stream subscribers.
 //
 // Both suites share the helpers (setupMongoDB, newTestStore) defined in
 // mongodb_integration_test.go.
@@ -46,11 +43,8 @@ func TestIntegration_MongoDBTenantContracts_ChangeStream(t *testing.T) {
 	})
 }
 
-// TestIntegration_MongoDBTenantContracts_Polling runs the same suite
-// against the polling subscription path. The "TenantSubscribeReceivesDeleteEvent"
-// contract is skipped because inter-tick deletes are not visible in
-// polling mode — the Client layer is expected to document this limitation
-// for operators who choose standalone MongoDB.
+// TestIntegration_MongoDBTenantContracts_Polling runs the same suite against
+// the polling subscription path.
 //
 // Polling interval is 100ms (same as the existing contract_suite_polling
 // test) so the eventually() helper's 10s budget comfortably covers the
@@ -65,9 +59,5 @@ func TestIntegration_MongoDBTenantContracts_Polling(t *testing.T) {
 	systemplanetest.Run(t, func(t *testing.T) store.Store {
 		return newTestStore(t, client, 100*time.Millisecond)
 	},
-		// Polling mode cannot observe inter-tick deletes; see
-		// subscribePoll godoc. Skip the delete-event contract rather than
-		// silently weaken the assertion.
-		systemplanetest.SkipSubtest("TenantSubscribeReceivesDeleteEvent"),
 	)
 }

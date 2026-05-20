@@ -27,10 +27,7 @@ import (
 	"time"
 
 	"github.com/LerianStudio/lib-commons/v5/commons/tenant-manager/core"
-	"github.com/LerianStudio/lib-observability/log"
-	"github.com/LerianStudio/lib-observability/tracing"
 	"github.com/LerianStudio/lib-systemplane/internal/store"
-	"go.opentelemetry.io/otel/attribute"
 )
 
 // RegisterTenantScoped declares a tenant-scoped configuration key with its
@@ -56,17 +53,8 @@ import (
 //   - Seeds the legacy cache[nk] = defaultValue under cacheMu so a pre-Start
 //     Get call returns the default (same contract as Register).
 //
-// # Mutable defaults
-//
-// Avoid mutable defaults (slices, maps, pointers to shared state). The
-// registered default is held by reference and shared across every tenant
-// that falls through to it — a subscriber (or reader) mutating the default
-// is visible to every other tenant's subsequent reads and to every
-// OnTenantChange delete echo (which dispatches def.defaultValue). The
-// blast radius is N tenants × K keys. Prefer value types (string, int,
-// bool, duration), or wrap slices/maps in a defensive copy the caller
-// owns. This same caveat applies to Register; tenant scoping widens the
-// surface, not the shape.
+// Mutable defaults are defensively cloned for cache seeding and fallback
+// reads so map/slice defaults are not shared across tenants by reference.
 //
 // Concurrency: the two writes (registry insert + cacheMu seed) happen under
 // separate locks; no other goroutine can observe the in-between state because
@@ -77,6 +65,9 @@ func (c *Client) RegisterTenantScoped(namespace, key string, defaultValue any, o
 	if c == nil || c.closed.Load() {
 		return ErrClosed
 	}
+
+	c.startMu.Lock()
+	defer c.startMu.Unlock()
 
 	if c.started.Load() {
 		return ErrRegisterAfterStart
@@ -92,19 +83,17 @@ func (c *Client) RegisterTenantScoped(namespace, key string, defaultValue any, o
 	// so the rest of the Client treats tenant-scoped and globals-only keys
 	// uniformly for description, validator, and redaction lookups.
 	def := keyDef{
-		defaultValue: defaultValue,
+		defaultValue: cloneValue(defaultValue),
 		redaction:    RedactNone,
 	}
 
-	for _, o := range opts {
-		o(&def)
-	}
+	applyKeyOptions(&def, opts)
 
 	// Validate the default value if a validator is set. Mirrors register.go
 	// behavior — we prefer a fail-fast signal at registration over a confusing
 	// validation error emerging later from a tenant write.
 	if def.validator != nil {
-		if err := def.validator(defaultValue); err != nil {
+		if err := def.validator(def.defaultValue); err != nil {
 			return fmt.Errorf("%w: default value rejected: %w", ErrValidation, err)
 		}
 	}
@@ -132,7 +121,7 @@ func (c *Client) RegisterTenantScoped(namespace, key string, defaultValue any, o
 	// even if Start is never called (e.g. in a Client built via NewForTesting
 	// and discarded without Start).
 	c.cacheMu.Lock()
-	c.cache[nk] = defaultValue
+	c.cache[nk] = cloneValue(def.defaultValue)
 	c.cacheMu.Unlock()
 
 	return nil
@@ -153,6 +142,10 @@ func (c *Client) RegisterTenantScoped(namespace, key string, defaultValue any, o
 // extraction path used by every tenant-scoped method — centralizing it here
 // ensures uniform fail-closed behavior.
 func extractTenantID(ctx context.Context) (string, error) {
+	if ctx == nil {
+		return "", ErrNilContext
+	}
+
 	id := core.GetTenantIDContext(ctx)
 	if id == "" {
 		return "", fmt.Errorf("%w", ErrMissingTenantContext)
@@ -263,16 +256,16 @@ func (c *Client) SetForTenant(ctx context.Context, namespace, key string, value 
 		UpdatedBy: actor,
 	}
 
-	ctx, span, finish := c.startSpanWithAttrs(ctx, "systemplane.client.set_tenant_value",
-		attribute.String("tenant.id", tenantID),
-		attribute.String("systemplane.namespace", namespace),
-		attribute.String("systemplane.key", key),
+	ctx, span, finish := c.startSpanWithLabels(ctx, "systemplane.client.set_tenant_value",
+		spanString("tenant.id", tenantID),
+		spanString("systemplane.namespace", namespace),
+		spanString("systemplane.key", key),
 	)
 	defer finish()
 
 	jsonBytes, err := json.Marshal(value)
 	if err != nil {
-		tracing.HandleSpanError(span, "json marshal failed", err)
+		span.HandleError("json marshal failed", err)
 
 		return fmt.Errorf("%w: value is not JSON-serializable: %w", ErrValidation, err)
 	}
@@ -283,7 +276,7 @@ func (c *Client) SetForTenant(ctx context.Context, namespace, key string, value 
 	}
 
 	if err := c.store.SetTenantValue(ctx, tenantID, entry); err != nil {
-		tracing.HandleSpanError(span, "store set_tenant_value failed", err)
+		span.HandleError("store set_tenant_value failed", err)
 
 		return fmt.Errorf("systemplane: SetTenantValue: %w", err)
 	}
@@ -299,7 +292,7 @@ func (c *Client) SetForTenant(ctx context.Context, namespace, key string, value 
 	// so type agreement with refresh.go is guaranteed (set.go:70-78
 	// precedent).
 	c.cacheMu.Lock()
-	c.tenantCache.set(tenantID, nk, canonical)
+	c.tenantCache.set(tenantID, nk, cloneValue(canonical))
 	c.cacheMu.Unlock()
 
 	return nil
@@ -318,10 +311,9 @@ func (c *Client) SetForTenant(ctx context.Context, namespace, key string, value 
 // override yet" case always resolves to the global or default and
 // therefore returns (value, true, nil).
 //
-// In lazy mode, a tenantCache miss triggers a single-flight
-// store.GetTenantValue with a 5s timeout. Store errors during the miss-
-// populate path are logged and swallowed — the method falls through to
-// the global/default cascade so a degraded store does not block reads.
+// In lazy mode, a tenantCache miss triggers a single-flight store.GetTenantValue
+// with a 5s timeout. Backend errors during the miss-populate path fail closed
+// so critical tenant overrides cannot be bypassed during backend degradation.
 //
 // Errors (value is nil, found is false):
 //   - ErrClosed, ErrNotStarted, ErrMissingTenantContext, ErrInvalidTenantID,
@@ -357,123 +349,39 @@ func (c *Client) GetForTenant(ctx context.Context, namespace, key string) (any, 
 	c.cacheMu.RUnlock()
 
 	if hit {
-		return v, true, nil
+		if isTenantNoOverride(v) {
+			return c.getTenantFallbackValue(nk, def)
+		}
+
+		return cloneValue(v), true, nil
 	}
 
 	// 1b. Lazy-mode miss: delegate to the helper so this method stays
 	// focused on the cascade (tenantCache → legacy global → default).
 	if c.tenantLoadMode == tenantLoadLazy {
-		if val, found, handled := c.getForTenantLazyMissLocked(ctx, tenantID, namespace, key, nk); handled {
-			return val, found, nil
+		if val, found, handled, err := c.getForTenantLazyMissLocked(ctx, tenantID, namespace, key, nk); handled {
+			return val, found, err
 		}
 	}
 
 	// 2. Fall through to the legacy global cache. This is the D3 fallthrough
 	// contract — tenant without an override sees whatever Set wrote to the
 	// global row (or the default if Set was never called).
+	return c.getTenantFallbackValue(nk, def)
+}
+
+func (c *Client) getTenantFallbackValue(nk nskey, def keyDef) (any, bool, error) {
 	c.cacheMu.RLock()
 	globalVal, hasGlobal := c.cache[nk]
 	c.cacheMu.RUnlock()
 
 	if hasGlobal {
-		return globalVal, true, nil
+		return cloneValue(globalVal), true, nil
 	}
 
-	// 3. Registered default. Never errors on "no override" — GetForTenant
+	// Registered default. Never errors on "no override" — GetForTenant
 	// always returns a value when the key is correctly registered.
-	return def.defaultValue, true, nil
-}
-
-// getForTenantLazyMissLocked executes the lazy-mode cache-miss path:
-// single-flight coalesced fetch from the backend, populate the LRU on a hit,
-// and swallow-with-log on failure (falling through to the global/default
-// cascade in the caller).
-//
-// Return contract:
-//   - (value, true, true)  — override present in the store (including nil-value
-//     overrides — "found=true" is the sole signal, the value may legitimately
-//     be nil).
-//   - (nil, false, false)  — no override; caller proceeds with the cascade.
-//   - (nil, false, false)  — fetch failed; caller proceeds with the cascade.
-//
-// The closure's return is wrapped in a struct {value, found} so that the
-// outer code branches on the explicit `found` flag rather than the historical
-// `fetched != nil` heuristic, which conflated a nil-valued override (found=true,
-// value=nil) with "no override" (found=false). See AC3.
-//
-// The "Locked" suffix reflects that the method takes cacheMu.Lock internally
-// around the LRU populate; it does not require the caller to hold any lock.
-func (c *Client) getForTenantLazyMissLocked(ctx context.Context, tenantID, namespace, key string, nk nskey) (any, bool, bool) {
-	sfKey := singleflightKey(tenantID, namespace, key)
-
-	// Struct-wrap the single-flight payload so "nil-valued override" and
-	// "no override" are unambiguously distinguishable. The previous
-	// (fetched any, err error) shape collapsed both to (nil, nil) and
-	// caused the AC3 nil-value bug.
-	type sfResult struct {
-		value any
-		found bool
-	}
-
-	res, fetchErr, _ := c.sfg.Do(sfKey, func() (any, error) {
-		fetchCtx, cancel := context.WithTimeout(ctx, tenantStoreTimeout)
-		defer cancel()
-
-		fetchCtx, span, finish := c.startSpanWithAttrs(fetchCtx, "systemplane.client.get_tenant_value",
-			attribute.String("tenant.id", tenantID),
-			attribute.String("systemplane.namespace", namespace),
-			attribute.String("systemplane.key", key),
-		)
-		defer finish()
-
-		entry, found, err := c.store.GetTenantValue(fetchCtx, tenantID, namespace, key)
-		if err != nil {
-			tracing.HandleSpanError(span, "store get_tenant_value failed", err)
-
-			return sfResult{}, fmt.Errorf("systemplane: GetTenantValue: %w", err)
-		}
-
-		if !found {
-			return sfResult{found: false}, nil
-		}
-
-		var decoded any
-		if err := json.Unmarshal(entry.Value, &decoded); err != nil {
-			tracing.HandleSpanError(span, "json unmarshal failed", err)
-
-			return sfResult{}, fmt.Errorf("systemplane: GetTenantValue: decode: %w", err)
-		}
-
-		// Populate the LRU under cacheMu.Lock before returning so every
-		// shared-call waiter sees the same cached state.
-		c.cacheMu.Lock()
-		c.tenantCache.set(tenantID, nk, decoded)
-		c.cacheMu.Unlock()
-
-		return sfResult{value: decoded, found: true}, nil
-	})
-	if fetchErr != nil {
-		c.logWarn(ctx, "lazy GetForTenant store fetch failed, falling through to global/default",
-			fetchErrFields(namespace, key, tenantID, fetchErr)...,
-		)
-		// Attribute the fall-through for operators: a non-zero rate
-		// here indicates the lazy cache is absorbing backend failures
-		// behind the scenes. The metric is tenant-agnostic by design
-		// (cardinality) — namespace+key alone is sufficient to locate
-		// the affected key.
-		c.recordTenantLazyFetchError(ctx, namespace, key)
-
-		return nil, false, false
-	}
-
-	// sfg.Do returns `any`; the type assertion is safe because the closure
-	// always returns an sfResult.
-	r, _ := res.(sfResult)
-	if !r.found {
-		return nil, false, false
-	}
-
-	return r.value, true, true
+	return cloneValue(def.defaultValue), true, nil
 }
 
 // DeleteForTenant removes the tenant-specific override for (namespace, key)
@@ -517,16 +425,16 @@ func (c *Client) DeleteForTenant(ctx context.Context, namespace, key, actor stri
 		return err
 	}
 
-	ctx, span, finish := c.startSpanWithAttrs(ctx, "systemplane.client.delete_tenant_value",
-		attribute.String("tenant.id", tenantID),
-		attribute.String("systemplane.namespace", namespace),
-		attribute.String("systemplane.key", key),
-		attribute.String("systemplane.actor", actor),
+	ctx, span, finish := c.startSpanWithLabels(ctx, "systemplane.client.delete_tenant_value",
+		spanString("tenant.id", tenantID),
+		spanString("systemplane.namespace", namespace),
+		spanString("systemplane.key", key),
+		spanString("systemplane.actor", actor),
 	)
 	defer finish()
 
 	if err := c.store.DeleteTenantValue(ctx, tenantID, namespace, key, actor); err != nil {
-		tracing.HandleSpanError(span, "store delete_tenant_value failed", err)
+		span.HandleError("store delete_tenant_value failed", err)
 
 		return fmt.Errorf("systemplane: DeleteTenantValue: %w", err)
 	}
@@ -535,105 +443,12 @@ func (c *Client) DeleteForTenant(ctx context.Context, namespace, key, actor stri
 	// subsequent GetForTenant in the same process falls through to the
 	// global/default cascade without waiting for the changefeed roundtrip.
 	c.cacheMu.Lock()
-	c.tenantCache.delete(tenantID, nk)
+	if c.tenantLoadMode == tenantLoadLazy {
+		c.tenantCache.set(tenantID, nk, tenantNoOverride)
+	} else {
+		c.tenantCache.delete(tenantID, nk)
+	}
 	c.cacheMu.Unlock()
 
 	return nil
-}
-
-// emptyTenantList is the canonical empty slice returned by ListTenantsForKey
-// on any error or unregistered-key path. Defined as a package-level var so
-// every error branch shares the same zero-allocation sentinel instead of
-// rebuilding a fresh []string{} on each call. Callers MUST NOT mutate the
-// returned slice — it is structurally shared across every error response.
-// Matches the "return the same zero-length slice" pattern used by a handful
-// of stdlib helpers (e.g. strings.Split returning a 1-element slice of
-// empty) to avoid unnecessary allocation on the cold path.
-var emptyTenantList = []string{}
-
-// ListTenantsForKey returns a sorted, deduplicated list of tenant IDs that
-// have an override for (namespace, key). Returns an empty slice (never nil)
-// on any error; errors are logged at warn level. Callers that need to
-// distinguish "empty" from "errored" should use the admin surface, which
-// returns explicit HTTP status codes.
-//
-// The '_global' sentinel is excluded by the backend; this method surfaces
-// only actual tenant IDs. Unlike the other tenant methods, ListTenantsForKey
-// does NOT require a tenant ID in ctx — it is an administrative/reflection
-// query. An internal 5s timeout bounds the backend call.
-func (c *Client) ListTenantsForKey(namespace, key string) []string {
-	if c == nil || c.closed.Load() {
-		return emptyTenantList
-	}
-
-	if _, _, err := c.requireTenantScoped(namespace, key); err != nil {
-		c.logWarn(context.Background(), "ListTenantsForKey: registration check failed, returning empty slice",
-			registrationErrFields(namespace, key, err)...,
-		)
-
-		return emptyTenantList
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), tenantStoreTimeout)
-	defer cancel()
-
-	ctx, span, finish := c.startSpanWithAttrs(ctx, "systemplane.client.list_tenants_for_key",
-		attribute.String("systemplane.namespace", namespace),
-		attribute.String("systemplane.key", key),
-	)
-	defer finish()
-
-	tenants, err := c.store.ListTenantsForKey(ctx, namespace, key)
-	if err != nil {
-		tracing.HandleSpanError(span, "store list_tenants_for_key failed", err)
-
-		err = fmt.Errorf("systemplane: ListTenantsForKey: %w", err)
-		c.logWarn(ctx, "ListTenantsForKey: backend query failed, returning empty slice",
-			registrationErrFields(namespace, key, err)...,
-		)
-
-		return emptyTenantList
-	}
-
-	return tenants
-}
-
-// singleflightKey builds the composite string key used by the Client's
-// singleflight.Group to coalesce concurrent lazy-mode miss fetches on the
-// same (tenantID, namespace, key) tuple. The U+001F (Unit Separator)
-// delimiter (see the `unitSeparator` constant in register.go) is a control
-// character that cannot appear in valid tenantIDs, namespaces, or keys —
-// the same scheme the changefeed debouncer used before it was moved to a
-// struct key in onEvent.
-//
-// Safety depends on validateKeyArgs rejecting namespace/key that contain
-// U+001F AND on core.IsValidTenantID rejecting tenant IDs that contain
-// U+001F (it accepts only `[A-Za-z0-9][A-Za-z0-9_-]*`, so the delimiter is
-// structurally impossible in a valid tenant ID). If either guard weakens,
-// distinct tuples could collide on the same singleflight slot.
-func singleflightKey(tenantID, namespace, key string) string {
-	return tenantID + unitSeparator + namespace + unitSeparator + key
-}
-
-// fetchErrFields builds the log.Field slice for a lazy-mode cache-miss
-// backend failure. Isolated in a helper so the call sites at
-// GetForTenant stay concise.
-func fetchErrFields(namespace, key, tenantID string, err error) []log.Field {
-	return []log.Field{
-		log.String("namespace", namespace),
-		log.String("key", key),
-		log.String("tenant_id", tenantID),
-		log.Err(err),
-	}
-}
-
-// registrationErrFields builds the log.Field slice for
-// ListTenantsForKey's warn paths. The tenant ID is intentionally absent —
-// ListTenantsForKey is tenant-agnostic (lists every tenant).
-func registrationErrFields(namespace, key string, err error) []log.Field {
-	return []log.Field{
-		log.String("namespace", namespace),
-		log.String("key", key),
-		log.Err(err),
-	}
 }

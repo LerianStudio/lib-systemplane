@@ -9,6 +9,7 @@ package systemplane
 
 import (
 	"context"
+	"reflect"
 	"time"
 
 	"github.com/LerianStudio/lib-systemplane/internal/store"
@@ -39,6 +40,10 @@ type TestStore interface {
 	ListTenantsForKey(ctx context.Context, namespace, key string) ([]string, error)
 }
 
+type testStoreReady interface {
+	SubscribeReady(ctx context.Context, handler func(TestEvent), ready func(error)) error
+}
+
 // TestEntry is the public mirror of internal store.Entry.
 type TestEntry struct {
 	Namespace string
@@ -58,7 +63,8 @@ type TestEvent struct {
 
 // testStoreAdapter wraps a TestStore to satisfy the internal store.Store interface.
 type testStoreAdapter struct {
-	ts TestStore
+	ts                  TestStore
+	tenantSchemaEnabled bool
 }
 
 func (a *testStoreAdapter) List(ctx context.Context) ([]store.Entry, error) {
@@ -110,13 +116,27 @@ func (a *testStoreAdapter) Set(ctx context.Context, e store.Entry) error {
 }
 
 func (a *testStoreAdapter) Subscribe(ctx context.Context, handler func(store.Event)) error {
-	return a.ts.Subscribe(ctx, func(te TestEvent) {
+	return a.SubscribeReady(ctx, handler, nil)
+}
+
+func (a *testStoreAdapter) SubscribeReady(ctx context.Context, handler func(store.Event), ready func(error)) error {
+	adapted := func(te TestEvent) {
 		handler(store.Event{
 			Namespace: te.Namespace,
 			Key:       te.Key,
 			TenantID:  te.TenantID,
 		})
-	})
+	}
+
+	if readyStore, ok := a.ts.(testStoreReady); ok {
+		return readyStore.SubscribeReady(ctx, adapted, ready)
+	}
+
+	if ready != nil {
+		ready(nil)
+	}
+
+	return a.ts.Subscribe(ctx, adapted)
 }
 
 func (a *testStoreAdapter) Close() error {
@@ -140,6 +160,10 @@ func (a *testStoreAdapter) GetTenantValue(ctx context.Context, tenantID, namespa
 }
 
 func (a *testStoreAdapter) SetTenantValue(ctx context.Context, tenantID string, e store.Entry) error {
+	if !a.tenantSchemaEnabled {
+		return store.ErrTenantSchemaNotEnabled
+	}
+
 	return a.ts.SetTenantValue(ctx, tenantID, TestEntry{
 		Namespace: e.Namespace,
 		Key:       e.Key,
@@ -151,6 +175,10 @@ func (a *testStoreAdapter) SetTenantValue(ctx context.Context, tenantID string, 
 }
 
 func (a *testStoreAdapter) DeleteTenantValue(ctx context.Context, tenantID, namespace, key, actor string) error {
+	if !a.tenantSchemaEnabled {
+		return store.ErrTenantSchemaNotEnabled
+	}
+
 	return a.ts.DeleteTenantValue(ctx, tenantID, namespace, key, actor)
 }
 
@@ -186,10 +214,14 @@ func (a *testStoreAdapter) ListTenantsForKey(ctx context.Context, namespace, key
 // Debouncing is disabled by default for test determinism. Callers can override
 // via [WithDebounce] if needed.
 //
+// Tenant write paths mirror production store behavior: SetForTenant and
+// DeleteForTenant require [WithTenantSchemaEnabled], just like the Postgres and
+// MongoDB backends during the phase-2 tenant-schema rollout.
+//
 // DO NOT USE IN PRODUCTION. This constructor is intentionally undocumented in
 // README/API docs. Its API stability is not promised.
 func NewForTesting(s TestStore, opts ...Option) (*Client, error) {
-	if s == nil {
+	if isNilTestStore(s) {
 		return nil, store.ErrNilBackend
 	}
 
@@ -199,9 +231,21 @@ func NewForTesting(s TestStore, opts ...Option) (*Client, error) {
 	// Applied before opts so callers can override via WithDebounce.
 	cfg.debounce = 0
 
-	for _, o := range opts {
-		o(&cfg)
+	applyClientOptions(&cfg, opts)
+
+	return newClient(&testStoreAdapter{ts: s, tenantSchemaEnabled: cfg.tenantSchemaEnabled}, cfg), nil
+}
+
+func isNilTestStore(s TestStore) bool {
+	if s == nil {
+		return true
 	}
 
-	return newClient(&testStoreAdapter{ts: s}, cfg), nil
+	v := reflect.ValueOf(s)
+	switch v.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return v.IsNil()
+	default:
+		return false
+	}
 }

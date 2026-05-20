@@ -79,6 +79,12 @@ type Store interface {
 	// change event received from the backend's changefeed mechanism.
 	Subscribe(ctx context.Context, handler func(Event)) error
 
+	// SubscribeReady is Subscribe with an initial-readiness handshake. Backends
+	// invoke ready(nil) after the changefeed has been established, or ready(err)
+	// when initial setup fails before event delivery can begin. Errors after the
+	// initial ready signal are handled by the backend's normal reconnect loop.
+	SubscribeReady(ctx context.Context, handler func(Event), ready func(error)) error
+
 	// Close releases backend resources. Idempotent.
 	Close() error
 

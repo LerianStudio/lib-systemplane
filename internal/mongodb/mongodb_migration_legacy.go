@@ -20,11 +20,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
+	"github.com/LerianStudio/lib-commons/v5/commons"
 	"github.com/LerianStudio/lib-observability/log"
+	"github.com/LerianStudio/lib-observability/runtime"
 	"github.com/LerianStudio/lib-systemplane/internal/store"
-	"github.com/google/uuid"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -59,9 +61,10 @@ type leaseDoc struct {
 }
 
 // acquireMigrationLease attempts to claim the migration lease. On success,
-// it returns the original ctx (unchanged for now — a future revision could
-// attach a keepalive heartbeat goroutine), a release closure that MUST be
-// deferred by the caller, and acquired=true. On "peer holds a fresh lease",
+// it returns a child ctx cancelled by release, a release closure that MUST be
+// deferred by the caller, and acquired=true. The owner refreshes its own
+// heartbeat until release so long-running migrations are not stolen. On
+// "peer holds a fresh lease",
 // it returns acquired=false without error so the caller can no-op the
 // migration and proceed to createCompoundIndex (which is idempotent).
 //
@@ -75,55 +78,33 @@ func acquireMigrationLease(
 	coll *mongo.Collection,
 	logger log.Logger,
 ) (context.Context, func(), bool, error) {
-	owner := uuid.NewString()
+	ownerID, err := commons.GenerateUUIDv7()
+	if err != nil {
+		return ctx, func() {}, false, fmt.Errorf("generate migration lease owner id: %w", err)
+	}
+
+	owner := ownerID.String()
 	now := time.Now().UTC()
 
-	// findOneAndUpdate with upsert+return-after gives us the doc as it
-	// exists after our write — either our just-written lease (acquired) or
-	// the peer's lease (lost). We check the owner field to disambiguate.
-	filter := bson.D{{Key: fieldID, Value: migrationLeaseID}}
+	_, err = coll.InsertOne(ctx, leaseDoc{
+		ID:        migrationLeaseID,
+		Owner:     owner,
+		Heartbeat: now,
+		Acquired:  now,
+	})
+	if err == nil {
+		leaseCtx, release := migrationLeaseRelease(ctx, coll, logger, owner)
 
-	// $setOnInsert seeds owner/acquired on first write; $set refreshes the
-	// heartbeat unconditionally so a live owner re-entering its own lease
-	// (e.g., process restart that reuses the owner UUID — unlikely but
-	// cheap to tolerate) keeps the heartbeat current.
-	update := bson.D{
-		{Key: opSet, Value: bson.D{
-			{Key: "heartbeat", Value: now},
-		}},
-		{Key: "$setOnInsert", Value: bson.D{
-			{Key: fieldOwner, Value: owner},
-			{Key: "acquired_at", Value: now},
-		}},
+		return leaseCtx, release, true, nil
 	}
 
-	opts := options.FindOneAndUpdate().
-		SetUpsert(true).
-		SetReturnDocument(options.After)
+	if !mongo.IsDuplicateKeyError(err) {
+		return ctx, func() {}, false, fmt.Errorf("insert lease: %w", err)
+	}
 
 	var current leaseDoc
-
-	err := coll.FindOneAndUpdate(ctx, filter, update, opts).Decode(&current)
-	if err != nil {
-		return ctx, func() {}, false, fmt.Errorf("findOneAndUpdate lease: %w", err)
-	}
-
-	// Did we just insert it? If so, Owner == our UUID.
-	if current.Owner == owner {
-		release := func() {
-			// Best-effort release. Filter by owner so a stolen lease is left
-			// alone. Swallow errors — the document is a singleton sentinel
-			// and the next acquire will overwrite it anyway.
-			releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-
-			_, _ = coll.DeleteOne(releaseCtx, bson.D{
-				{Key: fieldID, Value: migrationLeaseID},
-				{Key: fieldOwner, Value: owner},
-			})
-		}
-
-		return ctx, release, true, nil
+	if err := coll.FindOne(ctx, bson.D{{Key: fieldID, Value: migrationLeaseID}}).Decode(&current); err != nil {
+		return ctx, func() {}, false, fmt.Errorf("find lease: %w", err)
 	}
 
 	// Peer holds the lease. If their heartbeat is stale, forcibly steal it.
@@ -155,22 +136,74 @@ func acquireMigrationLease(
 		}
 
 		if res.ModifiedCount == 1 {
-			release := func() {
-				releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
+			leaseCtx, release := migrationLeaseRelease(ctx, coll, logger, owner)
 
-				_, _ = coll.DeleteOne(releaseCtx, bson.D{
-					{Key: fieldID, Value: migrationLeaseID},
-					{Key: fieldOwner, Value: owner},
-				})
-			}
-
-			return ctx, release, true, nil
+			return leaseCtx, release, true, nil
 		}
 	}
 
 	// Fresh lease held by a live peer. Let them finish.
 	return ctx, func() {}, false, nil
+}
+
+func migrationLeaseRelease(ctx context.Context, coll *mongo.Collection, logger log.Logger, owner string) (context.Context, func()) {
+	leaseCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+
+	var once sync.Once
+
+	runtime.SafeGoWithContextAndComponent(ctx, logger, "systemplane", "mongodb.migration_lease_heartbeat", runtime.KeepRunning, func(context.Context) {
+		defer close(done)
+
+		ticker := time.NewTicker(migrationLeaseStaleAfter / 3)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-leaseCtx.Done():
+				return
+			case <-ticker.C:
+				heartbeatCtx, heartbeatCancel := context.WithTimeout(context.WithoutCancel(leaseCtx), 5*time.Second)
+				_, err := coll.UpdateOne(heartbeatCtx, bson.D{
+					{Key: fieldID, Value: migrationLeaseID},
+					{Key: fieldOwner, Value: owner},
+				}, bson.D{{Key: opSet, Value: bson.D{{Key: "heartbeat", Value: time.Now().UTC()}}}})
+
+				heartbeatCancel()
+
+				if err != nil && logger != nil {
+					logger.Log(ctx, log.LevelWarn,
+						"systemplane/mongodb: migration lease heartbeat failed",
+						log.String("owner", owner),
+						log.Err(err),
+					)
+				}
+			}
+		}
+	})
+
+	release := func() {
+		once.Do(func() {
+			cancel()
+			<-done
+
+			releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer releaseCancel()
+
+			if _, err := coll.DeleteOne(releaseCtx, bson.D{
+				{Key: fieldID, Value: migrationLeaseID},
+				{Key: fieldOwner, Value: owner},
+			}); err != nil && logger != nil {
+				logger.Log(releaseCtx, log.LevelWarn,
+					"systemplane/mongodb: migration lease release failed",
+					log.String("owner", owner),
+					log.Err(err),
+				)
+			}
+		})
+	}
+
+	return leaseCtx, release
 }
 
 // legacyDoc mirrors entryDoc but decodes _id as bson.RawValue so we can
@@ -214,6 +247,16 @@ type legacyDoc struct {
 func rewriteObjectIDDocuments(ctx context.Context, coll *mongo.Collection) error {
 	filter := bson.D{{Key: fieldID, Value: bson.D{{Key: "$type", Value: "objectId"}}}}
 
+	return rewriteDocumentsWithNewCompoundID(ctx, coll, filter)
+}
+
+func rewriteEmptyCompoundTenantIDDocuments(ctx context.Context, coll *mongo.Collection) error {
+	filter := bson.D{{Key: fieldID + "." + fieldTenantID, Value: ""}}
+
+	return rewriteDocumentsWithNewCompoundID(ctx, coll, filter)
+}
+
+func rewriteDocumentsWithNewCompoundID(ctx context.Context, coll *mongo.Collection, filter bson.D) error {
 	cursor, err := coll.Find(ctx, filter)
 	if err != nil {
 		return err //nolint:wrapcheck // wrapped by ensureSchema
@@ -279,7 +322,7 @@ func rewriteObjectIDDocuments(ctx context.Context, coll *mongo.Collection) error
 			{Key: fieldTenantID, Value: tenantID},
 			{Key: "value", Value: doc.Value},
 			{Key: fieldUpdatedAt, Value: updatedAt},
-			{Key: "updated_by", Value: doc.UpdatedBy},
+			{Key: fieldUpdatedBy, Value: doc.UpdatedBy},
 		}
 
 		migrated = append(migrated, newDoc)

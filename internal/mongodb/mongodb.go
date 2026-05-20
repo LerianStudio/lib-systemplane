@@ -119,6 +119,11 @@ type Config struct {
 	// serializes calls. Failures are logged at WARN and do not interrupt
 	// event delivery; the next successful Save replaces the lost one.
 	SaveResumeToken func(ctx context.Context, token bson.Raw) error
+
+	// ResumeTokenFailClosed makes LoadResumeToken and SaveResumeToken failures
+	// terminate subscription setup/delivery instead of degrading to
+	// warn-and-continue behavior.
+	ResumeTokenFailClosed bool
 }
 
 // compoundID is the shape of the document _id.
@@ -147,21 +152,27 @@ type compoundID struct {
 // _id value is used to target a DeleteOne against the pre-migration row.
 // All other call sites work with the top-level namespace/key/tenant_id trio.
 type entryDoc struct {
-	ID        compoundID `bson:"_id"`
-	Namespace string     `bson:"namespace"`
-	Key       string     `bson:"key"`
-	TenantID  string     `bson:"tenant_id"`
-	Value     string     `bson:"value"`
-	UpdatedAt time.Time  `bson:"updated_at"`
-	UpdatedBy string     `bson:"updated_by"`
+	ID        bson.RawValue `bson:"_id"`
+	Namespace string        `bson:"namespace"`
+	Key       string        `bson:"key"`
+	TenantID  string        `bson:"tenant_id"`
+	Value     string        `bson:"value"`
+	UpdatedAt time.Time     `bson:"updated_at"`
+	UpdatedBy string        `bson:"updated_by"`
+	Deleted   bool          `bson:"deleted"`
 }
 
 // toEntry converts a BSON document into the public store.Entry type.
 func (d entryDoc) toEntry() store.Entry {
+	tenantID := d.TenantID
+	if tenantID == "" {
+		tenantID = store.SentinelGlobal
+	}
+
 	return store.Entry{
 		Namespace: d.Namespace,
 		Key:       d.Key,
-		TenantID:  d.TenantID,
+		TenantID:  tenantID,
 		Value:     []byte(d.Value),
 		UpdatedAt: d.UpdatedAt,
 		UpdatedBy: d.UpdatedBy,
@@ -274,7 +285,7 @@ func (s *Store) List(ctx context.Context) ([]store.Entry, error) {
 	ctx, span := s.tracer.Start(ctx, "systemplane.mongodb.list")
 	defer span.End()
 
-	filter := bson.D{{Key: fieldTenantID, Value: store.SentinelGlobal}}
+	filter := s.globalReadFilter()
 
 	cursor, err := s.coll.Find(ctx, filter)
 	if err != nil {

@@ -91,6 +91,10 @@ func (s *tenantTestStore) Set(_ context.Context, e TestEntry) error {
 }
 
 func (s *tenantTestStore) Subscribe(ctx context.Context, handler func(TestEvent)) error {
+	return s.SubscribeReady(ctx, handler, nil)
+}
+
+func (s *tenantTestStore) SubscribeReady(ctx context.Context, handler func(TestEvent), ready func(error)) error {
 	s.mu.Lock()
 	first := len(s.handlers) == 0
 	s.handlers = append(s.handlers, handler)
@@ -98,6 +102,10 @@ func (s *tenantTestStore) Subscribe(ctx context.Context, handler func(TestEvent)
 
 	if first {
 		close(s.subReady)
+	}
+
+	if ready != nil {
+		ready(nil)
 	}
 
 	<-ctx.Done()
@@ -202,7 +210,7 @@ func newStartedClient(t *testing.T, namespace, key string, defaultValue any) (*C
 
 	fs := newTenantTestStore()
 
-	c, err := NewForTesting(fs)
+	c, err := NewForTesting(fs, WithTenantSchemaEnabled())
 	require.NoError(t, err, "NewForTesting")
 
 	require.NoError(t, c.RegisterTenantScoped(namespace, key, defaultValue), "RegisterTenantScoped")

@@ -6,11 +6,13 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.opentelemetry.io/otel/trace/noop"
 
 	"github.com/LerianStudio/lib-systemplane/internal/store"
@@ -151,6 +153,26 @@ func TestExtractEvent_InsertUpdateReadsFullDocument(t *testing.T) {
 	}
 }
 
+func TestEntryDocDecodesLegacyObjectIDAndNormalizesTenant(t *testing.T) {
+	t.Parallel()
+
+	raw, err := bson.Marshal(bson.D{
+		{Key: fieldID, Value: bson.NewObjectID()},
+		{Key: fieldNamespace, Value: "global"},
+		{Key: fieldKey, Value: "log.level"},
+		{Key: "value", Value: `"debug"`},
+	})
+	require.NoError(t, err)
+
+	var doc entryDoc
+	require.NoError(t, bson.Unmarshal(raw, &doc))
+
+	entry := doc.toEntry()
+	assert.Equal(t, store.SentinelGlobal, entry.TenantID)
+	assert.Equal(t, "global", entry.Namespace)
+	assert.Equal(t, "log.level", entry.Key)
+}
+
 // TestExtractEvent_InsertWithoutFullDocument verifies that a non-delete event
 // that somehow arrived without a fullDocument (e.g., a change stream option
 // regression) is rejected rather than emitted with empty fields.
@@ -211,6 +233,42 @@ func TestCompoundID_BSONDecodeFromWire(t *testing.T) {
 	assert.Equal(t, "acme-corp", got.TenantID)
 }
 
+func TestPollCursorFilterIncludesSameTimestampHigherTuple(t *testing.T) {
+	t.Parallel()
+
+	watermark := time.Date(2026, 5, 20, 10, 0, 0, 123000000, time.UTC)
+	filter := pollCursorFilter(pollCursor{
+		updatedAt: watermark,
+		namespace: "global",
+		key:       "feature.a",
+		tenantID:  "tenant-A",
+	})
+
+	raw, err := bson.Marshal(filter)
+	require.NoError(t, err)
+
+	var decoded bson.M
+	require.NoError(t, bson.Unmarshal(raw, &decoded))
+
+	assert.Contains(t, decoded, opOr)
+	encoded := decoded[opOr]
+	assert.NotNil(t, encoded, "filter must include a lexicographic same-timestamp branch")
+}
+
+func TestPollCursorFromDocNormalizesTenantID(t *testing.T) {
+	t.Parallel()
+
+	updatedAt := time.Date(2026, 5, 20, 10, 0, 0, 123000000, time.UTC)
+	doc := entryDoc{Namespace: "global", Key: "k", UpdatedAt: updatedAt}
+
+	cursor := pollCursorFromDoc(doc, store.SentinelGlobal)
+
+	assert.Equal(t, updatedAt, cursor.updatedAt)
+	assert.Equal(t, "global", cursor.namespace)
+	assert.Equal(t, "k", cursor.key)
+	assert.Equal(t, store.SentinelGlobal, cursor.tenantID)
+}
+
 // TestEntryDoc_ToEntryPopulatesTenantID pins the contract that entryDoc.toEntry
 // surfaces TenantID onto the store.Entry so Client-layer consumers receive
 // tenant attribution on every read.
@@ -232,6 +290,70 @@ func TestEntryDoc_ToEntryPopulatesTenantID(t *testing.T) {
 	assert.Equal(t, "tenant-7", got.TenantID)
 	assert.Equal(t, `"debug"`, string(got.Value))
 	assert.Equal(t, "actor", got.UpdatedBy)
+}
+
+func TestApplyResumeToken_LoadErrorFailOpenAndFailClosed(t *testing.T) {
+	t.Parallel()
+
+	loadErr := errors.New("resume token store unavailable")
+
+	failOpenStore := &Store{cfg: Config{
+		LoadResumeToken: func(context.Context) (bson.Raw, error) {
+			return nil, loadErr
+		},
+	}}
+
+	_, err := failOpenStore.applyResumeToken(context.Background(), options.ChangeStream())
+	require.NoError(t, err, "default behavior should warn and open from current oplog position")
+
+	failClosedStore := &Store{cfg: Config{
+		LoadResumeToken: func(context.Context) (bson.Raw, error) {
+			return nil, loadErr
+		},
+		ResumeTokenFailClosed: true,
+	}}
+
+	_, err = failClosedStore.applyResumeToken(context.Background(), options.ChangeStream())
+	require.Error(t, err)
+	assert.ErrorIs(t, err, loadErr)
+}
+
+func TestSaveResumeToken_CopiesTokenAndFailClosed(t *testing.T) {
+	t.Parallel()
+
+	original := bson.Raw{1, 2, 3, 4}
+	var saved bson.Raw
+
+	s := &Store{cfg: Config{
+		SaveResumeToken: func(_ context.Context, token bson.Raw) error {
+			saved = token
+
+			return nil
+		},
+	}}
+
+	require.NoError(t, s.saveResumeToken(context.Background(), original))
+	original[0] = 9
+	assert.Equal(t, bson.Raw{1, 2, 3, 4}, saved, "saved token must not share the driver's mutable buffer")
+
+	saveErr := errors.New("durable cursor write failed")
+	failOpenStore := &Store{cfg: Config{
+		SaveResumeToken: func(context.Context, bson.Raw) error {
+			return saveErr
+		},
+	}}
+	require.NoError(t, failOpenStore.saveResumeToken(context.Background(), bson.Raw{5}))
+
+	failClosedStore := &Store{cfg: Config{
+		SaveResumeToken: func(context.Context, bson.Raw) error {
+			return saveErr
+		},
+		ResumeTokenFailClosed: true,
+	}}
+	err := failClosedStore.saveResumeToken(context.Background(), bson.Raw{5})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errResumeTokenSaveFailed)
+	assert.ErrorIs(t, err, saveErr)
 }
 
 // TestIsIndexNotFoundErr_CommandError pins the canonical detection path:
