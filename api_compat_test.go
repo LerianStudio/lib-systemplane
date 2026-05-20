@@ -29,11 +29,12 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
 	"github.com/LerianStudio/lib-observability/log"
 	"github.com/LerianStudio/lib-observability/tracing"
-	"github.com/LerianStudio/lib-systemplane"
+	systemplane "github.com/LerianStudio/lib-systemplane"
 	"github.com/LerianStudio/lib-systemplane/admin"
 )
 
@@ -46,6 +47,7 @@ import (
 
 var (
 	_ systemplane.Client       // struct type
+	_ = systemplane.Client{}   // zero-value composite literal remains source-compatible
 	_ systemplane.ListEntry    // struct type (returned by List)
 	_ systemplane.RedactPolicy // enum type
 	_ systemplane.Option       // func type
@@ -102,6 +104,7 @@ var (
 	_ func(ctx context.Context, namespace, key string, value any, actor string) error = (*systemplane.Client)(nil).SetForTenant
 	_ func(ctx context.Context, namespace, key, actor string) error                   = (*systemplane.Client)(nil).DeleteForTenant
 	_ func(namespace, key string) []string                                            = (*systemplane.Client)(nil).ListTenantsForKey
+	_ func(ctx context.Context, namespace, key string) ([]string, error)              = (*systemplane.Client)(nil).ListTenantsForKeyContext
 
 	_ func(namespace, key string, fn func(ctx context.Context, namespace, key, tenantID string, newValue any)) (unsubscribe func()) = (*systemplane.Client)(nil).OnTenantChange
 
@@ -135,14 +138,20 @@ var (
 // ---------------------------------------------------------------------------
 
 var (
-	_ func(l log.Logger) systemplane.Option         = systemplane.WithLogger
-	_ func(t *tracing.Telemetry) systemplane.Option = systemplane.WithTelemetry
-	_ func(name string) systemplane.Option          = systemplane.WithListenChannel
-	_ func(d time.Duration) systemplane.Option      = systemplane.WithPollInterval
-	_ func(d time.Duration) systemplane.Option      = systemplane.WithDebounce
-	_ func(name string) systemplane.Option          = systemplane.WithCollection
-	_ func(name string) systemplane.Option          = systemplane.WithTable
-	_ func(maxEntries int) systemplane.Option       = systemplane.WithLazyTenantLoad
+	_ func(l log.Logger) systemplane.Option                                                                             = systemplane.WithLogger
+	_ func(t *tracing.Telemetry) systemplane.Option                                                                     = systemplane.WithTelemetry
+	_ func(name string) systemplane.Option                                                                              = systemplane.WithListenChannel
+	_ func(d time.Duration) systemplane.Option                                                                          = systemplane.WithPollInterval
+	_ func(d time.Duration) systemplane.Option                                                                          = systemplane.WithDebounce
+	_ func(name string) systemplane.Option                                                                              = systemplane.WithCollection
+	_ func(name string) systemplane.Option                                                                              = systemplane.WithTable
+	_ func() systemplane.Option                                                                                         = systemplane.WithStrictPostgresIsolation
+	_ func(maxEntries int) systemplane.Option                                                                           = systemplane.WithLazyTenantLoad
+	_ func() systemplane.Option                                                                                         = systemplane.WithTenantLazyFailClosed
+	_ func() systemplane.Option                                                                                         = systemplane.WithTenantLazyFailOpen
+	_ func(load func(context.Context) (bson.Raw, error), save func(context.Context, bson.Raw) error) systemplane.Option = systemplane.WithMongoResumeTokenStore
+	_ func() systemplane.Option                                                                                         = systemplane.WithMongoResumeTokenFailClosed
+	_ func() systemplane.Option                                                                                         = systemplane.WithTenantSchemaEnabled
 )
 
 // ---------------------------------------------------------------------------
@@ -185,12 +194,14 @@ var (
 	_ error = systemplane.ErrRegisterAfterStart
 	_ error = systemplane.ErrUnknownKey
 	_ error = systemplane.ErrValidation
+	_ error = systemplane.ErrNilContext
 	_ error = systemplane.ErrDuplicateKey
 
 	// Tenant-scoping sentinels (new in this feature).
 	_ error = systemplane.ErrMissingTenantContext
 	_ error = systemplane.ErrInvalidTenantID
 	_ error = systemplane.ErrTenantScopeNotRegistered
+	_ error = systemplane.ErrTenantSchemaNotEnabled
 )
 
 // ---------------------------------------------------------------------------

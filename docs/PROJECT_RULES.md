@@ -23,10 +23,11 @@ This document defines the coding standards, architecture patterns, and developme
 
 ```text
 lib-systemplane/
-├── (root package: systemplane)     # Client, register/get/set, subscribers, tenant-scoped accessors
+├── (root package: systemplane)     # Small public API facade (api_*.go)
 ├── admin/                          # Fiber HTTP handlers for runtime config management
 ├── systemplanetest/                # Backend-equivalence contract test suite
 └── internal/
+    ├── client/                     # Client lifecycle, register/get/set, subscribers, tenant APIs
     ├── store/                      # Backend-agnostic Store interface (private)
     ├── postgres/                   # PostgreSQL LISTEN/NOTIFY implementation
     ├── mongodb/                    # MongoDB change-stream (+ polling fallback) implementation

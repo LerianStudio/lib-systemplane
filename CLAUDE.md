@@ -19,15 +19,16 @@ This file provides repository-specific guidance for coding agents working on `li
 ## Repository shape
 
 Root (package `systemplane`):
-- `client.go`, `client_telemetry.go`, `client_testing.go`, `doc.go`, `errors.go`,
-  `get.go`, `metrics.go`, `onchange.go`, `options.go`, `redact.go`, `refresh.go`,
-  `register.go`, `set.go`, `tenant_cache.go`, `tenant_cache_lru.go`,
-  `tenant_hydration.go`, `tenant_onchange.go`, `tenant_scoped.go`,
-  `tenant_scoped_accessors.go`, `tenant_storage.go`
+- Small public API facade: `api_*.go` plus `doc.go`. Public types are aliases to
+  `internal/client` where practical so the root import path remains
+  `github.com/LerianStudio/lib-systemplane`.
 
 Subpackages:
 - `admin/` — Fiber HTTP handlers for the admin surface
 - `systemplanetest/` — contract suite shared by both backend implementations
+- `internal/client/` — Client implementation: lifecycle, registration, reads,
+  writes, subscriptions, telemetry, tenant cache/lazy/hydration, value cloning,
+  and unit tests that need implementation-private access
 - `internal/store/` — backend-agnostic `Store` interface (stays private)
 - `internal/postgres/` — pgx/v5 + LISTEN/NOTIFY
 - `internal/mongodb/` — mongo-driver/v2 + change streams (polling fallback)
