@@ -293,25 +293,31 @@ func (s *Store) ensureSchemaByKey(ctx context.Context, cacheKey string, run func
 
 	// runErr captures the error produced by this Do invocation (if any). A
 	// transient runSchema failure must NOT cache permanently — callers would
-	// be locked out of a healthy tenant for the lifetime of the process. We
-	// detect that case by inspecting the local var: if runSchema failed, we
-	// purge the once + err entries so the next ensureSchema call retries.
+	// be locked out of a healthy tenant for the lifetime of the process. The
+	// once entry is evicted on failure so the next ensureSchema call retries;
+	// the err tombstone is left in place so concurrent callers that joined
+	// the same once.Do can still observe the failure via schemaErr.Load
+	// below. It is cleared on the next successful bootstrap.
 	var runErr error
 
 	once.Do(func() {
 		runErr = run(ctx)
 		if runErr != nil {
-			// Persist the error for observability of concurrent callers that
-			// joined the same once.Do, then evict so the next attempt retries.
+			// Persist the error so concurrent callers that joined the same
+			// once.Do observe the failure via schemaErr.Load below. Evict the
+			// once entry so the next ensureSchema call retries. Do NOT delete
+			// the err tombstone here — that would race the concurrent callers
+			// joined to this Do and they would incorrectly return nil. The
+			// tombstone is cleared on the next successful bootstrap (see the
+			// success branch below).
 			s.schemaErr.Store(cacheKey, runErr)
 			s.schemaOnce.Delete(cacheKey)
-			s.schemaErr.Delete(cacheKey)
 
 			return
 		}
 
-		// Success — clear any stale error tombstone from a prior failed
-		// attempt (defensive; with the Delete above this is normally empty).
+		// Success — clear any stale error tombstone left by a prior failed
+		// attempt so subsequent callers observe success.
 		s.schemaErr.Delete(cacheKey)
 	})
 
@@ -322,8 +328,9 @@ func (s *Store) ensureSchemaByKey(ctx context.Context, cacheKey string, run func
 
 	// Either the closure ran successfully or it was already executed by a
 	// previous call. A non-empty schemaErr here means a concurrent caller
-	// ran the closure, saw it fail, and we joined the once.Do after their
-	// Store but before their Delete. Return that error.
+	// ran the closure and saw it fail; we joined the same once.Do but our
+	// local runErr is nil because we did not execute the closure. Return
+	// the stored error so we do not mask the bootstrap failure.
 	if errVal, ok := s.schemaErr.Load(cacheKey); ok {
 		if err, _ := errVal.(error); err != nil {
 			return err

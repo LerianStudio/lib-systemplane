@@ -226,17 +226,21 @@ func TestEnsureSchema_TransientFailureRetries(t *testing.T) {
 		t.Fatal("first ensureSchemaByKey: expected error, got nil")
 	}
 
-	// The once/err entries must have been evicted so the next call retries.
+	// The once entry must have been evicted so the next call retries. The
+	// err tombstone is intentionally left in place after a failed run so
+	// that concurrent callers which joined the same once.Do can still
+	// observe the failure; it is cleared on the next successful bootstrap.
 	if _, exists := s.schemaOnce.Load(cacheKey); exists {
 		t.Error("schemaOnce should be evicted after a failed run")
 	}
 
-	if _, exists := s.schemaErr.Load(cacheKey); exists {
-		t.Error("schemaErr should be evicted after a failed run")
+	if _, exists := s.schemaErr.Load(cacheKey); !exists {
+		t.Error("schemaErr should remain after a failed run so concurrent callers observe it")
 	}
 
 	// Second call: stub now succeeds. Without the A4 fix the prior failure
-	// would have stuck and this assertion would fail.
+	// would have stuck and this assertion would fail. The success branch
+	// must also clear the residual schemaErr tombstone.
 	mu.Lock()
 	failNow = false
 	mu.Unlock()
@@ -245,12 +249,145 @@ func TestEnsureSchema_TransientFailureRetries(t *testing.T) {
 		t.Fatalf("second ensureSchemaByKey: %v", err)
 	}
 
+	// After a successful bootstrap the err tombstone must be cleared.
+	if _, exists := s.schemaErr.Load(cacheKey); exists {
+		t.Error("schemaErr should be cleared after a successful bootstrap")
+	}
+
 	mu.Lock()
 	gotCalls := calls
 	mu.Unlock()
 
 	if gotCalls != 2 {
 		t.Errorf("schemaRunner invocations = %d, want 2 (first failed, second succeeded)", gotCalls)
+	}
+}
+
+// TestEnsureSchema_ConcurrentCallersObserveFailure exercises the race where
+// many goroutines call ensureSchemaByKey concurrently against a runner that
+// fails. Only one goroutine executes the once.Do closure; all the others
+// joined the same once.Do and have a nil local runErr. They MUST still
+// observe the bootstrap failure via the schemaErr tombstone — otherwise the
+// failure is silently masked for every joined caller.
+//
+// Regression guard: an earlier implementation deleted the schemaErr tombstone
+// immediately after storing it inside the failure branch of the closure. That
+// created a window where joined callers reached schemaErr.Load() after the
+// store but before the delete (or after the delete, with the same masking
+// outcome) and returned nil. This test fans out enough goroutines, with a
+// runner that blocks just long enough to make the race observable.
+func TestEnsureSchema_ConcurrentCallersObserveFailure(t *testing.T) {
+	s := newSubscribeStore()
+
+	const (
+		cacheKey = "fake-db/fake-coll-concurrent"
+		workers  = 64
+	)
+
+	var (
+		calls   int
+		failNow bool
+		mu      sync.Mutex
+		release = make(chan struct{})
+	)
+
+	s.schemaRunner = func(_ context.Context, _ string) error {
+		mu.Lock()
+		calls++
+		fail := failNow
+		mu.Unlock()
+
+		if fail {
+			// Block so concurrent callers join the same once.Do before
+			// the closure resolves. Without this the test would not
+			// reliably exercise the join-after-store-but-before-delete
+			// race that the fix is guarding against.
+			<-release
+
+			return errTransient
+		}
+
+		return nil
+	}
+
+	// Round 1 — concurrent failure.
+	mu.Lock()
+	failNow = true
+	mu.Unlock()
+
+	var (
+		wg      sync.WaitGroup
+		results = make([]error, workers)
+	)
+
+	wg.Add(workers)
+
+	for i := 0; i < workers; i++ {
+		go func(idx int) {
+			defer wg.Done()
+
+			results[idx] = s.ensureSchemaByKey(context.Background(), cacheKey, nil)
+		}(i)
+	}
+
+	// Give the worker goroutines time to all join the same once.Do.
+	time.Sleep(50 * time.Millisecond)
+
+	close(release)
+	wg.Wait()
+
+	for i, err := range results {
+		if err == nil {
+			t.Errorf("worker %d: expected failure error, got nil — concurrent caller masked the bootstrap failure", i)
+		}
+	}
+
+	mu.Lock()
+	roundOneCalls := calls
+	mu.Unlock()
+
+	if roundOneCalls != 1 {
+		t.Errorf("runner invocations during failure round = %d, want 1 (single Do execution)", roundOneCalls)
+	}
+
+	// Round 2 — runner now succeeds; the cached err tombstone must be
+	// cleared and the retry must run the runner exactly once more.
+	mu.Lock()
+	failNow = false
+	mu.Unlock()
+
+	wg = sync.WaitGroup{}
+	results = make([]error, workers)
+
+	wg.Add(workers)
+
+	for i := 0; i < workers; i++ {
+		go func(idx int) {
+			defer wg.Done()
+
+			results[idx] = s.ensureSchemaByKey(context.Background(), cacheKey, nil)
+		}(i)
+	}
+
+	wg.Wait()
+
+	for i, err := range results {
+		if err != nil {
+			t.Errorf("worker %d: unexpected error on retry round: %v", i, err)
+		}
+	}
+
+	mu.Lock()
+	roundTwoCalls := calls - roundOneCalls
+	mu.Unlock()
+
+	if roundTwoCalls != 1 {
+		t.Errorf("runner invocations during retry round = %d, want 1 (single Do execution after eviction)", roundTwoCalls)
+	}
+
+	// schemaErr tombstone must be cleared after the successful round.
+	if _, exists := s.schemaErr.Load(cacheKey); exists {
+		t.Error("schemaErr should be cleared after a successful bootstrap")
 	}
 }
 
