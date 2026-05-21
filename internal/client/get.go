@@ -67,13 +67,13 @@ func (c *Client) Get(ctx context.Context, namespace, key string) (any, bool, err
 
 	var decoded any
 	if err := json.Unmarshal(entry.Value, &decoded); err != nil {
-		c.logWarn(ctx, "failed to unmarshal stored value, returning default",
+		c.logError(ctx, "failed to unmarshal stored value",
 			log.String("namespace", namespace),
 			log.String("key", key),
 			log.Err(err),
 		)
 
-		return cloneValue(def.defaultValue), true, nil
+		return nil, false, fmt.Errorf("systemplane: decode value for %s/%s: %w", namespace, key, err)
 	}
 
 	return decoded, true, nil
@@ -297,14 +297,16 @@ func (c *Client) listFromStore(ctx context.Context, namespace string, keys []nsk
 		if raw, ok := storedByKey[nk.Key]; ok {
 			var decoded any
 			if err := json.Unmarshal(raw, &decoded); err != nil {
-				c.logWarn(ctx, "failed to unmarshal stored value, using default",
+				c.logError(ctx, "failed to unmarshal stored value",
 					log.String("namespace", namespace),
 					log.String("key", nk.Key),
 					log.Err(err),
 				)
-			} else {
-				val = decoded
+
+				return nil, fmt.Errorf("systemplane: decode value for %s/%s: %w", namespace, nk.Key, err)
 			}
+
+			val = decoded
 		}
 
 		entries = append(entries, ListEntry{

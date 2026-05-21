@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -146,8 +147,9 @@ func newClient(s store.Store, cfg clientConfig) *Client {
 
 	// cancel is intentionally stored on the Client (lifecycleCancel) and
 	// invoked from Close() to terminate dispatch goroutines and subscribers.
-	// gosec flags WithCancel calls whose cancel is not in a defer; that's
-	// the wrong heuristic for a long-lived lifecycle context.
+	// gosec G118 flags WithCancel calls whose cancel is not invoked via defer;
+	// that heuristic is wrong for a long-lived lifecycle context that Close()
+	// drives explicitly. Keep the directive — without it lint fails.
 	ctx, cancel := context.WithCancel(context.Background()) //nolint:gosec // lifecycle cancel released in Close
 
 	c := &Client{
@@ -328,6 +330,8 @@ func (c *Client) Close() error {
 		return nil
 	}
 
+	var closeErr error
+
 	c.closeOnce.Do(func() {
 		c.startMu.Lock()
 		defer c.startMu.Unlock()
@@ -348,11 +352,13 @@ func (c *Client) Close() error {
 		}
 
 		if c.store != nil {
-			_ = c.store.Close()
+			if err := c.store.Close(); err != nil {
+				closeErr = fmt.Errorf("systemplane: close store: %w", err)
+			}
 		}
 	})
 
-	return nil
+	return closeErr
 }
 
 // onEvent debounces a backend event by (namespace, key) and refreshes the
@@ -386,14 +392,6 @@ func (c *Client) refreshFromStore(nk nskey, op string) {
 
 		return
 	}
-
-	// Record that hydration's later List() pass MUST NOT overwrite this key:
-	// the changefeed has just delivered a fresher value (or a delete event).
-	c.hydratingMu.Lock()
-	if c.hydrating {
-		c.hydrationTouched[nk] = struct{}{}
-	}
-	c.hydratingMu.Unlock()
 
 	// Use the Client's lifecycle context as the parent so a Close() cancels
 	// the refresh and all downstream subscriber invocations.
@@ -434,6 +432,17 @@ func (c *Client) refreshFromStore(nk nskey, op string) {
 			newValue = decoded
 		}
 	}
+
+	// Record that hydration's later List() pass MUST NOT overwrite this key:
+	// the changefeed has just delivered a fresher value (or a delete event).
+	// We set this AFTER the refresh has produced a usable value — if Get or
+	// the JSON decode failed, we return above without touching the cache, so
+	// hydrate()'s List() snapshot remains the correct source of truth.
+	c.hydratingMu.Lock()
+	if c.hydrating && c.hydrationTouched != nil {
+		c.hydrationTouched[nk] = struct{}{}
+	}
+	c.hydratingMu.Unlock()
 
 	c.cacheMu.Lock()
 	c.cache[nk] = cloneValue(newValue)

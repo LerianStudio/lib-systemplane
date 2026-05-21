@@ -125,6 +125,14 @@ type Store struct {
 	schemaOnce sync.Map // map[string]*sync.Once
 	schemaErr  sync.Map // map[string]error
 
+	// schemaRunner allows unit tests to inject a runSchema replacement that
+	// fails on demand without standing up a live MongoDB. Production callers
+	// leave this nil; ensureSchema falls back to s.runSchema in that case.
+	//
+	// The signature uses an interface argument so tests don't need to
+	// construct a *mongo.Collection; we pass the cacheKey string instead.
+	schemaRunner func(ctx context.Context, cacheKey string) error
+
 	// subscriberMu / subscribers serve the single-tenant change-stream path.
 	subscriberMu sync.Mutex
 	subscribers  map[uint64]func(store.Event)
@@ -266,15 +274,56 @@ func schemaCacheKey(coll *mongo.Collection) string {
 func (s *Store) ensureSchema(ctx context.Context, coll *mongo.Collection) error {
 	cacheKey := schemaCacheKey(coll)
 
+	return s.ensureSchemaByKey(ctx, cacheKey, func(ctx context.Context) error {
+		return s.runSchema(ctx, coll)
+	})
+}
+
+// ensureSchemaByKey is the testable core of ensureSchema. It accepts a stable
+// cache key plus a runner closure so tests can drive the once/err cache via a
+// stubbed runSchema without standing up a real *mongo.Collection.
+func (s *Store) ensureSchemaByKey(ctx context.Context, cacheKey string, run func(context.Context) error) error {
+	if s.schemaRunner != nil {
+		// Test seam — replace the runner entirely.
+		run = func(ctx context.Context) error { return s.schemaRunner(ctx, cacheKey) }
+	}
+
 	onceVal, _ := s.schemaOnce.LoadOrStore(cacheKey, &sync.Once{})
 	once, _ := onceVal.(*sync.Once)
 
+	// runErr captures the error produced by this Do invocation (if any). A
+	// transient runSchema failure must NOT cache permanently — callers would
+	// be locked out of a healthy tenant for the lifetime of the process. We
+	// detect that case by inspecting the local var: if runSchema failed, we
+	// purge the once + err entries so the next ensureSchema call retries.
+	var runErr error
+
 	once.Do(func() {
-		if err := s.runSchema(ctx, coll); err != nil {
-			s.schemaErr.Store(cacheKey, err)
+		runErr = run(ctx)
+		if runErr != nil {
+			// Persist the error for observability of concurrent callers that
+			// joined the same once.Do, then evict so the next attempt retries.
+			s.schemaErr.Store(cacheKey, runErr)
+			s.schemaOnce.Delete(cacheKey)
+			s.schemaErr.Delete(cacheKey)
+
+			return
 		}
+
+		// Success — clear any stale error tombstone from a prior failed
+		// attempt (defensive; with the Delete above this is normally empty).
+		s.schemaErr.Delete(cacheKey)
 	})
 
+	if runErr != nil {
+		// This goroutine ran the closure and observed the failure directly.
+		return runErr
+	}
+
+	// Either the closure ran successfully or it was already executed by a
+	// previous call. A non-empty schemaErr here means a concurrent caller
+	// ran the closure, saw it fail, and we joined the once.Do after their
+	// Store but before their Delete. Return that error.
 	if errVal, ok := s.schemaErr.Load(cacheKey); ok {
 		if err, _ := errVal.(error); err != nil {
 			return err

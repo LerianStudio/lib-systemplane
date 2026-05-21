@@ -23,6 +23,11 @@ import (
 type fakeStore struct {
 	mu      sync.Mutex
 	entries map[string]systemplane.TestEntry
+
+	// lastDeleteActor records the actor argument passed to the most recent
+	// Delete call so tests can assert the admin handler forwarded the
+	// actor-extractor output all the way to the store.
+	lastDeleteActor string
 }
 
 func newFakeStore() *fakeStore {
@@ -52,13 +57,23 @@ func (f *fakeStore) Set(_ context.Context, e systemplane.TestEntry) error {
 	return nil
 }
 
-func (f *fakeStore) Delete(_ context.Context, ns, key, _ string) error {
+func (f *fakeStore) Delete(_ context.Context, ns, key, actor string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	f.lastDeleteActor = actor
 	delete(f.entries, fakeKey(ns, key))
 
 	return nil
+}
+
+// LastDeleteActor returns the actor captured by the most recent Delete call.
+// Locked-read so callers see a consistent value alongside the entries map.
+func (f *fakeStore) LastDeleteActor() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.lastDeleteActor
 }
 
 func (f *fakeStore) List(_ context.Context) ([]systemplane.TestEntry, error) {
@@ -235,10 +250,16 @@ func TestAdmin_Delete(t *testing.T) {
 	resp.Body.Close()
 
 	// Assert the admin handler propagated the actor extractor's value all the
-	// way through to Delete (we can only observe the side effect — the row
-	// is gone from the backing store).
+	// way through to Delete. The previous version of this test only observed
+	// the row-removed side effect; that would also pass for a handler that
+	// silently dropped the actor. Capturing it on the store eliminates that
+	// gap and pins the admin handler ↔ store contract.
 	if _, ok, _ := store.Get(context.Background(), "ns", "k"); ok {
 		t.Error("post-delete: entry still present in backing store")
+	}
+
+	if got := store.LastDeleteActor(); got != "tester" {
+		t.Errorf("Delete actor = %q, want %q (admin handler did not forward extractor output)", got, "tester")
 	}
 }
 

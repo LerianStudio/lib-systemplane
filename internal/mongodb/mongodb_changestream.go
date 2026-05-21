@@ -52,39 +52,41 @@ func (s *Store) Subscribe(ctx context.Context, fn func(store.Event)) (func(), er
 	s.subscribers[id] = fn
 	s.subscriberMu.Unlock()
 
+	// cancelCh stops the optional ctx-observer goroutine below. We gate every
+	// teardown action (subscriber removal + cancelCh close) through a single
+	// sync.Once so that concurrent invocations — for example a caller-driven
+	// unsubscribe racing with ctx.Done() — never double-close the channel and
+	// never delete the subscriber slot twice.
+	cancelCh := make(chan struct{})
+
 	var once sync.Once
 
-	unsubscribe := func() {
+	teardown := func() {
 		once.Do(func() {
 			s.subscriberMu.Lock()
 			delete(s.subscribers, id)
 			s.subscriberMu.Unlock()
+
+			close(cancelCh)
 		})
 	}
 
 	// Honor the caller's lifetime ctx: when it cancels, remove the handler
-	// automatically so a forgotten unsubscribe does not leak the entry. The
-	// goroutine exits either on ctx cancellation or when the caller invokes
-	// unsubscribe directly (the cancel chan is closed by unsubscribe below).
-	cancelCh := make(chan struct{})
+	// automatically so a forgotten unsubscribe does not leak the entry. We
+	// only spawn the observer when ctx is non-nil — a nil ctx would panic on
+	// ctx.Done(). Callers passing a nil ctx receive an unsubscribe func that
+	// works exactly the same.
+	if ctx != nil {
+		go func() {
+			select {
+			case <-ctx.Done():
+				teardown()
+			case <-cancelCh:
+			}
+		}()
+	}
 
-	go func() {
-		select {
-		case <-ctx.Done():
-			unsubscribe()
-		case <-cancelCh:
-		}
-	}()
-
-	return func() {
-		unsubscribe()
-		// Stop the watcher goroutine so it doesn't outlive the subscription.
-		select {
-		case <-cancelCh:
-		default:
-			close(cancelCh)
-		}
-	}, nil
+	return teardown, nil
 }
 
 func (s *Store) startListener(_ context.Context) error {

@@ -22,3 +22,11 @@ func (c *Client) logDebug(ctx context.Context, msg string, fields ...log.Field) 
 
 	c.logger.Log(ctx, log.LevelDebug, msg, fields...)
 }
+
+func (c *Client) logError(ctx context.Context, msg string, fields ...log.Field) {
+	if c == nil || c.logger == nil {
+		return
+	}
+
+	c.logger.Log(ctx, log.LevelError, msg, fields...)
+}

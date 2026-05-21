@@ -744,6 +744,90 @@ func TestStartAndCloseAreMutuallyExclusive(t *testing.T) {
 	}
 }
 
+// A6 — Get on a multi-tenant read-through path must NOT swallow corrupted
+// JSON. Previously the decode failure was logged at warn level and the call
+// returned (default, true, nil), making malformed data indistinguishable from
+// a missing row. The fix surfaces the decode error to the caller so corruption
+// is visible — the test wires the multiTenant memStore with raw bytes that are
+// invalid JSON and asserts (nil, false, err).
+func TestGetReturnsErrorOnCorruptedJSON(t *testing.T) {
+	m := newMemStore(true)
+	c := newMultiTenantClient(t, m)
+
+	if err := c.Register("ns", "k", "default"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	defer c.Close()
+
+	// Plant invalid JSON directly into the store so the read-through path
+	// hits the decode failure on Get.
+	m.mu.Lock()
+	m.entries[memKey("ns", "k")] = store.Entry{
+		Namespace: "ns",
+		Key:       "k",
+		Value:     []byte("{not valid json"),
+	}
+	m.mu.Unlock()
+
+	v, ok, err := c.Get(context.Background(), "ns", "k")
+	if err == nil {
+		t.Fatal("expected decode error, got nil")
+	}
+
+	if ok {
+		t.Errorf("ok = true, want false on decode failure (got %v)", v)
+	}
+
+	if v != nil {
+		t.Errorf("value = %v, want nil on decode failure", v)
+	}
+}
+
+// A6 — List on the multi-tenant path must surface decode errors rather than
+// silently swapping in the registered default. We plant invalid JSON for one
+// of the registered keys and assert List returns an error.
+func TestListReturnsErrorOnCorruptedJSON(t *testing.T) {
+	m := newMemStore(true)
+	c := newMultiTenantClient(t, m)
+
+	if err := c.Register("ns", "good", "default-good"); err != nil {
+		t.Fatalf("register good: %v", err)
+	}
+
+	if err := c.Register("ns", "bad", "default-bad"); err != nil {
+		t.Fatalf("register bad: %v", err)
+	}
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	defer c.Close()
+
+	// Plant a valid entry and an invalid one.
+	m.mu.Lock()
+	m.entries[memKey("ns", "good")] = store.Entry{
+		Namespace: "ns",
+		Key:       "good",
+		Value:     []byte(`"ok"`),
+	}
+	m.entries[memKey("ns", "bad")] = store.Entry{
+		Namespace: "ns",
+		Key:       "bad",
+		Value:     []byte("{garbage"),
+	}
+	m.mu.Unlock()
+
+	if _, err := c.List(context.Background(), "ns"); err == nil {
+		t.Fatal("expected List to return decode error, got nil")
+	}
+}
+
 // Item #9: Hydration must not overwrite fresher changefeed state. We seed a
 // row, then between Subscribe registration and List() completion we force a
 // change event to fire for the same key with a newer value. The expected
