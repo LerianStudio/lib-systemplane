@@ -397,3 +397,92 @@ var errTransient = errFakeTransient("transient runSchema failure")
 type errFakeTransient string
 
 func (e errFakeTransient) Error() string { return string(e) }
+
+// boundaryDedupHit is the pure discrimination rule extracted from pollOnce.
+// Testing it in isolation pins the behavior we care about — same (ns, key) at
+// the boundary ms with the SAME value is an idempotent rewrite (skip); with a
+// DIFFERENT value it is a real write that MUST emit. The polling integration
+// test exercises the surrounding cursor/IO machinery; the unit tests here
+// guard the decision rule itself so a refactor cannot regress it silently.
+func TestBoundaryDedupHit_DecisionRule(t *testing.T) {
+	hV1 := hashValue(`"v1"`)
+	hV2 := hashValue(`"v2"`)
+	nk := nsKey{Namespace: "ns", Key: "k"}
+
+	tests := []struct {
+		name       string
+		prevSeen   map[nsKey]seenEntry
+		atBoundary bool
+		valueHash  uint64
+		want       bool
+	}{
+		{
+			name:       "not at boundary — never dedup",
+			prevSeen:   map[nsKey]seenEntry{nk: {valueHash: hV1}},
+			atBoundary: false,
+			valueHash:  hV1,
+			want:       false,
+		},
+		{
+			name:       "at boundary, key not yet seen — emit",
+			prevSeen:   map[nsKey]seenEntry{},
+			atBoundary: true,
+			valueHash:  hV1,
+			want:       false,
+		},
+		{
+			name:       "at boundary, key seen with same value — skip (idempotent rewrite)",
+			prevSeen:   map[nsKey]seenEntry{nk: {valueHash: hV1}},
+			atBoundary: true,
+			valueHash:  hV1,
+			want:       true,
+		},
+		{
+			name:       "at boundary, key seen with different value — emit (real rewrite at same ms)",
+			prevSeen:   map[nsKey]seenEntry{nk: {valueHash: hV1}},
+			atBoundary: true,
+			valueHash:  hV2,
+			want:       false,
+		},
+		{
+			name:       "at boundary, nil prevSeen map — emit",
+			prevSeen:   nil,
+			atBoundary: true,
+			valueHash:  hV1,
+			want:       false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := boundaryDedupHit(tt.prevSeen, nk, tt.atBoundary, tt.valueHash)
+			if got != tt.want {
+				t.Fatalf("boundaryDedupHit = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestHashValue_Stability locks the contract that hashValue is deterministic
+// across calls and discriminates between distinct payloads. The dedup logic
+// relies on both properties — non-determinism would re-emit forever, and
+// collision would re-introduce the silent-skip bug for any pair that
+// collides. (Random pair collisions in a 64-bit FNV space are astronomically
+// rare for our payloads, but we pin the basic discrimination here.)
+func TestHashValue_Stability(t *testing.T) {
+	a := hashValue(`{"foo":"bar"}`)
+	b := hashValue(`{"foo":"bar"}`)
+	c := hashValue(`{"foo":"baz"}`)
+
+	if a != b {
+		t.Fatalf("hashValue is not deterministic: %d != %d", a, b)
+	}
+
+	if a == c {
+		t.Fatalf("hashValue collided on distinct payloads: %d == %d", a, c)
+	}
+
+	if hashValue("") == hashValue(" ") {
+		t.Fatalf("hashValue did not distinguish empty from whitespace payload")
+	}
+}
