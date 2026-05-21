@@ -140,10 +140,11 @@ func TestIntegration_MongoDBMultiTenantIsolation(t *testing.T) {
 }
 
 func TestIntegration_MongoDBMultiTenantMissingCtx(t *testing.T) {
-	client, cleanup := startContainer(t)
-	t.Cleanup(cleanup)
-	_ = client
-
+	// This test only exercises the "missing tenant context" path: no real
+	// Mongo client is required because resolveCollection short-circuits on
+	// the missing tmcore.GetMBContext before touching any database. Starting
+	// a container here just adds 5+ seconds and a Docker dependency for a
+	// purely in-process assertion.
 	s, err := mongodb.New(mongodb.Config{
 		MultiTenantEnabled: true,
 		Module:             "systemplane",

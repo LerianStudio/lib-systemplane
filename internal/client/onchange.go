@@ -49,8 +49,11 @@ func (c *Client) OnChange(namespace, key string, fn func(ctx context.Context, ns
 	c.subsMu.Lock()
 	c.subscribers[nk] = append(c.subscribers[nk], subscription{
 		id: id,
-		fn: func(newValue any) {
-			fn(context.Background(), namespace, key, newValue)
+		// ctx is the Client's lifecycle context (passed in by fireSubscribers);
+		// callbacks receive cancellation when the Client shuts down. Falling
+		// back to context.Background() here would defeat that propagation.
+		fn: func(ctx context.Context, newValue any) {
+			fn(ctx, namespace, key, newValue)
 		},
 	})
 	c.subsMu.Unlock()

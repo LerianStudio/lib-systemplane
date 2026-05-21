@@ -79,19 +79,32 @@ func (c *Client) Get(ctx context.Context, namespace, key string) (any, bool, err
 	return decoded, true, nil
 }
 
-// GetString returns the value as a string, or "" on miss/type mismatch/error.
+// GetString returns the value as a string.
+//
+// When the stored value is not a string, returns (zero, false, ErrValidation)
+// so callers can distinguish a missing/typed-incompatible value from a
+// legitimate empty string. Callers that only care about success can check the
+// second return.
 func (c *Client) GetString(ctx context.Context, namespace, key string) (string, bool, error) {
 	v, ok, err := c.Get(ctx, namespace, key)
 	if err != nil || !ok {
 		return "", ok, err
 	}
 
-	s, _ := v.(string)
+	s, isString := v.(string)
+	if !isString {
+		return "", false, fmt.Errorf("%w: %s/%s: stored value is %T, want string", ErrValidation, namespace, key, v)
+	}
 
 	return s, true, nil
 }
 
 // GetInt returns the value as an int64.
+//
+// Accepts int, int64, and integer-valued float64 (JSON-decoded numbers).
+// Fractional float64 values, strings, and other types fail conversion and
+// return (0, false, ErrValidation). This avoids silently truncating
+// fractional input or returning 0 for a malformed value.
 func (c *Client) GetInt(ctx context.Context, namespace, key string) (int64, bool, error) {
 	v, ok, err := c.Get(ctx, namespace, key)
 	if err != nil || !ok {
@@ -104,37 +117,61 @@ func (c *Client) GetInt(ctx context.Context, namespace, key string) (int64, bool
 	case int64:
 		return n, true, nil
 	case float64:
+		// JSON decodes all numbers as float64. Reject any value that would
+		// lose precision when truncated to int64 (NaN, Inf, fractional).
+		if n != float64(int64(n)) {
+			return 0, false, fmt.Errorf("%w: %s/%s: stored value %v is not an integer", ErrValidation, namespace, key, n)
+		}
+
 		return int64(n), true, nil
 	default:
-		return 0, true, nil
+		return 0, false, fmt.Errorf("%w: %s/%s: stored value is %T, want int", ErrValidation, namespace, key, v)
 	}
 }
 
 // GetBool returns the value as a bool.
+//
+// Returns (false, false, ErrValidation) when the stored value is not a bool.
 func (c *Client) GetBool(ctx context.Context, namespace, key string) (bool, bool, error) {
 	v, ok, err := c.Get(ctx, namespace, key)
 	if err != nil || !ok {
 		return false, ok, err
 	}
 
-	b, _ := v.(bool)
+	b, isBool := v.(bool)
+	if !isBool {
+		return false, false, fmt.Errorf("%w: %s/%s: stored value is %T, want bool", ErrValidation, namespace, key, v)
+	}
 
 	return b, true, nil
 }
 
 // GetFloat64 returns the value as a float64.
+//
+// Returns (0, false, ErrValidation) when the stored value is not a number.
 func (c *Client) GetFloat64(ctx context.Context, namespace, key string) (float64, bool, error) {
 	v, ok, err := c.Get(ctx, namespace, key)
 	if err != nil || !ok {
 		return 0, ok, err
 	}
 
-	f, _ := v.(float64)
-
-	return f, true, nil
+	switch n := v.(type) {
+	case float64:
+		return n, true, nil
+	case int:
+		return float64(n), true, nil
+	case int64:
+		return float64(n), true, nil
+	default:
+		return 0, false, fmt.Errorf("%w: %s/%s: stored value is %T, want float64", ErrValidation, namespace, key, v)
+	}
 }
 
 // GetDuration returns the value as a time.Duration.
+//
+// Accepts time.Duration, parseable duration string (e.g. "30s"), and integer
+// float64 nanoseconds. All other shapes — including unparseable strings —
+// return (0, false, ErrValidation).
 func (c *Client) GetDuration(ctx context.Context, namespace, key string) (time.Duration, bool, error) {
 	v, ok, err := c.Get(ctx, namespace, key)
 	if err != nil || !ok {
@@ -147,17 +184,15 @@ func (c *Client) GetDuration(ctx context.Context, namespace, key string) (time.D
 	case string:
 		parsed, parseErr := time.ParseDuration(d)
 		if parseErr != nil {
-			// Intentionally swallow the parse error: the typed accessors
-			// return zero values for type/format mismatches and let the
-			// caller treat the second return as the source of truth.
-			return 0, true, nil //nolint:nilerr // explicit fallback to zero on bad string
+			return 0, false, fmt.Errorf("%w: %s/%s: cannot parse %q as duration: %w",
+				ErrValidation, namespace, key, d, parseErr)
 		}
 
 		return parsed, true, nil
 	case float64:
 		return time.Duration(int64(d)), true, nil
 	default:
-		return 0, true, nil
+		return 0, false, fmt.Errorf("%w: %s/%s: stored value is %T, want time.Duration", ErrValidation, namespace, key, v)
 	}
 }
 

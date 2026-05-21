@@ -78,7 +78,7 @@ func (f *fakeStore) Subscribe(_ context.Context, _ func(systemplane.TestEvent)) 
 	return func() {}, nil
 }
 
-func setupClient(t *testing.T, register func(c *systemplane.Client) error) *systemplane.Client {
+func setupClient(t *testing.T, register func(c *systemplane.Client) error) (*systemplane.Client, *fakeStore) {
 	t.Helper()
 
 	store := newFakeStore()
@@ -100,7 +100,7 @@ func setupClient(t *testing.T, register func(c *systemplane.Client) error) *syst
 
 	t.Cleanup(func() { _ = c.Close() })
 
-	return c
+	return c, store
 }
 
 func mountAndRun(t *testing.T, c *systemplane.Client, opts ...admin.MountOption) *fiber.App {
@@ -134,7 +134,7 @@ func doRequest(t *testing.T, app *fiber.App, method, path, body string) *http.Re
 }
 
 func TestAdmin_GetOne(t *testing.T) {
-	c := setupClient(t, func(c *systemplane.Client) error {
+	c, _ := setupClient(t, func(c *systemplane.Client) error {
 		return c.Register("ns", "k", "default")
 	})
 
@@ -168,7 +168,7 @@ func TestAdmin_GetOne(t *testing.T) {
 }
 
 func TestAdmin_GetNotFound(t *testing.T) {
-	c := setupClient(t, nil)
+	c, _ := setupClient(t, nil)
 	app := mountAndRun(t, c)
 
 	resp := doRequest(t, app, http.MethodGet, "/system/ns/k", "")
@@ -180,7 +180,7 @@ func TestAdmin_GetNotFound(t *testing.T) {
 }
 
 func TestAdmin_PutCreatesEntry(t *testing.T) {
-	c := setupClient(t, func(c *systemplane.Client) error {
+	c, _ := setupClient(t, func(c *systemplane.Client) error {
 		return c.Register("ns", "k", "default")
 	})
 
@@ -200,7 +200,7 @@ func TestAdmin_PutCreatesEntry(t *testing.T) {
 }
 
 func TestAdmin_PutUnknownKey(t *testing.T) {
-	c := setupClient(t, nil)
+	c, _ := setupClient(t, nil)
 	app := mountAndRun(t, c)
 
 	resp := doRequest(t, app, http.MethodPut, "/system/ns/unregistered", `{"value":1}`)
@@ -212,12 +212,17 @@ func TestAdmin_PutUnknownKey(t *testing.T) {
 }
 
 func TestAdmin_Delete(t *testing.T) {
-	c := setupClient(t, func(c *systemplane.Client) error {
+	c, store := setupClient(t, func(c *systemplane.Client) error {
 		return c.Register("ns", "k", "default")
 	})
 
 	if err := c.Set(context.Background(), "ns", "k", "set", "actor"); err != nil {
 		t.Fatalf("set: %v", err)
+	}
+
+	// Sanity check: the value reached the backing store via the write path.
+	if _, ok, _ := store.Get(context.Background(), "ns", "k"); !ok {
+		t.Fatal("pre-delete: entry missing from backing store")
 	}
 
 	app := mountAndRun(t, c)
@@ -228,15 +233,30 @@ func TestAdmin_Delete(t *testing.T) {
 	}
 
 	resp.Body.Close()
+
+	// Assert the admin handler propagated the actor extractor's value all the
+	// way through to Delete (we can only observe the side effect — the row
+	// is gone from the backing store).
+	if _, ok, _ := store.Get(context.Background(), "ns", "k"); ok {
+		t.Error("post-delete: entry still present in backing store")
+	}
 }
 
 func TestAdmin_ListNamespace(t *testing.T) {
-	c := setupClient(t, func(c *systemplane.Client) error {
+	// Seed two namespaces — only `ns` should appear in the `ns` listing.
+	// A second namespace (`other`) with its own key exercises the filter and
+	// would silently leak through if the handler returned every registered
+	// key instead of just the requested namespace.
+	c, _ := setupClient(t, func(c *systemplane.Client) error {
 		if err := c.Register("ns", "a", "1"); err != nil {
 			return err
 		}
 
-		return c.Register("ns", "b", "2")
+		if err := c.Register("ns", "b", "2"); err != nil {
+			return err
+		}
+
+		return c.Register("other", "leak", "should-not-appear")
 	})
 
 	app := mountAndRun(t, c)
@@ -250,7 +270,8 @@ func TestAdmin_ListNamespace(t *testing.T) {
 	resp.Body.Close()
 
 	var got struct {
-		Entries []struct {
+		Namespace string `json:"namespace"`
+		Entries   []struct {
 			Key string `json:"key"`
 		} `json:"entries"`
 	}
@@ -259,13 +280,23 @@ func TestAdmin_ListNamespace(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 
+	if got.Namespace != "ns" {
+		t.Errorf("namespace = %q, want ns", got.Namespace)
+	}
+
 	if len(got.Entries) != 2 {
-		t.Errorf("entries = %d, want 2", len(got.Entries))
+		t.Fatalf("entries = %d, want 2", len(got.Entries))
+	}
+
+	for _, e := range got.Entries {
+		if e.Key == "leak" {
+			t.Errorf("entry from other namespace leaked into ns listing: %q", e.Key)
+		}
 	}
 }
 
 func TestAdmin_DenyByDefault(t *testing.T) {
-	c := setupClient(t, nil)
+	c, _ := setupClient(t, nil)
 
 	app := fiber.New(fiber.Config{DisableStartupMessage: true})
 	// Mount WITHOUT WithAuthorizer — should deny.
@@ -280,7 +311,7 @@ func TestAdmin_DenyByDefault(t *testing.T) {
 }
 
 func TestAdmin_CustomPrefix(t *testing.T) {
-	c := setupClient(t, func(c *systemplane.Client) error {
+	c, _ := setupClient(t, func(c *systemplane.Client) error {
 		return c.Register("ns", "k", "default")
 	})
 

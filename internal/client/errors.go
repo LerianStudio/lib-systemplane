@@ -20,8 +20,12 @@ var (
 	// ErrUnknownKey is returned when Get or Set references an unregistered key.
 	ErrUnknownKey = errors.New("systemplane: unknown key")
 
-	// ErrValidation is returned when a value fails its registered validator.
-	ErrValidation = errors.New("systemplane: validation failed")
+	// ErrValidation is returned when a value fails its registered validator,
+	// when a backend rejects structural preconditions (empty namespace, empty
+	// key), or when a typed accessor cannot coerce the stored value to the
+	// requested Go type. Aliased to store.ErrValidation so the same sentinel
+	// is recognized whether it originates in the client layer or a backend.
+	ErrValidation = store.ErrValidation
 
 	// ErrNilContext is returned when a method that requires a live context is
 	// called with a nil context.

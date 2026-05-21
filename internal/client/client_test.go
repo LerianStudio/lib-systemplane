@@ -4,6 +4,7 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"testing"
@@ -24,6 +25,10 @@ type memStore struct {
 	nextID uint64
 
 	multiTenant bool
+
+	// listHook is invoked at the top of List(), allowing tests to block
+	// hydration to inject race conditions deterministically. nil disables it.
+	listHook func()
 }
 
 func newMemStore(multiTenant bool) *memStore {
@@ -32,6 +37,13 @@ func newMemStore(multiTenant bool) *memStore {
 		subs:        make(map[uint64]func(store.Event)),
 		multiTenant: multiTenant,
 	}
+}
+
+// newMemStoreWithListHook returns a memStore whose List() pauses at the
+// listHook callback set by the test. Used to deterministically inject a
+// changefeed event during the hydrate() window.
+func newMemStoreWithListHook(multiTenant bool) *memStore {
+	return newMemStore(multiTenant)
 }
 
 func memKey(ns, key string) string { return ns + "\x00" + key }
@@ -67,6 +79,16 @@ func (m *memStore) Delete(_ context.Context, ns, key, _ string) error {
 }
 
 func (m *memStore) List(_ context.Context) ([]store.Entry, error) {
+	// Capture and invoke the hook outside the lock so the hook itself can
+	// touch m.* (e.g., set/fire) without deadlock.
+	m.mu.Lock()
+	hook := m.listHook
+	m.mu.Unlock()
+
+	if hook != nil {
+		hook()
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -507,5 +529,292 @@ func TestConstructorAllowsNilInMultiTenantMode(t *testing.T) {
 
 	if c2 != nil {
 		_ = c2.Close()
+	}
+}
+
+// Item #7: typed accessors must surface ErrValidation on type mismatch
+// instead of returning (zero, true, nil) — that previous shape silently
+// turned malformed data into a valid zero value.
+
+func TestGetIntRejectsFractionalFloat(t *testing.T) {
+	m := newMemStore(false)
+	c := newSingleTenantClient(t, m)
+
+	if err := c.Register("ns", "k", 0); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	defer c.Close()
+
+	if err := c.Set(context.Background(), "ns", "k", 1.5, "actor"); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+
+	v, ok, err := c.GetInt(context.Background(), "ns", "k")
+	if ok {
+		t.Errorf("ok = true, want false for fractional value (got %v)", v)
+	}
+
+	if !errors.Is(err, ErrValidation) {
+		t.Errorf("err = %v, want ErrValidation", err)
+	}
+}
+
+func TestGetStringRejectsNonString(t *testing.T) {
+	m := newMemStore(false)
+	c := newSingleTenantClient(t, m)
+
+	if err := c.Register("ns", "k", "default"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	defer c.Close()
+
+	if err := c.Set(context.Background(), "ns", "k", 42, "actor"); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+
+	v, ok, err := c.GetString(context.Background(), "ns", "k")
+	if ok {
+		t.Errorf("ok = true, want false for non-string (got %q)", v)
+	}
+
+	if !errors.Is(err, ErrValidation) {
+		t.Errorf("err = %v, want ErrValidation", err)
+	}
+}
+
+func TestGetBoolRejectsNonBool(t *testing.T) {
+	m := newMemStore(false)
+	c := newSingleTenantClient(t, m)
+
+	if err := c.Register("ns", "k", false); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	defer c.Close()
+
+	if err := c.Set(context.Background(), "ns", "k", "not-a-bool", "actor"); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+
+	_, ok, err := c.GetBool(context.Background(), "ns", "k")
+	if ok {
+		t.Error("ok = true, want false for non-bool")
+	}
+
+	if !errors.Is(err, ErrValidation) {
+		t.Errorf("err = %v, want ErrValidation", err)
+	}
+}
+
+func TestGetDurationRejectsUnparseableString(t *testing.T) {
+	m := newMemStore(false)
+	c := newSingleTenantClient(t, m)
+
+	if err := c.Register("ns", "k", time.Second); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	defer c.Close()
+
+	if err := c.Set(context.Background(), "ns", "k", "not-a-duration", "actor"); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+
+	_, ok, err := c.GetDuration(context.Background(), "ns", "k")
+	if ok {
+		t.Error("ok = true, want false for unparseable string")
+	}
+
+	if !errors.Is(err, ErrValidation) {
+		t.Errorf("err = %v, want ErrValidation", err)
+	}
+}
+
+func TestGetDurationAcceptsParseableString(t *testing.T) {
+	m := newMemStore(false)
+	c := newSingleTenantClient(t, m)
+
+	if err := c.Register("ns", "k", time.Second); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	defer c.Close()
+
+	if err := c.Set(context.Background(), "ns", "k", "250ms", "actor"); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+
+	d, ok, err := c.GetDuration(context.Background(), "ns", "k")
+	if err != nil || !ok {
+		t.Fatalf("get duration: ok=%v err=%v", ok, err)
+	}
+
+	if d != 250*time.Millisecond {
+		t.Errorf("duration = %v, want 250ms", d)
+	}
+}
+
+func TestGetFloat64RejectsNonNumber(t *testing.T) {
+	m := newMemStore(false)
+	c := newSingleTenantClient(t, m)
+
+	if err := c.Register("ns", "k", 0.0); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	defer c.Close()
+
+	if err := c.Set(context.Background(), "ns", "k", "not-a-number", "actor"); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+
+	_, ok, err := c.GetFloat64(context.Background(), "ns", "k")
+	if ok {
+		t.Error("ok = true, want false for non-number")
+	}
+
+	if !errors.Is(err, ErrValidation) {
+		t.Errorf("err = %v, want ErrValidation", err)
+	}
+}
+
+// Item #8: Start and Close must be mutually exclusive. With the previous
+// implementation a concurrent Close could slip in mid-Start because Close
+// did not take startMu. This race test runs many parallel Start/Close pairs
+// — under -race it would have detected the missing synchronization on
+// storeUnsubscribe / debouncer / store. The bar here is "no race, no panic,
+// no deadlock".
+func TestStartAndCloseAreMutuallyExclusive(t *testing.T) {
+	const iterations = 50
+
+	for i := 0; i < iterations; i++ {
+		m := newMemStore(false)
+		c := newSingleTenantClient(t, m)
+
+		if err := c.Register("ns", "k", "default"); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+
+		var wg sync.WaitGroup
+
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			_ = c.Start(context.Background())
+		}()
+
+		go func() {
+			defer wg.Done()
+			_ = c.Close()
+		}()
+
+		wg.Wait()
+
+		// A subsequent Close must always be a no-op and never panic.
+		if err := c.Close(); err != nil {
+			t.Fatalf("repeat close: %v", err)
+		}
+	}
+}
+
+// Item #9: Hydration must not overwrite fresher changefeed state. We seed a
+// row, then between Subscribe registration and List() completion we force a
+// change event to fire for the same key with a newer value. The expected
+// outcome: the cache holds the changefeed-delivered value, not the older
+// List snapshot.
+//
+// We exercise this by having the memStore's List sleep briefly before
+// returning, while a writer goroutine pushes the newer value into the
+// changefeed during that window.
+func TestHydrationDoesNotOverwriteFresherChangefeedState(t *testing.T) {
+	m := newMemStoreWithListHook(false)
+	c := newSingleTenantClient(t, m)
+
+	if err := c.Register("ns", "k", "default"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	// Seed an OLD value visible to List().
+	rawOld, _ := json.Marshal("old-from-list")
+	if err := m.Set(context.Background(), store.Entry{Namespace: "ns", Key: "k", Value: rawOld}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// Force List() to block until the changefeed has delivered the NEW value.
+	listReady := make(chan struct{})
+	listRelease := make(chan struct{})
+	m.listHook = func() {
+		select {
+		case listReady <- struct{}{}:
+		default:
+		}
+		<-listRelease
+	}
+
+	startDone := make(chan error, 1)
+
+	go func() {
+		startDone <- c.Start(context.Background())
+	}()
+
+	// Wait until Start has reached List() — at this point Subscribe has run.
+	<-listReady
+
+	// Inject a fresh upsert via the memStore's fire() (simulates the
+	// changefeed delivering a newer value during hydration).
+	rawNew, _ := json.Marshal("new-from-changefeed")
+	m.mu.Lock()
+	m.entries[memKey("ns", "k")] = store.Entry{Namespace: "ns", Key: "k", Value: rawNew}
+	m.mu.Unlock()
+	m.fire(store.Event{Namespace: "ns", Key: "k", Op: store.OpUpsert})
+
+	// Give the changefeed callback time to land in the cache before
+	// releasing List().
+	time.Sleep(50 * time.Millisecond)
+	close(listRelease)
+
+	if err := <-startDone; err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	defer c.Close()
+
+	// Allow any debounce window to flush.
+	time.Sleep(50 * time.Millisecond)
+
+	v, ok, err := c.Get(context.Background(), "ns", "k")
+	if err != nil || !ok {
+		t.Fatalf("get: ok=%v err=%v", ok, err)
+	}
+
+	if v.(string) != "new-from-changefeed" {
+		t.Errorf("cache holds %q — hydration overwrote fresher changefeed state", v)
 	}
 }

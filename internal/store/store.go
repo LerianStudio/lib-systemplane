@@ -40,6 +40,11 @@ var (
 	// an equivalent that calls tmcore.ContextWithPG / ContextWithMB) before
 	// invoking the Client.
 	ErrTenantConnectionMissing = errors.New("systemplane/store: tenant database missing from context")
+
+	// ErrValidation is returned when a backend rejects input that fails a
+	// structural precondition (e.g. empty namespace or key). The admin layer
+	// maps this to HTTP 400 via the client's ErrValidation alias.
+	ErrValidation = errors.New("systemplane/store: validation failed")
 )
 
 // Entry is the persisted shape of a single configuration key.

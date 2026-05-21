@@ -54,12 +54,36 @@ func (s *Store) Subscribe(ctx context.Context, fn func(store.Event)) (func(), er
 
 	var once sync.Once
 
-	return func() {
+	unsubscribe := func() {
 		once.Do(func() {
 			s.subscriberMu.Lock()
 			delete(s.subscribers, id)
 			s.subscriberMu.Unlock()
 		})
+	}
+
+	// Honor the caller's lifetime ctx: when it cancels, remove the handler
+	// automatically so a forgotten unsubscribe does not leak the entry. The
+	// goroutine exits either on ctx cancellation or when the caller invokes
+	// unsubscribe directly (the cancel chan is closed by unsubscribe below).
+	cancelCh := make(chan struct{})
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			unsubscribe()
+		case <-cancelCh:
+		}
+	}()
+
+	return func() {
+		unsubscribe()
+		// Stop the watcher goroutine so it doesn't outlive the subscription.
+		select {
+		case <-cancelCh:
+		default:
+			close(cancelCh)
+		}
 	}, nil
 }
 
@@ -218,8 +242,30 @@ func (s *Store) watchOnce(stop <-chan struct{}) error {
 	return nil
 }
 
+// nsKey is the polling-mode set element used to detect deletes. We can't
+// rely on _id (compound subdocument) as a map key directly, so we tuple it.
+type nsKey struct {
+	Namespace string
+	Key       string
+}
+
 func (s *Store) pollForever(stop <-chan struct{}) {
+	// Watermark anchored slightly in the past so the first tick observes any
+	// row that already exists. Deduplication is keyed on (namespace, key)
+	// pairs already emitted at the current watermark boundary.
 	watermark := time.Now().UTC().Truncate(time.Millisecond)
+	// known tracks the set of (namespace, key) tuples observed by the most
+	// recent full poll. Anything present last time but absent now is a
+	// delete that we synthesize an OpDelete event for.
+	known := make(map[nsKey]struct{})
+	// seenAtWatermark holds the ids whose updated_at equals the current
+	// watermark, so a $gte query can include the boundary without emitting
+	// duplicates for the same write twice in a row.
+	seenAtWatermark := make(map[nsKey]struct{})
+	// firstPoll suppresses delete synthesis on the very first iteration
+	// (when `known` is empty by construction) and primes the watermark from
+	// the maximum updated_at observed during the snapshot scan.
+	firstPoll := true
 
 	ticker := time.NewTicker(s.cfg.PollInterval)
 	defer ticker.Stop()
@@ -229,7 +275,7 @@ func (s *Store) pollForever(stop <-chan struct{}) {
 		case <-stop:
 			return
 		case <-ticker.C:
-			newWatermark, err := s.pollOnce(watermark)
+			newWatermark, currentKnown, newSeen, err := s.pollOnce(watermark, seenAtWatermark, known, firstPoll)
 			if err != nil {
 				s.logWarn(context.Background(), "poll query failed", log.Err(err))
 
@@ -237,15 +283,35 @@ func (s *Store) pollForever(stop <-chan struct{}) {
 			}
 
 			watermark = newWatermark
+			seenAtWatermark = newSeen
+			known = currentKnown
+			firstPoll = false
 		}
 	}
 }
 
-func (s *Store) pollOnce(watermark time.Time) (time.Time, error) {
+// pollOnce performs one poll cycle:
+//   - Emits OpUpsert for every doc with updated_at >= watermark whose
+//     (namespace, key) is not already in seenAtWatermark (dedup at the
+//     boundary).
+//   - Performs a full collection scan to capture the current key set;
+//     anything present in `prevKnown` but absent now becomes a synthesized
+//     OpDelete event. Skipped on the first iteration (prevKnown empty).
+//
+// Returns the new watermark, the new full known set, and the new
+// seenAtWatermark set (ids that touched the boundary millisecond).
+func (s *Store) pollOnce(
+	watermark time.Time,
+	prevSeenAtWatermark map[nsKey]struct{},
+	prevKnown map[nsKey]struct{},
+	firstPoll bool,
+) (time.Time, map[nsKey]struct{}, map[nsKey]struct{}, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	filter := bson.D{{Key: fieldUpdatedAt, Value: bson.D{{Key: "$gt", Value: watermark}}}}
+	// Use >= so two writes that land in the same millisecond as the previous
+	// boundary aren't silently skipped; dedup via prevSeenAtWatermark.
+	filter := bson.D{{Key: fieldUpdatedAt, Value: bson.D{{Key: "$gte", Value: watermark}}}}
 
 	findOpts := options.Find().SetSort(bson.D{
 		{Key: fieldUpdatedAt, Value: 1},
@@ -255,11 +321,12 @@ func (s *Store) pollOnce(watermark time.Time) (time.Time, error) {
 
 	cur, err := s.coll.Find(ctx, filter, findOpts)
 	if err != nil {
-		return watermark, fmt.Errorf("poll find: %w", err)
+		return watermark, prevKnown, prevSeenAtWatermark, fmt.Errorf("poll find: %w", err)
 	}
 	defer cur.Close(ctx)
 
 	newWatermark := watermark
+	newSeen := make(map[nsKey]struct{})
 
 	for cur.Next(ctx) {
 		var doc entryDoc
@@ -269,22 +336,107 @@ func (s *Store) pollOnce(watermark time.Time) (time.Time, error) {
 			continue
 		}
 
+		nk := nsKey{Namespace: doc.Namespace, Key: doc.Key}
+
+		// Dedup: if this id was already emitted at the current watermark
+		// boundary, don't re-emit until something newer arrives for it.
+		if doc.UpdatedAt.Equal(watermark) {
+			if _, already := prevSeenAtWatermark[nk]; already {
+				newSeen[nk] = struct{}{}
+
+				continue
+			}
+		}
+
 		s.dispatchEvent(store.Event{
 			Namespace: doc.Namespace,
 			Key:       doc.Key,
 			Op:        store.OpUpsert,
 		})
 
-		if doc.UpdatedAt.After(newWatermark) {
+		switch {
+		case doc.UpdatedAt.After(newWatermark):
 			newWatermark = doc.UpdatedAt
+			newSeen = map[nsKey]struct{}{nk: {}}
+		case doc.UpdatedAt.Equal(newWatermark):
+			newSeen[nk] = struct{}{}
 		}
 	}
 
 	if err := cur.Err(); err != nil {
-		return watermark, fmt.Errorf("poll cursor error: %w", err)
+		return watermark, prevKnown, prevSeenAtWatermark, fmt.Errorf("poll cursor error: %w", err)
 	}
 
-	return newWatermark, nil
+	// Full-collection scan to detect deletes done by other processes. The
+	// incremental updated_at scan above cannot see deletes (the row is gone
+	// before its tombstone is observable); diffing key sets is the only way.
+	currentKnown, err := s.snapshotKeys(ctx)
+	if err != nil {
+		// If the snapshot fails, keep prevKnown — we'd rather miss a delete
+		// event than emit a spurious one based on a partial scan.
+		s.logWarn(ctx, "poll snapshot failed, skipping delete diff", log.Err(err))
+
+		return newWatermark, prevKnown, newSeen, nil
+	}
+
+	if !firstPoll {
+		for nk := range prevKnown {
+			if _, stillThere := currentKnown[nk]; !stillThere {
+				s.dispatchEvent(store.Event{
+					Namespace: nk.Namespace,
+					Key:       nk.Key,
+					Op:        store.OpDelete,
+				})
+			}
+		}
+	}
+
+	return newWatermark, currentKnown, newSeen, nil
+}
+
+// snapshotKeys returns the set of (namespace, key) tuples currently present
+// in the collection. Used by polling mode to diff against the prior poll and
+// synthesize OpDelete events for rows that disappeared.
+func (s *Store) snapshotKeys(ctx context.Context) (map[nsKey]struct{}, error) {
+	projection := bson.D{
+		{Key: fieldNamespace, Value: 1},
+		{Key: fieldKey, Value: 1},
+		{Key: fieldID, Value: 0},
+	}
+	findOpts := options.Find().SetProjection(projection)
+
+	cur, err := s.coll.Find(ctx, bson.D{}, findOpts)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot find: %w", err)
+	}
+	defer cur.Close(ctx)
+
+	out := make(map[nsKey]struct{})
+
+	for cur.Next(ctx) {
+		var doc struct {
+			Namespace string `bson:"namespace"`
+			Key       string `bson:"key"`
+		}
+
+		if err := cur.Decode(&doc); err != nil {
+			s.logWarn(ctx, "snapshot decode error, skipping document", log.Err(err))
+
+			continue
+		}
+
+		if doc.Namespace == "" || doc.Key == "" {
+			continue
+		}
+
+		out[nsKey{Namespace: doc.Namespace, Key: doc.Key}] = struct{}{}
+	}
+
+	if err := cur.Err(); err != nil {
+		return nil, fmt.Errorf("snapshot cursor: %w", err)
+	}
+
+	return out, nil
 }
 
 func eventFromChange(ce changeEvent) (store.Event, bool) {

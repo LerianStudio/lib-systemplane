@@ -355,11 +355,11 @@ func (s *Store) Set(ctx context.Context, e store.Entry) error {
 	}
 
 	if e.Namespace == "" {
-		return errors.New("systemplane/postgres: namespace must not be empty")
+		return fmt.Errorf("systemplane/postgres: %w: namespace must not be empty", store.ErrValidation)
 	}
 
 	if e.Key == "" {
-		return errors.New("systemplane/postgres: key must not be empty")
+		return fmt.Errorf("systemplane/postgres: %w: key must not be empty", store.ErrValidation)
 	}
 
 	if e.UpdatedAt.IsZero() {
@@ -401,11 +401,11 @@ func (s *Store) Delete(ctx context.Context, namespace, key, actor string) error 
 	}
 
 	if namespace == "" {
-		return errors.New("systemplane/postgres: namespace must not be empty")
+		return fmt.Errorf("systemplane/postgres: %w: namespace must not be empty", store.ErrValidation)
 	}
 
 	if key == "" {
-		return errors.New("systemplane/postgres: key must not be empty")
+		return fmt.Errorf("systemplane/postgres: %w: key must not be empty", store.ErrValidation)
 	}
 
 	db, err := s.resolveDB(ctx)
@@ -413,10 +413,14 @@ func (s *Store) Delete(ctx context.Context, namespace, key, actor string) error 
 		return err
 	}
 
+	// actor is intentionally NOT a span attribute: it is unbounded caller
+	// identity and would create a high-cardinality / potentially PII tag.
+	// Audit trails capture it via the updated_by column on writes.
+	_ = actor
+
 	ctx, span, finish := s.startSpan(ctx, "systemplane.postgres.delete",
 		attribute.String("namespace", namespace),
 		attribute.String("key", key),
-		attribute.String("actor", actor),
 	)
 	defer finish()
 

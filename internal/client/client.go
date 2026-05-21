@@ -31,7 +31,7 @@ type nskey struct {
 
 type subscription struct {
 	id uint64
-	fn func(newValue any)
+	fn func(ctx context.Context, newValue any)
 }
 
 // Client is the runtime-config handle. Read methods are nil-receiver safe,
@@ -57,6 +57,21 @@ type Client struct {
 	nextSubID   atomic.Uint64
 
 	storeUnsubscribe func()
+
+	// hydratingMu guards hydrating / hydrationTouched. The changefeed
+	// callback consults these to record which keys it observed during
+	// hydration so hydrate() can skip those keys (the changefeed already has
+	// fresher values for them).
+	hydratingMu      sync.Mutex
+	hydrating        bool
+	hydrationTouched map[nskey]struct{}
+
+	// lifecycleCtx is the Client's process-wide context. It is derived in
+	// newClient() and canceled by Close(). Dispatch paths (changefeed
+	// callbacks, OnChange subscribers) thread this through so subscribers see
+	// cancellation when the Client shuts down.
+	lifecycleCtx    context.Context
+	lifecycleCancel context.CancelFunc
 
 	startMu   sync.Mutex
 	started   atomic.Bool
@@ -129,14 +144,22 @@ func newClient(s store.Store, cfg clientConfig) *Client {
 		logger = log.NewNop()
 	}
 
+	// cancel is intentionally stored on the Client (lifecycleCancel) and
+	// invoked from Close() to terminate dispatch goroutines and subscribers.
+	// gosec flags WithCancel calls whose cancel is not in a defer; that's
+	// the wrong heuristic for a long-lived lifecycle context.
+	ctx, cancel := context.WithCancel(context.Background()) //nolint:gosec // lifecycle cancel released in Close
+
 	c := &Client{
-		store:       s,
-		logger:      logger,
-		telemetry:   cfg.telemetry,
-		multiTenant: cfg.multiTenantEnabled,
-		registry:    make(map[nskey]keyDef),
-		cache:       make(map[nskey]any),
-		subscribers: make(map[nskey][]subscription),
+		store:           s,
+		logger:          logger,
+		telemetry:       cfg.telemetry,
+		multiTenant:     cfg.multiTenantEnabled,
+		registry:        make(map[nskey]keyDef),
+		cache:           make(map[nskey]any),
+		subscribers:     make(map[nskey][]subscription),
+		lifecycleCtx:    ctx,
+		lifecycleCancel: cancel,
 	}
 
 	if !cfg.multiTenantEnabled {
@@ -149,8 +172,12 @@ func newClient(s store.Store, cfg clientConfig) *Client {
 // Start performs backend bootstrap and (in single-tenant mode) hydrates the
 // in-process cache. In multi-tenant mode it only marks the Client started;
 // schema bootstrap and reads run lazily against the per-request tenant DB.
+//
+// Start and Close are mutually exclusive: both take startMu for the duration
+// of their work, and Start re-checks `closed` under the lock so a concurrent
+// Close that arrived first cannot be interleaved with Start's wiring.
 func (c *Client) Start(ctx context.Context) error {
-	if c == nil || c.closed.Load() {
+	if c == nil {
 		return ErrClosed
 	}
 
@@ -158,12 +185,17 @@ func (c *Client) Start(ctx context.Context) error {
 		return ErrNilContext
 	}
 
-	if c.store == nil {
+	c.startMu.Lock()
+	defer c.startMu.Unlock()
+
+	// Recheck under the lock: Close may have raced past the unlocked check.
+	if c.closed.Load() {
 		return ErrClosed
 	}
 
-	c.startMu.Lock()
-	defer c.startMu.Unlock()
+	if c.store == nil {
+		return ErrClosed
+	}
 
 	if c.started.Load() {
 		return nil
@@ -185,10 +217,24 @@ func (c *Client) Start(ctx context.Context) error {
 		c.cacheMu.Unlock()
 		c.registryMu.RUnlock()
 
+		// Mark hydration in progress BEFORE Subscribe so the changefeed
+		// callback knows to record which keys it touched. hydrate() then
+		// skips those keys to avoid overwriting fresh changefeed state with
+		// the older List() snapshot.
+		c.hydratingMu.Lock()
+		c.hydrating = true
+		c.hydrationTouched = make(map[nskey]struct{})
+		c.hydratingMu.Unlock()
+
 		// Subscribe BEFORE hydration so writes that land between List() and
 		// the change feed's first event are still observed.
 		unsub, err := c.store.Subscribe(ctx, c.onEvent)
 		if err != nil {
+			c.hydratingMu.Lock()
+			c.hydrating = false
+			c.hydrationTouched = nil
+			c.hydratingMu.Unlock()
+
 			return err
 		}
 
@@ -200,8 +246,19 @@ func (c *Client) Start(ctx context.Context) error {
 				c.storeUnsubscribe = nil
 			}
 
+			c.hydratingMu.Lock()
+			c.hydrating = false
+			c.hydrationTouched = nil
+			c.hydratingMu.Unlock()
+
 			return err
 		}
+
+		// Hydration done — release the touched set.
+		c.hydratingMu.Lock()
+		c.hydrating = false
+		c.hydrationTouched = nil
+		c.hydratingMu.Unlock()
 	}
 
 	c.started.Store(true)
@@ -229,6 +286,16 @@ func (c *Client) hydrate(ctx context.Context) error {
 			continue
 		}
 
+		// Skip keys the changefeed already wrote during hydration — those
+		// values are by definition fresher than this List() snapshot.
+		c.hydratingMu.Lock()
+		_, touched := c.hydrationTouched[nk]
+		c.hydratingMu.Unlock()
+
+		if touched {
+			continue
+		}
+
 		var decoded any
 		if err := json.Unmarshal(entry.Value, &decoded); err != nil {
 			c.logWarn(ctx, "failed to unmarshal stored value, keeping default",
@@ -251,13 +318,25 @@ func (c *Client) hydrate(ctx context.Context) error {
 }
 
 // Close unsubscribes from the changefeed and releases backend resources.
+//
+// Start and Close are mutually exclusive: Close takes startMu so it cannot
+// interleave with a concurrent Start that is mid-wiring. closed is set
+// inside the same lock, and Start re-checks it under startMu before any
+// teardown-visible state mutation.
 func (c *Client) Close() error {
 	if c == nil {
 		return nil
 	}
 
 	c.closeOnce.Do(func() {
+		c.startMu.Lock()
+		defer c.startMu.Unlock()
+
 		c.closed.Store(true)
+
+		if c.lifecycleCancel != nil {
+			c.lifecycleCancel()
+		}
 
 		if c.storeUnsubscribe != nil {
 			c.storeUnsubscribe()
@@ -308,7 +387,22 @@ func (c *Client) refreshFromStore(nk nskey, op string) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), refreshTimeout)
+	// Record that hydration's later List() pass MUST NOT overwrite this key:
+	// the changefeed has just delivered a fresher value (or a delete event).
+	c.hydratingMu.Lock()
+	if c.hydrating {
+		c.hydrationTouched[nk] = struct{}{}
+	}
+	c.hydratingMu.Unlock()
+
+	// Use the Client's lifecycle context as the parent so a Close() cancels
+	// the refresh and all downstream subscriber invocations.
+	parent := c.lifecycleCtx
+	if parent == nil {
+		parent = context.Background()
+	}
+
+	ctx, cancel := context.WithTimeout(parent, refreshTimeout)
 	defer cancel()
 
 	newValue := cloneValue(def.defaultValue)
@@ -345,11 +439,20 @@ func (c *Client) refreshFromStore(nk nskey, op string) {
 	c.cache[nk] = cloneValue(newValue)
 	c.cacheMu.Unlock()
 
-	c.fireSubscribers(nk, cloneValue(newValue))
+	// Fire subscribers with the lifecycle context (NOT the per-refresh timeout
+	// context); subscribers may outlive the Get call's bounded timeout.
+	dispatchCtx := c.lifecycleCtx
+	if dispatchCtx == nil {
+		dispatchCtx = context.Background()
+	}
+
+	c.fireSubscribers(dispatchCtx, nk, cloneValue(newValue))
 }
 
-// fireSubscribers invokes all OnChange callbacks for a key with panic recovery.
-func (c *Client) fireSubscribers(nk nskey, newValue any) {
+// fireSubscribers invokes all OnChange callbacks for a key with panic
+// recovery. ctx is derived from the Client's lifecycle so subscribers receive
+// cancellation when the Client shuts down.
+func (c *Client) fireSubscribers(ctx context.Context, nk nskey, newValue any) {
 	c.subsMu.RLock()
 	subs := make([]subscription, len(c.subscribers[nk]))
 	copy(subs, c.subscribers[nk])
@@ -361,7 +464,7 @@ func (c *Client) fireSubscribers(nk nskey, newValue any) {
 		func() {
 			defer runtime.RecoverAndLog(c.logger, "systemplane.onchange")
 
-			fn(cloneValue(newValue))
+			fn(ctx, cloneValue(newValue))
 		}()
 	}
 }

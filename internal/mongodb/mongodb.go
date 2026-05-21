@@ -35,6 +35,7 @@ import (
 	"github.com/LerianStudio/lib-systemplane/internal/store"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
@@ -116,10 +117,13 @@ type Store struct {
 	coll   *mongo.Collection
 	tracer trace.Tracer
 
-	// schemaOnce caches the lazy ensure-collection step per resolved
-	// *mongo.Database (multi-tenant) or per *mongo.Collection (single-tenant).
-	schemaOnce sync.Map // map[*mongo.Collection]*sync.Once
-	schemaErr  sync.Map // map[*mongo.Collection]error
+	// schemaOnce caches the lazy ensure-collection step per resolved tenant
+	// database. Keyed by a stable string ("<db.Name()>/<collectionName>")
+	// rather than the *mongo.Collection pointer — the mongo-driver/v2
+	// Database.Collection method MAY return a fresh handle per call, so a
+	// pointer-keyed map would miss every time and rerun the schema probe.
+	schemaOnce sync.Map // map[string]*sync.Once
+	schemaErr  sync.Map // map[string]error
 
 	// subscriberMu / subscribers serve the single-tenant change-stream path.
 	subscriberMu sync.Mutex
@@ -252,17 +256,26 @@ func (s *Store) resolveCollection(ctx context.Context) (*mongo.Collection, error
 	return coll, nil
 }
 
+// schemaCacheKey returns the stable key used to memoize the per-database
+// schema bootstrap. The mongo-driver/v2 Collection handle is not guaranteed
+// to be reused across calls, so we key by ("<db.Name()>/<collection>").
+func schemaCacheKey(coll *mongo.Collection) string {
+	return coll.Database().Name() + "/" + coll.Name()
+}
+
 func (s *Store) ensureSchema(ctx context.Context, coll *mongo.Collection) error {
-	onceVal, _ := s.schemaOnce.LoadOrStore(coll, &sync.Once{})
+	cacheKey := schemaCacheKey(coll)
+
+	onceVal, _ := s.schemaOnce.LoadOrStore(cacheKey, &sync.Once{})
 	once, _ := onceVal.(*sync.Once)
 
 	once.Do(func() {
 		if err := s.runSchema(ctx, coll); err != nil {
-			s.schemaErr.Store(coll, err)
+			s.schemaErr.Store(cacheKey, err)
 		}
 	})
 
-	if errVal, ok := s.schemaErr.Load(coll); ok {
+	if errVal, ok := s.schemaErr.Load(cacheKey); ok {
 		if err, _ := errVal.(error); err != nil {
 			return err
 		}
@@ -285,7 +298,12 @@ func (s *Store) List(ctx context.Context) ([]store.Entry, error) {
 	ctx, span := s.tracer.Start(ctx, "systemplane.mongodb.list")
 	defer span.End()
 
-	cursor, err := coll.Find(ctx, bson.D{})
+	findOpts := options.Find().SetSort(bson.D{
+		{Key: fieldNamespace, Value: 1},
+		{Key: fieldKey, Value: 1},
+	})
+
+	cursor, err := coll.Find(ctx, bson.D{}, findOpts)
 	if err != nil {
 		tracing.HandleSpanError(span, "list find failed", err)
 
@@ -352,7 +370,7 @@ func (s *Store) Set(ctx context.Context, e store.Entry) error {
 	}
 
 	if e.Namespace == "" || e.Key == "" {
-		return errors.New("systemplane/mongodb: namespace and key must be non-empty")
+		return fmt.Errorf("systemplane/mongodb: %w: namespace and key must be non-empty", store.ErrValidation)
 	}
 
 	if e.UpdatedAt.IsZero() {
@@ -388,7 +406,7 @@ func (s *Store) Delete(ctx context.Context, namespace, key, actor string) error 
 	}
 
 	if namespace == "" || key == "" {
-		return errors.New("systemplane/mongodb: namespace and key must be non-empty")
+		return fmt.Errorf("systemplane/mongodb: %w: namespace and key must be non-empty", store.ErrValidation)
 	}
 
 	coll, err := s.resolveCollection(ctx)
@@ -399,10 +417,14 @@ func (s *Store) Delete(ctx context.Context, namespace, key, actor string) error 
 	ctx, span := s.tracer.Start(ctx, "systemplane.mongodb.delete")
 	defer span.End()
 
+	// actor is intentionally NOT a span attribute: it is unbounded caller
+	// identity and would create a high-cardinality / potentially PII tag.
+	// Audit trails capture it via the UpdatedBy column on writes.
+	_ = actor
+
 	span.SetAttributes(
 		attribute.String("namespace", namespace),
 		attribute.String("key", key),
-		attribute.String("actor", actor),
 	)
 
 	filter := bson.D{{Key: fieldID, Value: compoundID{Namespace: namespace, Key: key}}}

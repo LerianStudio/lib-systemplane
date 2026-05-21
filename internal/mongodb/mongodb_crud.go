@@ -3,7 +3,9 @@ package mongodb
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/LerianStudio/lib-systemplane/internal/store"
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -13,12 +15,37 @@ import (
 
 // runSchema makes the collection ready for use. With a compound _id there is
 // no separate unique index to create — the server enforces uniqueness on _id
-// automatically. We touch the collection so a brand-new namespace exists when
-// the change stream first runs.
+// automatically.
+//
+// Behavior differs by mode:
+//
+//   - Multi-tenant: we MUST eagerly materialize the collection via
+//     CreateCollection. MongoDB creates collections lazily on first write, so
+//     a Get/List against a fresh tenant DB before any Set would otherwise
+//     succeed (returning an empty result) — masking permission problems and
+//     producing answers that look correct. CreateCollection is treated as
+//     idempotent: NamespaceExists (code 48 / "already exists") is success.
+//
+//   - Single-tenant: we deliberately DO NOT call CreateCollection. The
+//     change stream that backs Subscribe attaches at the current oplog
+//     position, and on freshly created replica-set members there is a brief
+//     window after CreateCollection where the watcher can miss the first
+//     insert. Listing indexes is sufficient — it confirms the connection has
+//     the required privileges, and the change stream observes the very first
+//     write that auto-creates the namespace.
 func (s *Store) runSchema(ctx context.Context, coll *mongo.Collection) error {
-	// Touch the collection by listing indexes; this both ensures it exists in
-	// the database catalog (MongoDB creates collections lazily) and confirms
-	// the caller's connection has the required privileges.
+	if s.cfg.MultiTenantEnabled {
+		db := coll.Database()
+		if err := db.CreateCollection(ctx, coll.Name()); err != nil && !isNamespaceExists(err) {
+			return fmt.Errorf("systemplane/mongodb: create collection: %w", err)
+		}
+
+		return nil
+	}
+
+	// Single-tenant: just touch the collection's index catalog. This both
+	// confirms the connection has the required privileges and avoids the
+	// change-stream attach race that affects single-tenant Subscribe.
 	cur, err := coll.Indexes().List(ctx)
 	if err != nil {
 		return fmt.Errorf("systemplane/mongodb: list indexes: %w", err)
@@ -29,6 +56,31 @@ func (s *Store) runSchema(ctx context.Context, coll *mongo.Collection) error {
 	}
 
 	return nil
+}
+
+// isNamespaceExists reports whether err signals that the target collection
+// already exists. MongoDB returns server error code 48 ("NamespaceExists") in
+// that case; the driver's CommandError wraps that, and string matching covers
+// the unstructured fallback path.
+func isNamespaceExists(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var cmdErr mongo.CommandError
+	if errors.As(err, &cmdErr) {
+		if cmdErr.Code == 48 {
+			return true
+		}
+
+		if strings.Contains(cmdErr.Message, "already exists") {
+			return true
+		}
+	}
+
+	msg := err.Error()
+
+	return strings.Contains(msg, "NamespaceExists") || strings.Contains(msg, "already exists")
 }
 
 // upsert writes an entry using an upsert keyed on the compound _id.
