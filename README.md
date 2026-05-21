@@ -1,15 +1,15 @@
 # lib-systemplane
 
-Dual-backend (PostgreSQL / MongoDB) hot-reload runtime configuration for Lerian services. Register operational knobs (log levels, feature flags, rate limits, circuit-breaker thresholds, worker intervals) at startup, mutate them at runtime without a pod restart, and subscribe to change events through a LISTEN/NOTIFY (Postgres) or change-stream (Mongo) backed subscription. First-class support for per-tenant overrides and an optional Fiber admin HTTP surface.
+Dual-backend (PostgreSQL / MongoDB) hot-reload runtime configuration for Lerian services. Register operational knobs (log levels, feature flags, rate limits, circuit-breaker thresholds, worker intervals) at startup, mutate them at runtime without a pod restart, and — in single-tenant mode — subscribe to change events through a LISTEN/NOTIFY (Postgres) or change-stream (MongoDB) backed subscription. First-class support for the Lerian database-per-tenant model via the `lib-commons/v5` tenant-manager dispatch layer.
 
-This library was extracted from `lib-commons/v5/commons/systemplane`. The v1 line intentionally migrates the observability surface to `lib-observability`: `WithLogger` uses `lib-observability/log.Logger`, `WithTelemetry` uses `*lib-observability/tracing.Telemetry`, and subscriber panic recovery uses `lib-observability/runtime`.
+This library was extracted from `lib-commons/v5/commons/systemplane`. The v1 line uses `lib-observability` for logging, tracing, telemetry, redaction, and panic recovery.
 
 ## Requirements
 
 - Go `1.26.3` or newer
-- PostgreSQL 13+ **or** MongoDB 4.4+ (replica set required for change-streams; polling fallback available for standalone Mongo)
-- `github.com/LerianStudio/lib-commons/v5 v5.2.1` for tenant context, admin HTTP helpers, and backoff
-- `github.com/LerianStudio/lib-observability v1.0.0` for logging, tracing, telemetry, redaction, and panic recovery
+- PostgreSQL 13+ **or** MongoDB 4.4+ (replica set required for change streams; polling fallback available for standalone MongoDB)
+- `github.com/LerianStudio/lib-commons/v5` for tenant-manager context, admin HTTP helpers, and backoff
+- `github.com/LerianStudio/lib-observability` for logging, tracing, telemetry, redaction, and panic recovery
 
 ## Installation
 
@@ -17,7 +17,18 @@ This library was extracted from `lib-commons/v5/commons/systemplane`. The v1 lin
 go get github.com/LerianStudio/lib-systemplane
 ```
 
-## Quickstart — PostgreSQL
+## Operating modes
+
+The library supports two modes; pick at construction time:
+
+| Mode | Constructor handles | Reads | Writes | Changefeed |
+|------|---------------------|-------|--------|------------|
+| Single-tenant | `db *sql.DB` / `*mongo.Client` | In-process cache | Through cache + store | LISTEN/NOTIFY (Postgres) or change stream (MongoDB) |
+| Multi-tenant  | May be nil | Resolved per-call via tenant-manager ctx | Same | Disabled — `OnChange` returns `ErrNotSupportedInMultiTenant` |
+
+In multi-tenant mode the library does NOT hold an in-process cache. Every `Get` reads through the resolved tenant database. The lib expects the caller to wire `lib-commons/v5/commons/tenant-manager/middleware.TenantMiddleware` with `WithPG(pgManager, "<module>")` (Postgres) or `WithMB(mongoManager, "<module>")` (MongoDB) where `<module>` matches the lib's `WithModule(...)` option (default `"systemplane"`). The middleware populates the request context; the lib calls `tmcore.GetPGContext` / `tmcore.GetMBContext` to resolve the tenant database, lazily ensures the schema on first use per database, and runs the read/write against that handle.
+
+## Single-tenant Quickstart — PostgreSQL
 
 ```go
 package main
@@ -29,7 +40,7 @@ import (
     "os"
 
     _ "github.com/jackc/pgx/v5/stdlib"
-    "github.com/LerianStudio/lib-systemplane"
+    systemplane "github.com/LerianStudio/lib-systemplane"
 )
 
 func main() {
@@ -41,8 +52,6 @@ func main() {
 
 func run() error {
     ctx := context.Background()
-    // Load this from your secret manager or environment. sslmode=disable is
-    // acceptable only for local development.
     dsn := os.Getenv("SYSTEMPLANE_POSTGRES_DSN")
 
     db, err := sql.Open("pgx", dsn)
@@ -51,7 +60,7 @@ func run() error {
     }
     defer db.Close()
 
-    // listenDSN is the separate long-lived connection used for LISTEN/NOTIFY.
+    // listenDSN is the separate connection used for LISTEN/NOTIFY.
     client, err := systemplane.NewPostgres(db, dsn)
     if err != nil {
         return err
@@ -68,14 +77,17 @@ func run() error {
         return err
     }
 
-    level := client.GetString("global", "log.level")
+    level, _, err := client.GetString(ctx, "global", "log.level")
+    if err != nil {
+        return err
+    }
     _ = level
 
     return nil
 }
 ```
 
-## Quickstart — MongoDB
+## Single-tenant Quickstart — MongoDB
 
 ```go
 package main
@@ -88,7 +100,7 @@ import (
     "go.mongodb.org/mongo-driver/v2/mongo"
     "go.mongodb.org/mongo-driver/v2/mongo/options"
 
-    "github.com/LerianStudio/lib-systemplane"
+    systemplane "github.com/LerianStudio/lib-systemplane"
 )
 
 func main() {
@@ -122,44 +134,167 @@ func run() error {
         return err
     }
 
-    enabled := client.GetBool("global", "feature.new_pricing")
+    enabled, _, err := client.GetBool(ctx, "global", "feature.new_pricing")
+    if err != nil {
+        return err
+    }
     _ = enabled
 
     return nil
 }
 ```
 
-On a MongoDB standalone (no replica set) pass `systemplane.WithPollInterval(2 * time.Second)` to `NewMongoDB` so the client uses polling instead of change-streams.
+On a MongoDB standalone (no replica set) pass `systemplane.WithPollInterval(2 * time.Second)` to `NewMongoDB` so the client polls instead of using change streams.
 
-## Operational safety options
+## Multi-tenant Quickstart — PostgreSQL
 
-- `WithStrictPostgresIsolation()` makes `NewPostgres` reject implicit default table/channel names. Use it when multiple services share a Postgres database and each service must deliberately choose its own table and LISTEN channel.
-- `WithMongoResumeTokenStore(load, save)` persists MongoDB change-stream resume tokens so reconnects can resume from the last processed event. Pair it with `WithMongoResumeTokenFailClosed()` when losing durable cursor progress must stop the subscriber instead of reconnecting from an unsafe position.
-- `WithLazyTenantLoad(maxEntries)` switches tenant override caching from eager startup hydration to a bounded LRU populated on first tenant read. Lazy tenant reads fail closed on backend fetch errors; `WithTenantLazyFailOpen()` is retained only as a deprecated source-compatible no-op.
+```go
+package main
 
-## Tenant-scoped overrides
+import (
+    "context"
+    "fmt"
+    "os"
 
-Register a key with `RegisterTenantScoped` to allow per-tenant values while the legacy global row keeps its semantics for services that do not supply a tenant context. Use `GetForTenant` / `SetForTenant` / `DeleteForTenant` / `OnTenantChange` for the tenant-aware surface. `ListTenantsForKey` returns tenants with overrides and preserves the historical empty-list-on-error behavior; use `ListTenantsForKeyContext` when administrative callers need backend errors surfaced explicitly. The tenant ID is extracted from `context.Context` via `lib-commons/v5/commons/tenant-manager/core`. See [`MIGRATION_TENANT_SCOPED.md`](MIGRATION_TENANT_SCOPED.md) for the full adoption runbook, including the two-phase rolling-deploy migration using `WithTenantSchemaEnabled`.
+    tmpostgres "github.com/LerianStudio/lib-commons/v5/commons/tenant-manager/postgres"
+    tmmiddleware "github.com/LerianStudio/lib-commons/v5/commons/tenant-manager/middleware"
+    systemplane "github.com/LerianStudio/lib-systemplane"
+    "github.com/gofiber/fiber/v2"
+)
+
+func main() {
+    if err := run(); err != nil {
+        fmt.Fprintln(os.Stderr, err)
+        os.Exit(1)
+    }
+}
+
+func run() error {
+    ctx := context.Background()
+
+    // The tenant-manager Postgres manager owns the per-tenant connection pools.
+    pgManager, err := tmpostgres.NewManager(/* construction-time config */)
+    if err != nil {
+        return err
+    }
+    defer pgManager.Close()
+
+    client, err := systemplane.NewPostgres(nil, "",
+        systemplane.WithMultiTenantEnabled(),
+        systemplane.WithModule("systemplane"),
+    )
+    if err != nil {
+        return err
+    }
+    defer client.Close()
+
+    if err := client.Register("global", "log.level", "info"); err != nil {
+        return err
+    }
+
+    if err := client.Start(ctx); err != nil {
+        return err
+    }
+
+    app := fiber.New()
+
+    // Wire the tenant-manager middleware so each request ctx carries the
+    // resolved tenant database under the module key "systemplane".
+    app.Use(tmmiddleware.TenantMiddleware(
+        tmmiddleware.WithPG(pgManager, "systemplane"),
+    ))
+
+    app.Get("/log-level", func(c *fiber.Ctx) error {
+        level, _, err := client.GetString(c.UserContext(), "global", "log.level")
+        if err != nil {
+            return err
+        }
+
+        return c.JSON(fiber.Map{"level": level})
+    })
+
+    return app.Listen(":8080")
+}
+```
+
+## Multi-tenant Quickstart — MongoDB
+
+```go
+package main
+
+import (
+    "context"
+
+    tmmongo "github.com/LerianStudio/lib-commons/v5/commons/tenant-manager/mongo"
+    tmmiddleware "github.com/LerianStudio/lib-commons/v5/commons/tenant-manager/middleware"
+    systemplane "github.com/LerianStudio/lib-systemplane"
+    "github.com/gofiber/fiber/v2"
+)
+
+func run() error {
+    ctx := context.Background()
+
+    mbManager, err := tmmongo.NewManager(/* construction-time config */)
+    if err != nil {
+        return err
+    }
+    defer mbManager.Close()
+
+    client, err := systemplane.NewMongoDB(nil, "",
+        systemplane.WithMultiTenantEnabled(),
+        systemplane.WithModule("systemplane"),
+    )
+    if err != nil {
+        return err
+    }
+    defer client.Close()
+
+    if err := client.Register("global", "feature.new_pricing", false); err != nil {
+        return err
+    }
+
+    if err := client.Start(ctx); err != nil {
+        return err
+    }
+
+    app := fiber.New()
+    app.Use(tmmiddleware.TenantMiddleware(
+        tmmiddleware.WithMB(mbManager, "systemplane"),
+    ))
+
+    return app.Listen(":8080")
+}
+```
+
+In multi-tenant mode the lib lazily runs `CREATE TABLE IF NOT EXISTS` (Postgres) or its MongoDB equivalent once per tenant database, the first time a request touches that database. Calling `OnChange` returns `ErrNotSupportedInMultiTenant`.
 
 ## Admin HTTP routes
 
-Mount the optional Fiber admin surface under a configurable path prefix (default `/system`):
+Mount the Fiber admin surface under a configurable path prefix (default `/system`):
 
 ```go
 import "github.com/LerianStudio/lib-systemplane/admin"
 
 admin.Mount(app, client,
     admin.WithPathPrefix("/system"),
-    admin.WithAuthorizer(myAuthFn),            // legacy global routes
-    admin.WithTenantAuthorizer(myTenantAuthFn), // tenant-scoped routes (default-deny when absent)
+    admin.WithAuthorizer(myAuthFn), // required — defaults to deny-all
 )
 ```
 
-See [`admin/admin.go`](admin/admin.go) for the complete route set (read/write on globals; read/write/delete on tenant overrides; list tenants with an override for a given key).
+Routes:
+
+```
+GET    /<prefix>/:namespace        - list entries in a namespace
+GET    /<prefix>/:namespace/:key   - read a single entry
+PUT    /<prefix>/:namespace/:key   - write a single entry
+DELETE /<prefix>/:namespace/:key   - delete a single entry
+```
+
+In multi-tenant mode mount the tenant-manager middleware BEFORE `admin.Mount` so handler `c.UserContext()` carries the tenant database.
 
 ## Scope
 
-Systemplane is intended for **runtime-mutable knobs only**. Bootstrap-only configuration (DB DSNs, secrets, TLS material, telemetry endpoints, server identity) should live in environment variables or a secret manager — not here.
+Systemplane is intended for **runtime-mutable knobs only**. Bootstrap-only configuration (DB DSNs, secrets, TLS material, telemetry endpoints, server identity) belongs in environment variables or a secret manager — not here.
 
 ## License
 

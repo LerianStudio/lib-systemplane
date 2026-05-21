@@ -1,23 +1,16 @@
-// Change-stream and polling subscriptions for the MongoDB backend.
+// Change-stream and polling subscriptions for the single-tenant MongoDB
+// backend.
 //
-// The change-stream path is the default and requires a replica set; the
-// polling path is the fallback for standalone deployments and is enabled by
-// setting Config.PollInterval to a positive duration. Both paths emit
-// store.Event values whose TenantID is populated from the row's tenant_id
-// field so downstream subscribers can route global-vs-tenant dispatch.
-//
-// Delete events carry neither a fullDocument nor (under stock MongoDB) any
-// pre-image. This backend sidesteps the problem by storing a compound _id
-// {namespace, key, tenant_id} on every row, so the documentKey that the
-// server always includes is sufficient on its own to reconstruct the event.
-// See TRD §3.2 and research.md §MongoDB.
-
+// Multi-tenant deployments resolve a fresh database per call and have no
+// shared process-wide changefeed; Subscribe in that mode returns
+// store.ErrNotSupportedInMultiTenant.
 package mongodb
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"hash/fnv"
+	"sync"
 	"time"
 
 	"github.com/LerianStudio/lib-commons/v5/commons/backoff"
@@ -29,142 +22,144 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
-// operationTypeDelete matches the string the MongoDB server places in
-// changeEvent.OperationType for delete events.
 const operationTypeDelete = "delete"
 
-// resumeTokenBatchEvents bounds how many events can be processed before a
-// persisted resume token is considered "too far behind" and forcibly saved.
-const resumeTokenBatchEvents = 100
-
-// resumeTokenBatchInterval bounds the wall-clock interval between resume
-// token saves regardless of event volume — an idle change stream must still
-// periodically persist its position so a later reconnect doesn't replay
-// hours of oplog.
-const resumeTokenBatchInterval = 5 * time.Second
-
-var errResumeTokenSaveFailed = errors.New("resume token save failed")
-
-// changeEventFullDoc captures the shape of an insert/update/replace event's
-// fullDocument — the only branch where all three scoping fields are present
-// in the payload.
-type changeEventFullDoc struct {
-	Namespace string `bson:"namespace"`
-	Key       string `bson:"key"`
-	TenantID  string `bson:"tenant_id"`
-}
-
 // changeEvent is the subset of a MongoDB change stream event we decode.
-//
-// DocumentKey decodes to the server-populated {_id: compoundID} document.
-// On insert/update/replace events FullDocument is also populated courtesy
-// of SetFullDocument(UpdateLookup); on delete events FullDocument is nil
-// and DocumentKey is the only source of truth — hence the compound _id.
 type changeEvent struct {
-	OperationType string              `bson:"operationType"`
-	FullDocument  *changeEventFullDoc `bson:"fullDocument,omitempty"`
+	OperationType string `bson:"operationType"`
 	DocumentKey   struct {
 		ID compoundID `bson:"_id"`
 	} `bson:"documentKey"`
 }
 
-// Subscribe blocks until ctx is cancelled, watching for changes via
-// change-streams or polling depending on cfg.PollInterval.
-//
-// Change-stream mode (PollInterval == 0) requires a MongoDB replica set.
-// Polling mode (PollInterval > 0) works with standalone MongoDB deployments.
-// The polling path uses an in-process watermark that starts at time.Now()
-// on subscription — callers that need to capture updates already observed
-// by the Client's hydration pass should plumb the hydration max(updated_at)
-// through subscribePoll's initialWatermark argument (see M-S3-3 / caller
-// Client.Start). The exported Subscribe always starts at "now" because
-// that matches the change-stream semantic (subscriptions see only future
-// events unless a resume token was supplied).
-//
-// Multiple concurrent Subscribe calls are independent — each gets its own
-// stream or ticker. Store.Close cancels all in-flight Subscribe calls via
-// the internal s.ctx merge-cancel below.
-func (s *Store) Subscribe(ctx context.Context, handler func(store.Event)) error {
-	return s.SubscribeReady(ctx, handler, nil)
-}
-
-// SubscribeReady is Subscribe with a setup readiness callback.
-func (s *Store) SubscribeReady(ctx context.Context, handler func(store.Event), ready func(error)) error {
+// Subscribe registers fn for the lifetime of ctx (or until unsubscribe is
+// called). Multi-tenant mode returns store.ErrNotSupportedInMultiTenant.
+func (s *Store) Subscribe(ctx context.Context, fn func(store.Event)) (func(), error) {
 	if s == nil || s.isClosed() {
-		return store.ErrClosed
+		return nil, store.ErrClosed
 	}
 
-	if handler == nil {
-		return errors.New("mongodb store subscribe: handler must not be nil")
+	if s.cfg.MultiTenantEnabled {
+		return nil, store.ErrNotSupportedInMultiTenant
 	}
 
-	// Merge the store-level ctx so Close() terminates the subscription even
-	// when the caller's ctx is still live (M-S3-1).
-	mergedCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	runtime.SafeGoWithContextAndComponent(mergedCtx, s.cfg.Logger, "systemplane", "mongodb.subscribe_cancel_bridge", runtime.KeepRunning, func(context.Context) {
-		select {
-		case <-s.ctx.Done():
-			cancel()
-		case <-mergedCtx.Done():
-		}
-	})
-
-	if s.cfg.PollInterval > 0 {
-		// MongoDB BSON datetimes have millisecond precision. Truncating the
-		// initial watermark down prevents writes in the same millisecond as the
-		// readiness signal from sorting before the cursor and being skipped.
-		watermark := time.Now().UTC().Truncate(time.Millisecond)
-
-		if ready != nil {
-			ready(nil)
-		}
-
-		return s.subscribePoll(mergedCtx, handler, watermark)
+	if fn == nil {
+		return func() {}, nil
 	}
 
-	return s.subscribeChangeStream(mergedCtx, handler, ready)
+	s.subscriberMu.Lock()
+	s.nextSubID++
+	id := s.nextSubID
+	s.subscribers[id] = fn
+	s.subscriberMu.Unlock()
+
+	// cancelCh stops the optional ctx-observer goroutine below. We gate every
+	// teardown action (subscriber removal + cancelCh close) through a single
+	// sync.Once so that concurrent invocations — for example a caller-driven
+	// unsubscribe racing with ctx.Done() — never double-close the channel and
+	// never delete the subscriber slot twice.
+	cancelCh := make(chan struct{})
+
+	var once sync.Once
+
+	teardown := func() {
+		once.Do(func() {
+			s.subscriberMu.Lock()
+			delete(s.subscribers, id)
+			s.subscriberMu.Unlock()
+
+			close(cancelCh)
+		})
+	}
+
+	// Honor the caller's lifetime ctx: when it cancels, remove the handler
+	// automatically so a forgotten unsubscribe does not leak the entry. We
+	// only spawn the observer when ctx is non-nil — a nil ctx would panic on
+	// ctx.Done(). Callers passing a nil ctx receive an unsubscribe func that
+	// works exactly the same.
+	if ctx != nil {
+		go func() {
+			select {
+			case <-ctx.Done():
+				teardown()
+			case <-cancelCh:
+			}
+		}()
+	}
+
+	return teardown, nil
 }
 
-// subscribeChangeStream opens a MongoDB change stream on the collection and
-// translates insert/update/replace/delete events into store.Event values.
-// On stream error, it reconnects with exponential backoff. The resume token
-// persisted by the prior watchOnce (if any) is handed to the new stream via
-// SetResumeAfter, so events during the disconnect window are recovered.
-func (s *Store) subscribeChangeStream(ctx context.Context, handler func(store.Event), ready func(error)) error {
+func (s *Store) startListener(_ context.Context) error {
+	s.subscriberMu.Lock()
+	if s.streamStop != nil {
+		s.subscriberMu.Unlock()
+
+		return nil
+	}
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	s.streamStop = stop
+	s.streamDone = done
+	s.subscriberMu.Unlock()
+
+	go func() {
+		defer close(done)
+		defer runtime.RecoverAndLog(s.cfg.Logger, "systemplane.mongodb.listener")
+
+		if s.cfg.PollInterval > 0 {
+			s.pollForever(stop)
+
+			return
+		}
+
+		s.streamForever(stop)
+	}()
+
+	return nil
+}
+
+func (s *Store) stopListener() {
+	s.subscriberMu.Lock()
+	stop := s.streamStop
+	done := s.streamDone
+	s.streamStop = nil
+	s.streamDone = nil
+	s.subscriberMu.Unlock()
+
+	if stop == nil {
+		return
+	}
+
+	close(stop)
+
+	if done != nil {
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+		}
+	}
+}
+
+func (s *Store) streamForever(stop <-chan struct{}) {
 	attempt := 0
-	readyCalled := false
 
 	for {
-		if err := s.watchOnce(ctx, handler, func() {
-			if !readyCalled && ready != nil {
-				ready(nil)
+		select {
+		case <-stop:
+			return
+		default:
+		}
+
+		if err := s.watchOnce(stop); err != nil {
+			select {
+			case <-stop:
+				return
+			default:
 			}
 
-			readyCalled = true
-		}); err != nil {
-			// Context cancelled — clean exit regardless of the watch error.
-			if ctx.Err() != nil {
-				if !readyCalled && ready != nil {
-					ready(ctx.Err())
-				}
-
-				return ctx.Err() //nolint:wrapcheck // propagate cancellation as-is
-			}
-
-			if !readyCalled && ready != nil {
-				ready(err)
-
-				return err
-			}
-
-			if errors.Is(err, errResumeTokenSaveFailed) && s.cfg.ResumeTokenFailClosed {
-				return err
-			}
-
-			// Log and reconnect with backoff.
-			s.logWarn(ctx, "change stream disconnected, reconnecting",
+			s.logWarn(context.Background(), "change stream disconnected, reconnecting",
 				log.Err(err),
 				log.Int("attempt", attempt),
 			)
@@ -172,60 +167,40 @@ func (s *Store) subscribeChangeStream(ctx context.Context, handler func(store.Ev
 			delay := min(backoff.ExponentialWithJitter(reconnectBaseDelay, attempt), reconnectMaxDelay)
 			attempt++
 
-			if waitErr := backoff.WaitContext(ctx, delay); waitErr != nil {
-				return waitErr //nolint:wrapcheck // propagate cancellation as-is
+			select {
+			case <-stop:
+				return
+			case <-time.After(delay):
 			}
 
 			continue
 		}
 
-		return nil
+		return
 	}
 }
 
-// watchOnce opens a single change stream session and processes events until
-// error or context cancellation.
-//
-// # Resume token behavior
-//
-// When Config.LoadResumeToken is non-nil, its return value (if it yields a
-// non-nil bson.Raw with no error) is passed via
-// options.ChangeStream().SetResumeAfter so the new stream picks up where
-// the previous one left off — events that occurred during a disconnect are
-// replayed from the oplog. A nil token or an error is logged and the stream
-// opens from the current oplog position (the pre-H2 behavior).
-//
-// While the stream is running, the event loop batches ResumeToken captures
-// and invokes Config.SaveResumeToken every resumeTokenBatchEvents events or
-// every resumeTokenBatchInterval of wall-clock time, whichever comes first.
-// SaveResumeToken failures are logged at WARN and, by default, the loop
-// continues — the next successful save replaces the lost one. When
-// ResumeTokenFailClosed is enabled, a save failure terminates the subscription
-// instead of reconnecting without durable cursor progress.
-//
-// Operators who want strict at-least-once delivery across reconnects should
-// wire both LoadResumeToken and SaveResumeToken to durable storage (Redis,
-// a dedicated Postgres row, etc.). Without them, idle keys may hold stale
-// values in a subscriber cache until the next write. See also
-// MIGRATION_TENANT_SCOPED.md §8.1.
-func (s *Store) watchOnce(ctx context.Context, handler func(store.Event), onReady func()) error {
+func (s *Store) watchOnce(stop <-chan struct{}) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		select {
+		case <-stop:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
 	pipeline := mongo.Pipeline{
-		{{Key: opMatch, Value: bson.D{
+		{{Key: "$match", Value: bson.D{
 			{Key: "operationType", Value: bson.D{
 				{Key: "$in", Value: bson.A{"insert", "update", "replace", operationTypeDelete}},
 			}},
 		}}},
 	}
 
-	opts := options.ChangeStream().
-		SetFullDocument(options.UpdateLookup)
-
-	var err error
-
-	opts, err = s.applyResumeToken(ctx, opts)
-	if err != nil {
-		return err
-	}
+	opts := options.ChangeStream()
 
 	stream, err := s.coll.Watch(ctx, pipeline, opts)
 	if err != nil {
@@ -233,62 +208,30 @@ func (s *Store) watchOnce(ctx context.Context, handler func(store.Event), onRead
 	}
 	defer stream.Close(ctx)
 
-	if onReady != nil {
-		onReady()
-	}
-
-	// Per-stream scratch space. pendingToken and the counters live across
-	// iterations so the batched-save cadence is preserved; event is
-	// re-declared per iteration because changeEvent carries a
-	// *changeEventFullDoc pointer that BSON's Decode will NOT reset to nil
-	// when the incoming document omits fullDocument (delete events). A
-	// reused event from a prior insert would keep stale FullDocument data
-	// on a subsequent delete, which extractEvent would then happily read.
-	var (
-		pendingToken  bson.Raw
-		eventsInBatch int
-		lastSaveAt    = time.Now()
+	s.logInfo(ctx, "change stream established",
+		log.String("collection", s.cfg.Collection),
 	)
 
-	flushToken := func() error {
-		if len(pendingToken) == 0 {
-			return nil
-		}
-
-		if err := s.saveResumeToken(ctx, pendingToken); err != nil {
-			return err
-		}
-
-		pendingToken = nil
-		eventsInBatch = 0
-		lastSaveAt = time.Now()
-
-		return nil
-	}
-
 	for stream.Next(ctx) {
-		token, ok := s.processChangeStreamEvent(ctx, stream, handler)
-		if !ok {
+		var event changeEvent
+		if err := stream.Decode(&event); err != nil {
+			s.logWarn(ctx, "change stream decode error, skipping event", log.Err(err))
+
 			continue
 		}
 
-		// Capture the resume token for this event and flush on batch
-		// thresholds. ResumeToken is valid until the next Next() call so
-		// we must consume it before the next iteration.
-		pendingToken = token
-		eventsInBatch++
+		evt, ok := eventFromChange(event)
+		if !ok {
+			s.droppedEvents.Add(1)
 
-		if eventsInBatch >= resumeTokenBatchEvents || time.Since(lastSaveAt) >= resumeTokenBatchInterval {
-			if err := flushToken(); err != nil {
-				return err
-			}
+			s.logWarn(ctx, "change stream event dropped — missing identifiers",
+				log.String("operationType", event.OperationType),
+			)
+
+			continue
 		}
-	}
 
-	// Flush any pending token on clean exit — without this, the tail end
-	// of a shutdown window would be replayed on next startup.
-	if err := flushToken(); err != nil {
-		return err
+		s.dispatchEvent(evt)
 	}
 
 	if ctx.Err() != nil {
@@ -302,148 +245,300 @@ func (s *Store) watchOnce(ctx context.Context, handler func(store.Event), onRead
 	return nil
 }
 
-func (s *Store) saveResumeToken(ctx context.Context, token bson.Raw) error {
-	if s.cfg.SaveResumeToken == nil || len(token) == 0 {
-		return nil
-	}
-
-	// Copy the token into a stable allocation — the driver reuses the
-	// underlying buffer on the next Next() call, so a save that escapes
-	// into a goroutine would otherwise read a mutated slice.
-	tokenCopy := make(bson.Raw, len(token))
-	copy(tokenCopy, token)
-
-	if saveErr := s.cfg.SaveResumeToken(ctx, tokenCopy); saveErr != nil {
-		s.logWarn(ctx, "resume token save failed, will retry on next batch",
-			log.Err(saveErr),
-		)
-
-		if s.cfg.ResumeTokenFailClosed {
-			return fmt.Errorf("%w: %w", errResumeTokenSaveFailed, saveErr)
-		}
-
-		return nil
-	}
-
-	return nil
+// nsKey is the polling-mode set element used to detect deletes. We can't
+// rely on _id (compound subdocument) as a map key directly, so we tuple it.
+type nsKey struct {
+	Namespace string
+	Key       string
 }
 
-func (s *Store) processChangeStreamEvent(
-	ctx context.Context,
-	stream *mongo.ChangeStream,
-	handler func(store.Event),
-) (bson.Raw, bool) {
-	var event changeEvent
-	if err := stream.Decode(&event); err != nil {
-		s.logWarn(ctx, "change stream decode error, skipping event", log.Err(err))
+// seenEntry records what we already emitted at the current watermark boundary.
+// The valueHash is a content discriminator: two writes for the same
+// (namespace, key) that share a BSON-millisecond updated_at but carry distinct
+// payloads must NOT collapse into one emission, otherwise the second writer's
+// value never reaches peer caches and they stay stale until a later, strictly
+// newer write advances the watermark. Keying by nsKey alone produced exactly
+// that silent-skip bug — see boundaryDedupHit for the discrimination rule.
+type seenEntry struct {
+	valueHash uint64
+}
 
-		return nil, false
+// hashValue produces an FNV-64a digest of the persisted value column. FNV is
+// used (rather than crypto/md5 or sha) because this is a non-adversarial
+// in-process discriminator on the dedup hot path: cost dominates, collision
+// resistance against an attacker is irrelevant, and a 64-bit FNV space is
+// large enough that an accidental collision on a (namespace, key) at the same
+// BSON millisecond is astronomically unlikely. The value column is stored as
+// a Go string by the upsert path (see mongodb_crud.go: bson string for
+// fieldValue), so we hash its bytes directly with no marshaling round-trip.
+func hashValue(v string) uint64 {
+	h := fnv.New64a()
+	// fnv.Hash64a.Write never returns an error.
+	_, _ = h.Write([]byte(v))
+
+	return h.Sum64()
+}
+
+// boundaryDedupHit reports whether a doc landing exactly on the current
+// watermark millisecond is an idempotent rewrite of what we already emitted
+// at that boundary. The rule:
+//
+//   - Not at the boundary  → not a dedup case; emit.
+//   - At the boundary, key not seen this round → not a dedup case; emit.
+//   - At the boundary, key seen AND value hash matches → idempotent rewrite;
+//     skip.
+//   - At the boundary, key seen but value hash differs → a real new write
+//     that happened to land in the same millisecond; emit.
+//
+// Pulled into a free function so we can unit-test the discrimination rule
+// without standing up a live MongoDB and without exercising the surrounding
+// cursor/IO machinery.
+func boundaryDedupHit(prevSeenAtWatermark map[nsKey]seenEntry, nk nsKey, atBoundary bool, valueHash uint64) bool {
+	if !atBoundary {
+		return false
 	}
 
-	evt, ok := extractEvent(event)
+	existing, ok := prevSeenAtWatermark[nk]
 	if !ok {
-		// Count the drop so operators can spot a runaway (malformed payload,
-		// upstream bug) without grepping logs (L-S3-BL-1).
-		s.droppedEvents.Add(1)
-
-		s.logWarn(ctx, "change stream event dropped — missing identifiers",
-			log.String("operationType", event.OperationType),
-		)
-
-		return nil, false
+		return false
 	}
 
-	s.safeInvokeHandler(ctx, handler, evt)
-
-	return stream.ResumeToken(), true
+	return existing.valueHash == valueHash
 }
 
-func (s *Store) applyResumeToken(
-	ctx context.Context,
-	opts *options.ChangeStreamOptionsBuilder,
-) (*options.ChangeStreamOptionsBuilder, error) {
-	if s.cfg.LoadResumeToken == nil {
-		return opts, nil
-	}
+func (s *Store) pollForever(stop <-chan struct{}) {
+	// Watermark anchored slightly in the past so the first tick observes any
+	// row that already exists. Deduplication is keyed on (namespace, key)
+	// pairs already emitted at the current watermark boundary.
+	watermark := time.Now().UTC().Truncate(time.Millisecond)
+	// known tracks the set of (namespace, key) tuples observed by the most
+	// recent full poll. Anything present last time but absent now is a
+	// delete that we synthesize an OpDelete event for.
+	known := make(map[nsKey]struct{})
+	// seenAtWatermark holds the ids whose updated_at equals the current
+	// watermark, paired with a content hash of the value we emitted for them.
+	// Two consecutive polls observing the same (ns, key) at the boundary skip
+	// re-emission only when the hash also matches — otherwise the second
+	// write (same key, same ms, different value) would be silently swallowed
+	// and never reach peer caches. See seenEntry / boundaryDedupHit.
+	seenAtWatermark := make(map[nsKey]seenEntry)
+	// firstPoll suppresses delete synthesis on the very first iteration
+	// (when `known` is empty by construction) and primes the watermark from
+	// the maximum updated_at observed during the snapshot scan.
+	firstPoll := true
 
-	token, err := s.cfg.LoadResumeToken(ctx)
+	ticker := time.NewTicker(s.cfg.PollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			newWatermark, currentKnown, newSeen, err := s.pollOnce(watermark, seenAtWatermark, known, firstPoll)
+			if err != nil {
+				s.logWarn(context.Background(), "poll query failed", log.Err(err))
+
+				continue
+			}
+
+			watermark = newWatermark
+			seenAtWatermark = newSeen
+			known = currentKnown
+			firstPoll = false
+		}
+	}
+}
+
+// pollOnce performs one poll cycle:
+//   - Emits OpUpsert for every doc with updated_at >= watermark unless it is
+//     an idempotent rewrite at the watermark boundary (same (ns, key), same
+//     boundary millisecond, AND same value-hash as what was emitted last
+//     round). Same key at the same ms with a different value is a real new
+//     write and IS emitted — otherwise peer caches would stay stale until a
+//     later, strictly-newer write advances the watermark.
+//   - Performs a full collection scan to capture the current key set;
+//     anything present in `prevKnown` but absent now becomes a synthesized
+//     OpDelete event. Skipped on the first iteration (prevKnown empty).
+//
+// Returns the new watermark, the new full known set, and the new
+// seenAtWatermark set (ids that touched the boundary millisecond, with their
+// value-hash content discriminator).
+func (s *Store) pollOnce(
+	watermark time.Time,
+	prevSeenAtWatermark map[nsKey]seenEntry,
+	prevKnown map[nsKey]struct{},
+	firstPoll bool,
+) (time.Time, map[nsKey]struct{}, map[nsKey]seenEntry, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Use >= so two writes that land in the same millisecond as the previous
+	// boundary aren't silently skipped; dedup via prevSeenAtWatermark with
+	// a value-hash discriminator (see seenEntry).
+	filter := bson.D{{Key: fieldUpdatedAt, Value: bson.D{{Key: "$gte", Value: watermark}}}}
+
+	findOpts := options.Find().SetSort(bson.D{
+		{Key: fieldUpdatedAt, Value: 1},
+		{Key: fieldNamespace, Value: 1},
+		{Key: fieldKey, Value: 1},
+	})
+
+	cur, err := s.coll.Find(ctx, filter, findOpts)
 	if err != nil {
-		s.logWarn(ctx, "resume token load failed, starting from current oplog position",
-			log.Err(err),
-		)
+		return watermark, prevKnown, prevSeenAtWatermark, fmt.Errorf("poll find: %w", err)
+	}
+	defer cur.Close(ctx)
 
-		if s.cfg.ResumeTokenFailClosed {
-			return opts, fmt.Errorf("load resume token: %w", err)
+	newWatermark := watermark
+	newSeen := make(map[nsKey]seenEntry)
+
+	for cur.Next(ctx) {
+		var doc entryDoc
+		if err := cur.Decode(&doc); err != nil {
+			s.logWarn(ctx, "poll decode error, skipping document", log.Err(err))
+
+			continue
 		}
 
-		return opts, nil
+		nk := nsKey{Namespace: doc.Namespace, Key: doc.Key}
+		valueHash := hashValue(doc.Value)
+		atBoundary := doc.UpdatedAt.Equal(watermark)
+
+		// Dedup: only skip when the same (ns, key) was emitted at this
+		// boundary millisecond AND the value digest matches. Same key, same
+		// ms, different value is a real write that MUST re-emit — otherwise
+		// peer caches stay stale until a strictly newer write advances the
+		// watermark.
+		if boundaryDedupHit(prevSeenAtWatermark, nk, atBoundary, valueHash) {
+			// Preserve the entry in newSeen so the next poll round still
+			// dedupes against it (we re-observe the same row again via $gte
+			// until the watermark advances).
+			newSeen[nk] = seenEntry{valueHash: valueHash}
+
+			continue
+		}
+
+		s.dispatchEvent(store.Event{
+			Namespace: doc.Namespace,
+			Key:       doc.Key,
+			Op:        store.OpUpsert,
+		})
+
+		switch {
+		case doc.UpdatedAt.After(newWatermark):
+			newWatermark = doc.UpdatedAt
+			newSeen = map[nsKey]seenEntry{nk: {valueHash: valueHash}}
+		case doc.UpdatedAt.Equal(newWatermark):
+			newSeen[nk] = seenEntry{valueHash: valueHash}
+		}
 	}
 
-	if len(token) > 0 {
-		opts = opts.SetResumeAfter(token)
+	if err := cur.Err(); err != nil {
+		return watermark, prevKnown, prevSeenAtWatermark, fmt.Errorf("poll cursor error: %w", err)
 	}
 
-	return opts, nil
+	// Full-collection scan to detect deletes done by other processes. The
+	// incremental updated_at scan above cannot see deletes (the row is gone
+	// before its tombstone is observable); diffing key sets is the only way.
+	currentKnown, err := s.snapshotKeys(ctx)
+	if err != nil {
+		// If the snapshot fails, keep prevKnown — we'd rather miss a delete
+		// event than emit a spurious one based on a partial scan.
+		s.logWarn(ctx, "poll snapshot failed, skipping delete diff", log.Err(err))
+
+		return newWatermark, prevKnown, newSeen, nil
+	}
+
+	if !firstPoll {
+		for nk := range prevKnown {
+			if _, stillThere := currentKnown[nk]; !stillThere {
+				s.dispatchEvent(store.Event{
+					Namespace: nk.Namespace,
+					Key:       nk.Key,
+					Op:        store.OpDelete,
+				})
+			}
+		}
+	}
+
+	return newWatermark, currentKnown, newSeen, nil
 }
 
-// extractEvent converts a decoded changeEvent into a store.Event.
-// Returns false if the event cannot be mapped (missing fields, etc.).
-//
-// Two paths:
-//   - Delete: documentKey._id carries the full tuple (namespace, key,
-//     tenant_id). No fullDocument is ever available from the server in this
-//     branch. The tuple is already decoded into event.DocumentKey.ID by the
-//     driver's BSON codec.
-//   - Insert/update/replace: fullDocument is populated thanks to
-//     SetFullDocument(UpdateLookup). We prefer fullDocument because on
-//     update events documentKey may refer to a previous tenant_id shape
-//     from a pre-migration row; the server always re-reads the current
-//     shape into fullDocument.
-//
-// The delete branch is the critical one for tenant attribution; getting it
-// wrong would silently fire OnChange for tenant deletes. Keep both paths in
-// this single function so reviewers can see the invariant.
-func extractEvent(ce changeEvent) (store.Event, bool) {
+// snapshotKeys returns the set of (namespace, key) tuples currently present
+// in the collection. Used by polling mode to diff against the prior poll and
+// synthesize OpDelete events for rows that disappeared.
+func (s *Store) snapshotKeys(ctx context.Context) (map[nsKey]struct{}, error) {
+	projection := bson.D{
+		{Key: fieldNamespace, Value: 1},
+		{Key: fieldKey, Value: 1},
+		{Key: fieldID, Value: 0},
+	}
+	findOpts := options.Find().SetProjection(projection)
+
+	cur, err := s.coll.Find(ctx, bson.D{}, findOpts)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot find: %w", err)
+	}
+	defer cur.Close(ctx)
+
+	out := make(map[nsKey]struct{})
+
+	for cur.Next(ctx) {
+		var doc struct {
+			Namespace string `bson:"namespace"`
+			Key       string `bson:"key"`
+		}
+
+		if err := cur.Decode(&doc); err != nil {
+			s.logWarn(ctx, "snapshot decode error, skipping document", log.Err(err))
+
+			continue
+		}
+
+		if doc.Namespace == "" || doc.Key == "" {
+			continue
+		}
+
+		out[nsKey{Namespace: doc.Namespace, Key: doc.Key}] = struct{}{}
+	}
+
+	if err := cur.Err(); err != nil {
+		return nil, fmt.Errorf("snapshot cursor: %w", err)
+	}
+
+	return out, nil
+}
+
+func eventFromChange(ce changeEvent) (store.Event, bool) {
+	id := ce.DocumentKey.ID
+	if id.Namespace == "" || id.Key == "" {
+		return store.Event{}, false
+	}
+
+	op := store.OpUpsert
 	if ce.OperationType == operationTypeDelete {
-		id := ce.DocumentKey.ID
-		if id.Namespace == "" || id.Key == "" || id.TenantID == "" {
-			return store.Event{}, false
-		}
-
-		return store.Event{
-			Namespace: id.Namespace,
-			Key:       id.Key,
-			TenantID:  id.TenantID,
-		}, true
+		op = store.OpDelete
 	}
 
-	if ce.FullDocument == nil {
-		return store.Event{}, false
-	}
-
-	fd := *ce.FullDocument
-	if fd.Namespace == "" || fd.Key == "" {
-		return store.Event{}, false
-	}
-
-	// A tenant_id coming through as "" is only expected on legacy rows that
-	// slipped past ensureSchema's backfill. Treat as the sentinel rather
-	// than dropping the event.
-	tenantID := fd.TenantID
-	if tenantID == "" {
-		tenantID = store.SentinelGlobal
-	}
-
-	return store.Event{
-		Namespace: fd.Namespace,
-		Key:       fd.Key,
-		TenantID:  tenantID,
-	}, true
+	return store.Event{Namespace: id.Namespace, Key: id.Key, Op: op}, true
 }
 
-// safeInvokeHandler calls handler inside a deferred panic recovery.
-func (s *Store) safeInvokeHandler(ctx context.Context, handler func(store.Event), evt store.Event) {
-	defer runtime.RecoverAndLogWithContext(ctx, s.cfg.Logger, "systemplane", "mongodb.handler")
+func (s *Store) dispatchEvent(evt store.Event) {
+	s.subscriberMu.Lock()
+	subs := make([]func(store.Event), 0, len(s.subscribers))
 
-	handler(evt)
+	for _, fn := range s.subscribers {
+		subs = append(subs, fn)
+	}
+
+	s.subscriberMu.Unlock()
+
+	for _, fn := range subs {
+		func() {
+			defer runtime.RecoverAndLog(s.cfg.Logger, "systemplane.mongodb.handler")
+
+			fn(evt)
+		}()
+	}
 }

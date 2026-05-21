@@ -1,31 +1,215 @@
-// Typed read accessors for systemplane Client.
+// Read paths and listing for systemplane Client.
 package client
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"sort"
 	"time"
 
 	"github.com/LerianStudio/lib-observability/log"
 )
 
-// ListEntry is a single entry returned by [Client.List]. It exposes the key
-// name, its current effective value (default or override), and the
-// human-readable description registered via [WithDescription].
+// ListEntry is a single entry returned by [Client.List].
 type ListEntry struct {
 	Key         string
 	Value       any
 	Description string
 }
 
-// List returns all currently-cached entries in the given namespace, sorted by
-// key for deterministic output. Keys registered but never persisted return
-// their default values. Safe to call concurrently; nil-safe.
-func (c *Client) List(namespace string) []ListEntry {
+// Get returns the current value for (namespace, key).
+//
+// In single-tenant mode it returns the cached value (or the registered
+// default when the cache is empty). In multi-tenant mode it resolves the
+// tenant database from ctx and reads through, returning the registered
+// default when the row is absent.
+func (c *Client) Get(ctx context.Context, namespace, key string) (any, bool, error) {
 	if c == nil || c.closed.Load() {
-		return nil
+		return nil, false, ErrClosed
 	}
 
-	// Collect all registered keys in this namespace.
+	if ctx == nil {
+		return nil, false, ErrNilContext
+	}
+
+	nk := nskey{Namespace: namespace, Key: key}
+
+	c.registryMu.RLock()
+	def, registered := c.registry[nk]
+	c.registryMu.RUnlock()
+
+	if !registered {
+		return nil, false, nil
+	}
+
+	if !c.multiTenant {
+		c.cacheMu.RLock()
+		v, inCache := c.cache[nk]
+		c.cacheMu.RUnlock()
+
+		if inCache {
+			return cloneValue(v), true, nil
+		}
+
+		return cloneValue(def.defaultValue), true, nil
+	}
+
+	// Multi-tenant: read through to the resolved tenant DB.
+	entry, found, err := c.store.Get(ctx, namespace, key)
+	if err != nil {
+		return nil, false, fmt.Errorf("systemplane: Get: %w", err)
+	}
+
+	if !found {
+		return cloneValue(def.defaultValue), true, nil
+	}
+
+	var decoded any
+	if err := json.Unmarshal(entry.Value, &decoded); err != nil {
+		c.logError(ctx, "failed to unmarshal stored value",
+			log.String("namespace", namespace),
+			log.String("key", key),
+			log.Err(err),
+		)
+
+		return nil, false, fmt.Errorf("systemplane: decode value for %s/%s: %w", namespace, key, err)
+	}
+
+	return decoded, true, nil
+}
+
+// GetString returns the value as a string.
+//
+// When the stored value is not a string, returns (zero, false, ErrValidation)
+// so callers can distinguish a missing/typed-incompatible value from a
+// legitimate empty string. Callers that only care about success can check the
+// second return.
+func (c *Client) GetString(ctx context.Context, namespace, key string) (string, bool, error) {
+	v, ok, err := c.Get(ctx, namespace, key)
+	if err != nil || !ok {
+		return "", ok, err
+	}
+
+	s, isString := v.(string)
+	if !isString {
+		return "", false, fmt.Errorf("%w: %s/%s: stored value is %T, want string", ErrValidation, namespace, key, v)
+	}
+
+	return s, true, nil
+}
+
+// GetInt returns the value as an int64.
+//
+// Accepts int, int64, and integer-valued float64 (JSON-decoded numbers).
+// Fractional float64 values, strings, and other types fail conversion and
+// return (0, false, ErrValidation). This avoids silently truncating
+// fractional input or returning 0 for a malformed value.
+func (c *Client) GetInt(ctx context.Context, namespace, key string) (int64, bool, error) {
+	v, ok, err := c.Get(ctx, namespace, key)
+	if err != nil || !ok {
+		return 0, ok, err
+	}
+
+	switch n := v.(type) {
+	case int:
+		return int64(n), true, nil
+	case int64:
+		return n, true, nil
+	case float64:
+		// JSON decodes all numbers as float64. Reject any value that would
+		// lose precision when truncated to int64 (NaN, Inf, fractional).
+		if n != float64(int64(n)) {
+			return 0, false, fmt.Errorf("%w: %s/%s: stored value %v is not an integer", ErrValidation, namespace, key, n)
+		}
+
+		return int64(n), true, nil
+	default:
+		return 0, false, fmt.Errorf("%w: %s/%s: stored value is %T, want int", ErrValidation, namespace, key, v)
+	}
+}
+
+// GetBool returns the value as a bool.
+//
+// Returns (false, false, ErrValidation) when the stored value is not a bool.
+func (c *Client) GetBool(ctx context.Context, namespace, key string) (bool, bool, error) {
+	v, ok, err := c.Get(ctx, namespace, key)
+	if err != nil || !ok {
+		return false, ok, err
+	}
+
+	b, isBool := v.(bool)
+	if !isBool {
+		return false, false, fmt.Errorf("%w: %s/%s: stored value is %T, want bool", ErrValidation, namespace, key, v)
+	}
+
+	return b, true, nil
+}
+
+// GetFloat64 returns the value as a float64.
+//
+// Returns (0, false, ErrValidation) when the stored value is not a number.
+func (c *Client) GetFloat64(ctx context.Context, namespace, key string) (float64, bool, error) {
+	v, ok, err := c.Get(ctx, namespace, key)
+	if err != nil || !ok {
+		return 0, ok, err
+	}
+
+	switch n := v.(type) {
+	case float64:
+		return n, true, nil
+	case int:
+		return float64(n), true, nil
+	case int64:
+		return float64(n), true, nil
+	default:
+		return 0, false, fmt.Errorf("%w: %s/%s: stored value is %T, want float64", ErrValidation, namespace, key, v)
+	}
+}
+
+// GetDuration returns the value as a time.Duration.
+//
+// Accepts time.Duration, parseable duration string (e.g. "30s"), and integer
+// float64 nanoseconds. All other shapes — including unparseable strings —
+// return (0, false, ErrValidation).
+func (c *Client) GetDuration(ctx context.Context, namespace, key string) (time.Duration, bool, error) {
+	v, ok, err := c.Get(ctx, namespace, key)
+	if err != nil || !ok {
+		return 0, ok, err
+	}
+
+	switch d := v.(type) {
+	case time.Duration:
+		return d, true, nil
+	case string:
+		parsed, parseErr := time.ParseDuration(d)
+		if parseErr != nil {
+			return 0, false, fmt.Errorf("%w: %s/%s: cannot parse %q as duration: %w",
+				ErrValidation, namespace, key, d, parseErr)
+		}
+
+		return parsed, true, nil
+	case float64:
+		return time.Duration(int64(d)), true, nil
+	default:
+		return 0, false, fmt.Errorf("%w: %s/%s: stored value is %T, want time.Duration", ErrValidation, namespace, key, v)
+	}
+}
+
+// List returns all registered entries in namespace sorted by key.
+//
+// In multi-tenant mode List resolves the tenant database from ctx; in
+// single-tenant mode it serves from the in-process cache and registered
+// defaults.
+func (c *Client) List(ctx context.Context, namespace string) ([]ListEntry, error) {
+	if c == nil || c.closed.Load() {
+		return nil, ErrClosed
+	}
+
+	if ctx == nil {
+		return nil, ErrNilContext
+	}
+
 	c.registryMu.RLock()
 
 	keys := make([]nskey, 0)
@@ -39,23 +223,22 @@ func (c *Client) List(namespace string) []ListEntry {
 	c.registryMu.RUnlock()
 
 	if len(keys) == 0 {
-		return []ListEntry{}
+		return []ListEntry{}, nil
 	}
 
-	// Sort by key name for deterministic output.
 	sort.Slice(keys, func(i, j int) bool {
 		return keys[i].Key < keys[j].Key
 	})
 
-	type listSnapshot struct {
-		key         string
-		value       any
-		description string
+	if c.multiTenant {
+		return c.listFromStore(ctx, namespace, keys)
 	}
 
-	// Snapshot values under lock, then clone outside the critical section so
-	// large mutable config values do not block concurrent writers/read refreshes.
-	snapshots := make([]listSnapshot, 0, len(keys))
+	return c.listFromCache(keys), nil
+}
+
+func (c *Client) listFromCache(keys []nskey) []ListEntry {
+	entries := make([]ListEntry, 0, len(keys))
 
 	c.registryMu.RLock()
 	c.cacheMu.RLock()
@@ -65,7 +248,6 @@ func (c *Client) List(namespace string) []ListEntry {
 
 		def, registered := c.registry[nk]
 		if !inCache && registered {
-			// Fallback to the registered default.
 			val = def.defaultValue
 		}
 
@@ -74,26 +256,70 @@ func (c *Client) List(namespace string) []ListEntry {
 			desc = def.description
 		}
 
-		snapshots = append(snapshots, listSnapshot{key: nk.Key, value: val, description: desc})
+		entries = append(entries, ListEntry{
+			Key:         nk.Key,
+			Value:       cloneValue(val),
+			Description: desc,
+		})
 	}
 
 	c.cacheMu.RUnlock()
 	c.registryMu.RUnlock()
 
-	entries := make([]ListEntry, 0, len(snapshots))
-	for _, snapshot := range snapshots {
-		entries = append(entries, ListEntry{
-			Key:         snapshot.key,
-			Value:       cloneValue(snapshot.value),
-			Description: snapshot.description,
-		})
-	}
-
 	return entries
 }
 
+func (c *Client) listFromStore(ctx context.Context, namespace string, keys []nskey) ([]ListEntry, error) {
+	stored, err := c.store.List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("systemplane: List: %w", err)
+	}
+
+	storedByKey := make(map[string][]byte, len(stored))
+
+	for _, entry := range stored {
+		if entry.Namespace != namespace {
+			continue
+		}
+
+		storedByKey[entry.Key] = entry.Value
+	}
+
+	entries := make([]ListEntry, 0, len(keys))
+
+	c.registryMu.RLock()
+	defer c.registryMu.RUnlock()
+
+	for _, nk := range keys {
+		def := c.registry[nk]
+		val := cloneValue(def.defaultValue)
+
+		if raw, ok := storedByKey[nk.Key]; ok {
+			var decoded any
+			if err := json.Unmarshal(raw, &decoded); err != nil {
+				c.logError(ctx, "failed to unmarshal stored value",
+					log.String("namespace", namespace),
+					log.String("key", nk.Key),
+					log.Err(err),
+				)
+
+				return nil, fmt.Errorf("systemplane: decode value for %s/%s: %w", namespace, nk.Key, err)
+			}
+
+			val = decoded
+		}
+
+		entries = append(entries, ListEntry{
+			Key:         nk.Key,
+			Value:       val,
+			Description: def.description,
+		})
+	}
+
+	return entries, nil
+}
+
 // KeyDescription returns the human-readable description for a registered key.
-// Returns "" for unregistered keys or nil receivers.
 func (c *Client) KeyDescription(namespace, key string) string {
 	if c == nil || c.closed.Load() {
 		return ""
@@ -112,8 +338,7 @@ func (c *Client) KeyDescription(namespace, key string) string {
 	return def.description
 }
 
-// KeyRedaction returns the redaction policy for a registered key. Returns
-// [RedactNone] for unregistered keys or nil receivers.
+// KeyRedaction returns the redaction policy for a registered key.
 func (c *Client) KeyRedaction(namespace, key string) RedactPolicy {
 	if c == nil || c.closed.Load() {
 		return RedactNone
@@ -132,159 +357,11 @@ func (c *Client) KeyRedaction(namespace, key string) RedactPolicy {
 	return def.redaction
 }
 
-// KeyStatus reports whether a (namespace, key) pair is registered and, if so,
-// whether it was registered via [Client.RegisterTenantScoped]. Returns
-// (false, false) for nil receivers or unregistered keys. A key registered via
-// the legacy [Client.Register] returns (true, false); a tenant-scoped key
-// returns (true, true).
-//
-// Callers such as the admin HTTP surface use this to distinguish "key does not
-// exist" (404) from "key exists but is not tenant-scoped" (400) without
-// threading new sentinel errors through the write path.
-func (c *Client) KeyStatus(namespace, key string) (registered, tenantScoped bool) {
-	if c == nil || c.closed.Load() {
-		return false, false
-	}
-
-	nk := nskey{Namespace: namespace, Key: key}
-
-	c.registryMu.RLock()
-	_, registered = c.registry[nk]
-	_, tenantScoped = c.tenantScopedRegistry[nk]
-	c.registryMu.RUnlock()
-
-	return registered, tenantScoped
-}
-
-// Logger returns the logger attached to this Client (via [WithLogger] at
-// construction time) or a nop logger when the Client is nil or was
-// constructed without a logger. Never returns nil — callers may safely
-// invoke methods on the returned logger without a nil check.
-//
-// This accessor exists so sibling subpackages (notably the admin subpackage)
-// can share the Client's configured logger without reintroducing a
-// parallel WithLogger option on their own surface.
+// Logger returns the logger attached to this Client.
 func (c *Client) Logger() log.Logger {
 	if c == nil || c.logger == nil {
 		return log.NewNop()
 	}
 
 	return c.logger
-}
-
-// Get returns the current value for the given namespace and key.
-// Returns (nil, false) when the Client is nil, closed, or the key is unregistered.
-// If the key is registered but absent from the cache (before Start), the
-// registered default is returned.
-func (c *Client) Get(namespace, key string) (any, bool) {
-	if c == nil || c.closed.Load() {
-		return nil, false
-	}
-
-	nk := nskey{Namespace: namespace, Key: key}
-
-	// Try the cache first (populated after Start).
-	c.cacheMu.RLock()
-	v, inCache := c.cache[nk]
-	c.cacheMu.RUnlock()
-
-	if inCache {
-		return cloneValue(v), true
-	}
-
-	// Fallback to the registered default (before Start or if cache was never populated).
-	c.registryMu.RLock()
-	def, registered := c.registry[nk]
-	c.registryMu.RUnlock()
-
-	if registered {
-		return cloneValue(def.defaultValue), true
-	}
-
-	return nil, false
-}
-
-// GetString returns the current value as a string.
-// Returns "" when the Client is nil or the key is not found.
-func (c *Client) GetString(namespace, key string) string {
-	v, ok := c.Get(namespace, key)
-	if !ok {
-		return ""
-	}
-
-	s, _ := v.(string)
-
-	return s
-}
-
-// GetInt returns the current value as an int.
-// Returns 0 when the Client is nil or the key is not found.
-func (c *Client) GetInt(namespace, key string) int {
-	v, ok := c.Get(namespace, key)
-	if !ok {
-		return 0
-	}
-
-	// JSON numbers decode as float64; handle both int and float64.
-	switch n := v.(type) {
-	case int:
-		return n
-	case float64:
-		return int(n)
-	default:
-		return 0
-	}
-}
-
-// GetBool returns the current value as a bool.
-// Returns false when the Client is nil or the key is not found.
-func (c *Client) GetBool(namespace, key string) bool {
-	v, ok := c.Get(namespace, key)
-	if !ok {
-		return false
-	}
-
-	b, _ := v.(bool)
-
-	return b
-}
-
-// GetFloat64 returns the current value as a float64.
-// Returns 0 when the Client is nil or the key is not found.
-func (c *Client) GetFloat64(namespace, key string) float64 {
-	v, ok := c.Get(namespace, key)
-	if !ok {
-		return 0
-	}
-
-	f, _ := v.(float64)
-
-	return f
-}
-
-// GetDuration returns the current value as a [time.Duration].
-// It supports both string values parseable by [time.ParseDuration] and
-// numeric values interpreted as nanoseconds.
-// Returns 0 when the Client is nil or the key is not found.
-func (c *Client) GetDuration(namespace, key string) time.Duration {
-	v, ok := c.Get(namespace, key)
-	if !ok {
-		return 0
-	}
-
-	switch d := v.(type) {
-	case time.Duration:
-		return d
-	case string:
-		parsed, err := time.ParseDuration(d)
-		if err != nil {
-			return 0
-		}
-
-		return parsed
-	case float64:
-		return time.Duration(int64(d))
-	default:
-		return 0
-	}
 }

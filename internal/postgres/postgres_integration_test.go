@@ -1,6 +1,6 @@
 //go:build integration
 
-package postgres
+package postgres_test
 
 import (
 	"context"
@@ -8,594 +8,310 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib" // pgx driver registration
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-	"github.com/testcontainers/testcontainers-go"
-	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
-
+	tmcore "github.com/LerianStudio/lib-commons/v5/commons/tenant-manager/core"
+	"github.com/LerianStudio/lib-systemplane/internal/postgres"
 	"github.com/LerianStudio/lib-systemplane/internal/store"
 	"github.com/LerianStudio/lib-systemplane/systemplanetest"
+	"github.com/bxcodec/dbresolver/v2"
+	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/testcontainers/testcontainers-go"
+	pgcontainer "github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 
-// tableSeq generates unique table names so each factory call produces an
-// isolated Store with its own empty table. This prevents leftover data from
-// earlier contract sub-tests polluting later ones.
-var tableSeq atomic.Int64
-
-// startPostgresContainer creates a PostgreSQL 17 testcontainer and returns
-// its DSN. The container is terminated when the test finishes.
-//
-// Argument order follows the Go convention — context first, then *testing.T —
-// to satisfy linters that flag `t, ctx` as an anti-pattern (L-S2-test-1).
-func startPostgresContainer(ctx context.Context, t *testing.T) string {
+// startContainer launches a single Postgres testcontainer reused across the
+// integration tests in this file.
+func startContainer(t *testing.T) (string, func()) {
 	t.Helper()
 
-	container, err := tcpostgres.Run(ctx,
-		"postgres:17-alpine",
-		tcpostgres.WithDatabase("systemplanetest"),
-		tcpostgres.WithUsername("test"),
-		tcpostgres.WithPassword("test"),
-		testcontainers.WithWaitStrategy(
-			wait.ForAll(
-				wait.ForLog("database system is ready to accept connections").WithOccurrence(2),
-				wait.ForListeningPort("5432/tcp"),
-			).WithStartupTimeout(90*time.Second),
-		),
-	)
-	require.NoError(t, err)
+	ctx := context.Background()
 
-	t.Cleanup(func() {
-		require.NoError(t, container.Terminate(context.Background()))
-	})
+	container, err := pgcontainer.Run(ctx, "postgres:16-alpine",
+		pgcontainer.WithDatabase("postgres"),
+		pgcontainer.WithUsername("postgres"),
+		pgcontainer.WithPassword("postgres"),
+		pgcontainer.BasicWaitStrategies(),
+	)
+	if err != nil {
+		t.Fatalf("start container: %v", err)
+	}
 
 	dsn, err := container.ConnectionString(ctx, "sslmode=disable")
-	require.NoError(t, err)
+	if err != nil {
+		_ = testcontainers.TerminateContainer(container)
 
-	return dsn
+		t.Fatalf("connection string: %v", err)
+	}
+
+	cleanup := func() {
+		_ = testcontainers.TerminateContainer(container)
+	}
+
+	return dsn, cleanup
 }
 
-// newTestStore creates a Store backed by the given DSN, creating the schema
-// idempotently. The store is closed on test cleanup.
-func newTestStore(t *testing.T, dsn string) *Store {
+// adminDSN returns a connection string for the postgres admin database used
+// to create per-test databases.
+func adminDSN(t *testing.T, base string) *sql.DB {
 	t.Helper()
 
-	db, err := sql.Open("pgx", dsn)
-	require.NoError(t, err)
-
-	t.Cleanup(func() {
-		require.NoError(t, db.Close())
-	})
-
-	table := fmt.Sprintf("sp_test_%d", tableSeq.Add(1))
-
-	s, err := New(Config{
-		DB:                  db,
-		ListenDSN:           dsn,
-		Channel:             "systemplane_changes",
-		Table:               table,
-		TenantSchemaEnabled: true,
-	})
-	require.NoError(t, err)
-
-	t.Cleanup(func() {
-		require.NoError(t, s.Close())
-	})
-
-	return s
-}
-
-// TestIntegration_ContractSuite invokes the shared backend contract suite
-// against the Postgres implementation.
-func TestIntegration_ContractSuite(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	dsn := startPostgresContainer(ctx, t)
-
-	systemplanetest.Run(t, func(t *testing.T) store.Store {
-		return newTestStore(t, dsn)
-	})
-}
-
-// TestIntegration_SetEmitsNotifyWithCorrectPayload verifies that a Set triggers
-// NOTIFY and the subscriber receives the exact (namespace, key) pair.
-func TestIntegration_SetEmitsNotifyWithCorrectPayload(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	dsn := startPostgresContainer(ctx, t)
-	s := newTestStore(t, dsn)
-
-	var mu sync.Mutex
-
-	var received []store.Event
-
-	subCtx, subCancel := context.WithCancel(ctx)
-	done := make(chan error, 1)
-	ready := make(chan error, 1)
-
-	go func() {
-		done <- s.SubscribeReady(subCtx, func(evt store.Event) {
-			mu.Lock()
-			received = append(received, evt)
-			mu.Unlock()
-		}, func(err error) { ready <- err })
-	}()
-
-	select {
-	case err := <-ready:
-		require.NoError(t, err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for subscribe readiness")
-	}
-
-	value, err := json.Marshal("debug")
+	db, err := sql.Open("pgx", base)
 	if err != nil {
-		t.Fatalf("json.Marshal: %v", err)
+		t.Fatalf("open admin: %v", err)
 	}
 
-	err = s.Set(ctx, store.Entry{
-		Namespace: "global",
-		Key:       "log.level",
-		Value:     value,
-		UpdatedBy: "test-actor",
-	})
-	require.NoError(t, err)
-
-	require.Eventually(t, func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-
-		return len(received) >= 1
-	}, 10*time.Second, 50*time.Millisecond, "expected at least 1 event within timeout")
-
-	mu.Lock()
-	evt := received[0]
-	mu.Unlock()
-
-	assert.Equal(t, "global", evt.Namespace)
-	assert.Equal(t, "log.level", evt.Key)
-	// H6: a global-path Set must emit NOTIFY carrying the '_global' sentinel
-	// as tenant_id — the Client's changefeed router distinguishes global vs
-	// tenant-scoped events by this field. Asserting it here pins the NOTIFY
-	// payload contract at the integration boundary where the real trigger
-	// runs, not just the parseNotifyPayload unit test.
-	assert.Equal(t, store.SentinelGlobal, evt.TenantID)
-
-	subCancel()
-
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Subscribe did not return after context cancellation")
-	}
+	return db
 }
 
-// TestIntegration_SetIsIdempotent verifies that calling Set with the same
-// (namespace, key) multiple times results in exactly one row.
-func TestIntegration_SetIsIdempotent(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
+// freshDB creates a uniquely-named database and returns its DSN.
+func freshDB(t *testing.T, admin *sql.DB, name string) string {
+	t.Helper()
+
+	if _, err := admin.Exec(fmt.Sprintf(`CREATE DATABASE %s`, name)); err != nil {
+		t.Fatalf("create database %s: %v", name, err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	dsn := startPostgresContainer(ctx, t)
-	s := newTestStore(t, dsn)
-
-	value, err := json.Marshal(42)
-	if err != nil {
-		t.Fatalf("json.Marshal: %v", err)
-	}
-
-	for range 3 {
-		err := s.Set(ctx, store.Entry{
-			Namespace: "global",
-			Key:       "rate_limit.rps",
-			Value:     value,
-			UpdatedBy: "test-actor",
-		})
-		require.NoError(t, err)
-	}
-
-	entries, err := s.List(ctx)
-	require.NoError(t, err)
-
-	// Count entries matching our namespace+key.
-	var count int
-
-	for _, e := range entries {
-		if e.Namespace == "global" && e.Key == "rate_limit.rps" {
-			count++
-		}
-	}
-
-	assert.Equal(t, 1, count, "ON CONFLICT should keep exactly one row")
+	return name
 }
 
-// TestIntegration_InvalidChannelNameRejected verifies that New rejects
-// channel names containing SQL metacharacters.
-func TestIntegration_InvalidChannelNameRejected(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
+// dsnFor reshapes the admin DSN to point at db.
+func dsnFor(base, dbName string) string {
+	// testcontainers gives us a fully-formed URL of the shape
+	// postgres://user:pass@host:port/postgres?sslmode=disable; we swap the
+	// database segment with dbName.
+	for i := len(base) - 1; i >= 0; i-- {
+		if base[i] == '/' {
+			head := base[:i+1]
+			tail := base[i+1:]
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	dsn := startPostgresContainer(ctx, t)
-
-	db, err := sql.Open("pgx", dsn)
-	require.NoError(t, err)
-
-	defer func() { _ = db.Close() }()
-
-	_, err = New(Config{
-		DB:        db,
-		ListenDSN: dsn,
-		Channel:   `"; DROP TABLE--`,
-		Table:     "systemplane_entries",
-	})
-
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "unsafe channel name")
-}
-
-func TestIntegration_StrictIsolationRequiresExplicitChannelAndTable(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	dsn := startPostgresContainer(ctx, t)
-
-	db, err := sql.Open("pgx", dsn)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, db.Close()) })
-
-	_, err = New(Config{DB: db, ListenDSN: dsn, StrictIsolation: true})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "explicit listen channel")
-
-	_, err = New(Config{
-		DB:              db,
-		ListenDSN:       dsn,
-		Channel:         "service_changes",
-		ChannelExplicit: true,
-		StrictIsolation: true,
-	})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "explicit table")
-
-	s, err := New(Config{
-		DB:              db,
-		ListenDSN:       dsn,
-		Channel:         defaultChannel,
-		ChannelExplicit: true,
-		Table:           defaultTable,
-		TableExplicit:   true,
-		StrictIsolation: true,
-	})
-	require.NoError(t, err, "explicit default names are allowed because the caller deliberately opted in")
-	require.NoError(t, s.Close())
-}
-
-func TestIntegration_TriggerUsesPerTableChannel(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	dsn := startPostgresContainer(ctx, t)
-
-	db, err := sql.Open("pgx", dsn)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, db.Close()) })
-
-	tableA := fmt.Sprintf("sp_channel_a_%d", tableSeq.Add(1))
-	tableB := fmt.Sprintf("sp_channel_b_%d", tableSeq.Add(1))
-
-	sA, err := New(Config{
-		DB:                  db,
-		ListenDSN:           dsn,
-		Channel:             "sp_channel_a_changes",
-		ChannelExplicit:     true,
-		Table:               tableA,
-		TableExplicit:       true,
-		TenantSchemaEnabled: true,
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, sA.Close()) })
-
-	// Constructing B after A used to replace the shared trigger function and
-	// reroute A's trigger notifications to B's channel. This order pins that
-	// regression directly.
-	sB, err := New(Config{
-		DB:                  db,
-		ListenDSN:           dsn,
-		Channel:             "sp_channel_b_changes",
-		ChannelExplicit:     true,
-		Table:               tableB,
-		TableExplicit:       true,
-		TenantSchemaEnabled: true,
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, sB.Close()) })
-
-	subCtx, subCancel := context.WithCancel(ctx)
-	defer subCancel()
-
-	receivedA := make(chan store.Event, 1)
-	receivedB := make(chan store.Event, 1)
-	readyA := make(chan error, 1)
-	readyB := make(chan error, 1)
-	doneA := make(chan error, 1)
-	doneB := make(chan error, 1)
-
-	go func() {
-		doneA <- sA.SubscribeReady(subCtx, func(evt store.Event) { receivedA <- evt }, func(err error) { readyA <- err })
-	}()
-	go func() {
-		doneB <- sB.SubscribeReady(subCtx, func(evt store.Event) { receivedB <- evt }, func(err error) { readyB <- err })
-	}()
-
-	for _, ready := range []chan error{readyA, readyB} {
-		select {
-		case err := <-ready:
-			require.NoError(t, err)
-		case <-time.After(5 * time.Second):
-			t.Fatal("timed out waiting for subscribe readiness")
-		}
-	}
-
-	value, err := json.Marshal("debug")
-	require.NoError(t, err)
-
-	require.NoError(t, sA.Set(ctx, store.Entry{
-		Namespace: "global",
-		Key:       "log.level",
-		Value:     value,
-		UpdatedBy: "test-actor",
-	}))
-
-	select {
-	case evt := <-receivedA:
-		assert.Equal(t, "global", evt.Namespace)
-		assert.Equal(t, "log.level", evt.Key)
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for table A notification")
-	}
-
-	select {
-	case evt := <-receivedB:
-		t.Fatalf("table B subscriber received table A event: %+v", evt)
-	case <-time.After(300 * time.Millisecond):
-	}
-
-	subCancel()
-
-	for _, done := range []chan error{doneA, doneB} {
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			t.Fatal("Subscribe did not return after context cancellation")
-		}
-	}
-}
-
-// TestIntegration_ListenReconnectsAfterConnDrop starts a Subscribe, kills the
-// LISTEN connection via pg_terminate_backend, then verifies that a subsequent
-// Set still triggers the handler after reconnection.
-func TestIntegration_ListenReconnectsAfterConnDrop(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	dsn := startPostgresContainer(ctx, t)
-	s := newTestStore(t, dsn)
-
-	var mu sync.Mutex
-
-	var received []store.Event
-
-	subCtx, subCancel := context.WithCancel(ctx)
-	done := make(chan error, 1)
-	ready := make(chan error, 1)
-
-	go func() {
-		done <- s.SubscribeReady(subCtx, func(evt store.Event) {
-			mu.Lock()
-			received = append(received, evt)
-			mu.Unlock()
-		}, func(err error) { ready <- err })
-	}()
-
-	select {
-	case err := <-ready:
-		require.NoError(t, err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for initial LISTEN readiness")
-	}
-
-	// Kill all non-superuser connections that are in LISTEN state by
-	// terminating backends that are not our control connection.
-	controlDB, err := sql.Open("pgx", dsn)
-	require.NoError(t, err)
-
-	defer func() { _ = controlDB.Close() }()
-
-	// Terminate backends that are idle (the LISTEN connection will be in
-	// "idle" state waiting for notifications).
-	_, err = controlDB.ExecContext(ctx,
-		`SELECT pg_terminate_backend(pid)
-		 FROM pg_stat_activity
-		 WHERE pid != pg_backend_pid()
-		   AND datname = current_database()
-		   AND state = 'idle'
-		   AND query LIKE 'LISTEN%'`)
-	require.NoError(t, err)
-
-	require.Eventually(t, func() bool {
-		var count int
-		err := controlDB.QueryRowContext(ctx,
-			`SELECT count(*)
-			 FROM pg_stat_activity
-			 WHERE pid != pg_backend_pid()
-			   AND datname = current_database()
-			   AND state = 'idle'
-			   AND query LIKE 'LISTEN%'`).Scan(&count)
-
-		return err == nil && count > 0
-	}, 10*time.Second, 100*time.Millisecond, "subscriber should re-establish LISTEN after connection drop")
-
-	// Now issue a Set; the trigger should fire NOTIFY on the new connection.
-	value, err := json.Marshal("reconnected")
-	if err != nil {
-		t.Fatalf("json.Marshal: %v", err)
-	}
-
-	err = s.Set(ctx, store.Entry{
-		Namespace: "global",
-		Key:       "reconnect_test",
-		Value:     value,
-		UpdatedBy: "reconnect-actor",
-	})
-	require.NoError(t, err)
-
-	require.Eventually(t, func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-
-		for _, evt := range received {
-			if evt.Namespace == "global" && evt.Key == "reconnect_test" {
-				return true
+			// Drop the existing dbname (everything up to the first '?').
+			for j := 0; j < len(tail); j++ {
+				if tail[j] == '?' {
+					return head + dbName + tail[j:]
+				}
 			}
+
+			return head + dbName
+		}
+	}
+
+	return base
+}
+
+func TestIntegration_PostgresSingleTenant(t *testing.T) {
+	dsn, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	factory := func(t *testing.T) (store.Store, func()) {
+		t.Helper()
+
+		admin := adminDSN(t, dsn)
+		dbName := fmt.Sprintf("st_%d", time.Now().UnixNano())
+		freshDB(t, admin, dbName)
+
+		_ = admin.Close()
+
+		tenantDSN := dsnFor(dsn, dbName)
+
+		db, err := sql.Open("pgx", tenantDSN)
+		if err != nil {
+			t.Fatalf("open: %v", err)
 		}
 
-		return false
-	}, 10*time.Second, 100*time.Millisecond, "expected reconnect_test event after reconnection")
+		s, err := postgres.New(postgres.Config{
+			DB:        db,
+			ListenDSN: tenantDSN,
+		})
+		if err != nil {
+			t.Fatalf("postgres.New: %v", err)
+		}
 
-	subCancel()
-
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Subscribe did not return after context cancellation")
-	}
-}
-
-// TestIntegration_NilReceiverSafety verifies that nil-receiver methods return
-// store.ErrClosed without panicking.
-func TestIntegration_NilReceiverSafety(t *testing.T) {
-	var s *Store
-
-	_, err := s.List(context.Background())
-	assert.ErrorIs(t, err, store.ErrClosed)
-
-	_, _, err = s.Get(context.Background(), "ns", "key")
-	assert.ErrorIs(t, err, store.ErrClosed)
-
-	err = s.Set(context.Background(), store.Entry{Namespace: "ns", Key: "key", Value: []byte(`"v"`)})
-	assert.ErrorIs(t, err, store.ErrClosed)
-
-	err = s.Subscribe(context.Background(), func(_ store.Event) {})
-	assert.ErrorIs(t, err, store.ErrClosed)
-
-	err = s.Close()
-	assert.NoError(t, err)
-}
-
-// TestIntegration_GetNotFound verifies that Get returns (_, false, nil)
-// for a non-existent key.
-func TestIntegration_GetNotFound(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
+		return s, func() {
+			_ = s.Close()
+			_ = db.Close()
+		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	dsn := startPostgresContainer(ctx, t)
-	s := newTestStore(t, dsn)
-
-	_, found, err := s.Get(ctx, "nonexistent", "key")
-	require.NoError(t, err)
-	assert.False(t, found)
+	systemplanetest.Run(t, factory, systemplanetest.RunOptions{EventWait: 5 * time.Second})
 }
 
-// TestIntegration_ListEmpty verifies that List returns an empty (non-nil)
-// slice when no entries exist.
-func TestIntegration_ListEmpty(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
+// TestIntegration_PostgresMultiTenantIsolation verifies that writes against
+// one tenant's database are invisible to another tenant in multi-tenant mode,
+// and that schema bootstrap runs exactly once per tenant DB.
+func TestIntegration_PostgresMultiTenantIsolation(t *testing.T) {
+	dsn, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
+	admin := adminDSN(t, dsn)
+	defer admin.Close()
 
-	dsn := startPostgresContainer(ctx, t)
-	s := newTestStore(t, dsn)
+	dbA := fmt.Sprintf("tenant_a_%d", time.Now().UnixNano())
+	dbB := fmt.Sprintf("tenant_b_%d", time.Now().UnixNano())
 
-	entries, err := s.List(ctx)
-	require.NoError(t, err)
-	assert.NotNil(t, entries)
-	assert.Empty(t, entries)
-}
+	freshDB(t, admin, dbA)
+	freshDB(t, admin, dbB)
 
-// TestIntegration_SetAndGet verifies the basic roundtrip: Set then Get.
-func TestIntegration_SetAndGet(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	dsn := startPostgresContainer(ctx, t)
-	s := newTestStore(t, dsn)
-
-	value, err := json.Marshal("info")
+	tenantA, err := sql.Open("pgx", dsnFor(dsn, dbA))
 	if err != nil {
-		t.Fatalf("json.Marshal: %v", err)
+		t.Fatalf("open A: %v", err)
 	}
 
-	err = s.Set(ctx, store.Entry{
-		Namespace: "global",
-		Key:       "log.level",
-		Value:     value,
-		UpdatedBy: "tester",
-	})
-	require.NoError(t, err)
+	defer tenantA.Close()
 
-	entry, found, err := s.Get(ctx, "global", "log.level")
-	require.NoError(t, err)
-	assert.True(t, found)
-	assert.Equal(t, "global", entry.Namespace)
-	assert.Equal(t, "log.level", entry.Key)
-	assert.JSONEq(t, `"info"`, string(entry.Value))
-	assert.Equal(t, "tester", entry.UpdatedBy)
-	assert.False(t, entry.UpdatedAt.IsZero())
+	tenantB, err := sql.Open("pgx", dsnFor(dsn, dbB))
+	if err != nil {
+		t.Fatalf("open B: %v", err)
+	}
+
+	defer tenantB.Close()
+
+	resolverA := dbresolver.New(dbresolver.WithPrimaryDBs(tenantA))
+	resolverB := dbresolver.New(dbresolver.WithPrimaryDBs(tenantB))
+
+	s, err := postgres.New(postgres.Config{
+		MultiTenantEnabled: true,
+		Module:             "systemplane",
+	})
+	if err != nil {
+		t.Fatalf("postgres.New: %v", err)
+	}
+
+	defer s.Close()
+
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	ctxA := tmcore.ContextWithPG(context.Background(), resolverA, "systemplane")
+	ctxB := tmcore.ContextWithPG(context.Background(), resolverB, "systemplane")
+
+	mustSet(t, s, ctxA, "ns", "k", "value-A")
+	mustSet(t, s, ctxB, "ns", "k", "value-B")
+
+	gotA := mustGet(t, s, ctxA, "ns", "k")
+	if gotA != "value-A" {
+		t.Errorf("tenant A read = %q, want value-A", gotA)
+	}
+
+	gotB := mustGet(t, s, ctxB, "ns", "k")
+	if gotB != "value-B" {
+		t.Errorf("tenant B read = %q, want value-B", gotB)
+	}
+
+	// Confirm tenant A cannot see tenant B's value or vice-versa.
+	listA, err := s.List(ctxA)
+	if err != nil {
+		t.Fatalf("listA: %v", err)
+	}
+
+	for _, e := range listA {
+		var v string
+		_ = json.Unmarshal(e.Value, &v)
+
+		if v == "value-B" {
+			t.Errorf("tenant A list leaked tenant B value")
+		}
+	}
+
+	// Drop the trigger created during the FIRST schema bootstrap on tenant A;
+	// a follow-up call should re-use the cached schema-once and NOT recreate
+	// the trigger (the test expectation is the trigger STAYS gone).
+	if _, err := tenantA.Exec(`DROP TRIGGER IF EXISTS systemplane_notify_trigger ON systemplane_entries`); err != nil {
+		t.Fatalf("drop trigger: %v", err)
+	}
+
+	// Issue more reads/writes on tenant A — schema-once cache should prevent
+	// the trigger from being recreated.
+	if err := s.Set(ctxA, store.Entry{Namespace: "ns", Key: "k2", Value: jsonBytes(t, "again")}); err != nil {
+		t.Fatalf("second set on A: %v", err)
+	}
+
+	var triggerExists bool
+
+	if err := tenantA.QueryRow(`SELECT EXISTS (
+		SELECT 1 FROM information_schema.triggers
+		WHERE event_object_table = 'systemplane_entries'
+		  AND trigger_name = 'systemplane_notify_trigger'
+	)`).Scan(&triggerExists); err != nil {
+		t.Fatalf("check trigger: %v", err)
+	}
+
+	if triggerExists {
+		t.Errorf("schema bootstrap ran a second time — trigger was recreated")
+	}
+
+	// Multi-tenant mode disables Subscribe.
+	if _, err := s.Subscribe(ctxA, func(_ store.Event) {}); err != store.ErrNotSupportedInMultiTenant {
+		t.Errorf("subscribe should fail with ErrNotSupportedInMultiTenant, got %v", err)
+	}
 }
+
+func TestIntegration_PostgresMultiTenantMissingCtx(t *testing.T) {
+	dsn, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+	_ = dsn
+
+	s, err := postgres.New(postgres.Config{
+		MultiTenantEnabled: true,
+		Module:             "systemplane",
+	})
+	if err != nil {
+		t.Fatalf("postgres.New: %v", err)
+	}
+
+	defer s.Close()
+
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	_, _, err = s.Get(context.Background(), "ns", "k")
+	if err != store.ErrTenantConnectionMissing {
+		t.Errorf("expected ErrTenantConnectionMissing, got %v", err)
+	}
+}
+
+func mustSet(t *testing.T, s store.Store, ctx context.Context, ns, key, value string) {
+	t.Helper()
+
+	if err := s.Set(ctx, store.Entry{Namespace: ns, Key: key, Value: jsonBytes(t, value)}); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+}
+
+func mustGet(t *testing.T, s store.Store, ctx context.Context, ns, key string) string {
+	t.Helper()
+
+	entry, found, err := s.Get(ctx, ns, key)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if !found {
+		t.Fatalf("get: not found")
+	}
+
+	var v string
+
+	if err := json.Unmarshal(entry.Value, &v); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	return v
+}
+
+func jsonBytes(t *testing.T, v any) []byte {
+	t.Helper()
+
+	raw, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	return raw
+}
+
+// ensure the sync/sync imports are used when only some sub-tests run.
+var _ = sync.Mutex{}

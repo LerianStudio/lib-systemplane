@@ -1,19 +1,20 @@
 package systemplane
 
 import (
-	"context"
 	"database/sql"
 	"time"
 
 	"github.com/LerianStudio/lib-observability/log"
 	"github.com/LerianStudio/lib-observability/tracing"
 	internalclient "github.com/LerianStudio/lib-systemplane/internal/client"
-	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
-// NewPostgres creates a Client backed by a Postgres database with LISTEN/NOTIFY
-// change-feed.
+// NewPostgres creates a Client backed by Postgres with LISTEN/NOTIFY.
+//
+// In single-tenant mode db and listenDSN are required.
+// In multi-tenant mode (see WithMultiTenantEnabled) they MAY be nil/empty —
+// every method resolves the tenant database from ctx via tenant-manager.
 func NewPostgres(db *sql.DB, listenDSN string, opts ...Option) (*Client, error) {
 	c, err := internalclient.NewPostgres(db, listenDSN, opts...)
 	if err != nil {
@@ -23,9 +24,11 @@ func NewPostgres(db *sql.DB, listenDSN string, opts ...Option) (*Client, error) 
 	return (*Client)(c), nil
 }
 
-// NewMongoDB creates a Client backed by a MongoDB database with change-streams
-// (or polling when WithPollInterval is set). Change-streams require a replica
-// set; standalone deployments should use WithPollInterval.
+// NewMongoDB creates a Client backed by MongoDB with change streams (or
+// polling when WithPollInterval is set).
+//
+// In single-tenant mode client and database are required.
+// In multi-tenant mode they MAY be nil/empty.
 func NewMongoDB(client *mongo.Client, database string, opts ...Option) (*Client, error) {
 	c, err := internalclient.NewMongoDB(client, database, opts...)
 	if err != nil {
@@ -35,10 +38,10 @@ func NewMongoDB(client *mongo.Client, database string, opts ...Option) (*Client,
 	return (*Client)(c), nil
 }
 
-// WithLogger sets the structured logger used by the Client and its backend.
+// WithLogger sets the structured logger.
 func WithLogger(l log.Logger) Option { return internalclient.WithLogger(l) }
 
-// WithTelemetry sets the OpenTelemetry provider for spans and metrics.
+// WithTelemetry sets the OpenTelemetry provider.
 func WithTelemetry(t *tracing.Telemetry) Option { return internalclient.WithTelemetry(t) }
 
 // WithListenChannel overrides the Postgres LISTEN/NOTIFY channel name.
@@ -56,37 +59,14 @@ func WithCollection(name string) Option { return internalclient.WithCollection(n
 // WithTable overrides the Postgres table name.
 func WithTable(name string) Option { return internalclient.WithTable(name) }
 
-// WithStrictPostgresIsolation makes NewPostgres reject implicit default table
-// or channel names.
-func WithStrictPostgresIsolation() Option { return internalclient.WithStrictPostgresIsolation() }
+// WithMultiTenantEnabled enables tenant-manager dispatch: every read/write
+// resolves the per-tenant database from ctx via tmcore.GetPGContext /
+// tmcore.GetMBContext using the configured module name.
+func WithMultiTenantEnabled() Option { return internalclient.WithMultiTenantEnabled() }
 
-// WithLazyTenantLoad switches tenant value caching from eager hydration to a
-// lazy bounded-LRU cache populated on first read.
-func WithLazyTenantLoad(maxEntries int) Option { return internalclient.WithLazyTenantLoad(maxEntries) }
-
-// WithTenantLazyFailClosed keeps lazy tenant reads in fail-closed mode.
-func WithTenantLazyFailClosed() Option { return internalclient.WithTenantLazyFailClosed() }
-
-// WithTenantLazyFailOpen is retained for source compatibility only.
-//
-// Deprecated: lazy tenant reads always fail closed on backend uncertainty.
-func WithTenantLazyFailOpen() Option { return internalclient.WithTenantLazyFailOpen() }
-
-// WithMongoResumeTokenStore wires durable resume-token persistence for MongoDB
-// change streams.
-func WithMongoResumeTokenStore(
-	load func(context.Context) (bson.Raw, error),
-	save func(context.Context, bson.Raw) error,
-) Option {
-	return internalclient.WithMongoResumeTokenStore(load, save)
-}
-
-// WithMongoResumeTokenFailClosed makes MongoDB change-stream subscription setup
-// fail when loading a configured resume token fails.
-func WithMongoResumeTokenFailClosed() Option { return internalclient.WithMongoResumeTokenFailClosed() }
-
-// WithTenantSchemaEnabled opts the backend into phase-2 tenant schema.
-func WithTenantSchemaEnabled() Option { return internalclient.WithTenantSchemaEnabled() }
+// WithModule sets the tenant-manager module name used by ctx dispatch.
+// Default: "systemplane".
+func WithModule(name string) Option { return internalclient.WithModule(name) }
 
 // WithDescription sets a human-readable description for the key.
 func WithDescription(s string) KeyOption { return internalclient.WithDescription(s) }
@@ -94,7 +74,7 @@ func WithDescription(s string) KeyOption { return internalclient.WithDescription
 // WithValidator sets a validation function invoked on every Set.
 func WithValidator(fn func(any) error) KeyOption { return internalclient.WithValidator(fn) }
 
-// WithRedaction sets the redaction policy for admin and log output.
+// WithRedaction sets the redaction policy.
 func WithRedaction(policy RedactPolicy) KeyOption {
 	return internalclient.WithRedaction(internalclient.RedactPolicy(policy))
 }
