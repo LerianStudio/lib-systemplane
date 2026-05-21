@@ -24,38 +24,20 @@ var (
 	ErrValidation = errors.New("systemplane: validation failed")
 
 	// ErrNilContext is returned when a method that requires a live context is
-	// called with a nil context. This avoids stdlib panics from context helpers
-	// and keeps the library on explicit-error semantics.
+	// called with a nil context.
 	ErrNilContext = errors.New("systemplane: context is nil")
 
-	// ErrDuplicateKey is returned when Register is called with a (namespace, key)
-	// pair that has already been registered.
+	// ErrDuplicateKey is returned when Register is called with an already
+	// registered (namespace, key) pair.
 	ErrDuplicateKey = errors.New("systemplane: duplicate key")
 
-	// ErrMissingTenantContext is returned when a tenant-scoped read or write is
-	// attempted without a tenant ID present in the context. Tenant resolution
-	// is fail-closed: there is no fallback to a shared global for tenant-scoped
-	// keys.
-	ErrMissingTenantContext = errors.New("systemplane: missing tenant ID in context")
+	// ErrNotSupportedInMultiTenant is returned by OnChange (and any other
+	// process-wide changefeed primitive) when the Client was constructed with
+	// WithMultiTenantEnabled().
+	ErrNotSupportedInMultiTenant = store.ErrNotSupportedInMultiTenant
 
-	// ErrInvalidTenantID is returned when the tenant ID extracted from context
-	// fails validation (empty, too long, or otherwise malformed). Tenant IDs
-	// must satisfy core.IsValidTenantID and cannot collide with the "_global"
-	// sentinel that identifies shared rows.
-	ErrInvalidTenantID = errors.New("systemplane: invalid tenant ID")
-
-	// ErrTenantScopeNotRegistered is returned when a tenant-scoped operation
-	// (GetForTenant, SetForTenant, DeleteForTenant) references a key that was
-	// registered via Register rather than RegisterTenantScoped. Globals-only
-	// keys cannot accept tenant overrides.
-	ErrTenantScopeNotRegistered = errors.New("systemplane: key was not registered via RegisterTenantScoped")
-
-	// ErrTenantSchemaNotEnabled is returned when a tenant write (SetForTenant,
-	// DeleteForTenant) is attempted against a backend running in phase-1 compat
-	// mode. Phase 1 preserves the legacy unique constraint on (namespace, key)
-	// so pre-tenant consumers (v5.0.x) can continue to upsert safely during a
-	// rolling deploy. Enable phase 2 via [WithTenantSchemaEnabled] once every
-	// consumer is on v5.1+ — see MIGRATION_TENANT_SCOPED.md §4 for the full
-	// upgrade runbook.
-	ErrTenantSchemaNotEnabled = store.ErrTenantSchemaNotEnabled
+	// ErrTenantConnectionMissing is returned when a method runs in multi-tenant
+	// mode and the caller's context carries no tenant database for the
+	// configured module.
+	ErrTenantConnectionMissing = store.ErrTenantConnectionMissing
 )
