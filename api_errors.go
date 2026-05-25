@@ -27,19 +27,12 @@ var (
 	// registered (namespace, key) pair.
 	ErrDuplicateKey = internalclient.ErrDuplicateKey
 
-	// ErrMissingTenantContext is returned when tenant-scoped operations are called
-	// without a tenant ID in context.
-	ErrMissingTenantContext = internalclient.ErrMissingTenantContext
+	// ErrNotSupportedInMultiTenant is returned by OnChange in multi-tenant
+	// mode — there is no shared process-wide changefeed.
+	ErrNotSupportedInMultiTenant = internalclient.ErrNotSupportedInMultiTenant
 
-	// ErrInvalidTenantID is returned when the tenant ID extracted from context is
-	// invalid or reserved.
-	ErrInvalidTenantID = internalclient.ErrInvalidTenantID
-
-	// ErrTenantScopeNotRegistered is returned when tenant-scoped operations target
-	// a key registered only as global.
-	ErrTenantScopeNotRegistered = internalclient.ErrTenantScopeNotRegistered
-
-	// ErrTenantSchemaNotEnabled is returned when a tenant write is attempted
-	// against a backend running in phase-1 compatibility mode.
-	ErrTenantSchemaNotEnabled = internalclient.ErrTenantSchemaNotEnabled
+	// ErrTenantConnectionMissing is returned when a method runs in
+	// multi-tenant mode and the caller's context carries no tenant database
+	// for the configured module.
+	ErrTenantConnectionMissing = internalclient.ErrTenantConnectionMissing
 )
