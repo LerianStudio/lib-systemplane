@@ -81,6 +81,15 @@ type Manager struct {
 	// handlers no-op and Gets fall through to the DB read path.
 	closedMu sync.RWMutex
 	closed   bool
+
+	// onTenant* are the seams HandleTenantLifecycle routes to. They default
+	// to the real OnTenant* methods (wired in New) and exist as overridable
+	// fields purely so the routing switch can be unit-tested without a live
+	// tenant DB. Production code never reassigns them.
+	onTenantActivated          func(ctx context.Context, tenantID string) error
+	onTenantSuspended          func(ctx context.Context, tenantID string) error
+	onTenantDeleted            func(ctx context.Context, tenantID string) error
+	onTenantCredentialsRotated func(ctx context.Context, tenantID string) error
 }
 
 // ClientHooks is the subset of the Client surface the Manager calls back into.
@@ -111,12 +120,12 @@ type RegisteredKey struct {
 
 // config holds the merged ManagerOption values.
 type config struct {
-	logger                     log.Logger
-	telemetry                  *tracing.Telemetry
-	aggregateTenantThreshold   int
-	listenBackoffBaseMillis    int
-	listenBackoffCapSeconds    int
-	listenStaleAfterFailures   int
+	logger                      log.Logger
+	telemetry                   *tracing.Telemetry
+	aggregateTenantThreshold    int
+	listenBackoffBaseMillis     int
+	listenBackoffCapSeconds     int
+	listenStaleAfterFailures    int
 	maxEntriesPerTenantOverride int
 }
 
@@ -195,6 +204,13 @@ func New(pgMgr *tmpostgres.Manager, opts ...Option) *Manager {
 	if pgMgr != nil {
 		m.connector = &pgMgrConnector{mgr: pgMgr}
 	}
+
+	// Default the lifecycle routing seams to the real handlers. Tests may
+	// override them to observe routing without a live tenant DB.
+	m.onTenantActivated = m.OnTenantActivated
+	m.onTenantSuspended = m.OnTenantSuspended
+	m.onTenantDeleted = m.OnTenantDeleted
+	m.onTenantCredentialsRotated = m.OnTenantCredentialsRotated
 
 	return m
 }
