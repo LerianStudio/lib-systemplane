@@ -49,6 +49,8 @@ func (m *Manager) Lookup(ctx context.Context, tenantID, namespace, key string) (
 
 	v, found := ts.entries[nsKey{Namespace: namespace, Key: key}]
 	if !found {
+		m.metrics.recordGetCacheOutcome(ctx, tenantID, "miss")
+
 		return nil, false, nil
 	}
 
