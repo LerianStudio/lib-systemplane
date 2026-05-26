@@ -99,7 +99,7 @@ func (m *Manager) startListen(ctx context.Context, tenantID string, ts *tenantSt
 	// terminate the goroutine. gosec G118 wrongly flags this as a leaked
 	// cancel because it cannot see the deferred invocation across the
 	// goroutine boundary.
-	loopCtx, cancel := context.WithCancel(m.lifecycleContext()) //nolint:gosec // released via stopListen
+	loopCtx, cancel := context.WithCancel(m.lifecycleContext())
 	handle.cancel = cancel
 
 	m.logInfo(ctx, "manager LISTEN established",
