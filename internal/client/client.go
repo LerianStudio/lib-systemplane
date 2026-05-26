@@ -16,6 +16,7 @@ import (
 	"github.com/LerianStudio/lib-observability/runtime"
 	"github.com/LerianStudio/lib-observability/tracing"
 	"github.com/LerianStudio/lib-systemplane/internal/debounce"
+	"github.com/LerianStudio/lib-systemplane/internal/manager"
 	mongoDB "github.com/LerianStudio/lib-systemplane/internal/mongodb"
 	"github.com/LerianStudio/lib-systemplane/internal/postgres"
 	"github.com/LerianStudio/lib-systemplane/internal/store"
@@ -78,6 +79,11 @@ type Client struct {
 	started   atomic.Bool
 	closeOnce sync.Once
 	closed    atomic.Bool
+
+	// managerMu guards manager. The Manager is opt-in (BindManager) and
+	// nil for every caller that does not migrate to v1.5.0 explicitly.
+	managerMu sync.RWMutex
+	manager   *manager.Manager
 }
 
 // NewPostgres creates a Client backed by Postgres.
