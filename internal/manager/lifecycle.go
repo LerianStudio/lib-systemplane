@@ -7,6 +7,7 @@ package manager
 
 import (
 	"context"
+	"time"
 
 	"github.com/LerianStudio/lib-observability/log"
 )
@@ -33,8 +34,47 @@ func (m *Manager) OnTenantActivated(ctx context.Context, tenantID string) error 
 		return nil
 	}
 
-	// Slice 1: ensure a tenantState exists. Cache stays empty; Get hits DB.
-	_ = m.tenantStateFor(tenantID)
+	start := time.Now()
+
+	db, err := m.resolveTenantDB(ctx, tenantID)
+	if err != nil {
+		m.logWarn(ctx, "OnTenantActivated: tenant DB unavailable",
+			log.String("tenant_id", tenantID),
+			log.Err(err),
+		)
+
+		return err
+	}
+
+	ts := m.tenantStateFor(tenantID)
+	registered := m.hooks.RegisteredKeys()
+
+	if err := m.runSchemaAndSeed(ctx, db, registered); err != nil {
+		m.logWarn(ctx, "OnTenantActivated: schema/seed failed",
+			log.String("tenant_id", tenantID),
+			log.Err(err),
+		)
+
+		return err
+	}
+
+	if err := m.warmLoad(ctx, db, ts, registered); err != nil {
+		m.logWarn(ctx, "OnTenantActivated: warm-load failed",
+			log.String("tenant_id", tenantID),
+			log.Err(err),
+		)
+
+		return err
+	}
+
+	m.metrics.recordTenantActivated(ctx, tenantID)
+	m.metrics.recordCacheEntries(ctx, tenantID, ts.entryCount())
+	m.metrics.recordWarmloadLatency(ctx, tenantID, time.Since(start).Seconds())
+
+	m.logInfo(ctx, "tenant activated for systemplane",
+		log.String("tenant_id", tenantID),
+		log.Int("cache_entries", ts.entryCount()),
+	)
 
 	return nil
 }
@@ -42,7 +82,7 @@ func (m *Manager) OnTenantActivated(ctx context.Context, tenantID string) error 
 // OnTenantSuspended pauses the LISTEN goroutine and marks the cache stale.
 // Cache entries are kept (suspension is reversible — fast reactivation
 // avoids re-warming) but reads after suspension fall through to the DB.
-func (m *Manager) OnTenantSuspended(_ context.Context, tenantID string) error {
+func (m *Manager) OnTenantSuspended(ctx context.Context, tenantID string) error {
 	if m == nil || m.IsClosed() || tenantID == "" {
 		return nil
 	}
@@ -53,18 +93,26 @@ func (m *Manager) OnTenantSuspended(_ context.Context, tenantID string) error {
 	}
 
 	ts.markStale()
+	m.logInfo(ctx, "tenant suspended for systemplane (cache marked stale)",
+		log.String("tenant_id", tenantID),
+	)
 
 	return nil
 }
 
 // OnTenantDeleted closes the LISTEN goroutine and evicts the cache for
 // tenantID. Frees process resources tied to the tenant.
-func (m *Manager) OnTenantDeleted(_ context.Context, tenantID string) error {
+func (m *Manager) OnTenantDeleted(ctx context.Context, tenantID string) error {
 	if m == nil || m.IsClosed() || tenantID == "" {
 		return nil
 	}
 
-	m.perTenant.Delete(tenantID)
+	if _, ok := m.perTenant.LoadAndDelete(tenantID); ok {
+		m.metrics.recordTenantDeactivated(ctx, tenantID)
+		m.logInfo(ctx, "tenant deactivated for systemplane",
+			log.String("tenant_id", tenantID),
+		)
+	}
 
 	return nil
 }

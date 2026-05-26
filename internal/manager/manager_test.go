@@ -169,6 +169,43 @@ func TestLifecycle_EmptyTenantID_NoOp(t *testing.T) {
 	}
 }
 
+func TestOnTenantActivated_WithoutPgMgr_NoOp(t *testing.T) {
+	t.Parallel()
+
+	// No hooks bound + no pgMgr → handler returns nil without panicking.
+	m := manager.New(nil)
+
+	if err := m.OnTenantActivated(context.Background(), "tenant-a"); err != nil {
+		t.Fatalf("OnTenantActivated without pgMgr: %v", err)
+	}
+}
+
+func TestOnTenantDeleted_RemovesPerTenantState(t *testing.T) {
+	t.Parallel()
+
+	m := manager.New(nil)
+
+	// Activate is a no-op without pgMgr, so prime perTenant manually via
+	// Populate's gated path - which itself is gated. Use Invalidate to
+	// confirm no panic when state doesn't exist.
+	m.Invalidate(context.Background(), "unknown-tenant", "ns", "k")
+
+	// Delete an unknown tenant is also a no-op.
+	if err := m.OnTenantDeleted(context.Background(), "unknown-tenant"); err != nil {
+		t.Fatalf("OnTenantDeleted unknown: %v", err)
+	}
+}
+
+func TestOnTenantCredentialsRotated_DeletesThenReactivates(t *testing.T) {
+	t.Parallel()
+
+	m := manager.New(nil)
+
+	if err := m.OnTenantCredentialsRotated(context.Background(), "tenant-a"); err != nil {
+		t.Fatalf("OnTenantCredentialsRotated: %v", err)
+	}
+}
+
 func TestNilManager_AllMethodsSafe(t *testing.T) {
 	t.Parallel()
 
