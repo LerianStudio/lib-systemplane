@@ -64,6 +64,38 @@ func TestBindManager_NilArgs_NoOp(t *testing.T) {
 	nilC.BindManager(manager.New(nil))
 }
 
+// TestMT_WithManager_OnChangeRegistersAndUnsubscribes pins that when a
+// Manager is bound to an MT Client, OnChange returns a working unsubscribe
+// closure instead of ErrNotSupportedInMultiTenant. The dispatch wiring is
+// covered by the integration tests (slice 8); here we verify the binding.
+func TestMT_WithManager_OnChangeRegistersAndUnsubscribes(t *testing.T) {
+	t.Parallel()
+
+	c := newMultiTenantClient(t, newMemStore(true))
+
+	mgr := manager.New(nil)
+	c.BindManager(mgr)
+
+	called := 0
+	unsub, err := c.OnChange("ns", "k", func(_ context.Context, _, _ string, _ any) {
+		called++
+	})
+	if err != nil {
+		t.Fatalf("OnChange with Manager bound: %v", err)
+	}
+
+	if unsub == nil {
+		t.Fatal("OnChange returned nil unsubscribe")
+	}
+
+	unsub()
+	unsub() // idempotent
+
+	if called != 0 {
+		t.Fatalf("callback fired without NOTIFY: called %d", called)
+	}
+}
+
 // TestBackwardCompat_ST_Get_BypassesManager pins that single-tenant Get
 // never consults the Manager even when one is bound. ST mode keeps its own
 // in-process cache; the Manager is strictly an MT-mode primitive.

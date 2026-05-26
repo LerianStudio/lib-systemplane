@@ -11,9 +11,16 @@ import (
 // OnChange registers a callback for backend-observed value changes.
 //
 // In single-tenant mode the callback fires whenever the changefeed echo for
-// (namespace, key) arrives. In multi-tenant mode OnChange returns
-// ErrNotSupportedInMultiTenant — every read resolves a fresh tenant database
-// per call, so there is no shared process-wide changefeed to attach to.
+// (namespace, key) arrives.
+//
+// In multi-tenant mode without a bound Manager, OnChange returns
+// ErrNotSupportedInMultiTenant — preserving the v1.4.0 contract for callers
+// that have not opted into the v1.5.0 Manager.
+//
+// In multi-tenant mode with a bound Manager, the callback is registered on
+// the Manager's per-tenant LISTEN dispatcher. It fires once per NOTIFY
+// observed across any active tenant's LISTEN goroutine, with ctx carrying
+// the tenant scope at the time of dispatch.
 func (c *Client) OnChange(namespace, key string, fn func(ctx context.Context, ns, key string, newValue any)) (func(), error) {
 	noop := func() {}
 
@@ -22,7 +29,23 @@ func (c *Client) OnChange(namespace, key string, fn func(ctx context.Context, ns
 	}
 
 	if c.multiTenant {
-		return noop, ErrNotSupportedInMultiTenant
+		mgr := c.boundManager()
+		if mgr == nil {
+			return noop, ErrNotSupportedInMultiTenant
+		}
+
+		if fn == nil {
+			return noop, nil
+		}
+
+		unsub := mgr.RegisterCallback(namespace, key, func(ctx context.Context, ns, k string, newValue any) {
+			fn(ctx, ns, k, newValue)
+		})
+		if unsub == nil {
+			return noop, nil
+		}
+
+		return func() { unsub() }, nil
 	}
 
 	if fn == nil {
