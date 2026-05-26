@@ -7,7 +7,19 @@
 // miss. Slice 4 invalidates the cache on NOTIFY arrival.
 package manager
 
-import "context"
+import (
+	"context"
+
+	tmcore "github.com/LerianStudio/lib-commons/v5/commons/tenant-manager/core"
+)
+
+// TenantIDFromContext extracts the tenant ID set by lib-commons tenant-manager
+// middleware. Returns "" when the ctx carries no tenant — typically a boot
+// context that pre-dates request dispatch. Exposed to the Client side so the
+// Get fallback path can branch on the same source of truth.
+func TenantIDFromContext(ctx context.Context) string {
+	return tmcore.GetTenantIDContext(ctx)
+}
 
 // Lookup attempts to satisfy a Get from the per-tenant cache.
 //
