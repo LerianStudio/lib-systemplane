@@ -662,4 +662,3 @@ goreleaser:
 	$(call check_command,goreleaser,"go install github.com/goreleaser/goreleaser@latest")
 	goreleaser release --snapshot --skip=publish --clean
 	@echo "$(GREEN)$(BOLD)[ok]$(NC) Release snapshot created successfully$(GREEN) ✔️$(NC)"
-
