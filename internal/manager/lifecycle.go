@@ -24,9 +24,9 @@ func (m *Manager) OnTenantActivated(ctx context.Context, tenantID string) error 
 		return nil
 	}
 
-	if m.hooks == nil || m.pgMgr == nil {
-		// Manager not yet bound or running without a tmpostgres.Manager
-		// (test contexts): no-op, log at debug so test runs stay quiet.
+	if m.hooks == nil || m.connector == nil {
+		// Manager not yet bound or running without a Connector (test
+		// contexts): no-op, log at debug so test runs stay quiet.
 		m.logDebug(ctx, "OnTenantActivated skipped: manager not fully wired",
 			log.String("tenant_id", tenantID),
 		)

@@ -60,7 +60,8 @@ type Manager struct {
 	// the circular Client<->Manager reference resolves cleanly.
 	hooks ClientHooks
 
-	pgMgr *tmpostgres.Manager
+	pgMgr     *tmpostgres.Manager
+	connector Connector
 
 	// perTenant maps tenantID -> *tenantState. sync.Map handles the read-heavy
 	// access pattern (every Get checks the per-tenant cache).
@@ -183,13 +184,34 @@ func New(pgMgr *tmpostgres.Manager, opts ...Option) *Manager {
 		logger = log.NewNop()
 	}
 
-	return &Manager{
+	m := &Manager{
 		pgMgr:     pgMgr,
 		logger:    logger,
 		telemetry: cfg.telemetry,
 		metrics:   newMetrics(cfg.telemetry, logger, cfg.aggregateTenantThreshold),
 		cfg:       cfg,
 	}
+
+	if pgMgr != nil {
+		m.connector = &pgMgrConnector{mgr: pgMgr}
+	}
+
+	return m
+}
+
+// SetConnector replaces the Connector used to resolve tenant handles. Tests
+// use this to inject in-memory fakes; production callers should rely on the
+// pgMgr-driven default wired in New. Goroutine-safe via the close lock so
+// the connector swap synchronizes with Drain.
+func (m *Manager) SetConnector(c Connector) {
+	if m == nil {
+		return
+	}
+
+	m.closedMu.Lock()
+	defer m.closedMu.Unlock()
+
+	m.connector = c
 }
 
 // Bind wires the Client hooks into the Manager. Called from

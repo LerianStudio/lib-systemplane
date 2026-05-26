@@ -235,25 +235,15 @@ func (m *Manager) warmLoad(ctx context.Context, db dbresolver.DB, ts *tenantStat
 	return nil
 }
 
-// resolveTenantDB acquires the tenant's primary dbresolver.DB via the bound
-// tenant-manager Postgres Manager. Returns ErrPgMgrUnavailable when no
-// manager is wired (test contexts).
+// resolveTenantDB acquires the tenant's primary dbresolver.DB via the
+// configured Connector. Returns ErrPgMgrUnavailable when no Connector is
+// wired (test contexts).
 func (m *Manager) resolveTenantDB(ctx context.Context, tenantID string) (dbresolver.DB, error) {
-	if m.pgMgr == nil {
+	if m == nil || m.connector == nil {
 		return nil, ErrPgMgrUnavailable
 	}
 
-	conn, err := m.pgMgr.GetConnection(ctx, tenantID)
-	if err != nil {
-		return nil, fmt.Errorf("systemplane/manager: get tenant connection %s: %w", tenantID, err)
-	}
-
-	db, err := conn.GetDB()
-	if err != nil {
-		return nil, fmt.Errorf("systemplane/manager: get tenant DB %s: %w", tenantID, err)
-	}
-
-	return db, nil
+	return m.connector.ResolveDB(ctx, tenantID)
 }
 
 // ErrPgMgrUnavailable is returned when a lifecycle handler runs without a

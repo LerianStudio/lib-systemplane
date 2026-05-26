@@ -48,7 +48,7 @@ type notifyPayload struct {
 // The caller MUST hold no locks on ts; startListen takes ts.mu internally
 // to install the handle.
 func (m *Manager) startListen(ctx context.Context, tenantID string, ts *tenantState) error {
-	if m == nil || m.pgMgr == nil || ts == nil {
+	if m == nil || m.connector == nil || ts == nil {
 		return ErrPgMgrUnavailable
 	}
 
@@ -446,24 +446,14 @@ func quoteIdentifier(name string) string {
 	return `"` + name + `"`
 }
 
-// tenantDSN returns the primary connection string for tenantID. Acquired
-// via tmpostgres.Manager.GetConnection; the DSN comes from the cached
-// PostgresConnection.ConnectionStringPrimary field.
+// tenantDSN returns the primary connection string for tenantID via the
+// configured Connector.
 func (m *Manager) tenantDSN(ctx context.Context, tenantID string) (string, error) {
-	if m.pgMgr == nil {
+	if m == nil || m.connector == nil {
 		return "", ErrPgMgrUnavailable
 	}
 
-	conn, err := m.pgMgr.GetConnection(ctx, tenantID)
-	if err != nil {
-		return "", fmt.Errorf("systemplane/manager: get tenant connection %s: %w", tenantID, err)
-	}
-
-	if conn.ConnectionStringPrimary == "" {
-		return "", fmt.Errorf("systemplane/manager: tenant %s has empty primary DSN", tenantID)
-	}
-
-	return conn.ConnectionStringPrimary, nil
+	return m.connector.ResolveDSN(ctx, tenantID)
 }
 
 // lifecycleContext returns the bound Client's lifecycle context so the
