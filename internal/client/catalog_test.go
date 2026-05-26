@@ -262,6 +262,24 @@ func TestRegisterRejectsUnsafeUnexportedMutableStructFields(t *testing.T) {
 	}
 }
 
+func TestRegisterRejectsCyclicMutableValues(t *testing.T) {
+	c := newSingleTenantClient(t, newMemStore(false))
+
+	cyclicMap := map[string]any{}
+	cyclicMap["self"] = cyclicMap
+
+	if err := c.Register("policy", "cyclic-map", cyclicMap); !errors.Is(err, ErrValidation) {
+		t.Fatalf("cyclic map err = %v, want ErrValidation", err)
+	}
+
+	cyclicSlice := make([]any, 1)
+	cyclicSlice[0] = cyclicSlice
+
+	if err := c.Register("policy", "cyclic-slice", cyclicSlice); !errors.Is(err, ErrValidation) {
+		t.Fatalf("cyclic slice err = %v, want ErrValidation", err)
+	}
+}
+
 func TestCatalogKindInference(t *testing.T) {
 	c := newSingleTenantClient(t, newMemStore(false))
 

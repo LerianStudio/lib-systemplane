@@ -1,17 +1,20 @@
 // Package admin provides Fiber HTTP handlers for inspecting and modifying
 // systemplane configuration entries at runtime.
 //
-// Mount registers four value routes on a Fiber router:
+// Mount registers value routes on a Fiber router:
 //
 //	GET    /<prefix>/:namespace            - list entries in a namespace
 //	GET    /<prefix>/:namespace/:key       - read a single entry
+//	GET    /<prefix>/:namespace/*          - read a key that may contain "/"
 //	PUT    /<prefix>/:namespace/:key       - write a single entry
+//	PUT    /<prefix>/:namespace/*          - write a key that may contain "/"
 //	DELETE /<prefix>/:namespace/:key       - delete a single entry
+//	DELETE /<prefix>/:namespace/*          - delete a key that may contain "/"
 //
 // MountCatalog registers registry-only metadata routes separately:
 //
 //	GET /<prefix>/-/catalog                 - list registered key metadata
-//	GET /<prefix>/-/catalog/:namespace/:key - read metadata for one key
+//	GET /<prefix>/-/catalog/:namespace/*    - read metadata for one key
 //
 // The default path prefix is "/system".
 // The namespace/key path beginning with "-/catalog" is reserved for catalog

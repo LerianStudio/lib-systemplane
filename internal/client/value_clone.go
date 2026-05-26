@@ -196,15 +196,30 @@ func validateCloneSafePointer(v reflect.Value, seen map[visit]struct{}, path str
 
 	mark := visit{typ: v.Type(), ptr: v.Pointer()}
 	if _, ok := seen[mark]; ok {
-		return nil
+		return fmt.Errorf("%s contains cyclic reference", path)
 	}
 
 	seen[mark] = struct{}{}
+	defer delete(seen, mark)
 
 	return validateCloneSafeValue(v.Elem(), seen, path)
 }
 
 func validateCloneSafeIndexed(v reflect.Value, seen map[visit]struct{}, path string) error {
+	if v.Kind() == reflect.Slice {
+		if v.IsNil() {
+			return nil
+		}
+
+		mark := visit{typ: v.Type(), ptr: v.Pointer()}
+		if _, ok := seen[mark]; ok {
+			return fmt.Errorf("%s contains cyclic reference", path)
+		}
+
+		seen[mark] = struct{}{}
+		defer delete(seen, mark)
+	}
+
 	for i := range v.Len() {
 		if err := validateCloneSafeValue(v.Index(i), seen, fmt.Sprintf("%s[%d]", path, i)); err != nil {
 			return err
@@ -215,6 +230,18 @@ func validateCloneSafeIndexed(v reflect.Value, seen map[visit]struct{}, path str
 }
 
 func validateCloneSafeMap(v reflect.Value, seen map[visit]struct{}, path string) error {
+	if v.IsNil() {
+		return nil
+	}
+
+	mark := visit{typ: v.Type(), ptr: v.Pointer()}
+	if _, ok := seen[mark]; ok {
+		return fmt.Errorf("%s contains cyclic reference", path)
+	}
+
+	seen[mark] = struct{}{}
+	defer delete(seen, mark)
+
 	for _, key := range v.MapKeys() {
 		if err := validateCloneSafeValue(v.MapIndex(key), seen, path+"[map-value]"); err != nil {
 			return err
