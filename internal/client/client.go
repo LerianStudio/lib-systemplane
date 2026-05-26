@@ -43,7 +43,8 @@ type Client struct {
 	logger    log.Logger
 	telemetry *tracing.Telemetry
 
-	multiTenant bool
+	multiTenant    bool
+	catalogService string
 
 	registryMu sync.RWMutex
 	registry   map[nskey]keyDef
@@ -147,16 +148,14 @@ func newClient(s store.Store, cfg clientConfig) *Client {
 
 	// cancel is intentionally stored on the Client (lifecycleCancel) and
 	// invoked from Close() to terminate dispatch goroutines and subscribers.
-	// gosec G118 flags WithCancel calls whose cancel is not invoked via defer;
-	// that heuristic is wrong for a long-lived lifecycle context that Close()
-	// drives explicitly. Keep the directive — without it lint fails.
-	ctx, cancel := context.WithCancel(context.Background()) //nolint:gosec // lifecycle cancel released in Close
+	ctx, cancel := context.WithCancel(context.Background())
 
 	c := &Client{
 		store:           s,
 		logger:          logger,
 		telemetry:       cfg.telemetry,
 		multiTenant:     cfg.multiTenantEnabled,
+		catalogService:  cfg.catalogService,
 		registry:        make(map[nskey]keyDef),
 		cache:           make(map[nskey]any),
 		subscribers:     make(map[nskey][]subscription),

@@ -29,6 +29,19 @@ type getResponse struct {
 	Description string `json:"description,omitempty"`
 }
 
+type catalogDetailResponse struct {
+	CatalogVersion string `json:"catalogVersion"`
+	Service        string `json:"service,omitempty"`
+	systemplane.CatalogKeyDetail
+	Write catalogWriteResponse `json:"write"`
+}
+
+type catalogWriteResponse struct {
+	Method    string         `json:"method"`
+	Path      string         `json:"path"`
+	BodyShape map[string]any `json:"bodyShape"`
+}
+
 type putRequest struct {
 	Value json.RawMessage `json:"value"`
 }

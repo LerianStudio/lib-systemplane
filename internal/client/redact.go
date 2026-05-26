@@ -28,3 +28,15 @@ func ApplyRedaction(value any, policy RedactPolicy) any {
 		return value
 	}
 }
+
+// String returns the catalog-safe name for the redaction policy.
+func (p RedactPolicy) String() string {
+	switch p {
+	case RedactMask:
+		return "mask"
+	case RedactFull:
+		return "full"
+	default:
+		return "none"
+	}
+}

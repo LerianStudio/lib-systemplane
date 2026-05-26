@@ -22,6 +22,23 @@ type ListEntry struct {
 	Description string
 }
 
+// Catalog is a registry-only snapshot of registered systemplane keys.
+type Catalog = internalclient.Catalog
+
+// CatalogKeySummary is the list-view metadata for a registered key.
+type CatalogKeySummary = internalclient.CatalogKeySummary
+
+// CatalogKeyDetail is the detail-view metadata for a registered key.
+type CatalogKeyDetail = internalclient.CatalogKeyDetail
+
+// CatalogKeyMetadata contains optional operator-facing metadata attached at registration time.
+type CatalogKeyMetadata = internalclient.CatalogKeyMetadata
+
+// CatalogExample documents one accepted value shape for a registered key.
+// Values are operator-facing examples and are not redacted; never include
+// secrets or credentials.
+type CatalogExample = internalclient.CatalogExample
+
 // RedactPolicy controls how a key's value is rendered in admin endpoints and logs.
 type RedactPolicy int
 

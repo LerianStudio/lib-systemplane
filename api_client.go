@@ -93,6 +93,21 @@ func (c *Client) List(ctx context.Context, namespace string) ([]ListEntry, error
 	return out, nil
 }
 
+// Catalog returns a registry-only snapshot of all registered keys.
+func (c *Client) Catalog() Catalog {
+	return asInternalClient(c).Catalog()
+}
+
+// CatalogKey returns registry-only detail metadata for namespace/key.
+func (c *Client) CatalogKey(namespace, key string) (CatalogKeyDetail, bool) {
+	return asInternalClient(c).CatalogKey(namespace, key)
+}
+
+// CatalogService returns the service name emitted by catalog responses.
+func (c *Client) CatalogService() string {
+	return asInternalClient(c).CatalogService()
+}
+
 // OnChange registers a callback for backend-observed value changes.
 // Returns ErrNotSupportedInMultiTenant in multi-tenant mode.
 func (c *Client) OnChange(namespace, key string, fn func(ctx context.Context, ns, key string, newValue any)) (func(), error) {
