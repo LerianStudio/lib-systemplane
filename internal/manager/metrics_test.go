@@ -9,6 +9,9 @@
 // the per-tenant label is preserved; above the threshold every emission
 // collapses to tenant_id="aggregate" so Prometheus cardinality stays
 // bounded under thousands of tenants.
+//
+// The newTestTelemetry helper lives in metrics_helper_test.go (build tag
+// unit || integration) so the integration-tagged listen tests can reuse it.
 package manager
 
 import (
@@ -17,27 +20,10 @@ import (
 	"testing"
 
 	"github.com/LerianStudio/lib-observability/log"
-	"github.com/LerianStudio/lib-observability/tracing"
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
-
-// newTestTelemetry builds a tracing.Telemetry whose MeterProvider is wired to
-// the supplied manual reader so tests can collect emitted metric points
-// without spinning up an OTLP exporter.
-func newTestTelemetry(t *testing.T) (*tracing.Telemetry, *sdkmetric.ManualReader) {
-	t.Helper()
-
-	reader := sdkmetric.NewManualReader()
-	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
-
-	t.Cleanup(func() {
-		_ = mp.Shutdown(context.Background())
-	})
-
-	return &tracing.Telemetry{MeterProvider: mp}, reader
-}
 
 // collect snapshots every metric point currently held by the manual reader.
 func collect(t *testing.T, r *sdkmetric.ManualReader) metricdata.ResourceMetrics {
