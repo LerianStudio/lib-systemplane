@@ -67,6 +67,15 @@ func (m *Manager) OnTenantActivated(ctx context.Context, tenantID string) error 
 		return err
 	}
 
+	if err := m.startListen(ctx, tenantID, ts); err != nil {
+		m.logWarn(ctx, "OnTenantActivated: start LISTEN failed",
+			log.String("tenant_id", tenantID),
+			log.Err(err),
+		)
+
+		return err
+	}
+
 	m.metrics.recordTenantActivated(ctx, tenantID)
 	m.metrics.recordCacheEntries(ctx, tenantID, ts.entryCount())
 	m.metrics.recordWarmloadLatency(ctx, tenantID, time.Since(start).Seconds())
@@ -92,6 +101,7 @@ func (m *Manager) OnTenantSuspended(ctx context.Context, tenantID string) error 
 		return nil
 	}
 
+	m.stopListen(ts)
 	ts.markStale()
 	m.logInfo(ctx, "tenant suspended for systemplane (cache marked stale)",
 		log.String("tenant_id", tenantID),
@@ -107,7 +117,11 @@ func (m *Manager) OnTenantDeleted(ctx context.Context, tenantID string) error {
 		return nil
 	}
 
-	if _, ok := m.perTenant.LoadAndDelete(tenantID); ok {
+	if existing, ok := m.perTenant.LoadAndDelete(tenantID); ok {
+		if ts, _ := existing.(*tenantState); ts != nil {
+			m.stopListen(ts)
+		}
+
 		m.metrics.recordTenantDeactivated(ctx, tenantID)
 		m.logInfo(ctx, "tenant deactivated for systemplane",
 			log.String("tenant_id", tenantID),
@@ -138,14 +152,32 @@ func (m *Manager) OnTenantCredentialsRotated(ctx context.Context, tenantID strin
 // Drain returns the Manager rejects subsequent lifecycle calls and Gets
 // fall through to the DB-read path. Idempotent.
 //
-// Slice 11 wires real LISTEN cancellation; slice 1 just sets the closed flag
-// so future calls become no-ops.
-func (m *Manager) Drain(_ context.Context) error {
+// Closure proceeds best-effort: every per-tenant state is removed and its
+// LISTEN goroutine canceled. Drain blocks up to listenCloseTimeout per
+// goroutine waiting for it to exit (so total drain time is bounded by
+// staleAfter * tenant_count); callers with strict shutdown budgets should
+// supply a ctx and rely on context cancellation to abandon stuck waits.
+func (m *Manager) Drain(ctx context.Context) error {
 	if m == nil {
 		return nil
 	}
 
 	m.markClosed()
+
+	m.perTenant.Range(func(key, value any) bool {
+		tenantID, _ := key.(string)
+
+		ts, _ := value.(*tenantState)
+		if ts != nil {
+			m.stopListen(ts)
+		}
+
+		m.perTenant.Delete(tenantID)
+
+		return true
+	})
+
+	m.logInfo(ctx, "manager drained")
 
 	return nil
 }
