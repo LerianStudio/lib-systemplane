@@ -131,6 +131,17 @@ ON CONFLICT (namespace, key) DO NOTHING`,
 	var firstErr error
 
 	for _, rk := range registered {
+		// Honour ctx cancellation between iterations so a fast-shutdown
+		// path stops contending for the tenant's connection pool. Mirrors
+		// the same discipline Drain already follows on perTenant.Range.
+		if err := ctx.Err(); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+
+			return firstErr
+		}
+
 		raw, err := json.Marshal(rk.DefaultValue)
 		if err != nil {
 			m.logWarn(ctx, "manager seed: marshal default failed, skipping",
@@ -182,6 +193,12 @@ func (m *Manager) warmLoad(ctx context.Context, db dbresolver.DB, ts *tenantStat
 	loaded := make(map[nsKey]any, len(registered))
 
 	for rows.Next() {
+		// Honour ctx cancellation between row scans so a fast-shutdown
+		// path stops reading from a tenant DB it is about to release.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		var (
 			ns, key string
 			raw     []byte
