@@ -369,7 +369,7 @@ coverage-unit:
 	    echo "Filtering coverage with .ignorecoverunit patterns..."; \
 	    patterns=$$(grep -v '^#' .ignorecoverunit | grep -v '^$$' | tr '\n' '|' | sed 's/|$$//'); \
 	    if [ -n "$$patterns" ]; then \
-	      regex_patterns=$$(echo "$$patterns" | sed 's/[][(){}+?^$$\\|]/\\&/g' | sed 's/\./\\./g' | sed 's/\*/.*/g'); \
+	      regex_patterns=$$(echo "$$patterns" | sed 's/[][(){}+?^$$\\]/\\&/g' | sed 's/\./\\./g' | sed 's/\*/.*/g'); \
 	      head -1 $(TEST_REPORTS_DIR)/unit_coverage.out > $(TEST_REPORTS_DIR)/unit_coverage_filtered.out; \
 	      tail -n +2 $(TEST_REPORTS_DIR)/unit_coverage.out | grep -vE "$$regex_patterns" >> $(TEST_REPORTS_DIR)/unit_coverage_filtered.out || true; \
 	      mv $(TEST_REPORTS_DIR)/unit_coverage_filtered.out $(TEST_REPORTS_DIR)/unit_coverage.out; \

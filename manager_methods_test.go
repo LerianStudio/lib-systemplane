@@ -75,3 +75,36 @@ func TestManager_HandleTenantLifecycle_SatisfiesEventHandler(t *testing.T) {
 
 	var _ tmevent.EventHandler = m.HandleTenantLifecycle
 }
+
+func TestManager_PublicLifecycleWrappers_NoOpPaths(t *testing.T) {
+	t.Parallel()
+
+	m := systemplane.NewManager(nil, nil,
+		systemplane.WithManagerLogger(nil),
+		systemplane.WithManagerTelemetry(nil),
+		systemplane.WithManagerAggregateTenantThreshold(10),
+	)
+	ctx := context.Background()
+
+	if err := m.OnTenantActivated(ctx, "tenant-a"); err != nil {
+		t.Fatalf("OnTenantActivated: %v", err)
+	}
+	if err := m.OnTenantSuspended(ctx, "tenant-a"); err != nil {
+		t.Fatalf("OnTenantSuspended: %v", err)
+	}
+	if err := m.OnTenantDeleted(ctx, "tenant-a"); err != nil {
+		t.Fatalf("OnTenantDeleted: %v", err)
+	}
+	if err := m.OnTenantCredentialsRotated(ctx, "tenant-a"); err != nil {
+		t.Fatalf("OnTenantCredentialsRotated: %v", err)
+	}
+	if m.IsClosed() {
+		t.Fatal("IsClosed before Drain = true, want false")
+	}
+	if err := m.Drain(ctx); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if !m.IsClosed() {
+		t.Fatal("IsClosed after Drain = false, want true")
+	}
+}
