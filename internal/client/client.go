@@ -156,7 +156,7 @@ func newClient(s store.Store, cfg clientConfig) *Client {
 	// gosec G118 flags WithCancel calls whose cancel is not invoked via defer;
 	// that heuristic is wrong for a long-lived lifecycle context that Close()
 	// drives explicitly. Keep the directive — without it lint fails.
-	ctx, cancel := context.WithCancel(context.Background()) //nolint:gosec // lifecycle cancel released in Close
+	ctx, cancel := context.WithCancel(context.Background())
 
 	c := &Client{
 		store:           s,
