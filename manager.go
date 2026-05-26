@@ -29,9 +29,11 @@ type ManagerOption = internalmanager.Option
 
 // NewManager constructs a Manager bound to a Postgres tenant-manager.
 //
-// The returned Manager is non-functional until it is bound to a Client via
-// Client.BindManager. New does NOT open any LISTEN connections — the first
-// per-tenant LISTEN goroutine spins up on OnTenantActivated.
+// When client is non-nil, NewManager binds the Manager to that Client
+// internally so the Client's MT Get/OnChange paths route through the
+// Manager's per-tenant cache. NewManager does NOT open any LISTEN
+// connections — the first per-tenant LISTEN goroutine spins up on the first
+// OnTenantActivated call for each tenant.
 func NewManager(client *Client, pgMgr *tmpostgres.Manager, opts ...ManagerOption) *Manager {
 	m := internalmanager.New(pgMgr, opts...)
 

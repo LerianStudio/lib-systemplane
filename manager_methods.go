@@ -4,7 +4,11 @@
 // methods directly on the public type and so godoc renders them.
 package systemplane
 
-import "context"
+import (
+	"context"
+
+	tmevent "github.com/LerianStudio/lib-commons/v5/commons/tenant-manager/event"
+)
 
 // OnTenantActivated bootstraps systemplane state for tenantID:
 //
@@ -72,4 +76,21 @@ func (m *Manager) Drain(ctx context.Context) error {
 // shutdown plumbing.
 func (m *Manager) IsClosed() bool {
 	return asInternalManager(m).IsClosed()
+}
+
+// HandleTenantLifecycle routes a tenant lifecycle event to the matching On*
+// handler, so consumers stop hand-rolling a switch over event.EventType.
+// Non-tenant-lifecycle event types are ignored (no-op).
+//
+// Best-effort: an On* handler error is logged at WARN via the Manager's
+// logger and SWALLOWED (returns nil) — a transient LISTEN reconnect failure
+// must never wedge the consumer's lifecycle dispatch pipeline.
+//
+// The signature is intentionally identical to
+// github.com/LerianStudio/lib-commons/v5/commons/tenant-manager/event.EventHandler
+// so a bound Manager can be registered directly as an event handler.
+//
+// Nil-receiver safe: calling on a nil Manager is a no-op returning nil.
+func (m *Manager) HandleTenantLifecycle(ctx context.Context, event tmevent.TenantLifecycleEvent) error {
+	return asInternalManager(m).HandleTenantLifecycle(ctx, event)
 }
