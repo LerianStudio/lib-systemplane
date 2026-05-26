@@ -21,4 +21,7 @@ jobs:
     uses: LerianStudio/github-actions-shared-workflows/.github/workflows/pr-security-scan.yml@v1.30.0
     with:
       enable_docker_scan: false
+      # CodeQL static analysis stays off here; gosec (in go-combined-analysis)
+      # already covers Go security scanning and uploads SARIF to the Security tab.
+      enable_codeql: false
     secrets: inherit
