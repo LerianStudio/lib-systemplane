@@ -169,6 +169,39 @@ func TestLifecycle_EmptyTenantID_NoOp(t *testing.T) {
 	}
 }
 
+func TestOptions_AreApplied(t *testing.T) {
+	t.Parallel()
+
+	m := manager.New(nil,
+		manager.WithLogger(nil), // nil filtered
+		manager.WithTelemetry(nil),
+		manager.WithAggregateTenantThreshold(42),
+	)
+	if m == nil {
+		t.Fatal("New returned nil")
+	}
+
+	// nil options should be ignored without panic
+	m2 := manager.New(nil, nil)
+	if m2 == nil {
+		t.Fatal("nil option must be tolerated")
+	}
+}
+
+func TestSetConnector_IsApplied(t *testing.T) {
+	t.Parallel()
+
+	m := manager.New(nil)
+
+	// Setting nil is safe.
+	m.SetConnector(nil)
+
+	// Setting on nil receiver is safe.
+	var nilM *manager.Manager
+
+	nilM.SetConnector(nil)
+}
+
 func TestOnTenantActivated_WithoutPgMgr_NoOp(t *testing.T) {
 	t.Parallel()
 
