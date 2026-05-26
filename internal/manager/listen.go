@@ -118,6 +118,14 @@ func (m *Manager) startListen(ctx context.Context, tenantID string, ts *tenantSt
 // stopListen cancels the per-tenant LISTEN goroutine and waits up to
 // listenCloseTimeout for it to exit. Idempotent.
 func (m *Manager) stopListen(ts *tenantState) {
+	m.stopListenCtx(context.Background(), ts)
+}
+
+// stopListenCtx is the ctx-aware variant of stopListen used by Drain. When
+// ctx cancels before the goroutine exits, the wait is abandoned so a
+// shutdown budget can bound total drain time even if a single LISTEN
+// reader is wedged (e.g. the Postgres server stopped responding).
+func (m *Manager) stopListenCtx(ctx context.Context, ts *tenantState) {
 	if ts == nil {
 		return
 	}
@@ -135,11 +143,17 @@ func (m *Manager) stopListen(ts *tenantState) {
 		handle.cancel()
 	}
 
-	if handle.done != nil {
-		select {
-		case <-handle.done:
-		case <-time.After(listenCloseTimeout):
-		}
+	if handle.done == nil {
+		return
+	}
+
+	timer := time.NewTimer(listenCloseTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-handle.done:
+	case <-timer.C:
+	case <-ctx.Done():
 	}
 }
 

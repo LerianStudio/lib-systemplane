@@ -169,12 +169,21 @@ func (m *Manager) Drain(ctx context.Context) error {
 
 		ts, _ := value.(*tenantState)
 		if ts != nil {
-			m.stopListen(ts)
+			m.stopListenCtx(ctx, ts)
 		}
 
 		m.perTenant.Delete(tenantID)
 
-		return true
+		// Stop iterating early if the ctx has canceled — the remaining
+		// goroutines will still observe lifecycleCancel (the per-listen
+		// ctx is wired to the Client lifecycle ctx) and exit, but the
+		// caller's shutdown deadline is honoured.
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+			return true
+		}
 	})
 
 	m.logInfo(ctx, "manager drained")

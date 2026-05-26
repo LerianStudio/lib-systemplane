@@ -82,6 +82,41 @@ func TestIntegration_Manager_CredentialsRotated_ReleasesOldGoroutine(t *testing.
 	time.Sleep(200 * time.Millisecond)
 }
 
+func TestIntegration_Manager_Drain_HonoursCtxCancellation(t *testing.T) {
+	baseDSN, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	keys := []manager.RegisteredKey{{Namespace: "ns", Key: "k", DefaultValue: "v"}}
+
+	m, _, _, mClean := setup(t, baseDSN, "tenant-drain-ctx", keys)
+	t.Cleanup(mClean)
+
+	if err := m.OnTenantActivated(context.Background(), "tenant-drain-ctx"); err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+
+	// Drain with an already-canceled ctx must return promptly.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	start := time.Now()
+
+	if err := m.Drain(ctx); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("Drain ignored ctx cancellation, took %v", elapsed)
+	}
+
+	// Subsequent Drain is idempotent.
+	if err := m.Drain(context.Background()); err != nil {
+		t.Fatalf("second Drain: %v", err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+}
+
 func TestIntegration_Manager_Drain_ReleasesAllGoroutines(t *testing.T) {
 	baseDSN, cleanup := startContainer(t)
 	t.Cleanup(cleanup)

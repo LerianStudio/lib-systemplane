@@ -59,8 +59,11 @@ func (m *Manager) OnTenantCredentialsRotated(ctx context.Context, tenantID strin
 // calls and Gets fall through to the DB-read path. Idempotent.
 //
 // Drain blocks up to an internal close timeout per goroutine waiting for
-// it to exit; callers with strict shutdown budgets should supply a ctx
-// and rely on its cancellation to abandon any stuck waits.
+// it to exit, but honours ctx cancellation: if the caller's shutdown
+// budget expires (ctx.Done fires) before every goroutine has acknowledged
+// its cancel signal, Drain returns immediately. The in-flight goroutines
+// still observe the per-listen ctx cancellation and will exit on their
+// own — Drain just stops waiting for them.
 func (m *Manager) Drain(ctx context.Context) error {
 	return asInternalManager(m).Drain(ctx)
 }
