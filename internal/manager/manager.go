@@ -248,5 +248,6 @@ func (m *Manager) IsClosed() bool {
 func (m *Manager) markClosed() {
 	m.closedMu.Lock()
 	defer m.closedMu.Unlock()
+
 	m.closed = true
 }

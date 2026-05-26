@@ -31,10 +31,3 @@ func (m *Manager) logWarn(ctx context.Context, msg string, fields ...log.Field) 
 	m.logger.Log(ctx, log.LevelWarn, msg, fields...)
 }
 
-func (m *Manager) logError(ctx context.Context, msg string, fields ...log.Field) {
-	if m == nil || m.logger == nil {
-		return
-	}
-
-	m.logger.Log(ctx, log.LevelError, msg, fields...)
-}

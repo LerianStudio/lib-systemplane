@@ -44,7 +44,7 @@ const (
 	eventActivated   = "TenantActivated"
 	eventSuspended   = "TenantSuspended"
 	eventDeleted     = "TenantDeleted"
-	eventCredsRotate = "TenantCredentialsRotated"
+	eventCredsRotate = "TenantCredentialsRotated" //nolint:gosec // event type name, not a credential
 )
 
 func main() {
@@ -95,15 +95,12 @@ func main() {
 	events := fakeTenantEventSource(ctx)
 
 	wg := &sync.WaitGroup{}
-	wg.Add(1)
 
-	go func() {
-		defer wg.Done()
-
+	wg.Go(func() {
 		for evt := range events {
 			handleEvent(ctx, manager, evt)
 		}
-	}()
+	})
 
 	<-ctx.Done()
 

@@ -19,7 +19,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"time"
 
 	"github.com/LerianStudio/lib-commons/v5/commons/backoff"
@@ -96,7 +95,11 @@ func (m *Manager) startListen(ctx context.Context, tenantID string, ts *tenantSt
 		return fmt.Errorf("systemplane/manager: listen: %w", err)
 	}
 
-	loopCtx, cancel := context.WithCancel(m.lifecycleContext())
+	// cancel is stored on the handle and invoked from stopListen() to
+	// terminate the goroutine. gosec G118 wrongly flags this as a leaked
+	// cancel because it cannot see the deferred invocation across the
+	// goroutine boundary.
+	loopCtx, cancel := context.WithCancel(m.lifecycleContext()) //nolint:gosec // released via stopListen
 	handle.cancel = cancel
 
 	m.logInfo(ctx, "manager LISTEN established",
@@ -104,10 +107,11 @@ func (m *Manager) startListen(ctx context.Context, tenantID string, ts *tenantSt
 	)
 
 	libRuntime.SafeGo(m.logger,
-		fmt.Sprintf("systemplane.manager.listen.%s", tenantID),
+		"systemplane.manager.listen."+tenantID,
 		libRuntime.KeepRunning,
 		func() {
 			defer close(handle.done)
+
 			m.consumeAndReconnect(loopCtx, tenantID, ts, conn, dsn)
 		},
 	)
@@ -169,9 +173,12 @@ func (m *Manager) stopListenCtx(ctx context.Context, ts *tenantState) {
 // Exits only when ctx is canceled.
 func (m *Manager) consumeAndReconnect(ctx context.Context, tenantID string, ts *tenantState, conn *pgx.Conn, dsn string) {
 	current := conn
+
 	defer func() {
 		closeCtx, cancel := context.WithTimeout(context.Background(), listenCloseTimeout)
+
 		_ = current.Close(closeCtx)
+
 		cancel()
 	}()
 
@@ -189,10 +196,13 @@ func (m *Manager) consumeAndReconnect(ctx context.Context, tenantID string, ts *
 
 		// Close failed connection before attempting to reopen.
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), listenCloseTimeout)
+
 		_ = current.Close(closeCtx)
+
 		closeCancel()
 
 		failures++
+
 		m.metrics.recordListenDisconnect(ctx, tenantID, "wait_failed")
 
 		if staleAfter > 0 && failures >= staleAfter {
@@ -265,9 +275,9 @@ func (m *Manager) reconnect(ctx context.Context, tenantID, dsn string, failuresS
 		base = 500 * time.Millisecond
 	}
 
-	cap := time.Duration(m.cfg.listenBackoffCapSeconds) * time.Second
-	if cap <= 0 {
-		cap = 30 * time.Second
+	maxDelay := time.Duration(m.cfg.listenBackoffCapSeconds) * time.Second
+	if maxDelay <= 0 {
+		maxDelay = 30 * time.Second
 	}
 
 	attempt := failuresSoFar
@@ -280,8 +290,8 @@ func (m *Manager) reconnect(ctx context.Context, tenantID, dsn string, failuresS
 		}
 
 		delay := backoff.ExponentialWithJitter(base, attempt)
-		if delay > cap || math.IsNaN(float64(delay)) {
-			delay = cap
+		if delay > maxDelay || delay < 0 {
+			delay = maxDelay
 		}
 
 		attempt++
@@ -293,7 +303,9 @@ func (m *Manager) reconnect(ctx context.Context, tenantID, dsn string, failuresS
 		}
 
 		connectCtx, connectCancel := context.WithTimeout(context.Background(), 10*time.Second)
+
 		conn, err := pgx.Connect(connectCtx, dsn)
+
 		connectCancel()
 
 		if err != nil {
@@ -306,12 +318,16 @@ func (m *Manager) reconnect(ctx context.Context, tenantID, dsn string, failuresS
 		}
 
 		listenCtx, listenCancel := context.WithTimeout(context.Background(), 5*time.Second)
+
 		_, err = conn.Exec(listenCtx, `LISTEN `+quoteIdentifier(defaultChannel))
+
 		listenCancel()
 
 		if err != nil {
 			closeCtx, closeCancel := context.WithTimeout(context.Background(), listenCloseTimeout)
+
 			_ = conn.Close(closeCtx)
+
 			closeCancel()
 
 			continue
@@ -374,9 +390,11 @@ func (m *Manager) applyEvent(ctx context.Context, tenantID string, ts *tenantSta
 		}
 
 		ts.mu.Lock()
+
 		if len(ts.entries) < m.cfg.maxEntriesPerTenantOverride || ts.entries[nk] != nil {
 			ts.entries[nk] = value
 		}
+
 		count := len(ts.entries)
 		ts.mu.Unlock()
 
@@ -403,11 +421,12 @@ func (m *Manager) dispatchCallbacks(ctx context.Context, namespace, key string, 
 	}
 }
 
-// notifyEvent is the decoded NOTIFY payload.
+// notifyEvent is the decoded NOTIFY payload. Field tags match notifyPayload
+// so decode can use a single struct conversion.
 type notifyEvent struct {
-	Namespace string
-	Key       string
-	Op        string
+	Namespace string `json:"namespace"`
+	Key       string `json:"key"`
+	Op        string `json:"op"`
 }
 
 func decodeNotifyPayload(data string) (notifyEvent, bool) {
@@ -425,7 +444,7 @@ func decodeNotifyPayload(data string) (notifyEvent, bool) {
 		return notifyEvent{}, false
 	}
 
-	return notifyEvent{Namespace: p.Namespace, Key: p.Key, Op: p.Op}, true
+	return notifyEvent(p), true
 }
 
 // readSingle reads one (namespace, key) row from the tenant DB. Returns

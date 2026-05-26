@@ -171,7 +171,7 @@ func (m *Manager) warmLoad(ctx context.Context, db dbresolver.DB, ts *tenantStat
 		registry[nsKey{Namespace: rk.Namespace, Key: rk.Key}] = struct{}{}
 	}
 
-	query := fmt.Sprintf(`SELECT namespace, key, value FROM %s`, defaultTable)
+	query := `SELECT namespace, key, value FROM ` + defaultTable
 
 	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
