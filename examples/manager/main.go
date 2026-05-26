@@ -44,7 +44,7 @@ const (
 	eventActivated   = "TenantActivated"
 	eventSuspended   = "TenantSuspended"
 	eventDeleted     = "TenantDeleted"
-	eventCredsRotate = "TenantCredentialsRotated" //nolint:gosec // event type name, not a credential
+	eventCredsRotate = "TenantCredentialsRotated" // #nosec G101 -- event type name, not a credential.
 )
 
 func main() {

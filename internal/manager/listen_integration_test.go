@@ -404,7 +404,7 @@ func TestListen_ApplyEvent_UpsertSuccess_UpdatesCacheAndDispatches(t *testing.T)
 		t.Fatalf("runSchema: %v", err)
 	}
 
-	if _, err := raw.Exec(`INSERT INTO `+defaultTable+
+	if _, err := raw.Exec(`INSERT INTO ` + defaultTable +
 		` (namespace, key, value, updated_by) VALUES ('a', 'k', '"fresh"'::jsonb, 'op')`); err != nil {
 		t.Fatalf("seed row: %v", err)
 	}
@@ -465,7 +465,7 @@ func TestListen_ConsumeAndReconnect_RealNotify(t *testing.T) {
 	t.Cleanup(func() { m.stopListen(ts) })
 
 	// Fire a NOTIFY by inserting a row via the same DB.
-	if _, err := raw.Exec(`INSERT INTO `+defaultTable+
+	if _, err := raw.Exec(`INSERT INTO ` + defaultTable +
 		` (namespace, key, value, updated_by) VALUES ('a', 'k', '"hi"'::jsonb, 'op')`); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
@@ -537,7 +537,7 @@ func TestListen_Reconnect_RecoversAfterDrop(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	// Insert a row and wait for the LISTEN to deliver it post-reconnect.
-	if _, err := raw.Exec(`INSERT INTO `+defaultTable+
+	if _, err := raw.Exec(`INSERT INTO ` + defaultTable +
 		` (namespace, key, value, updated_by) VALUES ('post', 'reconnect', '"ok"'::jsonb, 'op')`); err != nil {
 		t.Fatalf("post-reconnect insert: %v", err)
 	}

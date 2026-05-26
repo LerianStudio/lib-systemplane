@@ -44,7 +44,8 @@ type Client struct {
 	logger    log.Logger
 	telemetry *tracing.Telemetry
 
-	multiTenant bool
+	multiTenant    bool
+	catalogService string
 
 	registryMu sync.RWMutex
 	registry   map[nskey]keyDef
@@ -163,6 +164,7 @@ func newClient(s store.Store, cfg clientConfig) *Client {
 		logger:          logger,
 		telemetry:       cfg.telemetry,
 		multiTenant:     cfg.multiTenantEnabled,
+		catalogService:  cfg.catalogService,
 		registry:        make(map[nskey]keyDef),
 		cache:           make(map[nskey]any),
 		subscribers:     make(map[nskey][]subscription),

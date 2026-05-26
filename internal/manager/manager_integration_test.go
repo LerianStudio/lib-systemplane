@@ -25,9 +25,9 @@ import (
 // invoking the tenant-manager gRPC client. Tests prime it with one entry per
 // tenant.
 type fakeConnector struct {
-	mu    sync.RWMutex
-	dsns  map[string]string
-	dbs   map[string]dbresolver.DB
+	mu     sync.RWMutex
+	dsns   map[string]string
+	dbs    map[string]dbresolver.DB
 	resErr map[string]error
 }
 

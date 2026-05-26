@@ -30,4 +30,3 @@ func (m *Manager) logWarn(ctx context.Context, msg string, fields ...log.Field) 
 
 	m.logger.Log(ctx, log.LevelWarn, msg, fields...)
 }
-

@@ -4,3 +4,25 @@
 
 # Auto-generated mocks
 *_mock.go
+
+# Executable examples are documentation, not library code.
+examples/*
+
+# Contract test harness exercised by backend integration suites.
+systemplanetest/*
+
+# Backend live-I/O files are covered by integration tests; unit coverage keeps
+# pure adapter config/parsing/dispatch helpers in the denominator.
+internal/postgres/postgres.go
+internal/postgres/postgres_listen.go
+internal/postgres/postgres_schema.go
+internal/mongodb/mongodb.go
+internal/mongodb/mongodb_changestream.go
+internal/mongodb/mongodb_crud.go
+
+# Manager LISTEN/schema paths are Postgres I/O paths covered by integration tests.
+internal/manager/listen.go
+internal/manager/schema.go
+
+# Build-tagged test helper for out-of-package tests, not production code.
+internal/client/client_testing.go

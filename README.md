@@ -61,7 +61,9 @@ func run() error {
     defer db.Close()
 
     // listenDSN is the separate connection used for LISTEN/NOTIFY.
-    client, err := systemplane.NewPostgres(db, dsn)
+    client, err := systemplane.NewPostgres(db, dsn,
+        systemplane.WithCatalogService("example-service"),
+    )
     if err != nil {
         return err
     }
@@ -69,6 +71,13 @@ func run() error {
 
     if err := client.Register("global", "log.level", "info",
         systemplane.WithDescription("application log level"),
+        systemplane.WithCatalogMetadata(systemplane.CatalogKeyMetadata{
+            Kind:         "string",
+            RuntimeClass: "read_live",
+            Schema:       map[string]any{"type": "string"},
+            Rules:        []string{"Value must be a supported log level."},
+            Examples:     []systemplane.CatalogExample{{Name: "default", Value: "info"}},
+        }),
     ); err != nil {
         return err
     }
@@ -290,11 +299,55 @@ PUT    /<prefix>/:namespace/:key   - write a single entry
 DELETE /<prefix>/:namespace/:key   - delete a single entry
 ```
 
-In multi-tenant mode mount the tenant-manager middleware BEFORE `admin.Mount` so handler `c.UserContext()` carries the tenant database.
+In multi-tenant mode, authenticate before tenant resolution, then mount the tenant-manager middleware BEFORE `admin.Mount` so handler `c.UserContext()` carries the tenant database.
+
+### Catalog routes
+
+The catalog surface exposes registration metadata, not current persisted values. It is useful for operators and consoles that need to discover the canonical key set, descriptions, redaction policy, schemas, examples, and write path.
+
+Mount it separately from value routes:
+
+```go
+admin.MountCatalog(app, client,
+    admin.WithPathPrefix("/system"),
+    admin.WithAuthorizer(myAuthFn), // required — defaults to deny-all
+)
+```
+
+Routes:
+
+```text
+GET /<prefix>/-/catalog                 - list registered systemplane key metadata
+GET /<prefix>/-/catalog/:namespace/:key - read metadata for one registered key
+```
+
+The namespace/key path beginning with `-/catalog` is reserved for catalog routes and cannot be registered as a runtime configuration key. When value and catalog routes share a prefix, mount catalog routes before value routes.
+
+In multi-tenant services, authenticate before tenant resolution, mount catalog routes before tenant-manager middleware, then mount value routes after tenant-manager middleware:
+
+```go
+admin.MountCatalog(app, client,
+    admin.WithPathPrefix("/system"),
+    admin.WithAuthorizer(myAuthFn),
+)
+
+app.Use("/system", myJWTAuthMiddleware)
+
+app.Use(tmmiddleware.TenantMiddleware(
+    tmmiddleware.WithPG(pgManager, "systemplane"),
+))
+
+admin.Mount(app, client,
+    admin.WithPathPrefix("/system"),
+    admin.WithAuthorizer(myAuthFn),
+)
+```
+
+Catalog detail includes the registered default value. Admin HTTP responses obfuscate defaults for keys registered with `RedactMask` or `RedactFull`. Catalog examples are operator-facing documentation and are emitted as provided; do not put secrets, credentials, DSNs, tokens, or other sensitive material in registered defaults, persisted values, schemas, rules, or examples. Systemplane is not a secret store.
 
 ## Scope
 
-Systemplane is intended for **runtime-mutable knobs only**. Bootstrap-only configuration (DB DSNs, secrets, TLS material, telemetry endpoints, server identity) belongs in environment variables or a secret manager — not here.
+Systemplane is intended for **runtime-mutable knobs only**. Bootstrap-only configuration (DB DSNs, secrets, TLS material, telemetry endpoints, server identity) and any credential-like runtime value belongs in environment variables or a secret manager — not here. Redaction is an admin/log obfuscation aid, not permission to store secrets in systemplane.
 
 ## License
 

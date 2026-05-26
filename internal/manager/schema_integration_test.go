@@ -271,9 +271,9 @@ func TestSchema_SeedDefaults_ConflictDoesNotOverwrite(t *testing.T) {
 	}
 
 	var (
-		opsRate  string
+		opsRate   string
 		opsRateBy string
-		opsNew   string
+		opsNew    string
 	)
 
 	if err := raw.QueryRow(`SELECT value::text, updated_by FROM `+defaultTable+

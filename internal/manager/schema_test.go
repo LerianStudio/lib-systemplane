@@ -41,6 +41,32 @@ func TestSeedDefaults_CtxCancelled_ReturnsCtxErrBeforeDB(t *testing.T) {
 	}
 }
 
+func TestSeedDefaults_MarshalFailureSkipsDBAndReturnsErr(t *testing.T) {
+	t.Parallel()
+
+	m := New(nil)
+	registered := []RegisteredKey{{Namespace: "ns", Key: "bad", DefaultValue: func() {}}}
+
+	err := m.seedDefaults(context.Background(), nil, registered)
+	if err == nil {
+		t.Fatal("expected marshal error, got nil")
+	}
+}
+
+func TestApplyEvent_UpsertResolveFailureDoesNotMutateCache(t *testing.T) {
+	t.Parallel()
+
+	m := New(nil)
+	ts := newTenantState("tenant-a")
+	ts.entries[nsKey{Namespace: "ns", Key: "k"}] = "old"
+
+	m.applyEvent(context.Background(), "tenant-a", ts, notifyEvent{Namespace: "ns", Key: "k", Op: "upsert"})
+
+	if got := ts.entries[nsKey{Namespace: "ns", Key: "k"}]; got != "old" {
+		t.Fatalf("cache value = %#v, want old", got)
+	}
+}
+
 func TestResolveTenantDB_NilConnector_ReturnsErr(t *testing.T) {
 	t.Parallel()
 

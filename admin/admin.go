@@ -1,22 +1,32 @@
 // Package admin provides Fiber HTTP handlers for inspecting and modifying
 // systemplane configuration entries at runtime.
 //
-// Mount registers four routes on a Fiber router:
+// Mount registers value routes on a Fiber router:
 //
 //	GET    /<prefix>/:namespace            - list entries in a namespace
 //	GET    /<prefix>/:namespace/:key       - read a single entry
+//	GET    /<prefix>/:namespace/*          - read a key that may contain "/"
 //	PUT    /<prefix>/:namespace/:key       - write a single entry
+//	PUT    /<prefix>/:namespace/*          - write a key that may contain "/"
 //	DELETE /<prefix>/:namespace/:key       - delete a single entry
+//	DELETE /<prefix>/:namespace/*          - delete a key that may contain "/"
+//
+// MountCatalog registers registry-only metadata routes separately:
+//
+//	GET /<prefix>/-/catalog                 - list registered key metadata
+//	GET /<prefix>/-/catalog/:namespace/*    - read metadata for one key
 //
 // The default path prefix is "/system".
+// The namespace/key path beginning with "-/catalog" is reserved for catalog
+// routes and cannot be used as a runtime configuration key.
 //
 // Authorization is deny-all by default: callers MUST supply WithAuthorizer to
 // enable access.
 //
-// In multi-tenant mode the caller is expected to wire lib-commons
-// tenant-manager middleware (TenantMiddleware with WithPG / WithMB) BEFORE
-// Mount so handlers' c.UserContext() carries the resolved tenant database
-// for the lib's configured module.
+// In multi-tenant mode the caller is expected to run authentication before
+// lib-commons tenant-manager middleware, then call Mount so handlers'
+// c.UserContext() carries the resolved tenant database for the lib's
+// configured module.
 package admin
 
 import (
@@ -24,6 +34,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 
 	commonshttp "github.com/LerianStudio/lib-commons/v5/commons/net/http"
@@ -33,8 +44,10 @@ import (
 )
 
 const (
-	maxNamespaceLen = 256
-	maxKeyLen       = 512
+	maxNamespaceLen      = 256
+	maxKeyLen            = 512
+	catalogMetaNamespace = "-"
+	catalogKey           = "catalog"
 )
 
 // mountConfig holds options applied by MountOption functions.
@@ -105,18 +118,54 @@ func Mount(router fiber.Router, c *systemplane.Client, opts ...MountOption) {
 		o(&cfg)
 	}
 
-	prefix := cfg.pathPrefix
-	if !strings.HasPrefix(prefix, "/") {
-		prefix = "/" + prefix
-	}
-
-	prefix = strings.TrimRight(prefix, "/")
+	prefix := normalizePathPrefix(cfg.pathPrefix)
 	logger := c.Logger()
 
 	router.Get(prefix+"/:namespace", validateNamespaceParam, authorize(cfg, logger, "read"), handleList(c))
 	router.Get(prefix+"/:namespace/:key", validatePathParams, authorize(cfg, logger, "read"), handleGetOne(c))
+	router.Get(prefix+"/:namespace/*", validateWildcardPathParams, authorize(cfg, logger, "read"), handleGetOne(c))
 	router.Put(prefix+"/:namespace/:key", validatePathParams, authorize(cfg, logger, "write"), handlePut(c, cfg))
+	router.Put(prefix+"/:namespace/*", validateWildcardPathParams, authorize(cfg, logger, "write"), handlePut(c, cfg))
 	router.Delete(prefix+"/:namespace/:key", validatePathParams, authorize(cfg, logger, "write"), handleDelete(c, cfg))
+	router.Delete(prefix+"/:namespace/*", validateWildcardPathParams, authorize(cfg, logger, "write"), handleDelete(c, cfg))
+}
+
+// MountCatalog registers read-only catalog metadata routes on router using the
+// given Client. Nil client or router make MountCatalog a no-op (does not panic).
+//
+// In multi-tenant services, run authentication before tenant-manager
+// middleware, mount catalog routes before tenant-manager middleware, and mount
+// value routes with [Mount] after tenant-manager middleware so value
+// reads/writes receive the resolved tenant database.
+func MountCatalog(router fiber.Router, c *systemplane.Client, opts ...MountOption) {
+	if c == nil || router == nil {
+		return
+	}
+
+	cfg := defaultMountConfig()
+
+	for _, o := range opts {
+		if o == nil {
+			continue
+		}
+
+		o(&cfg)
+	}
+
+	prefix := normalizePathPrefix(cfg.pathPrefix)
+	logger := c.Logger()
+	catalogPath := catalogPathPrefix(prefix)
+
+	router.Get(catalogPath, authorize(cfg, logger, "read"), handleCatalogList(c, prefix))
+	router.Get(catalogPath+"/:namespace/*", validateWildcardPathParams, authorize(cfg, logger, "read"), handleCatalogDetail(c, prefix))
+}
+
+func normalizePathPrefix(prefix string) string {
+	if !strings.HasPrefix(prefix, "/") {
+		prefix = "/" + prefix
+	}
+
+	return strings.TrimRight(prefix, "/")
 }
 
 func authorize(cfg mountConfig, logger log.Logger, action string) fiber.Handler {
@@ -144,12 +193,20 @@ func validateNamespaceParam(c *fiber.Ctx) error {
 }
 
 func validatePathParams(c *fiber.Ctx) error {
-	if ns := c.Params("namespace"); len(ns) > maxNamespaceLen {
+	return validateParamLengths(c, c.Params("namespace"), c.Params("key"))
+}
+
+func validateWildcardPathParams(c *fiber.Ctx) error {
+	return validateParamLengths(c, c.Params("namespace"), c.Params("*"))
+}
+
+func validateParamLengths(c *fiber.Ctx, namespace, key string) error {
+	if len(namespace) > maxNamespaceLen {
 		return commonshttp.RespondError(c, http.StatusBadRequest, "validation_error",
 			fmt.Sprintf("namespace exceeds maximum length of %d", maxNamespaceLen))
 	}
 
-	if k := c.Params("key"); len(k) > maxKeyLen {
+	if len(key) > maxKeyLen {
 		return commonshttp.RespondError(c, http.StatusBadRequest, "validation_error",
 			fmt.Sprintf("key exceeds maximum length of %d", maxKeyLen))
 	}
@@ -186,10 +243,116 @@ func handleList(client *systemplane.Client) fiber.Handler {
 	}
 }
 
+func handleCatalogList(client *systemplane.Client, prefix string) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		catalog := client.Catalog()
+		for i := range catalog.Keys {
+			catalog.Keys[i].DetailURL = catalogDetailPath(prefix, catalog.Keys[i].Namespace, catalog.Keys[i].Key)
+		}
+
+		return c.Status(fiber.StatusOK).JSON(catalog)
+	}
+}
+
+func handleCatalogDetail(client *systemplane.Client, prefix string) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		detail, namespace, key, ok := catalogDetailFromParams(client, c.Params("namespace"), routeKeyParam(c))
+		if !ok {
+			return commonshttp.RespondError(c, http.StatusNotFound, "not_found", "systemplane catalog entry not found")
+		}
+
+		policy := catalogRedactionPolicy(detail.Redaction)
+		detail.DefaultValue = systemplane.ApplyRedaction(detail.DefaultValue, policy)
+		detail.DetailURL = catalogDetailPath(prefix, namespace, key)
+
+		return c.Status(fiber.StatusOK).JSON(catalogDetailResponse{
+			CatalogVersion:   systemplane.CatalogVersion,
+			Service:          client.CatalogService(),
+			CatalogKeyDetail: detail,
+			Write: catalogWriteResponse{
+				Method:    http.MethodPut,
+				Path:      valuePath(prefix, namespace, key),
+				BodyShape: map[string]any{"value": "<schema value>"},
+			},
+		})
+	}
+}
+
+func catalogPathPrefix(prefix string) string {
+	return fmt.Sprintf("%s/%s/%s", prefix, catalogMetaNamespace, catalogKey)
+}
+
+func catalogDetailPath(prefix, namespace, key string) string {
+	return fmt.Sprintf("%s/%s/%s", catalogPathPrefix(prefix), url.PathEscape(namespace), url.PathEscape(key))
+}
+
+func valuePath(prefix, namespace, key string) string {
+	return fmt.Sprintf("%s/%s/%s", prefix, url.PathEscape(namespace), url.PathEscape(key))
+}
+
+func routeKeyParam(c *fiber.Ctx) string {
+	if key := c.Params("key"); key != "" {
+		return key
+	}
+
+	return c.Params("*")
+}
+
+func registeredPathParams(client *systemplane.Client, c *fiber.Ctx) (string, string) {
+	namespaceParam := c.Params("namespace")
+	keyParam := routeKeyParam(c)
+
+	for _, namespace := range pathParamCandidates(namespaceParam) {
+		for _, key := range pathParamCandidates(keyParam) {
+			if client.IsRegistered(namespace, key) {
+				return namespace, key
+			}
+		}
+	}
+
+	return namespaceParam, keyParam
+}
+
+func catalogDetailFromParams(
+	client *systemplane.Client,
+	namespaceParam string,
+	keyParam string,
+) (systemplane.CatalogKeyDetail, string, string, bool) {
+	for _, namespace := range pathParamCandidates(namespaceParam) {
+		for _, key := range pathParamCandidates(keyParam) {
+			detail, ok := client.CatalogKey(namespace, key)
+			if ok {
+				return detail, namespace, key, true
+			}
+		}
+	}
+
+	return systemplane.CatalogKeyDetail{}, namespaceParam, keyParam, false
+}
+
+func pathParamCandidates(raw string) []string {
+	decoded, err := url.PathUnescape(raw)
+	if err != nil || decoded == raw {
+		return []string{raw}
+	}
+
+	return []string{raw, decoded}
+}
+
+func catalogRedactionPolicy(redaction string) systemplane.RedactPolicy {
+	switch redaction {
+	case systemplane.RedactMask.String():
+		return systemplane.RedactMask
+	case systemplane.RedactFull.String():
+		return systemplane.RedactFull
+	default:
+		return systemplane.RedactNone
+	}
+}
+
 func handleGetOne(client *systemplane.Client) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		namespace := c.Params("namespace")
-		key := c.Params("key")
+		namespace, key := registeredPathParams(client, c)
 
 		value, ok, err := client.Get(c.UserContext(), namespace, key)
 		if err != nil {
@@ -214,8 +377,7 @@ func handleGetOne(client *systemplane.Client) fiber.Handler {
 
 func handlePut(client *systemplane.Client, cfg mountConfig) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		namespace := c.Params("namespace")
-		key := c.Params("key")
+		namespace, key := registeredPathParams(client, c)
 
 		value, badRequestMsg := decodePutValue(c)
 		if badRequestMsg != "" {
@@ -234,8 +396,7 @@ func handlePut(client *systemplane.Client, cfg mountConfig) fiber.Handler {
 
 func handleDelete(client *systemplane.Client, cfg mountConfig) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		namespace := c.Params("namespace")
-		key := c.Params("key")
+		namespace, key := registeredPathParams(client, c)
 
 		actor := cfg.actorExtractor(c)
 
