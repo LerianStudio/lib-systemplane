@@ -42,6 +42,21 @@ Contributors: @bedatty, @fredcamaral, @jeffersonrodrigues92
   `warmload_latency_seconds`, `get_cache_hits_total`. Tenant-id cardinality
   is bounded by a configurable aggregate-rollup threshold (default 1000).
 - `examples/manager/main.go` documents the canonical consumer integration.
+- **Published DDL + default seed as importable artifacts.** New exported
+  functions `systemplane.SchemaSQL()` and `systemplane.DefaultSeedSQL()`
+  return, respectively, the canonical `systemplane_entries` schema DDL
+  (table + `systemplane_notify_v3()` function + INSERT/DELETE and UPDATE
+  NOTIFY triggers on the `systemplane_changes` channel) and a universal
+  neutral `runtime_config` default seed (`INSERT ... ON CONFLICT
+  (namespace, "key") DO NOTHING`). Backed by `//go:embed` of
+  `ddl/schema.sql` and `ddl/default_seed.sql`. This lets consumers fold
+  systemplane schema provisioning into their own migration pipelines
+  (e.g. `make systemplane-ddl` copying the artifacts into `migrations/`)
+  instead of relying on the lib's runtime `runSchema`. The artifacts are
+  static — table name `systemplane_entries` and channel `systemplane_changes`
+  are fixed, not parameterized. A unit test asserts the embedded schema
+  contains the canonical fragments the runtime emits, so a future runtime
+  DDL change forces the embed to be updated in lock-step.
 
 ### Changed
 
