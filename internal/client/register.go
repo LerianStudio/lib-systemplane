@@ -1,7 +1,15 @@
 // Register and key definition management for systemplane Client.
 package client
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
+
+const (
+	reservedCatalogNamespace = "-"
+	reservedCatalogKey       = "catalog"
+)
 
 // keyDef holds the metadata and default value for a registered configuration key.
 type keyDef struct {
@@ -9,6 +17,7 @@ type keyDef struct {
 	description  string
 	validator    func(any) error
 	redaction    RedactPolicy
+	catalog      CatalogKeyMetadata
 }
 
 // Register declares a configuration key with its default value and optional
@@ -30,6 +39,14 @@ func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOp
 		return fmt.Errorf("%w: namespace and key must be non-empty", ErrValidation)
 	}
 
+	if isReservedCatalogKey(namespace, key) {
+		return fmt.Errorf("%w: namespace/key is reserved for the admin catalog", ErrValidation)
+	}
+
+	if err := validateCloneSafe(defaultValue); err != nil {
+		return fmt.Errorf("%w: default value is not safely cloneable: %w", ErrValidation, err)
+	}
+
 	nk := nskey{Namespace: namespace, Key: key}
 
 	def := keyDef{
@@ -38,6 +55,10 @@ func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOp
 	}
 
 	applyKeyOptions(&def, opts)
+
+	if err := validateCatalogCloneSafe(def.catalog); err != nil {
+		return fmt.Errorf("%w: catalog metadata is not safely cloneable: %w", ErrValidation, err)
+	}
 
 	if def.validator != nil {
 		if err := def.validator(def.defaultValue); err != nil {
@@ -55,6 +76,10 @@ func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOp
 	c.registry[nk] = def
 
 	return nil
+}
+
+func isReservedCatalogKey(namespace, key string) bool {
+	return namespace == reservedCatalogNamespace && (key == reservedCatalogKey || strings.HasPrefix(key, reservedCatalogKey+"/"))
 }
 
 // IsRegistered reports whether (namespace, key) was registered via Register.

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/LerianStudio/lib-observability/log"
+	"github.com/LerianStudio/lib-systemplane/internal/manager"
 )
 
 // ListEntry is a single entry returned by [Client.List].
@@ -55,7 +56,18 @@ func (c *Client) Get(ctx context.Context, namespace, key string) (any, bool, err
 		return cloneValue(def.defaultValue), true, nil
 	}
 
-	// Multi-tenant: read through to the resolved tenant DB.
+	// Multi-tenant: try the bound Manager's per-tenant cache first; fall
+	// through to a tenant-DB read on miss. Without a bound Manager this
+	// preserves v1.4.0 behaviour (DB roundtrip on every Get).
+	tenantID := manager.TenantIDFromContext(ctx)
+
+	mgr := c.boundManager()
+	if mgr != nil && tenantID != "" {
+		if v, hit, lookupErr := mgr.Lookup(ctx, tenantID, namespace, key); lookupErr == nil && hit {
+			return cloneValue(v), true, nil
+		}
+	}
+
 	entry, found, err := c.store.Get(ctx, namespace, key)
 	if err != nil {
 		return nil, false, fmt.Errorf("systemplane: Get: %w", err)
@@ -74,6 +86,13 @@ func (c *Client) Get(ctx context.Context, namespace, key string) (any, bool, err
 		)
 
 		return nil, false, fmt.Errorf("systemplane: decode value for %s/%s: %w", namespace, key, err)
+	}
+
+	// Populate the per-tenant cache so subsequent reads bypass the DB.
+	// Populate is a no-op for tenants that have never been activated, so it
+	// will never seed state behind the lifecycle handlers' back.
+	if mgr != nil && tenantID != "" {
+		mgr.Populate(ctx, tenantID, namespace, key, decoded)
 	}
 
 	return decoded, true, nil

@@ -170,6 +170,28 @@ func TestRegisterRequiresNonEmptyKey(t *testing.T) {
 	}
 }
 
+func TestRegisterRejectsReservedCatalogKeys(t *testing.T) {
+	c := newSingleTenantClient(t, newMemStore(false))
+
+	for _, tt := range []struct {
+		name string
+		key  string
+	}{
+		{name: "catalog root", key: "catalog"},
+		{name: "catalog wildcard", key: "catalog/runtime/timeout"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := c.Register("-", tt.key, 1); !errors.Is(err, ErrValidation) {
+				t.Fatalf("register -/%s: got %v, want ErrValidation", tt.key, err)
+			}
+		})
+	}
+
+	if err := c.Register("-", "ordinary", 1); err != nil {
+		t.Fatalf("ordinary key in reserved namespace should remain valid: %v", err)
+	}
+}
+
 func TestRegisterRejectsDuplicates(t *testing.T) {
 	c := newSingleTenantClient(t, newMemStore(false))
 

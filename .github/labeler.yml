@@ -1,0 +1,96 @@
+# Pull Request Labeler configuration
+#
+# Labels are aligned with the pr_title_scopes in pr-validation.yml.
+
+# Admin HTTP surface (Fiber handlers)
+admin:
+  - changed-files:
+      - any-glob-to-any-file: 'admin/**/*'
+
+# Client implementation (lifecycle, registration, reads/writes, cache, telemetry)
+client:
+  - changed-files:
+      - any-glob-to-any-file: 'internal/client/**/*'
+
+# Trailing-edge changefeed debouncer
+debounce:
+  - changed-files:
+      - any-glob-to-any-file: 'internal/debounce/**/*'
+
+# MongoDB backend (change streams, polling fallback)
+mongodb:
+  - changed-files:
+      - any-glob-to-any-file: 'internal/mongodb/**/*'
+
+# Postgres backend (pgx, LISTEN/NOTIFY)
+postgres:
+  - changed-files:
+      - any-glob-to-any-file: 'internal/postgres/**/*'
+
+# Backend-agnostic Store interface
+store:
+  - changed-files:
+      - any-glob-to-any-file: 'internal/store/**/*'
+
+# Backend-agnostic contract test suite
+systemplanetest:
+  - changed-files:
+      - any-glob-to-any-file: 'systemplanetest/**/*'
+
+# Root public API surface (api_*.go + doc.go)
+core:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'api_*.go'
+          - 'doc.go'
+
+# Build and tooling scripts
+scripts:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'shell/**/*'
+          - 'scripts/**/*'
+          - 'Makefile'
+
+# Application and tooling configuration
+config:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '.golangci.yml'
+          - '.golangci.yaml'
+          - '.releaserc.yml'
+          - '.releaserc.yaml'
+          - '.goreleaser.yml'
+          - '.goreleaser.yaml'
+          - '.ignorecoverunit'
+
+# Continuous integration pipelines and automation configs
+ci:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '.github/workflows/**/*'
+          - '.github/labeler.yml'
+          - '.github/labels.yml'
+          - '.github/dependabot.yml'
+          - '.github/FUNDING.yml'
+
+# Markdown docs and context files
+docs:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '**/*.md'
+          - 'docs/**/*'
+
+# Unit, integration and end-to-end tests
+tests:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '**/*_test.go'
+          - 'tests/**/*'
+
+# Go module dependencies
+deps:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'go.mod'
+          - 'go.sum'

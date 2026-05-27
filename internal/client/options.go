@@ -10,13 +10,14 @@ import (
 
 // clientConfig holds the merged configuration applied by Option functions.
 type clientConfig struct {
-	logger        log.Logger
-	telemetry     *tracing.Telemetry
-	listenChannel string
-	pollInterval  time.Duration
-	debounce      time.Duration
-	collection    string
-	table         string
+	logger         log.Logger
+	telemetry      *tracing.Telemetry
+	listenChannel  string
+	pollInterval   time.Duration
+	debounce       time.Duration
+	collection     string
+	table          string
+	catalogService string
 
 	multiTenantEnabled bool
 	module             string
@@ -129,6 +130,15 @@ func WithModule(name string) Option {
 	}
 }
 
+// WithCatalogService sets the service name emitted by catalog snapshots.
+func WithCatalogService(name string) Option {
+	return func(cfg *clientConfig) {
+		if name != "" {
+			cfg.catalogService = name
+		}
+	}
+}
+
 func applyClientOptions(cfg *clientConfig, opts []Option) {
 	for _, opt := range opts {
 		if opt == nil {
@@ -163,5 +173,13 @@ func WithValidator(fn func(any) error) KeyOption {
 func WithRedaction(policy RedactPolicy) KeyOption {
 	return func(k *keyDef) {
 		k.redaction = policy
+	}
+}
+
+// WithCatalogMetadata attaches operator-facing catalog metadata to a key.
+// Examples are emitted as provided; do not include secrets or credentials.
+func WithCatalogMetadata(meta CatalogKeyMetadata) KeyOption {
+	return func(k *keyDef) {
+		k.catalog = cloneCatalogMetadata(meta)
 	}
 }

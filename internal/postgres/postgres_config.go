@@ -1,0 +1,61 @@
+package postgres
+
+import (
+	"errors"
+	"fmt"
+
+	"github.com/LerianStudio/lib-systemplane/internal/store"
+)
+
+// New creates a Postgres-backed Store. Validates the configuration but does
+// not touch the database — schema bootstrap happens lazily on first access
+// (multi-tenant) or eagerly at Start() (single-tenant).
+func New(cfg Config) (*Store, error) {
+	if err := normalizeConfig(&cfg); err != nil {
+		return nil, err
+	}
+
+	return &Store{cfg: cfg, subscribers: make(map[uint64]func(store.Event))}, nil
+}
+
+func normalizeConfig(cfg *Config) error {
+	if cfg.Channel == "" {
+		cfg.Channel = defaultChannel
+	}
+
+	if cfg.Table == "" {
+		cfg.Table = defaultTable
+	}
+
+	if cfg.Module == "" {
+		cfg.Module = defaultModule
+	}
+
+	if !safeIdentifierRe.MatchString(cfg.Channel) {
+		return fmt.Errorf("systemplane/postgres: unsafe channel name %q", cfg.Channel)
+	}
+
+	if !safeIdentifierRe.MatchString(cfg.Table) {
+		return fmt.Errorf("systemplane/postgres: unsafe table name %q", cfg.Table)
+	}
+
+	if cfg.MultiTenantEnabled {
+		// In multi-tenant mode DB/ListenDSN are resolved per-request from ctx;
+		// constructor handles may be nil.
+		return nil
+	}
+
+	if cfg.DB == nil {
+		return store.ErrNilBackend
+	}
+
+	if cfg.ListenDSN == "" {
+		return errors.New("systemplane/postgres: ListenDSN is required in single-tenant mode")
+	}
+
+	return nil
+}
+
+func quoteIdentifier(name string) string {
+	return `"` + name + `"`
+}

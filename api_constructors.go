@@ -68,6 +68,9 @@ func WithMultiTenantEnabled() Option { return internalclient.WithMultiTenantEnab
 // Default: "systemplane".
 func WithModule(name string) Option { return internalclient.WithModule(name) }
 
+// WithCatalogService sets the service name emitted by catalog snapshots.
+func WithCatalogService(name string) Option { return internalclient.WithCatalogService(name) }
+
 // WithDescription sets a human-readable description for the key.
 func WithDescription(s string) KeyOption { return internalclient.WithDescription(s) }
 
@@ -77,6 +80,12 @@ func WithValidator(fn func(any) error) KeyOption { return internalclient.WithVal
 // WithRedaction sets the redaction policy.
 func WithRedaction(policy RedactPolicy) KeyOption {
 	return internalclient.WithRedaction(internalclient.RedactPolicy(policy))
+}
+
+// WithCatalogMetadata attaches operator-facing catalog metadata to a key.
+// Examples are emitted as provided; do not include secrets or credentials.
+func WithCatalogMetadata(meta CatalogKeyMetadata) KeyOption {
+	return internalclient.WithCatalogMetadata(meta)
 }
 
 // ApplyRedaction returns the value rendered per policy.
