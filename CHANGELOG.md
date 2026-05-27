@@ -1,5 +1,17 @@
 # Lib-systemplane Changelog
 
+## [1.6.0](https://github.com/LerianStudio/lib-systemplane/releases/tag/v1.6.0)
+
+- Features:
+  - Provision schema externally; drop runtime DDL and defaults seed.
+  - Publish schema + default seed as importable artifacts.
+
+Contributors: @jeffersonrodrigues92, @lerian-studio.
+
+[Compare changes](https://github.com/LerianStudio/lib-systemplane/compare/v1.5.0...v1.6.0)
+
+---
+
 ## [Unreleased]
 
 ### Changed
