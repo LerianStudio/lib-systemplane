@@ -64,8 +64,11 @@ func main() {
 
 	defer func() { _ = client.Close() }()
 
-	// 2. Register every runtime configuration key. Defaults are seeded
-	//    per tenant by the Manager on OnTenantActivated.
+	// 2. Register every runtime configuration key. The Manager does NOT seed
+	//    defaults at runtime — provision the schema and any defaults externally
+	//    via systemplane.SchemaSQL() / DefaultSeedSQL() (e.g. your migration
+	//    pipeline). OnTenantActivated warm-loads existing values and opens
+	//    LISTEN; a not-yet-provisioned table is tolerated (empty cache).
 	if err := client.Register("ledger", "retries", 3, systemplane.WithDescription("retry count")); err != nil {
 		fail("Register retries", err)
 	}

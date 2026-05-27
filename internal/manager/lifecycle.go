@@ -14,11 +14,13 @@ import (
 
 // OnTenantActivated bootstraps systemplane state for tenantID.
 //
-// Slice 3+: ensures the systemplane schema exists, seeds defaults via
-// INSERT ON CONFLICT DO NOTHING, opens the LISTEN goroutine, and warm-loads
-// every registered key into the cache. Slice 1 records the tenant in
-// perTenant so subsequent Get calls observe an empty cache for it (which
-// still falls through to the DB).
+// It warm-loads every registered key into the per-tenant cache and opens the
+// LISTEN goroutine. It does NOT create the schema or seed defaults — those are
+// provisioned externally by the consumer's migration pipeline (see
+// internal/manager/schema.go and the root package's SchemaSQL() /
+// DefaultSeedSQL()). Warm-load tolerates a not-yet-provisioned table: it logs
+// and proceeds with an empty cache so a provisioning race never wedges
+// activation; LISTEN/poll refreshes the cache once the table exists.
 func (m *Manager) OnTenantActivated(ctx context.Context, tenantID string) error {
 	if m == nil || m.IsClosed() || tenantID == "" {
 		return nil
@@ -48,15 +50,6 @@ func (m *Manager) OnTenantActivated(ctx context.Context, tenantID string) error 
 
 	ts := m.tenantStateFor(tenantID)
 	registered := m.hooks.RegisteredKeys()
-
-	if err := m.runSchemaAndSeed(ctx, db, registered); err != nil {
-		m.logWarn(ctx, "OnTenantActivated: schema/seed failed",
-			log.String("tenant_id", tenantID),
-			log.Err(err),
-		)
-
-		return err
-	}
 
 	if err := m.warmLoad(ctx, db, ts, registered); err != nil {
 		m.logWarn(ctx, "OnTenantActivated: warm-load failed",

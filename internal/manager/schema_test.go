@@ -10,49 +10,6 @@ import (
 	"github.com/bxcodec/dbresolver/v2"
 )
 
-func TestSeedDefaults_EmptyRegistered_NoOp(t *testing.T) {
-	t.Parallel()
-
-	m := New(nil)
-
-	if err := m.seedDefaults(context.Background(), nil, nil); err != nil {
-		t.Fatalf("seedDefaults empty: %v", err)
-	}
-}
-
-// TestSeedDefaults_CtxCancelled_ReturnsCtxErrBeforeDB pins the cancellation
-// discipline: a pre-cancelled ctx must abort the seed loop before any DB
-// call, so a fast-shutdown path stops contending for the tenant's pool.
-// Passing a nil dbresolver.DB proves no DB call happens — otherwise the
-// test would panic.
-func TestSeedDefaults_CtxCancelled_ReturnsCtxErrBeforeDB(t *testing.T) {
-	t.Parallel()
-
-	m := New(nil)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	registered := []RegisteredKey{{Namespace: "ns", Key: "k", DefaultValue: 1}}
-
-	err := m.seedDefaults(ctx, nil, registered)
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("expected context.Canceled, got %v", err)
-	}
-}
-
-func TestSeedDefaults_MarshalFailureSkipsDBAndReturnsErr(t *testing.T) {
-	t.Parallel()
-
-	m := New(nil)
-	registered := []RegisteredKey{{Namespace: "ns", Key: "bad", DefaultValue: func() {}}}
-
-	err := m.seedDefaults(context.Background(), nil, registered)
-	if err == nil {
-		t.Fatal("expected marshal error, got nil")
-	}
-}
-
 func TestApplyEvent_UpsertResolveFailureDoesNotMutateCache(t *testing.T) {
 	t.Parallel()
 
