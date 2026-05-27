@@ -9,10 +9,17 @@
 //
 //   - Multi-tenant. The constructor receives no db; instead the caller wires
 //     lib-commons tenant-manager middleware so each request context carries
-//     the per-tenant database. resolveDB(ctx) extracts that database, lazily
-//     bootstraps the schema on first use per database, and returns the handle
-//     to the CRUD helpers. LISTEN/NOTIFY is disabled in this mode — Subscribe
-//     returns store.ErrNotSupportedInMultiTenant.
+//     the per-tenant database. resolveDB(ctx) extracts that database and
+//     returns the handle to the CRUD helpers. LISTEN/NOTIFY is disabled in
+//     this mode — Subscribe returns store.ErrNotSupportedInMultiTenant.
+//
+// This package performs NO runtime schema provisioning. The
+// systemplane_entries table, the systemplane_notify_v3() trigger function, and
+// the NOTIFY triggers MUST be provisioned externally (e.g. via the consumer's
+// migration pipeline) using the DDL published by the root package's
+// SchemaSQL() / DefaultSeedSQL(). The store only reads, writes values, and —
+// in single-tenant mode — runs LISTEN/NOTIFY. The runtime database role only
+// needs DML + LISTEN privileges, never CREATE on the schema.
 package postgres
 
 import (
@@ -37,8 +44,9 @@ import (
 var _ store.Store = (*Store)(nil)
 
 // safeIdentifierRe validates that a SQL identifier contains only safe characters.
-// DDL paths cannot use parameterized queries for identifiers, so any name
-// interpolated into a statement must pass this check first.
+// SQL statements cannot use parameterized queries for identifiers (table name,
+// LISTEN channel), so any name interpolated into a statement must pass this
+// check first.
 var safeIdentifierRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 
 const (
@@ -100,12 +108,6 @@ type Config struct {
 type Store struct {
 	cfg Config
 
-	// schemaOnce tracks lazy schema bootstrap per database handle in
-	// multi-tenant mode. Single-tenant mode populates the sole entry at
-	// Start() time.
-	schemaOnce sync.Map // map[dbExecutor]*sync.Once
-	schemaErr  sync.Map // map[dbExecutor]error
-
 	// listenerMu / subscribers serve the single-tenant LISTEN/NOTIFY path.
 	listenerMu  sync.Mutex
 	subscribers map[uint64]func(store.Event)
@@ -117,9 +119,10 @@ type Store struct {
 	closed bool
 }
 
-// Start performs single-tenant schema bootstrap and opens the LISTEN
-// connection. In multi-tenant mode it is a no-op — schema bootstrap is lazy
-// per tenant database and there is no shared changefeed.
+// Start opens the single-tenant LISTEN connection. The schema is NOT created
+// here — it must be provisioned externally (see the package doc). In
+// multi-tenant mode Start is a no-op: there is no shared changefeed and reads
+// go through the per-request tenant database.
 func (s *Store) Start(ctx context.Context) error {
 	if s == nil || s.isClosed() {
 		return store.ErrClosed
@@ -127,10 +130,6 @@ func (s *Store) Start(ctx context.Context) error {
 
 	if s.cfg.MultiTenantEnabled {
 		return nil
-	}
-
-	if err := s.ensureSchema(ctx, s.cfg.DB); err != nil {
-		return err
 	}
 
 	return s.startListener(ctx)
@@ -168,9 +167,9 @@ func (s *Store) isClosed() bool {
 // resolveDB returns the database handle for the current call.
 //
 // Single-tenant mode returns the constructor-supplied *sql.DB unchanged.
-// Multi-tenant mode extracts the dbresolver.DB stored in ctx by
-// tenant-manager middleware and lazily bootstraps the schema on first use per
-// resolved database.
+// Multi-tenant mode extracts the dbresolver.DB stored in ctx by tenant-manager
+// middleware. The schema is assumed to be provisioned externally; the store
+// does not create it.
 func (s *Store) resolveDB(ctx context.Context) (dbExecutor, error) {
 	if !s.cfg.MultiTenantEnabled {
 		return s.cfg.DB, nil
@@ -181,34 +180,7 @@ func (s *Store) resolveDB(ctx context.Context) (dbExecutor, error) {
 		return nil, store.ErrTenantConnectionMissing
 	}
 
-	if err := s.ensureSchema(ctx, db); err != nil {
-		return nil, err
-	}
-
 	return db, nil
-}
-
-// ensureSchema runs the idempotent DDL exactly once per database handle. The
-// once/err pair are keyed on the dbExecutor interface value, which is stable
-// per tmpostgres.Manager pool — every Manager returns the same dbresolver.DB
-// reference for a given tenant, so subsequent lookups hit the cache.
-func (s *Store) ensureSchema(ctx context.Context, db dbExecutor) error {
-	onceVal, _ := s.schemaOnce.LoadOrStore(db, &sync.Once{})
-	once, _ := onceVal.(*sync.Once)
-
-	once.Do(func() {
-		if err := s.runSchema(ctx, db); err != nil {
-			s.schemaErr.Store(db, err)
-		}
-	})
-
-	if errVal, ok := s.schemaErr.Load(db); ok {
-		if err, _ := errVal.(error); err != nil {
-			return err
-		}
-	}
-
-	return nil
 }
 
 // List returns every entry in the resolved database, ordered by (namespace, key).

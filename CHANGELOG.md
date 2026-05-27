@@ -1,5 +1,49 @@
 # Lib-systemplane Changelog
 
+## [Unreleased]
+
+### Changed
+
+- **lib-systemplane no longer creates its schema or seeds defaults at
+  runtime.** The Postgres store and the multi-tenant `Manager` previously ran
+  `CREATE TABLE` / `CREATE FUNCTION` / `CREATE TRIGGER` and an
+  `INSERT ... ON CONFLICT DO NOTHING` defaults seed on first use
+  (`Store.Start` / `OnTenantActivated`). Those runtime DDL/seed paths are
+  removed. Consumers provision `systemplane_entries` (plus
+  `systemplane_notify_v3()` and the INSERT/DELETE and UPDATE NOTIFY triggers)
+  and any default values externally — e.g. via their migration pipeline —
+  using the DDL published by `SchemaSQL()` / `DefaultSeedSQL()`. The runtime
+  database role needs only DML (`SELECT`/`INSERT`/`UPDATE`/`DELETE`) +
+  `LISTEN`; it no longer needs `CREATE` on the schema. This aligns with the
+  least-privilege per-tenant roles handed back by the tenant-manager (which
+  reject runtime DDL with `permission denied for schema ... (42501)`). No
+  current consumers depend on the removed runtime bootstrap, so this is a
+  behavior change with no expected real-world breakage.
+- Warm-load (`OnTenantActivated`) now tolerates a not-yet-provisioned table:
+  if `systemplane_entries` does not exist yet (SQLSTATE `42P01`) it logs at
+  WARN and proceeds with an empty cache instead of failing activation;
+  LISTEN/poll refreshes the cache once the consumer's migration creates the
+  table. Reads return not-found / zero-value as before.
+
+### Removed
+
+- Postgres store: `runSchema` and the `CREATE ...` DDL builders, the
+  `ensureSchema` / `schemaOnce` / `schemaErr` lazy-bootstrap machinery, and
+  the `Start`/`resolveDB` calls into them.
+- Manager: `runSchemaAndSeed`, `runSchema`, and the runtime `seedDefaults`
+  defaults seed.
+
+### Unchanged
+
+- `SchemaSQL()` and `DefaultSeedSQL()` are intact and are now the ONLY way the
+  schema and defaults are expressed, for consumers to vendor into migrations.
+
+> Recommended version: **v1.7.0** (next beta `v1.7.0-beta.1`) — minor bump
+> continuing the v1.6.x line that introduced `SchemaSQL()` / `DefaultSeedSQL()`.
+> Tag owned by the maintainer; not tagged here.
+
+---
+
 ## [1.5.0](https://github.com/LerianStudio/lib-systemplane/releases/tag/v1.5.0)
 
 - **Features**
@@ -35,13 +79,29 @@ Contributors: @bedatty, @fredcamaral, @jeffersonrodrigues92
   identical v1.4.0 behaviour.
 - Schema bootstrap + defaults seed via `INSERT ... ON CONFLICT DO NOTHING`
   happen at `OnTenantActivated` time. Operator-set values are never
-  overwritten. This removes the need for hand-rolled plugin-side migrations
-  that seeded systemplane defaults.
+  overwritten. (Superseded by the Unreleased change above: runtime schema
+  creation and the defaults seed were removed — provision the schema and
+  defaults externally via `SchemaSQL()` / `DefaultSeedSQL()`.)
 - Six new OpenTelemetry metrics: `systemplane.manager.tenants_active`,
   `cache_entries`, `notify_received_total`, `listen_disconnects_total`,
   `warmload_latency_seconds`, `get_cache_hits_total`. Tenant-id cardinality
   is bounded by a configurable aggregate-rollup threshold (default 1000).
 - `examples/manager/main.go` documents the canonical consumer integration.
+- **Published DDL + default seed as importable artifacts.** New exported
+  functions `systemplane.SchemaSQL()` and `systemplane.DefaultSeedSQL()`
+  return, respectively, the canonical `systemplane_entries` schema DDL
+  (table + `systemplane_notify_v3()` function + INSERT/DELETE and UPDATE
+  NOTIFY triggers on the `systemplane_changes` channel) and a universal
+  neutral `runtime_config` default seed (`INSERT ... ON CONFLICT
+  (namespace, "key") DO NOTHING`). Backed by `//go:embed` of
+  `ddl/schema.sql` and `ddl/default_seed.sql`. This lets consumers fold
+  systemplane schema provisioning into their own migration pipelines
+  (e.g. `make systemplane-ddl` copying the artifacts into `migrations/`)
+  instead of relying on the lib's runtime `runSchema`. The artifacts are
+  static — table name `systemplane_entries` and channel `systemplane_changes`
+  are fixed, not parameterized. A unit test asserts the embedded schema
+  contains the canonical fragments the runtime emits, so a future runtime
+  DDL change forces the embed to be updated in lock-step.
 
 ### Changed
 
