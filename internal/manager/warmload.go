@@ -1,81 +1,47 @@
+// Warm-load for the Manager.
+//
+// warmLoad reads every registered key's current value from the tenant DB into
+// the per-tenant cache at activation time. The schema is provisioned
+// externally (see schema.go); warm-load never creates it. If the table has not
+// been provisioned yet — e.g. activation races the consumer's migration —
+// warm-load logs and proceeds with an empty cache rather than failing, so a
+// provisioning race never wedges activation. The cache refreshes via
+// LISTEN/poll once the table exists.
 package manager
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"time"
 
 	"github.com/LerianStudio/lib-observability/log"
 	"github.com/bxcodec/dbresolver/v2"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// seedDefaults inserts every registered key's default value with
-// ON CONFLICT (namespace, key) DO NOTHING so operator-set values are never
-// overwritten. Logs and continues for individual key failures; the first
-// encountered error is returned at the end so the caller can surface it.
-func (m *Manager) seedDefaults(ctx context.Context, db dbresolver.DB, registered []RegisteredKey) error {
-	if len(registered) == 0 {
-		return nil
-	}
+// pgUndefinedTable is the Postgres SQLSTATE for "relation does not exist"
+// (42P01). It is returned when warm-load runs before the consumer's migration
+// provisioned systemplane_entries.
+const pgUndefinedTable = "42P01"
 
-	query := fmt.Sprintf(
-		`INSERT INTO %s (namespace, key, value, updated_at, updated_by)
-VALUES ($1, $2, $3, $4, $5)
-ON CONFLICT (namespace, key) DO NOTHING`,
-		defaultTable,
-	)
+// isUndefinedTable reports whether err is a Postgres "undefined table" error
+// (SQLSTATE 42P01). Used to tolerate a not-yet-provisioned schema during
+// warm-load instead of failing activation.
+func isUndefinedTable(err error) bool {
+	var pgErr *pgconn.PgError
 
-	now := time.Now().UTC()
-
-	var firstErr error
-
-	for _, rk := range registered {
-		// Honour ctx cancellation between iterations so a fast-shutdown
-		// path stops contending for the tenant's connection pool. Mirrors
-		// the same discipline Drain already follows on perTenant.Range.
-		if err := ctx.Err(); err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-
-			return firstErr
-		}
-
-		raw, err := json.Marshal(rk.DefaultValue)
-		if err != nil {
-			m.logWarn(ctx, "manager seed: marshal default failed, skipping",
-				log.String("namespace", rk.Namespace),
-				log.String("key", rk.Key),
-				log.Err(err),
-			)
-
-			if firstErr == nil {
-				firstErr = fmt.Errorf("systemplane/manager: seed marshal %s/%s: %w", rk.Namespace, rk.Key, err)
-			}
-
-			continue
-		}
-
-		if _, err := db.ExecContext(ctx, query, rk.Namespace, rk.Key, raw, now, defaultActor); err != nil {
-			m.logWarn(ctx, "manager seed: insert failed",
-				log.String("namespace", rk.Namespace),
-				log.String("key", rk.Key),
-				log.Err(err),
-			)
-
-			if firstErr == nil {
-				firstErr = fmt.Errorf("systemplane/manager: seed insert %s/%s: %w", rk.Namespace, rk.Key, err)
-			}
-		}
-	}
-
-	return firstErr
+	return errors.As(err, &pgErr) && pgErr.Code == pgUndefinedTable
 }
 
 // warmLoad reads every row from the tenant DB into the per-tenant cache.
 // Unregistered keys are skipped (a row exists but the Client never declared
 // it — typical when a stale registration was removed but the row remained).
+//
+// If the table has not been provisioned yet (SQLSTATE 42P01) warm-load logs at
+// WARN and returns nil with an empty, non-stale cache — the consumer's
+// migration is expected to create the table, and LISTEN/poll will populate the
+// cache once it does.
 func (m *Manager) warmLoad(ctx context.Context, db dbresolver.DB, ts *tenantState, registered []RegisteredKey) error {
 	registry := make(map[nsKey]struct{}, len(registered))
 	for _, rk := range registered {
@@ -86,6 +52,19 @@ func (m *Manager) warmLoad(ctx context.Context, db dbresolver.DB, ts *tenantStat
 
 	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
+		if isUndefinedTable(err) {
+			m.logWarn(ctx, "manager warm-load: systemplane table not provisioned yet, proceeding with empty cache",
+				log.String("table", defaultTable),
+				log.Err(err),
+			)
+
+			ts.mu.Lock()
+			ts.stale = false
+			ts.mu.Unlock()
+
+			return nil
+		}
+
 		return fmt.Errorf("systemplane/manager: warm-load query: %w", err)
 	}
 	defer rows.Close()

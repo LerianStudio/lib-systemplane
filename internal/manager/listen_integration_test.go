@@ -187,10 +187,7 @@ func TestListen_ReadSingle_NoRows(t *testing.T) {
 	db, raw, _, cleanup := freshTenantDB(t, baseDSN)
 	t.Cleanup(cleanup)
 
-	m := New(nil)
-	if err := m.runSchema(context.Background(), db); err != nil {
-		t.Fatalf("runSchema: %v", err)
-	}
+	provisionTestSchema(t, db)
 	_ = raw
 
 	v, found, err := readSingle(context.Background(), db, "ns", "missing")
@@ -210,10 +207,7 @@ func TestListen_ReadSingle_DecodeError(t *testing.T) {
 	db, raw, _, cleanup := freshTenantDB(t, baseDSN)
 	t.Cleanup(cleanup)
 
-	m := New(nil)
-	if err := m.runSchema(context.Background(), db); err != nil {
-		t.Fatalf("runSchema: %v", err)
-	}
+	provisionTestSchema(t, db)
 
 	// JSONB enforces JSON well-formedness, but our column's bytes path will
 	// still decode any valid JSON. To force a Unmarshal failure we have to
@@ -363,9 +357,7 @@ func TestListen_ApplyEvent_UpsertRowMissing_DeletesEntry(t *testing.T) {
 	tel, _ := newTestTelemetry(t)
 	m.metrics = newMetrics(tel, log.NewNop(), DefaultAggregateTenantThreshold)
 
-	if err := m.runSchema(context.Background(), db); err != nil {
-		t.Fatalf("runSchema: %v", err)
-	}
+	provisionTestSchema(t, db)
 
 	fc := newFakeConnectorInternal()
 	fc.setTenant("t", "", db)
@@ -400,9 +392,7 @@ func TestListen_ApplyEvent_UpsertSuccess_UpdatesCacheAndDispatches(t *testing.T)
 	tel, _ := newTestTelemetry(t)
 	m.metrics = newMetrics(tel, log.NewNop(), DefaultAggregateTenantThreshold)
 
-	if err := m.runSchema(context.Background(), db); err != nil {
-		t.Fatalf("runSchema: %v", err)
-	}
+	provisionTestSchema(t, db)
 
 	if _, err := raw.Exec(`INSERT INTO ` + defaultTable +
 		` (namespace, key, value, updated_by) VALUES ('a', 'k', '"fresh"'::jsonb, 'op')`); err != nil {
@@ -448,9 +438,7 @@ func TestListen_ConsumeAndReconnect_RealNotify(t *testing.T) {
 	tel, _ := newTestTelemetry(t)
 	m.metrics = newMetrics(tel, log.NewNop(), DefaultAggregateTenantThreshold)
 
-	if err := m.runSchema(context.Background(), db); err != nil {
-		t.Fatalf("runSchema: %v", err)
-	}
+	provisionTestSchema(t, db)
 
 	fc := newFakeConnectorInternal()
 	fc.setTenant("t", tDSN, db)
@@ -505,9 +493,7 @@ func TestListen_Reconnect_RecoversAfterDrop(t *testing.T) {
 	tel, _ := newTestTelemetry(t)
 	m.metrics = newMetrics(tel, log.NewNop(), DefaultAggregateTenantThreshold)
 
-	if err := m.runSchema(context.Background(), db); err != nil {
-		t.Fatalf("runSchema: %v", err)
-	}
+	provisionTestSchema(t, db)
 
 	fc := newFakeConnectorInternal()
 	fc.setTenant("t", tDSN, db)

@@ -5,7 +5,6 @@ package manager_test
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	tmcore "github.com/LerianStudio/lib-commons/v5/commons/tenant-manager/core"
+	systemplane "github.com/LerianStudio/lib-systemplane"
 	"github.com/LerianStudio/lib-systemplane/internal/manager"
 	"github.com/bxcodec/dbresolver/v2"
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -135,6 +135,18 @@ func freshDB(t *testing.T, admin *sql.DB, name string) {
 	}
 }
 
+// provisionSchema applies the published systemplane DDL to db. The Manager no
+// longer creates its schema or seeds defaults at runtime, so the test (acting
+// as the consumer's migration pipeline) provisions systemplane_entries plus
+// the NOTIFY trigger before activating tenants.
+func provisionSchema(t *testing.T, db *sql.DB) {
+	t.Helper()
+
+	if _, err := db.Exec(systemplane.SchemaSQL()); err != nil {
+		t.Fatalf("provision schema: %v", err)
+	}
+}
+
 func dsnFor(base, dbName string) string {
 	for i := len(base) - 1; i >= 0; i-- {
 		if base[i] == '/' {
@@ -174,6 +186,9 @@ func setup(t *testing.T, baseDSN string, tenantID string, keys []manager.Registe
 		t.Fatalf("open tenant: %v", err)
 	}
 
+	// Provision the schema externally — the Manager no longer creates it.
+	provisionSchema(t, tenantSQL)
+
 	resolver := dbresolver.New(dbresolver.WithPrimaryDBs(tenantSQL))
 
 	fc := newFakeConnector()
@@ -191,9 +206,11 @@ func setup(t *testing.T, baseDSN string, tenantID string, keys []manager.Registe
 	return m, tdsn, resolver, cleanup
 }
 
-// TestIntegration_Manager_OnTenantActivated_BootstrapsSchemaAndSeeds verifies
-// that activation runs DDL, seeds defaults, opens LISTEN and warm-loads.
-func TestIntegration_Manager_OnTenantActivated_BootstrapsSchemaAndSeeds(t *testing.T) {
+// TestIntegration_Manager_OnTenantActivated_WarmLoadsExternallySeeded verifies
+// that activation warm-loads values the consumer's migration seeded into the
+// externally provisioned table and opens LISTEN. The Manager no longer seeds
+// defaults itself — the row is inserted out-of-band first.
+func TestIntegration_Manager_OnTenantActivated_WarmLoadsExternallySeeded(t *testing.T) {
 	baseDSN, cleanup := startContainer(t)
 	t.Cleanup(cleanup)
 
@@ -205,30 +222,19 @@ func TestIntegration_Manager_OnTenantActivated_BootstrapsSchemaAndSeeds(t *testi
 	m, _, resolver, mClean := setup(t, baseDSN, "tenant-a", keys)
 	defer mClean()
 
+	// Seed the value externally (the migration pipeline's job now).
+	if _, err := resolver.ExecContext(context.Background(),
+		`INSERT INTO systemplane_entries (namespace, key, value, updated_at, updated_by)
+		VALUES ($1, $2, $3, now(), $4)`,
+		"ns", "retries", []byte(`3`), "migration"); err != nil {
+		t.Fatalf("external seed: %v", err)
+	}
+
 	if err := m.OnTenantActivated(context.Background(), "tenant-a"); err != nil {
 		t.Fatalf("OnTenantActivated: %v", err)
 	}
 
-	// Verify defaults were seeded.
-	row := resolver.QueryRowContext(context.Background(),
-		`SELECT value FROM systemplane_entries WHERE namespace=$1 AND key=$2`,
-		"ns", "retries")
-
-	var raw []byte
-	if err := row.Scan(&raw); err != nil {
-		t.Fatalf("scan seeded row: %v", err)
-	}
-
-	var v float64
-	if err := json.Unmarshal(raw, &v); err != nil {
-		t.Fatalf("decode seeded value: %v", err)
-	}
-
-	if v != 3.0 {
-		t.Fatalf("seeded retries = %v, want 3", v)
-	}
-
-	// Verify cache was warm-loaded.
+	// Verify cache was warm-loaded from the externally seeded row.
 	got, hit, err := m.Lookup(context.Background(), "tenant-a", "ns", "retries")
 	if err != nil || !hit {
 		t.Fatalf("Lookup retries: err=%v hit=%v", err, hit)
@@ -236,6 +242,56 @@ func TestIntegration_Manager_OnTenantActivated_BootstrapsSchemaAndSeeds(t *testi
 
 	if got.(float64) != 3.0 {
 		t.Fatalf("Lookup retries = %v, want 3", got)
+	}
+}
+
+// TestIntegration_Manager_OnTenantActivated_MissingTableTolerated verifies the
+// graceful path: when the systemplane table has NOT been provisioned yet,
+// activation does not fail — warm-load logs and proceeds with an empty cache,
+// and the LISTEN goroutine still opens. (Reads fall through / miss until the
+// migration creates the table.)
+func TestIntegration_Manager_OnTenantActivated_MissingTableTolerated(t *testing.T) {
+	baseDSN, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	admin := adminDSN(t, baseDSN)
+	defer admin.Close()
+
+	dbName := fmt.Sprintf("mgr_missing_%d", time.Now().UnixNano())
+	freshDB(t, admin, dbName)
+
+	tdsn := dsnFor(baseDSN, dbName)
+
+	tenantSQL, err := sql.Open("pgx", tdsn)
+	if err != nil {
+		t.Fatalf("open tenant: %v", err)
+	}
+	defer tenantSQL.Close()
+
+	// Intentionally DO NOT provision the schema.
+	resolver := dbresolver.New(dbresolver.WithPrimaryDBs(tenantSQL))
+
+	fc := newFakeConnector()
+	fc.setTenant("tenant-miss", tdsn, resolver)
+
+	m := manager.New(nil)
+	m.SetConnector(fc)
+	m.Bind(&stubHooks{keys: []manager.RegisteredKey{{Namespace: "ns", Key: "k", DefaultValue: "default"}}})
+	t.Cleanup(func() { _ = m.Drain(context.Background()) })
+
+	// Activation must succeed despite the missing table.
+	if err := m.OnTenantActivated(context.Background(), "tenant-miss"); err != nil {
+		t.Fatalf("OnTenantActivated with missing table should be tolerated, got: %v", err)
+	}
+
+	// Cache is empty — Lookup misses (no panic, no error).
+	_, hit, err := m.Lookup(context.Background(), "tenant-miss", "ns", "k")
+	if err != nil {
+		t.Fatalf("Lookup after tolerated missing table: %v", err)
+	}
+
+	if hit {
+		t.Fatal("expected cache miss with empty warm-load cache")
 	}
 }
 
@@ -319,6 +375,9 @@ func TestIntegration_Manager_MultiTenantIsolation(t *testing.T) {
 	}
 	defer tenantB.Close()
 
+	provisionSchema(t, tenantA)
+	provisionSchema(t, tenantB)
+
 	rA := dbresolver.New(dbresolver.WithPrimaryDBs(tenantA))
 	rB := dbresolver.New(dbresolver.WithPrimaryDBs(tenantB))
 
@@ -339,15 +398,20 @@ func TestIntegration_Manager_MultiTenantIsolation(t *testing.T) {
 		t.Fatalf("activate B: %v", err)
 	}
 
-	// Write distinct values to each tenant.
+	// Write distinct values to each tenant (upsert — the table starts empty
+	// now that the Manager no longer seeds defaults).
 	if _, err := rA.ExecContext(context.Background(),
-		`UPDATE systemplane_entries SET value=$1 WHERE namespace=$2 AND key=$3`,
+		`INSERT INTO systemplane_entries (namespace, key, value, updated_at, updated_by)
+		VALUES ($2, $3, $1, now(), 'test')
+		ON CONFLICT (namespace, key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
 		[]byte(`"value-A"`), "ns", "k"); err != nil {
 		t.Fatalf("write A: %v", err)
 	}
 
 	if _, err := rB.ExecContext(context.Background(),
-		`UPDATE systemplane_entries SET value=$1 WHERE namespace=$2 AND key=$3`,
+		`INSERT INTO systemplane_entries (namespace, key, value, updated_at, updated_by)
+		VALUES ($2, $3, $1, now(), 'test')
+		ON CONFLICT (namespace, key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
 		[]byte(`"value-B"`), "ns", "k"); err != nil {
 		t.Fatalf("write B: %v", err)
 	}
@@ -405,7 +469,9 @@ func TestIntegration_Manager_ReconnectAfterTerminateBackend(t *testing.T) {
 	time.Sleep(1 * time.Second)
 
 	if _, err := resolver.ExecContext(context.Background(),
-		`UPDATE systemplane_entries SET value=$1 WHERE namespace=$2 AND key=$3`,
+		`INSERT INTO systemplane_entries (namespace, key, value, updated_at, updated_by)
+		VALUES ($2, $3, $1, now(), 'test')
+		ON CONFLICT (namespace, key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
 		[]byte(`"after-reconnect"`), "ns", "k"); err != nil {
 		t.Fatalf("write after terminate: %v", err)
 	}
@@ -428,8 +494,16 @@ func TestIntegration_Manager_DeleteThenReactivate(t *testing.T) {
 
 	keys := []manager.RegisteredKey{{Namespace: "ns", Key: "k", DefaultValue: "default"}}
 
-	m, _, _, mClean := setup(t, baseDSN, "tenant-c", keys)
+	m, _, resolver, mClean := setup(t, baseDSN, "tenant-c", keys)
 	defer mClean()
+
+	// Seed the value externally (migration pipeline's job now).
+	if _, err := resolver.ExecContext(context.Background(),
+		`INSERT INTO systemplane_entries (namespace, key, value, updated_at, updated_by)
+		VALUES ($1, $2, $3, now(), 'migration')`,
+		"ns", "k", []byte(`"default"`)); err != nil {
+		t.Fatalf("external seed: %v", err)
+	}
 
 	if err := m.OnTenantActivated(context.Background(), "tenant-c"); err != nil {
 		t.Fatalf("activate 1: %v", err)
@@ -485,7 +559,9 @@ func TestIntegration_Manager_CredentialsRotated(t *testing.T) {
 	defer unsub()
 
 	if _, err := resolver.ExecContext(context.Background(),
-		`UPDATE systemplane_entries SET value=$1 WHERE namespace=$2 AND key=$3`,
+		`INSERT INTO systemplane_entries (namespace, key, value, updated_at, updated_by)
+		VALUES ($2, $3, $1, now(), 'test')
+		ON CONFLICT (namespace, key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
 		[]byte(`"post-rotation"`), "ns", "k"); err != nil {
 		t.Fatalf("write after rotation: %v", err)
 	}
@@ -500,9 +576,11 @@ func TestIntegration_Manager_CredentialsRotated(t *testing.T) {
 	}
 }
 
-// TestIntegration_Manager_SeedDoesNotOverwriteExisting verifies that
-// re-activation does not overwrite operator-set values.
-func TestIntegration_Manager_SeedDoesNotOverwriteExisting(t *testing.T) {
+// TestIntegration_Manager_ReactivateDoesNotClobberOperatorValue verifies that
+// re-activation never overwrites operator-set values. Because the Manager no
+// longer seeds defaults at runtime, re-activation is a pure warm-load that must
+// reflect the current DB value as-is.
+func TestIntegration_Manager_ReactivateDoesNotClobberOperatorValue(t *testing.T) {
 	baseDSN, cleanup := startContainer(t)
 	t.Cleanup(cleanup)
 
@@ -511,18 +589,19 @@ func TestIntegration_Manager_SeedDoesNotOverwriteExisting(t *testing.T) {
 	m, _, resolver, mClean := setup(t, baseDSN, "tenant-noov", keys)
 	defer mClean()
 
+	// Operator-set value, written externally as an upsert.
+	if _, err := resolver.ExecContext(context.Background(),
+		`INSERT INTO systemplane_entries (namespace, key, value, updated_at, updated_by)
+		VALUES ($1, $2, $3, now(), 'operator')`,
+		"ns", "k", []byte(`"operator-set"`)); err != nil {
+		t.Fatalf("operator write: %v", err)
+	}
+
 	if err := m.OnTenantActivated(context.Background(), "tenant-noov"); err != nil {
 		t.Fatalf("activate 1: %v", err)
 	}
 
-	// Operator-set value.
-	if _, err := resolver.ExecContext(context.Background(),
-		`UPDATE systemplane_entries SET value=$1 WHERE namespace=$2 AND key=$3`,
-		[]byte(`"operator-set"`), "ns", "k"); err != nil {
-		t.Fatalf("operator write: %v", err)
-	}
-
-	// Drop the per-tenant state so re-activation runs a fresh seed.
+	// Drop the per-tenant state so re-activation runs a fresh warm-load.
 	if err := m.OnTenantDeleted(context.Background(), "tenant-noov"); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
@@ -537,7 +616,7 @@ func TestIntegration_Manager_SeedDoesNotOverwriteExisting(t *testing.T) {
 	}
 
 	if got != "operator-set" {
-		t.Fatalf("seed overwrote operator value: got %v, want operator-set", got)
+		t.Fatalf("re-activation clobbered operator value: got %v, want operator-set", got)
 	}
 }
 

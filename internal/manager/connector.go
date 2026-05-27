@@ -18,7 +18,8 @@ import (
 // substitute a fake implementation.
 type Connector interface {
 	// ResolveDB returns the tenant's primary database handle. Used for
-	// schema bootstrap, defaults seed, warm-load and NOTIFY refresh reads.
+	// warm-load and NOTIFY refresh reads. The schema is provisioned
+	// externally; the Manager never issues DDL through this handle.
 	ResolveDB(ctx context.Context, tenantID string) (dbresolver.DB, error)
 
 	// ResolveDSN returns the connection string used by pgx.Connect to open
