@@ -3,6 +3,7 @@ package postgres
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/LerianStudio/lib-systemplane/internal/store"
 )
@@ -31,7 +32,7 @@ func normalizeConfig(cfg *Config) error {
 		cfg.Module = defaultModule
 	}
 
-	if !safeIdentifierRe.MatchString(cfg.Channel) {
+	if !safeChannelRe.MatchString(cfg.Channel) {
 		return fmt.Errorf("systemplane/postgres: unsafe channel name %q", cfg.Channel)
 	}
 
@@ -57,5 +58,8 @@ func normalizeConfig(cfg *Config) error {
 }
 
 func quoteIdentifier(name string) string {
-	return `"` + name + `"`
+	// Canonical Postgres identifier quoting: double any embedded double quote so
+	// the name can never break out of the quoted context (injection-safe for any
+	// input, independent of the safe*Re validators).
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }

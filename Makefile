@@ -75,7 +75,7 @@ endif
 
 # Pinned tool versions for reproducibility (update as needed)
 GOTESTSUM_VERSION ?= v1.13.0
-GOSEC_VERSION ?= v2.26.1
+GOSEC_VERSION ?= v2.27.1
 GOLANGCI_LINT_VERSION ?= v2.12.2
 
 TEST_REPORTS_DIR ?= ./reports
