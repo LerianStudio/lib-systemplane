@@ -90,7 +90,15 @@ type Config struct {
 	ListenDSN string
 
 	// Channel is the Postgres LISTEN/NOTIFY channel name.
-	// Default: "systemplane_changes".
+	// Default: "systemplane_changes". Hyphens are allowed (validated by
+	// safeChannelRe) — the channel is double-quoted at LISTEN time.
+	//
+	// COUPLING: this is only the LISTEN side. The matching NOTIFY side lives in
+	// the trigger DDL the consumer provisions (SchemaSQL() binds the reference
+	// trigger to the default "systemplane_changes" via TG_ARGV[0]). A consumer
+	// that sets a NON-default Channel here MUST bind the SAME name in its trigger
+	// DDL, otherwise the store LISTENs on one channel while the trigger NOTIFYs
+	// on another and no events are delivered.
 	Channel string
 
 	// ChannelExplicit suppresses the default-channel collision warning when
