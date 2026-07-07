@@ -43,11 +43,20 @@ import (
 // Compile-time interface satisfaction check.
 var _ store.Store = (*Store)(nil)
 
-// safeIdentifierRe validates that a SQL identifier contains only safe characters.
-// SQL statements cannot use parameterized queries for identifiers (table name,
-// LISTEN channel), so any name interpolated into a statement must pass this
-// check first.
+// safeIdentifierRe validates a BARE SQL identifier — one interpolated UNQUOTED
+// into a statement (the table name, e.g. "... FROM <table>"). SQL statements
+// cannot parameterize identifiers, so a bare-interpolated name must pass this
+// strict check first; hyphens/dots are illegal because they would break the
+// unquoted SQL.
 var safeIdentifierRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+
+// safeChannelRe validates the LISTEN/NOTIFY channel name. Unlike the table, the
+// channel is always DOUBLE-QUOTED at use (LISTEN "<channel>" via quoteIdentifier),
+// so it may safely contain hyphens — the common case for an ApplicationName-prefixed
+// channel such as "my-service_systemplane_changes". It still rejects quotes,
+// whitespace and other breakout characters; quoteIdentifier additionally escapes any
+// embedded double quote, so the quoted channel is injection-safe regardless.
+var safeChannelRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_-]*$`)
 
 const (
 	tracerName     = "systemplane.postgres"
