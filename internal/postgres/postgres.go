@@ -43,11 +43,22 @@ import (
 // Compile-time interface satisfaction check.
 var _ store.Store = (*Store)(nil)
 
-// safeIdentifierRe validates that a SQL identifier contains only safe characters.
-// SQL statements cannot use parameterized queries for identifiers (table name,
-// LISTEN channel), so any name interpolated into a statement must pass this
-// check first.
+// safeIdentifierRe validates a BARE SQL identifier — one interpolated UNQUOTED
+// into a statement (the table name, e.g. "... FROM <table>"). SQL statements
+// cannot parameterize identifiers, so a bare-interpolated name must pass this
+// strict check first; hyphens/dots are illegal because they would break the
+// unquoted SQL.
 var safeIdentifierRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+
+// safeChannelRe validates the LISTEN/NOTIFY channel name. Unlike the table, the
+// channel is always DOUBLE-QUOTED at use (LISTEN "<channel>" via quoteIdentifier),
+// so it may safely contain hyphens — the common case for an ApplicationName-prefixed
+// channel such as "my-service_systemplane_changes". It still rejects quotes,
+// whitespace and other breakout characters; quoteIdentifier additionally escapes any
+// embedded double quote, so the quoted channel is injection-safe regardless.
+// Length is enforced separately in normalizeConfig: Postgres truncates identifiers
+// to 63 bytes (NAMEDATALEN-1), so over-length channels are rejected outright.
+var safeChannelRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_-]*$`)
 
 const (
 	tracerName     = "systemplane.postgres"
@@ -81,7 +92,15 @@ type Config struct {
 	ListenDSN string
 
 	// Channel is the Postgres LISTEN/NOTIFY channel name.
-	// Default: "systemplane_changes".
+	// Default: "systemplane_changes". Hyphens are allowed (validated by
+	// safeChannelRe) — the channel is double-quoted at LISTEN time.
+	//
+	// COUPLING: this is only the LISTEN side. The matching NOTIFY side lives in
+	// the trigger DDL the consumer provisions (SchemaSQL() binds the reference
+	// trigger to the default "systemplane_changes" via TG_ARGV[0]). A consumer
+	// that sets a NON-default Channel here MUST bind the SAME name in its trigger
+	// DDL, otherwise the store LISTENs on one channel while the trigger NOTIFYs
+	// on another and no events are delivered.
 	Channel string
 
 	// ChannelExplicit suppresses the default-channel collision warning when

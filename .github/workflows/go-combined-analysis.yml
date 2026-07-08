@@ -16,9 +16,10 @@ permissions:
 jobs:
   go-analysis:
     name: Go Analysis
-    uses: LerianStudio/github-actions-shared-workflows/.github/workflows/go-pr-analysis.yml@v1.30.0
+    uses: LerianStudio/github-actions-shared-workflows/.github/workflows/go-pr-analysis.yml@v1.44.0
     permissions:
       id-token: write
+      actions: read # required by go-pr-analysis.yml >= v1.44.0; missing grant = startup_failure
       contents: read
       pull-requests: write
       security-events: write
@@ -43,7 +44,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-go@v6
         with:
