@@ -36,6 +36,11 @@ func TestNew_ConfigValidationAndDefaults(t *testing.T) {
 			wantErr: errors.New("unsafe channel"),
 		},
 		{
+			name:    "rejects channel exceeding 63 bytes",
+			cfg:     Config{DB: &sql.DB{}, ListenDSN: "postgres://example", Channel: strings.Repeat("a", 64)},
+			wantErr: errors.New("63 bytes"),
+		},
+		{
 			name:    "rejects unsafe table",
 			cfg:     Config{DB: &sql.DB{}, ListenDSN: "postgres://example", Table: "bad.table"},
 			wantErr: errors.New("unsafe table"),

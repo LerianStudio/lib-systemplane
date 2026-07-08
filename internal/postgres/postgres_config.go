@@ -36,6 +36,10 @@ func normalizeConfig(cfg *Config) error {
 		return fmt.Errorf("systemplane/postgres: unsafe channel name %q", cfg.Channel)
 	}
 
+	if len(cfg.Channel) > 63 {
+		return fmt.Errorf("systemplane/postgres: channel name %q is %d bytes; PostgreSQL truncates identifiers to 63 bytes (NAMEDATALEN-1), which would silently desync LISTEN from the trigger's NOTIFY", cfg.Channel, len(cfg.Channel))
+	}
+
 	if !safeIdentifierRe.MatchString(cfg.Table) {
 		return fmt.Errorf("systemplane/postgres: unsafe table name %q", cfg.Table)
 	}

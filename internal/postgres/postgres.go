@@ -56,6 +56,8 @@ var safeIdentifierRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 // channel such as "my-service_systemplane_changes". It still rejects quotes,
 // whitespace and other breakout characters; quoteIdentifier additionally escapes any
 // embedded double quote, so the quoted channel is injection-safe regardless.
+// Length is enforced separately in normalizeConfig: Postgres truncates identifiers
+// to 63 bytes (NAMEDATALEN-1), so over-length channels are rejected outright.
 var safeChannelRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_-]*$`)
 
 const (
