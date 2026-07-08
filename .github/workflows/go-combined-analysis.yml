@@ -19,6 +19,7 @@ jobs:
     uses: LerianStudio/github-actions-shared-workflows/.github/workflows/go-pr-analysis.yml@v1.44.0
     permissions:
       id-token: write
+      actions: read # required by go-pr-analysis.yml >= v1.44.0; missing grant = startup_failure
       contents: read
       pull-requests: write
       security-events: write
