@@ -1,5 +1,27 @@
 # Lib-systemplane Changelog
 
+## [1.6.1](https://github.com/LerianStudio/lib-systemplane/releases/tag/v1.6.1)
+
+Features:
+
+- Allow hyphens in `LISTEN`/`NOTIFY` channel names, enhancing flexibility in naming conventions. (@fredcamaral)
+
+Fixes:
+
+- Reject `LISTEN` channel names that exceed the PostgreSQL 63-byte limit to prevent errors. (@fredcamaral)
+- Grant `actions:read` permission to the `go-pr-analysis` caller job in the CI pipeline to ensure proper access rights. (@fredcamaral)
+
+Improvements:
+
+- Suppress `GO-2026-5932` security warning related to unused indirect `openpgp` to maintain a clean security profile. (@fredcamaral)
+- Document the coupling between `LISTEN` channel and `NOTIFY` trigger-DDL in PostgreSQL to provide clearer guidance on their interactions. (@fredcamaral)
+- Bump CI actions and tool pins to their latest versions for improved performance and security. (@fredcamaral)
+- Update Go module dependencies to their latest versions to ensure compatibility and leverage new features. (@fredcamaral)
+
+[Compare changes](https://github.com/LerianStudio/lib-systemplane/compare/v1.6.0...v1.6.1)
+
+---
+
 ## [1.6.0](https://github.com/LerianStudio/lib-systemplane/releases/tag/v1.6.0)
 
 - Features:
