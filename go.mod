@@ -3,15 +3,15 @@ module github.com/LerianStudio/lib-systemplane
 go 1.26.3
 
 require (
-	github.com/LerianStudio/lib-commons/v5 v5.8.0
+	github.com/LerianStudio/lib-commons/v5 v5.9.0
 	github.com/LerianStudio/lib-observability v1.1.0
 	github.com/bxcodec/dbresolver/v2 v2.2.1
 	github.com/gofiber/fiber/v2 v2.52.14
 	github.com/jackc/pgx/v5 v5.10.0
-	github.com/testcontainers/testcontainers-go v0.42.0
-	github.com/testcontainers/testcontainers-go/modules/mongodb v0.42.0
-	github.com/testcontainers/testcontainers-go/modules/postgres v0.42.0
-	go.mongodb.org/mongo-driver/v2 v2.7.0
+	github.com/testcontainers/testcontainers-go v0.43.0
+	github.com/testcontainers/testcontainers-go/modules/mongodb v0.43.0
+	github.com/testcontainers/testcontainers-go/modules/postgres v0.43.0
+	go.mongodb.org/mongo-driver/v2 v2.8.0
 	go.opentelemetry.io/otel v1.44.0
 	go.opentelemetry.io/otel/metric v1.44.0
 	go.opentelemetry.io/otel/sdk/metric v1.44.0
@@ -77,7 +77,7 @@ require (
 	github.com/rabbitmq/amqp091-go v1.12.0 // indirect
 	github.com/redis/go-redis/v9 v9.21.0 // indirect
 	github.com/shirou/gopsutil v3.21.11+incompatible // indirect
-	github.com/shirou/gopsutil/v4 v4.26.4 // indirect
+	github.com/shirou/gopsutil/v4 v4.26.5 // indirect
 	github.com/shopspring/decimal v1.4.0 // indirect
 	github.com/sirupsen/logrus v1.9.4 // indirect
 	github.com/sony/gobreaker v1.0.0 // indirect
