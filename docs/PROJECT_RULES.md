@@ -62,7 +62,7 @@ lib-systemplane/
 
 - **Minimum**: Go 1.26.3
 - Keep `go.mod` updated with latest stable Go version
-- Module path: `github.com/LerianStudio/lib-systemplane`
+- Module path: `github.com/LerianStudio/lib-systemplane/v2`
 
 ### Build Tags
 
@@ -93,7 +93,7 @@ import (
     "go.uber.org/zap"
 
     // Internal packages
-    "github.com/LerianStudio/lib-observability/log"
+    "github.com/LerianStudio/lib-observability/v2/log"
 )
 ```
 
@@ -322,16 +322,16 @@ func (c *Client) Connect(ctx context.Context) error {
 
 Lerian shared-library ownership is split intentionally:
 
-- `github.com/LerianStudio/lib-commons/v5` — non-observability shared primitives. This repo uses `commons/tenant-manager/core`, `commons/net/http`, and `commons/backoff`.
-- `github.com/LerianStudio/lib-observability` — canonical observability stack. This repo uses `log`, `tracing`, and `runtime` for structured logging, telemetry, span helpers, redaction, and panic recovery.
-- `github.com/LerianStudio/lib-systemplane` — runtime-mutable configuration. Do not duplicate its functionality in service repositories.
+- `github.com/LerianStudio/lib-commons/v6` — non-observability shared primitives. This repo uses `commons/tenant-manager/core`, `commons/net/http`, and `commons/backoff`.
+- `github.com/LerianStudio/lib-observability/v2` — canonical observability stack. This repo uses `log`, `tracing`, and `runtime` for structured logging, telemetry, span helpers, redaction, and panic recovery.
+- `github.com/LerianStudio/lib-systemplane/v2` — runtime-mutable configuration. Do not duplicate its functionality in service repositories.
 - `github.com/LerianStudio/lib-streaming` — tenant-scoped event streaming. Do not add it to this repo unless a task explicitly requires streaming integration.
 
 Do not reintroduce observability packages from `lib-commons`; they are being removed from that module. New observability code must use `lib-observability`.
 
 ### Key Third-Party Dependencies
 
-- `github.com/gofiber/fiber/v2` — HTTP framework for the admin routes
+- `github.com/gofiber/fiber/v3` — HTTP framework for the admin routes
 - `github.com/jackc/pgx/v5` — PostgreSQL driver with LISTEN/NOTIFY support
 - `go.mongodb.org/mongo-driver/v2` — MongoDB driver with change streams
 - `github.com/hashicorp/golang-lru/v2` — Bounded LRU for lazy tenant cache

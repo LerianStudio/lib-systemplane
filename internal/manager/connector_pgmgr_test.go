@@ -29,7 +29,7 @@ import (
 	"strings"
 	"testing"
 
-	tmpostgres "github.com/LerianStudio/lib-commons/v5/commons/tenant-manager/postgres"
+	tmpostgres "github.com/LerianStudio/lib-commons/v6/commons/tenant-manager/postgres"
 )
 
 func TestPgMgrConnector_ResolveDB_GetConnectionFails(t *testing.T) {

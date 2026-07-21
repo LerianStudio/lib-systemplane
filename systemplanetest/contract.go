@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/LerianStudio/lib-systemplane/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v2/internal/store"
 )
 
 // Factory constructs a fresh Store for one test. Backends embed test-fixture

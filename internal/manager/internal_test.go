@@ -6,7 +6,7 @@ import (
 	"context"
 	"testing"
 
-	tmcore "github.com/LerianStudio/lib-commons/v5/commons/tenant-manager/core"
+	tmcore "github.com/LerianStudio/lib-commons/v6/commons/tenant-manager/core"
 )
 
 func TestTenantIDFromContext_DelegatesToTmcore(t *testing.T) {

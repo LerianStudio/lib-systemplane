@@ -7,7 +7,7 @@ package systemplane
 import (
 	"context"
 
-	tmevent "github.com/LerianStudio/lib-commons/v5/commons/tenant-manager/event"
+	tmevent "github.com/LerianStudio/lib-commons/v6/commons/tenant-manager/event"
 )
 
 // OnTenantActivated bootstraps systemplane state for tenantID:
@@ -87,7 +87,7 @@ func (m *Manager) IsClosed() bool {
 // must never wedge the consumer's lifecycle dispatch pipeline.
 //
 // The signature is intentionally identical to
-// github.com/LerianStudio/lib-commons/v5/commons/tenant-manager/event.EventHandler
+// github.com/LerianStudio/lib-commons/v6/commons/tenant-manager/event.EventHandler
 // so a bound Manager can be registered directly as an event handler.
 //
 // Nil-receiver safe: calling on a nil Manager is a no-op returning nil.

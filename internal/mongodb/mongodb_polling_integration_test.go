@@ -21,7 +21,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/LerianStudio/lib-systemplane/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v2/internal/store"
 	"github.com/testcontainers/testcontainers-go"
 	mongocontainer "github.com/testcontainers/testcontainers-go/modules/mongodb"
 	"go.mongodb.org/mongo-driver/v2/bson"

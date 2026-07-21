@@ -4,10 +4,10 @@ This file provides repository-specific guidance for coding agents working on `li
 
 ## Project snapshot
 
-- Module: `github.com/LerianStudio/lib-systemplane`
+- Module: `github.com/LerianStudio/lib-systemplane/v2`
 - Language: Go
 - Go version: `1.26.3` (see `go.mod`)
-- Current API generation: v1.x observability migration (extracted from `lib-commons/v5`; public observability types now come from `lib-observability`)
+- Current API generation: v2.x Fiber v3 stack (extracted from `lib-commons/v5`; built on `lib-commons/v6`, `lib-observability/v2`, and `gofiber/fiber/v3`)
 
 ## Primary objective for changes
 
@@ -21,7 +21,7 @@ This file provides repository-specific guidance for coding agents working on `li
 Root (package `systemplane`):
 - Small public API facade: `api_*.go` plus `doc.go`. Public types are aliases to
   `internal/client` where practical so the root import path remains
-  `github.com/LerianStudio/lib-systemplane`.
+  `github.com/LerianStudio/lib-systemplane/v2`.
 
 Subpackages:
 - `admin/` — Fiber HTTP handlers for the admin surface
@@ -44,9 +44,9 @@ Scaffolding:
 
 Lerian shared-library boundaries are now split across four libraries:
 
-- `github.com/LerianStudio/lib-commons/v5` — non-observability shared primitives used here: `commons/tenant-manager/core`, `commons/net/http`, and `commons/backoff`.
-- `github.com/LerianStudio/lib-observability` — canonical observability stack: `log`, `tracing`, redaction helpers, span helpers, telemetry lifecycle, and `runtime` panic recovery.
-- `github.com/LerianStudio/lib-systemplane` — this module; runtime-mutable configuration with Postgres/MongoDB backends.
+- `github.com/LerianStudio/lib-commons/v6` — non-observability shared primitives used here: `commons/tenant-manager/core`, `commons/net/http`, and `commons/backoff`.
+- `github.com/LerianStudio/lib-observability/v2` — canonical observability stack: `log`, `tracing`, redaction helpers, span helpers, telemetry lifecycle, and `runtime` panic recovery.
+- `github.com/LerianStudio/lib-systemplane/v2` — this module; runtime-mutable configuration with Postgres/MongoDB backends.
 - `github.com/LerianStudio/lib-streaming` — tenant-scoped event streaming; do not introduce it here unless a task explicitly asks for streaming integration.
 
 These are external module imports. Do not rewrite them to in-repo paths. Do not reintroduce observability imports from `lib-commons`; observability has moved to `lib-observability`.
@@ -58,7 +58,7 @@ These are external module imports. Do not rewrite them to in-repo paths. Do not 
 The Client runs in one of two modes selected at construction:
 
 - **Single-tenant** (default). The constructor receives a non-nil `*sql.DB` / `*mongo.Client`. Reads serve from an in-process cache; writes upsert through the store and update the cache. The backend's changefeed (LISTEN/NOTIFY on Postgres, change stream on MongoDB) drives invalidation and fires `OnChange` subscribers.
-- **Multi-tenant** (opt-in via `WithMultiTenantEnabled()`). DB/client may be nil. Every read/write resolves the tenant database from `ctx` via `tmcore.GetPGContext(ctx, module)` / `tmcore.GetMBContext(ctx, module)` (`lib-commons/v5/commons/tenant-manager/core`). For Postgres the lib performs NO runtime schema provisioning — `systemplane_entries` plus its NOTIFY trigger function/triggers must be created externally via `SchemaSQL()` / `DefaultSeedSQL()` (e.g. the consumer's migration pipeline); the runtime role only needs DML + `LISTEN`. (MongoDB still bootstraps its collection/indexes lazily once per resolved tenant database via a `sync.Map`-backed `sync.Once` cache.) No in-process cache. No LISTEN/NOTIFY. `OnChange` returns `ErrNotSupportedInMultiTenant`. Callers wire `tenant-manager/middleware.TenantMiddleware` (with `WithPG(...)` or `WithMB(...)` and a matching module name) before the lib's handlers.
+- **Multi-tenant** (opt-in via `WithMultiTenantEnabled()`). DB/client may be nil. Every read/write resolves the tenant database from `ctx` via `tmcore.GetPGContext(ctx, module)` / `tmcore.GetMBContext(ctx, module)` (`lib-commons/v6/commons/tenant-manager/core`). For Postgres the lib performs NO runtime schema provisioning — `systemplane_entries` plus its NOTIFY trigger function/triggers must be created externally via `SchemaSQL()` / `DefaultSeedSQL()` (e.g. the consumer's migration pipeline); the runtime role only needs DML. (MongoDB still bootstraps its collection/indexes lazily once per resolved tenant database via a `sync.Map`-backed `sync.Once` cache.) No in-process cache. No LISTEN/NOTIFY. `OnChange` returns `ErrNotSupportedInMultiTenant`. Callers wire `tenant-manager/middleware.TenantMiddleware` (with `WithPG(...)` or `WithMB(...)` and a matching module name) before the lib's handlers.
 
 ### Storage shape
 
@@ -81,7 +81,7 @@ The Client runs in one of two modes selected at construction:
 - Subscriptions: `OnChange(ns, key, fn) (unsubscribe func(), error)`. Returns `ErrNotSupportedInMultiTenant` in multi-tenant mode. Callbacks invoked serially with panic recovery via `lib-observability/runtime.RecoverAndLog`.
 - Registered keys carry: default value, description, validator func, redaction policy (`RedactNone | RedactMask | RedactFull`). Options: `WithDescription`, `WithValidator`, `WithRedaction`.
 - Client options: `WithLogger`, `WithTelemetry`, `WithDebounce` (default 100ms), `WithListenChannel` (Postgres default `"systemplane_changes"`), `WithTable` (Postgres default `"systemplane_entries"`), `WithCollection` (MongoDB default `"systemplane_entries"`), `WithPollInterval` (MongoDB — switches to polling), `WithMultiTenantEnabled()`, `WithModule(name)` (default `"systemplane"`).
-- Admin HTTP surface (`admin` subpackage): `Mount(router, client, opts...)` registers four routes at a configurable prefix (default `/system`): `GET :prefix/:namespace`, `GET :prefix/:namespace/:key`, `PUT :prefix/:namespace/:key`, `DELETE :prefix/:namespace/:key`. Options: `WithPathPrefix`, `WithAuthorizer(fn func(*fiber.Ctx, action string) error)` — default-deny — and `WithActorExtractor`. The `action` argument is `"read"` (GET) or `"write"` (PUT/DELETE). In multi-tenant mode the caller MUST mount tenant-manager middleware before `admin.Mount` so handler `c.UserContext()` carries the resolved tenant database.
+- Admin HTTP surface (`admin` subpackage): `Mount(router, client, opts...)` registers four routes at a configurable prefix (default `/system`): `GET :prefix/:namespace`, `GET :prefix/:namespace/:key`, `PUT :prefix/:namespace/:key`, `DELETE :prefix/:namespace/:key`. Options: `WithPathPrefix`, `WithAuthorizer(fn func(fiber.Ctx, action string) error)` — default-deny — and `WithActorExtractor`. The `action` argument is `"read"` (GET) or `"write"` (PUT/DELETE). In multi-tenant mode the caller MUST mount tenant-manager middleware before `admin.Mount` so handler `c.Context()` carries the resolved tenant database.
 - Internal `Store` interface (`internal/store`): `Start`, `Close`, `Get`, `Set`, `Delete`, `List`, `Subscribe`. Implemented by `internal/postgres` and `internal/mongodb`. Backend-agnostic contract suite lives in `systemplanetest.Run(t, factory, RunOptions{SkipSubscribe: ...})` — multi-tenant modes pass `SkipSubscribe: true`.
 - Sentinel errors: `ErrClosed`, `ErrNotStarted`, `ErrRegisterAfterStart`, `ErrUnknownKey`, `ErrValidation`, `ErrDuplicateKey`, `ErrNilContext`, `ErrNotSupportedInMultiTenant`, `ErrTenantConnectionMissing`.
 - `NewForTesting(s TestStore, opts ...Option) (*Client, error)` is an explicit out-of-package test helper. Build-tag gated (`unit`/`integration`); not a promised production API.

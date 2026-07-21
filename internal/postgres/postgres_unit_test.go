@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/LerianStudio/lib-systemplane/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v2/internal/store"
 )
 
 func TestNew_ConfigValidationAndDefaults(t *testing.T) {

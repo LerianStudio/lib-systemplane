@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/LerianStudio/lib-systemplane/internal/manager"
+	"github.com/LerianStudio/lib-systemplane/v2/internal/manager"
 )
 
 func TestIntegration_Manager_OnTenantDeleted_ReleasesGoroutine(t *testing.T) {

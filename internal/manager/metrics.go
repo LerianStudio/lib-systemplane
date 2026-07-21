@@ -16,8 +16,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/LerianStudio/lib-observability/log"
-	"github.com/LerianStudio/lib-observability/tracing"
+	"github.com/LerianStudio/lib-observability/v2/log"
+	"github.com/LerianStudio/lib-observability/v2/tracing"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 )

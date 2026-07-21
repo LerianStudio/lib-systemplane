@@ -4,9 +4,9 @@ import (
 	"database/sql"
 	"time"
 
-	"github.com/LerianStudio/lib-observability/log"
-	"github.com/LerianStudio/lib-observability/tracing"
-	internalclient "github.com/LerianStudio/lib-systemplane/internal/client"
+	"github.com/LerianStudio/lib-observability/v2/log"
+	"github.com/LerianStudio/lib-observability/v2/tracing"
+	internalclient "github.com/LerianStudio/lib-systemplane/v2/internal/client"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 

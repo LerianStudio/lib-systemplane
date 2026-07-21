@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/LerianStudio/lib-systemplane/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v2/internal/store"
 )
 
 // Set writes a new value for (namespace, key). The value is validated against

@@ -4,8 +4,8 @@ package client
 import (
 	"time"
 
-	"github.com/LerianStudio/lib-observability/log"
-	"github.com/LerianStudio/lib-observability/tracing"
+	"github.com/LerianStudio/lib-observability/v2/log"
+	"github.com/LerianStudio/lib-observability/v2/tracing"
 )
 
 // clientConfig holds the merged configuration applied by Option functions.
