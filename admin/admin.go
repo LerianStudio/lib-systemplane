@@ -25,7 +25,7 @@
 //
 // In multi-tenant mode the caller is expected to run authentication before
 // lib-commons tenant-manager middleware, then call Mount so handlers'
-// c.UserContext() carries the resolved tenant database for the lib's
+// c.Context() carries the resolved tenant database for the lib's
 // configured module.
 package admin
 
@@ -37,10 +37,10 @@ import (
 	"net/url"
 	"strings"
 
-	commonshttp "github.com/LerianStudio/lib-commons/v5/commons/net/http"
-	"github.com/LerianStudio/lib-observability/log"
-	systemplane "github.com/LerianStudio/lib-systemplane"
-	"github.com/gofiber/fiber/v2"
+	commonshttp "github.com/LerianStudio/lib-commons/v6/commons/net/http"
+	"github.com/LerianStudio/lib-observability/v2/log"
+	systemplane "github.com/LerianStudio/lib-systemplane/v2"
+	"github.com/gofiber/fiber/v3"
 )
 
 const (
@@ -53,17 +53,17 @@ const (
 // mountConfig holds options applied by MountOption functions.
 type mountConfig struct {
 	pathPrefix     string
-	authorizer     func(*fiber.Ctx, string) error
-	actorExtractor func(*fiber.Ctx) string
+	authorizer     func(fiber.Ctx, string) error
+	actorExtractor func(fiber.Ctx) string
 }
 
 func defaultMountConfig() mountConfig {
 	return mountConfig{
 		pathPrefix: "/system",
-		authorizer: func(_ *fiber.Ctx, _ string) error {
+		authorizer: func(_ fiber.Ctx, _ string) error {
 			return errors.New("admin: no authorizer configured — use admin.WithAuthorizer to set one")
 		},
-		actorExtractor: func(_ *fiber.Ctx) string { return "" },
+		actorExtractor: func(_ fiber.Ctx) string { return "" },
 	}
 }
 
@@ -82,7 +82,7 @@ func WithPathPrefix(p string) MountOption {
 // WithAuthorizer sets an authorization check called before each handler. The
 // action argument is "read" for GET requests and "write" for PUT/DELETE
 // requests. Return a non-nil error to reject the request with 403 Forbidden.
-func WithAuthorizer(fn func(*fiber.Ctx, string) error) MountOption {
+func WithAuthorizer(fn func(fiber.Ctx, string) error) MountOption {
 	return func(cfg *mountConfig) {
 		if fn != nil {
 			cfg.authorizer = fn
@@ -93,7 +93,7 @@ func WithAuthorizer(fn func(*fiber.Ctx, string) error) MountOption {
 // WithActorExtractor sets a function that extracts the actor identity from
 // the request context; the returned string is passed as the actor argument
 // to [systemplane.Client.Set] and [systemplane.Client.Delete].
-func WithActorExtractor(fn func(*fiber.Ctx) string) MountOption {
+func WithActorExtractor(fn func(fiber.Ctx) string) MountOption {
 	return func(cfg *mountConfig) {
 		if fn != nil {
 			cfg.actorExtractor = fn
@@ -169,9 +169,9 @@ func normalizePathPrefix(prefix string) string {
 }
 
 func authorize(cfg mountConfig, logger log.Logger, action string) fiber.Handler {
-	return func(c *fiber.Ctx) error {
+	return func(c fiber.Ctx) error {
 		if err := cfg.authorizer(c, action); err != nil {
-			logger.Log(c.UserContext(), log.LevelDebug, "admin: authorizer denied",
+			logger.Log(c.Context(), log.LevelDebug, "admin: authorizer denied",
 				log.String("action", action),
 				log.Err(err),
 			)
@@ -183,7 +183,7 @@ func authorize(cfg mountConfig, logger log.Logger, action string) fiber.Handler 
 	}
 }
 
-func validateNamespaceParam(c *fiber.Ctx) error {
+func validateNamespaceParam(c fiber.Ctx) error {
 	if ns := c.Params("namespace"); len(ns) > maxNamespaceLen {
 		return commonshttp.RespondError(c, http.StatusBadRequest, "validation_error",
 			fmt.Sprintf("namespace exceeds maximum length of %d", maxNamespaceLen))
@@ -192,15 +192,15 @@ func validateNamespaceParam(c *fiber.Ctx) error {
 	return c.Next()
 }
 
-func validatePathParams(c *fiber.Ctx) error {
+func validatePathParams(c fiber.Ctx) error {
 	return validateParamLengths(c, c.Params("namespace"), c.Params("key"))
 }
 
-func validateWildcardPathParams(c *fiber.Ctx) error {
+func validateWildcardPathParams(c fiber.Ctx) error {
 	return validateParamLengths(c, c.Params("namespace"), c.Params("*"))
 }
 
-func validateParamLengths(c *fiber.Ctx, namespace, key string) error {
+func validateParamLengths(c fiber.Ctx, namespace, key string) error {
 	if len(namespace) > maxNamespaceLen {
 		return commonshttp.RespondError(c, http.StatusBadRequest, "validation_error",
 			fmt.Sprintf("namespace exceeds maximum length of %d", maxNamespaceLen))
@@ -215,10 +215,10 @@ func validateParamLengths(c *fiber.Ctx, namespace, key string) error {
 }
 
 func handleList(client *systemplane.Client) fiber.Handler {
-	return func(c *fiber.Ctx) error {
+	return func(c fiber.Ctx) error {
 		namespace := c.Params("namespace")
 
-		entries, err := client.List(c.UserContext(), namespace)
+		entries, err := client.List(c.Context(), namespace)
 		if err != nil {
 			return mapSentinelErr(c, err)
 		}
@@ -244,7 +244,7 @@ func handleList(client *systemplane.Client) fiber.Handler {
 }
 
 func handleCatalogList(client *systemplane.Client, prefix string) fiber.Handler {
-	return func(c *fiber.Ctx) error {
+	return func(c fiber.Ctx) error {
 		catalog := client.Catalog()
 		for i := range catalog.Keys {
 			catalog.Keys[i].DetailURL = catalogDetailPath(prefix, catalog.Keys[i].Namespace, catalog.Keys[i].Key)
@@ -255,7 +255,7 @@ func handleCatalogList(client *systemplane.Client, prefix string) fiber.Handler 
 }
 
 func handleCatalogDetail(client *systemplane.Client, prefix string) fiber.Handler {
-	return func(c *fiber.Ctx) error {
+	return func(c fiber.Ctx) error {
 		detail, namespace, key, ok := catalogDetailFromParams(client, c.Params("namespace"), routeKeyParam(c))
 		if !ok {
 			return commonshttp.RespondError(c, http.StatusNotFound, "not_found", "systemplane catalog entry not found")
@@ -290,7 +290,7 @@ func valuePath(prefix, namespace, key string) string {
 	return fmt.Sprintf("%s/%s/%s", prefix, url.PathEscape(namespace), url.PathEscape(key))
 }
 
-func routeKeyParam(c *fiber.Ctx) string {
+func routeKeyParam(c fiber.Ctx) string {
 	if key := c.Params("key"); key != "" {
 		return key
 	}
@@ -298,7 +298,7 @@ func routeKeyParam(c *fiber.Ctx) string {
 	return c.Params("*")
 }
 
-func registeredPathParams(client *systemplane.Client, c *fiber.Ctx) (string, string) {
+func registeredPathParams(client *systemplane.Client, c fiber.Ctx) (string, string) {
 	namespaceParam := c.Params("namespace")
 	keyParam := routeKeyParam(c)
 
@@ -351,10 +351,10 @@ func catalogRedactionPolicy(redaction string) systemplane.RedactPolicy {
 }
 
 func handleGetOne(client *systemplane.Client) fiber.Handler {
-	return func(c *fiber.Ctx) error {
+	return func(c fiber.Ctx) error {
 		namespace, key := registeredPathParams(client, c)
 
-		value, ok, err := client.Get(c.UserContext(), namespace, key)
+		value, ok, err := client.Get(c.Context(), namespace, key)
 		if err != nil {
 			return mapSentinelErr(c, err)
 		}
@@ -376,7 +376,7 @@ func handleGetOne(client *systemplane.Client) fiber.Handler {
 }
 
 func handlePut(client *systemplane.Client, cfg mountConfig) fiber.Handler {
-	return func(c *fiber.Ctx) error {
+	return func(c fiber.Ctx) error {
 		namespace, key := registeredPathParams(client, c)
 
 		value, badRequestMsg := decodePutValue(c)
@@ -386,7 +386,7 @@ func handlePut(client *systemplane.Client, cfg mountConfig) fiber.Handler {
 
 		actor := cfg.actorExtractor(c)
 
-		if err := client.Set(c.UserContext(), namespace, key, value, actor); err != nil {
+		if err := client.Set(c.Context(), namespace, key, value, actor); err != nil {
 			return mapSentinelErr(c, err)
 		}
 
@@ -395,12 +395,12 @@ func handlePut(client *systemplane.Client, cfg mountConfig) fiber.Handler {
 }
 
 func handleDelete(client *systemplane.Client, cfg mountConfig) fiber.Handler {
-	return func(c *fiber.Ctx) error {
+	return func(c fiber.Ctx) error {
 		namespace, key := registeredPathParams(client, c)
 
 		actor := cfg.actorExtractor(c)
 
-		if err := client.Delete(c.UserContext(), namespace, key, actor); err != nil {
+		if err := client.Delete(c.Context(), namespace, key, actor); err != nil {
 			return mapSentinelErr(c, err)
 		}
 
@@ -408,9 +408,9 @@ func handleDelete(client *systemplane.Client, cfg mountConfig) fiber.Handler {
 	}
 }
 
-func decodePutValue(c *fiber.Ctx) (any, string) {
+func decodePutValue(c fiber.Ctx) (any, string) {
 	var body putRequest
-	if err := c.BodyParser(&body); err != nil {
+	if err := c.Bind().Body(&body); err != nil {
 		return nil, "invalid request body"
 	}
 

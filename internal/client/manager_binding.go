@@ -9,7 +9,7 @@ package client
 import (
 	"context"
 
-	"github.com/LerianStudio/lib-systemplane/internal/manager"
+	"github.com/LerianStudio/lib-systemplane/v2/internal/manager"
 )
 
 // BindManager attaches a Manager to the Client. After binding, MT-mode Get
