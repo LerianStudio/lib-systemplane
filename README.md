@@ -344,15 +344,15 @@ GET /<prefix>/-/catalog/:namespace/:key - read metadata for one registered key
 
 The namespace/key path beginning with `-/catalog` is reserved for catalog routes and cannot be registered as a runtime configuration key. When value and catalog routes share a prefix, mount catalog routes before value routes.
 
-In multi-tenant services, authenticate before tenant resolution, mount catalog routes before tenant-manager middleware, then mount value routes after tenant-manager middleware:
+In multi-tenant services, register authentication FIRST so it covers catalog *and* value routes, then mount catalog routes before the tenant-manager middleware (catalog serves registration metadata and needs no tenant database), then mount value routes after it:
 
 ```go
+app.Use("/system", myJWTAuthMiddleware)
+
 admin.MountCatalog(app, client,
     admin.WithPathPrefix("/system"),
     admin.WithAuthorizer(myAuthFn),
 )
-
-app.Use("/system", myJWTAuthMiddleware)
 
 app.Use(tmmiddleware.TenantMiddleware(
     tmmiddleware.WithPG(pgManager, "systemplane"),
@@ -363,6 +363,8 @@ admin.Mount(app, client,
     admin.WithAuthorizer(myAuthFn),
 )
 ```
+
+Fiber applies `app.Use` middleware only to routes registered *after* the `Use` call. Registering `myJWTAuthMiddleware` after `MountCatalog` leaves the catalog routes outside the authentication chain, so `myAuthFn` would run on an unauthenticated request. Keep the auth middleware above both mounts, or have `myAuthFn` authenticate independently.
 
 Catalog detail includes the registered default value. Admin HTTP responses obfuscate defaults for keys registered with `RedactMask` or `RedactFull`. Catalog examples are operator-facing documentation and are emitted as provided; do not put secrets, credentials, DSNs, tokens, or other sensitive material in registered defaults, persisted values, schemas, rules, or examples. Systemplane is not a secret store.
 
