@@ -1,5 +1,20 @@
 # Lib-systemplane Changelog
 
+## [2.0.0](https://github.com/LerianStudio/lib-systemplane/releases/tag/v2.0.0)
+
+Features:
+- Ported lib-systemplane to the `v2` line on the fiber `v3` stack. (@fredcamaral)
+
+Fixes:
+- Patched a HIGH CVE in grpc that was blocking the promotion of `v2.0.0`. (@fredcamaral)
+
+Improvements:
+- Registered auth above MountCatalog in the mount recipe documentation. (@fredcamaral)
+
+[Compare changes](https://github.com/LerianStudio/lib-systemplane/compare/v1.6.1...v2.0.0)
+
+---
+
 ## [1.6.1](https://github.com/LerianStudio/lib-systemplane/releases/tag/v1.6.1)
 
 Features:
