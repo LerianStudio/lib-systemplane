@@ -6,8 +6,8 @@ import (
 	"context"
 	"testing"
 
-	tmevent "github.com/LerianStudio/lib-commons/v5/commons/tenant-manager/event"
-	systemplane "github.com/LerianStudio/lib-systemplane"
+	tmevent "github.com/LerianStudio/lib-commons/v6/commons/tenant-manager/event"
+	systemplane "github.com/LerianStudio/lib-systemplane/v2"
 )
 
 // These tests exercise the public HandleTenantLifecycle proxy. Routing

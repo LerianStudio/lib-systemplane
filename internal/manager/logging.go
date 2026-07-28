@@ -4,7 +4,7 @@ package manager
 import (
 	"context"
 
-	"github.com/LerianStudio/lib-observability/log"
+	"github.com/LerianStudio/lib-observability/v2/log"
 )
 
 func (m *Manager) logDebug(ctx context.Context, msg string, fields ...log.Field) {

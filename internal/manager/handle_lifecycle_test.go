@@ -7,8 +7,8 @@ import (
 	"errors"
 	"testing"
 
-	tmevent "github.com/LerianStudio/lib-commons/v5/commons/tenant-manager/event"
-	"github.com/LerianStudio/lib-observability/log"
+	tmevent "github.com/LerianStudio/lib-commons/v6/commons/tenant-manager/event"
+	"github.com/LerianStudio/lib-observability/v2/log"
 )
 
 // captureLogger records every Log call so tests can assert on emitted

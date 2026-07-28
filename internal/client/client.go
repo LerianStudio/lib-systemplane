@@ -12,14 +12,14 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
-	"github.com/LerianStudio/lib-observability/log"
-	"github.com/LerianStudio/lib-observability/runtime"
-	"github.com/LerianStudio/lib-observability/tracing"
-	"github.com/LerianStudio/lib-systemplane/internal/debounce"
-	"github.com/LerianStudio/lib-systemplane/internal/manager"
-	mongoDB "github.com/LerianStudio/lib-systemplane/internal/mongodb"
-	"github.com/LerianStudio/lib-systemplane/internal/postgres"
-	"github.com/LerianStudio/lib-systemplane/internal/store"
+	"github.com/LerianStudio/lib-observability/v2/log"
+	"github.com/LerianStudio/lib-observability/v2/runtime"
+	"github.com/LerianStudio/lib-observability/v2/tracing"
+	"github.com/LerianStudio/lib-systemplane/v2/internal/debounce"
+	"github.com/LerianStudio/lib-systemplane/v2/internal/manager"
+	mongoDB "github.com/LerianStudio/lib-systemplane/v2/internal/mongodb"
+	"github.com/LerianStudio/lib-systemplane/v2/internal/postgres"
+	"github.com/LerianStudio/lib-systemplane/v2/internal/store"
 )
 
 // refreshTimeout bounds Get calls made by the changefeed-driven refresh loop.

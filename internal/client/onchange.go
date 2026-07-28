@@ -5,7 +5,7 @@ import (
 	"context"
 	"sync"
 
-	"github.com/LerianStudio/lib-observability/log"
+	"github.com/LerianStudio/lib-observability/v2/log"
 )
 
 // OnChange registers a callback for backend-observed value changes.

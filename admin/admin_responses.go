@@ -6,9 +6,9 @@ import (
 	"errors"
 	"net/http"
 
-	commonshttp "github.com/LerianStudio/lib-commons/v5/commons/net/http"
-	systemplane "github.com/LerianStudio/lib-systemplane"
-	"github.com/gofiber/fiber/v2"
+	commonshttp "github.com/LerianStudio/lib-commons/v6/commons/net/http"
+	systemplane "github.com/LerianStudio/lib-systemplane/v2"
+	"github.com/gofiber/fiber/v3"
 )
 
 type listResponse struct {
@@ -46,7 +46,7 @@ type putRequest struct {
 	Value json.RawMessage `json:"value"`
 }
 
-func mapSentinelErr(c *fiber.Ctx, err error) error {
+func mapSentinelErr(c fiber.Ctx, err error) error {
 	switch {
 	case errors.Is(err, systemplane.ErrUnknownKey):
 		return commonshttp.RespondError(c, http.StatusBadRequest, "unknown_key", "key is not registered")

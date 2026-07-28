@@ -4,8 +4,8 @@ import (
 	"context"
 	"time"
 
-	"github.com/LerianStudio/lib-observability/log"
-	internalclient "github.com/LerianStudio/lib-systemplane/internal/client"
+	"github.com/LerianStudio/lib-observability/v2/log"
+	internalclient "github.com/LerianStudio/lib-systemplane/v2/internal/client"
 )
 
 func asInternalClient(c *Client) *internalclient.Client {

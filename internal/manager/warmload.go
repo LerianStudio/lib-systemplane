@@ -15,7 +15,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/LerianStudio/lib-observability/log"
+	"github.com/LerianStudio/lib-observability/v2/log"
 	"github.com/bxcodec/dbresolver/v2"
 	"github.com/jackc/pgx/v5/pgconn"
 )

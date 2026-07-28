@@ -3,8 +3,8 @@ package postgres
 import (
 	"encoding/json"
 
-	"github.com/LerianStudio/lib-observability/runtime"
-	"github.com/LerianStudio/lib-systemplane/internal/store"
+	"github.com/LerianStudio/lib-observability/v2/runtime"
+	"github.com/LerianStudio/lib-systemplane/v2/internal/store"
 )
 
 func (s *Store) dispatchEvent(evt store.Event) {

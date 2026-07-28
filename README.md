@@ -1,20 +1,20 @@
 # lib-systemplane
 
-Dual-backend (PostgreSQL / MongoDB) hot-reload runtime configuration for Lerian services. Register operational knobs (log levels, feature flags, rate limits, circuit-breaker thresholds, worker intervals) at startup, mutate them at runtime without a pod restart, and — in single-tenant mode — subscribe to change events through a LISTEN/NOTIFY (Postgres) or change-stream (MongoDB) backed subscription. First-class support for the Lerian database-per-tenant model via the `lib-commons/v5` tenant-manager dispatch layer.
+Dual-backend (PostgreSQL / MongoDB) hot-reload runtime configuration for Lerian services. Register operational knobs (log levels, feature flags, rate limits, circuit-breaker thresholds, worker intervals) at startup, mutate them at runtime without a pod restart, and — in single-tenant mode — subscribe to change events through a LISTEN/NOTIFY (Postgres) or change-stream (MongoDB) backed subscription. First-class support for the Lerian database-per-tenant model via the `lib-commons/v6` tenant-manager dispatch layer.
 
-This library was extracted from `lib-commons/v5/commons/systemplane`. The v1 line uses `lib-observability` for logging, tracing, telemetry, redaction, and panic recovery.
+This library was extracted from `lib-commons/v5/commons/systemplane`. The v2 line targets Fiber v3 and uses `lib-observability/v2` for logging, tracing, telemetry, redaction, and panic recovery.
 
 ## Requirements
 
 - Go `1.26.3` or newer
 - PostgreSQL 13+ **or** MongoDB 4.4+ (replica set required for change streams; polling fallback available for standalone MongoDB)
-- `github.com/LerianStudio/lib-commons/v5` for tenant-manager context, admin HTTP helpers, and backoff
-- `github.com/LerianStudio/lib-observability` for logging, tracing, telemetry, redaction, and panic recovery
+- `github.com/LerianStudio/lib-commons/v6` for tenant-manager context, admin HTTP helpers, and backoff
+- `github.com/LerianStudio/lib-observability/v2` for logging, tracing, telemetry, redaction, and panic recovery
 
 ## Installation
 
 ```bash
-go get github.com/LerianStudio/lib-systemplane
+go get github.com/LerianStudio/lib-systemplane/v2
 ```
 
 ## Operating modes
@@ -26,7 +26,7 @@ The library supports two modes; pick at construction time:
 | Single-tenant | `db *sql.DB` / `*mongo.Client` | In-process cache | Through cache + store | LISTEN/NOTIFY (Postgres) or change stream (MongoDB) |
 | Multi-tenant  | May be nil | Resolved per-call via tenant-manager ctx | Same | Disabled — `OnChange` returns `ErrNotSupportedInMultiTenant` |
 
-In multi-tenant mode the library does NOT hold an in-process cache. Every `Get` reads through the resolved tenant database. The lib expects the caller to wire `lib-commons/v5/commons/tenant-manager/middleware.TenantMiddleware` with `WithPG(pgManager, "<module>")` (Postgres) or `WithMB(mongoManager, "<module>")` (MongoDB) where `<module>` matches the lib's `WithModule(...)` option (default `"systemplane"`). The middleware populates the request context; the lib calls `tmcore.GetPGContext` / `tmcore.GetMBContext` to resolve the tenant database and runs the read/write against that handle.
+In multi-tenant mode the library does NOT hold an in-process cache. Every `Get` reads through the resolved tenant database. The lib expects the caller to wire `lib-commons/v6/commons/tenant-manager/middleware.TenantMiddleware` with `WithPG(pgManager, "<module>")` (Postgres) or `WithMB(mongoManager, "<module>")` (MongoDB) where `<module>` matches the lib's `WithModule(...)` option (default `"systemplane"`). The middleware populates the request context; the lib calls `tmcore.GetPGContext` / `tmcore.GetMBContext` to resolve the tenant database and runs the read/write against that handle.
 
 > **Provisioning (Postgres).** The library no longer creates its schema or seeds defaults at runtime. Provision `systemplane_entries` (plus the `systemplane_notify_v3()` trigger function and the NOTIFY triggers) and any defaults externally — e.g. via your migration pipeline — using the DDL published by [`SchemaSQL()` / `DefaultSeedSQL()`](#schema-provisioning). The runtime database role only needs DML (`SELECT`/`INSERT`/`UPDATE`/`DELETE`) + `LISTEN`; it does NOT need `CREATE` on the schema.
 
@@ -61,7 +61,7 @@ import (
     "os"
 
     _ "github.com/jackc/pgx/v5/stdlib"
-    systemplane "github.com/LerianStudio/lib-systemplane"
+    systemplane "github.com/LerianStudio/lib-systemplane/v2"
 )
 
 func main() {
@@ -130,7 +130,7 @@ import (
     "go.mongodb.org/mongo-driver/v2/mongo"
     "go.mongodb.org/mongo-driver/v2/mongo/options"
 
-    systemplane "github.com/LerianStudio/lib-systemplane"
+    systemplane "github.com/LerianStudio/lib-systemplane/v2"
 )
 
 func main() {
@@ -186,10 +186,10 @@ import (
     "fmt"
     "os"
 
-    tmpostgres "github.com/LerianStudio/lib-commons/v5/commons/tenant-manager/postgres"
-    tmmiddleware "github.com/LerianStudio/lib-commons/v5/commons/tenant-manager/middleware"
-    systemplane "github.com/LerianStudio/lib-systemplane"
-    "github.com/gofiber/fiber/v2"
+    tmpostgres "github.com/LerianStudio/lib-commons/v6/commons/tenant-manager/postgres"
+    tmmiddleware "github.com/LerianStudio/lib-commons/v6/commons/tenant-manager/middleware"
+    systemplane "github.com/LerianStudio/lib-systemplane/v2"
+    "github.com/gofiber/fiber/v3"
 )
 
 func main() {
@@ -234,8 +234,8 @@ func run() error {
         tmmiddleware.WithPG(pgManager, "systemplane"),
     ))
 
-    app.Get("/log-level", func(c *fiber.Ctx) error {
-        level, _, err := client.GetString(c.UserContext(), "global", "log.level")
+    app.Get("/log-level", func(c fiber.Ctx) error {
+        level, _, err := client.GetString(c.Context(), "global", "log.level")
         if err != nil {
             return err
         }
@@ -255,10 +255,10 @@ package main
 import (
     "context"
 
-    tmmongo "github.com/LerianStudio/lib-commons/v5/commons/tenant-manager/mongo"
-    tmmiddleware "github.com/LerianStudio/lib-commons/v5/commons/tenant-manager/middleware"
-    systemplane "github.com/LerianStudio/lib-systemplane"
-    "github.com/gofiber/fiber/v2"
+    tmmongo "github.com/LerianStudio/lib-commons/v6/commons/tenant-manager/mongo"
+    tmmiddleware "github.com/LerianStudio/lib-commons/v6/commons/tenant-manager/middleware"
+    systemplane "github.com/LerianStudio/lib-systemplane/v2"
+    "github.com/gofiber/fiber/v3"
 )
 
 func run() error {
@@ -303,7 +303,7 @@ In multi-tenant mode the lib does NOT provision schema at runtime for Postgres �
 Mount the Fiber admin surface under a configurable path prefix (default `/system`):
 
 ```go
-import "github.com/LerianStudio/lib-systemplane/admin"
+import "github.com/LerianStudio/lib-systemplane/v2/admin"
 
 admin.Mount(app, client,
     admin.WithPathPrefix("/system"),
@@ -320,7 +320,7 @@ PUT    /<prefix>/:namespace/:key   - write a single entry
 DELETE /<prefix>/:namespace/:key   - delete a single entry
 ```
 
-In multi-tenant mode, authenticate before tenant resolution, then mount the tenant-manager middleware BEFORE `admin.Mount` so handler `c.UserContext()` carries the tenant database.
+In multi-tenant mode, authenticate before tenant resolution, then mount the tenant-manager middleware BEFORE `admin.Mount` so handler `c.Context()` carries the tenant database.
 
 ### Catalog routes
 
