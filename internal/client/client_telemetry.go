@@ -4,7 +4,7 @@ package client
 import (
 	"context"
 
-	"github.com/LerianStudio/lib-observability/log"
+	"github.com/LerianStudio/lib-observability/v2/log"
 )
 
 func (c *Client) logWarn(ctx context.Context, msg string, fields ...log.Field) {

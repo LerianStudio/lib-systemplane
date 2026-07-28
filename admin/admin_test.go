@@ -14,10 +14,10 @@ import (
 	"testing"
 	"time"
 
-	obsconstants "github.com/LerianStudio/lib-observability/constants"
-	systemplane "github.com/LerianStudio/lib-systemplane"
-	"github.com/LerianStudio/lib-systemplane/admin"
-	"github.com/gofiber/fiber/v2"
+	obsconstants "github.com/LerianStudio/lib-observability/v2/constants"
+	systemplane "github.com/LerianStudio/lib-systemplane/v2"
+	"github.com/LerianStudio/lib-systemplane/v2/admin"
+	"github.com/gofiber/fiber/v3"
 )
 
 // fakeStore is an in-memory implementation of systemplane.TestStore used to
@@ -171,10 +171,10 @@ func setupClientWithOptions(
 func mountAndRun(t *testing.T, c *systemplane.Client, opts ...admin.MountOption) *fiber.App {
 	t.Helper()
 
-	app := fiber.New(fiber.Config{DisableStartupMessage: true})
+	app := fiber.New()
 	defaults := []admin.MountOption{
-		admin.WithAuthorizer(func(_ *fiber.Ctx, _ string) error { return nil }),
-		admin.WithActorExtractor(func(_ *fiber.Ctx) string { return "tester" }),
+		admin.WithAuthorizer(func(_ fiber.Ctx, _ string) error { return nil }),
+		admin.WithActorExtractor(func(_ fiber.Ctx) string { return "tester" }),
 	}
 
 	admin.Mount(app, c, append(defaults, opts...)...)
@@ -185,10 +185,10 @@ func mountAndRun(t *testing.T, c *systemplane.Client, opts ...admin.MountOption)
 func mountCatalogAndRun(t *testing.T, c *systemplane.Client, opts ...admin.MountOption) *fiber.App {
 	t.Helper()
 
-	app := fiber.New(fiber.Config{DisableStartupMessage: true})
+	app := fiber.New()
 	defaults := []admin.MountOption{
-		admin.WithAuthorizer(func(_ *fiber.Ctx, _ string) error { return nil }),
-		admin.WithActorExtractor(func(_ *fiber.Ctx) string { return "tester" }),
+		admin.WithAuthorizer(func(_ fiber.Ctx, _ string) error { return nil }),
+		admin.WithActorExtractor(func(_ fiber.Ctx) string { return "tester" }),
 	}
 
 	admin.MountCatalog(app, c, append(defaults, opts...)...)
@@ -204,7 +204,7 @@ func doRequest(t *testing.T, app *fiber.App, method, path, body string) *http.Re
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	resp, err := app.Test(req, int(2*time.Second/time.Millisecond))
+	resp, err := app.Test(req, fiber.TestConfig{Timeout: 2 * time.Second})
 	if err != nil {
 		t.Fatalf("app.Test: %v", err)
 	}
@@ -404,7 +404,7 @@ func TestAdmin_ListNamespace(t *testing.T) {
 func TestAdmin_DenyByDefault(t *testing.T) {
 	c, _ := setupClient(t, nil)
 
-	app := fiber.New(fiber.Config{DisableStartupMessage: true})
+	app := fiber.New()
 	// Mount WITHOUT WithAuthorizer — should deny.
 	admin.Mount(app, c)
 
@@ -461,13 +461,13 @@ func TestAdmin_CatalogListAndDetail(t *testing.T) {
 		return c.Register("tenant", "enabled", true)
 	})
 
-	app := fiber.New(fiber.Config{DisableStartupMessage: true})
-	authorizer := admin.WithAuthorizer(func(_ *fiber.Ctx, action string) error {
+	app := fiber.New()
+	authorizer := admin.WithAuthorizer(func(_ fiber.Ctx, action string) error {
 		actions = append(actions, action)
 		return nil
 	})
 	admin.MountCatalog(app, c, authorizer)
-	admin.Mount(app, c, authorizer, admin.WithActorExtractor(func(*fiber.Ctx) string { return "tester" }))
+	admin.Mount(app, c, authorizer, admin.WithActorExtractor(func(fiber.Ctx) string { return "tester" }))
 
 	resp := doRequest(t, app, http.MethodGet, "/system/-/catalog", "")
 	if resp.StatusCode != http.StatusOK {
@@ -666,7 +666,7 @@ func TestAdmin_CatalogUnknownDetailReturnsNotFound(t *testing.T) {
 
 func TestAdmin_CatalogDenyByDefault(t *testing.T) {
 	c, _ := setupClient(t, nil)
-	app := fiber.New(fiber.Config{DisableStartupMessage: true})
+	app := fiber.New()
 	admin.MountCatalog(app, c)
 
 	resp := doRequest(t, app, http.MethodGet, "/system/-/catalog", "")
@@ -775,10 +775,10 @@ func TestAdmin_CatalogDoesNotRedactExamples(t *testing.T) {
 
 func TestAdmin_CatalogUsesReadAuthorization(t *testing.T) {
 	c, _ := setupClient(t, nil)
-	app := fiber.New(fiber.Config{DisableStartupMessage: true})
+	app := fiber.New()
 	wantErr := errors.New("denied")
 	var gotAction string
-	admin.MountCatalog(app, c, admin.WithAuthorizer(func(_ *fiber.Ctx, action string) error {
+	admin.MountCatalog(app, c, admin.WithAuthorizer(func(_ fiber.Ctx, action string) error {
 		gotAction = action
 		return wantErr
 	}))

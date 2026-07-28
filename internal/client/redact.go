@@ -1,6 +1,6 @@
 package client
 
-import "github.com/LerianStudio/lib-observability/constants"
+import "github.com/LerianStudio/lib-observability/v2/constants"
 
 // RedactPolicy controls how a key's value is rendered in admin endpoints and logs.
 type RedactPolicy int

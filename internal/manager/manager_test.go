@@ -6,7 +6,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/LerianStudio/lib-systemplane/internal/manager"
+	"github.com/LerianStudio/lib-systemplane/v2/internal/manager"
 )
 
 func TestNew_NilPgMgr_ReturnsNonNilManager(t *testing.T) {
