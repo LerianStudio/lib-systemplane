@@ -40,7 +40,7 @@ jobs:
   # race-enabled lane.
   perf-gate:
     name: AC15 Perf Gate
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       contents: read
     steps:
