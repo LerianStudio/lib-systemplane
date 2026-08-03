@@ -3,8 +3,8 @@ module github.com/LerianStudio/lib-systemplane/v2
 go 1.26.3
 
 require (
-	github.com/LerianStudio/lib-commons/v6 v6.0.0
-	github.com/LerianStudio/lib-observability/v2 v2.0.0
+	github.com/LerianStudio/lib-commons/v6 v6.2.0
+	github.com/LerianStudio/lib-observability/v2 v2.1.0
 	github.com/bxcodec/dbresolver/v2 v2.3.0
 	github.com/gofiber/fiber/v3 v3.4.0
 	github.com/jackc/pgx/v5 v5.10.0
@@ -75,7 +75,7 @@ require (
 	github.com/philhofer/fwd v1.2.0 // indirect
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
-	github.com/rabbitmq/amqp091-go v1.12.0 // indirect
+	github.com/rabbitmq/amqp091-go v1.13.0 // indirect
 	github.com/redis/go-redis/v9 v9.21.0 // indirect
 	github.com/shirou/gopsutil v3.21.11+incompatible // indirect
 	github.com/shirou/gopsutil/v4 v4.26.5 // indirect
@@ -108,9 +108,9 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/crypto v0.53.0 // indirect
 	golang.org/x/net v0.56.0 // indirect
-	golang.org/x/sync v0.21.0 // indirect
+	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.46.0 // indirect
-	golang.org/x/text v0.39.0 // indirect
+	golang.org/x/text v0.40.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260706201446-f0a921348800 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260706201446-f0a921348800 // indirect
 	google.golang.org/grpc v1.82.1 // indirect
