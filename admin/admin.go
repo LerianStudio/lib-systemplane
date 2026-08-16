@@ -27,14 +27,18 @@
 // lib-commons tenant-manager middleware, then call Mount so handlers'
 // c.Context() carries the resolved tenant database for the lib's
 // configured module.
+//
+// Services that do not serve this surface on Fiber — because they generate
+// their OpenAPI document from their own registrations, for instance — use
+// [NewOperations] instead: it exposes the same logic without a transport, and
+// the Fiber routes registered here are a thin adapter over it. The request and
+// response payloads ([ListResponse], [GetResponse], [CatalogDetailResponse],
+// [PutRequest]) are exported for the same reason.
 package admin
 
 import (
-	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
-	"net/url"
 	"strings"
 
 	commonshttp "github.com/LerianStudio/lib-commons/v6/commons/net/http"
@@ -44,6 +48,7 @@ import (
 )
 
 const (
+	defaultPathPrefix    = "/system"
 	maxNamespaceLen      = 256
 	maxKeyLen            = 512
 	catalogMetaNamespace = "-"
@@ -59,7 +64,7 @@ type mountConfig struct {
 
 func defaultMountConfig() mountConfig {
 	return mountConfig{
-		pathPrefix: "/system",
+		pathPrefix: defaultPathPrefix,
 		authorizer: func(_ fiber.Ctx, _ string) error {
 			return errors.New("admin: no authorizer configured — use admin.WithAuthorizer to set one")
 		},
@@ -120,14 +125,15 @@ func Mount(router fiber.Router, c *systemplane.Client, opts ...MountOption) {
 
 	prefix := normalizePathPrefix(cfg.pathPrefix)
 	logger := c.Logger()
+	ops := newMountedOperations(c, prefix)
 
-	router.Get(prefix+"/:namespace", validateNamespaceParam, authorize(cfg, logger, "read"), handleList(c))
-	router.Get(prefix+"/:namespace/:key", validatePathParams, authorize(cfg, logger, "read"), handleGetOne(c))
-	router.Get(prefix+"/:namespace/*", validateWildcardPathParams, authorize(cfg, logger, "read"), handleGetOne(c))
-	router.Put(prefix+"/:namespace/:key", validatePathParams, authorize(cfg, logger, "write"), handlePut(c, cfg))
-	router.Put(prefix+"/:namespace/*", validateWildcardPathParams, authorize(cfg, logger, "write"), handlePut(c, cfg))
-	router.Delete(prefix+"/:namespace/:key", validatePathParams, authorize(cfg, logger, "write"), handleDelete(c, cfg))
-	router.Delete(prefix+"/:namespace/*", validateWildcardPathParams, authorize(cfg, logger, "write"), handleDelete(c, cfg))
+	router.Get(prefix+"/:namespace", validateNamespaceParam, authorize(cfg, logger, ActionRead), handleList(ops))
+	router.Get(prefix+"/:namespace/:key", validatePathParams, authorize(cfg, logger, ActionRead), handleGetOne(ops))
+	router.Get(prefix+"/:namespace/*", validateWildcardPathParams, authorize(cfg, logger, ActionRead), handleGetOne(ops))
+	router.Put(prefix+"/:namespace/:key", validatePathParams, authorize(cfg, logger, ActionWrite), handlePut(ops, cfg))
+	router.Put(prefix+"/:namespace/*", validateWildcardPathParams, authorize(cfg, logger, ActionWrite), handlePut(ops, cfg))
+	router.Delete(prefix+"/:namespace/:key", validatePathParams, authorize(cfg, logger, ActionWrite), handleDelete(ops, cfg))
+	router.Delete(prefix+"/:namespace/*", validateWildcardPathParams, authorize(cfg, logger, ActionWrite), handleDelete(ops, cfg))
 }
 
 // MountCatalog registers read-only catalog metadata routes on router using the
@@ -154,10 +160,11 @@ func MountCatalog(router fiber.Router, c *systemplane.Client, opts ...MountOptio
 
 	prefix := normalizePathPrefix(cfg.pathPrefix)
 	logger := c.Logger()
-	catalogPath := catalogPathPrefix(prefix)
+	ops := newMountedOperations(c, prefix)
+	catalogPath := ops.CatalogPath()
 
-	router.Get(catalogPath, authorize(cfg, logger, "read"), handleCatalogList(c, prefix))
-	router.Get(catalogPath+"/:namespace/*", validateWildcardPathParams, authorize(cfg, logger, "read"), handleCatalogDetail(c, prefix))
+	router.Get(catalogPath, authorize(cfg, logger, ActionRead), handleCatalogList(ops))
+	router.Get(catalogPath+"/:namespace/*", validateWildcardPathParams, authorize(cfg, logger, ActionRead), handleCatalogDetail(ops))
 }
 
 func normalizePathPrefix(prefix string) string {
@@ -184,9 +191,8 @@ func authorize(cfg mountConfig, logger log.Logger, action string) fiber.Handler 
 }
 
 func validateNamespaceParam(c fiber.Ctx) error {
-	if ns := c.Params("namespace"); len(ns) > maxNamespaceLen {
-		return commonshttp.RespondError(c, http.StatusBadRequest, "validation_error",
-			fmt.Sprintf("namespace exceeds maximum length of %d", maxNamespaceLen))
+	if err := validateNamespace(c.Params("namespace")); err != nil {
+		return respondErr(c, err)
 	}
 
 	return c.Next()
@@ -201,93 +207,44 @@ func validateWildcardPathParams(c fiber.Ctx) error {
 }
 
 func validateParamLengths(c fiber.Ctx, namespace, key string) error {
-	if len(namespace) > maxNamespaceLen {
-		return commonshttp.RespondError(c, http.StatusBadRequest, "validation_error",
-			fmt.Sprintf("namespace exceeds maximum length of %d", maxNamespaceLen))
-	}
-
-	if len(key) > maxKeyLen {
-		return commonshttp.RespondError(c, http.StatusBadRequest, "validation_error",
-			fmt.Sprintf("key exceeds maximum length of %d", maxKeyLen))
+	if err := validateNamespaceKey(namespace, key); err != nil {
+		return respondErr(c, err)
 	}
 
 	return c.Next()
 }
 
-func handleList(client *systemplane.Client) fiber.Handler {
+func handleList(ops *Operations) fiber.Handler {
 	return func(c fiber.Ctx) error {
-		namespace := c.Params("namespace")
-
-		entries, err := client.List(c.Context(), namespace)
+		resp, err := ops.List(c.Context(), c.Params("namespace"))
 		if err != nil {
-			return mapSentinelErr(c, err)
-		}
-
-		resp := listResponse{
-			Namespace: namespace,
-			Entries:   make([]entryResponse, 0, len(entries)),
-		}
-
-		for _, e := range entries {
-			policy := client.KeyRedaction(namespace, e.Key)
-			redacted := systemplane.ApplyRedaction(e.Value, policy)
-
-			resp.Entries = append(resp.Entries, entryResponse{
-				Key:         e.Key,
-				Value:       redacted,
-				Description: e.Description,
-			})
+			return respondErr(c, err)
 		}
 
 		return c.Status(fiber.StatusOK).JSON(resp)
 	}
 }
 
-func handleCatalogList(client *systemplane.Client, prefix string) fiber.Handler {
+func handleCatalogList(ops *Operations) fiber.Handler {
 	return func(c fiber.Ctx) error {
-		catalog := client.Catalog()
-		for i := range catalog.Keys {
-			catalog.Keys[i].DetailURL = catalogDetailPath(prefix, catalog.Keys[i].Namespace, catalog.Keys[i].Key)
+		catalog, err := ops.CatalogList(c.Context())
+		if err != nil {
+			return respondErr(c, err)
 		}
 
 		return c.Status(fiber.StatusOK).JSON(catalog)
 	}
 }
 
-func handleCatalogDetail(client *systemplane.Client, prefix string) fiber.Handler {
+func handleCatalogDetail(ops *Operations) fiber.Handler {
 	return func(c fiber.Ctx) error {
-		detail, namespace, key, ok := catalogDetailFromParams(client, c.Params("namespace"), routeKeyParam(c))
-		if !ok {
-			return commonshttp.RespondError(c, http.StatusNotFound, "not_found", "systemplane catalog entry not found")
+		resp, err := ops.CatalogDetail(c.Context(), c.Params("namespace"), routeKeyParam(c))
+		if err != nil {
+			return respondErr(c, err)
 		}
 
-		policy := catalogRedactionPolicy(detail.Redaction)
-		detail.DefaultValue = systemplane.ApplyRedaction(detail.DefaultValue, policy)
-		detail.DetailURL = catalogDetailPath(prefix, namespace, key)
-
-		return c.Status(fiber.StatusOK).JSON(catalogDetailResponse{
-			CatalogVersion:   systemplane.CatalogVersion,
-			Service:          client.CatalogService(),
-			CatalogKeyDetail: detail,
-			Write: catalogWriteResponse{
-				Method:    http.MethodPut,
-				Path:      valuePath(prefix, namespace, key),
-				BodyShape: map[string]any{"value": "<schema value>"},
-			},
-		})
+		return c.Status(fiber.StatusOK).JSON(resp)
 	}
-}
-
-func catalogPathPrefix(prefix string) string {
-	return fmt.Sprintf("%s/%s/%s", prefix, catalogMetaNamespace, catalogKey)
-}
-
-func catalogDetailPath(prefix, namespace, key string) string {
-	return fmt.Sprintf("%s/%s/%s", catalogPathPrefix(prefix), url.PathEscape(namespace), url.PathEscape(key))
-}
-
-func valuePath(prefix, namespace, key string) string {
-	return fmt.Sprintf("%s/%s/%s", prefix, url.PathEscape(namespace), url.PathEscape(key))
 }
 
 func routeKeyParam(c fiber.Ctx) string {
@@ -298,130 +255,38 @@ func routeKeyParam(c fiber.Ctx) string {
 	return c.Params("*")
 }
 
-func registeredPathParams(client *systemplane.Client, c fiber.Ctx) (string, string) {
-	namespaceParam := c.Params("namespace")
-	keyParam := routeKeyParam(c)
-
-	for _, namespace := range pathParamCandidates(namespaceParam) {
-		for _, key := range pathParamCandidates(keyParam) {
-			if client.IsRegistered(namespace, key) {
-				return namespace, key
-			}
-		}
-	}
-
-	return namespaceParam, keyParam
-}
-
-func catalogDetailFromParams(
-	client *systemplane.Client,
-	namespaceParam string,
-	keyParam string,
-) (systemplane.CatalogKeyDetail, string, string, bool) {
-	for _, namespace := range pathParamCandidates(namespaceParam) {
-		for _, key := range pathParamCandidates(keyParam) {
-			detail, ok := client.CatalogKey(namespace, key)
-			if ok {
-				return detail, namespace, key, true
-			}
-		}
-	}
-
-	return systemplane.CatalogKeyDetail{}, namespaceParam, keyParam, false
-}
-
-func pathParamCandidates(raw string) []string {
-	decoded, err := url.PathUnescape(raw)
-	if err != nil || decoded == raw {
-		return []string{raw}
-	}
-
-	return []string{raw, decoded}
-}
-
-func catalogRedactionPolicy(redaction string) systemplane.RedactPolicy {
-	switch redaction {
-	case systemplane.RedactMask.String():
-		return systemplane.RedactMask
-	case systemplane.RedactFull.String():
-		return systemplane.RedactFull
-	default:
-		return systemplane.RedactNone
-	}
-}
-
-func handleGetOne(client *systemplane.Client) fiber.Handler {
+func handleGetOne(ops *Operations) fiber.Handler {
 	return func(c fiber.Ctx) error {
-		namespace, key := registeredPathParams(client, c)
-
-		value, ok, err := client.Get(c.Context(), namespace, key)
+		resp, err := ops.Get(c.Context(), c.Params("namespace"), routeKeyParam(c))
 		if err != nil {
-			return mapSentinelErr(c, err)
+			return respondErr(c, err)
 		}
 
-		if !ok {
-			return commonshttp.RespondError(c, http.StatusNotFound, "not_found", "key not found")
-		}
-
-		policy := client.KeyRedaction(namespace, key)
-		redacted := systemplane.ApplyRedaction(value, policy)
-
-		return c.Status(fiber.StatusOK).JSON(getResponse{
-			Namespace:   namespace,
-			Key:         key,
-			Value:       redacted,
-			Description: client.KeyDescription(namespace, key),
-		})
+		return c.Status(fiber.StatusOK).JSON(resp)
 	}
 }
 
-func handlePut(client *systemplane.Client, cfg mountConfig) fiber.Handler {
+func handlePut(ops *Operations, cfg mountConfig) fiber.Handler {
 	return func(c fiber.Ctx) error {
-		namespace, key := registeredPathParams(client, c)
-
-		value, badRequestMsg := decodePutValue(c)
-		if badRequestMsg != "" {
-			return commonshttp.RespondError(c, http.StatusBadRequest, "bad_request", badRequestMsg)
+		var body PutRequest
+		if err := c.Bind().Body(&body); err != nil {
+			return commonshttp.RespondError(c, http.StatusBadRequest, titleBadRequest, "invalid request body")
 		}
 
-		actor := cfg.actorExtractor(c)
-
-		if err := client.Set(c.Context(), namespace, key, value, actor); err != nil {
-			return mapSentinelErr(c, err)
+		if err := ops.Put(c.Context(), c.Params("namespace"), routeKeyParam(c), body, cfg.actorExtractor(c)); err != nil {
+			return respondErr(c, err)
 		}
 
 		return c.SendStatus(fiber.StatusNoContent)
 	}
 }
 
-func handleDelete(client *systemplane.Client, cfg mountConfig) fiber.Handler {
+func handleDelete(ops *Operations, cfg mountConfig) fiber.Handler {
 	return func(c fiber.Ctx) error {
-		namespace, key := registeredPathParams(client, c)
-
-		actor := cfg.actorExtractor(c)
-
-		if err := client.Delete(c.Context(), namespace, key, actor); err != nil {
-			return mapSentinelErr(c, err)
+		if err := ops.Delete(c.Context(), c.Params("namespace"), routeKeyParam(c), cfg.actorExtractor(c)); err != nil {
+			return respondErr(c, err)
 		}
 
 		return c.SendStatus(fiber.StatusNoContent)
 	}
-}
-
-func decodePutValue(c fiber.Ctx) (any, string) {
-	var body putRequest
-	if err := c.Bind().Body(&body); err != nil {
-		return nil, "invalid request body"
-	}
-
-	if body.Value == nil {
-		return nil, "missing value field"
-	}
-
-	var value any
-	if err := json.Unmarshal(body.Value, &value); err != nil {
-		return nil, "invalid value"
-	}
-
-	return value, ""
 }
