@@ -8,6 +8,7 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -99,6 +100,19 @@ func TestExportedBoundaryTakesNoCoupledLoggerType(t *testing.T) {
 			}
 
 			rel, _ := filepath.Rel(root, path)
+
+			// A dot import merges another package's identifiers into this
+			// file's namespace as bare idents, which this checker would then
+			// resolve against the WRONG package and silently pass. Nothing in
+			// this module dot-imports and the linter forbids it, so treat one
+			// as a defeat of the gate rather than a shape to support.
+			if name := dotImport(file); name != "" {
+				t.Errorf("%s: dot import of %q defeats this checker; "+
+					"import it under a name instead", rel, name)
+
+				violations++
+			}
+
 			scope := newPkgScope(declared, file)
 
 			ast.Inspect(file, func(node ast.Node) bool {
@@ -150,6 +164,11 @@ func receiverTypeName(expr ast.Expr) string {
 	case *ast.Ident:
 		return typed.Name
 	case *ast.IndexExpr:
+		return receiverTypeName(typed.X)
+	case *ast.IndexListExpr:
+		// A generic receiver with more than one type parameter, Cache[K, V].
+		// Without this case the name comes back empty, exportedReceiver says
+		// false, and every method on such a type is skipped silently.
 		return receiverTypeName(typed.X)
 	default:
 		return ""
@@ -226,6 +245,14 @@ func universalityViolation(expr ast.Expr, scope *pkgScope, depth int) string {
 			"universal types instead (see systemplane.Logger) and convert with log.Adapt."
 	}
 
+	// An anonymous interface has no name to resolve, so the loop below would
+	// skip it entirely — while its methods can name whatever they like. Walk it
+	// directly. Nothing can self-return here: an anonymous interface gives a
+	// method no name to return.
+	if iface := anonymousInterface(expr); iface != nil {
+		return interfaceViolation("it is an anonymous interface", "", iface, scope, depth)
+	}
+
 	for _, name := range scope.qualify(expr) {
 		decl, isLocal := scope.declared[name]
 		if !isLocal {
@@ -250,46 +277,90 @@ func universalityViolation(expr ast.Expr, scope *pkgScope, depth int) string {
 			continue
 		}
 
-		for _, method := range iface.Methods.List {
-			// Method signatures resolve in the scope of the file that DECLARED
-			// the interface, not the file accepting it as a parameter: the two
-			// need not import a coupled module under the same alias, or at all.
-			inner := declScope
+		// The method set resolves in the scope of the file that DECLARED the
+		// interface, not the file accepting it as a parameter: the two need not
+		// import a coupled module under the same alias, or at all.
+		if reason := interfaceViolation("it names "+name, name, iface, declScope, depth); reason != "" {
+			return reason
+		}
+	}
 
-			fn, ok := method.Type.(*ast.FuncType)
-			if !ok {
-				// An embedded interface carries the embedded method set whole,
-				// so embedding a non-universal interface couples a consumer
-				// exactly as naming it directly would.
-				if reason := universalityViolation(method.Type, inner, depth+1); reason != "" {
-					return "it names " + name + ", whose embedded interface is not universal: " + reason
-				}
+	return ""
+}
 
-				continue
+// interfaceViolation walks one interface's method set. selfName is the
+// package-qualified name the interface is declared under, or "" for an
+// anonymous one, which cannot self-return.
+func interfaceViolation(prefix, selfName string, iface *ast.InterfaceType, scope *pkgScope, depth int) string {
+	for _, method := range iface.Methods.List {
+		fn, ok := method.Type.(*ast.FuncType)
+		if !ok {
+			// An embedded interface carries the embedded method set whole, so
+			// embedding a non-universal interface couples a consumer exactly as
+			// naming it directly would.
+			if reason := universalityViolation(method.Type, scope, depth+1); reason != "" {
+				return prefix + ", whose embedded interface is not universal: " + reason
 			}
 
-			for _, result := range fieldTypes(fn.Results) {
-				for _, resultName := range inner.qualify(result) {
-					if resultName == name {
-						return "it names " + name + ", an interface with a self-returning method. " +
+			continue
+		}
+
+		for _, result := range fieldTypes(fn.Results) {
+			if selfName != "" {
+				for _, resultName := range scope.qualify(result) {
+					if resultName == selfName {
+						return prefix + ", an interface with a self-returning method. " +
 							"A consumer cannot declare that interface in its own package — it has " +
 							"no way to name the return type — so it must import this module."
 					}
 				}
-
-				if reason := universalityViolation(result, inner, depth+1); reason != "" {
-					return "it names " + name + ", whose method " + methodName(method) +
-						" returns a non-universal type: " + reason
-				}
 			}
 
-			for _, param := range fieldTypes(fn.Params) {
-				if reason := universalityViolation(param, inner, depth+1); reason != "" {
-					return "it names " + name + ", whose method " + methodName(method) +
-						" is not universal: " + reason
-				}
+			if reason := universalityViolation(result, scope, depth+1); reason != "" {
+				return prefix + ", whose method " + methodName(method) +
+					" returns a non-universal type: " + reason
 			}
 		}
+
+		for _, param := range fieldTypes(fn.Params) {
+			if reason := universalityViolation(param, scope, depth+1); reason != "" {
+				return prefix + ", whose method " + methodName(method) + " is not universal: " + reason
+			}
+		}
+	}
+
+	return ""
+}
+
+// anonymousInterface unwraps an inline interface literal, or returns nil.
+func anonymousInterface(expr ast.Expr) *ast.InterfaceType {
+	switch typed := expr.(type) {
+	case *ast.InterfaceType:
+		return typed
+	case *ast.StarExpr:
+		return anonymousInterface(typed.X)
+	case *ast.Ellipsis:
+		return anonymousInterface(typed.Elt)
+	case *ast.ArrayType:
+		return anonymousInterface(typed.Elt)
+	default:
+		return nil
+	}
+}
+
+// dotImport returns the path of the first dot import in a file, or "".
+func dotImport(file *ast.File) string {
+	for _, imp := range file.Imports {
+		if imp.Name == nil || imp.Name.Name != "." {
+			continue
+		}
+
+		path, err := strconv.Unquote(imp.Path.Value)
+		if err != nil {
+			return imp.Path.Value
+		}
+
+		return path
 	}
 
 	return ""
@@ -300,6 +371,11 @@ func universalityViolation(expr ast.Expr, scope *pkgScope, depth int) string {
 // satisfying it is the consumer's job, and it cannot do that without naming the
 // type.
 func namesLocalInterface(expr ast.Expr, scope *pkgScope) bool {
+	// An inline interface literal is declared here too — it just has no name.
+	if iface := anonymousInterface(expr); iface != nil {
+		return !sealed(iface, scope, 0)
+	}
+
 	for _, name := range scope.qualify(expr) {
 		decl, declScope, isLocal := resolve(name, scope)
 		if !isLocal {
@@ -579,22 +655,48 @@ func record(declared map[string]declaration, file *ast.File) {
 	}
 }
 
+// rootPackageName is the package clause of this module's root package.
+//
+// It cannot be derived from the import path. The path ends in the major-version
+// suffix (.../lib-systemplane/v3), and the directory above it is
+// "lib-systemplane" while the package is "systemplane" — so the usual
+// last-path-element rule yields "v3", which matches no declaration and would
+// make every root type referenced from admin/ silently unresolvable.
+const rootPackageName = "systemplane"
+
+// majorSuffix matches the /vN element a Go module path carries from v2 onward.
+var majorSuffix = regexp.MustCompile(`^v[0-9]+$`)
+
+// localPackageName maps one of THIS module's import paths to the package name
+// its declarations are keyed by.
+func localPackageName(path string) string {
+	if last := lastElement(path); !majorSuffix.MatchString(last) {
+		return last
+	}
+
+	return rootPackageName
+}
+
+func lastElement(path string) string {
+	return path[strings.LastIndex(path, "/")+1:]
+}
+
 // localAliases maps the name a file refers to each of THIS module's packages
 // by, back to the real package name.
 func localAliases(file *ast.File) map[string]string {
-	return importsMatching(file, func(path string) (string, bool) {
+	return importsMatching(file, localPackageName, func(path string) (string, bool) {
 		if !strings.Contains(path, "lib-systemplane") {
 			return "", false
 		}
 
-		return path[strings.LastIndex(path, "/")+1:], true
+		return localPackageName(path), true
 	})
 }
 
 // coupledAliases maps the name a file refers to a coupled module's package by,
 // to that module's identifying path fragment.
 func coupledAliases(file *ast.File) map[string]string {
-	return importsMatching(file, func(path string) (string, bool) {
+	return importsMatching(file, lastElement, func(path string) (string, bool) {
 		for _, module := range coupledModules {
 			if strings.Contains(path, module) {
 				return module, true
@@ -605,7 +707,13 @@ func coupledAliases(file *ast.File) map[string]string {
 	})
 }
 
-func importsMatching(file *ast.File, match func(string) (string, bool)) map[string]string {
+// importsMatching keys each selected import by the identifier the file refers
+// to it as: the explicit alias when there is one, otherwise defaultName(path).
+func importsMatching(
+	file *ast.File,
+	defaultName func(string) string,
+	match func(string) (string, bool),
+) map[string]string {
 	out := make(map[string]string, len(file.Imports))
 
 	for _, imp := range file.Imports {
@@ -619,7 +727,7 @@ func importsMatching(file *ast.File, match func(string) (string, bool)) map[stri
 			continue
 		}
 
-		name := path[strings.LastIndex(path, "/")+1:]
+		name := defaultName(path)
 		if imp.Name != nil {
 			name = imp.Name.Name
 		}
@@ -755,6 +863,51 @@ func WithTelemetry(t *tracing.Telemetry) {}
 import "github.com/LerianStudio/lib-observability/v4/tracing"
 
 func WithManagerTelemetry(provider *tracing.Telemetry) {}
+`,
+			wantHit: "lib-observability",
+		},
+		"a coupled type inside an ANONYMOUS interface's method": {
+			src: `package systemplane
+
+import (
+	"context"
+
+	obslog "github.com/LerianStudio/lib-observability/v4/log"
+)
+
+func WithLogger(l interface {
+	Log(ctx context.Context, level int, msg string, fields ...obslog.Field)
+}) {
+}
+`,
+			wantHit: "lib-observability",
+		},
+		"a coupled type returned by an ANONYMOUS interface's method": {
+			src: `package systemplane
+
+import "github.com/LerianStudio/lib-observability/v4/tracing"
+
+func WithTelemetry(provider interface{ Unwrap() *tracing.Telemetry }) {}
+`,
+			wantHit: "lib-observability",
+		},
+		"a coupled type on a method of a receiver with TWO type parameters": {
+			src: `package systemplane
+
+import "github.com/LerianStudio/lib-observability/v4/log"
+
+type Cache[K comparable, V any] struct{}
+
+func (c *Cache[K, V]) WithLogger(l log.Logger) {}
+`,
+			wantHit: "lib-observability",
+		},
+		"a coupled type behind a root type imported through the /vN path": {
+			src: `package admin
+
+import systemplane "example.test/lib-systemplane/v3"
+
+func Mount(l systemplane.Logger) {}
 `,
 			wantHit: "lib-observability",
 		},
@@ -928,7 +1081,7 @@ func checkFixture(t *testing.T, dependency, subject string) string {
 	fset := token.NewFileSet()
 	declared := make(map[string]declaration)
 
-	for _, src := range []string{dependency, subject} {
+	for _, src := range []string{dependency, rootPackageFixture, subject} {
 		file, err := parser.ParseFile(fset, "fixture.go", src, parser.SkipObjectResolution)
 		if err != nil {
 			t.Fatalf("parse fixture: %v", err)
@@ -951,7 +1104,7 @@ func checkFixture(t *testing.T, dependency, subject string) string {
 
 	for _, decl := range file.Decls {
 		fn, isFunc := decl.(*ast.FuncDecl)
-		if !isFunc || !fn.Name.IsExported() || fn.Type.Params == nil {
+		if !isFunc || !fn.Name.IsExported() || !exportedReceiver(fn) || fn.Type.Params == nil {
 			continue
 		}
 
@@ -997,11 +1150,23 @@ func recordFixture(declared map[string]declaration, file *ast.File) {
 	}
 }
 
+// rootPackageFixture stands in for this module's root package, so a fixture can
+// exercise the .../lib-systemplane/v3 import path whose last element is a
+// version rather than a package name.
+const rootPackageFixture = `package systemplane
+
+import obslog "github.com/LerianStudio/lib-observability/v4/log"
+
+type Logger interface {
+	Log(fields ...obslog.Field)
+}
+`
+
 // fixtureAliases treats every import in a fixture as local, so the checker can
 // resolve the fixture's own dependency package the way it resolves this
 // module's real ones.
 func fixtureAliases(file *ast.File) map[string]string {
-	return importsMatching(file, func(path string) (string, bool) {
-		return path[strings.LastIndex(path, "/")+1:], true
+	return importsMatching(file, localPackageName, func(path string) (string, bool) {
+		return localPackageName(path), true
 	})
 }
