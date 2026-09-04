@@ -7,7 +7,7 @@ import (
 	"net/http"
 
 	commonshttp "github.com/LerianStudio/lib-commons/v6/commons/net/http"
-	systemplane "github.com/LerianStudio/lib-systemplane/v2"
+	systemplane "github.com/LerianStudio/lib-systemplane/v3"
 	"github.com/gofiber/fiber/v3"
 )
 

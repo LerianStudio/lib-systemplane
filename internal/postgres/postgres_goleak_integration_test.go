@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/LerianStudio/lib-systemplane/v2/internal/postgres"
-	"github.com/LerianStudio/lib-systemplane/v2/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v3/internal/postgres"
+	"github.com/LerianStudio/lib-systemplane/v3/internal/store"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 

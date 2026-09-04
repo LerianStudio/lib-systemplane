@@ -13,10 +13,9 @@ package systemplane
 
 import (
 	tmpostgres "github.com/LerianStudio/lib-commons/v6/commons/tenant-manager/postgres"
-	"github.com/LerianStudio/lib-observability/v2/log"
-	"github.com/LerianStudio/lib-observability/v2/tracing"
-	internalclient "github.com/LerianStudio/lib-systemplane/v2/internal/client"
-	internalmanager "github.com/LerianStudio/lib-systemplane/v2/internal/manager"
+	"github.com/LerianStudio/lib-observability/v4/log"
+	internalclient "github.com/LerianStudio/lib-systemplane/v3/internal/client"
+	internalmanager "github.com/LerianStudio/lib-systemplane/v3/internal/manager"
 )
 
 // Manager owns per-tenant cache + push hot-reload bookkeeping for MT
@@ -46,12 +45,18 @@ func NewManager(client *Client, pgMgr *tmpostgres.Manager, opts ...ManagerOption
 }
 
 // WithManagerLogger sets the structured logger for the Manager.
-func WithManagerLogger(l log.Logger) ManagerOption {
-	return internalmanager.WithLogger(l)
+// A nil logger discards every entry.
+func WithManagerLogger(l Logger) ManagerOption {
+	return internalmanager.WithLogger(log.Adapt(l))
 }
 
 // WithManagerTelemetry sets the OpenTelemetry provider for the Manager.
-func WithManagerTelemetry(t *tracing.Telemetry) ManagerOption {
+// A nil provider disables tracing and metrics.
+func WithManagerTelemetry(t Telemetry) ManagerOption {
+	if log.IsNil(t) {
+		return internalmanager.WithTelemetry(nil)
+	}
+
 	return internalmanager.WithTelemetry(t)
 }
 

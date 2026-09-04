@@ -32,9 +32,9 @@ import (
 	"time"
 
 	tmcore "github.com/LerianStudio/lib-commons/v6/commons/tenant-manager/core"
-	"github.com/LerianStudio/lib-observability/v2/log"
-	"github.com/LerianStudio/lib-observability/v2/tracing"
-	"github.com/LerianStudio/lib-systemplane/v2/internal/store"
+	"github.com/LerianStudio/lib-observability/v4/log"
+	"github.com/LerianStudio/lib-observability/v4/tracing"
+	"github.com/LerianStudio/lib-systemplane/v3/internal/store"
 	"github.com/bxcodec/dbresolver/v2"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -120,7 +120,7 @@ type Config struct {
 	Module string
 
 	Logger    log.Logger
-	Telemetry *tracing.Telemetry
+	Telemetry store.Telemetry
 }
 
 // Store implements [store.Store] over Postgres.
@@ -400,18 +400,18 @@ func (s *Store) startSpan(ctx context.Context, name string, attrs ...attribute.K
 
 func (s *Store) logInfo(ctx context.Context, msg string, fields ...log.Field) {
 	if s.cfg.Logger != nil {
-		s.cfg.Logger.Log(ctx, log.LevelInfo, msg, fields...)
+		s.cfg.Logger.Log(ctx, log.LevelInfo, msg, fields)
 	}
 }
 
 func (s *Store) logWarn(ctx context.Context, msg string, fields ...log.Field) {
 	if s.cfg.Logger != nil {
-		s.cfg.Logger.Log(ctx, log.LevelWarn, msg, fields...)
+		s.cfg.Logger.Log(ctx, log.LevelWarn, msg, fields)
 	}
 }
 
 func (s *Store) logDebug(ctx context.Context, msg string, fields ...log.Field) {
 	if s.cfg.Logger != nil {
-		s.cfg.Logger.Log(ctx, log.LevelDebug, msg, fields...)
+		s.cfg.Logger.Log(ctx, log.LevelDebug, msg, fields)
 	}
 }

@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	tmevent "github.com/LerianStudio/lib-commons/v6/commons/tenant-manager/event"
-	"github.com/LerianStudio/lib-observability/v2/log"
+	"github.com/LerianStudio/lib-observability/v4/log"
 )
 
 // captureLogger records every Log call so tests can assert on emitted
@@ -18,19 +18,23 @@ type captureLogger struct {
 }
 
 type captureEntry struct {
-	level  log.Level
+	level  int
 	msg    string
 	fields []log.Field
 }
 
-func (c *captureLogger) Log(_ context.Context, level log.Level, msg string, fields ...log.Field) {
-	c.entries = append(c.entries, captureEntry{level: level, msg: msg, fields: fields})
+// Log widens to the universal shape lib-observability v4 requires of an
+// implementer: an int level and an ...any variadic. log.Fields recovers the
+// typed fields, flattening the []log.Field the production helpers pass as a
+// single variadic element, so the assertions below still read f.Key/f.Value.
+func (c *captureLogger) Log(_ context.Context, level int, msg string, fields ...any) {
+	c.entries = append(c.entries, captureEntry{level: level, msg: msg, fields: log.Fields(fields...)})
 }
 
-func (c *captureLogger) With(...log.Field) log.Logger { return c }
-func (c *captureLogger) WithGroup(string) log.Logger  { return c }
-func (c *captureLogger) Enabled(log.Level) bool       { return true }
-func (c *captureLogger) Sync(context.Context) error   { return nil }
+func (c *captureLogger) With(...any) log.Logger      { return c }
+func (c *captureLogger) WithGroup(string) log.Logger { return c }
+func (c *captureLogger) Enabled(int) bool            { return true }
+func (c *captureLogger) Sync(context.Context) error  { return nil }
 
 func (c *captureLogger) warnEntries() []captureEntry {
 	var out []captureEntry

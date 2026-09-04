@@ -4,14 +4,14 @@ package client
 import (
 	"time"
 
-	"github.com/LerianStudio/lib-observability/v2/log"
-	"github.com/LerianStudio/lib-observability/v2/tracing"
+	"github.com/LerianStudio/lib-observability/v4/log"
+	"github.com/LerianStudio/lib-systemplane/v3/internal/store"
 )
 
 // clientConfig holds the merged configuration applied by Option functions.
 type clientConfig struct {
 	logger         log.Logger
-	telemetry      *tracing.Telemetry
+	telemetry      store.Telemetry
 	listenChannel  string
 	pollInterval   time.Duration
 	debounce       time.Duration
@@ -46,7 +46,7 @@ func WithLogger(l log.Logger) Option {
 }
 
 // WithTelemetry sets the OpenTelemetry provider for spans and metrics.
-func WithTelemetry(t *tracing.Telemetry) Option {
+func WithTelemetry(t store.Telemetry) Option {
 	return func(cfg *clientConfig) {
 		if t != nil {
 			cfg.telemetry = t

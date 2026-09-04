@@ -4,9 +4,8 @@ import (
 	"database/sql"
 	"time"
 
-	"github.com/LerianStudio/lib-observability/v2/log"
-	"github.com/LerianStudio/lib-observability/v2/tracing"
-	internalclient "github.com/LerianStudio/lib-systemplane/v2/internal/client"
+	"github.com/LerianStudio/lib-observability/v4/log"
+	internalclient "github.com/LerianStudio/lib-systemplane/v3/internal/client"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
@@ -38,11 +37,18 @@ func NewMongoDB(client *mongo.Client, database string, opts ...Option) (*Client,
 	return (*Client)(c), nil
 }
 
-// WithLogger sets the structured logger.
-func WithLogger(l log.Logger) Option { return internalclient.WithLogger(l) }
+// WithLogger sets the structured logger. A nil logger discards every entry.
+func WithLogger(l Logger) Option { return internalclient.WithLogger(log.Adapt(l)) }
 
-// WithTelemetry sets the OpenTelemetry provider.
-func WithTelemetry(t *tracing.Telemetry) Option { return internalclient.WithTelemetry(t) }
+// WithTelemetry sets the OpenTelemetry provider. A nil provider disables
+// tracing and metrics.
+func WithTelemetry(t Telemetry) Option {
+	if log.IsNil(t) {
+		return internalclient.WithTelemetry(nil)
+	}
+
+	return internalclient.WithTelemetry(t)
+}
 
 // WithListenChannel overrides the Postgres LISTEN/NOTIFY channel name.
 func WithListenChannel(name string) Option { return internalclient.WithListenChannel(name) }

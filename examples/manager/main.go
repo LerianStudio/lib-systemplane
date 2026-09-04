@@ -29,8 +29,8 @@ import (
 	"time"
 
 	tmpostgres "github.com/LerianStudio/lib-commons/v6/commons/tenant-manager/postgres"
-	"github.com/LerianStudio/lib-observability/v2/log"
-	systemplane "github.com/LerianStudio/lib-systemplane/v2"
+	"github.com/LerianStudio/lib-observability/v4/log"
+	systemplane "github.com/LerianStudio/lib-systemplane/v3"
 )
 
 // tenantEvent is the minimal shape any tenant-lifecycle event source emits.

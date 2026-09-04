@@ -16,8 +16,8 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/LerianStudio/lib-observability/v2/log"
-	"github.com/LerianStudio/lib-observability/v2/tracing"
+	"github.com/LerianStudio/lib-observability/v4/log"
+	"github.com/LerianStudio/lib-systemplane/v3/internal/store"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 )
@@ -37,7 +37,7 @@ const (
 
 // metrics holds the OpenTelemetry instruments used by the Manager.
 type metrics struct {
-	telemetry                *tracing.Telemetry
+	telemetry                store.Telemetry
 	logger                   log.Logger
 	aggregateTenantThreshold int
 
@@ -56,7 +56,7 @@ type metrics struct {
 }
 
 // newMetrics constructs a metrics holder. Instruments are created lazily.
-func newMetrics(t *tracing.Telemetry, logger log.Logger, aggregateThreshold int) *metrics {
+func newMetrics(t store.Telemetry, logger log.Logger, aggregateThreshold int) *metrics {
 	if logger == nil {
 		logger = log.NewNop()
 	}
