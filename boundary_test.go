@@ -198,9 +198,17 @@ func checkParams(t *testing.T, fset *token.FileSet, file, fnName string, params 
 		//     today, since that is the position a coupled type reappears in;
 		//   - an interface declared HERE is checked whatever it is called: a
 		//     consumer cannot implement it without importing this module, so
-		//     it must at least be implementable.
+		//     it must at least be implementable;
+		//   - an ALIAS declared here is checked, because an alias is a rename
+		//     rather than a new type and slips past all three of the above:
+		//     "type Alias = log.Logger" is a bare identifier, so it is no
+		//     selector for the first gate to see, and it resolves to no
+		//     declaration this module owns for the third.
 		coupled := scope.coupledQualifier(param.Type) != ""
-		if !coupled && !isLoggerish(param.Names) && !namesLocalInterface(param.Type, scope) {
+		if !coupled &&
+			!isLoggerish(param.Names) &&
+			!namesLocalInterface(param.Type, scope) &&
+			!namesLocalAlias(param.Type, scope) {
 			continue
 		}
 
@@ -393,6 +401,40 @@ func namesLocalInterface(expr ast.Expr, scope *pkgScope) bool {
 		// constructor and never implements anything.
 		if sealed(iface, declScope, 0) {
 			continue
+		}
+
+		return true
+	}
+
+	return false
+}
+
+// namesLocalAlias reports whether expr names a type ALIAS declared by this
+// module.
+//
+// It is its own gate because an alias evades every other one. "type Alias =
+// log.Logger" appears in a signature as a bare identifier, so coupledQualifier
+// sees no selector to inspect; and resolve cannot follow it to a declaration
+// this module owns, because its target lives in another module, so
+// namesLocalInterface reports false. A parameter with a neutral name would
+// then be skipped entirely, which is the cheapest way to put a coupled
+// interface back into the public API.
+func namesLocalAlias(expr ast.Expr, scope *pkgScope) bool {
+	for _, name := range scope.qualify(expr) {
+		decl, isLocal := scope.declared[name]
+		if !isLocal || !decl.alias {
+			continue
+		}
+
+		// An alias to a SEALED interface stays exempt, exactly as naming that
+		// interface directly does: the unexported method makes it
+		// unimplementable outside its own package, so the consumer receives
+		// one from a constructor rather than supplying it.
+		if target, targetScope, resolvable := resolve(name, scope); resolvable {
+			if iface, isInterface := target.expr.(*ast.InterfaceType); isInterface &&
+				sealed(iface, targetScope, 0) {
+				continue
+			}
 		}
 
 		return true
@@ -866,6 +908,17 @@ func WithManagerTelemetry(provider *tracing.Telemetry) {}
 `,
 			wantHit: "lib-observability",
 		},
+		"a coupled type behind a local alias with a neutral parameter name": {
+			src: `package systemplane
+
+import "github.com/LerianStudio/lib-observability/v4/tracing"
+
+type Alias = *tracing.Telemetry
+
+func WithProvider(provider Alias) {}
+`,
+			wantHit: "lib-observability",
+		},
 		"a coupled type inside an ANONYMOUS interface's method": {
 			src: `package systemplane
 
@@ -1028,6 +1081,14 @@ func WithLogger(l interface {
 }) {
 }
 `,
+		"a sealed option interface reached through a local alias": `package systemplane
+
+import "example.test/tracing"
+
+type Opt = tracing.Option
+
+func Mount(opts ...Opt) {}
+`,
 		"a sealed option interface": `package systemplane
 
 import "example.test/tracing"
@@ -1071,9 +1132,9 @@ func NewManager(pgMgr *tmpostgres.Manager) {}
 // package under test — and returns the violation the checker reports for the
 // first examined parameter, or "" for none.
 //
-// It mirrors all three gates in checkParams: a parameter is examined when its
+// It mirrors all four gates in checkParams: a parameter is examined when its
 // type names a coupled module, OR its name looks loggerish, OR its type is a
-// local interface. Calling universalityViolation directly would bypass the
+// local interface, OR its type is a local alias. Calling universalityViolation directly would bypass the
 // sealed-interface exemption, which lives in namesLocalInterface.
 func checkFixture(t *testing.T, dependency, subject string) string {
 	t.Helper()
@@ -1110,7 +1171,10 @@ func checkFixture(t *testing.T, dependency, subject string) string {
 
 		for _, param := range fn.Type.Params.List {
 			coupled := scope.coupledQualifier(param.Type) != ""
-			if !coupled && !isLoggerish(param.Names) && !namesLocalInterface(param.Type, scope) {
+			if !coupled &&
+				!isLoggerish(param.Names) &&
+				!namesLocalInterface(param.Type, scope) &&
+				!namesLocalAlias(param.Type, scope) {
 				continue
 			}
 
