@@ -30,9 +30,9 @@ import (
 	"time"
 
 	tmcore "github.com/LerianStudio/lib-commons/v6/commons/tenant-manager/core"
-	"github.com/LerianStudio/lib-observability/v2/log"
-	"github.com/LerianStudio/lib-observability/v2/tracing"
-	"github.com/LerianStudio/lib-systemplane/v2/internal/store"
+	"github.com/LerianStudio/lib-observability/v4/log"
+	"github.com/LerianStudio/lib-observability/v4/tracing"
+	"github.com/LerianStudio/lib-systemplane/v3/internal/store"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -79,7 +79,7 @@ type Config struct {
 	Module string
 
 	Logger    log.Logger
-	Telemetry *tracing.Telemetry
+	Telemetry store.Telemetry
 }
 
 // compoundID is the shape of the document _id. The tuple lives in _id so that
@@ -446,7 +446,7 @@ func (s *Store) logWarn(ctx context.Context, msg string, fields ...log.Field) {
 		return
 	}
 
-	s.cfg.Logger.Log(ctx, log.LevelWarn, msg, fields...)
+	s.cfg.Logger.Log(ctx, log.LevelWarn, msg, fields)
 }
 
 func (s *Store) logInfo(ctx context.Context, msg string, fields ...log.Field) {
@@ -454,5 +454,5 @@ func (s *Store) logInfo(ctx context.Context, msg string, fields ...log.Field) {
 		return
 	}
 
-	s.cfg.Logger.Log(ctx, log.LevelInfo, msg, fields...)
+	s.cfg.Logger.Log(ctx, log.LevelInfo, msg, fields)
 }

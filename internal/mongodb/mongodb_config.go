@@ -3,7 +3,7 @@ package mongodb
 import (
 	"fmt"
 
-	"github.com/LerianStudio/lib-systemplane/v2/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v3/internal/store"
 	"go.opentelemetry.io/otel/trace/noop"
 )
 

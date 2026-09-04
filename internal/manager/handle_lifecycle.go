@@ -11,7 +11,7 @@ import (
 	"context"
 
 	tmevent "github.com/LerianStudio/lib-commons/v6/commons/tenant-manager/event"
-	"github.com/LerianStudio/lib-observability/v2/log"
+	"github.com/LerianStudio/lib-observability/v4/log"
 )
 
 // HandleTenantLifecycle routes a tenant lifecycle event to the matching On*

@@ -4,7 +4,7 @@ package manager
 import (
 	"context"
 
-	"github.com/LerianStudio/lib-observability/v2/log"
+	"github.com/LerianStudio/lib-observability/v4/log"
 )
 
 func (m *Manager) logDebug(ctx context.Context, msg string, fields ...log.Field) {
@@ -12,7 +12,7 @@ func (m *Manager) logDebug(ctx context.Context, msg string, fields ...log.Field)
 		return
 	}
 
-	m.logger.Log(ctx, log.LevelDebug, msg, fields...)
+	m.logger.Log(ctx, log.LevelDebug, msg, fields)
 }
 
 func (m *Manager) logInfo(ctx context.Context, msg string, fields ...log.Field) {
@@ -20,7 +20,7 @@ func (m *Manager) logInfo(ctx context.Context, msg string, fields ...log.Field) 
 		return
 	}
 
-	m.logger.Log(ctx, log.LevelInfo, msg, fields...)
+	m.logger.Log(ctx, log.LevelInfo, msg, fields)
 }
 
 func (m *Manager) logWarn(ctx context.Context, msg string, fields ...log.Field) {
@@ -28,5 +28,5 @@ func (m *Manager) logWarn(ctx context.Context, msg string, fields ...log.Field) 
 		return
 	}
 
-	m.logger.Log(ctx, log.LevelWarn, msg, fields...)
+	m.logger.Log(ctx, log.LevelWarn, msg, fields)
 }

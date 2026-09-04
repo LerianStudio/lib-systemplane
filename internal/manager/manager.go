@@ -27,8 +27,8 @@ import (
 	"sync"
 
 	tmpostgres "github.com/LerianStudio/lib-commons/v6/commons/tenant-manager/postgres"
-	"github.com/LerianStudio/lib-observability/v2/log"
-	"github.com/LerianStudio/lib-observability/v2/tracing"
+	"github.com/LerianStudio/lib-observability/v4/log"
+	"github.com/LerianStudio/lib-systemplane/v3/internal/store"
 )
 
 // MaxEntriesPerTenant is the defensive upper bound on cached entries per tenant.
@@ -72,7 +72,7 @@ type Manager struct {
 	callbacks sync.Map
 
 	logger    log.Logger
-	telemetry *tracing.Telemetry
+	telemetry store.Telemetry
 	metrics   *metrics
 
 	cfg config
@@ -121,7 +121,7 @@ type RegisteredKey struct {
 // config holds the merged ManagerOption values.
 type config struct {
 	logger                      log.Logger
-	telemetry                   *tracing.Telemetry
+	telemetry                   store.Telemetry
 	aggregateTenantThreshold    int
 	listenBackoffBaseMillis     int
 	listenBackoffCapSeconds     int
@@ -143,20 +143,21 @@ func defaultConfig() config {
 type Option func(*config)
 
 // WithLogger sets the structured logger for the Manager.
+//
+// Options are last-wins, nil included: a nil logger clears one set by an
+// earlier option, and New then substitutes a no-op logger.
 func WithLogger(l log.Logger) Option {
 	return func(c *config) {
-		if l != nil {
-			c.logger = l
-		}
+		c.logger = l
 	}
 }
 
 // WithTelemetry sets the OpenTelemetry provider for spans and metrics.
-func WithTelemetry(t *tracing.Telemetry) Option {
+// Last-wins, nil included: a nil provider clears one set by an earlier option
+// and disables spans and metrics.
+func WithTelemetry(t store.Telemetry) Option {
 	return func(c *config) {
-		if t != nil {
-			c.telemetry = t
-		}
+		c.telemetry = t
 	}
 }
 

@@ -7,7 +7,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/LerianStudio/lib-systemplane/v2/internal/manager"
+	"github.com/LerianStudio/lib-systemplane/v3/internal/manager"
 )
 
 // TestBackwardCompat_MTWithoutManager_OnChangeReturnsErr pins the v1.4.0

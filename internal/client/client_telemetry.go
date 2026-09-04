@@ -4,7 +4,7 @@ package client
 import (
 	"context"
 
-	"github.com/LerianStudio/lib-observability/v2/log"
+	"github.com/LerianStudio/lib-observability/v4/log"
 )
 
 func (c *Client) logWarn(ctx context.Context, msg string, fields ...log.Field) {
@@ -12,7 +12,7 @@ func (c *Client) logWarn(ctx context.Context, msg string, fields ...log.Field) {
 		return
 	}
 
-	c.logger.Log(ctx, log.LevelWarn, msg, fields...)
+	c.logger.Log(ctx, log.LevelWarn, msg, fields)
 }
 
 func (c *Client) logDebug(ctx context.Context, msg string, fields ...log.Field) {
@@ -20,7 +20,7 @@ func (c *Client) logDebug(ctx context.Context, msg string, fields ...log.Field) 
 		return
 	}
 
-	c.logger.Log(ctx, log.LevelDebug, msg, fields...)
+	c.logger.Log(ctx, log.LevelDebug, msg, fields)
 }
 
 func (c *Client) logError(ctx context.Context, msg string, fields ...log.Field) {
@@ -28,5 +28,5 @@ func (c *Client) logError(ctx context.Context, msg string, fields ...log.Field) 
 		return
 	}
 
-	c.logger.Log(ctx, log.LevelError, msg, fields...)
+	c.logger.Log(ctx, log.LevelError, msg, fields)
 }

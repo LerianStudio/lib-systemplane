@@ -13,8 +13,8 @@ import (
 	"time"
 
 	tmcore "github.com/LerianStudio/lib-commons/v6/commons/tenant-manager/core"
-	systemplane "github.com/LerianStudio/lib-systemplane/v2"
-	"github.com/LerianStudio/lib-systemplane/v2/internal/manager"
+	systemplane "github.com/LerianStudio/lib-systemplane/v3"
+	"github.com/LerianStudio/lib-systemplane/v3/internal/manager"
 	"github.com/bxcodec/dbresolver/v2"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/testcontainers/testcontainers-go"

@@ -24,8 +24,8 @@ import (
 	"time"
 
 	"github.com/LerianStudio/lib-commons/v6/commons/backoff"
-	"github.com/LerianStudio/lib-observability/v2/log"
-	libRuntime "github.com/LerianStudio/lib-observability/v2/runtime"
+	"github.com/LerianStudio/lib-observability/v4/log"
+	libRuntime "github.com/LerianStudio/lib-observability/v4/runtime"
 	"github.com/bxcodec/dbresolver/v2"
 	"github.com/jackc/pgx/v5"
 )

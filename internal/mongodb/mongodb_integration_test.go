@@ -10,9 +10,9 @@ import (
 	"time"
 
 	tmcore "github.com/LerianStudio/lib-commons/v6/commons/tenant-manager/core"
-	"github.com/LerianStudio/lib-systemplane/v2/internal/mongodb"
-	"github.com/LerianStudio/lib-systemplane/v2/internal/store"
-	"github.com/LerianStudio/lib-systemplane/v2/systemplanetest"
+	"github.com/LerianStudio/lib-systemplane/v3/internal/mongodb"
+	"github.com/LerianStudio/lib-systemplane/v3/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v3/systemplanetest"
 	"github.com/testcontainers/testcontainers-go"
 	mongocontainer "github.com/testcontainers/testcontainers-go/modules/mongodb"
 	"go.mongodb.org/mongo-driver/v2/mongo"

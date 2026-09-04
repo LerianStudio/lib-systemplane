@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
-	obsconstants "github.com/LerianStudio/lib-observability/v2/constants"
-	systemplane "github.com/LerianStudio/lib-systemplane/v2"
-	"github.com/LerianStudio/lib-systemplane/v2/admin"
+	obsconstants "github.com/LerianStudio/lib-observability/v4/constants"
+	systemplane "github.com/LerianStudio/lib-systemplane/v3"
+	"github.com/LerianStudio/lib-systemplane/v3/admin"
 	"github.com/gofiber/fiber/v3"
 )
 
