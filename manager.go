@@ -44,14 +44,19 @@ func NewManager(client *Client, pgMgr *tmpostgres.Manager, opts ...ManagerOption
 	return (*Manager)(m)
 }
 
-// WithManagerLogger sets the structured logger for the Manager.
-// A nil logger discards every entry.
+// WithManagerLogger sets the structured logger for the Manager. A nil logger
+// discards every entry and clears one set by an earlier option.
 func WithManagerLogger(l Logger) ManagerOption {
+	if log.IsNil(l) {
+		return internalmanager.WithLogger(nil)
+	}
+
 	return internalmanager.WithLogger(log.Adapt(l))
 }
 
-// WithManagerTelemetry sets the OpenTelemetry provider for the Manager.
-// A nil provider disables tracing and metrics.
+// WithManagerTelemetry sets the OpenTelemetry provider for the Manager. A nil
+// provider disables tracing and metrics, and clears one set by an earlier
+// option.
 func WithManagerTelemetry(t Telemetry) ManagerOption {
 	if log.IsNil(t) {
 		return internalmanager.WithTelemetry(nil)

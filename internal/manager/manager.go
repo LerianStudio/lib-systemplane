@@ -143,20 +143,21 @@ func defaultConfig() config {
 type Option func(*config)
 
 // WithLogger sets the structured logger for the Manager.
+//
+// Options are last-wins, nil included: a nil logger clears one set by an
+// earlier option, and New then substitutes a no-op logger.
 func WithLogger(l log.Logger) Option {
 	return func(c *config) {
-		if l != nil {
-			c.logger = l
-		}
+		c.logger = l
 	}
 }
 
 // WithTelemetry sets the OpenTelemetry provider for spans and metrics.
+// Last-wins, nil included: a nil provider clears one set by an earlier option
+// and disables spans and metrics.
 func WithTelemetry(t store.Telemetry) Option {
 	return func(c *config) {
-		if t != nil {
-			c.telemetry = t
-		}
+		c.telemetry = t
 	}
 }
 

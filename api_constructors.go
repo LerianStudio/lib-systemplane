@@ -37,11 +37,18 @@ func NewMongoDB(client *mongo.Client, database string, opts ...Option) (*Client,
 	return (*Client)(c), nil
 }
 
-// WithLogger sets the structured logger. A nil logger discards every entry.
-func WithLogger(l Logger) Option { return internalclient.WithLogger(log.Adapt(l)) }
+// WithLogger sets the structured logger. A nil logger discards every entry and
+// clears one set by an earlier option.
+func WithLogger(l Logger) Option {
+	if log.IsNil(l) {
+		return internalclient.WithLogger(nil)
+	}
+
+	return internalclient.WithLogger(log.Adapt(l))
+}
 
 // WithTelemetry sets the OpenTelemetry provider. A nil provider disables
-// tracing and metrics.
+// tracing and metrics, and clears one set by an earlier option.
 func WithTelemetry(t Telemetry) Option {
 	if log.IsNil(t) {
 		return internalclient.WithTelemetry(nil)

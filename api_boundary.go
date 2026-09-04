@@ -30,7 +30,8 @@ import (
 // fields accepts lib-observability log.Field values, a []log.Field carried as
 // a single element, or slog-style alternating key/value pairs.
 //
-// A nil Logger is accepted and discards every entry.
+// A nil Logger is accepted, discards every entry, and clears a logger set by
+// an earlier option.
 type Logger interface {
 	Log(ctx context.Context, level int, msg string, fields ...any)
 }
@@ -50,7 +51,8 @@ type Logger interface {
 //
 // Both methods may return an error; this library then falls back to a no-op
 // tracer or leaves the affected instruments disabled. A nil Telemetry is
-// accepted and disables tracing and metrics entirely.
+// accepted, disables tracing and metrics entirely, and clears a provider set
+// by an earlier option.
 type Telemetry interface {
 	Tracer(name string) (trace.Tracer, error)
 	Meter(name string) (metric.Meter, error)

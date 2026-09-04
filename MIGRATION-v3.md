@@ -81,6 +81,16 @@ type Telemetry interface {
 Both are built from types this library does not own a major of: stdlib types,
 and `go.opentelemetry.io/otel`, a stable v1 module the whole ecosystem shares.
 
+### One behaviour change beyond the types
+
+The four options are now **last-wins including nil**. In v2 a nil logger or a
+nil telemetry provider was silently ignored, so `WithTelemetry(t)` followed by
+`WithTelemetry(nil)` kept `t` — the opposite of what the second call asked for.
+A nil now clears whatever an earlier option set, and the constructor substitutes
+a no-op logger and disables spans and metrics. A single `WithLogger(nil)` or
+`WithTelemetry(nil)`, which is the only shape anyone actually writes, behaves
+exactly as it did.
+
 `Logger` is one method because one method is all this library calls. It has no
 `With`, `WithGroup`, `Enabled` or `Sync`, so a consumer can declare the same
 interface in its own package and satisfy the parameter while importing nothing
@@ -192,6 +202,15 @@ denylist of shapes rather than a signature snapshot, so it keeps working as the
 API grows, and it carries its own positive controls: `TestCheckerCatchesEvasions`
 pins eight shapes the checker must reject, `TestCheckerAcceptsLegitimateShapes`
 pins four it must not, so the gate cannot go quietly vacuous.
+
+It closes the bypasses an AST checker collects if nobody looks for them: a
+receiver with two type parameters (`ast.IndexListExpr`, which resolves to no
+name and skips every method on the type), an anonymous interface literal (which
+resolves to no name either, while its methods can name anything), the root
+package imported through its `/v3` path (whose last element is a version, not a
+package name, so a root type referenced from `admin/` would never resolve), and
+a dot import (which the checker cannot resolve at all, so it fails loudly rather
+than passing quietly). Each has a fixture that fails without its fix.
 
 `internal/` is deliberately outside the walk. Those packages still name
 `log.Logger` and use `tracing.HandleSpanError` freely; no consumer can import
