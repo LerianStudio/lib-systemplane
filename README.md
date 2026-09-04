@@ -2,19 +2,21 @@
 
 Dual-backend (PostgreSQL / MongoDB) hot-reload runtime configuration for Lerian services. Register operational knobs (log levels, feature flags, rate limits, circuit-breaker thresholds, worker intervals) at startup, mutate them at runtime without a pod restart, and — in single-tenant mode — subscribe to change events through a LISTEN/NOTIFY (Postgres) or change-stream (MongoDB) backed subscription. First-class support for the Lerian database-per-tenant model via the `lib-commons/v6` tenant-manager dispatch layer.
 
-This library was extracted from `lib-commons/v5/commons/systemplane`. The v2 line targets the Fiber v3 stack (`lib-commons/v6`) and uses `lib-observability/v2` for logging, tracing, telemetry, redaction, and panic recovery.
+This library was extracted from `lib-commons/v5/commons/systemplane`. The v3 line targets the Fiber v3 stack (`lib-commons/v6`) and uses `lib-observability/v4` internally for logging, tracing, telemetry, redaction, and panic recovery.
+
+The public API names none of that. `WithLogger` and `WithTelemetry` take interfaces declared by this library from stdlib and OpenTelemetry types only, so a logger or telemetry provider built against **any** lib-observability major satisfies them — see [`MIGRATION-v3.md`](MIGRATION-v3.md) for the v2 → v3 move.
 
 ## Requirements
 
 - Go `1.26.3` or newer
 - PostgreSQL 13+ **or** MongoDB 4.4+ (replica set required for change streams; polling fallback available for standalone MongoDB)
 - `github.com/LerianStudio/lib-commons/v6` for tenant-manager context, admin HTTP helpers, and backoff
-- `github.com/LerianStudio/lib-observability/v2` for logging, tracing, telemetry, redaction, and panic recovery
+- `github.com/LerianStudio/lib-observability/v4` for logging, tracing, telemetry, redaction, and panic recovery
 
 ## Installation
 
 ```bash
-go get github.com/LerianStudio/lib-systemplane/v2
+go get github.com/LerianStudio/lib-systemplane/v3
 ```
 
 ## Operating modes
@@ -61,7 +63,7 @@ import (
     "os"
 
     _ "github.com/jackc/pgx/v5/stdlib"
-    systemplane "github.com/LerianStudio/lib-systemplane/v2"
+    systemplane "github.com/LerianStudio/lib-systemplane/v3"
 )
 
 func main() {
@@ -130,7 +132,7 @@ import (
     "go.mongodb.org/mongo-driver/v2/mongo"
     "go.mongodb.org/mongo-driver/v2/mongo/options"
 
-    systemplane "github.com/LerianStudio/lib-systemplane/v2"
+    systemplane "github.com/LerianStudio/lib-systemplane/v3"
 )
 
 func main() {
@@ -188,7 +190,7 @@ import (
 
     tmpostgres "github.com/LerianStudio/lib-commons/v6/commons/tenant-manager/postgres"
     tmmiddleware "github.com/LerianStudio/lib-commons/v6/commons/tenant-manager/middleware"
-    systemplane "github.com/LerianStudio/lib-systemplane/v2"
+    systemplane "github.com/LerianStudio/lib-systemplane/v3"
     "github.com/gofiber/fiber/v3"
 )
 
@@ -257,7 +259,7 @@ import (
 
     tmmongo "github.com/LerianStudio/lib-commons/v6/commons/tenant-manager/mongo"
     tmmiddleware "github.com/LerianStudio/lib-commons/v6/commons/tenant-manager/middleware"
-    systemplane "github.com/LerianStudio/lib-systemplane/v2"
+    systemplane "github.com/LerianStudio/lib-systemplane/v3"
     "github.com/gofiber/fiber/v3"
 )
 
@@ -303,7 +305,7 @@ In multi-tenant mode the lib does NOT provision schema at runtime for Postgres �
 Mount the Fiber admin surface under a configurable path prefix (default `/system`):
 
 ```go
-import "github.com/LerianStudio/lib-systemplane/v2/admin"
+import "github.com/LerianStudio/lib-systemplane/v3/admin"
 
 admin.Mount(app, client,
     admin.WithPathPrefix("/system"),
