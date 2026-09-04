@@ -81,6 +81,13 @@ type Telemetry interface {
 Both are built from types this library does not own a major of: stdlib types,
 and `go.opentelemetry.io/otel`, a stable v1 module the whole ecosystem shares.
 
+`Logger` is one method because one method is all this library calls. It has no
+`With`, `WithGroup`, `Enabled` or `Sync`, so a consumer can declare the same
+interface in its own package and satisfy the parameter while importing nothing
+from lib-observability. `Telemetry` is two methods for the same reason: `Tracer`
+for backend spans, `Meter` for the Manager's instruments, and nothing else was
+ever read from the struct.
+
 ### One behaviour change beyond the types
 
 The four options are now **last-wins including nil**. In v2 a nil logger or a
@@ -90,13 +97,6 @@ A nil now clears whatever an earlier option set, and the constructor substitutes
 a no-op logger and disables spans and metrics. A single `WithLogger(nil)` or
 `WithTelemetry(nil)`, which is the only shape anyone actually writes, behaves
 exactly as it did.
-
-`Logger` is one method because one method is all this library calls. It has no
-`With`, `WithGroup`, `Enabled` or `Sync`, so a consumer can declare the same
-interface in its own package and satisfy the parameter while importing nothing
-from lib-observability. `Telemetry` is two methods for the same reason: `Tracer`
-for backend spans, `Meter` for the Manager's instruments, and nothing else was
-ever read from the struct.
 
 ---
 
