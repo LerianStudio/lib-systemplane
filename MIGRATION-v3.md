@@ -208,9 +208,13 @@ receiver with two type parameters (`ast.IndexListExpr`, which resolves to no
 name and skips every method on the type), an anonymous interface literal (which
 resolves to no name either, while its methods can name anything), the root
 package imported through its `/v3` path (whose last element is a version, not a
-package name, so a root type referenced from `admin/` would never resolve), and
-a dot import (which the checker cannot resolve at all, so it fails loudly rather
-than passing quietly). Each has a fixture that fails without its fix.
+package name, so a root type referenced from `admin/` would never resolve), a
+dot import (which the checker cannot resolve at all, so it fails loudly rather
+than passing quietly), and a local type alias — a rename rather than a new type,
+which appears as a bare identifier no selector gate sees and resolves to no
+declaration this module owns, making `type Alias = log.Logger` under a neutral
+parameter name the cheapest way to put a coupled interface back in. Each has a
+fixture that fails without its fix.
 
 `internal/` is deliberately outside the walk. Those packages still name
 `log.Logger` and use `tracing.HandleSpanError` freely; no consumer can import
