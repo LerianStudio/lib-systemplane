@@ -3,7 +3,7 @@ module github.com/LerianStudio/lib-systemplane/v3
 go 1.26.3
 
 require (
-	github.com/LerianStudio/lib-commons/v7 v7.1.0-beta.1
+	github.com/LerianStudio/lib-commons/v7 v7.0.0
 	github.com/LerianStudio/lib-observability/v4 v4.0.1
 	github.com/bxcodec/dbresolver/v2 v2.3.0
 	github.com/gofiber/fiber/v3 v3.4.0
