@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	tmcore "github.com/LerianStudio/lib-commons/v6/commons/tenant-manager/core"
+	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
 	systemplane "github.com/LerianStudio/lib-systemplane/v3"
 	"github.com/LerianStudio/lib-systemplane/v3/internal/postgres"
 	"github.com/LerianStudio/lib-systemplane/v3/internal/store"

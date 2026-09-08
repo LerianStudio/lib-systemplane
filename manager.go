@@ -12,7 +12,7 @@
 package systemplane
 
 import (
-	tmpostgres "github.com/LerianStudio/lib-commons/v6/commons/tenant-manager/postgres"
+	tmpostgres "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/postgres"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	internalclient "github.com/LerianStudio/lib-systemplane/v3/internal/client"
 	internalmanager "github.com/LerianStudio/lib-systemplane/v3/internal/manager"
