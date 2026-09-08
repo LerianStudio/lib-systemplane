@@ -1111,7 +1111,7 @@ func WithTelemetry(t Telemetry) {}
 `,
 		"a lib-commons handle, which is out of scope by design": `package systemplane
 
-import tmpostgres "github.com/LerianStudio/lib-commons/v6/commons/tenant-manager/postgres"
+import tmpostgres "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/postgres"
 
 func NewManager(pgMgr *tmpostgres.Manager) {}
 `,

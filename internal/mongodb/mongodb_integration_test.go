@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	tmcore "github.com/LerianStudio/lib-commons/v6/commons/tenant-manager/core"
+	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
 	"github.com/LerianStudio/lib-systemplane/v3/internal/mongodb"
 	"github.com/LerianStudio/lib-systemplane/v3/internal/store"
 	"github.com/LerianStudio/lib-systemplane/v3/systemplanetest"

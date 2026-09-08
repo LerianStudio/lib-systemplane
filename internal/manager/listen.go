@@ -23,7 +23,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/LerianStudio/lib-commons/v6/commons/backoff"
+	"github.com/LerianStudio/lib-commons/v7/commons/backoff"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	libRuntime "github.com/LerianStudio/lib-observability/v4/runtime"
 	"github.com/bxcodec/dbresolver/v2"
