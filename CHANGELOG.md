@@ -1,5 +1,24 @@
 # Lib-systemplane Changelog
 
+## [2.1.0](https://github.com/LerianStudio/lib-systemplane/releases/tag/v2.1.0)
+
+Features:
+- Expanded the logger boundary to support universal types and transitioned to `/v3`. (@fredcamaral)
+
+Fixes:
+- Adjusted the behavior of a nil logger or telemetry option to clear any previously set provider. (@fredcamaral)
+
+Improvements:
+- Enhanced documentation by recording the observability boundary for `v3` and noting the manual `v3.0.0` tag. (@fredcamaral)
+- Updated documentation to include the alias bypass among the boundary-checker gaps and repositioned the nil-option note following the interface rationale. (@fredcamaral)
+- Improved testing by closing four bypasses in the exported-boundary checker and gating parameters typed as a local alias in the boundary checker. (@fredcamaral)
+- Raised four indirect dependencies to surpass their advisories. (@fredcamaral)
+- Migrated CI workflow jobs to Blacksmith runners, including the `.github/workflows/go-combined-analysis.yml` file. (@fredcamaral)
+
+[Compare changes](https://github.com/LerianStudio/lib-systemplane/compare/v2.0.0...v2.1.0)
+
+---
+
 ## [2.0.0](https://github.com/LerianStudio/lib-systemplane/releases/tag/v2.0.0)
 
 Features:
