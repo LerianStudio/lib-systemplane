@@ -1,6 +1,6 @@
 package systemplane
 
-import internalclient "github.com/LerianStudio/lib-systemplane/v2/internal/client"
+import internalclient "github.com/LerianStudio/lib-systemplane/v3/internal/client"
 
 // CatalogVersion identifies the public catalog response contract.
 const CatalogVersion = internalclient.CatalogVersion

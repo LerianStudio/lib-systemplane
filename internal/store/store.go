@@ -10,7 +10,26 @@ import (
 	"context"
 	"errors"
 	"time"
+
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 )
+
+// Telemetry is the OpenTelemetry provider contract the backends and the
+// Manager accept.
+//
+// It names only go.opentelemetry.io/otel types — a stable v1 module — so it
+// carries no other library's major version. lib-observability's
+// *tracing.Telemetry satisfies it directly, from any major. It mirrors the
+// public systemplane.Telemetry; the compiler enforces that the two agree,
+// because a value accepted at the public boundary is passed straight here.
+//
+// Implementations must be safe to call with a nil receiver: both methods
+// return an error rather than panicking when no provider is configured.
+type Telemetry interface {
+	Tracer(name string) (trace.Tracer, error)
+	Meter(name string) (metric.Meter, error)
+}
 
 // Op classifies a change event delivered by a backend changefeed.
 const (

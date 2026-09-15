@@ -19,7 +19,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/LerianStudio/lib-observability/v2/log"
+	"github.com/LerianStudio/lib-observability/v4/log"
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"

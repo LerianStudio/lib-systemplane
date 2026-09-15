@@ -3,8 +3,8 @@ package mongodb
 import (
 	"hash/fnv"
 
-	"github.com/LerianStudio/lib-observability/v2/runtime"
-	"github.com/LerianStudio/lib-systemplane/v2/internal/store"
+	"github.com/LerianStudio/lib-observability/v4/runtime"
+	"github.com/LerianStudio/lib-systemplane/v3/internal/store"
 )
 
 // seenEntry records what we already emitted at the current watermark boundary.

@@ -2,7 +2,7 @@
 
 package systemplane
 
-import internalclient "github.com/LerianStudio/lib-systemplane/v2/internal/client"
+import internalclient "github.com/LerianStudio/lib-systemplane/v3/internal/client"
 
 // TestStore is the public mirror of the internal store.Store interface,
 // exposed solely for [NewForTesting].

@@ -8,7 +8,7 @@ import (
 	"reflect"
 	"time"
 
-	"github.com/LerianStudio/lib-systemplane/v2/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v3/internal/store"
 )
 
 // TestStore is the public mirror of the internal store.Store interface,

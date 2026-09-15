@@ -10,7 +10,7 @@ package manager
 import (
 	"context"
 
-	tmcore "github.com/LerianStudio/lib-commons/v6/commons/tenant-manager/core"
+	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
 )
 
 // TenantIDFromContext extracts the tenant ID set by lib-commons tenant-manager

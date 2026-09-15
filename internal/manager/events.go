@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/LerianStudio/lib-observability/v2/log"
-	libRuntime "github.com/LerianStudio/lib-observability/v2/runtime"
+	"github.com/LerianStudio/lib-observability/v4/log"
+	libRuntime "github.com/LerianStudio/lib-observability/v4/runtime"
 )
 
 // applyEvent updates the cache and dispatches OnChange callbacks for one

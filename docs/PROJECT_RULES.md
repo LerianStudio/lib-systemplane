@@ -62,7 +62,7 @@ lib-systemplane/
 
 - **Minimum**: Go 1.26.3
 - Keep `go.mod` updated with latest stable Go version
-- Module path: `github.com/LerianStudio/lib-systemplane/v2`
+- Module path: `github.com/LerianStudio/lib-systemplane/v3`
 
 ### Build Tags
 
@@ -93,7 +93,7 @@ import (
     "go.uber.org/zap"
 
     // Internal packages
-    "github.com/LerianStudio/lib-observability/v2/log"
+    "github.com/LerianStudio/lib-observability/v4/log"
 )
 ```
 
@@ -323,8 +323,8 @@ func (c *Client) Connect(ctx context.Context) error {
 Lerian shared-library ownership is split intentionally:
 
 - `github.com/LerianStudio/lib-commons/v6` — non-observability shared primitives. This repo uses `commons/tenant-manager/core`, `commons/net/http`, and `commons/backoff`.
-- `github.com/LerianStudio/lib-observability/v2` — canonical observability stack. This repo uses `log`, `tracing`, and `runtime` for structured logging, telemetry, span helpers, redaction, and panic recovery.
-- `github.com/LerianStudio/lib-systemplane/v2` — runtime-mutable configuration. Do not duplicate its functionality in service repositories.
+- `github.com/LerianStudio/lib-observability/v4` — canonical observability stack. This repo uses `log`, `tracing`, and `runtime` for structured logging, telemetry, span helpers, redaction, and panic recovery. **Internally only:** no exported parameter may name a type from it. The public boundary is `systemplane.Logger` and `systemplane.Telemetry`, declared in this module from stdlib + `go.opentelemetry.io/otel` types, and `boundary_test.go` enforces it. Rationale and the v2 → v3 move: [`MIGRATION-v3.md`](../MIGRATION-v3.md).
+- `github.com/LerianStudio/lib-systemplane/v3` — runtime-mutable configuration. Do not duplicate its functionality in service repositories.
 - `github.com/LerianStudio/lib-streaming` — tenant-scoped event streaming. Do not add it to this repo unless a task explicitly requires streaming integration.
 
 Do not reintroduce observability packages from `lib-commons`; they are being removed from that module. New observability code must use `lib-observability`.

@@ -10,7 +10,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/LerianStudio/lib-observability/v2/tracing"
+	"github.com/LerianStudio/lib-observability/v4/tracing"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 )
 

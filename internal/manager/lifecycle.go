@@ -9,7 +9,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/LerianStudio/lib-observability/v2/log"
+	"github.com/LerianStudio/lib-observability/v4/log"
 )
 
 // OnTenantActivated bootstraps systemplane state for tenantID.

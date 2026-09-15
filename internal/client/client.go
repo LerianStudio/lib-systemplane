@@ -12,14 +12,13 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
-	"github.com/LerianStudio/lib-observability/v2/log"
-	"github.com/LerianStudio/lib-observability/v2/runtime"
-	"github.com/LerianStudio/lib-observability/v2/tracing"
-	"github.com/LerianStudio/lib-systemplane/v2/internal/debounce"
-	"github.com/LerianStudio/lib-systemplane/v2/internal/manager"
-	mongoDB "github.com/LerianStudio/lib-systemplane/v2/internal/mongodb"
-	"github.com/LerianStudio/lib-systemplane/v2/internal/postgres"
-	"github.com/LerianStudio/lib-systemplane/v2/internal/store"
+	"github.com/LerianStudio/lib-observability/v4/log"
+	"github.com/LerianStudio/lib-observability/v4/runtime"
+	"github.com/LerianStudio/lib-systemplane/v3/internal/debounce"
+	"github.com/LerianStudio/lib-systemplane/v3/internal/manager"
+	mongoDB "github.com/LerianStudio/lib-systemplane/v3/internal/mongodb"
+	"github.com/LerianStudio/lib-systemplane/v3/internal/postgres"
+	"github.com/LerianStudio/lib-systemplane/v3/internal/store"
 )
 
 // refreshTimeout bounds Get calls made by the changefeed-driven refresh loop.
@@ -42,7 +41,7 @@ type Client struct {
 	store     store.Store
 	debouncer *debounce.Debouncer[nskey]
 	logger    log.Logger
-	telemetry *tracing.Telemetry
+	telemetry store.Telemetry
 
 	multiTenant    bool
 	catalogService string

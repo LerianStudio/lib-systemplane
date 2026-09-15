@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/LerianStudio/lib-observability/v2/log"
-	"github.com/LerianStudio/lib-observability/v2/runtime"
+	"github.com/LerianStudio/lib-observability/v4/log"
+	"github.com/LerianStudio/lib-observability/v4/runtime"
 )
 
 // Debouncer coalesces rapid submissions for the same key, firing the

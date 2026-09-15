@@ -37,9 +37,9 @@ import (
 	"net/url"
 	"strings"
 
-	commonshttp "github.com/LerianStudio/lib-commons/v6/commons/net/http"
-	"github.com/LerianStudio/lib-observability/v2/log"
-	systemplane "github.com/LerianStudio/lib-systemplane/v2"
+	commonshttp "github.com/LerianStudio/lib-commons/v7/commons/net/http"
+	"github.com/LerianStudio/lib-observability/v4/log"
+	systemplane "github.com/LerianStudio/lib-systemplane/v3"
 	"github.com/gofiber/fiber/v3"
 )
 

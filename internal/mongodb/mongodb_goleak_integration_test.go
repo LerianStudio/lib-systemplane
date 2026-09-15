@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/LerianStudio/lib-systemplane/v2/internal/mongodb"
-	"github.com/LerianStudio/lib-systemplane/v2/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v3/internal/mongodb"
+	"github.com/LerianStudio/lib-systemplane/v3/internal/store"
 	"go.uber.org/goleak"
 )
 

@@ -8,8 +8,8 @@ import (
 	"sort"
 	"time"
 
-	"github.com/LerianStudio/lib-observability/v2/log"
-	"github.com/LerianStudio/lib-systemplane/v2/internal/manager"
+	"github.com/LerianStudio/lib-observability/v4/log"
+	"github.com/LerianStudio/lib-systemplane/v3/internal/manager"
 )
 
 // ListEntry is a single entry returned by [Client.List].

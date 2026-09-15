@@ -4,10 +4,11 @@ This file provides repository-specific guidance for coding agents working on `li
 
 ## Project snapshot
 
-- Module: `github.com/LerianStudio/lib-systemplane/v2`
+- Module: `github.com/LerianStudio/lib-systemplane/v3`
 - Language: Go
 - Go version: `1.26.3` (see `go.mod`)
-- Current API generation: v2.x Fiber v3 stack (extracted from `lib-commons/v5`; built on `lib-commons/v6`, `lib-observability/v2`, and `gofiber/fiber/v3`)
+- Current API generation: v3.x Fiber v3 stack (extracted from `lib-commons/v5`; built on `lib-commons/v6`, `lib-observability/v4`, and `gofiber/fiber/v3`)
+- Observability boundary: the public API accepts `systemplane.Logger` and `systemplane.Telemetry`, interfaces declared in this module from stdlib + `go.opentelemetry.io/otel` types only. `lib-observability` must never appear in an exported PARAMETER — `boundary_test.go` fails the build if it does. Returns may stay rich (`(*Client).Logger()` returns `log.Logger`). Internal packages use `lib-observability/v4` freely. See [`MIGRATION-v3.md`](MIGRATION-v3.md).
 
 ## Primary objective for changes
 
@@ -21,7 +22,7 @@ This file provides repository-specific guidance for coding agents working on `li
 Root (package `systemplane`):
 - Small public API facade: `api_*.go` plus `doc.go`. Public types are aliases to
   `internal/client` where practical so the root import path remains
-  `github.com/LerianStudio/lib-systemplane/v2`.
+  `github.com/LerianStudio/lib-systemplane/v3`.
 
 Subpackages:
 - `admin/` — Fiber HTTP handlers for the admin surface
@@ -45,8 +46,8 @@ Scaffolding:
 Lerian shared-library boundaries are now split across four libraries:
 
 - `github.com/LerianStudio/lib-commons/v6` — non-observability shared primitives used here: `commons/tenant-manager/core`, `commons/net/http`, and `commons/backoff`.
-- `github.com/LerianStudio/lib-observability/v2` — canonical observability stack: `log`, `tracing`, redaction helpers, span helpers, telemetry lifecycle, and `runtime` panic recovery.
-- `github.com/LerianStudio/lib-systemplane/v2` — this module; runtime-mutable configuration with Postgres/MongoDB backends.
+- `github.com/LerianStudio/lib-observability/v4` — canonical observability stack: `log`, `tracing`, redaction helpers, span helpers, telemetry lifecycle, and `runtime` panic recovery. Used **internally only**; it must not appear in an exported parameter (see the observability boundary above).
+- `github.com/LerianStudio/lib-systemplane/v3` — this module; runtime-mutable configuration with Postgres/MongoDB backends.
 - `github.com/LerianStudio/lib-streaming` — tenant-scoped event streaming; do not introduce it here unless a task explicitly asks for streaming integration.
 
 These are external module imports. Do not rewrite them to in-repo paths. Do not reintroduce observability imports from `lib-commons`; observability has moved to `lib-observability`.
@@ -80,7 +81,7 @@ The Client runs in one of two modes selected at construction:
 - Listing/metadata: `List(ctx, namespace) ([]ListEntry, error)`, `KeyDescription`, `KeyRedaction`, `IsRegistered`, `Logger()`.
 - Subscriptions: `OnChange(ns, key, fn) (unsubscribe func(), error)`. Returns `ErrNotSupportedInMultiTenant` in multi-tenant mode. Callbacks invoked serially with panic recovery via `lib-observability/runtime.RecoverAndLog`.
 - Registered keys carry: default value, description, validator func, redaction policy (`RedactNone | RedactMask | RedactFull`). Options: `WithDescription`, `WithValidator`, `WithRedaction`.
-- Client options: `WithLogger`, `WithTelemetry`, `WithDebounce` (default 100ms), `WithListenChannel` (Postgres default `"systemplane_changes"`), `WithTable` (Postgres default `"systemplane_entries"`), `WithCollection` (MongoDB default `"systemplane_entries"`), `WithPollInterval` (MongoDB — switches to polling), `WithMultiTenantEnabled()`, `WithModule(name)` (default `"systemplane"`).
+- Client options: `WithLogger` (takes [`Logger`](api_boundary.go)), `WithTelemetry` (takes [`Telemetry`](api_boundary.go)), `WithDebounce` (default 100ms), `WithListenChannel` (Postgres default `"systemplane_changes"`), `WithTable` (Postgres default `"systemplane_entries"`), `WithCollection` (MongoDB default `"systemplane_entries"`), `WithPollInterval` (MongoDB — switches to polling), `WithMultiTenantEnabled()`, `WithModule(name)` (default `"systemplane"`).
 - Admin HTTP surface (`admin` subpackage): `Mount(router, client, opts...)` registers four routes at a configurable prefix (default `/system`): `GET :prefix/:namespace`, `GET :prefix/:namespace/:key`, `PUT :prefix/:namespace/:key`, `DELETE :prefix/:namespace/:key`. Options: `WithPathPrefix`, `WithAuthorizer(fn func(fiber.Ctx, action string) error)` — default-deny — and `WithActorExtractor`. The `action` argument is `"read"` (GET) or `"write"` (PUT/DELETE). In multi-tenant mode the caller MUST mount tenant-manager middleware before `admin.Mount` so handler `c.Context()` carries the resolved tenant database.
 - Internal `Store` interface (`internal/store`): `Start`, `Close`, `Get`, `Set`, `Delete`, `List`, `Subscribe`. Implemented by `internal/postgres` and `internal/mongodb`. Backend-agnostic contract suite lives in `systemplanetest.Run(t, factory, RunOptions{SkipSubscribe: ...})` — multi-tenant modes pass `SkipSubscribe: true`.
 - Sentinel errors: `ErrClosed`, `ErrNotStarted`, `ErrRegisterAfterStart`, `ErrUnknownKey`, `ErrValidation`, `ErrDuplicateKey`, `ErrNilContext`, `ErrNotSupportedInMultiTenant`, `ErrTenantConnectionMissing`.
@@ -94,7 +95,8 @@ The Client runs in one of two modes selected at construction:
 - Keep exported docs aligned with behavior.
 - Reuse existing package patterns before introducing new abstractions.
 - Avoid introducing high-cardinality telemetry labels by default.
-- Use the `lib-observability/log` structured log interface (`Log(ctx, level, msg, fields...)`) — do not add printf-style methods.
+- Use the `lib-observability/log` structured log interface (`Log(ctx, level, msg, fields...)`) — do not add printf-style methods. In v4 the variadic is `...any`, so a `[]log.Field` is passed as ONE argument, not spread.
+- Never name a `lib-observability` type in an exported parameter. Accept `Logger` / `Telemetry` and convert at the boundary (`log.Adapt`).
 
 ## Testing and validation
 
