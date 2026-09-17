@@ -17,11 +17,11 @@
 
 - **D1 — One engine, not two.** `internal/manager` is deleted. `internal/client` keeps registry, options, catalog, redaction, value cloning and the facade adapter; cache, hydrate, refresh, subscribe and dispatch move to `internal/engine`. Root `Manager`, `NewManager`, `OnTenant*`, `Drain`, `IsClosed` are removed; `HandleTenantLifecycle` moves onto `Client`. Verified defects this closes in one place: no resync after reconnect (Postgres ST, Manager MT, Mongo re-open); `staleAfter` counter counts drops not retries so a hard outage never marks stale; warm-load before LISTEN; listener-open failure leaves a fresh-looking cache; validator skipped on hydrate/refresh/warm-load/per-request read; callback receives no tenant; delete publishes default in ST and `nil` in MT; MT callback runs on the LISTEN goroutine and receives the live cached object (data race); NOTIFY whose re-read finds no row drops the callback; `BindManager` accepts a Mongo client.
 - **D2 — Convergence by reconciliation, not by trusting the feed.** Every `Store.Subscribe` emits `OpResync` after each (re)connect. The engine answers `OpResync` with `List(scope)` and republishes every registered key whose revision differs, fenced two ways against the feed: (a) every publication into a scope's cache, whether from a feed event, a `Set`, or a resync, goes through one per-(scope, key) publish step that accepts an upsert only when its revision is greater than the cached revision (or the cached revision is unknown), so a stale `List` row can never overwrite a newer feed publication; (b) while a reconcile is in flight the engine records every key the feed touched since the `List` began and skips those keys when applying the `List` result, so a key deleted-then-recreated, or absent in an old `List`, is decided by the feed, not by the snapshot (this is the `hydrationTouched` pattern the v3 single-tenant client already uses at `Start`). A feed delete (revision 0) always publishes the default; a resync-absent only publishes the default when the feed did not touch the key during the reconcile. Until the first reconcile completes, and whenever the feed is down, the scope is `Stale`; reads keep serving the last published value (never block, never erase), and `Entry.Stale` / `Snapshot.Stale` expose it. No resume tokens (reconcile covers the gap).
-- **D3 — Revision is the identity of a published value.** Postgres gains a `revision BIGINT` column bumped by a BEFORE UPDATE trigger when `value` changes; NOTIFY carries it; MongoDB `$inc`s a `revision` field. Revision 0 means "no row: registered default in force". The same non-zero revision seen twice = no callback (Revision 0 is never deduplicated), but the re-read still refreshes the cached `updated_at` / `updated_by` so `GetEntry` provenance never lags the row. No compare-and-set in v4.0 (additive later: `If-Match` on admin PUT).
+- **D3 — Revision is the identity of a published value.** Postgres gains a `revision BIGINT` column bumped by a BEFORE UPDATE trigger when `value` changes; NOTIFY carries it; MongoDB `$inc`s a `revision` field through the lib's writer; MongoDB has no triggers, so a foreign writer (a Console process writing the collection directly) may change `value` without bumping `revision`. The engine therefore also publishes when the revision is unchanged but the value bytes differ, so a non-bumping writer is observed rather than deduplicated away. Revision 0 means "no row: registered default in force". The same non-zero revision seen twice = no callback (Revision 0 is never deduplicated), but the re-read still refreshes the cached `updated_at` / `updated_by` so `GetEntry` provenance never lags the row. No compare-and-set in v4.0 (additive later: `If-Match` on admin PUT).
 - **D4 — Read-your-writes in every mode.** `Set` publishes to the caller's scope cache with the revision the store returned before returning; the feed echo dedupes by revision.
 - **D5 — Typed groups are one key each.** `Bind[T]` registers `(namespace, key)` whose value is the JSON document of `T`. Atomicity of a group = atomicity of one row. No cross-key transactions.
-- **D6 — Multi-tenant is Postgres only; MongoDB is single-tenant only.** `NewMongoDB` with `WithMultiTenantEnabled()` returns an error at construction. Zero consumers use the MongoDB backend today; MongoDB stays because the unified engine makes it nearly free, and Fred may delete it instead (open option, not blocking).
-- **D7 — Tenant activation: lazy on first read, plus lifecycle events.** With `WithTenantManager(pgMgr)`, the first read for tenant X activates its scope (resolve DSN via connector, subscribe, reconcile). `Client.HandleTenantLifecycle` keeps handling suspended/deleted/credentials-rotated (and activated, idempotently). Suspended and Deleted drop the scope AND leave a `blocked` marker for that tenant: a read for a blocked tenant never re-activates it (it falls through to the per-request path, which the tenant-manager itself refuses for a suspended tenant); only an Activated event clears the marker; CredentialsRotated on a blocked tenant keeps the marker and re-activates nothing. Activation is single-flight per tenant and atomic: subscribe, then reconcile; if either step fails, the engine unsubscribes, discards the partial cache and scope state, leaves no marker, and the next read retries from scratch. Reads that arrive while an activation is in flight go per-request; they do not block and do not start a second activation. Consumers no longer copy a `systemplane_lifecycle.go`.
+- **D6 — Both backends, both modes (Fred, 2026-09-17).** MongoDB is a first-class backend in single- AND multi-tenant mode, with the same guarantees as Postgres: revision per document, `OpResync` after every change-stream (re)open, per-tenant change streams through the tenant-manager Mongo connector, per-tenant cached scopes in the engine. Reason: the Console (product-console) will consume systemplane and runs on MongoDB only. Today no Go consumer uses Mongo, so the Console is the first; its storage shape is FC-9 and is treated as a cross-product contract. Change streams need a replica set; `WithPollInterval` remains the fallback for standalone Mongo and must honor the same `OpResync` and revision rules.
+- **D7 — Tenant activation: lazy on first read, plus lifecycle events.** With `WithPostgresTenantManager(pgMgr)` or `WithMongoTenantManager(mbMgr)`, the first read for tenant X activates its scope (resolve DSN via connector, subscribe, reconcile). `Client.HandleTenantLifecycle` keeps handling suspended/deleted/credentials-rotated (and activated, idempotently). Suspended and Deleted drop the scope AND leave a `blocked` marker for that tenant: a read for a blocked tenant never re-activates it (it falls through to the per-request path, which the tenant-manager itself refuses for a suspended tenant); only an Activated event clears the marker; CredentialsRotated on a blocked tenant keeps the marker and re-activates nothing. Activation is single-flight per tenant and atomic: subscribe, then reconcile; if either step fails, the engine unsubscribes, discards the partial cache and scope state, leaves no marker, and the next read retries from scratch. Reads that arrive while an activation is in flight go per-request; they do not block and do not start a second activation. Consumers no longer copy a `systemplane_lifecycle.go`.
 - **D8 — Canonical names only.** `WithTable`, `WithListenChannel`, `WithCollection` are removed (`systemplane_entries` / `systemplane_changes`). `DefaultSeedSQL()` and `ddl/default_seed.sql` are removed: defaults live in code; consumers who want persisted overrides write their own migration. Known breakage: billing-worker and plugin-br-pix-jd call `WithListenChannel`; billing-worker, plugin-br-pix-jd and finance-hub have DDL generators built on `DefaultSeedSQL()`. billing-worker (v2.0.0) and finance-hub (v1.6.0) migrate majors anyway; plugin-br-pix-jd is on v3.0.0 and takes the v4 hop like everyone else; `MIGRATION-v4.md` names each.
 - **D9 — Facade kept for the per-key API.** `Register`, `Get*`, `Set`, `Delete`, `List`, `Catalog*`, `OnChange` (new signature), `KeyDescription`, `KeyRedaction`, `IsRegistered`, `Logger`, `NewForTesting` stay. Admin HTTP keeps its four routes.
 - **D10 — `Close` replaces `Drain`.** `Client.Close()` keeps its signature: it cancels every scope's feed and the ctx handed to every in-flight callback, then waits for dispatch workers to exit up to a bound (`WithCloseTimeout`, default 30s). Cancellation is cooperative: a callback that honors ctx ends and Close returns nil with no goroutine left; a callback that ignores ctx makes Close return `ErrCloseTimeout` naming the (scope, key) still running, and that goroutine is the subscriber's leak, made visible rather than hidden.
@@ -39,8 +39,9 @@
 | br-consignado-gw | v2.0.0 | ST | no | |
 | go-boilerplate-ddd | v2.0.0 | ST | no | template: update last |
 | plugin-br-pix-lerian | none in go.mod | — | — | only a mount helper |
+| product-console (planned) | — | MT, **MongoDB only** | n/a | first Mongo consumer; drives D6 and FC-9 |
 
-Nobody consumes the MongoDB backend. Nobody consumes current `develop`.
+No Go consumer uses the MongoDB backend yet; the Console will. Nobody consumes current `develop`.
 
 ## Lane Overview
 
@@ -48,13 +49,13 @@ Nobody consumes the MongoDB backend. Nobody consumes current `develop`.
 |------|----------|-----------|------|-------------------|------|--------|
 | contracts | `/v4` module path; `Store` interface with `Scope` + `Revision` + `OpResync` and compiling shims in both backends; connector moved to `internal/postgres`; public `Change`, new `OnChange` signature, `Entry` + `GetEntry` shims; all in-repo callers and tests updated | none | 1 | `/srv/worktrees/v4-contracts` / `feat/v4-contracts` | lane-contracts.md | Pending |
 | engine-core | `internal/engine` replacing Client cache + Manager for the single-tenant scope: ingress, reconcile on `OpResync`, revision dedupe, coalescing dispatch, read-your-writes, delete→default; `internal/manager` and root Manager API deleted; options in D8 removed; Mongo MT rejected at construction | contracts | 2 | `/srv/worktrees/v4-engine-core` / `feat/v4-engine-core` | lane-engine-core.md | Pending |
-| storage | Postgres: scope resolution via connector, `RETURNING revision`, per-tenant `Subscribe(scope)` LISTEN, `OpResync` after (re)connect, revision in NOTIFY; MongoDB: `revision` `$inc`, `OpResync` after stream re-open, MT `Subscribe` → `ErrNotSupportedInMultiTenant`; DDL v4 + `migrate_v3_to_v4.sql`; `DefaultSeedSQL` removed; contract suite extended | contracts | 2 | `/srv/worktrees/v4-storage` / `feat/v4-storage` | lane-storage.md | Pending |
+| storage | Postgres: scope resolution via connector, `RETURNING revision`, per-tenant `Subscribe(scope)` LISTEN, `OpResync` after (re)connect, revision in NOTIFY; MongoDB: `revision` `$inc`, `OpResync` after stream re-open and after every polling round-trip failure, tenant connector + per-tenant `Subscribe(scope)` change stream; DDL v4 + `migrate_v3_to_v4.sql`; `DefaultSeedSQL` removed; contract suite extended and run against both backends in both modes | contracts | 2 | `/srv/worktrees/v4-storage` / `feat/v4-storage` | lane-storage.md | Pending |
 | groups | `Bind[T]`, `Group[T].Snapshot/Set/OnApply/Status` over the per-key facade | contracts | 2 | `/srv/worktrees/v4-groups` / `feat/v4-groups` | lane-groups.md | Pending |
-| engine-tenants | `WithTenantManager`, lazy activation, `Client.HandleTenantLifecycle`, per-scope feeds through `Store.Subscribe(scope)`, stale marking, per-tenant metrics with aggregate threshold | engine-core, storage | 3 | `/srv/worktrees/v4-engine-tenants` / `feat/v4-engine-tenants` | lane-engine-tenants.md | Pending |
-| admin | GET responses carry `revision`, `updated_at`, `updated_by`, `stale`; list too; handlers read through `GetEntry` | engine-core | 3 | `/srv/worktrees/v4-admin` / `feat/v4-admin` | lane-admin.md | Pending |
+| engine-tenants | `WithPostgresTenantManager` / `WithMongoTenantManager`, lazy activation, `Client.HandleTenantLifecycle`, per-scope feeds through `Store.Subscribe(scope)` on both backends, stale marking, per-tenant metrics with aggregate threshold | engine-core, storage | 3 | `/srv/worktrees/v4-engine-tenants` / `feat/v4-engine-tenants` | lane-engine-tenants.md | Pending |
+| admin | GET responses carry `revision`, `updated_at`, `updated_by`, `stale`; list too; handlers read through `GetEntry` | contracts | 2 | `/srv/worktrees/v4-admin` / `feat/v4-admin` | lane-admin.md | Pending |
 | docs | README, CLAUDE.md, `MIGRATION-v4.md`, `.env.reference` deleted, `docs/PROJECT_RULES.md` corrected, three compiled examples (single-tenant, multi-tenant, groups) built in CI, godoc truth sweep | engine-core, storage, groups | 3 | `/srv/worktrees/v4-docs` / `feat/v4-docs` | lane-docs.md | Pending |
 | matcher-pilot | matcher on v4 groups: glue deleted, migrated env vars removed from charts, before/after line count reported | engine-core, storage, groups | 3 | repo `matcher`: `/srv/worktrees/matcher-v4-pilot` / `feat/systemplane-v4` | (lives in matcher: `docs/plans/`) | Pending |
-| integration | audit §10 acceptance suite end to end (feed loss → write → reconnect → converge without a second write, in ST Postgres, MT Postgres, ST Mongo; two tenants get distinct identity; invalid external row keeps last valid; activation gap; slow callback does not stall the pump; `-race` + goleak), repo-wide absence checks, manual `v4.0.0` cut | every other lane | 4 | `/srv/worktrees/v4-integration` / `feat/v4-integration` | lane-integration.md | Pending |
+| integration | audit §10 acceptance suite end to end (feed loss → write → reconnect → converge without a second write, in ST Postgres, MT Postgres, ST Mongo, MT Mongo; two tenants get distinct identity on both backends; invalid external row keeps last valid; activation gap; slow callback does not stall the pump; `-race` + goleak), repo-wide absence checks, manual `v4.0.0` cut | every other lane | 4 | `/srv/worktrees/v4-integration` / `feat/v4-integration` | lane-integration.md | Pending |
 
 `Status` lifecycle: Pending → In flight → In review → Merged | Failed.
 The orchestrator session owns this column. Lanes never write to this file.
@@ -66,8 +67,8 @@ The orchestrator session owns this column. Lanes never write to this file.
 No lane in wave 2 or 3 edits `go.mod` or `go.sum`. If `go mod tidy` demands a change, the lane stops and reports to the orchestrator, who lands it on `develop` separately.
 
 Wave 1 — `contracts` alone. Everything else depends on the frozen interface compiling on `develop`.
-Wave 2 — `engine-core`, `storage`, `groups` start together once `contracts` reads Merged.
-Wave 3 — `engine-tenants`, `admin`, `docs`, `matcher-pilot` start once their dependencies read Merged (`engine-tenants` waits for both `engine-core` and `storage`).
+Wave 2 — `engine-core`, `storage`, `groups`, `admin` start together once `contracts` reads Merged. To buy wall-clock, their worktrees are cut from `feat/v4-contracts` as soon as their lane plans exist and rebased onto `develop` when `contracts` merges; the frozen contracts make that safe.
+Wave 3 — `engine-tenants`, `docs`, `matcher-pilot` start once their dependencies read Merged (`engine-tenants` waits for both `engine-core` and `storage`).
 Wave 4 — `integration`, after every other lane is Merged.
 
 ## Frozen Contracts
@@ -167,6 +168,26 @@ func NewTenantManagerConnector(mgr *tmpostgres.Manager) Connector
 //   Connector Connector // nil in single-tenant mode
 ```
 
+MongoDB counterpart (storage lane lands it; `internal/mongodb`):
+
+```go
+package mongodb
+
+// Connector resolves a tenant's MongoDB database (client + database name).
+type Connector interface {
+	ResolveDatabase(ctx context.Context, tenantID string) (*mongo.Database, error)
+}
+
+// NewTenantManagerConnector wraps a lib-commons tenant-manager Mongo Manager
+// (its GetDatabaseForTenant method).
+func NewTenantManagerConnector(mgr *tmmongo.Manager) Connector
+
+// Config gains:
+//   Connector Connector // nil in single-tenant mode
+```
+
+For a non-empty `Scope.Tenant`, both stores resolve through their connector; `Subscribe(scope)` opens a per-tenant LISTEN (Postgres) or a per-tenant change stream on the tenant database's `systemplane_entries` collection (MongoDB), each emitting `OpResync` after every (re)connect.
+
 ### FC-4 Public `Change` and `OnChange`
 
 ```go
@@ -220,9 +241,12 @@ func (c *Client) GetEntry(ctx context.Context, namespace, key string) (e Entry, 
 ```go
 package systemplane
 
-// WithTenantManager enables per-tenant cache and push hot-reload in
-// multi-tenant mode. Implies WithMultiTenantEnabled(). Postgres only.
-func WithTenantManager(mgr *tmpostgres.Manager) Option
+// WithPostgresTenantManager / WithMongoTenantManager enable per-tenant cache
+// and push hot-reload in multi-tenant mode; each implies
+// WithMultiTenantEnabled(). The option must match the backend of the
+// constructor (NewPostgres / NewMongoDB); a mismatch is a construction error.
+func WithPostgresTenantManager(mgr *tmpostgres.Manager) Option
+func WithMongoTenantManager(mgr *tmmongo.Manager) Option
 
 // HandleTenantLifecycle has the tmevent.EventHandler signature so it can be
 // registered directly with the tenant-manager event dispatcher. Activated is
@@ -359,7 +383,7 @@ Re-setting an identical value bumps `updated_at` but not `revision`; the NOTIFY 
 
 ### FC-9 MongoDB document
 
-Document `_id` stays `{namespace, key}`. Top-level fields: `namespace`, `key`, `value`, `revision` (int64, `$setOnInsert: 1`, `$inc: 1` when `value` changes), `updated_at`, `updated_by`. Single-tenant only (D6).
+Document `_id` stays `{namespace, key}`. Top-level fields: `namespace`, `key`, `value`, `revision` (int64, `$setOnInsert: 1`, `$inc: 1` when `value` changes), `updated_at` (BSON date), `updated_by` (string). Collection `systemplane_entries`, one per tenant database in multi-tenant mode (D6). This shape is a cross-product contract: the Console reads and may write this collection, so any writer that changes `value` MUST `$inc` `revision` and set `updated_at`/`updated_by`; the engine tolerates a writer that forgets the bump (D3) but such a writer defeats revision dedupe for that key. The change stream watches the collection with `fullDocument: updateLookup`; a resume token is not required because `OpResync` reloads after every re-open.
 
 ### FC-10 Facade surface kept unchanged (admin and consumers rely on it)
 
@@ -379,9 +403,9 @@ Removed in v4: `Manager`, `ManagerOption`, `NewManager`, `WithManagerLogger`, `W
 ### Lane: storage
 
 **Goal:** Both backends implement FC-2 for real: revisions, scoped resolution, resync signalling, DDL v4.
-**Scope:** `internal/postgres/*` (including `postgres_listen.go`, `postgres_notify.go`, `connector.go`), `internal/mongodb/*`, `ddl/*`, `ddl.go`, `ddl_test.go`, `systemplanetest/*`.
+**Scope:** `internal/postgres/*` (including `postgres_listen.go`, `postgres_notify.go`, `connector.go`), `internal/mongodb/*` (including a new `connector.go` per FC-3), `ddl/*`, `ddl.go`, `ddl_test.go`, `systemplanetest/*`.
 **Depends on:** contracts.
-**Done when:** Postgres `Set` returns the row's revision and two identical writes return the same revision; `Subscribe(Scope{Tenant: "t1"})` opens a LISTEN on the DSN the connector returns for `t1` and emits `OpResync` before any key event, again after `pg_terminate_backend` kills the connection; NOTIFY payload carries `revision`; MongoDB `Set` increments `revision` only when `value` changes; MongoDB `Subscribe` with a tenant returns `ErrNotSupportedInMultiTenant`; `MigrationV3ToV4SQL()` applied to a v3 database makes `SchemaSQL()` idempotent on top; `DefaultSeedSQL` no longer exists; the contract suite asserts revision monotonicity and `OpResync` ordering for both backends.
+**Done when:** Postgres `Set` returns the row's revision and two identical writes return the same revision; `Subscribe(Scope{Tenant: "t1"})` opens a LISTEN on the DSN the connector returns for `t1` and emits `OpResync` before any key event, again after `pg_terminate_backend` kills the connection; NOTIFY payload carries `revision`; MongoDB `Set` increments `revision` only when `value` changes and returns it; MongoDB `Subscribe(Scope{Tenant: "t1"})` opens a change stream on the database the connector returns for `t1` and emits `OpResync` before any document event, again after the cursor is killed; the polling fallback emits `OpResync` after a failed round-trip recovers; MongoDB `Get/Set/Delete/List` with a tenant resolve through the connector; `MigrationV3ToV4SQL()` applied to a v3 database makes `SchemaSQL()` idempotent on top; `DefaultSeedSQL` no longer exists; the contract suite asserts revision monotonicity and `OpResync` ordering for both backends.
 
 ### Lane: groups
 
@@ -393,15 +417,15 @@ Removed in v4: `Manager`, `ManagerOption`, `NewManager`, `WithManagerLogger`, `W
 ### Lane: engine-tenants
 
 **Goal:** Multi-tenant scopes get the same engine: lazy activation, lifecycle events, per-tenant feeds, stale marking, metrics.
-**Scope:** `internal/engine/` (all files; tenant scope management is added to the core landed in wave 2), `internal/client/options.go` (`WithTenantManager`, `WithAggregateTenantThreshold`), root `api_constructors.go`, `api_client.go` (`HandleTenantLifecycle`), metrics port from the deleted `internal/manager/metrics.go` semantics (cache entries, listen disconnects, per-tenant labels collapsing above the aggregate threshold).
+**Scope:** `internal/engine/` (all files; tenant scope management is added to the core landed in wave 2), `internal/client/options.go` (`WithPostgresTenantManager`, `WithMongoTenantManager`, `WithAggregateTenantThreshold`), root `api_constructors.go`, `api_client.go` (`HandleTenantLifecycle`), metrics port from the deleted `internal/manager/metrics.go` semantics (cache entries, listen disconnects, per-tenant labels collapsing above the aggregate threshold).
 **Depends on:** engine-core, storage.
-**Done when:** first `Get` for tenant `t1` activates its scope (subscribe, then reconcile, then `Stale=false`) and later reads hit the cache; `HandleTenantLifecycle(Suspended)` drops the scope, reads fall back to per-request and do NOT re-activate the tenant until an Activated event arrives; `CredentialsRotated` re-activates an active tenant on the new DSN and leaves a blocked tenant blocked (Suspended then CredentialsRotated then a read: still per-request, no subscription); a `Change` for `t1` carries `Tenant == "t1"` and a callback registered once fires separately for `t1` and `t2`; a failed activation (subscribe ok, reconcile fails) unsubscribes and leaves no scope state, so the next read retries from scratch and the store sees exactly one live subscription per activated tenant (asserted through the fake store's subscription count); two concurrent first reads for the same tenant start one activation; metrics carry `tenant_id` up to the threshold and `aggregate` above it. Integration tests run on testcontainers Postgres with two tenant databases.
+**Done when:** first `Get` for tenant `t1` activates its scope (subscribe, then reconcile, then `Stale=false`) and later reads hit the cache, on Postgres AND on MongoDB; `HandleTenantLifecycle(Suspended)` drops the scope, reads fall back to per-request and do NOT re-activate the tenant until an Activated event arrives; `CredentialsRotated` re-activates an active tenant on the new DSN and leaves a blocked tenant blocked (Suspended then CredentialsRotated then a read: still per-request, no subscription); a `Change` for `t1` carries `Tenant == "t1"` and a callback registered once fires separately for `t1` and `t2`; a failed activation (subscribe ok, reconcile fails) unsubscribes and leaves no scope state, so the next read retries from scratch and the store sees exactly one live subscription per activated tenant (asserted through the fake store's subscription count); two concurrent first reads for the same tenant start one activation; metrics carry `tenant_id` up to the threshold and `aggregate` above it. Integration tests run on testcontainers Postgres and MongoDB (replica set) with two tenant databases each.
 
 ### Lane: admin
 
 **Goal:** Operators see revision, provenance and freshness on every read.
 **Scope:** `admin/admin.go`, `admin/admin_responses.go`, `admin/admin_test.go`.
-**Depends on:** engine-core.
+**Depends on:** contracts (only `GetEntry`, FC-5; the handlers render whatever it returns, so the engine-core lift of the shim needs no admin change).
 **Done when:** `GET :prefix/:namespace/:key` returns `{value, revision, updated_at, updated_by, stale}` (value still redacted per policy); `GET :prefix/:namespace` returns the same fields per entry; PUT and DELETE unchanged (204); `release_policy_test.go` still green.
 
 ### Lane: docs
@@ -431,7 +455,7 @@ Required: `engine-core`, `engine-tenants`, `storage` and `groups` all touch the 
 
 1. **Feed loss, ST Postgres.** Start Client, kill the LISTEN backend with `pg_terminate_backend`, write a new value via a separate connection, let the listener reconnect: `GetEntry` returns the new value and revision, `OnChange` fired exactly once, `Stale` was true during the gap and false after. Variant: a second write lands between the reconcile's `List` and its application; the cache ends at the second write's revision and `OnChange` never observes the first.
 2. **Feed loss, MT Postgres.** Same for tenant `t1` with `WithTenantManager`; `t2` unaffected.
-3. **Feed loss, ST Mongo.** Same with the change stream cursor killed.
+3. **Feed loss, Mongo.** Same with the change stream cursor killed, in ST and for tenant `t1` with `WithMongoTenantManager` (`t2` unaffected).
 4. **Two tenants, one subscription.** Write different values for `t1` and `t2`; the single `OnChange` receives two `Change`s with distinct `Tenant`, and `Group.OnApply` `Status()` shows both tenants applied.
 5. **Invalid external row.** Insert JSON of the wrong type directly in SQL; `GetEntry` keeps the previous value, `Stale` false, a rejection is logged, no callback fires.
 6. **Activation gap.** Write for `t1` concurrently with the first read that activates it; the value is visible after activation without a second write.
@@ -445,7 +469,7 @@ Absence checks deferred from lanes under rule 4 live here (see the lane's Done-w
 ## Merge Order
 
 1. `contracts` → `develop`. Orchestrator then runs `git tag v4.0.0-beta.1 <merge-sha> && git push origin v4.0.0-beta.1` and watches the next `release.yml` run on `develop`: it must compute `v4.0.0-beta.2`, not a `v3.x` tag. If it computes `v3.x`, stop and fix `release.yml` / tags before wave 2 merges anything.
-2. Wave 2 opens: `storage`, `engine-core`, `groups` (three worktrees). Merge in the order they go green; after each merge the two still-open lanes rebase onto `develop` before continuing.
-3. Wave 3 opens as dependencies read Merged: `admin` and `docs` may start after `engine-core` (docs also needs `storage` and `groups`); `engine-tenants` after `engine-core` and `storage`; `matcher-pilot` after `engine-core`, `storage`, `groups`. Same rebase discipline.
+2. Wave 2 opens: `storage`, `engine-core`, `groups`, `admin` (four worktrees). Merge in the order they go green; after each merge the two still-open lanes rebase onto `develop` before continuing.
+3. Wave 3 opens as dependencies read Merged: `docs` after `engine-core`, `storage` and `groups`; `engine-tenants` after `engine-core` and `storage`; `matcher-pilot` after `engine-core`, `storage`, `groups`. Same rebase discipline.
 4. `integration` opens after every other lane is Merged. Its PR carries the acceptance suite; when green, promote `develop → release-candidate → main` (the repo gates `main` to `develop|hotfix/*` sources) and hand-tag `v4.0.0` on `main`.
 5. After `v4.0.0`: consumer migrations (billing-worker, notifications, plugin-br-pix-jd, br-sfn, finance-hub, br-consignado-gw, go-boilerplate-ddd) follow the matcher recipe, one PR each, outside this plan.
