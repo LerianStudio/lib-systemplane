@@ -22,12 +22,20 @@ type fakeStore struct {
 	mu   sync.Mutex
 	rows map[scopeNSKey]store.Entry
 
-	// getHook and listHook run before the call is served. Returning an error
-	// fails that call; blocking inside one holds the call open.
-	getHook  func(scope store.Scope, nk NSKey) error
-	listHook func(scope store.Scope) error
+	// getHook, listHook and subscribeHook run before the call is served.
+	// Returning an error fails that call; blocking inside one holds the call
+	// open.
+	getHook       func(scope store.Scope, nk NSKey) error
+	listHook      func(scope store.Scope) error
+	subscribeHook func(scope store.Scope) error
+
+	// autoResync makes Subscribe emit store.OpResync the way a real backend
+	// does once its connection is up. It is off by default so a test can model
+	// a backend that never resyncs simply by not turning it on.
+	autoResync bool
 
 	getCalls       int
+	listCalls      int
 	subscribeCalls int
 	liveSubs       int
 
@@ -84,11 +92,35 @@ func (f *fakeStore) onList(hook func(scope store.Scope) error) {
 	f.listHook = hook
 }
 
+func (f *fakeStore) onSubscribe(hook func(scope store.Scope) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.subscribeHook = hook
+}
+
+// resyncOnSubscribe makes every later Subscribe emit store.OpResync once the
+// subscription is live, which is what FC-2 guarantees after a (re)connect and
+// what drives the engine's one initial reconcile.
+func (f *fakeStore) resyncOnSubscribe() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.autoResync = true
+}
+
 func (f *fakeStore) getCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	return f.getCalls
+}
+
+func (f *fakeStore) listCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.listCalls
 }
 
 func (f *fakeStore) subscribeCount() int {
@@ -174,6 +206,7 @@ func (f *fakeStore) Delete(_ context.Context, scope store.Scope, ns, key, _ stri
 
 func (f *fakeStore) List(ctx context.Context, scope store.Scope) ([]store.Entry, error) {
 	f.mu.Lock()
+	f.listCalls++
 	hook := f.listHook
 	f.mu.Unlock()
 
@@ -202,22 +235,36 @@ func (f *fakeStore) List(ctx context.Context, scope store.Scope) ([]store.Entry,
 }
 
 // Subscribe registers fn and hands back an unsubscribe that drops it. The fake
-// starts no goroutine of its own: events arrive only through emit, so a test
+// starts no goroutine of its own: events arrive only through emit, or through
+// the OpResync autoResync plays once the subscription is live, so a test
 // controls exactly when the feed speaks.
+//
+// A failing subscribeHook registers nothing, which is how a test models a
+// listener that could not be opened.
 func (f *fakeStore) Subscribe(_ context.Context, scope store.Scope, fn func(store.Event)) (func(), error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-
 	f.subscribeCalls++
+	hook := f.subscribeHook
+	f.mu.Unlock()
+
+	if hook != nil {
+		if err := hook(scope); err != nil {
+			return nil, err
+		}
+	}
+
+	f.mu.Lock()
 	f.liveSubs++
 	f.nextSubID++
 
 	id := f.nextSubID
 	f.feeds[id] = feedSubscription{scope: scope, fn: fn}
+	auto := f.autoResync
+	f.mu.Unlock()
 
 	var once sync.Once
 
-	return func() {
+	unsubscribe := func() {
 		once.Do(func() {
 			f.mu.Lock()
 			defer f.mu.Unlock()
@@ -225,5 +272,13 @@ func (f *fakeStore) Subscribe(_ context.Context, scope store.Scope, fn func(stor
 			delete(f.feeds, id)
 			f.liveSubs--
 		})
-	}, nil
+	}
+
+	// Emitted after the subscription is live and outside the lock, so the
+	// reconcile it triggers can see the subscription and read the store.
+	if auto {
+		f.emit(store.Event{Scope: scope, Op: store.OpResync})
+	}
+
+	return unsubscribe, nil
 }

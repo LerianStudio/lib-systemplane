@@ -53,6 +53,11 @@ type Engine struct {
 	dispatchWG sync.WaitGroup
 	running    sync.Map // workerKey -> struct{}
 
+	// startMu serializes scope bring-up so two concurrent Starts open one
+	// subscription instead of two. It is held across Store.Subscribe and never
+	// together with a scope's own lock.
+	startMu sync.Mutex
+
 	// closed refuses new scopes, publications and subscriptions from the
 	// moment Close begins. closeOnce makes Close idempotent and closeErr
 	// carries its single outcome to every later caller.
@@ -66,6 +71,201 @@ type Engine struct {
 	// derive from it so nothing outlives the engine.
 	lifecycleCtx    context.Context
 	lifecycleCancel context.CancelFunc
+}
+
+// Config is what the Client hands the engine at construction. Every field is
+// optional except Store and Registry, without which the engine can neither
+// read a value nor know which keys exist.
+type Config struct {
+	Store     store.Store
+	Registry  Registry
+	Logger    log.Logger
+	Telemetry store.Telemetry
+	// Debounce is the quiet window a key's changefeed notifications are
+	// coalesced into one store re-read over. Zero submits synchronously,
+	// which is what makes a test deterministic.
+	Debounce time.Duration
+	// CloseTimeout bounds how long Close waits for subscriber callbacks that
+	// have been canceled. Zero means defaultCloseTimeout.
+	CloseTimeout time.Duration
+}
+
+// New builds an engine from cfg, defaulting everything that has a sensible
+// default: a nil logger becomes a no-op, a zero CloseTimeout becomes 30s, and
+// a zero Debounce disables debouncing rather than dropping notifications.
+//
+// It opens no connection and starts no goroutine — Start does that — so a
+// Client that is constructed and never started leaves nothing behind.
+func New(cfg Config) *Engine {
+	logger := cfg.Logger
+	if logger == nil {
+		logger = log.NewNop()
+	}
+
+	closeTimeout := cfg.CloseTimeout
+	if closeTimeout <= 0 {
+		closeTimeout = defaultCloseTimeout
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	return &Engine{
+		store:           cfg.Store,
+		registry:        cfg.Registry,
+		logger:          logger,
+		telemetry:       cfg.Telemetry,
+		debouncer:       debounce.New(cfg.Debounce, debounce.WithLogger[scopeNSKey](logger)),
+		scopes:          make(map[store.Scope]*scopeState),
+		subscribers:     make(map[NSKey][]subscription),
+		workers:         make(map[workerKey]*dispatchWorker),
+		closeTimeout:    closeTimeout,
+		lifecycleCtx:    ctx,
+		lifecycleCancel: cancel,
+	}
+}
+
+// Start brings up the single-tenant scope and returns once its first reconcile
+// has completed, so a caller reading afterwards is looking at a cache the
+// store has confirmed and a subscriber registered beforehand cannot have
+// missed the announcement of a key (FC-11).
+//
+// Start runs NO reconcile of its own. It creates the scope, opens the
+// changefeed, and waits: the store guarantees an OpResync after every
+// (re)connect, and that resync drives the one initial reconcile. Reconciling
+// here as well would publish a registered key's default twice for a key with
+// no row — revision 0 is never deduplicated, so the second publication is
+// accepted and delivered, which is the double delivery FC-11 forbids.
+//
+// Three failures, three different outcomes:
+//
+//   - Subscribe fails: the scope is dropped entirely and the error returned. A
+//     tracked scope whose feed never opened would look fresh forever.
+//   - ctx expires before the first reconcile completes: the ctx error is
+//     returned and the scope is left tracked and stale. A backend that never
+//     emits OpResync is broken, and failing loudly beats serving registered
+//     defaults forever while pretending they are current.
+//   - the first reconcile ran and failed: its error is returned wrapped and
+//     the scope is left stale, for the next OpResync to retry.
+//
+// Start is idempotent: a second call finds the changefeed open and the first
+// reconcile finished, and returns that same recorded outcome without
+// subscribing or listing again.
+func (e *Engine) Start(ctx context.Context) error {
+	if e == nil {
+		return nil
+	}
+
+	if e.closed.Load() {
+		return store.ErrClosed
+	}
+
+	if e.store == nil {
+		return store.ErrNilBackend
+	}
+
+	scope := store.Scope{}
+
+	sc, err := e.bringUpScope(scope)
+	if err != nil {
+		return err
+	}
+
+	select {
+	case <-sc.firstReconcileDone:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	// The close is the release and this receive is the acquire, so the write
+	// is guaranteed visible; the lock is taken anyway, which keeps the race
+	// detector honest and costs nothing on a once-per-scope path.
+	sc.mu.RLock()
+	reconcileErr := sc.firstReconcileErr
+	sc.mu.RUnlock()
+
+	if reconcileErr != nil {
+		return fmt.Errorf("systemplane: first reconcile of %s failed: %w", scopeLabel(scope), reconcileErr)
+	}
+
+	return nil
+}
+
+// bringUpScope creates scope's state and opens its changefeed, exactly once.
+//
+// The subscription is opened on the engine's lifecycle context rather than the
+// caller's: the feed must outlive Start and die with Close. A failed Subscribe
+// drops the scope rather than leaving a half-built one behind.
+func (e *Engine) bringUpScope(scope store.Scope) (*scopeState, error) {
+	e.startMu.Lock()
+	defer e.startMu.Unlock()
+
+	sc := e.scopeFor(scope)
+
+	sc.mu.RLock()
+	subscribed := sc.unsubscribe != nil
+	sc.mu.RUnlock()
+
+	if subscribed {
+		return sc, nil
+	}
+
+	unsubscribe, err := e.store.Subscribe(e.dispatchContext(), scope, e.onEvent)
+	if err != nil {
+		e.dropScope(scope)
+
+		return nil, fmt.Errorf("systemplane: changefeed for %s failed to open: %w", scopeLabel(scope), err)
+	}
+
+	sc.mu.Lock()
+	sc.unsubscribe = unsubscribe
+	sc.mu.Unlock()
+
+	return sc, nil
+}
+
+// dropScope stops tracking scope. Everything it held — cached entries, the
+// stale flag, the first-reconcile channel — goes with it, which is the point:
+// a scope nothing feeds must not be readable as though it were current.
+func (e *Engine) dropScope(scope store.Scope) {
+	e.scopesMu.Lock()
+	defer e.scopesMu.Unlock()
+
+	delete(e.scopes, scope)
+}
+
+// scopeLabel renders a scope for an error message.
+func scopeLabel(scope store.Scope) string {
+	if scope.Tenant == "" {
+		return "the single-tenant scope"
+	}
+
+	return "tenant " + scope.Tenant
+}
+
+// Publish takes the row the Client has just persisted and puts it through the
+// engine's ingress, so the caller's own next read sees its write before the
+// changefeed echoes it (D4).
+//
+// It takes a store.Entry — marshaled bytes, the revision the store returned,
+// the provenance — and deliberately NOT an already-decoded Go value: the feed
+// decodes JSON, so a caller's []string{"a"} and the echo's []any{"a"} would
+// not compare equal and every echo would fire a redundant callback. One
+// ingress, one canonical shape, and the echo of this write is then deduplicated
+// by revision.
+//
+// A write whose revision the store could not report (0) still takes effect,
+// because revision 0 always wins the fence — at the cost of the echo
+// publishing a second time. A value the caller just wrote must be readable.
+//
+// Publish before Start creates the scope lazily, so a Client that writes
+// before starting is not silently dropped. A nil Engine ignores the write
+// instead of panicking.
+func (e *Engine) Publish(scope store.Scope, se store.Entry) {
+	if e == nil {
+		return
+	}
+
+	e.ingest(e.dispatchContext(), scope, se)
 }
 
 // Lookup returns the published state of nk in scope.
