@@ -52,8 +52,12 @@ type feed struct {
 	// slot has already been retracted from the feeds map. err is written BEFORE
 	// the close, so the close is the happens-before edge that publishes it.
 	// Both are nil on the zero-scope feed, which Start owns and never waits on.
-	ready chan struct{}
-	err   error
+	// readyClosed guards the single close of ready. Both the creator and Close
+	// can reach a reserved slot, so the flag lives under Store.feedsMu — the
+	// lock both of them already take — not under f.mu.
+	ready       chan struct{}
+	err         error
+	readyClosed bool
 
 	// refs counts the callers holding this feed, guarded by Store.feedsMu (NOT
 	// f.mu): the count decides the feed's lifetime and must be read and written
@@ -285,32 +289,86 @@ func (s *Store) createFeed(ctx context.Context, f *feed) error {
 		return s.retractFeed(f, err)
 	}
 
-	s.startFeedReader(f, conn)
+	return s.publishFeed(ctx, f, conn)
+}
 
-	close(f.ready)
+// publishFeed hands the connected feed to its waiters — or throws it away when
+// Close ran while this creator was still connecting. The recheck is the only
+// thing standing between a shut-down store and a live LISTEN connection,
+// because the slot Close found in the map carried nothing it could stop.
+//
+// Publishing the feed and launching its reader happen in ONE feedsMu hold:
+// Close decides what to tear down by walking that map, so a feed must never be
+// visible there without its goroutine already running, or Close would wait the
+// full closeTimeout on a done channel nothing will ever close.
+func (s *Store) publishFeed(ctx context.Context, f *feed, conn *pgx.Conn) error {
+	s.feedsMu.Lock()
+
+	if s.closing {
+		cause := s.failLocked(f, store.ErrClosed)
+
+		f.closeReadyLocked()
+		s.feedsMu.Unlock()
+
+		closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), closeTimeout)
+		defer cancel()
+
+		_ = conn.Close(closeCtx)
+
+		return cause
+	}
+
+	s.startFeedReader(f, conn)
+	f.closeReadyLocked()
+	s.feedsMu.Unlock()
 
 	return nil
 }
 
-// retractFeed publishes a creation failure to every waiter and removes the dead
-// slot. The order is load-bearing in both directions: err is written BEFORE the
-// close, so the close is the happens-before edge that publishes it, and the
-// slot is gone BEFORE the waiters wake, so the next Subscribe for that tenant
-// builds a fresh placeholder instead of finding a corpse.
-func (s *Store) retractFeed(f *feed, err error) error {
-	f.err = err
+// closeReadyLocked wakes every waiter, exactly once. The caller MUST hold
+// Store.feedsMu. The zero-scope feed has no ready channel — Start owns it and
+// nobody waits on it.
+func (f *feed) closeReadyLocked() {
+	if f.ready == nil || f.readyClosed {
+		return
+	}
 
-	s.feedsMu.Lock()
+	f.readyClosed = true
+
+	close(f.ready)
+}
+
+// failLocked records the cause a waiter will see and retracts the dead slot.
+// The caller MUST hold Store.feedsMu, and MUST close ready afterwards in the
+// same hold: err is written BEFORE the close, so the close is the
+// happens-before edge that publishes it, and the slot is gone BEFORE the
+// waiters wake, so the next Subscribe for that tenant builds a fresh
+// placeholder instead of finding a corpse. The FIRST cause wins — once ready
+// is closed err is never written again, which is what keeps a waiter's read
+// race-free.
+func (s *Store) failLocked(f *feed, err error) error {
+	if f.err == nil {
+		f.err = err
+	}
 
 	if s.feeds[f.scope.Tenant] == f {
 		delete(s.feeds, f.scope.Tenant)
 	}
 
-	s.feedsMu.Unlock()
+	return f.err
+}
 
-	close(f.ready)
+// retractFeed publishes a creation failure to every waiter and removes the dead
+// slot.
+func (s *Store) retractFeed(f *feed, err error) error {
+	s.feedsMu.Lock()
+	defer s.feedsMu.Unlock()
 
-	return err
+	cause := s.failLocked(f, err)
+
+	f.closeReadyLocked()
+
+	return cause
 }
 
 // releaseFeed drops one reference. When the last one goes, a NAMED feed leaves
@@ -509,11 +567,27 @@ func (s *Store) startListener(ctx context.Context) error {
 }
 
 // stopFeeds tears down every feed the store owns. Idempotent.
+//
+// The store-wide closing flag is raised in the SAME hold that walks the map, so
+// no creator can publish a feed into a shut-down store afterwards. A slot whose
+// creator is still connecting has no reader to stop and no connection to close
+// yet: it is failed with store.ErrClosed here — so every caller parked on it
+// learns the store is gone instead of waiting for a feed that will never
+// arrive — and its creator closes the connection it ends up with on its own.
 func (s *Store) stopFeeds() {
 	s.feedsMu.Lock()
+	s.closing = true
 	feeds := make([]*feed, 0, len(s.feeds))
 
 	for _, f := range s.feeds {
+		if f.ready != nil && !f.readyClosed {
+			_ = s.failLocked(f, store.ErrClosed)
+
+			f.closeReadyLocked()
+
+			continue
+		}
+
 		feeds = append(feeds, f)
 	}
 

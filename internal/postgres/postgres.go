@@ -139,6 +139,13 @@ type Store struct {
 	feedsMu sync.Mutex
 	feeds   map[string]*feed
 
+	// closing is set by Close under feedsMu, and is NOT the per-feed
+	// feed.closing (which only suppresses OpDisconnect on a clean teardown).
+	// A feed is created outside the map lock, so Close cannot stop an
+	// in-flight creator by walking the map alone: it raises this flag instead,
+	// and the creator rechecks it before publishing anything.
+	closing bool
+
 	mu     sync.Mutex
 	closed bool
 }

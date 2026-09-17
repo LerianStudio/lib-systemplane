@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -1196,4 +1197,136 @@ func TestIntegration_PostgresConcurrentFirstSubscribeOpensOneConnection(t *testi
 	}
 
 	waitForListenBackends(t, admin, dbName, 0, "the last unsubscribe closes the shared connection")
+}
+
+// blockingConnector parks the FIRST ResolveDSN call inside the connector until
+// the test releases it. That is the window Close has to survive: a creator
+// still connecting, a reserved slot in the feeds map that carries no stop
+// channel, and a second caller already waiting on it.
+type blockingConnector struct {
+	db  *sql.DB
+	dsn string
+
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *blockingConnector) ResolveDB(context.Context, string) (dbresolver.DB, error) {
+	return dbresolver.New(dbresolver.WithPrimaryDBs(c.db)), nil
+}
+
+func (c *blockingConnector) ResolveDSN(ctx context.Context, _ string) (string, error) {
+	c.once.Do(func() { close(c.entered) })
+
+	select {
+	case <-c.release:
+		return c.dsn, nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+// Close must not be able to leave a live feed, a live goroutine or an open
+// connection behind when it lands while a tenant feed is still being created.
+// Walking the feeds map is not enough on its own: the entry Close finds there
+// is a reserved slot with nothing to stop yet, so the creator itself has to
+// notice the shutdown after it connects and throw the connection away.
+func TestIntegration_PostgresCloseDuringFeedCreationLeavesNothingRunning(t *testing.T) {
+	base, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	admin := adminDSN(t, base)
+	defer admin.Close()
+
+	dbName, tenantDSN, db := provisionTenantDB(t, admin, base, "close_race")
+
+	conn := &blockingConnector{
+		db:      db,
+		dsn:     tenantDSN,
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+
+	s := tenantStore(t, conn)
+	scope := store.Scope{Tenant: "t1"}
+
+	const callers = 2
+
+	results := make(chan error, callers)
+
+	var wg sync.WaitGroup
+
+	subscribe := func() {
+		defer wg.Done()
+
+		unsub, err := s.Subscribe(context.Background(), scope, func(store.Event) {})
+		if err == nil {
+			unsub()
+		}
+
+		results <- err
+	}
+
+	wg.Add(1)
+
+	go subscribe()
+
+	select {
+	case <-conn.entered:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Subscribe never reached the connector")
+	}
+
+	// The second caller parks on the creator's reserved slot. Waiting for the
+	// reference count keeps the race deterministic: once it is there, Close
+	// provably runs against a slot that already has a waiter on it.
+	wg.Add(1)
+
+	go subscribe()
+
+	waitForFeedRefs(t, s, scope.Tenant, callers)
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	close(conn.release)
+
+	// Join before asserting: Close does not wait for an in-flight creator, and
+	// the package goleak guard is only meaningful once the creator has returned.
+	wg.Wait()
+	close(results)
+
+	for err := range results {
+		if !errors.Is(err, store.ErrClosed) {
+			t.Fatalf("Subscribe racing Close = %v, want store.ErrClosed", err)
+		}
+	}
+
+	if total, _ := s.FeedsSnapshot(scope.Tenant); total != 0 {
+		t.Fatalf("feeds map holds %d entries after Close, want 0", total)
+	}
+
+	waitForListenBackends(t, admin, dbName, 0, "Close during feed creation")
+}
+
+// waitForFeedRefs blocks until tenant's reserved slot has taken want
+// references — one per caller parked on it.
+func waitForFeedRefs(t *testing.T, s *postgres.Store, tenant string, want int) {
+	t.Helper()
+
+	deadline := time.Now().Add(15 * time.Second)
+
+	for {
+		if _, refs := s.FeedsSnapshot(tenant); refs >= want {
+			return
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("reserved slot for tenant %q never took %d references", tenant, want)
+		}
+
+		time.Sleep(time.Millisecond)
+	}
 }

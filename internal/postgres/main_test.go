@@ -32,3 +32,17 @@ func TestMain(m *testing.M) {
 		goleak.IgnoreAnyFunction("net/http.(*persistConn).writeLoop"),
 	)
 }
+
+// FeedsSnapshot exposes the feeds map to the external postgres_test package:
+// how many changefeed slots the store holds, and how many callers are parked
+// on tenant's slot. Test-only — this file never enters a production build.
+func (s *Store) FeedsSnapshot(tenant string) (total, refs int) {
+	s.feedsMu.Lock()
+	defer s.feedsMu.Unlock()
+
+	if f, ok := s.feeds[tenant]; ok {
+		refs = f.refs
+	}
+
+	return len(s.feeds), refs
+}
