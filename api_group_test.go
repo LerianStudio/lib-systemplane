@@ -23,6 +23,12 @@ type groupMemoryStore struct {
 	mu      sync.Mutex
 	entries map[string]systemplane.TestEntry
 	sub     func(systemplane.TestEvent)
+
+	// getErr and setErr let a test make the backend fail. They are read on the
+	// caller's goroutine and on the changefeed's, so they live under mu like
+	// every other field here.
+	getErr error
+	setErr error
 }
 
 func newGroupMemoryStore() *groupMemoryStore {
@@ -39,6 +45,10 @@ func (s *groupMemoryStore) Get(_ context.Context, _ systemplane.TestScope, names
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.getErr != nil {
+		return systemplane.TestEntry{}, false, s.getErr
+	}
+
 	e, ok := s.entries[groupMemoryKey(namespace, key)]
 
 	return e, ok, nil
@@ -46,6 +56,14 @@ func (s *groupMemoryStore) Get(_ context.Context, _ systemplane.TestScope, names
 
 func (s *groupMemoryStore) Set(_ context.Context, _ systemplane.TestScope, e systemplane.TestEntry) (int64, error) {
 	s.mu.Lock()
+
+	if s.setErr != nil {
+		err := s.setErr
+		s.mu.Unlock()
+
+		return 0, err
+	}
+
 	s.entries[groupMemoryKey(e.Namespace, e.Key)] = e
 	sub := s.sub
 	s.mu.Unlock()
@@ -142,6 +160,23 @@ func (s *groupMemoryStore) seed(t *testing.T, namespace, key string, value any) 
 		Key:       key,
 		Value:     data,
 	}
+}
+
+// failGets and failSets make the backend return err from every read or write
+// from this point on, so a test can prove the group hands a store failure back
+// to the caller as itself.
+func (s *groupMemoryStore) failGets(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.getErr = err
+}
+
+func (s *groupMemoryStore) failSets(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.setErr = err
 }
 
 func TestGroupBindRegistersCanonicalDefaults(t *testing.T) {
@@ -262,8 +297,17 @@ func TestGroupBindValidatorSurvivesCallerWithValidator(t *testing.T) {
 	c := newGroupClient(t)
 
 	// The caller's own WithValidator accepts anything; the group's type check
-	// must still reject a document that is not a groupConfig.
-	permissive := systemplane.WithValidator(func(any) error { return nil })
+	// must still reject a document that is not a groupConfig. It is also never
+	// consulted at all — Bind's own validator displaces it — which the counter
+	// pins, because a caller who believes theirs runs would be relying on a
+	// check that does not exist.
+	var callerValidatorCalls atomic.Int64
+
+	permissive := systemplane.WithValidator(func(any) error {
+		callerValidatorCalls.Add(1)
+
+		return nil
+	})
 
 	if _, err := systemplane.Bind(c, "runtime", "ingest", groupDefaults(), nil, permissive); err != nil {
 		t.Fatalf("Bind: %v", err)
@@ -281,6 +325,10 @@ func TestGroupBindValidatorSurvivesCallerWithValidator(t *testing.T) {
 
 	if err := c.Set(ctx, "runtime", "ingest", groupConfig{Name: "other", Retries: 9}, "actor"); err != nil {
 		t.Fatalf("Set of a well-shaped value: %v", err)
+	}
+
+	if calls := callerValidatorCalls.Load(); calls != 0 {
+		t.Fatalf("the caller's WithValidator ran %d times, want 0 — Bind's validator is the group's validator and replaces it", calls)
 	}
 }
 
@@ -796,7 +844,131 @@ func TestGroupDocumentPartialDecodeIsRejected(t *testing.T) {
 func TestGroupRejectsNullDocumentOnIngress(t *testing.T) {
 	t.Parallel()
 
+	// Each of these is written as the JSON document "null". Only the first is
+	// a nil interface: the others are typed nils and raw JSON, which a guard
+	// comparing the incoming value against nil waves straight through — and
+	// then every field of a live configuration is silently blanked. What
+	// decides is the canonical document, not the caller's Go value.
+	nullDocuments := map[string]any{
+		"untyped nil":   nil,
+		"nil pointer":   (*groupConfig)(nil),
+		"nil map":       map[string]any(nil),
+		"nil slice":     []string(nil),
+		"raw JSON null": json.RawMessage("null"),
+	}
+
+	for name, document := range nullDocuments {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			s := newGroupMemoryStore()
+			c := newGroupClientOn(t, s)
+
+			g, err := systemplane.Bind(c, "runtime", "ingest", groupDefaults(), nil)
+			if err != nil {
+				t.Fatalf("Bind: %v", err)
+			}
+
+			ctx := context.Background()
+			if err := c.Start(ctx); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+
+			inForce := groupConfig{Name: "written", Retries: 42, Hosts: []string{"p", "q"}}
+			if err := g.Set(ctx, inForce, "actor"); err != nil {
+				t.Fatalf("Set: %v", err)
+			}
+
+			// The per-key facade is the path the admin PUT takes with a null body.
+			if err := c.Set(ctx, "runtime", "ingest", document, "operator"); !errors.Is(err, systemplane.ErrValidation) {
+				t.Fatalf("Set of a null document = %v, want ErrValidation", err)
+			}
+
+			snap, err := g.Snapshot(ctx)
+			if err != nil {
+				t.Fatalf("Snapshot: %v", err)
+			}
+
+			if !reflect.DeepEqual(snap.Value, inForce) {
+				t.Fatalf("Snapshot.Value = %#v, want the document still in force %#v", snap.Value, inForce)
+			}
+		})
+	}
+}
+
+// groupTaggedConfig carries a field the JSON document cannot: Token is excluded
+// with json:"-", so the caller's Go value and the document that gets persisted
+// differ in exactly one field. That gap is what tells whether ingress validated
+// the caller's value or the document.
+type groupTaggedConfig struct {
+	Name  string `json:"name"`
+	Token string `json:"-"`
+}
+
+// TestGroupIngressValidatesTheCanonicalDocument pins D-G1's stated semantics:
+// validate sees the round-tripped document, because that is what will actually
+// be in force. A validator that inspected the caller's raw value would approve
+// a token the store never receives, and the configuration that ends up running
+// would be one nothing ever validated.
+func TestGroupIngressValidatesTheCanonicalDocument(t *testing.T) {
+	t.Parallel()
+
+	var (
+		seenMu sync.Mutex
+		seen   []string
+	)
+
+	validate := func(cfg groupTaggedConfig) error {
+		seenMu.Lock()
+		defer seenMu.Unlock()
+
+		seen = append(seen, cfg.Token)
+
+		return nil
+	}
+
+	c := newGroupClient(t)
+
+	g, err := systemplane.Bind(c, "runtime", "tagged", groupTaggedConfig{Name: "ingest"}, validate)
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	if err := g.Set(ctx, groupTaggedConfig{Name: "ingest", Token: "s3cret"}, "actor"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	seenMu.Lock()
+	observed := append([]string(nil), seen...)
+	seenMu.Unlock()
+
+	if len(observed) == 0 {
+		t.Fatal("validate never ran on the write path")
+	}
+
+	for i, token := range observed {
+		if token != "" {
+			t.Fatalf("validate call %d saw Token = %q, want \"\" — it inspected the caller's value instead of the document that gets persisted", i, token)
+		}
+	}
+}
+
+// TestGroupSnapshotRejectsANullRow is the read-side half of the null guard.
+// Ingress refuses to write a null, but a row holding one can predate this
+// binary — an older version, another writer, a hand-edited row. Handing back a
+// zero T with no error would report a wholly blank configuration as if it were
+// the real one.
+func TestGroupSnapshotRejectsANullRow(t *testing.T) {
+	t.Parallel()
+
 	s := newGroupMemoryStore()
+	s.seed(t, "runtime", "ingest", nil)
+
 	c := newGroupClientOn(t, s)
 
 	g, err := systemplane.Bind(c, "runtime", "ingest", groupDefaults(), nil)
@@ -809,24 +981,236 @@ func TestGroupRejectsNullDocumentOnIngress(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
-	inForce := groupConfig{Name: "written", Retries: 42, Hosts: []string{"p", "q"}}
-	if err := g.Set(ctx, inForce, "actor"); err != nil {
-		t.Fatalf("Set: %v", err)
+	snap, err := g.Snapshot(ctx)
+	if !errors.Is(err, systemplane.ErrValidation) {
+		t.Fatalf("Snapshot of a null row = %v, want ErrValidation", err)
 	}
 
-	// The per-key facade is the path the admin PUT takes with a null body.
-	if err := c.Set(ctx, "runtime", "ingest", nil, "operator"); !errors.Is(err, systemplane.ErrValidation) {
-		t.Fatalf("Set of a null document = %v, want ErrValidation", err)
+	var zero groupConfig
+	if !reflect.DeepEqual(snap.Value, zero) {
+		t.Fatalf("Snapshot.Value = %#v, want the zero Snapshot on a rejected row", snap.Value)
+	}
+}
+
+// TestGroupSnapshotAcceptsANullRowForANilableType is the other side: for a
+// group whose type can legitimately be nil, the null IS the document and the
+// read returns it without complaint.
+func TestGroupSnapshotAcceptsANullRowForANilableType(t *testing.T) {
+	t.Parallel()
+
+	s := newGroupMemoryStore()
+	s.seed(t, "runtime", "optional", nil)
+
+	c := newGroupClientOn(t, s)
+
+	g, err := systemplane.Bind(c, "runtime", "optional", &groupConfig{Name: "ingest"}, nil)
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
 	}
 
 	snap, err := g.Snapshot(ctx)
 	if err != nil {
-		t.Fatalf("Snapshot: %v", err)
+		t.Fatalf("Snapshot of a null row on a pointer-shaped group: %v", err)
 	}
 
-	if !reflect.DeepEqual(snap.Value, inForce) {
-		t.Fatalf("Snapshot.Value = %#v, want the document still in force %#v", snap.Value, inForce)
+	if snap.Value != nil {
+		t.Fatalf("Snapshot.Value = %#v, want nil", snap.Value)
 	}
+}
+
+// TestGroupBindForwardsKeyOptions pins that the options a caller hands Bind
+// still reach the registered key. A dropped WithRedaction is the expensive one:
+// a credential group would then render in plaintext on the admin surface and in
+// logs, with nothing failing.
+func TestGroupBindForwardsKeyOptions(t *testing.T) {
+	t.Parallel()
+
+	c := newGroupClient(t)
+
+	_, err := systemplane.Bind(c, "runtime", "ingest", groupDefaults(), nil,
+		systemplane.WithDescription("ingest pipeline settings"),
+		systemplane.WithRedaction(systemplane.RedactFull),
+	)
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	if got := c.KeyDescription("runtime", "ingest"); got != "ingest pipeline settings" {
+		t.Fatalf("KeyDescription = %q, want the description passed to Bind", got)
+	}
+
+	if got := c.KeyRedaction("runtime", "ingest"); got != systemplane.RedactFull {
+		t.Fatalf("KeyRedaction = %v, want RedactFull", got)
+	}
+}
+
+// groupStoreFailure is the sentinel a test injects into the fake backend, so an
+// assertion can prove the group returned that very error rather than a
+// look-alike built from its text.
+var groupStoreFailure = errors.New("group store is unavailable")
+
+// TestGroupSnapshotReturnsClientErrorsUnchanged pins that a group is a
+// pass-through on the read path. Wrapping a Client error into a group-flavored
+// one would break every caller's errors.Is — the difference between "retry, the
+// backend blinked" and "give up, the Client is closed".
+func TestGroupSnapshotReturnsClientErrorsUnchanged(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nil context", func(t *testing.T) {
+		t.Parallel()
+
+		c := newGroupClient(t)
+
+		g, err := systemplane.Bind(c, "runtime", "ingest", groupDefaults(), nil)
+		if err != nil {
+			t.Fatalf("Bind: %v", err)
+		}
+
+		if err := c.Start(context.Background()); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+
+		var nilCtx context.Context
+
+		if _, err := g.Snapshot(nilCtx); !errors.Is(err, systemplane.ErrNilContext) {
+			t.Fatalf("Snapshot with a nil context = %v, want ErrNilContext", err)
+		}
+	})
+
+	t.Run("closed client", func(t *testing.T) {
+		t.Parallel()
+
+		c := newGroupClient(t)
+
+		g, err := systemplane.Bind(c, "runtime", "ingest", groupDefaults(), nil)
+		if err != nil {
+			t.Fatalf("Bind: %v", err)
+		}
+
+		ctx := context.Background()
+		if err := c.Start(ctx); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+
+		if err := c.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+
+		if _, err := g.Snapshot(ctx); !errors.Is(err, systemplane.ErrClosed) {
+			t.Fatalf("Snapshot on a closed Client = %v, want ErrClosed", err)
+		}
+	})
+
+	t.Run("store failure", func(t *testing.T) {
+		t.Parallel()
+
+		// Multi-tenant mode is the read path that actually reaches the
+		// backend: the single-tenant read is served from the in-process cache
+		// and can never see a store error.
+		s := newGroupMemoryStore()
+
+		c, err := systemplane.NewForTesting(s, systemplane.WithMultiTenantEnabled())
+		if err != nil {
+			t.Fatalf("NewForTesting: %v", err)
+		}
+
+		t.Cleanup(func() { _ = c.Close() })
+
+		g, err := systemplane.Bind(c, "runtime", "ingest", groupDefaults(), nil)
+		if err != nil {
+			t.Fatalf("Bind: %v", err)
+		}
+
+		ctx := context.Background()
+		if err := c.Start(ctx); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+
+		s.failGets(groupStoreFailure)
+
+		if _, err := g.Snapshot(ctx); !errors.Is(err, groupStoreFailure) {
+			t.Fatalf("Snapshot over a failing store = %v, want the injected store error", err)
+		}
+	})
+}
+
+// TestGroupSetReturnsClientErrorsUnchanged is the write-path half of the same
+// pass-through guarantee.
+func TestGroupSetReturnsClientErrorsUnchanged(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nil context", func(t *testing.T) {
+		t.Parallel()
+
+		c := newGroupClient(t)
+
+		g, err := systemplane.Bind(c, "runtime", "ingest", groupDefaults(), nil)
+		if err != nil {
+			t.Fatalf("Bind: %v", err)
+		}
+
+		if err := c.Start(context.Background()); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+
+		var nilCtx context.Context
+
+		if err := g.Set(nilCtx, groupDefaults(), "actor"); !errors.Is(err, systemplane.ErrNilContext) {
+			t.Fatalf("Set with a nil context = %v, want ErrNilContext", err)
+		}
+	})
+
+	t.Run("closed client", func(t *testing.T) {
+		t.Parallel()
+
+		c := newGroupClient(t)
+
+		g, err := systemplane.Bind(c, "runtime", "ingest", groupDefaults(), nil)
+		if err != nil {
+			t.Fatalf("Bind: %v", err)
+		}
+
+		ctx := context.Background()
+		if err := c.Start(ctx); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+
+		if err := c.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+
+		if err := g.Set(ctx, groupDefaults(), "actor"); !errors.Is(err, systemplane.ErrClosed) {
+			t.Fatalf("Set on a closed Client = %v, want ErrClosed", err)
+		}
+	})
+
+	t.Run("store failure", func(t *testing.T) {
+		t.Parallel()
+
+		s := newGroupMemoryStore()
+		c := newGroupClientOn(t, s)
+
+		g, err := systemplane.Bind(c, "runtime", "ingest", groupDefaults(), nil)
+		if err != nil {
+			t.Fatalf("Bind: %v", err)
+		}
+
+		ctx := context.Background()
+		if err := c.Start(ctx); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+
+		s.failSets(groupStoreFailure)
+
+		if err := g.Set(ctx, groupDefaults(), "actor"); !errors.Is(err, groupStoreFailure) {
+			t.Fatalf("Set over a failing store = %v, want the injected store error", err)
+		}
+	})
 }
 
 // TestGroupNullIsADocumentForANilableType is the other side of that guard: a

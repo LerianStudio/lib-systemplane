@@ -16,6 +16,12 @@ type Group[T any] struct {
 	client    *Client
 	namespace string
 	key       string
+
+	// nullIsDocument records whether a JSON null is a legitimate document for
+	// T, which is true exactly when the zero T is itself nil. Ingress refuses a
+	// null for every other T; Snapshot refuses to decode one, so a row that
+	// predates the guard cannot be read back as a wholly blank configuration.
+	nullIsDocument bool
 }
 
 // Snapshot is the state of a group's document in one scope.
@@ -40,7 +46,19 @@ type Snapshot[T any] struct {
 //
 // A JSON null is refused on ingress unless the zero T is itself nil, because
 // a null would otherwise decode to the zero T and blank every field of the
-// group at once; the document in force stays in force instead.
+// group at once; the document in force stays in force instead. What decides is
+// the canonical document, not the caller's Go value, so a typed nil pointer, a
+// nil map and a nil slice are all refused for a struct-shaped group.
+//
+// When the zero T is nil — a pointer-, map-, slice- or interface-shaped group —
+// a null IS a document, and both validate and [Group.Snapshot] can therefore
+// see that nil. A validator for such a group must guard its argument rather
+// than dereference it.
+//
+// The validate parameter is the group's validator. A [WithValidator] passed in
+// opts is ignored: Bind's own validator is registered last and replaces it, so
+// a caller cannot disable the type check on their own group. Every other key
+// option in opts is forwarded to [Client.Register] unchanged.
 //
 // Bind on a nil Client returns ErrClosed. Defaults that validate rejects
 // surface as the ErrValidation that Register returns.
@@ -67,11 +85,23 @@ func Bind[T any](c *Client, namespace, key string, defaults T, validate func(T) 
 	nullIsDocument := zeroErr == nil && zeroDocument == nil
 
 	ingress := func(value any) error {
-		if value == nil && !nullIsDocument {
+		// Canonicalize FIRST, so every ingress validates the document that
+		// will actually be persisted rather than the caller's Go value. Two
+		// things ride on it: a field excluded with json:"-" is absent when
+		// validate runs (D-G1's stated semantics), and a typed nil — a nil
+		// pointer, a nil map, a raw JSON null — is unmasked as the null
+		// document it marshals to, which a check against the incoming any
+		// would let straight through.
+		document, canonicalErr := group.Canonical(value)
+		if canonicalErr != nil {
+			return canonicalErr
+		}
+
+		if document == nil && !nullIsDocument {
 			return fmt.Errorf("null is not a %T document", zero)
 		}
 
-		decoded, decodeErr := group.Decode[T](value)
+		decoded, decodeErr := group.Decode[T](document)
 		if decodeErr != nil {
 			return decodeErr
 		}
@@ -96,7 +126,7 @@ func Bind[T any](c *Client, namespace, key string, defaults T, validate func(T) 
 		return nil, err
 	}
 
-	return &Group[T]{client: c, namespace: namespace, key: key}, nil
+	return &Group[T]{client: c, namespace: namespace, key: key, nullIsDocument: nullIsDocument}, nil
 }
 
 // Snapshot returns the group's document in the caller's scope, decoded into T,
@@ -109,6 +139,11 @@ func Bind[T any](c *Client, namespace, key string, defaults T, validate func(T) 
 // [ErrValidation] and a zero Value — never a half-filled T. Through an
 // engine-backed Client that path is unreachable, because a document that fails
 // to decode cannot pass the registered validator either.
+//
+// A row holding a JSON null is refused the same way, unless the zero T is
+// itself nil — in which case the null IS the document and Snapshot returns that
+// nil Value with no error, so a caller of a pointer-, map- or slice-shaped
+// group must guard Value rather than dereference it.
 //
 // Tenant is the tenant id carried by ctx, "" in single-tenant mode. Snapshot on
 // a nil *Group returns ErrClosed; errors from the Client ([ErrClosed],
@@ -127,6 +162,16 @@ func (g *Group[T]) Snapshot(ctx context.Context) (Snapshot[T], error) {
 	// torn down underneath the group.
 	if !ok {
 		return Snapshot[T]{}, fmt.Errorf("%w: %s/%s", ErrUnknownKey, g.namespace, g.key)
+	}
+
+	// Defence in depth behind the ingress guard: a row holding a null predates
+	// it (an older binary, another writer, a hand-edited row), and Decode turns
+	// a null into the zero T by design (D-G2). Returning that would report a
+	// wholly blank configuration as the one in force.
+	if entry.Value == nil && !g.nullIsDocument {
+		var zero T
+
+		return Snapshot[T]{}, fmt.Errorf("%w: %s/%s holds a null document, which is not a %T", ErrValidation, g.namespace, g.key, zero)
 	}
 
 	value, err := group.Decode[T](entry.Value)
