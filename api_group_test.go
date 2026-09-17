@@ -4,10 +4,14 @@ package systemplane_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
 
+	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
 	systemplane "github.com/LerianStudio/lib-systemplane/v4"
 )
 
@@ -103,7 +107,13 @@ func groupDefaults() groupConfig {
 func newGroupClient(t *testing.T) *systemplane.Client {
 	t.Helper()
 
-	c, err := systemplane.NewForTesting(newGroupMemoryStore())
+	return newGroupClientOn(t, newGroupMemoryStore())
+}
+
+func newGroupClientOn(t *testing.T, s *groupMemoryStore) *systemplane.Client {
+	t.Helper()
+
+	c, err := systemplane.NewForTesting(s)
 	if err != nil {
 		t.Fatalf("NewForTesting: %v", err)
 	}
@@ -111,6 +121,26 @@ func newGroupClient(t *testing.T) *systemplane.Client {
 	t.Cleanup(func() { _ = c.Close() })
 
 	return c
+}
+
+// seed writes a row directly into the fake store, standing in for a document
+// an operator (or a previous process) persisted before this Client started.
+func (s *groupMemoryStore) seed(t *testing.T, namespace, key string, value any) {
+	t.Helper()
+
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("seed marshal: %v", err)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.entries[groupMemoryKey(namespace, key)] = systemplane.TestEntry{
+		Namespace: namespace,
+		Key:       key,
+		Value:     data,
+	}
 }
 
 func TestGroupBindRegistersCanonicalDefaults(t *testing.T) {
@@ -250,5 +280,198 @@ func TestGroupBindValidatorSurvivesCallerWithValidator(t *testing.T) {
 
 	if err := c.Set(ctx, "runtime", "ingest", groupConfig{Name: "other", Retries: 9}, "actor"); err != nil {
 		t.Fatalf("Set of a well-shaped value: %v", err)
+	}
+}
+
+func TestGroupSnapshotReturnsDefaultsBeforeAnyWrite(t *testing.T) {
+	t.Parallel()
+
+	c := newGroupClient(t)
+
+	g, err := systemplane.Bind(c, "runtime", "ingest", groupDefaults(), nil)
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	snap, err := g.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	if !reflect.DeepEqual(snap.Value, groupDefaults()) {
+		t.Fatalf("Snapshot.Value = %#v, want the registered defaults %#v", snap.Value, groupDefaults())
+	}
+
+	if snap.Revision != 0 {
+		t.Fatalf("Snapshot.Revision = %d, want 0 with no row", snap.Revision)
+	}
+
+	if snap.Tenant != "" {
+		t.Fatalf("Snapshot.Tenant = %q, want \"\" in single-tenant mode", snap.Tenant)
+	}
+}
+
+func TestGroupSnapshotReturnsStoredDocument(t *testing.T) {
+	t.Parallel()
+
+	stored := groupConfig{Name: "stored", Retries: 11, Hosts: []string{"x", "y", "z"}}
+
+	s := newGroupMemoryStore()
+	s.seed(t, "runtime", "ingest", stored)
+
+	c := newGroupClientOn(t, s)
+
+	g, err := systemplane.Bind(c, "runtime", "ingest", groupDefaults(), nil)
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	snap, err := g.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	if !reflect.DeepEqual(snap.Value, stored) {
+		t.Fatalf("Snapshot.Value = %#v, want the stored document %#v", snap.Value, stored)
+	}
+}
+
+func TestGroupSnapshotReturnsDecodeErrorNotPartialValue(t *testing.T) {
+	t.Parallel()
+
+	s := newGroupMemoryStore()
+	// A JSON string where the document belongs: nothing about it decodes into
+	// groupConfig, so a partial value would be the only way to return one.
+	s.seed(t, "runtime", "ingest", "not-a-document")
+
+	c := newGroupClientOn(t, s)
+
+	g, err := systemplane.Bind(c, "runtime", "ingest", groupDefaults(), nil)
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	snap, err := g.Snapshot(ctx)
+	if !errors.Is(err, systemplane.ErrValidation) {
+		t.Fatalf("Snapshot error = %v, want ErrValidation", err)
+	}
+
+	var zero groupConfig
+	if !reflect.DeepEqual(snap.Value, zero) {
+		t.Fatalf("Snapshot.Value = %#v, want the zero value on a decode failure", snap.Value)
+	}
+}
+
+func TestGroupSnapshotDoesNotRunConsumerValidate(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int64
+
+	validate := func(cfg groupConfig) error {
+		calls.Add(1)
+
+		if cfg.Name == "" {
+			return errors.New("name must not be empty")
+		}
+
+		return nil
+	}
+
+	c := newGroupClient(t)
+
+	g, err := systemplane.Bind(c, "runtime", "ingest", groupDefaults(), validate)
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	before := calls.Load()
+
+	for range 100 {
+		if _, err := g.Snapshot(ctx); err != nil {
+			t.Fatalf("Snapshot: %v", err)
+		}
+	}
+
+	if after := calls.Load(); after != before {
+		t.Fatalf("validate ran %d times across 100 Snapshots, want 0", after-before)
+	}
+
+	// The same validator must still guard the write path.
+	if err := c.Set(ctx, "runtime", "ingest", groupConfig{Retries: 1}, "actor"); !errors.Is(err, systemplane.ErrValidation) {
+		t.Fatalf("Set of an invalid document = %v, want ErrValidation", err)
+	}
+
+	if calls.Load() == before {
+		t.Fatal("validate never ran on the write path")
+	}
+}
+
+func TestGroupSnapshotCarriesTenantFromContext(t *testing.T) {
+	t.Parallel()
+
+	c := newGroupClient(t)
+
+	g, err := systemplane.Bind(c, "runtime", "ingest", groupDefaults(), nil)
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	snap, err := g.Snapshot(tmcore.ContextWithTenantID(ctx, "t1"))
+	if err != nil {
+		t.Fatalf("Snapshot with a tenant context: %v", err)
+	}
+
+	if snap.Tenant != "t1" {
+		t.Fatalf("Snapshot.Tenant = %q, want \"t1\"", snap.Tenant)
+	}
+
+	bare, err := g.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot with a bare context: %v", err)
+	}
+
+	if bare.Tenant != "" {
+		t.Fatalf("Snapshot.Tenant = %q on a bare context, want \"\"", bare.Tenant)
+	}
+}
+
+func TestGroupSnapshotOnNilGroupReturnsErrClosed(t *testing.T) {
+	t.Parallel()
+
+	var g *systemplane.Group[groupConfig]
+
+	snap, err := g.Snapshot(context.Background())
+	if !errors.Is(err, systemplane.ErrClosed) {
+		t.Fatalf("Snapshot error = %v, want ErrClosed", err)
+	}
+
+	var zero systemplane.Snapshot[groupConfig]
+	if !reflect.DeepEqual(snap, zero) {
+		t.Fatalf("Snapshot = %#v, want the zero Snapshot", snap)
 	}
 }

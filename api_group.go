@@ -1,8 +1,10 @@
 package systemplane
 
 import (
+	"context"
 	"fmt"
 
+	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/group"
 )
 
@@ -75,4 +77,47 @@ func Bind[T any](c *Client, namespace, key string, defaults T, validate func(T) 
 	}
 
 	return &Group[T]{client: c, namespace: namespace, key: key}, nil
+}
+
+// Snapshot returns the group's document in the caller's scope, decoded into T,
+// with the revision and freshness of the value in force. Before any write it
+// returns the registered defaults at Revision 0.
+//
+// Snapshot does NOT run the consumer's validate: whatever is in force already
+// passed it on ingress, so a second call would be a callback per read that can
+// never fail. A document that cannot decode into T returns an error wrapping
+// [ErrValidation] and a zero Value — never a half-filled T. Through an
+// engine-backed Client that path is unreachable, because a document that fails
+// to decode cannot pass the registered validator either.
+//
+// Tenant is the tenant id carried by ctx, "" in single-tenant mode. Snapshot on
+// a nil *Group returns ErrClosed; errors from the Client ([ErrClosed],
+// [ErrNilContext], store errors) are returned unchanged.
+func (g *Group[T]) Snapshot(ctx context.Context) (Snapshot[T], error) {
+	if g == nil {
+		return Snapshot[T]{}, ErrClosed
+	}
+
+	entry, ok, err := g.client.GetEntry(ctx, g.namespace, g.key)
+	if err != nil {
+		return Snapshot[T]{}, err
+	}
+
+	// A group's key is registered by construction, so !ok means the Client was
+	// torn down underneath the group.
+	if !ok {
+		return Snapshot[T]{}, fmt.Errorf("%w: %s/%s", ErrUnknownKey, g.namespace, g.key)
+	}
+
+	value, err := group.Decode[T](entry.Value)
+	if err != nil {
+		return Snapshot[T]{}, fmt.Errorf("%w: %s/%s is not a %T: %w", ErrValidation, g.namespace, g.key, value, err)
+	}
+
+	return Snapshot[T]{
+		Value:    value,
+		Revision: entry.Revision,
+		Tenant:   tmcore.GetTenantIDContext(ctx),
+		Stale:    entry.Stale,
+	}, nil
 }
