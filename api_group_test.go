@@ -787,3 +787,77 @@ func TestGroupDocumentPartialDecodeIsRejected(t *testing.T) {
 		t.Fatalf("Snapshot.Value = %#v, want the zero value — the scalar fields decoded, so anything else is a half-filled document", snap.Value)
 	}
 }
+
+// TestGroupRejectsNullDocumentOnIngress pins that a JSON null never becomes a
+// group's document. A null decodes to the zero T, so accepting one would
+// silently replace every field of a live configuration with zero values —
+// through Client.Set, through the admin PUT, or from a row already holding
+// null. The value in force stays in force instead.
+func TestGroupRejectsNullDocumentOnIngress(t *testing.T) {
+	t.Parallel()
+
+	s := newGroupMemoryStore()
+	c := newGroupClientOn(t, s)
+
+	g, err := systemplane.Bind(c, "runtime", "ingest", groupDefaults(), nil)
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	inForce := groupConfig{Name: "written", Retries: 42, Hosts: []string{"p", "q"}}
+	if err := g.Set(ctx, inForce, "actor"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	// The per-key facade is the path the admin PUT takes with a null body.
+	if err := c.Set(ctx, "runtime", "ingest", nil, "operator"); !errors.Is(err, systemplane.ErrValidation) {
+		t.Fatalf("Set of a null document = %v, want ErrValidation", err)
+	}
+
+	snap, err := g.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	if !reflect.DeepEqual(snap.Value, inForce) {
+		t.Fatalf("Snapshot.Value = %#v, want the document still in force %#v", snap.Value, inForce)
+	}
+}
+
+// TestGroupNullIsADocumentForANilableType is the other side of that guard: a
+// group whose type can legitimately BE nil — a pointer, map or slice document
+// — still accepts a JSON null, because there the null IS the value rather than
+// the erasure of one.
+func TestGroupNullIsADocumentForANilableType(t *testing.T) {
+	t.Parallel()
+
+	c := newGroupClient(t)
+
+	g, err := systemplane.Bind(c, "runtime", "optional", &groupConfig{Name: "ingest"}, nil)
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	if err := c.Set(ctx, "runtime", "optional", nil, "actor"); err != nil {
+		t.Fatalf("Set of a null document on a pointer-shaped group: %v", err)
+	}
+
+	snap, err := g.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	if snap.Value != nil {
+		t.Fatalf("Snapshot.Value = %#v, want nil", snap.Value)
+	}
+}

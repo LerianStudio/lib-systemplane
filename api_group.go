@@ -38,6 +38,10 @@ type Snapshot[T any] struct {
 // is absent when validate runs — which is the honest semantics, because it
 // validates what will actually be in force.
 //
+// A JSON null is refused on ingress unless the zero T is itself nil, because
+// a null would otherwise decode to the zero T and blank every field of the
+// group at once; the document in force stays in force instead.
+//
 // Bind on a nil Client returns ErrClosed. Defaults that validate rejects
 // surface as the ErrValidation that Register returns.
 func Bind[T any](c *Client, namespace, key string, defaults T, validate func(T) error, opts ...KeyOption) (*Group[T], error) {
@@ -50,7 +54,23 @@ func Bind[T any](c *Client, namespace, key string, defaults T, validate func(T) 
 		return nil, fmt.Errorf("%w: defaults for %s/%s are not JSON-serializable: %w", ErrValidation, namespace, key, err)
 	}
 
+	// A JSON null decodes to the zero T, so accepting one on ingress would
+	// silently replace the whole document with zero values — through Set,
+	// through the admin PUT, or from a row already holding null. It is a
+	// legitimate document only when the zero T is itself nil (a pointer, map,
+	// slice or interface shaped group), which is exactly when the zero
+	// canonicalizes to nil. A type that cannot be canonicalized at all never
+	// gets the exemption.
+	var zero T
+
+	zeroDocument, zeroErr := group.Canonical(zero)
+	nullIsDocument := zeroErr == nil && zeroDocument == nil
+
 	ingress := func(value any) error {
+		if value == nil && !nullIsDocument {
+			return fmt.Errorf("null is not a %T document", zero)
+		}
+
 		decoded, decodeErr := group.Decode[T](value)
 		if decodeErr != nil {
 			return decodeErr
