@@ -40,6 +40,13 @@ type publication struct {
 // the ingress already decoded fresh JSON, and cloning again per publication
 // would cost a reflective walk on the hot path for nothing.
 func (e *Engine) publish(pub publication) (notify bool) {
+	// A closed engine takes no publication: its workers are gone or going, so
+	// caching a value nobody can be told about only resurrects a scope during
+	// shutdown.
+	if e.closed.Load() {
+		return false
+	}
+
 	sc := e.scopeFor(pub.Scope)
 
 	sc.mu.Lock()

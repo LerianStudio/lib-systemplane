@@ -43,6 +43,13 @@ type scopeNSKey struct {
 //   - anything else is treated as an upsert: the store is re-read once the
 //     key's quiet window closes, and the row goes through the ingress.
 func (e *Engine) onEvent(evt store.Event) {
+	// An event that arrives while Close is running is dropped whole: there is
+	// nobody left to deliver it to, and answering it would create a scope or
+	// start a reconcile the engine is in the middle of tearing down.
+	if e.closed.Load() {
+		return
+	}
+
 	switch evt.Op {
 	case store.OpDisconnect:
 		e.markStale(evt.Scope)

@@ -77,9 +77,12 @@ func (w *dispatchWorker) take() (Change, bool) {
 //
 // It does not reject an unregistered key — the Client owns the registry and
 // answers FC-4's ErrUnknownKey before delegating here.
+//
+// A closed engine accepts no subscription: registering one would hand back a
+// callback nothing can ever invoke.
 func (e *Engine) OnChange(nk NSKey, fn func(ctx context.Context, ch Change)) (unsubscribe func()) {
 	noop := func() {}
-	if e == nil || fn == nil {
+	if e == nil || fn == nil || e.closed.Load() {
 		return noop
 	}
 
@@ -183,7 +186,11 @@ func (e *Engine) runWorker(wk workerKey, w *dispatchWorker) {
 			return
 		case <-w.signal:
 			if ch, ok := w.take(); ok {
+				// Marked for the whole delivery so a Close that times out can
+				// name this (scope, key) as one it is stuck on.
+				e.running.Store(wk, struct{}{})
 				e.deliver(ctx, wk.NSKey, ch)
+				e.running.Delete(wk)
 			}
 		}
 	}
