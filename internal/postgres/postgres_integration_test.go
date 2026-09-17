@@ -1732,9 +1732,11 @@ func TestIntegration_PostgresCleanCloseEmitsNoDisconnect(t *testing.T) {
 // number, an identical rewrite reports it again (the trigger still fires on the
 // updated_at change — deduplicating that is the engine's job, not the store's),
 // a delete arrives as OpDelete with revision 0, the "no row, registered default
-// in force" marker, and a key recreated after that delete comes back at
-// revision 1 — the counter lives in the row, so the delete resets it and the
-// recreate announces a revision BELOW the one the subscriber last saw.
+// in force" marker, and a key recreated after that delete comes back ABOVE
+// every revision it ever carried — the counter is a table-level sequence, not
+// a per-row counter, so a delete resets nothing and a subscriber that missed
+// both events still accepts the recreated value instead of fencing it out as
+// stale. assertV4Shape pins the catalog side of that mechanism.
 func TestIntegration_PostgresEventCarriesRevision(t *testing.T) {
 	s := freshStore(t, "evtrev")
 	ctx := context.Background()
@@ -1810,9 +1812,10 @@ func TestIntegration_PostgresEventCarriesRevision(t *testing.T) {
 		t.Fatalf("delete event revision = %d, want 0", deleted.Revision)
 	}
 
-	// Recreate. INSERT ... ON CONFLICT leaves revision to the column DEFAULT,
-	// which is nextval on the table-level sequence, so the new row lands above
-	// everything the key ever carried.
+	// Recreate. The revision column carries no DEFAULT at all: the BEFORE
+	// INSERT OR UPDATE trigger draws nextval on the table-level sequence and
+	// assigns it, so the new row lands above everything the key ever carried
+	// — and a DML-only runtime role never has to touch the sequence itself.
 	recreated := set("recreate after delete", "v3")
 	if recreated <= climbed {
 		t.Fatalf("recreated after delete: Set reported revision %d, want greater than the pre-delete %d", recreated, climbed)

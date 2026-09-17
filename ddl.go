@@ -28,46 +28,84 @@ var defaultSeedSQL string
 
 // SchemaSQL returns the full systemplane schema DDL as an importable artifact.
 //
-// The returned SQL creates the systemplane_revision_seq sequence, the
-// systemplane_entries table, the systemplane_bump_revision_v4() and
+// The returned SQL creates the systemplane_entries table, the
+// systemplane_revision_seq sequence, the systemplane_bump_revision_v4() and
 // systemplane_notify_v4() trigger functions, and the three triggers that
 // assign the revision and NOTIFY on the systemplane_changes channel.
+//
+// The table and the sequence always live in the SAME schema: the bump trigger
+// resolves the sequence as TG_TABLE_SCHEMA.systemplane_revision_seq, so the
+// DDL resolves the schema owning systemplane_entries the same way and creates
+// and seeds the sequence there rather than in whatever schema the applying
+// role's search_path happens to put first.
+//
+// Apply it to ONE DATABASE PER TENANT. It must never be applied once per
+// schema inside a shared database: NOTIFY is database-wide and every feed
+// listens on the single systemplane_changes channel, so two installations in
+// one database would each receive the other's events, and the unqualified
+// DROP FUNCTION of the v3 notify function resolves through the applying role's
+// whole search_path.
 //
 // Every revision comes from the sequence, and only ever through the BEFORE
 // INSERT OR UPDATE trigger: an insert draws a new one, an UPDATE that actually
 // changes value draws a new one, and an identical rewrite keeps the revision
 // it had. The column carries no DEFAULT and the trigger function is SECURITY
 // DEFINER on purpose — the sequence is advanced with the privileges of the
-// role that applied this DDL, so the runtime role still needs nothing beyond
-// DML on systemplane_entries. Because the counter is table-level rather than
-// per-row, a key deleted and recreated always comes back above every revision
-// it ever had, and revisions may skip numbers.
+// role that applied this DDL, so the runtime role needs plain DML on
+// systemplane_entries and no grant at all on systemplane_revision_seq.
+// Because the counter is table-level rather than per-row, a key deleted and
+// recreated always comes back above every revision it ever had, revisions may
+// skip numbers, and on a fresh database the first write lands at revision 2
+// rather than 1.
 //
-// It is idempotent and upgrades a v3 database in place: the ALTERs add the
-// column at revision 1 for the rows already there and then drop that default,
-// and the setval lifts the sequence past the highest revision present so the
-// first write after the upgrade lands at 2 or higher. It is safe to fold into
-// a consumer's own migration pipeline; lib-systemplane does not execute it for
-// the caller.
+// It is idempotent and upgrades a v3 database in place: the ALTER adds the
+// column at revision 1 for the rows already there and the setval lifts the
+// sequence past the highest revision present, so the first write after the
+// upgrade lands at 2 or higher. The statement dropping the column default
+// comes last, after the triggers are installed, so an untransacted
+// application never leaves a window in which a concurrent insert has neither
+// a default nor a trigger to fill the NOT NULL revision. It is safe to fold
+// into a consumer's own migration pipeline; lib-systemplane does not execute
+// it for the caller.
 func SchemaSQL() string {
 	return schemaSQL
 }
 
 // MigrationV3ToV4SQL returns the v3 -> v4 delta as an importable artifact.
 //
-// The returned SQL creates the systemplane_revision_seq sequence, adds the
-// revision column at 1 for every row already stored, drops that column default
-// again (the SECURITY DEFINER bump trigger is the only thing that may touch
-// the sequence, so a DML-only runtime role needs no grant on it), seeds the
-// sequence past the highest revision present so the first write after the
-// upgrade lands at 2 or higher, installs systemplane_bump_revision_v4() and
-// systemplane_notify_v4() with the three v4 triggers, and drops the v3 notify
-// function.
+// The returned SQL adds the revision column at 1 for every row already stored,
+// creates and seeds systemplane_revision_seq past the highest revision present
+// so the first write after the upgrade lands at 2 or higher, installs
+// systemplane_bump_revision_v4() and systemplane_notify_v4() with the three v4
+// triggers, drops the v3 notify function, and only then drops the column
+// default — last, after the triggers exist, so an untransacted application
+// never leaves a window in which a concurrent insert has neither a default nor
+// a trigger to fill the NOT NULL revision.
+//
+// The table and the sequence always live in the SAME schema: the bump trigger
+// resolves the sequence as TG_TABLE_SCHEMA.systemplane_revision_seq, so the
+// migration resolves the schema owning systemplane_entries the same way and
+// creates and seeds the sequence there rather than in whatever schema the
+// applying role's search_path happens to put first.
+//
+// Apply it to ONE DATABASE PER TENANT. It must never be applied once per
+// schema inside a shared database: NOTIFY is database-wide and every feed
+// listens on the single systemplane_changes channel, so two installations in
+// one database would each receive the other's events, and the unqualified
+// DROP FUNCTION of the v3 notify function resolves through the applying role's
+// whole search_path.
+//
+// After the upgrade the SECURITY DEFINER bump trigger is the only thing that
+// touches the sequence, so the runtime role needs plain DML on
+// systemplane_entries and no grant at all on systemplane_revision_seq.
+// Revisions may skip numbers from then on, and a key deleted and recreated
+// always comes back above every revision it previously had.
 //
 // It is idempotent and it does NOT create the systemplane_entries table: it
 // upgrades a database that already carries the v3 schema. A consumer starting
-// from an empty database applies SchemaSQL() instead. lib-systemplane does not
-// execute it for the caller.
+// from an empty database applies SchemaSQL() instead, where the first write
+// lands at revision 2 rather than 1. lib-systemplane does not execute it for
+// the caller.
 func MigrationV3ToV4SQL() string {
 	return migrationV3ToV4SQL
 }

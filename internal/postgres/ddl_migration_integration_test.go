@@ -399,3 +399,189 @@ func assertNextWriteClearsMigratedRevision(t *testing.T, db *sql.DB, dsn string)
 		t.Fatalf("first write after the upgrade returned revision %d, want at least 2 (above the migrated rows' revision 1)", rev)
 	}
 }
+
+// TestIntegration_DDLMigrationCreatesTheSequenceBesideTheTable is the
+// regression the rest of this suite cannot catch, because every other test
+// runs with a public-first search_path where "the first schema" and "the
+// table's schema" happen to be the same one.
+//
+// Here they are not: systemplane_entries lives in `app` and the upgrade is
+// applied with search_path = public, app — the shape a deployment gets from a
+// role default. An unqualified CREATE SEQUENCE lands in `public`, the
+// migration still exits 0, and then every write dies because the bump trigger
+// resolves app.systemplane_revision_seq. Resolving the table's own schema and
+// creating the sequence there is what keeps the upgrade writable.
+func TestIntegration_DDLMigrationCreatesTheSequenceBesideTheTable(t *testing.T) {
+	assertUpgradeOutsideTheDefaultSchema(t, "seqmig", "public, app",
+		systemplane.MigrationV3ToV4SQL(),
+		systemplane.MigrationV3ToV4SQL(),
+	)
+}
+
+// TestIntegration_DDLSchemaCreatesTheSequenceBesideTheTable is the sibling
+// route: SchemaSQL() applied straight to a raw v3 table that does not live in
+// `public`, twice.
+//
+// Its search_path starts at the table's own schema on purpose — CREATE TABLE
+// IF NOT EXISTS targets the first schema in search_path, so pointing it
+// anywhere else would provision a second, empty table instead of upgrading the
+// one that holds the data. That makes this the invariant test rather than the
+// regression test (the migration route above is the one that reproduces the
+// old failure): it pins that the full schema artifact keeps the table and its
+// sequence together, and installs nothing in `public`, when systemplane does
+// not live in `public`.
+func TestIntegration_DDLSchemaCreatesTheSequenceBesideTheTable(t *testing.T) {
+	assertUpgradeOutsideTheDefaultSchema(t, "seqschema", "app, public",
+		systemplane.SchemaSQL(),
+		systemplane.SchemaSQL(),
+	)
+}
+
+// assertUpgradeOutsideTheDefaultSchema builds a populated v3 install inside the
+// `app` schema, applies the given steps under searchPath, and asserts the
+// sequence followed the table rather than the search_path — then proves it by
+// writing through the Store, which is where a misplaced sequence surfaces.
+func assertUpgradeOutsideTheDefaultSchema(t *testing.T, label, searchPath string, steps ...string) {
+	t.Helper()
+
+	base, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	admin := adminDSN(t, base)
+	t.Cleanup(func() { _ = admin.Close() })
+
+	dbName := fmt.Sprintf("ddl_%s_%d", label, time.Now().UnixNano())
+	freshDB(t, admin, dbName)
+
+	dsn := dsnFor(base, dbName)
+
+	seed := openDatabase(t, dsn)
+
+	if _, err := seed.Exec(`CREATE SCHEMA app`); err != nil {
+		t.Fatalf("create schema app: %v", err)
+	}
+
+	_ = seed.Close()
+
+	// The v3 install goes in entirely under `app`.
+	setDatabaseSearchPath(t, admin, dbName, "app")
+
+	legacy := openDatabase(t, dsn)
+
+	if _, err := legacy.Exec(v3SchemaSQL); err != nil {
+		t.Fatalf("apply v3 schema inside app: %v", err)
+	}
+
+	if _, err := legacy.Exec(`INSERT INTO systemplane_entries (namespace, "key", value, updated_by)
+		VALUES ('runtime_config', 'log_level', '"debug"'::jsonb, 'operator')`); err != nil {
+		t.Fatalf("insert pre-existing row: %v", err)
+	}
+
+	assertRelationSchemas(t, legacy, "systemplane_entries", []string{"app"})
+
+	_ = legacy.Close()
+
+	// Now upgrade under a search_path that does not describe where the table is.
+	setDatabaseSearchPath(t, admin, dbName, searchPath)
+
+	db := openDatabase(t, dsn)
+	t.Cleanup(func() { _ = db.Close() })
+
+	for i, statements := range steps {
+		if _, err := db.Exec(statements); err != nil {
+			t.Fatalf("apply step %d under search_path %q: %v", i+1, searchPath, err)
+		}
+	}
+
+	assertRelationSchemas(t, db, "systemplane_entries", []string{"app"})
+	assertRelationSchemas(t, db, "systemplane_revision_seq", []string{"app"})
+
+	s := storeOn(t, db, dsn)
+	ctx := context.Background()
+
+	updated, err := s.Set(ctx, store.Scope{}, store.Entry{
+		Namespace: "runtime_config",
+		Key:       "log_level",
+		Value:     []byte(`"warn"`),
+	})
+	if err != nil {
+		t.Fatalf("update the migrated key under search_path %q: %v", searchPath, err)
+	}
+
+	if updated < 2 {
+		t.Fatalf("updating the migrated key returned revision %d, want at least 2", updated)
+	}
+
+	created, err := s.Set(ctx, store.Scope{}, store.Entry{
+		Namespace: "runtime_config",
+		Key:       "rate_limit.max",
+		Value:     []byte(`100`),
+	})
+	if err != nil {
+		t.Fatalf("insert a new key under search_path %q: %v", searchPath, err)
+	}
+
+	if created <= updated {
+		t.Fatalf("inserting a new key returned revision %d, want greater than the %d the update drew from the same sequence", created, updated)
+	}
+}
+
+// setDatabaseSearchPath pins search_path as a database default rather than a
+// session SET: *sql.DB is a pool, so only a default reaches every connection
+// the test and the Store open later.
+func setDatabaseSearchPath(t *testing.T, admin *sql.DB, dbName, searchPath string) {
+	t.Helper()
+
+	if _, err := admin.Exec(fmt.Sprintf(`ALTER DATABASE %s SET search_path = %s`, dbName, searchPath)); err != nil {
+		t.Fatalf("set search_path %q on %s: %v", searchPath, dbName, err)
+	}
+}
+
+func openDatabase(t *testing.T, dsn string) *sql.DB {
+	t.Helper()
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open %s: %v", dsn, err)
+	}
+
+	return db
+}
+
+// assertRelationSchemas pins which schemas hold a relation. Both schemas at
+// once is the interesting failure: a sequence in `public` and a table in `app`
+// means the bump trigger, which resolves TG_TABLE_SCHEMA.systemplane_revision_seq,
+// cannot see the sequence that was just created.
+func assertRelationSchemas(t *testing.T, db *sql.DB, relName string, want []string) {
+	t.Helper()
+
+	rows, err := db.Query(`SELECT n.nspname FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE c.relname = $1 AND c.relkind IN ('r', 'S')
+		ORDER BY n.nspname`, relName)
+	if err != nil {
+		t.Fatalf("look up %s: %v", relName, err)
+	}
+
+	defer func() { _ = rows.Close() }()
+
+	var got []string
+
+	for rows.Next() {
+		var schema string
+
+		if err := rows.Scan(&schema); err != nil {
+			t.Fatalf("scan schema of %s: %v", relName, err)
+		}
+
+		got = append(got, schema)
+	}
+
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate schemas of %s: %v", relName, err)
+	}
+
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("%s exists in schemas %v, want exactly %v", relName, got, want)
+	}
+}

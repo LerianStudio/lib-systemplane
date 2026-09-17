@@ -101,41 +101,40 @@ func Run(t *testing.T, f Factory, opts RunOptions) {
 		})
 	}
 
-	if opts.SkipRevisionAndResync {
-		return
+	// Gated as blocks rather than as early returns on purpose: a sub-test
+	// appended below would otherwise be skipped by position alone, silently,
+	// for every backend that sets one of these options.
+	if !opts.SkipRevisionAndResync {
+		t.Run("RevisionMonotonic", func(t *testing.T) {
+			s, cleanup := f(t)
+			t.Cleanup(cleanup)
+
+			runRevisionMonotonic(t, s, opts)
+		})
+
+		if !opts.SkipSubscribe {
+			t.Run("SubscribeEmitsResyncFirst", func(t *testing.T) {
+				s, cleanup := f(t)
+				t.Cleanup(cleanup)
+
+				runSubscribeEmitsResyncFirst(t, s, opts)
+			})
+
+			t.Run("EventCarriesScopeAndRevision", func(t *testing.T) {
+				s, cleanup := f(t)
+				t.Cleanup(cleanup)
+
+				runEventCarriesScopeAndRevision(t, s, opts)
+			})
+
+			t.Run("DeleteEventRevisionZero", func(t *testing.T) {
+				s, cleanup := f(t)
+				t.Cleanup(cleanup)
+
+				runDeleteEventRevisionZero(t, s, opts)
+			})
+		}
 	}
-
-	t.Run("RevisionMonotonic", func(t *testing.T) {
-		s, cleanup := f(t)
-		t.Cleanup(cleanup)
-
-		runRevisionMonotonic(t, s, opts)
-	})
-
-	if opts.SkipSubscribe {
-		return
-	}
-
-	t.Run("SubscribeEmitsResyncFirst", func(t *testing.T) {
-		s, cleanup := f(t)
-		t.Cleanup(cleanup)
-
-		runSubscribeEmitsResyncFirst(t, s, opts)
-	})
-
-	t.Run("EventCarriesScopeAndRevision", func(t *testing.T) {
-		s, cleanup := f(t)
-		t.Cleanup(cleanup)
-
-		runEventCarriesScopeAndRevision(t, s, opts)
-	})
-
-	t.Run("DeleteEventRevisionZero", func(t *testing.T) {
-		s, cleanup := f(t)
-		t.Cleanup(cleanup)
-
-		runDeleteEventRevisionZero(t, s, opts)
-	})
 }
 
 func startStore(t *testing.T, s store.Store) {

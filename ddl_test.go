@@ -26,7 +26,6 @@ func TestSchemaSQL_ContainsCanonicalStatements(t *testing.T) {
 	// nothing else fails when it drifts. These fragments are the drift guard:
 	// a change to the table/function/trigger shape has to be made here too.
 	wantFragments := []string{
-		"CREATE SEQUENCE IF NOT EXISTS systemplane_revision_seq AS BIGINT;",
 		"CREATE TABLE IF NOT EXISTS systemplane_entries (",
 		"namespace   TEXT NOT NULL,",
 		`"key"       TEXT NOT NULL,`,
@@ -37,9 +36,6 @@ func TestSchemaSQL_ContainsCanonicalStatements(t *testing.T) {
 		`PRIMARY KEY (namespace, "key")`,
 		"ALTER TABLE systemplane_entries ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;",
 		"ALTER TABLE systemplane_entries ALTER COLUMN revision DROP DEFAULT;",
-		"SELECT setval('systemplane_revision_seq', GREATEST(",
-		"(SELECT COALESCE(MAX(revision), 1) FROM systemplane_entries),",
-		"(SELECT last_value FROM systemplane_revision_seq)",
 		"CREATE OR REPLACE FUNCTION systemplane_bump_revision_v4() RETURNS TRIGGER AS $$",
 		"IF TG_OP = 'INSERT' OR OLD.value IS DISTINCT FROM NEW.value THEN",
 		"NEW.revision := nextval(format('%I.systemplane_revision_seq', TG_TABLE_SCHEMA)::regclass);",
@@ -71,8 +67,39 @@ func TestSchemaSQL_ContainsCanonicalStatements(t *testing.T) {
 		}
 	}
 
+	assertSequenceLivesInTheTableSchema(t, "SchemaSQL()", sql)
 	assertDropsTriggersBeforeFunction(t, "SchemaSQL()", sql)
 	assertNoV3FunctionDefinition(t, "SchemaSQL()", sql)
+	assertDropDefaultComesLast(t, "SchemaSQL()", sql)
+}
+
+// assertSequenceLivesInTheTableSchema pins the one thing an unqualified
+// CREATE SEQUENCE gets wrong: the bump trigger resolves the sequence as
+// TG_TABLE_SCHEMA.systemplane_revision_seq, so the artifact has to create it in
+// the schema that owns systemplane_entries rather than in whatever schema the
+// applier's search_path happens to put first. A v3 table in public applied by a
+// role whose search_path starts elsewhere would otherwise leave the sequence in
+// the wrong schema and every insert would fail at runtime.
+func assertSequenceLivesInTheTableSchema(t *testing.T, artifact, sql string) {
+	t.Helper()
+
+	if strings.Contains(sql, "CREATE SEQUENCE IF NOT EXISTS systemplane_revision_seq") {
+		t.Errorf("%s creates systemplane_revision_seq unqualified; it must be created in the schema that owns systemplane_entries", artifact)
+	}
+
+	wantFragments := []string{
+		"SELECT n.nspname INTO tbl_schema",
+		"WHERE c.oid = 'systemplane_entries'::regclass;",
+		"EXECUTE format('CREATE SEQUENCE IF NOT EXISTS %I.systemplane_revision_seq AS BIGINT', tbl_schema);",
+		"'SELECT setval(%L::regclass, GREATEST((SELECT COALESCE(MAX(revision), 1) FROM %I.systemplane_entries), (SELECT last_value FROM %I.systemplane_revision_seq)))',",
+		"format('%I.systemplane_revision_seq', tbl_schema), tbl_schema, tbl_schema);",
+	}
+
+	for _, frag := range wantFragments {
+		if !strings.Contains(sql, frag) {
+			t.Errorf("%s missing schema-resolving sequence fragment:\n%q", artifact, frag)
+		}
+	}
 }
 
 // assertDropsTriggersBeforeFunction pins the ordering both published artifacts
@@ -100,12 +127,48 @@ func assertDropsTriggersBeforeFunction(t *testing.T, artifact, sql string) {
 }
 
 // assertNoV3FunctionDefinition pins that neither artifact re-creates the v3
-// notify function it just dropped.
+// notify function it just dropped. Count-based on purpose: the name may appear
+// exactly once, in the DROP, so a CREATE OR REPLACE — or a plain CREATE
+// FUNCTION — reintroduced anywhere in the file fails here.
 func assertNoV3FunctionDefinition(t *testing.T, artifact, sql string) {
 	t.Helper()
 
-	if strings.Contains(sql, "CREATE OR REPLACE FUNCTION systemplane_notify_v3()") {
-		t.Errorf("%s defines systemplane_notify_v3(); v4 replaces it with systemplane_notify_v4()", artifact)
+	const (
+		name = "systemplane_notify_v3"
+		drop = "DROP FUNCTION IF EXISTS "
+	)
+
+	if n := strings.Count(sql, name); n != 1 {
+		t.Fatalf("%s names %s %d times, want exactly 1 (the DROP); v4 replaces it with systemplane_notify_v4()", artifact, name, n)
+	}
+
+	at := strings.Index(sql, name)
+	if at < len(drop) || sql[at-len(drop):at] != drop {
+		t.Errorf("%s names %s outside a %sstatement; the v3 function may only be dropped, never defined", artifact, name, drop)
+	}
+}
+
+// assertDropDefaultComesLast pins the ordering that keeps an untransacted
+// migration writable throughout: revision is NOT NULL, so between dropping the
+// column default and installing the bump trigger nothing would assign it and a
+// concurrent insert would fail with a not-null violation. The DROP DEFAULT
+// therefore has to be the last statement, after every CREATE TRIGGER.
+func assertDropDefaultComesLast(t *testing.T, artifact, sql string) {
+	t.Helper()
+
+	dropDefault := strings.LastIndex(sql, "ALTER TABLE systemplane_entries ALTER COLUMN revision DROP DEFAULT;")
+	lastCreateTrigger := strings.LastIndex(sql, "CREATE TRIGGER")
+
+	if dropDefault < 0 {
+		t.Fatalf("%s missing ALTER TABLE systemplane_entries ALTER COLUMN revision DROP DEFAULT;", artifact)
+	}
+
+	if lastCreateTrigger < 0 {
+		t.Fatalf("%s missing CREATE TRIGGER statements", artifact)
+	}
+
+	if dropDefault < lastCreateTrigger {
+		t.Errorf("%s drops the revision default at index %d, before its last CREATE TRIGGER at index %d; a concurrent insert in that window has neither a default nor a trigger to assign the NOT NULL revision", artifact, dropDefault, lastCreateTrigger)
 	}
 }
 
@@ -180,12 +243,8 @@ func TestMigrationV3ToV4SQL_IsTheDeltaOnly(t *testing.T) {
 	// trigger instead of the caller, and the sequence is seeded past every
 	// existing revision so the first post-migration write lands above them.
 	wantFragments := []string{
-		"CREATE SEQUENCE IF NOT EXISTS systemplane_revision_seq AS BIGINT;",
 		"ALTER TABLE systemplane_entries ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;",
 		"ALTER TABLE systemplane_entries ALTER COLUMN revision DROP DEFAULT;",
-		"SELECT setval('systemplane_revision_seq', GREATEST(",
-		"(SELECT COALESCE(MAX(revision), 1) FROM systemplane_entries),",
-		"(SELECT last_value FROM systemplane_revision_seq)",
 		"NEW.revision := nextval(format('%I.systemplane_revision_seq', TG_TABLE_SCHEMA)::regclass);",
 		"$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp;",
 		"BEFORE INSERT OR UPDATE ON systemplane_entries",
@@ -203,6 +262,8 @@ func TestMigrationV3ToV4SQL_IsTheDeltaOnly(t *testing.T) {
 		t.Error("MigrationV3ToV4SQL() must not contain a table creation statement")
 	}
 
+	assertSequenceLivesInTheTableSchema(t, "MigrationV3ToV4SQL()", sql)
 	assertDropsTriggersBeforeFunction(t, "MigrationV3ToV4SQL()", sql)
 	assertNoV3FunctionDefinition(t, "MigrationV3ToV4SQL()", sql)
+	assertDropDefaultComesLast(t, "MigrationV3ToV4SQL()", sql)
 }
