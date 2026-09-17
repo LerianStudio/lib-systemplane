@@ -108,9 +108,11 @@ func (c *Client) CatalogService() string {
 	return asInternalClient(c).CatalogService()
 }
 
-// OnChange registers a callback for backend-observed value changes.
-// Returns ErrNotSupportedInMultiTenant in multi-tenant mode.
-func (c *Client) OnChange(namespace, key string, fn func(ctx context.Context, ns, key string, newValue any)) (func(), error) {
+// OnChange registers a callback for backend-observed value changes of
+// (namespace, key). Change.Tenant names the tenant whose row changed ("" in
+// single-tenant mode) and a delete delivers the registered default with
+// Revision 0.
+func (c *Client) OnChange(namespace, key string, fn func(ctx context.Context, ch Change)) (unsubscribe func(), err error) {
 	return asInternalClient(c).OnChange(namespace, key, fn)
 }
 

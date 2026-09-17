@@ -22,7 +22,7 @@ func TestBackwardCompat_MTWithoutManager_OnChangeReturnsErr(t *testing.T) {
 		t.Fatalf("register: %v", err)
 	}
 
-	_, err := c.OnChange("ns", "k", func(_ context.Context, _, _ string, _ any) {})
+	_, err := c.OnChange("ns", "k", func(_ context.Context, _ Change) {})
 	if !errors.Is(err, ErrNotSupportedInMultiTenant) {
 		t.Errorf("expected ErrNotSupportedInMultiTenant, got %v", err)
 	}
@@ -77,7 +77,7 @@ func TestMT_WithManager_OnChangeRegistersAndUnsubscribes(t *testing.T) {
 	c.BindManager(mgr)
 
 	called := 0
-	unsub, err := c.OnChange("ns", "k", func(_ context.Context, _, _ string, _ any) {
+	unsub, err := c.OnChange("ns", "k", func(_ context.Context, _ Change) {
 		called++
 	})
 	if err != nil {
@@ -124,5 +124,71 @@ func TestBackwardCompat_ST_Get_BypassesManager(t *testing.T) {
 
 	if v != "default" {
 		t.Errorf("Get = %v, want default", v)
+	}
+}
+
+// TestMT_ManagerCallback_CarriesTenant pins FC-4: one subscriber bound to a
+// Manager observes a distinct Change.Tenant for every tenant whose row
+// changed, so a consumer can tell two tenants' deliveries apart.
+func TestMT_ManagerCallback_CarriesTenant(t *testing.T) {
+	t.Parallel()
+
+	c := newMultiTenantClient(t, newMemStore(true))
+
+	if err := c.Register("ns", "k", "default"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	var got []Change
+
+	cb := c.managerCallback(func(_ context.Context, ch Change) {
+		got = append(got, ch)
+	})
+
+	cb(context.Background(), "t1", "ns", "k", 7, "v1")
+	cb(context.Background(), "t2", "ns", "k", 9, "v2")
+
+	if len(got) != 2 {
+		t.Fatalf("got %d changes, want 2", len(got))
+	}
+
+	if got[0].Tenant != "t1" || got[1].Tenant != "t2" {
+		t.Errorf("tenants = %q, %q; want t1, t2", got[0].Tenant, got[1].Tenant)
+	}
+
+	if got[0].Revision != 7 || got[1].Revision != 9 {
+		t.Errorf("revisions = %d, %d; want 7, 9", got[0].Revision, got[1].Revision)
+	}
+
+	if got[0].Value != "v1" || got[1].Value != "v2" {
+		t.Errorf("values = %v, %v; want v1, v2", got[0].Value, got[1].Value)
+	}
+}
+
+// TestMT_ManagerCallback_DeleteDeliversDefault pins FC-4: a delete publishes
+// the registered default, never a nil value.
+func TestMT_ManagerCallback_DeleteDeliversDefault(t *testing.T) {
+	t.Parallel()
+
+	c := newMultiTenantClient(t, newMemStore(true))
+
+	if err := c.Register("ns", "k", "default"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	var got Change
+
+	cb := c.managerCallback(func(_ context.Context, ch Change) {
+		got = ch
+	})
+
+	cb(context.Background(), "t1", "ns", "k", 0, nil)
+
+	if got.Value != "default" {
+		t.Errorf("delete delivered %v, want the registered default", got.Value)
+	}
+
+	if got.Revision != 0 {
+		t.Errorf("delete Revision = %d, want 0", got.Revision)
 	}
 }

@@ -314,7 +314,7 @@ func TestIntegration_Manager_NotifyEndToEnd(t *testing.T) {
 
 	received := make(chan any, 1)
 
-	unsub := m.RegisterCallback("ns", "k", func(_ context.Context, _, _ string, newValue any) {
+	unsub := m.RegisterCallback("ns", "k", func(_ context.Context, _, _, _ string, _ int64, newValue any) {
 		received <- newValue
 	})
 	defer unsub()
@@ -457,7 +457,7 @@ func TestIntegration_Manager_ReconnectAfterTerminateBackend(t *testing.T) {
 	// After reconnect, a fresh NOTIFY should still be delivered.
 	received := make(chan any, 1)
 
-	unsub := m.RegisterCallback("ns", "k", func(_ context.Context, _, _ string, newValue any) {
+	unsub := m.RegisterCallback("ns", "k", func(_ context.Context, _, _, _ string, _ int64, newValue any) {
 		select {
 		case received <- newValue:
 		default:
@@ -550,7 +550,7 @@ func TestIntegration_Manager_CredentialsRotated(t *testing.T) {
 	// After rotation, NOTIFYs should still flow.
 	received := make(chan any, 1)
 
-	unsub := m.RegisterCallback("ns", "k", func(_ context.Context, _, _ string, newValue any) {
+	unsub := m.RegisterCallback("ns", "k", func(_ context.Context, _, _, _ string, _ int64, newValue any) {
 		select {
 		case received <- newValue:
 		default:

@@ -63,7 +63,7 @@ func TestApplyEvent_Delete_RemovesFromCacheAndFiresCallback(t *testing.T) {
 
 	var fired bool
 
-	unsub := m.RegisterCallback("ns", "k", func(_ context.Context, _, _ string, newValue any) {
+	unsub := m.RegisterCallback("ns", "k", func(_ context.Context, _, _, _ string, _ int64, newValue any) {
 		fired = true
 		if newValue != nil {
 			t.Errorf("delete dispatch should pass nil, got %v", newValue)

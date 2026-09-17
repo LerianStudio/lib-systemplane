@@ -144,8 +144,8 @@ func TestPublicClientFacadeRuntimeMethods(t *testing.T) {
 	}
 
 	var changed any
-	unsub, err := c.OnChange("runtime", "name", func(_ context.Context, _, _ string, newValue any) {
-		changed = newValue
+	unsub, err := c.OnChange("runtime", "name", func(_ context.Context, ch Change) {
+		changed = ch.Value
 	})
 	if err != nil {
 		t.Fatalf("OnChange: %v", err)

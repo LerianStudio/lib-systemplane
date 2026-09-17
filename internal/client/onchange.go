@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/manager"
 )
 
 // OnChange registers a callback for backend-observed value changes.
@@ -19,9 +20,9 @@ import (
 //
 // In multi-tenant mode with a bound Manager, the callback is registered on
 // the Manager's per-tenant LISTEN dispatcher. It fires once per NOTIFY
-// observed across any active tenant's LISTEN goroutine, with ctx carrying
-// the tenant scope at the time of dispatch.
-func (c *Client) OnChange(namespace, key string, fn func(ctx context.Context, ns, key string, newValue any)) (func(), error) {
+// observed across any active tenant's LISTEN goroutine; Change.Tenant names
+// the tenant whose row changed and a delete delivers the registered default.
+func (c *Client) OnChange(namespace, key string, fn func(ctx context.Context, ch Change)) (func(), error) {
 	noop := func() {}
 
 	if c == nil || c.closed.Load() {
@@ -38,9 +39,7 @@ func (c *Client) OnChange(namespace, key string, fn func(ctx context.Context, ns
 			return noop, nil
 		}
 
-		unsub := mgr.RegisterCallback(namespace, key, func(ctx context.Context, ns, k string, newValue any) {
-			fn(ctx, ns, k, newValue)
-		})
+		unsub := mgr.RegisterCallback(namespace, key, c.managerCallback(fn))
 		if unsub == nil {
 			return noop, nil
 		}
@@ -76,7 +75,8 @@ func (c *Client) OnChange(namespace, key string, fn func(ctx context.Context, ns
 		// callbacks receive cancellation when the Client shuts down. Falling
 		// back to context.Background() here would defeat that propagation.
 		fn: func(ctx context.Context, newValue any) {
-			fn(ctx, namespace, key, newValue)
+			// fireSubscribers already handed us a private clone.
+			fn(ctx, Change{Namespace: namespace, Key: key, Value: newValue})
 		},
 	})
 	c.subsMu.Unlock()
@@ -98,4 +98,30 @@ func (c *Client) OnChange(namespace, key string, fn func(ctx context.Context, ns
 			}
 		})
 	}, nil
+}
+
+// managerCallback adapts a subscriber to the Manager dispatch signature. The
+// Manager dispatches a nil value on delete; FC-4 publishes the registered
+// default in its place, and the value is cloned so each subscriber owns its
+// copy.
+func (c *Client) managerCallback(fn func(ctx context.Context, ch Change)) manager.Callback {
+	return func(ctx context.Context, tenantID, ns, k string, revision int64, newValue any) {
+		if newValue == nil {
+			c.registryMu.RLock()
+			def, registered := c.registry[nskey{Namespace: ns, Key: k}]
+			c.registryMu.RUnlock()
+
+			if registered {
+				newValue = def.defaultValue
+			}
+		}
+
+		fn(ctx, Change{
+			Tenant:    tenantID,
+			Namespace: ns,
+			Key:       k,
+			Revision:  revision,
+			Value:     cloneValue(newValue),
+		})
+	}
 }

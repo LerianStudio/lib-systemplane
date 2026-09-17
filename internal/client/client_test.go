@@ -312,8 +312,8 @@ func TestOnChangeFiresOnUpsert(t *testing.T) {
 
 	received := make(chan any, 1)
 
-	unsub, err := c.OnChange("ns", "k", func(_ context.Context, _, _ string, newValue any) {
-		received <- newValue
+	unsub, err := c.OnChange("ns", "k", func(_ context.Context, ch Change) {
+		received <- ch.Value
 	})
 	if err != nil {
 		t.Fatalf("onchange: %v", err)
@@ -349,7 +349,7 @@ func TestOnChangeReturnsErrInMultiTenantMode(t *testing.T) {
 
 	defer c.Close()
 
-	_, err := c.OnChange("ns", "k", func(_ context.Context, _, _ string, _ any) {})
+	_, err := c.OnChange("ns", "k", func(_ context.Context, _ Change) {})
 	if !errors.Is(err, ErrNotSupportedInMultiTenant) {
 		t.Errorf("expected ErrNotSupportedInMultiTenant, got %v", err)
 	}
