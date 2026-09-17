@@ -19,10 +19,20 @@ import (
 func feedEngine(t *testing.T, defs map[NSKey]KeyDef, fs *fakeStore, window time.Duration) *Engine {
 	t.Helper()
 
+	return registryEngine(t, fakeRegistry{defs: defs}, fs, window)
+}
+
+// registryEngine is feedEngine with the registry supplied by the caller, so a
+// test can hand the engine a registry that fires a hook at the exact moment a
+// reconcile decides a key — which is how a feed event is landed inside the gap
+// a fence is supposed to close, without guessing at it with a sleep.
+func registryEngine(t *testing.T, reg Registry, fs *fakeStore, window time.Duration) *Engine {
+	t.Helper()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	e := &Engine{
 		store:           fs,
-		registry:        fakeRegistry{defs: defs},
+		registry:        reg,
 		scopes:          map[store.Scope]*scopeState{},
 		debouncer:       debounce.New[scopeNSKey](window),
 		lifecycleCtx:    ctx,
@@ -63,32 +73,31 @@ func jsonRow(nk NSKey, revision int64, value, actor string) store.Entry {
 	}
 }
 
-// armReconcile puts the scope in the state the reconciler leaves it in while a
-// List is in flight, so a test can assert what the feed records during that
-// window without owning the reconcile itself.
-func armReconcile(e *Engine, scope store.Scope) {
-	sc := e.scopeFor(scope)
-
-	sc.reconcileMu.Lock()
-	defer sc.reconcileMu.Unlock()
-
-	sc.reconciling = true
-	sc.touched = map[NSKey]struct{}{}
-	sc.unusable = map[NSKey]struct{}{}
+// armReconcile opens a reconcile window on the scope the way an OpResync does,
+// so a test can assert what the feed records during that window without owning
+// the reconcile itself. It returns the arming, which names the window.
+func armReconcile(e *Engine, scope store.Scope) reconcileArming {
+	return e.scopeFor(scope).beginReconcile()
 }
 
+// recordedSets unions the fences of every window currently open on the scope.
+// A union is what a test wants: a key recorded in any open window is a key the
+// feed has spoken about, and the per-window separation is asserted by the
+// overlapping-reconcile tests through the values that end up cached.
 func recordedSets(e *Engine, scope store.Scope) (touched, unusable []NSKey) {
 	sc := e.scopeFor(scope)
 
 	sc.reconcileMu.Lock()
 	defer sc.reconcileMu.Unlock()
 
-	for nk := range sc.touched {
-		touched = append(touched, nk)
-	}
+	for _, window := range sc.windows {
+		for nk := range window.touched {
+			touched = append(touched, nk)
+		}
 
-	for nk := range sc.unusable {
-		unusable = append(unusable, nk)
+		for nk := range window.unusable {
+			unusable = append(unusable, nk)
+		}
 	}
 
 	return touched, unusable
@@ -259,7 +268,7 @@ func TestFeedRecordsTouchedOnlyWhileReconciling(t *testing.T) {
 		t.Errorf("outside a reconcile: touched=%v unusable=%v, want both empty", touched, unusable)
 	}
 
-	armReconcile(e, store.Scope{})
+	_ = armReconcile(e, store.Scope{})
 
 	fs.seed(store.Scope{}, jsonRow(nk, 2, `"two"`, "ops"))
 	e.onEvent(upsertEvent(store.Scope{}, nk, 2))

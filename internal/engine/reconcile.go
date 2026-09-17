@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"reflect"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
@@ -8,15 +9,36 @@ import (
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
+// reconcileWindow is one reconcile's own pair of fences, and nobody else's.
+//
+// touched names every key the feed published since this reconcile armed: the
+// feed holds the fresher fact, so the snapshot must not overwrite it. unusable
+// names every key the feed tried and learned nothing about — a re-read that
+// errored, a row the validator rejected — so absence from the snapshot is not
+// evidence the row is gone.
+//
+// The two sets are per window rather than per scope because windows overlap: a
+// second OpResync arrives while the first reconcile is still applying its
+// photograph. A window that inherited the first one's touched set would skip
+// exactly the keys its own, fresher List just answered, leaving the cache at
+// whatever revision the earlier feed happened to publish while reporting the
+// scope as no longer stale.
+type reconcileWindow struct {
+	touched  map[NSKey]struct{}
+	unusable map[NSKey]struct{}
+}
+
 // reconcileArming is what beginReconcile hands the reconcile that follows it.
 //
 // reconcile names the window this reconcile opened: a newer OpResync bumps it,
 // which is how a reconcile learns its snapshot has been superseded and must be
 // abandoned rather than applied. disconnect is the connection generation the
-// reconcile must still see at the end to be allowed to clear stale.
+// reconcile must still see at the end to be allowed to clear stale. window is
+// this reconcile's own fences, read only by it.
 type reconcileArming struct {
 	reconcile  uint64
 	disconnect uint64
+	window     *reconcileWindow
 }
 
 // onResync answers store.OpResync, which the store emits after every
@@ -55,6 +77,12 @@ func (e *Engine) onResync(scope store.Scope) {
 func (e *Engine) reconcileScope(sc *scopeState, arm reconcileArming) {
 	sc.runMu.Lock()
 	defer sc.runMu.Unlock()
+
+	// Every exit releases this reconcile's OWN window, superseded or not: the
+	// fences exist only for the span between this reconcile's List and its
+	// application, and a window nobody closes goes on collecting every feed
+	// event for the life of the scope.
+	defer sc.closeWindow(arm)
 
 	if sc.superseded(arm) {
 		return
@@ -101,8 +129,10 @@ func (e *Engine) applyScope(sc *scopeState, arm reconcileArming) (superseded boo
 			log.Err(err),
 		)
 
-		sc.endReconcile(arm, false)
-
+		// Nothing is cleared here: the deferred closeWindow releases this
+		// reconcile's own fences and stale stays true because clearStale is
+		// never reached. A failing reconcile must not disturb the window a
+		// newer OpResync has already opened.
 		return false, err
 	}
 
@@ -113,16 +143,11 @@ func (e *Engine) applyScope(sc *scopeState, arm reconcileArming) (superseded boo
 	seen := make(map[NSKey]struct{}, len(entries))
 
 	for _, se := range entries {
-		nk := NSKey{Namespace: se.Namespace, Key: se.Key}
-		seen[nk] = struct{}{}
+		seen[NSKey{Namespace: se.Namespace, Key: se.Key}] = struct{}{}
 
-		// The unusable set is deliberately NOT consulted here: a key whose
-		// feed re-read failed still takes a perfectly good snapshot row.
-		if touched, _ := sc.feedRecorded(nk); touched {
-			continue
+		if e.applySnapshotRow(ctx, sc, arm, se) {
+			return true, nil
 		}
-
-		e.ingest(ctx, sc.scope, se)
 	}
 
 	for _, nk := range e.registry.Keys() {
@@ -130,23 +155,72 @@ func (e *Engine) applyScope(sc *scopeState, arm reconcileArming) (superseded boo
 			continue
 		}
 
-		// Re-checked per key, not once before the loop: this is the only
-		// publication that cannot be undone by a revision fence, so it must
-		// not outlive the window that authorised it.
-		if sc.superseded(arm) {
+		if e.applyAbsentKey(ctx, sc, arm, nk) {
 			return true, nil
 		}
-
-		if e.keepsCachedValue(sc, nk) {
-			continue
-		}
-
-		e.ingestDefault(ctx, sc.scope, nk)
 	}
 
-	sc.endReconcile(arm, true)
+	sc.clearStale(arm)
 
 	return false, nil
+}
+
+// applySnapshotRow decides one row of the photograph, holding the scope's
+// fences across the decision AND the publication.
+//
+// One lock over the pair is what makes a reconcile atomic against the
+// changefeed: the feed takes the same lock around its own publish-and-record
+// pair, so a delete can no longer land between "the fence says nothing" and
+// "the snapshot row is published" and be overwritten by a photograph that
+// predates it.
+//
+// Reporting superseded abandons the rest of the snapshot: a newer OpResync
+// owns the scope and is taking a fresher one. The check is per row, not once
+// before the loop, so a window that moves mid-application stops immediately
+// instead of finishing a photograph of a connection that has already dropped.
+func (e *Engine) applySnapshotRow(ctx context.Context, sc *scopeState, arm reconcileArming, se store.Entry) (superseded bool) {
+	nk := NSKey{Namespace: se.Namespace, Key: se.Key}
+
+	sc.reconcileMu.Lock()
+	defer sc.reconcileMu.Unlock()
+
+	if sc.reconcileGen != arm.reconcile {
+		return true
+	}
+
+	// The unusable set is deliberately NOT consulted here: a key whose feed
+	// re-read failed still takes a perfectly good snapshot row.
+	if _, touched := arm.window.touched[nk]; touched {
+		return false
+	}
+
+	e.ingest(ctx, sc.scope, se)
+
+	return false
+}
+
+// applyAbsentKey decides one registered key the photograph did not carry,
+// under the same lock and for the same reason as applySnapshotRow.
+//
+// This publication is the one that cannot be undone by a revision fence —
+// revision 0 always wins — so it must not outlive the window that authorised
+// it, and it must not be able to land on top of a value the feed published
+// microseconds earlier.
+func (e *Engine) applyAbsentKey(ctx context.Context, sc *scopeState, arm reconcileArming, nk NSKey) (superseded bool) {
+	sc.reconcileMu.Lock()
+	defer sc.reconcileMu.Unlock()
+
+	if sc.reconcileGen != arm.reconcile {
+		return true
+	}
+
+	if e.keepsCachedValue(sc, arm, nk) {
+		return false
+	}
+
+	e.ingestDefault(ctx, sc.scope, nk)
+
+	return false
 }
 
 // keepsCachedValue reports whether a registered key absent from the snapshot
@@ -166,9 +240,11 @@ func (e *Engine) applyScope(sc *scopeState, arm reconcileArming) (superseded boo
 //   - the cache already holds exactly the registered default with no row
 //     behind it. Revision 0 never loses the fence, so republishing it would
 //     deliver a second Change for a key that never changed.
-func (e *Engine) keepsCachedValue(sc *scopeState, nk NSKey) bool {
-	touched, unusable := sc.feedRecorded(nk)
-	if touched {
+//
+// The caller holds sc.reconcileMu: the answer and the publication it gates are
+// one atomic step against the feed.
+func (e *Engine) keepsCachedValue(sc *scopeState, arm reconcileArming, nk NSKey) bool {
+	if _, touched := arm.window.touched[nk]; touched {
 		return true
 	}
 
@@ -177,7 +253,7 @@ func (e *Engine) keepsCachedValue(sc *scopeState, nk NSKey) bool {
 		return false
 	}
 
-	if unusable {
+	if _, unusable := arm.window.unusable[nk]; unusable {
 		return true
 	}
 
@@ -186,17 +262,18 @@ func (e *Engine) keepsCachedValue(sc *scopeState, nk NSKey) bool {
 	return registered && cached.Revision == 0 && reflect.DeepEqual(cached.Value, def.Default)
 }
 
-// beginReconcile opens the reconcile window and reports the generations the
+// beginReconcile opens a reconcile window and reports the generations the
 // reconcile must still see to be allowed to apply its snapshot and to clear
 // stale. It runs on the changefeed goroutine, before the List.
 //
-// The touched and unusable sets are re-used, not replaced, when a window is
-// already open: a reconcile may be applying a snapshot under it right now, and
-// discarding what the feed recorded for that reconcile would let its
-// photograph overwrite a value the feed has just published. A superset of the
-// fence only ever skips more keys, which is the safe direction. A closed
-// window starts from fresh sets, so a key the feed touched during one reconcile
-// never fences the next one.
+// Every call gets its OWN empty fences, even while another reconcile is still
+// applying a snapshot under a window of its own. Sharing them was the defect:
+// the feed publishes revision 3 during the first window, the store moves to
+// revision 9 during the second outage, and a second reconcile that inherited
+// the first window's touched set skips the very row its own List went and
+// fetched — leaving the cache six revisions behind and reporting it as fresh.
+// Both windows stay open and the feed fills both, so neither photograph can
+// overwrite a publication the feed made while it was being taken.
 func (sc *scopeState) beginReconcile() reconcileArming {
 	sc.mu.Lock()
 	sc.stale = true
@@ -208,14 +285,18 @@ func (sc *scopeState) beginReconcile() reconcileArming {
 
 	sc.reconcileGen++
 
-	if !sc.reconciling {
-		sc.touched = make(map[NSKey]struct{})
-		sc.unusable = make(map[NSKey]struct{})
+	window := &reconcileWindow{
+		touched:  make(map[NSKey]struct{}),
+		unusable: make(map[NSKey]struct{}),
 	}
 
-	sc.reconciling = true
+	if sc.windows == nil {
+		sc.windows = make(map[uint64]*reconcileWindow, 1)
+	}
 
-	return reconcileArming{reconcile: sc.reconcileGen, disconnect: disconnect}
+	sc.windows[sc.reconcileGen] = window
+
+	return reconcileArming{reconcile: sc.reconcileGen, disconnect: disconnect, window: window}
 }
 
 // superseded reports whether a newer OpResync has taken the window this
@@ -228,54 +309,66 @@ func (sc *scopeState) superseded(arm reconcileArming) bool {
 	return sc.reconcileGen != arm.reconcile
 }
 
-// endReconcile closes the window this reconcile opened, and is fenced by both
+// closeWindow releases the fences this reconcile armed, and only those. A
+// window still open belongs to a newer OpResync that is relying on the feed to
+// keep filling it, which is why a failing or superseded reconcile can no
+// longer disarm anyone but itself.
+func (sc *scopeState) closeWindow(arm reconcileArming) {
+	sc.reconcileMu.Lock()
+	defer sc.reconcileMu.Unlock()
+
+	delete(sc.windows, arm.reconcile)
+}
+
+// clearStale reports the scope confirmed against the store, fenced by both
 // generations.
 //
-// A window generation that moved means a newer OpResync owns the window now;
-// closing it here would disarm the fence that reconcile is relying on and
-// leave every later feed event of its window unrecorded.
-//
+// A window generation that moved means a newer OpResync owns the scope: this
+// reconcile is holding a photograph of a connection that has already dropped.
 // A disconnect generation that moved means the feed dropped again while this
-// reconcile ran: the data just applied may already be behind, so the scope
-// stays stale and the OpResync for the new connection runs its own reconcile.
+// reconcile ran, so the data it just applied may already be behind. Either
+// way the scope stays stale and the next OpResync reconciles it.
 //
-// applied is false for a reconcile that published nothing (a failed List), so
-// stale survives even when both generations are unchanged.
-func (sc *scopeState) endReconcile(arm reconcileArming, applied bool) {
-	sc.reconcileMu.Lock()
-
-	if sc.reconcileGen != arm.reconcile {
-		sc.reconcileMu.Unlock()
-
+// It is called only by a reconcile that applied a snapshot: a failed List
+// never reaches it, so stale survives even when both generations are
+// unchanged.
+func (sc *scopeState) clearStale(arm reconcileArming) {
+	if sc.superseded(arm) {
 		return
 	}
-
-	sc.reconciling = false
-	sc.touched = nil
-	sc.unusable = nil
-	sc.reconcileMu.Unlock()
 
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 
-	if sc.disconnectGen == arm.disconnect && applied {
+	if sc.disconnectGen == arm.disconnect {
 		sc.stale = false
 	}
 }
 
-// feedRecorded reports what the feed learned about nk since this reconcile
-// armed: touched means it published a value, unusable means it tried and
-// learned nothing it could publish. It is read per key at the moment that key
-// is decided, not once up front, so an event landing while the snapshot is
-// being applied still fences the key it names.
-func (sc *scopeState) feedRecorded(nk NSKey) (touched, unusable bool) {
-	sc.reconcileMu.Lock()
-	defer sc.reconcileMu.Unlock()
+// record writes nk's outcome into EVERY open reconcile window. Windows overlap
+// whenever the feed drops and comes back while a reconcile is still applying
+// its photograph, and each of them needs the fact for its own snapshot: the
+// older one to stop its rows overwriting this publication, the newer one for
+// the same reason a moment later.
+//
+// A usable value goes in touched, so a reconcile skips that key — the feed
+// holds the fresher fact. Anything the feed could not turn into a value goes
+// in unusable, so a reconcile keeps the cached value instead of treating the
+// key as absent and publishing the registered default over it.
+//
+// The caller holds sc.reconcileMu, and for a publication it holds it across
+// the publication too: that pairing is what makes the feed atomic against a
+// reconcile.
+func (sc *scopeState) record(nk NSKey, usable bool) {
+	for _, window := range sc.windows {
+		if usable {
+			window.touched[nk] = struct{}{}
 
-	_, touched = sc.touched[nk]
-	_, unusable = sc.unusable[nk]
+			continue
+		}
 
-	return touched, unusable
+		window.unusable[nk] = struct{}{}
+	}
 }
 
 // cached returns nk's published entry without copying its value: the reconcile

@@ -71,7 +71,7 @@ func waitReconcileIdle(t *testing.T, e *Engine, scope store.Scope) {
 		sc.reconcileMu.Lock()
 		defer sc.reconcileMu.Unlock()
 
-		return !sc.reconciling
+		return len(sc.windows) == 0
 	})
 }
 
@@ -915,4 +915,542 @@ func TestReconcileSurvivesPanickingValidator(t *testing.T) {
 	if n := rec.len(); n != 0 {
 		t.Errorf("deliveries: got %d (%v), want 0", n, rec.revisions())
 	}
+}
+
+// gate returns a channel a store or registry hook can block on and the
+// idempotent release that opens it, so a test can always unblock in a defer
+// without risking a double close.
+func gate() (ch chan struct{}, release func()) {
+	ch = make(chan struct{})
+
+	var once sync.Once
+
+	return ch, func() { once.Do(func() { close(ch) }) }
+}
+
+// hookedRegistry wraps a Registry with the two seams the concurrency tests
+// need: onKeys fires when a reconcile asks which keys are registered, onLookup
+// when one value is about to be decided. Both hooks are swappable under a
+// mutex, so a test installs them only after the first reconcile has settled.
+type hookedRegistry struct {
+	Registry
+
+	mu       sync.Mutex
+	onKeys   func()
+	onLookup func(NSKey)
+}
+
+func (r *hookedRegistry) hookKeys(fn func()) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.onKeys = fn
+}
+
+func (r *hookedRegistry) hookLookup(fn func(NSKey)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.onLookup = fn
+}
+
+func (r *hookedRegistry) Keys() []NSKey {
+	r.mu.Lock()
+	fn := r.onKeys
+	r.mu.Unlock()
+
+	if fn != nil {
+		fn()
+	}
+
+	return r.Registry.Keys()
+}
+
+func (r *hookedRegistry) Lookup(namespace, key string) (KeyDef, bool) {
+	r.mu.Lock()
+	fn := r.onLookup
+	r.mu.Unlock()
+
+	if fn != nil {
+		fn(NSKey{Namespace: namespace, Key: key})
+	}
+
+	return r.Registry.Lookup(namespace, key)
+}
+
+// pauseOnce returns a lookup hook that opens the gate and then holds the
+// reconcile at its decision point long enough for a feed event to reach the
+// engine. It fires for nk only, and only for the first caller: the gate
+// channel itself is the guard, never a sync.Once, because Once.Do makes every
+// later caller WAIT for the first one — which would serialize the very two
+// goroutines the test needs to interleave.
+func pauseOnce(nk NSKey, opened <-chan struct{}, open func(), hold time.Duration) func(NSKey) {
+	return func(got NSKey) {
+		if got != nk {
+			return
+		}
+
+		select {
+		case <-opened:
+			return
+		default:
+		}
+
+		open()
+		time.Sleep(hold)
+	}
+}
+
+// TestOverlappingReconcilesApplyFresherListRow is the RED test for fences
+// shared between reconcile windows. The feed publishes revision 3 inside the
+// first window; the store then moves to revision 9 during a second outage. A
+// second window that inherits the first one's touched set skips its own,
+// fresher snapshot row and leaves the cache three revisions behind, reporting
+// Stale false while it does so.
+func TestOverlappingReconcilesApplyFresherListRow(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0)
+
+	settled(t, e, scope)
+
+	var rec recorder
+
+	unsub := e.OnChange(nk, rec.record)
+	defer unsub()
+
+	first, releaseFirst := gate()
+	second, releaseSecond := gate()
+
+	defer releaseSecond()
+	defer releaseFirst()
+
+	fs.onList(func(store.Scope) error {
+		fs.onList(func(store.Scope) error {
+			fs.onList(nil)
+			<-second
+
+			return nil
+		})
+		<-first
+
+		return nil
+	})
+
+	// The first window photographs a store in which the key does not exist.
+	fs.freezeNextList(nil)
+
+	e.onEvent(disconnectEvent(scope))
+	e.onEvent(resyncEvent(scope))
+
+	// The feed speaks inside the first window: that is what fills its fence.
+	fs.seed(scope, jsonRow(nk, 3, `"three"`, "ops"))
+	e.onEvent(upsertEvent(scope, nk, 3))
+
+	waitFor(t, time.Second, "the feed publication", func() bool { return rec.len() == 1 })
+
+	// A second outage, and the store moves on behind the engine's back. The
+	// second window's own List is the only thing that can see revision 9.
+	e.onEvent(disconnectEvent(scope))
+	e.onEvent(resyncEvent(scope))
+
+	fs.seed(scope, jsonRow(nk, 9, `"nine"`, "ops"))
+
+	releaseFirst()
+	releaseSecond()
+
+	waitReconcileIdle(t, e, scope)
+	time.Sleep(50 * time.Millisecond)
+
+	got, ok := e.Lookup(scope, nk)
+	if !ok {
+		t.Fatal("Lookup reports a miss after two overlapping reconciles")
+	}
+
+	if got.Value != "nine" || got.Revision != 9 {
+		t.Errorf("after the second reconcile: got (%v, rev %d), want (\"nine\", rev 9): "+
+			"the second window inherited the first one's touched set and skipped its own fresher row",
+			got.Value, got.Revision)
+	}
+
+	if got.Stale {
+		t.Error("the scope reports Stale true after a completed reconcile of the live connection")
+	}
+}
+
+// TestPublishRecordsItsKeyAgainstAConcurrentReconcile is the RED test for the
+// Set ingress. Publish is the only way into a scope's cache that never told a
+// reconcile in flight that it had spoken, so a reconcile whose snapshot
+// predates the write publishes the registered default at revision 0 over the
+// value the caller just wrote — and revision 0 always wins the fence.
+func TestPublishRecordsItsKeyAgainstAConcurrentReconcile(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0)
+
+	settled(t, e, scope)
+
+	var rec recorder
+
+	unsub := e.OnChange(nk, rec.record)
+	defer unsub()
+
+	release := heldList(fs)
+	defer release()
+
+	// The photograph has no row for the key: it was taken before the write.
+	fs.freezeNextList(nil)
+
+	e.onEvent(disconnectEvent(scope))
+	e.onEvent(resyncEvent(scope))
+
+	waitFor(t, time.Second, "the reconcile to reach its List", func() bool { return fs.listCount() >= 2 })
+
+	// What Client.Set does: persist, then publish to the caller's own scope.
+	row := jsonRow(nk, 5, `"written"`, "ops")
+	fs.seed(scope, row)
+	e.Publish(scope, row)
+
+	release()
+
+	waitReconcileIdle(t, e, scope)
+	time.Sleep(50 * time.Millisecond)
+
+	got, ok := e.Lookup(scope, nk)
+	if !ok {
+		t.Fatal("Lookup reports a miss: the reconcile erased a value Set had just written")
+	}
+
+	if got.Value != "written" || got.Revision != 5 {
+		t.Errorf("after the reconcile: got (%v, rev %d), want (\"written\", rev 5): "+
+			"the snapshot published the registered default over the caller's own write",
+			got.Value, got.Revision)
+	}
+
+	for _, ch := range deliveries(&rec) {
+		if ch.Revision == 0 {
+			t.Fatalf("a Revision 0 default was delivered over the write: deliveries = %v", rec.revisions())
+		}
+	}
+}
+
+// TestConcurrentFeedDeleteIsNotResurrected is the RED test for the atomicity
+// of the feed's publish-and-record pair. The reconcile reads the fence, finds
+// it empty, and is held at its decision point while the feed publishes a
+// delete and records it. The snapshot row then lands on top and brings the
+// deleted key back.
+func TestConcurrentFeedDeleteIsNotResurrected(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	reg := &hookedRegistry{Registry: fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: "fallback"}}}}
+	e := registryEngine(t, reg, fs, 0)
+
+	fs.seed(scope, jsonRow(nk, 5, `"five"`, "ops"))
+	settled(t, e, scope)
+
+	release := heldList(fs)
+	defer release()
+
+	// The photograph still carries the row; the live store no longer does.
+	fs.freezeNextList([]store.Entry{jsonRow(nk, 5, `"five"`, "ops")})
+
+	e.onEvent(disconnectEvent(scope))
+	e.onEvent(resyncEvent(scope))
+
+	waitFor(t, time.Second, "the reconcile to reach its List", func() bool { return fs.listCount() >= 2 })
+
+	fs.remove(scope, nk)
+
+	atDecision, openDecision := gate()
+	defer openDecision()
+
+	reg.hookLookup(pauseOnce(nk, atDecision, openDecision, 20*time.Millisecond))
+
+	deleted := make(chan struct{})
+
+	go func() {
+		defer close(deleted)
+
+		<-atDecision
+
+		e.onEvent(deleteEvent(scope, nk))
+	}()
+
+	release()
+
+	<-deleted
+	waitReconcileIdle(t, e, scope)
+	time.Sleep(50 * time.Millisecond)
+
+	got, ok := e.Lookup(scope, nk)
+	if !ok {
+		t.Fatal("Lookup reports a miss after a delete concurrent with a reconcile")
+	}
+
+	if got.Value != "fallback" || got.Revision != 0 {
+		t.Errorf("after the delete: got (%v, rev %d), want the registered default at rev 0: "+
+			"the reconcile's snapshot resurrected the deleted row", got.Value, got.Revision)
+	}
+}
+
+// TestConcurrentFeedUpsertSurvivesReconcileDefault is the RED test for the
+// other half of the same pair. The reconcile decides a key absent from its
+// snapshot while the feed publishes a fresh revision for it; the registered
+// default at revision 0 then lands on top, and revision 0 never loses the
+// fence.
+func TestConcurrentFeedUpsertSurvivesReconcileDefault(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	reg := &hookedRegistry{Registry: fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: "fallback"}}}}
+	e := registryEngine(t, reg, fs, 0)
+
+	fs.seed(scope, jsonRow(nk, 2, `"two"`, "ops"))
+	settled(t, e, scope)
+
+	release := heldList(fs)
+	defer release()
+
+	// The photograph has no row for the key at all.
+	fs.freezeNextList(nil)
+
+	e.onEvent(disconnectEvent(scope))
+	e.onEvent(resyncEvent(scope))
+
+	waitFor(t, time.Second, "the reconcile to reach its List", func() bool { return fs.listCount() >= 2 })
+
+	fs.seed(scope, jsonRow(nk, 7, `"seven"`, "ops"))
+
+	atDecision, openDecision := gate()
+	defer openDecision()
+
+	reg.hookLookup(pauseOnce(nk, atDecision, openDecision, 20*time.Millisecond))
+
+	published := make(chan struct{})
+
+	go func() {
+		defer close(published)
+
+		<-atDecision
+
+		e.onEvent(upsertEvent(scope, nk, 7))
+	}()
+
+	release()
+
+	<-published
+	waitReconcileIdle(t, e, scope)
+	time.Sleep(50 * time.Millisecond)
+
+	got, ok := e.Lookup(scope, nk)
+	if !ok {
+		t.Fatal("Lookup reports a miss after an upsert concurrent with a reconcile")
+	}
+
+	if got.Value != "seven" || got.Revision != 7 {
+		t.Errorf("after the upsert: got (%v, rev %d), want (\"seven\", rev 7): "+
+			"the reconcile published the registered default over a value the feed had just published",
+			got.Value, got.Revision)
+	}
+}
+
+// TestSupersededWindowStopsApplyingItsSnapshot is the RED test for the per-row
+// window fence of step 3. A reconcile whose connection dropped part-way
+// through applying its photograph is holding rows from a dead connection:
+// every one it has not applied yet must be abandoned, or the cache ends up
+// carrying a revision the live store does not have and the fence then rejects
+// the truth that follows.
+//
+// The window moves BETWEEN two rows of one snapshot, a gap the engine holds
+// its own lock across, so it is exercised directly rather than raced for: a
+// test that tried to win that race would be telling the truth only sometimes.
+func TestSupersededWindowStopsApplyingItsSnapshot(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0)
+
+	sc := e.scopeFor(scope)
+	ctx := e.dispatchContext()
+
+	// The control: a window that still owns the scope applies its own row.
+	current := sc.beginReconcile()
+
+	if superseded := e.applySnapshotRow(ctx, sc, current, jsonRow(nk, 7, `"seven"`, "ops")); superseded {
+		t.Fatal("the window that owns the scope reported itself superseded")
+	}
+
+	got, ok := e.Lookup(scope, nk)
+	if !ok || got.Revision != 7 {
+		t.Fatalf("the owning window did not apply its own row: got (%v, rev %d), ok=%v", got.Value, got.Revision, ok)
+	}
+
+	sc.closeWindow(current)
+
+	// A newer OpResync takes the scope while the older window still holds
+	// rows it has not applied.
+	stale := sc.beginReconcile()
+	newer := sc.beginReconcile()
+
+	defer sc.closeWindow(newer)
+	defer sc.closeWindow(stale)
+
+	if superseded := e.applySnapshotRow(ctx, sc, stale, jsonRow(nk, 9, `"nine"`, "ops")); !superseded {
+		t.Error("a superseded window went on applying its photograph")
+	}
+
+	got, _ = e.Lookup(scope, nk)
+	if got.Value != "seven" || got.Revision != 7 {
+		t.Errorf("after the superseded row: got (%v, rev %d), want (\"seven\", rev 7): "+
+			"a photograph of a dropped connection was published", got.Value, got.Revision)
+	}
+}
+
+// TestSupersededReconcileDoesNotDefaultAbsentKeys is the step-4 twin of the
+// test above. The absent-key publication is the one no revision fence can undo
+// — revision 0 always wins — so a window that has moved must stop before it.
+func TestSupersededReconcileDoesNotDefaultAbsentKeys(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	reg := &hookedRegistry{Registry: fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: "fallback"}}}}
+	e := registryEngine(t, reg, fs, 0)
+
+	fs.seed(scope, jsonRow(nk, 4, `"four"`, "ops"))
+	settled(t, e, scope)
+
+	var rec recorder
+
+	unsub := e.OnChange(nk, rec.record)
+	defer unsub()
+
+	// The photograph has no row, so the key is decided by the absent-key loop.
+	fs.freezeNextList(nil)
+
+	var once sync.Once
+
+	reg.hookKeys(func() {
+		once.Do(func() {
+			e.onEvent(disconnectEvent(scope))
+			e.onEvent(resyncEvent(scope))
+		})
+	})
+
+	e.onEvent(disconnectEvent(scope))
+	e.onEvent(resyncEvent(scope))
+
+	waitReconcileIdle(t, e, scope)
+	time.Sleep(50 * time.Millisecond)
+
+	got, ok := e.Lookup(scope, nk)
+	if !ok {
+		t.Fatal("Lookup reports a miss: a superseded reconcile erased the cache")
+	}
+
+	if got.Value != "four" || got.Revision != 4 {
+		t.Errorf("after the superseded reconcile: got (%v, rev %d), want (\"four\", rev 4): "+
+			"a superseded window published the registered default over a live value",
+			got.Value, got.Revision)
+	}
+
+	if n := rec.len(); n != 0 {
+		t.Errorf("deliveries: got %d (%v), want 0", n, rec.revisions())
+	}
+}
+
+// TestQueuedReconcileAbandonsBeforeListing asserts a reconcile superseded
+// while it waits its turn never reaches the store at all. Listing for a
+// connection that has already dropped costs a full scope read and produces a
+// photograph nothing may apply.
+func TestQueuedReconcileAbandonsBeforeListing(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0)
+
+	fs.seed(scope, jsonRow(nk, 1, `"one"`, "ops"))
+	settled(t, e, scope)
+
+	release := heldList(fs)
+	defer release()
+
+	// The first reconcile holds the scope; the next two queue behind it.
+	e.onEvent(resyncEvent(scope))
+	waitFor(t, time.Second, "the reconcile to reach its List", func() bool { return fs.listCount() == 2 })
+
+	e.onEvent(resyncEvent(scope))
+	e.onEvent(resyncEvent(scope))
+
+	release()
+
+	waitReconcileIdle(t, e, scope)
+	time.Sleep(50 * time.Millisecond)
+
+	// One List for the first reconcile, one for the newest. The middle one was
+	// superseded before it ran and must never have asked the store.
+	if n := fs.listCount(); n != 3 {
+		t.Errorf("List calls: got %d, want 3: a superseded reconcile listed the scope anyway", n)
+	}
+}
+
+// TestFailedReconcileLeavesTheNewerWindowArmed asserts a reconcile whose List
+// fails disarms nobody but itself. Clearing the shared fence on the way out
+// would leave the newer window blind to everything the feed published while it
+// was open, and its snapshot would then overwrite those publications.
+func TestFailedReconcileLeavesTheNewerWindowArmed(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0)
+
+	settled(t, e, scope)
+
+	failing, releaseFailing := gate()
+	newer, releaseNewer := gate()
+
+	defer releaseNewer()
+	defer releaseFailing()
+
+	fs.onList(func(store.Scope) error {
+		fs.onList(func(store.Scope) error {
+			fs.onList(nil)
+			<-newer
+
+			return nil
+		})
+		<-failing
+
+		return errList
+	})
+
+	e.onEvent(disconnectEvent(scope))
+	e.onEvent(resyncEvent(scope))
+
+	waitFor(t, time.Second, "the failing reconcile to reach its List", func() bool { return fs.listCount() == 2 })
+
+	// A newer window opens while the first reconcile is still inside its List.
+	e.onEvent(disconnectEvent(scope))
+	e.onEvent(resyncEvent(scope))
+
+	// The feed speaks: both open windows record it.
+	fs.seed(scope, jsonRow(nk, 6, `"six"`, "ops"))
+	e.onEvent(upsertEvent(scope, nk, 6))
+
+	releaseFailing()
+
+	// Once the newer reconcile is inside its own List, the failed one is gone
+	// and whatever is still recorded belongs to the newer window alone.
+	waitFor(t, time.Second, "the newer reconcile to reach its List", func() bool { return fs.listCount() == 3 })
+
+	touched, _ := recordedSets(e, scope)
+	if len(touched) != 1 || touched[0] != nk {
+		t.Errorf("fences of the newer window: touched = %v, want [%v]: "+
+			"the failed reconcile disarmed a window it did not own", touched, nk)
+	}
+
+	releaseNewer()
+	waitReconcileIdle(t, e, scope)
 }

@@ -102,9 +102,19 @@ func (e *Engine) markStale(scope store.Scope) {
 // row. Revision 0 always wins the fence, so the delete is never deduplicated
 // away, and the key is recorded as touched so a reconcile running concurrently
 // does not resurrect the deleted row from its snapshot.
+//
+// The publication and the fence it writes are ONE atomic step. A reconcile
+// takes the same lock across its own check-and-apply pair, so it can no longer
+// read an empty fence, wait, and then republish a snapshot row that predates
+// this delete — which is exactly how a deleted key came back to life.
 func (e *Engine) applyDelete(scope store.Scope, nk NSKey) {
+	sc := e.scopeFor(scope)
+
+	sc.reconcileMu.Lock()
+	defer sc.reconcileMu.Unlock()
+
 	if e.ingestDefault(e.dispatchContext(), scope, nk) {
-		e.recordFeedOutcome(scope, nk, true)
+		sc.record(nk, true)
 	}
 }
 
@@ -156,46 +166,35 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
 		return
 	}
 
+	// The ingest and the fence it writes are one atomic step, for the same
+	// reason as in applyDelete: a reconcile deciding this key must see either
+	// both or neither, never an empty fence followed by this publication.
+	// The store read above deliberately stays outside the lock — holding it
+	// across a network round trip would stall every reconcile of the scope.
+	sc := e.scopeFor(scope)
+
+	sc.reconcileMu.Lock()
+	defer sc.reconcileMu.Unlock()
+
 	_, usable := e.ingest(ctx, scope, se)
 
-	e.recordFeedOutcome(scope, nk, usable)
+	sc.record(nk, usable)
 }
 
-// recordFeedOutcome tells a reconcile in flight what the feed learned about
-// nk, and is a no-op otherwise: the sets only exist for the window between a
-// reconcile's List and its application.
+// recordFeedOutcome tells every reconcile in flight what the feed learned
+// about nk, and is a no-op otherwise: the fences only exist for the window
+// between a reconcile's List and its application.
 //
-// A usable value goes in touched, so the reconcile skips that key when
-// applying its snapshot — the feed holds the fresher fact. Anything the feed
-// could not turn into a value goes in unusable, so the reconcile keeps the
-// cached value instead of treating the key as absent and publishing the
-// default over it. An unregistered key can land in unusable and never be read:
-// the reconcile only consults the set for keys the registry knows.
+// It is for outcomes with no publication of their own — a re-read that
+// errored. Anything that DOES publish holds reconcileMu across the pair and
+// calls record directly, so the two are indivisible to a reconcile.
 func (e *Engine) recordFeedOutcome(scope store.Scope, nk NSKey, usable bool) {
 	sc := e.scopeFor(scope)
 
 	sc.reconcileMu.Lock()
 	defer sc.reconcileMu.Unlock()
 
-	if !sc.reconciling {
-		return
-	}
-
-	if usable {
-		if sc.touched == nil {
-			sc.touched = make(map[NSKey]struct{})
-		}
-
-		sc.touched[nk] = struct{}{}
-
-		return
-	}
-
-	if sc.unusable == nil {
-		sc.unusable = make(map[NSKey]struct{})
-	}
-
-	sc.unusable[nk] = struct{}{}
+	sc.record(nk, usable)
 }
 
 // logDebug reports something that is expected rather than wrong — a re-read

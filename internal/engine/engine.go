@@ -263,13 +263,28 @@ func scopeLabel(scope store.Scope) string {
 //
 // Publish before Start creates the scope lazily, so a Client that writes
 // before starting is not silently dropped. A nil Engine ignores the write
-// instead of panicking.
+// instead of panicking, and a closed one drops it rather than resurrecting a
+// scope during shutdown.
+//
+// The write is fenced against a reconcile in flight exactly as a changefeed
+// publication is: the key is recorded as touched, under the same lock, in the
+// same step. Without that, a reconcile whose List predates the write finds the
+// key absent from its photograph and publishes the registered default at
+// revision 0 — which always wins the fence — over the value the caller just
+// wrote and already read back.
 func (e *Engine) Publish(scope store.Scope, se store.Entry) {
-	if e == nil {
+	if e == nil || e.closed.Load() {
 		return
 	}
 
-	e.ingest(e.dispatchContext(), scope, se)
+	sc := e.scopeFor(scope)
+
+	sc.reconcileMu.Lock()
+	defer sc.reconcileMu.Unlock()
+
+	if _, usable := e.ingest(e.dispatchContext(), scope, se); usable {
+		sc.record(NSKey{Namespace: se.Namespace, Key: se.Key}, true)
+	}
 }
 
 // Lookup returns the published state of nk in scope.

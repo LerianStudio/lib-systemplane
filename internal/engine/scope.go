@@ -47,21 +47,26 @@ type scopeState struct {
 	// and must never wait on a List that is still in flight.
 	runMu sync.Mutex
 
-	// reconcileMu guards reconciling, reconcileGen, touched and unusable. The
-	// feed callback records every key it publishes while a reconcile is in
-	// flight so the reconcile skips those keys when applying its List
-	// snapshot, and every key whose reread failed or was rejected so the
-	// reconcile does not treat it as absent.
+	// reconcileMu guards reconcileGen and windows, and is held across every
+	// check-and-publish pair on both sides of the fence: a reconcile deciding
+	// one key, and the changefeed publishing one. That is what makes the two
+	// atomic against each other — without it a feed delete lands between a
+	// reconcile reading the fence and applying its snapshot row, and the
+	// photograph resurrects the deleted key.
 	//
-	// reconcileGen names the open window. Every beginReconcile bumps it, so a
-	// reconcile whose generation no longer matches knows a newer OpResync took
-	// the scope and abandons its snapshot instead of publishing a photograph
-	// of a connection that has already dropped.
+	// windows holds one reconcileWindow per reconcile in flight, keyed by the
+	// generation that opened it. Each reconcile reads only its own fences and
+	// the feed writes into all of them, so two overlapping reconciles never
+	// inherit each other's: a window that did would skip keys ITS OWN List
+	// answered freshly.
+	//
+	// reconcileGen names the newest window. Every beginReconcile bumps it, so
+	// a reconcile whose generation no longer matches knows a newer OpResync
+	// took the scope and abandons its snapshot instead of publishing a
+	// photograph of a connection that has already dropped.
 	reconcileMu  sync.Mutex
-	reconciling  bool
 	reconcileGen uint64
-	touched      map[NSKey]struct{}
-	unusable     map[NSKey]struct{}
+	windows      map[uint64]*reconcileWindow
 
 	unsubscribe func()
 }
