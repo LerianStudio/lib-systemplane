@@ -51,12 +51,12 @@ func TestIngestRejectsInvalidValueKeepingPrevious(t *testing.T) {
 	}})
 
 	valid := store.Entry{Namespace: nk.Namespace, Key: nk.Key, Value: []byte(`"a"`), Revision: 1, UpdatedBy: "ops"}
-	if notify := e.ingest(context.Background(), store.Scope{}, valid); !notify {
+	if notify, _ := e.ingest(context.Background(), store.Scope{}, valid); !notify {
 		t.Fatal("first valid publication: notify is false, want true")
 	}
 
 	rejected := store.Entry{Namespace: nk.Namespace, Key: nk.Key, Value: []byte(`42`), Revision: 2, UpdatedBy: "typo"}
-	if notify := e.ingest(context.Background(), store.Scope{}, rejected); notify {
+	if notify, _ := e.ingest(context.Background(), store.Scope{}, rejected); notify {
 		t.Error("validator-rejected value: notify is true, want false")
 	}
 
@@ -74,7 +74,7 @@ func TestIngestSkipsUnregisteredKey(t *testing.T) {
 	e := engineWithRegistry(fakeRegistry{})
 
 	unregistered := store.Entry{Namespace: "billing", Key: "unknown", Value: []byte(`"a"`), Revision: 1}
-	if notify := e.ingest(context.Background(), store.Scope{}, unregistered); notify {
+	if notify, _ := e.ingest(context.Background(), store.Scope{}, unregistered); notify {
 		t.Error("unregistered key: notify is true, want false")
 	}
 
@@ -88,12 +88,12 @@ func TestIngestSkipsUndecodableJSONKeepingPrevious(t *testing.T) {
 	e := engineWithRegistry(fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: "default"}}})
 
 	valid := store.Entry{Namespace: nk.Namespace, Key: nk.Key, Value: []byte(`"a"`), Revision: 1, UpdatedBy: "ops"}
-	if notify := e.ingest(context.Background(), store.Scope{}, valid); !notify {
+	if notify, _ := e.ingest(context.Background(), store.Scope{}, valid); !notify {
 		t.Fatal("first valid publication: notify is false, want true")
 	}
 
 	corrupt := store.Entry{Namespace: nk.Namespace, Key: nk.Key, Value: []byte(`{not json`), Revision: 2, UpdatedBy: "corrupt"}
-	if notify := e.ingest(context.Background(), store.Scope{}, corrupt); notify {
+	if notify, _ := e.ingest(context.Background(), store.Scope{}, corrupt); notify {
 		t.Error("undecodable JSON: notify is true, want false")
 	}
 
@@ -109,7 +109,7 @@ func TestIngestDefaultPublishesAtRevisionZero(t *testing.T) {
 	e := engineWithRegistry(fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: "fallback"}}})
 
 	seeded := store.Entry{Namespace: nk.Namespace, Key: nk.Key, Value: []byte(`"a"`), Revision: 7, UpdatedBy: "ops"}
-	if notify := e.ingest(context.Background(), store.Scope{}, seeded); !notify {
+	if notify, _ := e.ingest(context.Background(), store.Scope{}, seeded); !notify {
 		t.Fatal("seeding publication: notify is false, want true")
 	}
 

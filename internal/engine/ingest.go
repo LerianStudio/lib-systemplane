@@ -16,7 +16,12 @@ import (
 // that skipped this function is a value the registered validator never saw,
 // which is exactly the hole this closes.
 //
-// It reports publish's notify flag so the caller decides whether to dispatch.
+// It reports two things. notify is publish's flag, so the caller decides
+// whether to dispatch. usable says the value decoded and passed the validator,
+// which is what the changefeed needs to tell a value it could not read from a
+// value the fence merely found no newer than the cached one: the first means
+// the engine learned nothing about the key, the second means the cache is
+// already current.
 //
 // Four rejections, each with its own outcome:
 //
@@ -29,7 +34,7 @@ import (
 //     reverting a key because an operator typo'd a row is a worse failure than
 //     keeping the last value that passed.
 //  4. Fence rejection — publish already decided; notify is passed through.
-func (e *Engine) ingest(ctx context.Context, scope store.Scope, se store.Entry) (notify bool) {
+func (e *Engine) ingest(ctx context.Context, scope store.Scope, se store.Entry) (notify, usable bool) {
 	def, registered := e.registry.Lookup(se.Namespace, se.Key)
 	if !registered {
 		e.logWarn(ctx, "value for unregistered key, skipping",
@@ -37,7 +42,7 @@ func (e *Engine) ingest(ctx context.Context, scope store.Scope, se store.Entry) 
 			log.String("key", se.Key),
 		)
 
-		return false
+		return false, false
 	}
 
 	var decoded any
@@ -48,7 +53,7 @@ func (e *Engine) ingest(ctx context.Context, scope store.Scope, se store.Entry) 
 			log.Err(err),
 		)
 
-		return false
+		return false, false
 	}
 
 	if def.Validate != nil {
@@ -59,7 +64,7 @@ func (e *Engine) ingest(ctx context.Context, scope store.Scope, se store.Entry) 
 				log.Err(err),
 			)
 
-			return false
+			return false, false
 		}
 	}
 
@@ -70,7 +75,7 @@ func (e *Engine) ingest(ctx context.Context, scope store.Scope, se store.Entry) 
 		Value:     decoded,
 		UpdatedAt: se.UpdatedAt,
 		UpdatedBy: se.UpdatedBy,
-	})
+	}), true
 }
 
 // ingestDefault is the ingress for the no-row case: a feed delete, or a

@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/debounce"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -17,6 +18,11 @@ type Engine struct {
 	registry  Registry
 	logger    log.Logger
 	telemetry store.Telemetry
+
+	// debouncer collapses a burst of changefeed notifications for one key in
+	// one scope into a single store re-read. It is keyed by scope as well as
+	// by key so a busy tenant never swallows another tenant's notification.
+	debouncer *debounce.Debouncer[scopeNSKey]
 
 	scopesMu sync.RWMutex
 	scopes   map[store.Scope]*scopeState
