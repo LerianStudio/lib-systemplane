@@ -15,12 +15,23 @@ import (
 // cannot name it (the trigger knows nothing about tenants — the tenant IS the
 // database it fired in), so the feed that read it stamps it, and
 // parseNotifyPayload stays a pure function of the payload.
+//
+// The fan-out is also marked on the feed, because a callback can call back into
+// the store: f.dispatching tells a teardown reached from inside a callback that
+// it must not wait for the reader goroutine — it may BE that goroutine.
 func (f *feed) dispatch(logger log.Logger, evt store.Event) {
 	evt.Scope = f.scope
 
 	f.mu.Lock()
 	subs := f.snapshotLocked()
+	f.dispatching++
 	f.mu.Unlock()
+
+	defer func() {
+		f.mu.Lock()
+		f.dispatching--
+		f.mu.Unlock()
+	}()
 
 	for _, sub := range subs {
 		sub.deliver(logger, evt)

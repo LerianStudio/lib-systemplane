@@ -1095,6 +1095,84 @@ func TestIntegration_PostgresTenantFeedTornDownOnLastUnsubscribe(t *testing.T) {
 	}
 }
 
+// TestIntegration_PostgresSelfUnsubscribeInCallbackDoesNotStall pins the one
+// teardown path that runs on the changefeed's OWN reader goroutine: a callback
+// that drops the last subscription of its tenant — the engine deactivating a
+// tenant from inside its own change handler, and equally a callback that closes
+// the store. Waiting there for the reader to exit is waiting for the goroutine
+// doing the waiting, so it can only ever end at the closeTimeout, and the
+// tenant's dispatch is frozen for those five seconds.
+func TestIntegration_PostgresSelfUnsubscribeInCallbackDoesNotStall(t *testing.T) {
+	base, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	admin := adminDSN(t, base)
+	defer admin.Close()
+
+	conn := newFakeConnector()
+	dbName, tenantDSN, db := provisionTenantDB(t, admin, base, "selfunsub")
+	conn.set("t1", db, tenantDSN)
+
+	s := tenantStore(t, conn)
+	scope := store.Scope{Tenant: "t1"}
+	ctx := context.Background()
+
+	var (
+		mu    sync.Mutex
+		unsub func()
+		once  sync.Once
+	)
+
+	took := make(chan time.Duration, 1)
+
+	// The joining resync is delivered inside Subscribe, on THIS goroutine,
+	// before unsub exists — so only a key event, which arrives on the reader
+	// goroutine, can exercise the self-teardown.
+	sub, err := s.Subscribe(ctx, scope, func(evt store.Event) {
+		if evt.Op != store.OpUpsert {
+			return
+		}
+
+		once.Do(func() {
+			mu.Lock()
+			fn := unsub
+			mu.Unlock()
+
+			start := time.Now()
+
+			fn()
+
+			took <- time.Since(start)
+		})
+	})
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	mu.Lock()
+	unsub = sub
+	mu.Unlock()
+
+	defer sub()
+
+	if _, err := s.Set(ctx, scope, store.Entry{Namespace: "ns", Key: "k", Value: jsonBytes(t, "v1")}); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+
+	select {
+	case elapsed := <-took:
+		if elapsed > time.Second {
+			t.Fatalf("unsubscribing from inside the callback took %v; the last subscriber of a tenant feed must not wait on the reader goroutine it is running on", elapsed)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("timed out waiting for the callback to unsubscribe itself")
+	}
+
+	// The feed is still torn down for real: skipping the self-wait must not
+	// leave the tenant's LISTEN connection behind.
+	waitForListenBackends(t, admin, dbName, 0, "the self-unsubscribing last subscriber tears the feed down")
+}
+
 // TestIntegration_PostgresConcurrentFirstSubscribeOpensOneConnection covers both
 // halves of the creation handshake. A tenant the connector cannot resolve fails
 // every concurrent caller — none of them blocks, and nothing is left running —

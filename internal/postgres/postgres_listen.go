@@ -24,9 +24,20 @@ import (
 )
 
 const (
-	backoffBase  = 500 * time.Millisecond
-	backoffCap   = 30 * time.Second
-	closeTimeout = 5 * time.Second
+	backoffBase = 500 * time.Millisecond
+	backoffCap  = 30 * time.Second
+)
+
+// Bounds on one changefeed connection attempt and on shutdown. EVERY connect
+// is bounded by the same pair — the first one as much as a reconnect — so an
+// unreachable tenant fails its Subscribe within connectTimeout instead of
+// pinning the reserved feed slot for as long as the caller's ctx happens to
+// live. They are vars, not consts, only so the unit tests can shrink them;
+// nothing in production writes them.
+var (
+	connectTimeout = 10 * time.Second
+	listenTimeout  = 5 * time.Second
+	closeTimeout   = 5 * time.Second
 )
 
 // notifyPayload is the JSON shape emitted by the systemplane_notify_v4 trigger.
@@ -71,6 +82,15 @@ type feed struct {
 	connected    bool // true between a successful LISTEN and the loss of that connection
 	disconnected bool // true once OpDisconnect has been emitted for the CURRENT outage
 	closing      bool // set by teardown under mu, BEFORE stop is closed
+
+	// dispatching counts the deliveries the reader goroutine is currently
+	// inside. A callback can reach teardown from there — unsubscribing itself
+	// as the last subscriber of a tenant feed, or closing the store — and the
+	// goroutine it would then wait on is the one running it, so the wait can
+	// only ever end at the closeTimeout with the feed frozen meanwhile. While
+	// this is non-zero a teardown signals and returns instead of waiting; the
+	// reader still closes done on its way out.
+	dispatching int
 
 	stop chan struct{}
 	done chan struct{}
@@ -537,14 +557,31 @@ func (s *Store) Subscribe(ctx context.Context, scope store.Scope, fn func(store.
 // openListen opens a dedicated pgx connection for the feed's DSN and installs
 // LISTEN on it synchronously, so a bad DSN or a missing privilege surfaces to
 // the caller instead of looping in the background.
+//
+// Both steps carry the same bounds a reconnect uses. Inheriting the caller's
+// ctx unbounded is what would let a tenant whose host swallows packets — no
+// refusal, no reset — park the Subscribe call for the life of that ctx, and
+// with it the reserved feed slot every later Subscribe for that tenant waits
+// on. The teardown interlock in publishFeed is only as tight as this bound.
 func (s *Store) openListen(ctx context.Context, f *feed) (*pgx.Conn, error) {
-	conn, err := pgx.Connect(ctx, f.dsn)
+	connectCtx, cancelConnect := context.WithTimeout(ctx, connectTimeout)
+	defer cancelConnect()
+
+	conn, err := pgx.Connect(connectCtx, f.dsn)
 	if err != nil {
 		return nil, fmt.Errorf("systemplane/postgres: listen connect%s: %w", f.label(), err)
 	}
 
-	if _, err := conn.Exec(ctx, "LISTEN "+quoteIdentifier(s.cfg.Channel)); err != nil {
-		_ = conn.Close(ctx)
+	listenCtx, cancelListen := context.WithTimeout(ctx, listenTimeout)
+	defer cancelListen()
+
+	if _, err := conn.Exec(listenCtx, "LISTEN "+quoteIdentifier(s.cfg.Channel)); err != nil {
+		// The connection is closed on a ctx of its own: the one that just
+		// expired would abandon the socket instead of closing it.
+		closeCtx, cancelClose := context.WithTimeout(context.WithoutCancel(ctx), closeTimeout)
+		defer cancelClose()
+
+		_ = conn.Close(closeCtx)
 
 		return nil, fmt.Errorf("systemplane/postgres: listen%s: %w", f.label(), err)
 	}
@@ -633,29 +670,68 @@ func (s *Store) stopFeeds() {
 	clear(s.feeds)
 	s.feedsMu.Unlock()
 
+	// Signal every feed FIRST, then wait on all of them against one shared
+	// deadline. Stopping them one at a time costs tenants x closeTimeout, so
+	// six unresponsive tenants alone overrun the engine's 30s Close budget and,
+	// behind that, the pod's termination grace period — the process is killed
+	// mid-shutdown instead of closing its connections.
+	waits := make([]<-chan struct{}, 0, len(feeds))
+
 	for _, f := range feeds {
-		s.stopFeed(f)
+		if done := signalFeed(f); done != nil {
+			waits = append(waits, done)
+		}
+	}
+
+	if len(waits) == 0 {
+		return
+	}
+
+	deadline := time.NewTimer(closeTimeout)
+	defer deadline.Stop()
+
+	for _, done := range waits {
+		select {
+		case <-done:
+		case <-deadline.C:
+			return
+		}
 	}
 }
 
-// stopFeed marks the feed closing under f.mu BEFORE closing f.stop, so the
-// reader's beginDisconnect can never announce a disconnect for a shutdown,
-// then waits up to closeTimeout for the reader to exit.
-func (s *Store) stopFeed(f *feed) {
+// signalFeed marks the feed closing under f.mu BEFORE closing f.stop, so the
+// reader's beginDisconnect can never announce a disconnect for a shutdown. It
+// returns the channel to wait on, or nil when there is nothing to wait for:
+// the feed was already stopped, it never had a reader, or its reader is inside
+// a callback right now and the caller may BE that goroutine.
+func signalFeed(f *feed) <-chan struct{} {
 	f.mu.Lock()
 
 	if f.closing {
 		f.mu.Unlock()
 
-		return
+		return nil
 	}
 
 	f.closing = true
 	done := f.done
+
+	if f.dispatching > 0 {
+		done = nil
+	}
+
 	f.mu.Unlock()
 
 	close(f.stop)
 
+	return done
+}
+
+// stopFeed signals one feed and waits up to closeTimeout for its reader to
+// exit. Used by the last unsubscribe of a tenant feed; Close signals all of its
+// feeds before waiting on any of them.
+func (s *Store) stopFeed(f *feed) {
+	done := signalFeed(f)
 	if done == nil {
 		return
 	}
@@ -725,7 +801,10 @@ func (s *Store) consumeUntilFailure(f *feed, conn *pgx.Conn) {
 		notification, err := conn.WaitForNotification(ctx)
 		if err != nil {
 			if !errors.Is(err, context.Canceled) {
-				s.logDebug(ctx, "LISTEN wait failed", log.Err(err))
+				s.logDebug(ctx, "LISTEN wait failed",
+					log.Err(err),
+					log.String("tenant", f.scope.Tenant),
+				)
 			}
 
 			return
@@ -748,6 +827,7 @@ func (s *Store) reconnect(f *feed, attempt *int) (*pgx.Conn, error) {
 	if *attempt == 0 {
 		s.logWarn(context.Background(), "LISTEN connection lost, reconnecting",
 			log.Int("attempt", *attempt),
+			log.String("tenant", f.scope.Tenant),
 		)
 	}
 
@@ -767,19 +847,22 @@ func (s *Store) reconnect(f *feed, attempt *int) (*pgx.Conn, error) {
 		case <-time.After(delay):
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
 
 		conn, err := pgx.Connect(ctx, f.dsn)
 
 		cancel()
 
 		if err != nil {
-			s.logDebug(context.Background(), "reconnect attempt failed", log.Err(err))
+			s.logDebug(context.Background(), "reconnect attempt failed",
+				log.Err(err),
+				log.String("tenant", f.scope.Tenant),
+			)
 
 			continue
 		}
 
-		listenCtx, listenCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		listenCtx, listenCancel := context.WithTimeout(context.Background(), listenTimeout)
 
 		_, err = conn.Exec(listenCtx, "LISTEN "+quoteIdentifier(s.cfg.Channel))
 

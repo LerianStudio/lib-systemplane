@@ -11,6 +11,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -441,4 +443,167 @@ func TestPostgresFeed_BeginResyncSuppressedWhenClosing(t *testing.T) {
 	if subs, ok := f.beginResync(); ok || len(subs) != 0 {
 		t.Fatalf("beginResync during teardown = (%d subs, ok %v), want (0, false)", len(subs), ok)
 	}
+}
+
+// shrinkTimeouts makes the connect and shutdown bounds small enough to assert
+// on inside a unit test, and restores them afterwards. The unit tests in this
+// package never run in parallel with one another, so a package var is enough.
+func shrinkTimeouts(t *testing.T, d time.Duration) {
+	t.Helper()
+
+	prevConnect, prevListen, prevClose := connectTimeout, listenTimeout, closeTimeout
+
+	connectTimeout, listenTimeout, closeTimeout = d, d, d
+
+	t.Cleanup(func() { connectTimeout, listenTimeout, closeTimeout = prevConnect, prevListen, prevClose })
+}
+
+// stalledFeed stands in for a feed whose reader ignores the stop signal: its
+// done channel is never closed, so every waiter on it burns the full
+// closeTimeout.
+func stalledFeed(tenant string) *feed {
+	f := newFeed(store.Scope{Tenant: tenant}, "")
+	f.done = make(chan struct{})
+
+	return f
+}
+
+// Close must cost ONE closeTimeout no matter how many tenants the store
+// carries. Tearing feeds down one at a time costs tenants x closeTimeout, so
+// six slow tenants overrun the engine's 30s Close budget and, behind it, a
+// Kubernetes termination grace period — the pod is killed mid-shutdown.
+func TestPostgresClose_SlowFeedsShareOneShutdownDeadline(t *testing.T) {
+	shrinkTimeouts(t, 200*time.Millisecond)
+
+	s := newSubscribeStore()
+
+	s.feedsMu.Lock()
+	s.feeds["t1"] = stalledFeed("t1")
+	s.feeds["t2"] = stalledFeed("t2")
+	s.feedsMu.Unlock()
+
+	start := time.Now()
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	elapsed := time.Since(start)
+
+	if elapsed >= 2*closeTimeout-50*time.Millisecond {
+		t.Fatalf("Close on two stalled feeds took %v; want about one closeTimeout (%v), not one per feed", elapsed, closeTimeout)
+	}
+
+	if elapsed < closeTimeout/2 {
+		t.Fatalf("Close on two stalled feeds took %v; it must still wait for the readers up to closeTimeout (%v)", elapsed, closeTimeout)
+	}
+}
+
+// blackholeDSN points at a listener that accepts a connection and then says
+// nothing, so a pgx dial parks in the startup handshake until its own bound
+// fires. It is how an unreachable tenant behaves in practice: a dropped packet
+// filter, not a closed port. The returned func shuts the listener down; it is
+// idempotent and also runs on cleanup.
+func blackholeDSN(t *testing.T) (string, func()) {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	var (
+		mu     sync.Mutex
+		accept sync.WaitGroup
+		conns  []net.Conn
+		once   sync.Once
+	)
+
+	accept.Add(1)
+
+	go func() {
+		defer accept.Done()
+
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+
+			mu.Lock()
+			conns = append(conns, c)
+			mu.Unlock()
+		}
+	}()
+
+	stop := func() {
+		once.Do(func() {
+			_ = ln.Close()
+
+			accept.Wait()
+
+			mu.Lock()
+			defer mu.Unlock()
+
+			for _, c := range conns {
+				_ = c.Close()
+			}
+		})
+	}
+
+	t.Cleanup(stop)
+
+	return "postgres://u:p@" + ln.Addr().String() + "/db?sslmode=disable", stop
+}
+
+// The FIRST connect of a feed is bounded exactly like a reconnect. Without the
+// bound it inherits the caller's ctx: an engine activating a tenant on a root
+// context would hang in Subscribe for as long as the process lives, holding the
+// reserved feed slot so every later Subscribe for that tenant parks behind it.
+func TestPostgresSubscribe_FirstConnectIsBounded(t *testing.T) {
+	shrinkTimeouts(t, 250*time.Millisecond)
+
+	dsn, stopBlackhole := blackholeDSN(t)
+	conn := &stubConnector{resolve: func(int) (string, error) { return dsn, nil }}
+
+	s, err := New(Config{MultiTenantEnabled: true, Connector: conn})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	start := time.Now()
+
+	unsub, subErr := s.Subscribe(context.Background(), store.Scope{Tenant: "t1"}, func(store.Event) {})
+
+	elapsed := time.Since(start)
+
+	if subErr == nil {
+		unsub()
+		t.Fatal("Subscribe to an unreachable tenant returned nil; want the connect bound to fail it")
+	}
+
+	if elapsed > 4*connectTimeout {
+		t.Fatalf("Subscribe took %v to give up; want it bounded by connectTimeout (%v)", elapsed, connectTimeout)
+	}
+
+	if !errors.Is(subErr, context.DeadlineExceeded) {
+		t.Fatalf("Subscribe error = %v, want it to carry context.DeadlineExceeded", subErr)
+	}
+
+	if !strings.Contains(subErr.Error(), "tenant t1") {
+		t.Errorf("Subscribe error %q must name the tenant", subErr)
+	}
+
+	if n := feedCount(s); n != 0 {
+		t.Fatalf("feeds map holds %d entries after a failed first connect, want 0", n)
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// The blackhole is the test's own goroutine; shut it down before asking
+	// whether the STORE left anything behind.
+	stopBlackhole()
+	waitForObserverExit(t)
 }
