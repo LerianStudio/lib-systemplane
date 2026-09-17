@@ -3,26 +3,20 @@ package postgres
 import (
 	"encoding/json"
 
-	"github.com/LerianStudio/lib-observability/v4/runtime"
+	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
-func (s *Store) dispatchEvent(evt store.Event) {
-	s.listenerMu.Lock()
-	subs := make([]func(store.Event), 0, len(s.subscribers))
+// dispatch fans one event out to the feed's subscribers. The snapshot is
+// taken under f.mu and the lock is RELEASED before any callback runs: a
+// callback that unsubscribes from inside itself would otherwise deadlock.
+func (f *feed) dispatch(logger log.Logger, evt store.Event) {
+	f.mu.Lock()
+	subs := f.snapshotLocked()
+	f.mu.Unlock()
 
-	for _, fn := range s.subscribers {
-		subs = append(subs, fn)
-	}
-
-	s.listenerMu.Unlock()
-
-	for _, fn := range subs {
-		func() {
-			defer runtime.RecoverAndLog(s.cfg.Logger, "systemplane.postgres.handler")
-
-			fn(evt)
-		}()
+	for _, sub := range subs {
+		sub.deliver(logger, evt)
 	}
 }
 

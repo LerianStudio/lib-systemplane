@@ -129,12 +129,10 @@ type Config struct {
 type Store struct {
 	cfg Config
 
-	// listenerMu / subscribers serve the single-tenant LISTEN/NOTIFY path.
-	listenerMu  sync.Mutex
-	subscribers map[uint64]func(store.Event)
-	nextSubID   uint64
-	listenStop  chan struct{}
-	listenDone  chan struct{}
+	// feedsMu guards feeds, the LISTEN/NOTIFY changefeeds keyed by
+	// scope.Tenant ("" is the zero, single-tenant scope).
+	feedsMu sync.Mutex
+	feeds   map[string]*feed
 
 	mu     sync.Mutex
 	closed bool
@@ -173,7 +171,7 @@ func (s *Store) Close() error {
 	s.closed = true
 	s.mu.Unlock()
 
-	s.stopListener()
+	s.stopFeeds()
 
 	return nil
 }

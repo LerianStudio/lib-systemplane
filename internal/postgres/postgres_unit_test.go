@@ -234,11 +234,12 @@ func TestNotifyPayloadParsingAndDispatch(t *testing.T) {
 	}
 
 	s := newSubscribeStore()
+	f := s.zeroFeed()
 	var got []store.Event
-	s.subscribers[1] = func(store.Event) { panic("handler panic must be recovered") }
-	s.subscribers[2] = func(evt store.Event) { got = append(got, evt) }
+	f.subs[1] = &subscription{fn: func(store.Event) { panic("handler panic must be recovered") }}
+	f.subs[2] = &subscription{fn: func(evt store.Event) { got = append(got, evt) }}
 
-	s.dispatchEvent(valid)
+	f.dispatch(s.cfg.Logger, valid)
 	if len(got) != 1 || got[0] != valid {
 		t.Fatalf("dispatch events = %#v, want %#v", got, []store.Event{valid})
 	}

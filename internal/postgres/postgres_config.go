@@ -16,7 +16,7 @@ func New(cfg Config) (*Store, error) {
 		return nil, err
 	}
 
-	return &Store{cfg: cfg, subscribers: make(map[uint64]func(store.Event))}, nil
+	return &Store{cfg: cfg, feeds: make(map[string]*feed)}, nil
 }
 
 func normalizeConfig(cfg *Config) error {
