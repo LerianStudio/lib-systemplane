@@ -14,7 +14,7 @@
 //     this mode — Subscribe returns store.ErrNotSupportedInMultiTenant.
 //
 // This package performs NO runtime schema provisioning. The
-// systemplane_entries table, the systemplane_notify_v3() trigger function, and
+// systemplane_entries table, the systemplane_notify_v4() trigger function, and
 // the NOTIFY triggers MUST be provisioned externally (e.g. via the consumer's
 // migration pipeline) using the DDL published by the root package's
 // SchemaSQL() / DefaultSeedSQL(). The store only reads, writes values, and —

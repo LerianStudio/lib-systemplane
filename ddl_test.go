@@ -22,11 +22,9 @@ func TestSchemaSQL_ContainsCanonicalStatements(t *testing.T) {
 
 	sql := systemplane.SchemaSQL()
 
-	// These fragments are the canonical DDL the runtime emits from
-	// internal/postgres/postgres_schema.go and internal/manager/schema.go.
-	// If a future runtime change alters the table/function/trigger shape,
-	// this test forces the embedded ddl/schema.sql to be updated in lock-step
-	// (the chosen drift-prevention strategy — see PR description).
+	// ddl/schema.sql is the canonical artifact the runtime never executes, so
+	// nothing else fails when it drifts. These fragments are the drift guard:
+	// a change to the table/function/trigger shape has to be made here too.
 	wantFragments := []string{
 		"CREATE TABLE IF NOT EXISTS systemplane_entries (",
 		"namespace   TEXT NOT NULL,",
@@ -117,5 +115,47 @@ func TestDefaultSeedSQL_ContainsExpectedStatements(t *testing.T) {
 	// Every seeded row must live in the universal runtime_config namespace.
 	if !strings.Contains(sql, "'runtime_config'") {
 		t.Error("DefaultSeedSQL() missing runtime_config namespace")
+	}
+}
+
+func TestMigrationV3ToV4SQL_NonEmpty(t *testing.T) {
+	t.Parallel()
+
+	if strings.TrimSpace(systemplane.MigrationV3ToV4SQL()) == "" {
+		t.Fatal("MigrationV3ToV4SQL() returned empty string")
+	}
+}
+
+func TestMigrationV3ToV4SQL_IsTheDeltaOnly(t *testing.T) {
+	t.Parallel()
+
+	sql := systemplane.MigrationV3ToV4SQL()
+
+	if !strings.Contains(sql, "ALTER TABLE systemplane_entries ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;") {
+		t.Error("MigrationV3ToV4SQL() missing the revision ALTER TABLE")
+	}
+
+	// The migration upgrades an existing v3 database in place; provisioning a
+	// fresh one is SchemaSQL()'s job.
+	if strings.Contains(sql, "CREATE TABLE") {
+		t.Error("MigrationV3ToV4SQL() must not contain a table creation statement")
+	}
+
+	// The v3 triggers depend on systemplane_notify_v3(), so every DROP TRIGGER
+	// has to precede the DROP FUNCTION or Postgres refuses with a dependency
+	// error.
+	firstDropTrigger := strings.Index(sql, "DROP TRIGGER IF EXISTS")
+	dropFunction := strings.Index(sql, "DROP FUNCTION IF EXISTS systemplane_notify_v3();")
+
+	if firstDropTrigger < 0 {
+		t.Fatal("MigrationV3ToV4SQL() missing DROP TRIGGER statements")
+	}
+
+	if dropFunction < 0 {
+		t.Fatal("MigrationV3ToV4SQL() missing DROP FUNCTION IF EXISTS systemplane_notify_v3();")
+	}
+
+	if firstDropTrigger > dropFunction {
+		t.Errorf("MigrationV3ToV4SQL() drops systemplane_notify_v3() at index %d before the first DROP TRIGGER at index %d; the dependent triggers must be dropped first", dropFunction, firstDropTrigger)
 	}
 }
