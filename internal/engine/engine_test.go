@@ -138,7 +138,7 @@ func TestPublishMakesSetVisibleBeforeFeedEcho(t *testing.T) {
 	e.onEvent(upsertEvent(scope, nk, 7))
 
 	waitFor(t, time.Second, "the echo's re-read", func() bool { return fs.getCount() == 1 })
-	time.Sleep(100 * time.Millisecond)
+	quiesce(t, e)
 
 	if revs := rec.revisions(); len(revs) != 1 || revs[0] != 7 {
 		t.Errorf("deliveries: got %v, want exactly [7] — the echo fired a redundant callback", revs)
@@ -187,7 +187,7 @@ func TestStartRunsExactlyOneInitialReconcile(t *testing.T) {
 	}
 
 	waitFor(t, time.Second, "the initial announcement", func() bool { return rec.len() == 1 })
-	time.Sleep(100 * time.Millisecond)
+	quiesce(t, e)
 
 	if got := fs.listCount(); got != 1 {
 		t.Errorf("List calls across Start: got %d, want 1 — Start reconciled on top of the resync-driven reconcile", got)

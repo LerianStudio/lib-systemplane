@@ -460,7 +460,7 @@ func TestFirstReconcileAnnouncesEveryRegisteredKey(t *testing.T) {
 	e.onEvent(resyncEvent(scope))
 	waitReconcileIdle(t, e, scope)
 
-	time.Sleep(50 * time.Millisecond)
+	quiesce(t, e)
 
 	for nk, want := range map[NSKey]int{seeded: 1, absentA: 1, absentB: 1} {
 		if got := countByKey()[nk]; got != want {
@@ -733,8 +733,9 @@ func TestOverlappingReconcilesKeepFeedValue(t *testing.T) {
 
 	waitReconcileIdle(t, e, scope)
 
-	// Give a superseded reconcile every chance to publish its stale snapshot.
-	time.Sleep(50 * time.Millisecond)
+	// A superseded reconcile has had every chance to publish its stale
+	// snapshot by the time the engine is quiet again.
+	quiesce(t, e)
 
 	got, ok := e.Lookup(scope, nk)
 	if !ok {
@@ -810,7 +811,7 @@ func TestFirstReconcileRejectsInvalidSnapshotRow(t *testing.T) {
 		// value in force stays in force (D-G4).
 		e.onEvent(resyncEvent(scope))
 		waitReconcileIdle(t, e, scope)
-		time.Sleep(50 * time.Millisecond)
+		quiesce(t, e)
 
 		if n := rec.len(); n != 1 {
 			t.Errorf("deliveries after a second reconcile: got %d (%v), want 1", n, rec.revisions())
@@ -836,7 +837,7 @@ func TestFirstReconcileRejectsInvalidSnapshotRow(t *testing.T) {
 		e.onEvent(resyncEvent(scope))
 
 		waitReconcileIdle(t, e, scope)
-		time.Sleep(50 * time.Millisecond)
+		quiesce(t, e)
 
 		got, ok := e.Lookup(scope, nk)
 		if !ok {
@@ -873,7 +874,7 @@ func TestReconcileSkipsUndecodableSnapshotRow(t *testing.T) {
 	e.onEvent(resyncEvent(scope))
 
 	waitReconcileIdle(t, e, scope)
-	time.Sleep(50 * time.Millisecond)
+	quiesce(t, e)
 
 	got, ok := e.Lookup(scope, nk)
 	if !ok {
@@ -918,7 +919,7 @@ func TestReconcileSurvivesPanickingValidator(t *testing.T) {
 	e.onEvent(resyncEvent(scope))
 
 	waitReconcileIdle(t, e, scope)
-	time.Sleep(50 * time.Millisecond)
+	quiesce(t, e)
 
 	got, ok := e.Lookup(scope, nk)
 	if !ok {
@@ -1079,7 +1080,7 @@ func TestOverlappingReconcilesApplyFresherListRow(t *testing.T) {
 	releaseSecond()
 
 	waitReconcileIdle(t, e, scope)
-	time.Sleep(50 * time.Millisecond)
+	quiesce(t, e)
 
 	got, ok := e.Lookup(scope, nk)
 	if !ok {
@@ -1134,7 +1135,7 @@ func TestPublishRecordsItsKeyAgainstAConcurrentReconcile(t *testing.T) {
 	release()
 
 	waitReconcileIdle(t, e, scope)
-	time.Sleep(50 * time.Millisecond)
+	quiesce(t, e)
 
 	got, ok := e.Lookup(scope, nk)
 	if !ok {
@@ -1201,7 +1202,7 @@ func TestConcurrentFeedDeleteIsNotResurrected(t *testing.T) {
 
 	<-deleted
 	waitReconcileIdle(t, e, scope)
-	time.Sleep(50 * time.Millisecond)
+	quiesce(t, e)
 
 	got, ok := e.Lookup(scope, nk)
 	if !ok {
@@ -1261,7 +1262,7 @@ func TestConcurrentFeedUpsertSurvivesReconcileDefault(t *testing.T) {
 
 	<-published
 	waitReconcileIdle(t, e, scope)
-	time.Sleep(50 * time.Millisecond)
+	quiesce(t, e)
 
 	got, ok := e.Lookup(scope, nk)
 	if !ok {
@@ -1361,7 +1362,7 @@ func TestSupersededReconcileDoesNotDefaultAbsentKeys(t *testing.T) {
 	e.onEvent(resyncEvent(scope))
 
 	waitReconcileIdle(t, e, scope)
-	time.Sleep(50 * time.Millisecond)
+	quiesce(t, e)
 
 	got, ok := e.Lookup(scope, nk)
 	if !ok {
@@ -1405,7 +1406,7 @@ func TestQueuedReconcileAbandonsBeforeListing(t *testing.T) {
 	release()
 
 	waitReconcileIdle(t, e, scope)
-	time.Sleep(50 * time.Millisecond)
+	quiesce(t, e)
 
 	// One List for the first reconcile, one for the newest. The middle one was
 	// superseded before it ran and must never have asked the store.

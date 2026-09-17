@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -245,7 +246,7 @@ func TestDispatchCoalescesToLatestRevision(t *testing.T) {
 	close(release)
 
 	waitFor(t, time.Second, "the coalesced delivery", func() bool { return rec.len() >= 2 })
-	time.Sleep(50 * time.Millisecond)
+	quiesce(t, e)
 
 	got := rec.revisions()
 	if len(got) != 2 || got[0] != 1 || got[1] != 10 {
@@ -349,7 +350,7 @@ func TestSameRevisionPublishedTwiceDeliversOnce(t *testing.T) {
 	waitFor(t, time.Second, "the first delivery", func() bool { return rec.len() == 1 })
 
 	e.publish(pub(nk, 7, "same"))
-	time.Sleep(50 * time.Millisecond)
+	quiesce(t, e)
 
 	if got := rec.revisions(); len(got) != 1 || got[0] != 7 {
 		t.Errorf("delivered revisions: got %v, want [7]", got)
@@ -385,8 +386,8 @@ func TestUnsubscribeRemovesOnlyItsOwnSubscription(t *testing.T) {
 
 	// Deliveries for one key run serially in registration order, so the
 	// survivor's delivery already proves the dropped one was skipped; the
-	// pause only covers a delivery ordered after it.
-	time.Sleep(50 * time.Millisecond)
+	// quiesce only covers a delivery ordered after it.
+	quiesce(t, e)
 
 	if got := dropped.len(); got != 0 {
 		t.Fatalf("the unsubscribed subscriber received %d deliveries, want 0", got)
@@ -455,4 +456,129 @@ func TestDispatchIsolatesScopesAndNamesTheTenant(t *testing.T) {
 	}
 
 	close(release)
+}
+
+// quiesceKey is the key the quiesce helper publishes its sentinel on. Nothing
+// in this package registers it, so no reconcile enumerates it and no
+// assertion can see it.
+var quiesceKey = NSKey{Namespace: "quiesce", Key: "sentinel"}
+
+// quiesceRev keeps every sentinel strictly newer than the last, so the publish
+// fence accepts it and the sentinel is always delivered.
+var quiesceRev atomic.Int64
+
+// quiesce blocks until the engine has finished everything the test already set
+// in motion, so an "and nothing more arrived" assertion cannot pass merely
+// because a loaded runner had not got round to the extra delivery yet. A fixed
+// time.Sleep gambles on exactly that and goes green when it loses.
+//
+// It waits for two POSITIVE signals, in this order:
+//
+//  1. A sentinel publication on a key of its own, submitted through the
+//     engine's own debouncer and waited for on a subscriber of that key. With
+//     a real quiet window the sentinel's trailing-edge timer is armed after
+//     every re-read the test submitted and runs for the same duration, so the
+//     sentinel cannot fire first: its delivery proves those windows closed and
+//     their re-reads went through the store.
+//  2. Every dispatch worker holding an empty mailbox and sitting in no
+//     subscriber. Dispatch is one goroutine per (scope, key) by design, so the
+//     sentinel's own worker can only speak for itself; this is what covers the
+//     key the assertion is actually about.
+//
+// It is for engines that are still open. A closed engine accepts no
+// publication, so there is no signal to wait for and nothing left in flight to
+// wait on.
+func quiesce(t *testing.T, e *Engine) {
+	t.Helper()
+
+	var rec recorder
+
+	unsub := e.OnChange(quiesceKey, rec.record)
+	defer unsub()
+
+	fire := func() {
+		e.publish(publication{
+			NSKey:    quiesceKey,
+			Revision: quiesceRev.Add(1),
+			Value:    "sentinel",
+		})
+	}
+
+	if e.debouncer == nil {
+		fire()
+	} else {
+		e.debouncer.Submit(scopeNSKey{Namespace: quiesceKey.Namespace, Key: quiesceKey.Key}, fire)
+	}
+
+	waitFor(t, 10*time.Second, "the quiesce sentinel to be delivered", func() bool {
+		return rec.len() > 0
+	})
+	waitFor(t, 10*time.Second, "every dispatch worker to go idle", func() bool {
+		return workersIdle(e)
+	})
+}
+
+// workersIdle reports whether no dispatch worker is holding a Change: none
+// waiting in a mailbox, none inside a subscriber.
+func workersIdle(e *Engine) bool {
+	busy := false
+
+	e.running.Range(func(_, _ any) bool {
+		busy = true
+
+		return false
+	})
+
+	if busy {
+		return false
+	}
+
+	e.workersMu.Lock()
+
+	ws := make([]*dispatchWorker, 0, len(e.workers))
+	for _, w := range e.workers {
+		ws = append(ws, w)
+	}
+
+	e.workersMu.Unlock()
+
+	for _, w := range ws {
+		w.mu.Lock()
+		pending := w.pending != nil
+		w.mu.Unlock()
+
+		if pending {
+			return false
+		}
+	}
+
+	return true
+}
+
+// TestQuiesceOutlastsASlowDelivery is the check on the helper every negative
+// assertion in this package now depends on. The subscriber is slower than any
+// fixed pause a test would have written, which is what a loaded CI runner
+// looks like from the outside: if quiesce returns first, every "and nothing
+// more arrived" assertion in the package can pass falsely.
+func TestQuiesceOutlastsASlowDelivery(t *testing.T) {
+	e := dispatchEngine(t)
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+
+	var rec recorder
+
+	unsub := e.OnChange(nk, func(ctx context.Context, ch Change) {
+		// A subscriber on a runner with nothing to spare. Modelled, not
+		// asserted: the assertion is that quiesce outlasts it.
+		time.Sleep(200 * time.Millisecond)
+		rec.record(ctx, ch)
+	})
+	defer unsub()
+
+	e.publish(pub(nk, 1, "v1"))
+
+	quiesce(t, e)
+
+	if got := rec.len(); got != 1 {
+		t.Fatalf("deliveries after quiesce: got %d, want 1 — quiesce returned before a slow delivery landed", got)
+	}
 }

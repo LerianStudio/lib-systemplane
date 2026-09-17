@@ -334,6 +334,11 @@ func TestCloseWaitsForAReconcileInsideList(t *testing.T) {
 
 	e.onEvent(upsertEvent(scope, nk, 9))
 	e.onEvent(resyncEvent(scope))
+
+	// A pause rather than quiesce: a closed engine accepts no publication, so
+	// there is no sentinel it could deliver and no signal to wait on. onEvent
+	// returns synchronously on a closed engine, so this only covers an
+	// implementation that would schedule the work instead of dropping it.
 	time.Sleep(100 * time.Millisecond)
 
 	if got := fs.getCount(); got != gets {
@@ -379,7 +384,8 @@ func TestClosePendingReReadNeverReachesTheStore(t *testing.T) {
 	}
 
 	// Well past the quiet window: a pending re-read Close discarded must never
-	// reach the store afterwards.
+	// reach the store afterwards. The debounce window IS what this test is
+	// about, so waiting it out is the assertion, not a guess at one.
 	time.Sleep(400 * time.Millisecond)
 
 	if got := fs.getCount(); got != 0 {
@@ -409,6 +415,8 @@ func TestEventsAfterCloseAreDroppedWhole(t *testing.T) {
 	e.onEvent(resyncEvent(scope))
 	e.onEvent(disconnectEvent(scope))
 
+	// A pause rather than quiesce, for the same reason as above: a closed
+	// engine has no signal to wait on.
 	time.Sleep(100 * time.Millisecond)
 
 	if tracked(e, scope) {

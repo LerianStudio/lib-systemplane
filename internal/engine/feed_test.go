@@ -215,7 +215,7 @@ func TestUpsertReReadNotFoundKeepsCurrentValue(t *testing.T) {
 	fs.remove(store.Scope{}, nk)
 	e.onEvent(upsertEvent(store.Scope{}, nk, 3))
 
-	time.Sleep(50 * time.Millisecond)
+	quiesce(t, e)
 
 	got, ok := e.Lookup(store.Scope{}, nk)
 	if !ok {
@@ -248,7 +248,7 @@ func TestFeedBurstForOneKeyCausesOneStoreRead(t *testing.T) {
 		return ok && got.Revision == 5
 	})
 
-	time.Sleep(100 * time.Millisecond)
+	quiesce(t, e)
 
 	if reads := fs.getCount(); reads != 1 {
 		t.Errorf("store reads for a burst of 5 events on one key: got %d, want 1", reads)
@@ -337,7 +337,7 @@ func TestDisconnectMarksScopeStaleWithoutPublishing(t *testing.T) {
 		t.Errorf("cached after disconnect: got (%v, rev %d), want (\"live\", rev 3)", got.Value, got.Revision)
 	}
 
-	time.Sleep(50 * time.Millisecond)
+	quiesce(t, e)
 
 	if n := rec.len(); n != 1 {
 		t.Errorf("deliveries: got %d, want 1: a disconnect publishes nothing", n)
@@ -377,7 +377,7 @@ func TestRepeatedDisconnectIsIdempotent(t *testing.T) {
 			got.Stale, got.Value, got.Revision)
 	}
 
-	time.Sleep(50 * time.Millisecond)
+	quiesce(t, e)
 
 	if n := rec.len(); n != 1 {
 		t.Errorf("deliveries: got %d, want 1: a repeated disconnect publishes nothing", n)
