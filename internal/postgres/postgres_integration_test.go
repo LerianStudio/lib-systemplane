@@ -596,3 +596,168 @@ func TestIntegration_PostgresDollarPrefixedStringsStoredVerbatim(t *testing.T) {
 		t.Errorf("updated_by = %q, want %q", entry.UpdatedBy, actor)
 	}
 }
+
+// fakeConnector resolves tenants from static maps, standing in for a
+// tenant-manager Postgres Manager without a tenant-config gRPC client.
+type fakeConnector struct {
+	dbs  map[string]*sql.DB
+	dsns map[string]string
+}
+
+func (c *fakeConnector) ResolveDB(_ context.Context, tenantID string) (dbresolver.DB, error) {
+	db, ok := c.dbs[tenantID]
+	if !ok {
+		return nil, fmt.Errorf("fakeConnector: unknown tenant %q", tenantID)
+	}
+
+	return dbresolver.New(dbresolver.WithPrimaryDBs(db)), nil
+}
+
+func (c *fakeConnector) ResolveDSN(_ context.Context, tenantID string) (string, error) {
+	dsn, ok := c.dsns[tenantID]
+	if !ok {
+		return "", fmt.Errorf("fakeConnector: unknown tenant %q", tenantID)
+	}
+
+	return dsn, nil
+}
+
+// TestIntegration_PostgresScopedCRUDIsolation pins FC-2's scoped resolution on
+// the Postgres CRUD path: a named Scope.Tenant resolves its database through
+// the connector and nothing else. Every call travels on a plain
+// context.Background() carrying no tenant at all, so a passing test proves the
+// handle came from the connector rather than from ctx, and each tenant sees
+// only its own rows.
+func TestIntegration_PostgresScopedCRUDIsolation(t *testing.T) {
+	dsn, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	admin := adminDSN(t, dsn)
+	defer admin.Close()
+
+	conn := &fakeConnector{
+		dbs:  map[string]*sql.DB{},
+		dsns: map[string]string{},
+	}
+
+	for _, tenant := range []string{"t1", "t2"} {
+		dbName := fmt.Sprintf("scoped_%s_%d", tenant, time.Now().UnixNano())
+		freshDB(t, admin, dbName)
+
+		tenantDSN := dsnFor(dsn, dbName)
+
+		db, err := sql.Open("pgx", tenantDSN)
+		if err != nil {
+			t.Fatalf("open %s: %v", tenant, err)
+		}
+
+		t.Cleanup(func() { _ = db.Close() })
+
+		provisionSchema(t, db)
+
+		conn.dbs[tenant] = db
+		conn.dsns[tenant] = tenantDSN
+	}
+
+	// No DB, no ListenDSN: every handle must come from the connector.
+	s, err := postgres.New(postgres.Config{MultiTenantEnabled: true, Connector: conn})
+	if err != nil {
+		t.Fatalf("postgres.New: %v", err)
+	}
+
+	t.Cleanup(func() { _ = s.Close() })
+
+	ctx := context.Background()
+	scope1 := store.Scope{Tenant: "t1"}
+	scope2 := store.Scope{Tenant: "t2"}
+
+	set := func(scope store.Scope, value string) int64 {
+		t.Helper()
+
+		rev, err := s.Set(ctx, scope, store.Entry{Namespace: "ns", Key: "k", Value: jsonBytes(t, value)})
+		if err != nil {
+			t.Fatalf("set %s: %v", scope.Tenant, err)
+		}
+
+		return rev
+	}
+
+	get := func(scope store.Scope) (string, bool) {
+		t.Helper()
+
+		entry, found, err := s.Get(ctx, scope, "ns", "k")
+		if err != nil {
+			t.Fatalf("get %s: %v", scope.Tenant, err)
+		}
+
+		if !found {
+			return "", false
+		}
+
+		var v string
+		if err := json.Unmarshal(entry.Value, &v); err != nil {
+			t.Fatalf("unmarshal %s: %v", scope.Tenant, err)
+		}
+
+		return v, true
+	}
+
+	if rev := set(scope1, "value-t1"); rev != 1 {
+		t.Errorf("t1 first Set revision = %d, want 1", rev)
+	}
+
+	if rev := set(scope2, "value-t2"); rev != 1 {
+		t.Errorf("t2 first Set revision = %d, want 1", rev)
+	}
+
+	if got, found := get(scope1); !found || got != "value-t1" {
+		t.Errorf("t1 Get = %q (found=%v), want value-t1", got, found)
+	}
+
+	if got, found := get(scope2); !found || got != "value-t2" {
+		t.Errorf("t2 Get = %q (found=%v), want value-t2", got, found)
+	}
+
+	// t2-only write must stay invisible from t1's scope.
+	if _, err := s.Set(ctx, scope2, store.Entry{Namespace: "ns", Key: "only-t2", Value: jsonBytes(t, "x")}); err != nil {
+		t.Fatalf("set only-t2: %v", err)
+	}
+
+	list1, err := s.List(ctx, scope1)
+	if err != nil {
+		t.Fatalf("list t1: %v", err)
+	}
+
+	if len(list1) != 1 || list1[0].Key != "k" {
+		t.Fatalf("t1 List = %#v, want exactly ns/k", list1)
+	}
+
+	list2, err := s.List(ctx, scope2)
+	if err != nil {
+		t.Fatalf("list t2: %v", err)
+	}
+
+	if len(list2) != 2 {
+		t.Fatalf("t2 List has %d entries, want 2", len(list2))
+	}
+
+	// Deleting in t1 must not touch t2.
+	if err := s.Delete(ctx, scope1, "ns", "k", "actor"); err != nil {
+		t.Fatalf("delete t1: %v", err)
+	}
+
+	if _, found := get(scope1); found {
+		t.Errorf("t1 Get after delete still found the entry")
+	}
+
+	if got, found := get(scope2); !found || got != "value-t2" {
+		t.Errorf("t2 Get after t1 delete = %q (found=%v), want value-t2", got, found)
+	}
+
+	// A tenant the connector does not know surfaces the resolution failure.
+	if _, err := s.List(ctx, store.Scope{Tenant: "unknown"}); err == nil {
+		t.Fatal("List for an unknown tenant succeeded, want a resolution error")
+	} else if !strings.Contains(err.Error(), "resolve tenant unknown") {
+		t.Errorf("unknown tenant error = %v, want it to name the tenant", err)
+	}
+}

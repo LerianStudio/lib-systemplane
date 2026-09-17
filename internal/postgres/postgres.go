@@ -190,16 +190,30 @@ func (s *Store) isClosed() bool {
 // The zero scope keeps today's behavior: single-tenant mode returns the
 // constructor-supplied *sql.DB unchanged, multi-tenant mode extracts the
 // dbresolver.DB stored in ctx by tenant-manager middleware. A named tenant
-// resolves through the connector, which is not wired yet — both branches
-// refuse the call with store.ErrTenantConnectorMissing. The schema is assumed
-// to be provisioned externally; the store does not create it.
+// resolves through the connector regardless of MultiTenantEnabled and
+// regardless of whatever tenant ctx carries (FC-2: an explicitly named scope
+// and a request-scoped ctx tenant must never silently disagree), and is
+// refused with store.ErrTenantConnectorMissing when no connector is
+// configured. The schema is assumed to be provisioned externally; the store
+// does not create it.
 func (s *Store) resolveDB(ctx context.Context, scope store.Scope) (dbExecutor, error) {
 	if scope.Tenant != "" {
 		if s.cfg.Connector == nil {
 			return nil, store.ErrTenantConnectorMissing
 		}
 
-		return nil, fmt.Errorf("systemplane/postgres: %w: scoped resolution not implemented", store.ErrTenantConnectorMissing)
+		db, err := s.cfg.Connector.ResolveDB(ctx, scope.Tenant)
+		if err != nil {
+			return nil, fmt.Errorf("systemplane/postgres: resolve tenant %s: %w", scope.Tenant, err)
+		}
+
+		// A nil handle with a nil error is a connector bug; refuse it here
+		// rather than hand back something that panics on the first query.
+		if db == nil {
+			return nil, fmt.Errorf("systemplane/postgres: resolve tenant %s: %w", scope.Tenant, store.ErrTenantConnectorMissing)
+		}
+
+		return db, nil
 	}
 
 	if !s.cfg.MultiTenantEnabled {

@@ -71,10 +71,10 @@ func TestConfig_CarriesConnector(t *testing.T) {
 		t.Fatal("Config.Connector must survive construction")
 	}
 
-	// A configured connector is not yet enough to serve a named tenant: FC-3
-	// leaves scoped resolution to the storage lane. Every entry point must
-	// refuse the call rather than silently fall back to the zero scope, which
-	// would read one tenant's rows on another tenant's behalf.
+	// Every entry point resolves a named tenant THROUGH the connector: this
+	// connector wraps a nil manager, so each call must surface that connector's
+	// own failure, named with the tenant, rather than falling back to the zero
+	// scope — which would read one tenant's rows on another tenant's behalf.
 	ctx := context.Background()
 	scope := store.Scope{Tenant: "t1"}
 
@@ -92,14 +92,14 @@ func TestConfig_CarriesConnector(t *testing.T) {
 		{"Delete", delErr},
 		{"List", listErr},
 	} {
-		if !errors.Is(tc.err, store.ErrTenantConnectorMissing) {
-			t.Errorf("%s with a named tenant: got %v, want ErrTenantConnectorMissing", tc.op, tc.err)
+		if !errors.Is(tc.err, ErrPgMgrUnavailable) {
+			t.Errorf("%s with a named tenant: got %v, want the connector's own failure", tc.op, tc.err)
 
 			continue
 		}
 
-		if !strings.Contains(tc.err.Error(), "scoped resolution not implemented") {
-			t.Errorf("%s error %q must say scoped resolution is not implemented yet", tc.op, tc.err)
+		if !strings.Contains(tc.err.Error(), "resolve tenant t1") {
+			t.Errorf("%s error %q must name the tenant it failed to resolve", tc.op, tc.err)
 		}
 	}
 }

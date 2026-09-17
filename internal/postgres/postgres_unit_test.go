@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
+	"github.com/bxcodec/dbresolver/v2"
 )
 
 func TestNew_ConfigValidationAndDefaults(t *testing.T) {
@@ -247,9 +248,10 @@ func containsError(err error, want string) bool {
 	return err != nil && strings.Contains(err.Error(), want)
 }
 
-// A named tenant is refused until the storage lane implements connector-based
-// scope resolution: without a connector there is nothing to resolve, and with
-// one the resolution path does not exist yet.
+// A named tenant is refused on every method when the Store was built without a
+// tenant connector: there is nothing to resolve the tenant's database through.
+// (Subscribe still refuses every named scope outright; Epic 1.4 gives it a
+// per-tenant feed.)
 func TestStore_NamedTenantScopeWithoutConnector(t *testing.T) {
 	t.Parallel()
 
@@ -279,5 +281,37 @@ func TestStore_NamedTenantScopeWithoutConnector(t *testing.T) {
 
 	if _, err := s.Subscribe(ctx, scope, func(store.Event) {}); !errors.Is(err, store.ErrNotSupportedInMultiTenant) {
 		t.Fatalf("Subscribe error = %v, want ErrNotSupportedInMultiTenant", err)
+	}
+}
+
+// nilHandleConnector reports success while handing back nothing — the shape a
+// buggy connector takes.
+type nilHandleConnector struct{}
+
+func (nilHandleConnector) ResolveDB(context.Context, string) (dbresolver.DB, error) {
+	return nil, nil
+}
+
+func (nilHandleConnector) ResolveDSN(context.Context, string) (string, error) {
+	return "", nil
+}
+
+// A connector that returns a nil handle with a nil error is refused at
+// resolution time rather than passed through to panic on the first query.
+func TestStore_NamedTenantScopeNilHandleIsRefused(t *testing.T) {
+	t.Parallel()
+
+	s, err := New(Config{MultiTenantEnabled: true, Connector: nilHandleConnector{}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	_, resolveErr := s.resolveDB(context.Background(), store.Scope{Tenant: "t1"})
+	if !errors.Is(resolveErr, store.ErrTenantConnectorMissing) {
+		t.Fatalf("resolveDB error = %v, want ErrTenantConnectorMissing", resolveErr)
+	}
+
+	if !strings.Contains(resolveErr.Error(), "resolve tenant t1") {
+		t.Errorf("resolveDB error %q must name the tenant", resolveErr)
 	}
 }
