@@ -192,3 +192,56 @@ func TestMT_ManagerCallback_DeleteDeliversDefault(t *testing.T) {
 		t.Errorf("delete Revision = %d, want 0", got.Revision)
 	}
 }
+
+// TestMT_ManagerCallback_ClonesValue pins FC-4's "the receiver owns this
+// copy": a subscriber that mutates the delivered Change.Value must not reach
+// the Manager's live cached object, nor the registered default that every
+// later delete republishes.
+func TestMT_ManagerCallback_ClonesValue(t *testing.T) {
+	t.Parallel()
+
+	c := newMultiTenantClient(t, newMemStore(true))
+
+	if err := c.Register("ns", "k", map[string]any{"limit": 1}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	var observed []any
+
+	cb := c.managerCallback(func(_ context.Context, ch Change) {
+		m, ok := ch.Value.(map[string]any)
+		if !ok {
+			t.Errorf("delivered value is %T, want map[string]any", ch.Value)
+
+			return
+		}
+
+		observed = append(observed, m["limit"])
+		m["limit"] = 999
+	})
+
+	// Upsert: the map the Manager holds in its cache must survive the
+	// subscriber's mutation.
+	cached := map[string]any{"limit": 1}
+	cb(context.Background(), "t1", "ns", "k", 7, cached)
+
+	if cached["limit"] != 1 {
+		t.Errorf("subscriber mutation reached the cached map: limit = %v, want 1", cached["limit"])
+	}
+
+	// Delete publishes the registered default; mutating one delivery must not
+	// corrupt the default handed to the next one.
+	cb(context.Background(), "t1", "ns", "k", 0, nil)
+	cb(context.Background(), "t2", "ns", "k", 0, nil)
+
+	want := []any{1, 1, 1}
+	if len(observed) != len(want) {
+		t.Fatalf("observed %d deliveries, want %d", len(observed), len(want))
+	}
+
+	for i, w := range want {
+		if observed[i] != w {
+			t.Errorf("delivery %d carried limit = %v, want %v (a previous subscriber mutated the source)", i, observed[i], w)
+		}
+	}
+}

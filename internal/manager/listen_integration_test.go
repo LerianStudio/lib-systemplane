@@ -405,9 +405,10 @@ func TestListen_ApplyEvent_UpsertSuccess_UpdatesCacheAndDispatches(t *testing.T)
 
 	ts := newTenantState("t")
 
-	var dispatched atomic.Value
+	var dispatched, dispatchedTenant atomic.Value
 
-	unsub := m.RegisterCallback("a", "k", func(_ context.Context, _, _, _ string, _ int64, v any) {
+	unsub := m.RegisterCallback("a", "k", func(_ context.Context, tenantID, _, _ string, _ int64, v any) {
+		dispatchedTenant.Store(tenantID)
 		dispatched.Store(fmt.Sprintf("%v", v))
 	})
 	defer unsub()
@@ -424,6 +425,10 @@ func TestListen_ApplyEvent_UpsertSuccess_UpdatesCacheAndDispatches(t *testing.T)
 
 	if got := dispatched.Load(); got != "fresh" {
 		t.Fatalf("callback dispatched %v, want fresh", got)
+	}
+
+	if got := dispatchedTenant.Load(); got != "t" {
+		t.Fatalf("callback dispatched tenant %v, want t", got)
 	}
 }
 
