@@ -35,8 +35,9 @@ type scopeNSKey struct {
 //     to publish; reads keep serving the last published value and Stale is how
 //     a caller learns nobody is confirming it.
 //   - OpResync carries no namespace or key. It says the whole scope must be
-//     reloaded, so it is neither debounced per key nor re-read as an upsert;
-//     the reload is the scope reconciler's job.
+//     reloaded, so it is neither debounced per key nor re-read as an upsert:
+//     it arms the scope's reconcile window here, synchronously, and the reload
+//     itself runs on its own goroutine.
 //   - OpDelete publishes the registered default at revision 0 with no store
 //     read at all: a delete is self-describing.
 //   - anything else is treated as an upsert: the store is re-read once the
@@ -48,6 +49,8 @@ func (e *Engine) onEvent(evt store.Event) {
 
 		return
 	case store.OpResync:
+		e.onResync(evt.Scope)
+
 		return
 	}
 
