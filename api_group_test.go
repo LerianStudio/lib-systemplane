@@ -739,12 +739,6 @@ func TestGroupDocumentIsAtomicAcrossFields(t *testing.T) {
 		defer wg.Done()
 
 		for {
-			select {
-			case <-done:
-				return
-			default:
-			}
-
 			snap, err := g.Snapshot(ctx)
 			if err != nil {
 				fail("Snapshot: %v", err)
@@ -758,6 +752,14 @@ func TestGroupDocumentIsAtomicAcrossFields(t *testing.T) {
 				fail("Snapshot.Value = %#v, which is neither %#v nor %#v — a reader saw a half-updated document", snap.Value, alpha, beta)
 
 				return
+			}
+
+			// Check for termination only after a read, so the reader observes
+			// at least one snapshot even when the writer finishes first.
+			select {
+			case <-done:
+				return
+			default:
 			}
 		}
 	}()
