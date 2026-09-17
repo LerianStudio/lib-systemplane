@@ -236,10 +236,10 @@ Decisions the implementer does not re-litigate:
 
 ### Epic 1.2: One ingress, and convergence by reconciliation
 
-**Goal:** Every value reaches the cache through one `decode → validate → publish` path, the changefeed drives it, and an `OpResync` reloads the whole scope from the store fenced against the feed.
+**Goal:** Every value reaches the cache through one `decode → validate → publish` path, the changefeed drives it, an `OpDisconnect` marks the scope stale for exactly as long as it is out of touch with the store, and an `OpResync` reloads the whole scope fenced against the feed.
 **Scope:** `internal/engine/` (ingress, feed handling, reconcile), `internal/debounce/` (re-keyed, reused)
 **Dependencies:** Epic 1.1
-**Done when:** a value written while the feed was down becomes visible after a single `OpResync` with no second write; a feed event that lands between a reconcile's `List` and its application wins over the `List` row, for both a newer upsert and a delete-then-recreate; a row whose JSON decodes to a type the registered validator rejects leaves the previous published value in place and fires no callback; a delete publishes the registered default at revision 0.
+**Done when:** a value written while the feed was down becomes visible after a single `OpResync` with no second write; a feed event that lands between a reconcile's `List` and its application wins over the `List` row, for both a newer upsert and a delete-then-recreate; a row whose JSON decodes to a type the registered validator rejects leaves the previous published value in place and fires no callback; a delete publishes the registered default at revision 0; `Stale` is true from the moment an `OpDisconnect` arrives until the reconcile triggered by the following `OpResync` completes, and false otherwise.
 **Status:** Pending
 
 #### Task 1.2.1: Implement the `decode → validate → publish` ingress
@@ -279,22 +279,27 @@ A second, smaller entry point in the same file handles the "no row" case — del
 
 Dispatch on `Event.Op`:
 
+- **`"disconnect"`** → mark the scope stale and do nothing else. No reconcile (there is no connection to read through), no publication, no callback. Reads keep serving the last published value; `Stale` is how a caller learns it is looking at a cache nobody is confirming. See the cross-lane note below on how to name this constant before the `storage` lane merges.
 - `store.OpResync` → hand to the reconcile path (Task 1.2.3). It carries no namespace or key, so it is not debounced per key; it takes the scope's reconcile path directly.
 - `store.OpDelete` → publish the registered default at revision 0 through the ingress's no-row entry point, and record the key in the scope's touched set. No store read: a delete is self-describing.
 - `store.OpUpsert` (and anything unrecognised, treated as an upsert) → `Submit` to the debouncer; when the quiet window closes, `Store.Get(ctx, scope, ns, key)` under a 5s timeout derived from the engine's lifecycle context (the same bound `internal/client/client.go:25` uses today), then ingest the returned entry.
 
 The touched-set recording is the point of contact with fence (b). A feed publication records its key in `scopeState.touched` **only while `scopeState.reconciling` is true**, and records it *after* the publication has produced a usable value — if the re-read errored, reported not-found, or failed validation, nothing was published, so the reconcile's `List` snapshot is still the better answer for that key and must not be skipped. This is the `internal/client/client.go:461` rule, preserved deliberately.
 
-Named edge cases: a re-read that reports **not found** keeps the current value and does not publish (an upsert NOTIFY whose row is not yet visible to this reader is a non-answer, not a deletion — `internal/client/client.go:427` already gets this right and the regression test at `internal/client/client_test.go:951` exists because it once did not). A re-read whose error is the context being cancelled during `Close` logs at DEBUG, not WARN — a shutdown is not an incident.
+**Cross-lane: the `OpDisconnect` constant.** FC-2 was amended on 2026-09-17 to add `store.OpDisconnect = "disconnect"`, emitted by `Subscribe` exactly once when the changefeed loses its connection, before the first reconnect attempt, with empty `Namespace`, `Key` and `Revision`. **The constant lands in `internal/store/store.go`, which the `storage` lane owns and this lane must not touch**, so it does not exist on `feat/v4-engine-core` until that lane merges and this branch rebases.
+
+The workaround, decided here so no task improvises it: declare `const opDisconnect = "disconnect"` unexported at the top of `internal/engine/feed.go`, with a comment naming `store.OpDisconnect` as its replacement, and compare `evt.Op` against it. The fake store (Task 1.4.1) emits the same local constant, so one deletion at rebase — swap the two references to `store.OpDisconnect` and drop the local const — retires the whole workaround. The alternative (fake emits a bare literal, production compares `store.OpDisconnect`) does not compile on this branch at all. Put the rebase step in the PR description so the reviewer looks for it.
+
+Named edge cases: a re-read that reports **not found** keeps the current value and does not publish (an upsert NOTIFY whose row is not yet visible to this reader is a non-answer, not a deletion — `internal/client/client.go:427` already gets this right and the regression test at `internal/client/client_test.go:951` exists because it once did not). A re-read whose error is the context being cancelled during `Close` logs at DEBUG, not WARN — a shutdown is not an incident. A second `OpDisconnect` with no `OpResync` between them is idempotent: the scope is already stale. An `OpResync` with no preceding `OpDisconnect` (the first connect, at `Start`) still reconciles — `OpDisconnect` is what makes staleness *observable during* an outage, not what makes a reconcile necessary.
 
 **Files:**
 - Create: `internal/engine/feed.go`
 - Create: `internal/engine/feed_test.go`
 - Modify: `internal/engine/engine.go` (debouncer field and its construction)
 
-**Verification:** `go test -tags=unit -race ./internal/engine/...` — `TestDeleteEventPublishesDefaultAtRevisionZero` (cache holds the default, `Lookup` reports revision 0, one notification), `TestUpsertEventReReadsAndIngests`, `TestUpsertReReadNotFoundKeepsCurrentValue`, `TestFeedBurstForOneKeyCausesOneStoreRead` (five events inside the debounce window, the fake store counts one `Get`), `TestFeedRecordsTouchedOnlyWhileReconciling`.
+**Verification:** `go test -tags=unit -race ./internal/engine/...` — `TestDeleteEventPublishesDefaultAtRevisionZero` (cache holds the default, `Lookup` reports revision 0, one notification), `TestUpsertEventReReadsAndIngests`, `TestUpsertReReadNotFoundKeepsCurrentValue`, `TestFeedBurstForOneKeyCausesOneStoreRead` (five events inside the debounce window, the fake store counts one `Get`), `TestFeedRecordsTouchedOnlyWhileReconciling`, `TestDisconnectMarksScopeStaleWithoutPublishing` (emit `OpDisconnect`, then assert `Lookup` reports `Stale` true, the cached value and revision are untouched, and no subscriber fired), `TestRepeatedDisconnectIsIdempotent`.
 
-**Done when:** the engine's feed callback never blocks on a subscriber and never calls a registered callback itself; every upsert reaches the cache through the ingress of Task 1.2.1.
+**Done when:** the engine's feed callback never blocks on a subscriber and never calls a registered callback itself; every upsert reaches the cache through the ingress of Task 1.2.1; `OpDisconnect` sets `stale` and publishes nothing.
 
 #### Task 1.2.3: Reconcile a scope on `OpResync`, double-fenced
 
