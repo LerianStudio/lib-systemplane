@@ -195,6 +195,8 @@ type scopeState struct {
 }
 ```
 
+Amended in the fix pass (2026-09-17): scopeState also carries runMu and reconcileGen; holding reconcileMu across List would block the changefeed goroutine inside recordFeedOutcome
+
 `Engine` itself gets its struct here too: a `store.Store`, a `Registry`, a logger, a `store.Telemetry`, `scopesMu sync.RWMutex` + `scopes map[store.Scope]*scopeState`, and the lifecycle context pair. Dispatch and debounce fields are added by Epic 1.3; leave them out rather than stubbing them.
 
 Cache reads land here as `(*Engine).Lookup(scope store.Scope, nk NSKey) (Entry, bool)`: it returns the cached `entry` widened into the exported `Entry`, with `Value` passed through `Clone` so the caller owns it and `Stale` copied from the scope. On a scope that is not tracked, or a key not in its map, `ok` is false — the caller (the Client, in Phase 2) then falls back to the registered default. A new scope is created `stale: true`: until its first reconcile completes nothing has confirmed the cache against the store.

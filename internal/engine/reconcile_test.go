@@ -784,18 +784,36 @@ func TestFirstReconcileRejectsInvalidSnapshotRow(t *testing.T) {
 		fs.seed(scope, jsonRow(nk, 7, `{"limit":10}`, "operator"))
 		settled(t, e, scope)
 
-		time.Sleep(50 * time.Millisecond)
+		waitFor(t, time.Second, "the first-reconcile announcement", func() bool {
+			return rec.len() == 1
+		})
 
-		// A rejected row is not an absent row: the key is NOT announced with
-		// the registered default, because that would be the silent revert the
-		// ingress exists to prevent. The Lookup miss is what makes the Client
-		// serve the registered default on a read without publishing it.
-		if _, ok := e.Lookup(scope, nk); ok {
-			t.Error("Lookup reports a hit: the rejected row was published")
+		// FC-11 as amended: with nothing cached, a row the ingress refuses on
+		// the FIRST reconcile is announced exactly like an absent row — the
+		// registered default at Revision 0 — so reads serve the default
+		// instead of a miss. The rejection itself was logged at WARN.
+		got, ok := e.Lookup(scope, nk)
+		if !ok {
+			t.Fatal("Lookup reports a miss: the key was never announced")
 		}
 
-		if n := rec.len(); n != 0 {
-			t.Errorf("deliveries: got %d (%v), want 0", n, rec.revisions())
+		if got.Value != "fallback" || got.Revision != 0 {
+			t.Errorf("announced: got (%v, rev %d), want (\"fallback\", rev 0)", got.Value, got.Revision)
+		}
+
+		if delivered := deliveries(&rec); len(delivered) != 1 ||
+			delivered[0].Value != "fallback" || delivered[0].Revision != 0 {
+			t.Errorf("deliveries: got %v, want one carrying the default at rev 0", delivered)
+		}
+
+		// The row stays rejected, so a later reconcile announces nothing: the
+		// value in force stays in force (D-G4).
+		e.onEvent(resyncEvent(scope))
+		waitReconcileIdle(t, e, scope)
+		time.Sleep(50 * time.Millisecond)
+
+		if n := rec.len(); n != 1 {
+			t.Errorf("deliveries after a second reconcile: got %d (%v), want 1", n, rec.revisions())
 		}
 	})
 

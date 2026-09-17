@@ -141,6 +141,18 @@ func (sc *scopeState) takeReconcile() (reconcileArming, bool) {
 	return arm, true
 }
 
+// firstReconcilePending reports whether this scope's first reconcile has not
+// completed yet. It is a non-blocking read of the very channel Start waits on,
+// so the two can never disagree about which reconcile is the first one.
+func (sc *scopeState) firstReconcilePending() bool {
+	select {
+	case <-sc.firstReconcileDone:
+		return false
+	default:
+		return true
+	}
+}
+
 // stopReconcileWorker ends this scope's reconcile goroutine. It is what a
 // dropped scope uses: the scope is gone, so a goroutine still waiting for its
 // next OpResync has nothing left to reconcile.

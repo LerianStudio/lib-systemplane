@@ -168,8 +168,9 @@ func (e *Engine) applyDelete(scope store.Scope, nk NSKey) {
 //     context being canceled is a shutdown, not an incident, and logs at DEBUG.
 //   - not found keeps the current value and publishes nothing: the write may
 //     simply not be visible to this reader yet, and a real removal arrives as
-//     OpDelete. It is recorded in neither set, so a concurrent reconcile's
-//     snapshot decides the key.
+//     OpDelete, so this is expected rather than wrong and logs at DEBUG. It is
+//     recorded in neither set, so a concurrent reconcile's snapshot decides
+//     the key.
 //   - a row the ingress rejects (undecodable or refused by the validator) is
 //     recorded as unusable, so a concurrent reconcile keeps the cached value
 //     instead of concluding the key is absent.
@@ -198,7 +199,7 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
 	}
 
 	if !found {
-		e.logWarn(ctx, "changefeed re-read found no row, keeping current value",
+		e.logDebug(ctx, "changefeed re-read found no row, keeping current value",
 			log.String("namespace", nk.Namespace),
 			log.String("key", nk.Key),
 		)
@@ -219,9 +220,7 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
 	sc.reconcileMu.Lock()
 	defer sc.reconcileMu.Unlock()
 
-	_, usable := e.ingest(ctx, scope, se)
-
-	sc.record(nk, usable)
+	sc.record(nk, e.ingest(ctx, scope, se))
 }
 
 // recordFeedOutcome tells every reconcile in flight what the feed learned

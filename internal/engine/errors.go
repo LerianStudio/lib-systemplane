@@ -11,3 +11,13 @@ import "errors"
 // ends and Close returns nil. One that ignores it survives Close, and this
 // error is how that leak is made visible instead of hidden.
 var ErrCloseTimeout = errors.New("systemplane: close timed out waiting for subscribers")
+
+// ErrNilRegistry is returned by Start when the engine was built without a
+// Registry. Config documents it as required and nothing else can supply it:
+// without a registry the engine knows no key, so it would reconcile nothing,
+// announce nothing at Start (FC-11), and skip every row the store holds.
+//
+// Refusing at Start rather than at construction is deliberate — New opens
+// nothing and can fail in no useful way — and refusing loudly beats a silent
+// cache that never fills.
+var ErrNilRegistry = errors.New("systemplane: engine built without a registry")

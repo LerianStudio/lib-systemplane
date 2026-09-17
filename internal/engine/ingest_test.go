@@ -51,13 +51,13 @@ func TestIngestRejectsInvalidValueKeepingPrevious(t *testing.T) {
 	}})
 
 	valid := store.Entry{Namespace: nk.Namespace, Key: nk.Key, Value: []byte(`"a"`), Revision: 1, UpdatedBy: "ops"}
-	if notify, _ := e.ingest(context.Background(), store.Scope{}, valid); !notify {
-		t.Fatal("first valid publication: notify is false, want true")
+	if !e.ingest(context.Background(), store.Scope{}, valid) {
+		t.Fatal("first valid row: usable is false, want true")
 	}
 
 	rejected := store.Entry{Namespace: nk.Namespace, Key: nk.Key, Value: []byte(`42`), Revision: 2, UpdatedBy: "typo"}
-	if notify, _ := e.ingest(context.Background(), store.Scope{}, rejected); notify {
-		t.Error("validator-rejected value: notify is true, want false")
+	if e.ingest(context.Background(), store.Scope{}, rejected) {
+		t.Error("validator-rejected row: usable is true, want false")
 	}
 
 	got := cachedEntry(t, e, store.Scope{}, nk)
@@ -74,8 +74,8 @@ func TestIngestSkipsUnregisteredKey(t *testing.T) {
 	e := engineWithRegistry(fakeRegistry{})
 
 	unregistered := store.Entry{Namespace: "billing", Key: "unknown", Value: []byte(`"a"`), Revision: 1}
-	if notify, _ := e.ingest(context.Background(), store.Scope{}, unregistered); notify {
-		t.Error("unregistered key: notify is true, want false")
+	if e.ingest(context.Background(), store.Scope{}, unregistered) {
+		t.Error("unregistered key: usable is true, want false")
 	}
 
 	if len(e.scopes) != 0 {
@@ -88,13 +88,13 @@ func TestIngestSkipsUndecodableJSONKeepingPrevious(t *testing.T) {
 	e := engineWithRegistry(fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: "default"}}})
 
 	valid := store.Entry{Namespace: nk.Namespace, Key: nk.Key, Value: []byte(`"a"`), Revision: 1, UpdatedBy: "ops"}
-	if notify, _ := e.ingest(context.Background(), store.Scope{}, valid); !notify {
-		t.Fatal("first valid publication: notify is false, want true")
+	if !e.ingest(context.Background(), store.Scope{}, valid) {
+		t.Fatal("first valid row: usable is false, want true")
 	}
 
 	corrupt := store.Entry{Namespace: nk.Namespace, Key: nk.Key, Value: []byte(`{not json`), Revision: 2, UpdatedBy: "corrupt"}
-	if notify, _ := e.ingest(context.Background(), store.Scope{}, corrupt); notify {
-		t.Error("undecodable JSON: notify is true, want false")
+	if e.ingest(context.Background(), store.Scope{}, corrupt) {
+		t.Error("undecodable JSON: usable is true, want false")
 	}
 
 	got := cachedEntry(t, e, store.Scope{}, nk)
@@ -109,8 +109,8 @@ func TestIngestDefaultPublishesAtRevisionZero(t *testing.T) {
 	e := engineWithRegistry(fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: "fallback"}}})
 
 	seeded := store.Entry{Namespace: nk.Namespace, Key: nk.Key, Value: []byte(`"a"`), Revision: 7, UpdatedBy: "ops"}
-	if notify, _ := e.ingest(context.Background(), store.Scope{}, seeded); !notify {
-		t.Fatal("seeding publication: notify is false, want true")
+	if !e.ingest(context.Background(), store.Scope{}, seeded) {
+		t.Fatal("seeding row: usable is false, want true")
 	}
 
 	if notify := e.ingestDefault(context.Background(), store.Scope{}, nk); !notify {

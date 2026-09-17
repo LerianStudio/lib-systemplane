@@ -232,7 +232,7 @@ func (e *Engine) applyScope(sc *scopeState, arm reconcileArming) (superseded boo
 		}
 	}
 
-	for _, nk := range e.registry.Keys() {
+	for _, nk := range e.registeredKeys() {
 		if _, ok := seen[nk]; ok {
 			continue
 		}
@@ -275,6 +275,10 @@ func (e *Engine) listSnapshot(ctx context.Context, scope store.Scope) ([]store.E
 // owns the scope and is taking a fresher one. The check is per row, not once
 // before the loop, so a window that moves mid-application stops immediately
 // instead of finishing a photograph of a connection that has already dropped.
+//
+// A row the ingress refuses is the one case where "the snapshot carried this
+// key" is not the same as "the engine learned its value"; see the FC-11 note
+// below the ingest call.
 func (e *Engine) applySnapshotRow(ctx context.Context, sc *scopeState, arm reconcileArming, se store.Entry) (superseded bool) {
 	nk := NSKey{Namespace: se.Namespace, Key: se.Key}
 
@@ -291,7 +295,23 @@ func (e *Engine) applySnapshotRow(ctx context.Context, sc *scopeState, arm recon
 		return false
 	}
 
-	e.ingest(ctx, sc.scope, se)
+	if e.ingest(ctx, sc.scope, se) {
+		return false
+	}
+
+	// The ingress refused the row — undecodable, or refused by the registered
+	// validator — and has already said so at WARN. FC-11 as amended: on the
+	// FIRST reconcile, with nothing cached, the key is announced with its
+	// registered default at Revision 0 exactly like an absent row. That is the
+	// same resolution keepsCachedValue gives an absent-and-unusable key with an
+	// empty cache, and it is what makes a read serve the default rather than
+	// report a miss for a key the consumer registered.
+	//
+	// Later reconciles never repeat it: the default is cached by then, so a row
+	// that stays rejected leaves the value in force in force (D-G4).
+	if _, isCached := sc.cached(nk); !isCached && sc.firstReconcilePending() {
+		e.ingestDefault(ctx, sc.scope, nk)
+	}
 
 	return false
 }
@@ -354,7 +374,7 @@ func (e *Engine) keepsCachedValue(sc *scopeState, arm reconcileArming, nk NSKey)
 		return true
 	}
 
-	def, registered := e.registry.Lookup(nk.Namespace, nk.Key)
+	def, registered := e.lookup(nk.Namespace, nk.Key)
 
 	return registered && cached.Revision == 0 && reflect.DeepEqual(cached.Value, def.Default)
 }

@@ -17,33 +17,34 @@ import (
 // that skipped this function is a value the registered validator never saw,
 // which is exactly the hole this closes.
 //
-// It reports two things. notify is publish's flag, so the caller decides
-// whether to dispatch. usable says the value decoded and passed the validator,
-// which is what the changefeed needs to tell a value it could not read from a
-// value the fence merely found no newer than the cached one: the first means
-// the engine learned nothing about the key, the second means the cache is
-// already current.
+// Dispatch is not the caller's business: an accepted publication is handed to
+// the key's delivery worker inside publish, so ingest reports only usable —
+// the value decoded and passed the validator. That is what the changefeed
+// needs to tell a value it could not read from a value the fence merely found
+// no newer than the cached one: the first means the engine learned nothing
+// about the key, the second means the cache is already current.
 //
 // Four rejections, each with its own outcome:
 //
 //  1. Unregistered key — skipped entirely, nothing published. A store may
-//     legitimately hold rows this process never registered.
+//     legitimately hold rows this process never registered, so this is
+//     ordinary and logs at DEBUG.
 //  2. Undecodable JSON — skipped; the cache keeps whatever it held. A corrupt
 //     byte sequence is not evidence the previous value is wrong.
 //  3. Validator rejection — skipped; the previously published value stays.
 //     It deliberately does NOT fall back to the registered default: silently
 //     reverting a key because an operator typo'd a row is a worse failure than
 //     keeping the last value that passed.
-//  4. Fence rejection — publish already decided; notify is passed through.
-func (e *Engine) ingest(ctx context.Context, scope store.Scope, se store.Entry) (notify, usable bool) {
-	def, registered := e.registry.Lookup(se.Namespace, se.Key)
+//  4. Fence rejection — publish already decided; the value was still usable.
+func (e *Engine) ingest(ctx context.Context, scope store.Scope, se store.Entry) (usable bool) {
+	def, registered := e.lookup(se.Namespace, se.Key)
 	if !registered {
-		e.logWarn(ctx, "value for unregistered key, skipping",
+		e.logDebug(ctx, "value for unregistered key, skipping",
 			log.String("namespace", se.Namespace),
 			log.String("key", se.Key),
 		)
 
-		return false, false
+		return false
 	}
 
 	var decoded any
@@ -54,7 +55,7 @@ func (e *Engine) ingest(ctx context.Context, scope store.Scope, se store.Entry) 
 			log.Err(err),
 		)
 
-		return false, false
+		return false
 	}
 
 	if err := runValidator(def.Validate, decoded); err != nil {
@@ -64,17 +65,19 @@ func (e *Engine) ingest(ctx context.Context, scope store.Scope, se store.Entry) 
 			log.Err(err),
 		)
 
-		return false, false
+		return false
 	}
 
-	return e.publish(publication{
+	e.publish(publication{
 		Scope:     scope,
 		NSKey:     NSKey{Namespace: se.Namespace, Key: se.Key},
 		Revision:  se.Revision,
 		Value:     decoded,
 		UpdatedAt: se.UpdatedAt,
 		UpdatedBy: se.UpdatedBy,
-	}), true
+	})
+
+	return true
 }
 
 // ingestDefault is the ingress for the no-row case: a feed delete, or a
@@ -86,9 +89,9 @@ func (e *Engine) ingest(ctx context.Context, scope store.Scope, se store.Entry) 
 // never be reached — let alone mutated — through the cache or through a
 // subscriber's callback.
 func (e *Engine) ingestDefault(ctx context.Context, scope store.Scope, nk NSKey) (notify bool) {
-	def, registered := e.registry.Lookup(nk.Namespace, nk.Key)
+	def, registered := e.lookup(nk.Namespace, nk.Key)
 	if !registered {
-		e.logWarn(ctx, "no-row event for unregistered key, skipping",
+		e.logDebug(ctx, "no-row event for unregistered key, skipping",
 			log.String("namespace", nk.Namespace),
 			log.String("key", nk.Key),
 		)

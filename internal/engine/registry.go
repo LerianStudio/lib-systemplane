@@ -25,3 +25,29 @@ type NSKey struct {
 	Namespace string
 	Key       string
 }
+
+// lookup is the registry read every ingress path goes through.
+//
+// A nil registry reports nothing registered rather than dereferencing nil.
+// Config documents Registry as required and Start refuses an engine without
+// one, but Publish runs on the CONSUMER's own goroutine — a Client that
+// publishes before Start, or an engine assembled by hand, must degrade to "no
+// key is known" instead of taking that goroutine down mid-Set.
+func (e *Engine) lookup(namespace, key string) (KeyDef, bool) {
+	if e.registry == nil {
+		return KeyDef{}, false
+	}
+
+	return e.registry.Lookup(namespace, key)
+}
+
+// registeredKeys is the reconcile's view of the registry: with a nil one
+// nothing is registered, so a snapshot's absent-key pass has nothing to
+// announce and nothing to fall back to a default.
+func (e *Engine) registeredKeys() []NSKey {
+	if e.registry == nil {
+		return nil
+	}
+
+	return e.registry.Keys()
+}
