@@ -476,8 +476,8 @@ func freshStore(t *testing.T, prefix string) *postgres.Store {
 // TestIntegration_PostgresSetReturnsRevision pins FC-2's revision contract on
 // the Postgres write path: the first write stores a non-zero revision, a write
 // of a DIFFERENT value advances it, a write of the SAME value does not (the
-// BEFORE UPDATE trigger is gated on OLD.value IS DISTINCT FROM NEW.value and
-// the ON CONFLICT DO UPDATE set-list deliberately omits revision), and both
+// bump trigger draws a new revision only when OLD.value IS DISTINCT FROM
+// NEW.value and otherwise puts the stored one back), and both
 // read paths report exactly the number Set reported. The numbers themselves
 // come from the table-level systemplane_revision_seq, so the test asserts the
 // relations between them and never a literal — revisions may skip.

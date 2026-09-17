@@ -17,14 +17,17 @@
 //     own changefeed, in either mode.
 //
 // This package performs NO runtime schema provisioning. The
-// systemplane_entries table, its revision column, the
+// systemplane_entries table, its revision column, the revision sequence, the
 // systemplane_bump_revision_v4() and systemplane_notify_v4() trigger
-// functions, and the three triggers that bind them (one BEFORE UPDATE bump,
-// two NOTIFY) MUST be provisioned externally (e.g. via the consumer's
-// migration pipeline) using the DDL published by the root package's
-// SchemaSQL() / DefaultSeedSQL(). The store only reads, writes values, and —
-// in single-tenant mode — runs LISTEN/NOTIFY. The runtime database role only
-// needs DML + LISTEN privileges, never CREATE on the schema.
+// functions, and the three triggers that bind them (one BEFORE INSERT OR
+// UPDATE bump, two NOTIFY) MUST be provisioned externally (e.g. via the
+// consumer's migration pipeline) using the DDL published by the root
+// package's SchemaSQL() / DefaultSeedSQL(). The store only reads, writes
+// values, and — in single-tenant mode — runs LISTEN/NOTIFY. The runtime
+// database role only needs DML + LISTEN privileges, never CREATE on the
+// schema: no statement this package issues names the revision sequence, and
+// the trigger that advances it is SECURITY DEFINER, so the runtime role needs
+// no grant on it either.
 package postgres
 
 import (
@@ -340,12 +343,14 @@ func (s *Store) Get(ctx context.Context, scope store.Scope, namespace, key strin
 
 // Set persists an entry using INSERT ... ON CONFLICT (namespace, key) DO UPDATE
 // and returns the revision now stored. The number comes from the table-level
-// systemplane_revision_seq sequence, never from the row: an insert takes it
-// through the column default, a write that changes the value takes it through
-// the BEFORE UPDATE trigger, and a write of an identical value leaves the
-// revision the row already carried (the set-list deliberately omits it). A key
-// deleted and recreated therefore always exceeds every revision it previously
-// had, and revisions may skip numbers.
+// systemplane_revision_seq sequence, never from the row, and it is drawn
+// exclusively by systemplane_bump_revision_trigger — this statement names
+// neither the sequence nor the revision column, which is what keeps the
+// runtime role on plain DML: an insert always draws a new revision, a write
+// that changes the value draws one too, and a write of an identical value
+// leaves the revision the row already carried. A key deleted and recreated
+// therefore always exceeds every revision it previously had, and revisions
+// may skip numbers.
 func (s *Store) Set(ctx context.Context, scope store.Scope, e store.Entry) (int64, error) {
 	if s == nil || s.isClosed() {
 		return 0, store.ErrClosed
@@ -385,10 +390,9 @@ RETURNING revision`,
 
 	var revision int64
 
-	// revision is deliberately absent from the DO UPDATE set-list: an unlisted
-	// column keeps its stored value, so when systemplane_bump_revision_trigger
-	// declines to fire (identical value) RETURNING reports the revision the row
-	// already had. sql.ErrNoRows is not special-cased — an upsert with RETURNING
+	// revision is deliberately absent from the DO UPDATE set-list: the trigger
+	// owns that column, and on an identical value it puts the stored revision
+	// back, so RETURNING reports the revision the row already had. sql.ErrNoRows is not special-cased — an upsert with RETURNING
 	// always yields a row, so its appearance is a real error and must propagate.
 	if err := db.QueryRowContext(ctx, query, e.Namespace, e.Key, e.Value, e.UpdatedAt, e.UpdatedBy).Scan(&revision); err != nil {
 		tracing.HandleSpanError(span, "set upsert failed", err)

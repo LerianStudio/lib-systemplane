@@ -13,16 +13,18 @@
 -- No transaction wrapper and no data backfill: the consumer's migration tool
 -- owns transaction boundaries. ADD COLUMN ... NOT NULL DEFAULT 1 gives every
 -- existing row revision 1 in one statement (revision 0 means "no row"), the
--- following ALTER points the column at the sequence, and the setval lifts the
--- sequence past the highest revision already stored so the first
--- post-migration write lands at 2 or higher. Revisions may skip numbers from
--- then on, and a key deleted and recreated always exceeds every revision it
--- previously had.
+-- following ALTER drops that default again because every later revision is
+-- assigned by the BEFORE INSERT OR UPDATE trigger alone — it is SECURITY
+-- DEFINER, so the runtime role needs no grant on systemplane_revision_seq —
+-- and the setval lifts the sequence past the highest revision already stored
+-- so the first post-migration write lands at 2 or higher. Revisions may skip
+-- numbers from then on, and a key deleted and recreated always exceeds every
+-- revision it previously had.
 
 CREATE SEQUENCE IF NOT EXISTS systemplane_revision_seq AS BIGINT;
 
 ALTER TABLE systemplane_entries ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;
-ALTER TABLE systemplane_entries ALTER COLUMN revision SET DEFAULT nextval('systemplane_revision_seq');
+ALTER TABLE systemplane_entries ALTER COLUMN revision DROP DEFAULT;
 SELECT setval('systemplane_revision_seq', GREATEST(
 	(SELECT COALESCE(MAX(revision), 1) FROM systemplane_entries),
 	(SELECT last_value FROM systemplane_revision_seq)
@@ -30,10 +32,15 @@ SELECT setval('systemplane_revision_seq', GREATEST(
 
 CREATE OR REPLACE FUNCTION systemplane_bump_revision_v4() RETURNS TRIGGER AS $$
 BEGIN
-	NEW.revision := nextval('systemplane_revision_seq');
+	IF TG_OP = 'INSERT' OR OLD.value IS DISTINCT FROM NEW.value THEN
+		NEW.revision := nextval(format('%I.systemplane_revision_seq', TG_TABLE_SCHEMA)::regclass);
+	ELSE
+		NEW.revision := OLD.revision;
+	END IF;
+
 	RETURN NEW;
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp;
 
 CREATE OR REPLACE FUNCTION systemplane_notify_v4() RETURNS TRIGGER AS $$
 BEGIN
@@ -63,9 +70,8 @@ DROP TRIGGER IF EXISTS systemplane_bump_revision_trigger ON systemplane_entries;
 DROP FUNCTION IF EXISTS systemplane_notify_v3();
 
 CREATE TRIGGER systemplane_bump_revision_trigger
-BEFORE UPDATE ON systemplane_entries
+BEFORE INSERT OR UPDATE ON systemplane_entries
 FOR EACH ROW
-WHEN (OLD.value IS DISTINCT FROM NEW.value)
 EXECUTE FUNCTION systemplane_bump_revision_v4();
 
 CREATE TRIGGER systemplane_notify_trigger

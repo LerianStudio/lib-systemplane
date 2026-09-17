@@ -30,22 +30,25 @@ var defaultSeedSQL string
 //
 // The returned SQL creates the systemplane_revision_seq sequence, the
 // systemplane_entries table, the systemplane_bump_revision_v4() and
-// systemplane_notify_v4() trigger functions, and the three triggers that bump
-// the revision on UPDATE and NOTIFY on the systemplane_changes channel.
+// systemplane_notify_v4() trigger functions, and the three triggers that
+// assign the revision and NOTIFY on the systemplane_changes channel.
 //
-// Every revision comes from the sequence: a fresh row takes it through the
-// column default, and an UPDATE that actually changes value takes it through
-// the BEFORE UPDATE trigger, so an identical rewrite keeps the revision it
-// had. Because the counter is table-level rather than per-row, a key deleted
-// and recreated always comes back above every revision it ever had, and
-// revisions may skip numbers.
+// Every revision comes from the sequence, and only ever through the BEFORE
+// INSERT OR UPDATE trigger: an insert draws a new one, an UPDATE that actually
+// changes value draws a new one, and an identical rewrite keeps the revision
+// it had. The column carries no DEFAULT and the trigger function is SECURITY
+// DEFINER on purpose — the sequence is advanced with the privileges of the
+// role that applied this DDL, so the runtime role still needs nothing beyond
+// DML on systemplane_entries. Because the counter is table-level rather than
+// per-row, a key deleted and recreated always comes back above every revision
+// it ever had, and revisions may skip numbers.
 //
 // It is idempotent and upgrades a v3 database in place: the ALTERs add the
-// column at revision 1 for the rows already there and repoint its default at
-// the sequence, and the setval lifts the sequence past the highest revision
-// present so the first write after the upgrade lands at 2 or higher. It is
-// safe to fold into a consumer's own migration pipeline; lib-systemplane does
-// not execute it for the caller.
+// column at revision 1 for the rows already there and then drop that default,
+// and the setval lifts the sequence past the highest revision present so the
+// first write after the upgrade lands at 2 or higher. It is safe to fold into
+// a consumer's own migration pipeline; lib-systemplane does not execute it for
+// the caller.
 func SchemaSQL() string {
 	return schemaSQL
 }
@@ -53,11 +56,13 @@ func SchemaSQL() string {
 // MigrationV3ToV4SQL returns the v3 -> v4 delta as an importable artifact.
 //
 // The returned SQL creates the systemplane_revision_seq sequence, adds the
-// revision column at 1 for every row already stored, repoints the column
-// default at the sequence, seeds the sequence past the highest revision
-// present so the first write after the upgrade lands at 2 or higher, installs
-// systemplane_bump_revision_v4() and systemplane_notify_v4() with the three v4
-// triggers, and drops the v3 notify function.
+// revision column at 1 for every row already stored, drops that column default
+// again (the SECURITY DEFINER bump trigger is the only thing that may touch
+// the sequence, so a DML-only runtime role needs no grant on it), seeds the
+// sequence past the highest revision present so the first write after the
+// upgrade lands at 2 or higher, installs systemplane_bump_revision_v4() and
+// systemplane_notify_v4() with the three v4 triggers, and drops the v3 notify
+// function.
 //
 // It is idempotent and it does NOT create the systemplane_entries table: it
 // upgrades a database that already carries the v3 schema. A consumer starting

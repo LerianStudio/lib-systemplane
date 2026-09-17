@@ -108,6 +108,7 @@ func assertUpgradeRoute(t *testing.T, label string, steps ...string) {
 
 	assertV4Shape(t, db)
 	assertNextWriteClearsMigratedRevision(t, db, dsn)
+	assertMigratedRevisionsComeFromTheSequence(t, db, dsn)
 }
 
 // TestIntegration_DDLRecreatedKeyExceedsDeletedRevision pins the reason the
@@ -151,6 +152,54 @@ func TestIntegration_DDLRecreatedKeyExceedsDeletedRevision(t *testing.T) {
 
 	if recreated := set("recreate after delete", "warn"); recreated <= changed {
 		t.Fatalf("recreated after delete: revision = %d, want strictly greater than the deleted row's last revision %d", recreated, changed)
+	}
+}
+
+// assertMigratedRevisionsComeFromTheSequence runs the revision guarantees on a
+// MIGRATED database rather than a fresh one — the route every existing
+// consumer takes. assertNextWriteClearsMigratedRevision only ever UPDATEs the
+// row the migration carried over, so on its own it leaves the INSERT route —
+// the one that decides what a recreated key comes back as — unexercised after
+// a migration.
+func assertMigratedRevisionsComeFromTheSequence(t *testing.T, db *sql.DB, dsn string) {
+	t.Helper()
+
+	s := storeOn(t, db, dsn)
+	ctx := context.Background()
+
+	set := func(what, key, value string) int64 {
+		t.Helper()
+
+		rev, err := s.Set(ctx, store.Scope{}, store.Entry{
+			Namespace: "runtime_config",
+			Key:       key,
+			Value:     []byte(value),
+		})
+		if err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+
+		return rev
+	}
+
+	// A key that did not exist before the upgrade takes the INSERT route.
+	if created := set("insert a new key after the upgrade", "rate_limit.max", "100"); created < 2 {
+		t.Fatalf("a key inserted after the upgrade returned revision %d, want at least 2 (above the revision 1 the ALTER handed every migrated row)", created)
+	}
+
+	var before int64
+
+	if err := db.QueryRow(`SELECT revision FROM systemplane_entries
+		WHERE namespace = 'runtime_config' AND "key" = 'log_level'`).Scan(&before); err != nil {
+		t.Fatalf("read the migrated row's current revision: %v", err)
+	}
+
+	if err := s.Delete(ctx, store.Scope{}, "runtime_config", "log_level", "tester"); err != nil {
+		t.Fatalf("delete the migrated key: %v", err)
+	}
+
+	if recreated := set("recreate the migrated key", "log_level", `"error"`); recreated <= before {
+		t.Fatalf("the migrated key recreated after a delete returned revision %d, want strictly greater than the %d it carried before the delete", recreated, before)
 	}
 }
 
@@ -224,17 +273,28 @@ func storeOn(t *testing.T, db *sql.DB, dsn string) *postgres.Store {
 func assertV4Shape(t *testing.T, db *sql.DB) {
 	t.Helper()
 
-	var dataType, isNullable string
+	var (
+		dataType, isNullable string
+		columnDefault        sql.NullString
+	)
 
-	if err := db.QueryRow(`SELECT data_type, is_nullable
+	if err := db.QueryRow(`SELECT data_type, is_nullable, column_default
 		FROM information_schema.columns
 		WHERE table_name = 'systemplane_entries' AND column_name = 'revision'`).
-		Scan(&dataType, &isNullable); err != nil {
+		Scan(&dataType, &isNullable, &columnDefault); err != nil {
 		t.Fatalf("read revision column metadata: %v", err)
 	}
 
 	if dataType != "bigint" || isNullable != "NO" {
 		t.Fatalf("revision column = (%s, nullable %s), want (bigint, nullable NO)", dataType, isNullable)
+	}
+
+	// No DEFAULT, deliberately: a default calling nextval() would run as the
+	// INVOKING role, so every insert by a DML-only runtime role would fail with
+	// "permission denied for sequence". The SECURITY DEFINER trigger is the
+	// only thing allowed to touch the sequence.
+	if columnDefault.Valid {
+		t.Fatalf("revision column default = %q, want none: the revision must be assigned by systemplane_bump_revision_trigger alone so the runtime role never calls nextval itself", columnDefault.String)
 	}
 
 	var sequenceExists bool

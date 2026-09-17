@@ -31,17 +31,19 @@ func TestSchemaSQL_ContainsCanonicalStatements(t *testing.T) {
 		"namespace   TEXT NOT NULL,",
 		`"key"       TEXT NOT NULL,`,
 		"value       JSONB NOT NULL,",
-		"revision    BIGINT NOT NULL DEFAULT nextval('systemplane_revision_seq'),",
+		"revision    BIGINT NOT NULL,",
 		"updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),",
 		"updated_by  TEXT NOT NULL DEFAULT '',",
 		`PRIMARY KEY (namespace, "key")`,
 		"ALTER TABLE systemplane_entries ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;",
-		"ALTER TABLE systemplane_entries ALTER COLUMN revision SET DEFAULT nextval('systemplane_revision_seq');",
+		"ALTER TABLE systemplane_entries ALTER COLUMN revision DROP DEFAULT;",
 		"SELECT setval('systemplane_revision_seq', GREATEST(",
 		"(SELECT COALESCE(MAX(revision), 1) FROM systemplane_entries),",
 		"(SELECT last_value FROM systemplane_revision_seq)",
 		"CREATE OR REPLACE FUNCTION systemplane_bump_revision_v4() RETURNS TRIGGER AS $$",
-		"NEW.revision := nextval('systemplane_revision_seq');",
+		"IF TG_OP = 'INSERT' OR OLD.value IS DISTINCT FROM NEW.value THEN",
+		"NEW.revision := nextval(format('%I.systemplane_revision_seq', TG_TABLE_SCHEMA)::regclass);",
+		"$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp;",
 		"CREATE OR REPLACE FUNCTION systemplane_notify_v4() RETURNS TRIGGER AS $$",
 		"PERFORM pg_notify(TG_ARGV[0], json_build_object(",
 		"'op',        'delete'",
@@ -53,8 +55,7 @@ func TestSchemaSQL_ContainsCanonicalStatements(t *testing.T) {
 		"DROP TRIGGER IF EXISTS systemplane_notify_update_trigger ON systemplane_entries",
 		"DROP FUNCTION IF EXISTS systemplane_notify_v3();",
 		"CREATE TRIGGER systemplane_bump_revision_trigger",
-		"BEFORE UPDATE ON systemplane_entries",
-		"WHEN (OLD.value IS DISTINCT FROM NEW.value)",
+		"BEFORE INSERT OR UPDATE ON systemplane_entries",
 		"CREATE TRIGGER systemplane_notify_trigger",
 		"AFTER INSERT OR DELETE ON systemplane_entries",
 		"FOR EACH ROW EXECUTE FUNCTION systemplane_notify_v4('systemplane_changes')",
@@ -175,16 +176,19 @@ func TestMigrationV3ToV4SQL_IsTheDeltaOnly(t *testing.T) {
 
 	// The sequence is what makes a migrated revision monotonic across a
 	// delete: the column is added at 1 for the rows already there, its default
-	// switches to the sequence, and the sequence is seeded past every existing
-	// revision so the first post-migration write lands above them.
+	// is dropped so every later revision comes from the SECURITY DEFINER
+	// trigger instead of the caller, and the sequence is seeded past every
+	// existing revision so the first post-migration write lands above them.
 	wantFragments := []string{
 		"CREATE SEQUENCE IF NOT EXISTS systemplane_revision_seq AS BIGINT;",
 		"ALTER TABLE systemplane_entries ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;",
-		"ALTER TABLE systemplane_entries ALTER COLUMN revision SET DEFAULT nextval('systemplane_revision_seq');",
+		"ALTER TABLE systemplane_entries ALTER COLUMN revision DROP DEFAULT;",
 		"SELECT setval('systemplane_revision_seq', GREATEST(",
 		"(SELECT COALESCE(MAX(revision), 1) FROM systemplane_entries),",
 		"(SELECT last_value FROM systemplane_revision_seq)",
-		"NEW.revision := nextval('systemplane_revision_seq');",
+		"NEW.revision := nextval(format('%I.systemplane_revision_seq', TG_TABLE_SCHEMA)::regclass);",
+		"$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp;",
+		"BEFORE INSERT OR UPDATE ON systemplane_entries",
 	}
 
 	for _, frag := range wantFragments {

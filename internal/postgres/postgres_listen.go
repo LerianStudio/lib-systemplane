@@ -209,10 +209,37 @@ func (sub *subscription) deliver(logger log.Logger, evt store.Event) {
 
 // broadcast fans a synthesized marker (OpResync / OpDisconnect) out to an
 // already-taken snapshot of subscribers, outside f.mu.
-func (s *Store) broadcast(subs []*subscription, evt store.Event) {
+//
+// The window is marked on the feed for the same reason feed.dispatch marks a
+// key event: a marker is delivered on the reader goroutine too, and the engine
+// reacts to markers by reconciling a scope — dropping the tenant's last
+// subscription when that reconcile fails, or closing the store. Without the
+// marker that teardown would wait the full closeTimeout on the goroutine
+// running it, freezing the tenant's feed for those five seconds.
+func (s *Store) broadcast(f *feed, subs []*subscription, evt store.Event) {
+	f.beginDispatch()
+	defer f.endDispatch()
+
 	for _, sub := range subs {
 		sub.deliver(s.cfg.Logger, evt)
 	}
+}
+
+// beginDispatch and endDispatch bracket one delivery performed by the reader
+// goroutine, so signalFeed can tell a teardown reached from inside a callback
+// not to wait on that goroutine. Every reader-goroutine delivery — key events
+// through feed.dispatch and markers through Store.broadcast — goes through
+// this pair.
+func (f *feed) beginDispatch() {
+	f.mu.Lock()
+	f.dispatching++
+	f.mu.Unlock()
+}
+
+func (f *feed) endDispatch() {
+	f.mu.Lock()
+	f.dispatching--
+	f.mu.Unlock()
 }
 
 // zeroFeed returns the zero-scope feed, creating it when Subscribe runs before
@@ -763,13 +790,13 @@ func (s *Store) runFeed(f *feed, conn *pgx.Conn) {
 
 	for {
 		if subs, ok := f.beginResync(); ok {
-			s.broadcast(subs, store.Event{Scope: f.scope, Op: store.OpResync})
+			s.broadcast(f, subs, store.Event{Scope: f.scope, Op: store.OpResync})
 		}
 
 		s.consumeUntilFailure(f, conn)
 
 		if subs, ok := f.beginDisconnect(); ok {
-			s.broadcast(subs, store.Event{Scope: f.scope, Op: store.OpDisconnect})
+			s.broadcast(f, subs, store.Event{Scope: f.scope, Op: store.OpDisconnect})
 		}
 
 		// Close the failed (or shutdown-time) connection before reconnect.

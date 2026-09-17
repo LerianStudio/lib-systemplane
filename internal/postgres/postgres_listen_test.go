@@ -445,6 +445,44 @@ func TestPostgresFeed_BeginResyncSuppressedWhenClosing(t *testing.T) {
 	}
 }
 
+// Markers (OpResync / OpDisconnect) reach subscribers on the reader goroutine
+// exactly as key events do, so broadcast has to mark the dispatch window too.
+// Without the marker a callback that drops its tenant's last subscription —
+// what the engine does on OpDisconnect, and on the OpResync whose reconcile
+// then fails — is handed the reader's own done channel and burns the full
+// closeTimeout waiting for the goroutine it is itself running on.
+func TestPostgresFeed_BroadcastMarksTheDispatchWindow(t *testing.T) {
+	s := newSubscribeStore()
+
+	f := newFeed(store.Scope{Tenant: "t1"}, "")
+	f.done = make(chan struct{}) // a reader that never exits, as a stalled one would
+
+	var (
+		delivered bool
+		wait      <-chan struct{}
+	)
+
+	f.subs[1] = &subscription{fn: func(store.Event) {
+		delivered = true
+		wait = signalFeed(f)
+	}}
+
+	subs, ok := f.beginDisconnect()
+	if !ok {
+		t.Fatal("beginDisconnect on a live feed = ok false; want the connected->disconnected edge to announce")
+	}
+
+	s.broadcast(f, subs, store.Event{Scope: f.scope, Op: store.OpDisconnect})
+
+	if !delivered {
+		t.Fatal("broadcast delivered no OpDisconnect to the registered subscriber")
+	}
+
+	if wait != nil {
+		t.Fatal("tearing the feed down from inside an OpDisconnect delivery returned the reader's done channel; the callback would wait closeTimeout on the goroutine running it")
+	}
+}
+
 // shrinkTimeouts makes the connect and shutdown bounds small enough to assert
 // on inside a unit test, and restores them afterwards. The unit tests in this
 // package never run in parallel with one another, so a package var is enough.

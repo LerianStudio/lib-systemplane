@@ -27,11 +27,7 @@ func (f *feed) dispatch(logger log.Logger, evt store.Event) {
 	f.dispatching++
 	f.mu.Unlock()
 
-	defer func() {
-		f.mu.Lock()
-		f.dispatching--
-		f.mu.Unlock()
-	}()
+	defer f.endDispatch()
 
 	for _, sub := range subs {
 		sub.deliver(logger, evt)

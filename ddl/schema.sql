@@ -6,16 +6,20 @@
 -- table/channel placeholders.
 --
 -- The DDL is fully idempotent and upgrades a v3 database in place: the ALTERs
--- add the `revision` column when it is missing and point it at the sequence,
--- and the DROP TRIGGER statements precede the DROP of the v3 notify function
+-- add the `revision` column when it is missing and then drop its default, and
+-- the DROP TRIGGER statements precede the DROP of the v3 notify function
 -- that those triggers depend on. A consumer already on v3 may instead apply
 -- the smaller delta in ddl/migrate_v3_to_v4.sql.
 --
 -- Revision semantics: every revision is drawn from the table-level sequence
--- `systemplane_revision_seq` — a fresh row takes it through the column
--- default, and a value-changing UPDATE takes it through the BEFORE UPDATE
--- trigger, so re-setting an identical value refreshes `updated_at` without
--- advancing the revision. Because the counter is table-level rather than
+-- `systemplane_revision_seq`, and ONLY from the BEFORE INSERT OR UPDATE
+-- trigger — an insert always draws a new one, an update draws one only when
+-- `value` changes, so re-setting an identical value refreshes `updated_at`
+-- without advancing the revision. The column deliberately carries NO DEFAULT
+-- and the trigger function is SECURITY DEFINER: the sequence is advanced with
+-- the privileges of the role that applied this file, so the runtime role
+-- needs no grant on `systemplane_revision_seq` — DML on systemplane_entries
+-- remains sufficient. Because the counter is table-level rather than
 -- per-row, a key deleted and recreated always comes back ABOVE every revision
 -- it ever had, and revisions may skip numbers. On a v3 table the ALTER seeds
 -- every existing row at revision 1 and the setval lifts the sequence past the
@@ -29,14 +33,14 @@ CREATE TABLE IF NOT EXISTS systemplane_entries (
 	namespace   TEXT NOT NULL,
 	"key"       TEXT NOT NULL,
 	value       JSONB NOT NULL,
-	revision    BIGINT NOT NULL DEFAULT nextval('systemplane_revision_seq'),
+	revision    BIGINT NOT NULL,
 	updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
 	updated_by  TEXT NOT NULL DEFAULT '',
 	PRIMARY KEY (namespace, "key")
 );
 
 ALTER TABLE systemplane_entries ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;
-ALTER TABLE systemplane_entries ALTER COLUMN revision SET DEFAULT nextval('systemplane_revision_seq');
+ALTER TABLE systemplane_entries ALTER COLUMN revision DROP DEFAULT;
 SELECT setval('systemplane_revision_seq', GREATEST(
 	(SELECT COALESCE(MAX(revision), 1) FROM systemplane_entries),
 	(SELECT last_value FROM systemplane_revision_seq)
@@ -44,10 +48,15 @@ SELECT setval('systemplane_revision_seq', GREATEST(
 
 CREATE OR REPLACE FUNCTION systemplane_bump_revision_v4() RETURNS TRIGGER AS $$
 BEGIN
-	NEW.revision := nextval('systemplane_revision_seq');
+	IF TG_OP = 'INSERT' OR OLD.value IS DISTINCT FROM NEW.value THEN
+		NEW.revision := nextval(format('%I.systemplane_revision_seq', TG_TABLE_SCHEMA)::regclass);
+	ELSE
+		NEW.revision := OLD.revision;
+	END IF;
+
 	RETURN NEW;
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp;
 
 CREATE OR REPLACE FUNCTION systemplane_notify_v4() RETURNS TRIGGER AS $$
 BEGIN
@@ -77,9 +86,8 @@ DROP TRIGGER IF EXISTS systemplane_bump_revision_trigger ON systemplane_entries;
 DROP FUNCTION IF EXISTS systemplane_notify_v3();
 
 CREATE TRIGGER systemplane_bump_revision_trigger
-BEFORE UPDATE ON systemplane_entries
+BEFORE INSERT OR UPDATE ON systemplane_entries
 FOR EACH ROW
-WHEN (OLD.value IS DISTINCT FROM NEW.value)
 EXECUTE FUNCTION systemplane_bump_revision_v4();
 
 CREATE TRIGGER systemplane_notify_trigger
