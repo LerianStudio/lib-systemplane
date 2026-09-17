@@ -1647,8 +1647,10 @@ func TestIntegration_PostgresCleanCloseEmitsNoDisconnect(t *testing.T) {
 // changefeed: what Set reports and what the subscriber is told are the same
 // number, an identical rewrite reports it again (the trigger still fires on the
 // updated_at change — deduplicating that is the engine's job, not the store's),
-// and a delete arrives as OpDelete with revision 0, the "no row, registered
-// default in force" marker.
+// a delete arrives as OpDelete with revision 0, the "no row, registered default
+// in force" marker, and a key recreated after that delete comes back at
+// revision 1 — the counter lives in the row, so the delete resets it and the
+// recreate announces a revision BELOW the one the subscriber last saw.
 func TestIntegration_PostgresEventCarriesRevision(t *testing.T) {
 	s := freshStore(t, "evtrev")
 	ctx := context.Background()
@@ -1699,6 +1701,18 @@ func TestIntegration_PostgresEventCarriesRevision(t *testing.T) {
 		t.Fatalf("identical rewrite event = %+v, want an upsert carrying revision %d", rewrite, rev)
 	}
 
+	// Climb above 1 before deleting, so the recreate below demonstrably
+	// announces a revision the subscriber has already seen surpassed.
+	climbed := set("changed value", "v2")
+	if climbed <= rev {
+		t.Fatalf("changed value: Set reported revision %d, want greater than %d", climbed, rev)
+	}
+
+	bumped := recvEvent(t, events, "the upsert of the changed value")
+	if bumped.Op != store.OpUpsert || bumped.Revision != climbed {
+		t.Fatalf("changed value event = %+v, want an upsert carrying revision %d", bumped, climbed)
+	}
+
 	if err := s.Delete(ctx, store.Scope{}, "ns", "k", "tester"); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
@@ -1710,5 +1724,25 @@ func TestIntegration_PostgresEventCarriesRevision(t *testing.T) {
 
 	if deleted.Revision != 0 {
 		t.Fatalf("delete event revision = %d, want 0", deleted.Revision)
+	}
+
+	// Recreate. INSERT ... ON CONFLICT leaves revision to the column DEFAULT
+	// and the bump trigger is BEFORE UPDATE only, so the new row is revision 1
+	// however high the old one had climbed.
+	if recreated := set("recreate after delete", "v3"); recreated != 1 {
+		t.Fatalf("recreated after delete: Set reported revision %d, want 1", recreated)
+	}
+
+	back := recvEvent(t, events, "the upsert recreating ns/k")
+	if back.Op != store.OpUpsert || back.Namespace != "ns" || back.Key != "k" {
+		t.Fatalf("event = %+v, want an upsert of ns/k", back)
+	}
+
+	if back.Revision != 1 {
+		t.Fatalf("recreate event revision = %d, want 1", back.Revision)
+	}
+
+	if back.Revision >= climbed {
+		t.Fatalf("recreate event revision = %d, unexpectedly not below the pre-delete %d", back.Revision, climbed)
 	}
 }

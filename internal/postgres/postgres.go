@@ -17,8 +17,10 @@
 //     own changefeed, in either mode.
 //
 // This package performs NO runtime schema provisioning. The
-// systemplane_entries table, the systemplane_notify_v4() trigger function, and
-// the NOTIFY triggers MUST be provisioned externally (e.g. via the consumer's
+// systemplane_entries table, its revision column, the
+// systemplane_bump_revision_v4() and systemplane_notify_v4() trigger
+// functions, and the three triggers that bind them (one BEFORE UPDATE bump,
+// two NOTIFY) MUST be provisioned externally (e.g. via the consumer's
 // migration pipeline) using the DDL published by the root package's
 // SchemaSQL() / DefaultSeedSQL(). The store only reads, writes values, and —
 // in single-tenant mode — runs LISTEN/NOTIFY. The runtime database role only
