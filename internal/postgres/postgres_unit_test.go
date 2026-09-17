@@ -7,7 +7,9 @@ import (
 	"database/sql"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 	"github.com/bxcodec/dbresolver/v2"
@@ -250,9 +252,9 @@ func containsError(err error, want string) bool {
 }
 
 // A named tenant is refused on every method when the Store was built without a
-// tenant connector: there is nothing to resolve the tenant's database through.
-// (Subscribe still refuses every named scope outright; Epic 1.4 gives it a
-// per-tenant feed.)
+// tenant connector: there is nothing to resolve the tenant's database through,
+// and nothing to resolve its LISTEN DSN through either — so Subscribe refuses
+// with the same sentinel rather than pretending the backend has no changefeed.
 func TestStore_NamedTenantScopeWithoutConnector(t *testing.T) {
 	t.Parallel()
 
@@ -280,8 +282,8 @@ func TestStore_NamedTenantScopeWithoutConnector(t *testing.T) {
 		t.Fatalf("List error = %v, want ErrTenantConnectorMissing", err)
 	}
 
-	if _, err := s.Subscribe(ctx, scope, func(store.Event) {}); !errors.Is(err, store.ErrNotSupportedInMultiTenant) {
-		t.Fatalf("Subscribe error = %v, want ErrNotSupportedInMultiTenant", err)
+	if _, err := s.Subscribe(ctx, scope, func(store.Event) {}); !errors.Is(err, store.ErrTenantConnectorMissing) {
+		t.Fatalf("Subscribe error = %v, want ErrTenantConnectorMissing", err)
 	}
 }
 
@@ -314,5 +316,161 @@ func TestStore_NamedTenantScopeNilHandleIsRefused(t *testing.T) {
 
 	if !strings.Contains(resolveErr.Error(), "resolve tenant t1") {
 		t.Errorf("resolveDB error %q must name the tenant", resolveErr)
+	}
+}
+
+// errResolveDSN is the cause every caller of a failed feed creation must see.
+var errResolveDSN = errors.New("tenant DSN unavailable")
+
+// stubConnector drives feed creation from the test: resolve decides what the
+// nth ResolveDSN call returns, so the first call can park inside the connector
+// while the other callers pile up on the reserved slot.
+type stubConnector struct {
+	mu      sync.Mutex
+	calls   int
+	resolve func(call int) (string, error)
+}
+
+func (c *stubConnector) ResolveDB(context.Context, string) (dbresolver.DB, error) {
+	return nil, errResolveDSN
+}
+
+func (c *stubConnector) ResolveDSN(context.Context, string) (string, error) {
+	c.mu.Lock()
+	c.calls++
+	call := c.calls
+	c.mu.Unlock()
+
+	return c.resolve(call)
+}
+
+func (c *stubConnector) callCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.calls
+}
+
+// waitForFeedRefs blocks until the tenant's reserved slot has taken want
+// references — one per caller that reached it. It is what makes the test below
+// deterministic instead of timing-based: once every caller holds a reference,
+// none of them can become a second creator, so releasing the first one exercises
+// the waiter path for all the others.
+func waitForFeedRefs(t *testing.T, s *Store, tenant string, want int) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+
+	for {
+		s.feedsMu.Lock()
+		refs := 0
+
+		if f, ok := s.feeds[tenant]; ok {
+			refs = f.refs
+		}
+
+		s.feedsMu.Unlock()
+
+		if refs >= want {
+			return
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("reserved slot for tenant %q holds %d references, want %d callers parked on it", tenant, refs, want)
+		}
+
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// A feed whose creation fails must fail EVERY caller waiting on it with the
+// same cause. A waiter that instead blocked until its own ctx died would strand
+// the engine's tenant activation, and a dead slot left in the map would poison
+// the tenant forever: the next Subscribe has to resolve the DSN again from
+// scratch.
+func TestPostgresSubscribe_FailedFeedCreationFailsEveryWaiter(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+
+	conn := &stubConnector{
+		resolve: func(call int) (string, error) {
+			// The first caller is the creator: park it inside the connector so
+			// every later caller provably finds the reserved slot.
+			if call == 1 {
+				close(entered)
+				<-release
+			}
+
+			return "", errResolveDSN
+		},
+	}
+
+	s, err := New(Config{MultiTenantEnabled: true, Connector: conn})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	defer s.Close()
+
+	const waiters = 8
+
+	scope := store.Scope{Tenant: "t1"}
+	results := make(chan error, waiters)
+
+	subscribe := func() {
+		_, err := s.Subscribe(context.Background(), scope, func(store.Event) {})
+		results <- err
+	}
+
+	go subscribe()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Subscribe never reached the connector: a named tenant must open its own feed, not be refused outright")
+	}
+
+	for i := 1; i < waiters; i++ {
+		go subscribe()
+	}
+
+	waitForFeedRefs(t, s, scope.Tenant, waiters)
+	close(release)
+
+	for i := 0; i < waiters; i++ {
+		select {
+		case err := <-results:
+			if !errors.Is(err, errResolveDSN) {
+				t.Fatalf("Subscribe %d error = %v, want it to carry %v", i, err, errResolveDSN)
+			}
+
+			if !strings.Contains(err.Error(), scope.Tenant) {
+				t.Errorf("Subscribe %d error %q must name the tenant", i, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("Subscribe %d blocked instead of receiving the creator's failure", i)
+		}
+	}
+
+	if got := conn.callCount(); got != 1 {
+		t.Errorf("ResolveDSN calls = %d, want 1: the waiters must share the creator's attempt", got)
+	}
+
+	s.feedsMu.Lock()
+	remaining := len(s.feeds)
+	s.feedsMu.Unlock()
+
+	if remaining != 0 {
+		t.Fatalf("feeds map holds %d entries after a failed creation, want 0", remaining)
+	}
+
+	// The tenant is not poisoned: the next Subscribe builds a fresh placeholder
+	// and resolves the DSN again rather than replaying the dead one.
+	if _, err := s.Subscribe(context.Background(), scope, func(store.Event) {}); !errors.Is(err, errResolveDSN) {
+		t.Fatalf("Subscribe after a failed creation = %v, want a fresh attempt carrying %v", err, errResolveDSN)
+	}
+
+	if got := conn.callCount(); got != 2 {
+		t.Errorf("ResolveDSN calls = %d after the retry, want 2: the retracted slot must be rebuilt", got)
 	}
 }

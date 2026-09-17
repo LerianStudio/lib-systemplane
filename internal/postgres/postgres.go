@@ -10,8 +10,11 @@
 //   - Multi-tenant. The constructor receives no db; instead the caller wires
 //     lib-commons tenant-manager middleware so each request context carries
 //     the per-tenant database. resolveDB(ctx) extracts that database and
-//     returns the handle to the CRUD helpers. LISTEN/NOTIFY is disabled in
-//     this mode — Subscribe returns store.ErrNotSupportedInMultiTenant.
+//     returns the handle to the CRUD helpers. The zero scope has no durable
+//     DSN to LISTEN on there, so Subscribe returns
+//     store.ErrNotSupportedInMultiTenant for it; a NAMED tenant scope resolves
+//     its own database and LISTEN DSN through the tenant connector and gets its
+//     own changefeed, in either mode.
 //
 // This package performs NO runtime schema provisioning. The
 // systemplane_entries table, the systemplane_notify_v4() trigger function, and
@@ -130,7 +133,9 @@ type Store struct {
 	cfg Config
 
 	// feedsMu guards feeds, the LISTEN/NOTIFY changefeeds keyed by
-	// scope.Tenant ("" is the zero, single-tenant scope).
+	// scope.Tenant ("" is the zero, single-tenant scope), and every feed's
+	// reference count: a feed's lifetime decision and its map slot change
+	// together, in one lock hold.
 	feedsMu sync.Mutex
 	feeds   map[string]*feed
 

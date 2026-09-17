@@ -60,10 +60,10 @@ func waitForObserverExit(t *testing.T) {
 	}
 }
 
-// The postgres Subscribe path is simpler than the mongodb one — there is no
-// ctx-observer goroutine because the changefeed lives in the feed's reader,
-// not in Subscribe. We still assert (a) basic unsubscribe behavior, (b) idempotency
-// under concurrent unsubscribe calls.
+// Subscribe spawns one ctx-observer goroutine per subscription, so that a
+// cancelled scope releases its feed without a caller-driven unsubscribe. We
+// assert (a) basic unsubscribe behavior, (b) idempotency under concurrent
+// unsubscribe calls, and (c) that the observer exits either way.
 func TestPostgresSubscribe_UnsubscribeIsIdempotent(t *testing.T) {
 	s := newSubscribeStore()
 

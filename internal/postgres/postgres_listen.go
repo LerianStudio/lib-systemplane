@@ -3,7 +3,10 @@
 // One feed per scope: the zero-scope feed is opened by Start and lives until
 // Close. Multi-tenant deployments resolve a fresh database on every call, so
 // the zero scope has no durable DSN to LISTEN on there and Subscribe returns
-// store.ErrNotSupportedInMultiTenant.
+// store.ErrNotSupportedInMultiTenant. A NAMED tenant scope is different: its
+// DSN comes from the tenant connector, so the first Subscribe for that tenant
+// opens a dedicated LISTEN connection, every later subscriber shares it, and
+// the last one to leave closes it.
 package postgres
 
 import (
@@ -44,6 +47,20 @@ type feed struct {
 	scope store.Scope
 	dsn   string
 
+	// ready is closed exactly once, by the creator, when creation finishes:
+	// with err nil the feed is live, with err non-nil creation failed and the
+	// slot has already been retracted from the feeds map. err is written BEFORE
+	// the close, so the close is the happens-before edge that publishes it.
+	// Both are nil on the zero-scope feed, which Start owns and never waits on.
+	ready chan struct{}
+	err   error
+
+	// refs counts the callers holding this feed, guarded by Store.feedsMu (NOT
+	// f.mu): the count decides the feed's lifetime and must be read and written
+	// in the same lock hold that publishes or removes the map slot. Meaningful
+	// only while the feed is in that map.
+	refs int
+
 	mu           sync.Mutex
 	subs         map[uint64]*subscription
 	nextID       uint64
@@ -72,6 +89,16 @@ func newFeed(scope store.Scope, dsn string) *feed {
 		subs:  make(map[uint64]*subscription),
 		stop:  make(chan struct{}),
 	}
+}
+
+// label names the feed's scope in an error or log message: empty for the zero,
+// single-tenant scope, " tenant <id>" for a named one.
+func (f *feed) label() string {
+	if f.scope.Tenant == "" {
+		return ""
+	}
+
+	return " tenant " + f.scope.Tenant
 }
 
 // snapshotLocked copies the subscriber set so it can be fanned out to after
@@ -166,8 +193,152 @@ func (s *Store) zeroFeedLocked() *feed {
 	return f
 }
 
-// Subscribe registers fn to be invoked for every change event. The returned
-// unsubscribe func removes fn from the dispatch list.
+// acquireFeed returns the live feed for scope — creating it when this caller is
+// the first to ask for that tenant — and takes one reference on it, released by
+// releaseFeed. Feeds are SHARED: a tenant has exactly one LISTEN connection no
+// matter how many subscribers it has.
+//
+// The feeds-map lock is never held across pgx.Connect, or one unreachable
+// tenant would freeze every other tenant's Subscribe. The creator instead
+// reserves the map slot with an unconnected placeholder, connects outside the
+// lock, and then publishes or retracts it.
+func (s *Store) acquireFeed(ctx context.Context, scope store.Scope) (*feed, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	s.feedsMu.Lock()
+
+	if scope.Tenant == "" {
+		f := s.zeroFeedLocked()
+		f.refs++
+		s.feedsMu.Unlock()
+
+		return f, nil
+	}
+
+	if f, ok := s.feeds[scope.Tenant]; ok {
+		f.refs++
+		s.feedsMu.Unlock()
+
+		return s.awaitFeed(ctx, f)
+	}
+
+	f := newFeed(scope, "")
+	f.ready = make(chan struct{})
+	f.refs = 1
+	s.feeds[scope.Tenant] = f
+	s.feedsMu.Unlock()
+
+	if err := s.createFeed(ctx, f); err != nil {
+		return nil, err
+	}
+
+	return f, nil
+}
+
+// awaitFeed blocks until the creator publishes or retracts the feed.
+//
+// A creation failure reaches EVERY waiter carrying the creator's own cause: a
+// waiter that blocked until its own ctx died instead would strand the caller.
+// It is never retried here — the slot is already gone, so the next Subscribe
+// for that tenant builds a fresh placeholder. On ctx cancellation the waiter
+// leaves the creator alone; the creator finishes or retracts on its own.
+func (s *Store) awaitFeed(ctx context.Context, f *feed) (*feed, error) {
+	select {
+	case <-f.ready:
+		if f.err != nil {
+			s.releaseFeed(f)
+
+			return nil, f.err
+		}
+
+		return f, nil
+	case <-ctx.Done():
+		s.releaseFeed(f)
+
+		return nil, ctx.Err()
+	}
+}
+
+// createFeed resolves the tenant's DSN and opens its first LISTEN connection
+// synchronously, so an unreachable tenant fails the Subscribe call instead of
+// looping in the background, then publishes the feed to every waiter.
+func (s *Store) createFeed(ctx context.Context, f *feed) error {
+	tenant := f.scope.Tenant
+
+	dsn, err := s.cfg.Connector.ResolveDSN(ctx, tenant)
+	if err != nil {
+		return s.retractFeed(f, fmt.Errorf("systemplane/postgres: resolve tenant %s DSN: %w", tenant, err))
+	}
+
+	// An empty DSN reported with a nil error is a connector bug; refuse it here
+	// rather than hand pgx a string it cannot dial.
+	if dsn == "" {
+		return s.retractFeed(f, fmt.Errorf("systemplane/postgres: resolve tenant %s DSN: %w", tenant, store.ErrTenantConnectorMissing))
+	}
+
+	f.dsn = dsn
+
+	conn, err := s.openListen(ctx, f)
+	if err != nil {
+		return s.retractFeed(f, err)
+	}
+
+	s.startFeedReader(f, conn)
+
+	close(f.ready)
+
+	return nil
+}
+
+// retractFeed publishes a creation failure to every waiter and removes the dead
+// slot. The order is load-bearing in both directions: err is written BEFORE the
+// close, so the close is the happens-before edge that publishes it, and the
+// slot is gone BEFORE the waiters wake, so the next Subscribe for that tenant
+// builds a fresh placeholder instead of finding a corpse.
+func (s *Store) retractFeed(f *feed, err error) error {
+	f.err = err
+
+	s.feedsMu.Lock()
+
+	if s.feeds[f.scope.Tenant] == f {
+		delete(s.feeds, f.scope.Tenant)
+	}
+
+	s.feedsMu.Unlock()
+
+	close(f.ready)
+
+	return err
+}
+
+// releaseFeed drops one reference. When the last one goes, a NAMED feed leaves
+// the map and its reader is stopped — so a later Subscribe for that tenant
+// resolves the DSN again and picks up a credentials rotation. The zero-scope
+// feed is exempt: Start owns it and it must survive an empty subscriber map.
+// Deciding under feedsMu is what stops a concurrent Subscribe from attaching to
+// a feed that is being torn down.
+func (s *Store) releaseFeed(f *feed) {
+	s.feedsMu.Lock()
+
+	f.refs--
+
+	if f.scope.Tenant == "" || f.refs > 0 || s.feeds[f.scope.Tenant] != f {
+		s.feedsMu.Unlock()
+
+		return
+	}
+
+	delete(s.feeds, f.scope.Tenant)
+	s.feedsMu.Unlock()
+
+	s.stopFeed(f)
+}
+
+// Subscribe registers fn to be invoked for every change event in scope. The
+// returned unsubscribe func removes fn from the dispatch list, and the last
+// subscriber to leave a tenant scope closes that tenant's LISTEN connection.
 //
 // A subscriber that joins an already-connected feed receives its own
 // store.OpResync before any key event: it missed everything published before
@@ -176,23 +347,39 @@ func (s *Store) zeroFeedLocked() *feed {
 // down emits nothing — the scope is legitimately stale, and the next
 // successful (re)connect broadcasts one.
 //
-// In multi-tenant mode, and for any named tenant scope, the method returns
-// store.ErrNotSupportedInMultiTenant — every method resolves a per-call tenant
-// database, so there is no shared process-wide changefeed to attach to.
+// The zero scope in multi-tenant mode returns
+// store.ErrNotSupportedInMultiTenant: every method there resolves a per-call
+// tenant database, so there is no shared process-wide changefeed to attach to.
+// A named tenant scope is served regardless of the mode — it resolves its own
+// LISTEN DSN through the connector — and is refused with
+// store.ErrTenantConnectorMissing when the Store was built without one.
+//
+// The subscription lives for the lifetime of ctx: when ctx is cancelled the
+// callback is removed and the feed released, exactly as if unsubscribe had been
+// called, so a cancelled scope never leaks a LISTEN connection.
 func (s *Store) Subscribe(ctx context.Context, scope store.Scope, fn func(store.Event)) (func(), error) {
 	if s == nil || s.isClosed() {
 		return nil, store.ErrClosed
 	}
 
-	if s.cfg.MultiTenantEnabled || scope.Tenant != "" {
-		return nil, store.ErrNotSupportedInMultiTenant
+	if scope.Tenant == "" {
+		if s.cfg.MultiTenantEnabled {
+			return nil, store.ErrNotSupportedInMultiTenant
+		}
+	} else if s.cfg.Connector == nil {
+		return nil, store.ErrTenantConnectorMissing
 	}
 
+	// Checked before any feed work: a nil callback must never open a connection.
 	if fn == nil {
 		return func() {}, nil
 	}
 
-	f := s.zeroFeed()
+	f, err := s.acquireFeed(ctx, scope)
+	if err != nil {
+		return nil, err
+	}
+
 	sub := &subscription{fn: fn}
 
 	// sub.mu is taken BEFORE the subscription becomes reachable and released
@@ -221,15 +408,79 @@ func (s *Store) Subscribe(ctx context.Context, scope store.Scope, fn func(store.
 		sub.deliverLocked(s.cfg.Logger, store.Event{Scope: f.scope, Op: store.OpResync})
 	}
 
+	// cancelCh stops the ctx observer below. Every teardown action — removing
+	// the callback, releasing the feed, stopping the observer — runs inside one
+	// sync.Once, so a caller-driven unsubscribe racing ctx cancellation can
+	// never double-release the feed or double-close the channel.
+	cancelCh := make(chan struct{})
+
 	var once sync.Once
 
-	return func() {
+	teardown := func() {
 		once.Do(func() {
 			f.mu.Lock()
 			delete(f.subs, id)
 			f.mu.Unlock()
+
+			close(cancelCh)
+
+			s.releaseFeed(f)
 		})
-	}, nil
+	}
+
+	// A nil ctx would panic on ctx.Done(); such callers simply get no observer
+	// and the same unsubscribe func.
+	if ctx != nil {
+		go func() {
+			select {
+			case <-ctx.Done():
+				teardown()
+			case <-cancelCh:
+			}
+		}()
+	}
+
+	return teardown, nil
+}
+
+// openListen opens a dedicated pgx connection for the feed's DSN and installs
+// LISTEN on it synchronously, so a bad DSN or a missing privilege surfaces to
+// the caller instead of looping in the background.
+func (s *Store) openListen(ctx context.Context, f *feed) (*pgx.Conn, error) {
+	conn, err := pgx.Connect(ctx, f.dsn)
+	if err != nil {
+		return nil, fmt.Errorf("systemplane/postgres: listen connect%s: %w", f.label(), err)
+	}
+
+	if _, err := conn.Exec(ctx, "LISTEN "+quoteIdentifier(s.cfg.Channel)); err != nil {
+		_ = conn.Close(ctx)
+
+		return nil, fmt.Errorf("systemplane/postgres: listen%s: %w", f.label(), err)
+	}
+
+	s.logInfo(ctx, "LISTEN connection established",
+		log.String("channel", s.cfg.Channel),
+		log.String("tenant", f.scope.Tenant),
+	)
+
+	return conn, nil
+}
+
+// startFeedReader records the reader's done channel and launches it. done is
+// what stopFeed waits on, so it must be recorded before the goroutine starts.
+func (s *Store) startFeedReader(f *feed, conn *pgx.Conn) {
+	done := make(chan struct{})
+
+	f.mu.Lock()
+	f.done = done
+	f.mu.Unlock()
+
+	go func() {
+		defer close(done)
+		defer runtime.RecoverAndLog(s.cfg.Logger, "systemplane.postgres.listener")
+
+		s.runFeed(f, conn)
+	}()
 }
 
 // startListener opens the zero-scope feed's dedicated pgx LISTEN connection
@@ -247,33 +498,12 @@ func (s *Store) startListener(ctx context.Context) error {
 		return nil
 	}
 
-	conn, err := pgx.Connect(ctx, f.dsn)
+	conn, err := s.openListen(ctx, f)
 	if err != nil {
-		return fmt.Errorf("systemplane/postgres: listen connect: %w", err)
+		return err
 	}
 
-	if _, err := conn.Exec(ctx, "LISTEN "+quoteIdentifier(s.cfg.Channel)); err != nil {
-		_ = conn.Close(ctx)
-
-		return fmt.Errorf("systemplane/postgres: listen: %w", err)
-	}
-
-	s.logInfo(ctx, "LISTEN connection established",
-		log.String("channel", s.cfg.Channel),
-	)
-
-	done := make(chan struct{})
-
-	f.mu.Lock()
-	f.done = done
-	f.mu.Unlock()
-
-	go func() {
-		defer close(done)
-		defer runtime.RecoverAndLog(s.cfg.Logger, "systemplane.postgres.listener")
-
-		s.runFeed(f, conn)
-	}()
+	s.startFeedReader(f, conn)
 
 	return nil
 }

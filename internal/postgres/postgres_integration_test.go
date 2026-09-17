@@ -438,9 +438,6 @@ func jsonBytes(t *testing.T, v any) []byte {
 	return raw
 }
 
-// ensure the sync/sync imports are used when only some sub-tests run.
-var _ = sync.Mutex{}
-
 // freshStore provisions a container-backed database with the published schema
 // and returns a Store over it. CRUD needs no Start: only the changefeed does.
 func freshStore(t *testing.T, prefix string) *postgres.Store {
@@ -598,13 +595,40 @@ func TestIntegration_PostgresDollarPrefixedStringsStoredVerbatim(t *testing.T) {
 }
 
 // fakeConnector resolves tenants from static maps, standing in for a
-// tenant-manager Postgres Manager without a tenant-config gRPC client.
+// tenant-manager Postgres Manager without a tenant-config gRPC client. It is
+// mutable under a mutex so a test can teach it a tenant it previously did not
+// know, and it counts DSN resolutions so a test can prove that a re-subscribed
+// tenant resolves again — which is how a credentials rotation is picked up.
 type fakeConnector struct {
-	dbs  map[string]*sql.DB
-	dsns map[string]string
+	mu       sync.Mutex
+	dbs      map[string]*sql.DB
+	dsns     map[string]string
+	dsnCalls int
+}
+
+func newFakeConnector() *fakeConnector {
+	return &fakeConnector{dbs: map[string]*sql.DB{}, dsns: map[string]string{}}
+}
+
+func (c *fakeConnector) set(tenantID string, db *sql.DB, dsn string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.dbs[tenantID] = db
+	c.dsns[tenantID] = dsn
+}
+
+func (c *fakeConnector) resolveDSNCalls() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.dsnCalls
 }
 
 func (c *fakeConnector) ResolveDB(_ context.Context, tenantID string) (dbresolver.DB, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	db, ok := c.dbs[tenantID]
 	if !ok {
 		return nil, fmt.Errorf("fakeConnector: unknown tenant %q", tenantID)
@@ -614,6 +638,11 @@ func (c *fakeConnector) ResolveDB(_ context.Context, tenantID string) (dbresolve
 }
 
 func (c *fakeConnector) ResolveDSN(_ context.Context, tenantID string) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.dsnCalls++
+
 	dsn, ok := c.dsns[tenantID]
 	if !ok {
 		return "", fmt.Errorf("fakeConnector: unknown tenant %q", tenantID)
@@ -635,10 +664,7 @@ func TestIntegration_PostgresScopedCRUDIsolation(t *testing.T) {
 	admin := adminDSN(t, dsn)
 	defer admin.Close()
 
-	conn := &fakeConnector{
-		dbs:  map[string]*sql.DB{},
-		dsns: map[string]string{},
-	}
+	conn := newFakeConnector()
 
 	for _, tenant := range []string{"t1", "t2"} {
 		dbName := fmt.Sprintf("scoped_%s_%d", tenant, time.Now().UnixNano())
@@ -655,8 +681,7 @@ func TestIntegration_PostgresScopedCRUDIsolation(t *testing.T) {
 
 		provisionSchema(t, db)
 
-		conn.dbs[tenant] = db
-		conn.dsns[tenant] = tenantDSN
+		conn.set(tenant, db, tenantDSN)
 	}
 
 	// No DB, no ListenDSN: every handle must come from the connector.
@@ -825,4 +850,350 @@ func recvEvent(t *testing.T, events <-chan store.Event, what string) store.Event
 
 		return store.Event{}
 	}
+}
+
+// provisionTenantDB creates a fresh database carrying the published schema and
+// returns its name, its DSN and an open handle. The caller decides when — or
+// whether — the connector learns about it.
+func provisionTenantDB(t *testing.T, admin *sql.DB, baseDSN, prefix string) (string, string, *sql.DB) {
+	t.Helper()
+
+	dbName := fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano())
+	freshDB(t, admin, dbName)
+
+	tenantDSN := dsnFor(baseDSN, dbName)
+
+	db, err := sql.Open("pgx", tenantDSN)
+	if err != nil {
+		t.Fatalf("open %s: %v", dbName, err)
+	}
+
+	t.Cleanup(func() { _ = db.Close() })
+
+	provisionSchema(t, db)
+
+	return dbName, tenantDSN, db
+}
+
+// tenantStore builds a Store with no database of its own: every scope resolves
+// through the connector, which is the shape the engine uses for tenant scopes.
+func tenantStore(t *testing.T, conn postgres.Connector) *postgres.Store {
+	t.Helper()
+
+	s, err := postgres.New(postgres.Config{MultiTenantEnabled: true, Connector: conn})
+	if err != nil {
+		t.Fatalf("postgres.New: %v", err)
+	}
+
+	t.Cleanup(func() { _ = s.Close() })
+
+	return s
+}
+
+// subscribeScope subscribes to scope and returns the delivered events. The
+// channel is buffered because a joining subscriber's OpResync is delivered
+// synchronously inside Subscribe.
+func subscribeScope(t *testing.T, s *postgres.Store, scope store.Scope) (<-chan store.Event, func()) {
+	t.Helper()
+
+	events := make(chan store.Event, 32)
+
+	unsub, err := s.Subscribe(context.Background(), scope, func(evt store.Event) {
+		select {
+		case events <- evt:
+		default:
+		}
+	})
+	if err != nil {
+		t.Fatalf("subscribe tenant %q: %v", scope.Tenant, err)
+	}
+
+	return events, unsub
+}
+
+// assertNoEvent fails when anything is delivered within wait.
+func assertNoEvent(t *testing.T, events <-chan store.Event, wait time.Duration, what string) {
+	t.Helper()
+
+	select {
+	case evt := <-events:
+		t.Fatalf("%s: unexpected event %+v", what, evt)
+	case <-time.After(wait):
+	}
+}
+
+// listenBackends counts the dedicated LISTEN connections open on dbName. A feed
+// parks its connection in `LISTEN "..."` for its whole life, so that query text
+// isolates it from the test's own pooled handles.
+func listenBackends(t *testing.T, admin *sql.DB, dbName string) int {
+	t.Helper()
+
+	var n int
+
+	if err := admin.QueryRow(
+		`SELECT count(*) FROM pg_stat_activity WHERE datname = $1 AND query LIKE 'LISTEN%'`,
+		dbName,
+	).Scan(&n); err != nil {
+		t.Fatalf("count LISTEN backends on %s: %v", dbName, err)
+	}
+
+	return n
+}
+
+// waitForListenBackends polls until dbName holds exactly want LISTEN
+// connections. Postgres reaps a closed backend asynchronously, so a teardown
+// assertion has to wait rather than sample once.
+func waitForListenBackends(t *testing.T, admin *sql.DB, dbName string, want int, what string) {
+	t.Helper()
+
+	deadline := time.Now().Add(15 * time.Second)
+
+	for {
+		got := listenBackends(t, admin, dbName)
+		if got == want {
+			return
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: %s holds %d LISTEN connections, want %d", what, dbName, got, want)
+		}
+
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// TestIntegration_PostgresTwoTenantFeedsAreIsolated pins the per-tenant feed:
+// each tenant's subscriber is told OpResync for ITS OWN scope, and a write in
+// one tenant's database never reaches the other tenant's subscriber.
+func TestIntegration_PostgresTwoTenantFeedsAreIsolated(t *testing.T) {
+	base, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	admin := adminDSN(t, base)
+	defer admin.Close()
+
+	conn := newFakeConnector()
+
+	for _, tenant := range []string{"t1", "t2"} {
+		_, tenantDSN, db := provisionTenantDB(t, admin, base, "feed_"+tenant)
+		conn.set(tenant, db, tenantDSN)
+	}
+
+	s := tenantStore(t, conn)
+
+	scope1 := store.Scope{Tenant: "t1"}
+	scope2 := store.Scope{Tenant: "t2"}
+
+	events1, unsub1 := subscribeScope(t, s, scope1)
+	defer unsub1()
+
+	events2, unsub2 := subscribeScope(t, s, scope2)
+	defer unsub2()
+
+	if first := recvEvent(t, events1, "t1 resync"); first.Op != store.OpResync || first.Scope != scope1 {
+		t.Fatalf("t1 first event = %+v, want {Scope:%+v Op:%q}", first, scope1, store.OpResync)
+	}
+
+	if first := recvEvent(t, events2, "t2 resync"); first.Op != store.OpResync || first.Scope != scope2 {
+		t.Fatalf("t2 first event = %+v, want {Scope:%+v Op:%q}", first, scope2, store.OpResync)
+	}
+
+	ctx := context.Background()
+
+	if _, err := s.Set(ctx, scope1, store.Entry{Namespace: "ns", Key: "only-t1", Value: jsonBytes(t, "v1")}); err != nil {
+		t.Fatalf("set t1: %v", err)
+	}
+
+	if got := recvEvent(t, events1, "t1 upsert"); got.Op != store.OpUpsert || got.Namespace != "ns" || got.Key != "only-t1" {
+		t.Fatalf("t1 event = %+v, want an upsert of ns/only-t1", got)
+	}
+
+	assertNoEvent(t, events2, 2*time.Second, "t2 must never see t1's write")
+
+	if _, err := s.Set(ctx, scope2, store.Entry{Namespace: "ns", Key: "only-t2", Value: jsonBytes(t, "v2")}); err != nil {
+		t.Fatalf("set t2: %v", err)
+	}
+
+	if got := recvEvent(t, events2, "t2 upsert"); got.Op != store.OpUpsert || got.Namespace != "ns" || got.Key != "only-t2" {
+		t.Fatalf("t2 event = %+v, want an upsert of ns/only-t2", got)
+	}
+
+	assertNoEvent(t, events1, 2*time.Second, "t1 must never see t2's write")
+}
+
+// TestIntegration_PostgresTenantFeedTornDownOnLastUnsubscribe pins the shared,
+// reference-counted lifetime of a tenant feed: two subscribers ride ONE LISTEN
+// connection, dropping the first keeps it alive for the second, the last one to
+// leave closes it, and a later Subscribe resolves the tenant's DSN again — which
+// is how a credentials rotation is picked up.
+func TestIntegration_PostgresTenantFeedTornDownOnLastUnsubscribe(t *testing.T) {
+	base, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	admin := adminDSN(t, base)
+	defer admin.Close()
+
+	conn := newFakeConnector()
+	dbName, tenantDSN, db := provisionTenantDB(t, admin, base, "teardown")
+	conn.set("t1", db, tenantDSN)
+
+	s := tenantStore(t, conn)
+	scope := store.Scope{Tenant: "t1"}
+	ctx := context.Background()
+
+	eventsA, unsubA := subscribeScope(t, s, scope)
+	eventsB, unsubB := subscribeScope(t, s, scope)
+
+	if first := recvEvent(t, eventsA, "A resync"); first.Op != store.OpResync || first.Scope != scope {
+		t.Fatalf("A first event = %+v, want {Scope:%+v Op:%q}", first, scope, store.OpResync)
+	}
+
+	if first := recvEvent(t, eventsB, "B resync"); first.Op != store.OpResync || first.Scope != scope {
+		t.Fatalf("B first event = %+v, want {Scope:%+v Op:%q}", first, scope, store.OpResync)
+	}
+
+	waitForListenBackends(t, admin, dbName, 1, "two subscribers share one feed")
+
+	if calls := conn.resolveDSNCalls(); calls != 1 {
+		t.Errorf("ResolveDSN calls = %d, want 1: the second subscriber must join the existing feed", calls)
+	}
+
+	// Dropping one subscriber keeps the connection alive for the other.
+	unsubA()
+
+	if _, err := s.Set(ctx, scope, store.Entry{Namespace: "ns", Key: "k", Value: jsonBytes(t, "v1")}); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+
+	if got := recvEvent(t, eventsB, "upsert after A left"); got.Op != store.OpUpsert || got.Key != "k" {
+		t.Fatalf("B event = %+v, want an upsert of ns/k", got)
+	}
+
+	assertNoEvent(t, eventsA, time.Second, "A unsubscribed and must receive nothing")
+
+	if n := listenBackends(t, admin, dbName); n != 1 {
+		t.Fatalf("%s holds %d LISTEN connections while one subscriber remains, want 1", dbName, n)
+	}
+
+	// The last subscriber closes the tenant's connection.
+	unsubB()
+	waitForListenBackends(t, admin, dbName, 0, "the last unsubscribe tears the feed down")
+
+	// A later Subscribe rebuilds the feed from a freshly resolved DSN.
+	eventsC, unsubC := subscribeScope(t, s, scope)
+	defer unsubC()
+
+	if first := recvEvent(t, eventsC, "resync after re-subscribe"); first.Op != store.OpResync || first.Scope != scope {
+		t.Fatalf("re-subscribe first event = %+v, want {Scope:%+v Op:%q}", first, scope, store.OpResync)
+	}
+
+	waitForListenBackends(t, admin, dbName, 1, "re-subscribing opens a fresh feed")
+
+	if calls := conn.resolveDSNCalls(); calls != 2 {
+		t.Errorf("ResolveDSN calls = %d, want 2: a re-subscribed tenant must resolve its DSN again", calls)
+	}
+}
+
+// TestIntegration_PostgresConcurrentFirstSubscribeOpensOneConnection covers both
+// halves of the creation handshake. A tenant the connector cannot resolve fails
+// every concurrent caller — none of them blocks, and nothing is left running —
+// and once the connector knows the tenant, the same burst of callers shares
+// exactly ONE LISTEN connection, which is what "one live subscription per
+// activated tenant" rests on.
+func TestIntegration_PostgresConcurrentFirstSubscribeOpensOneConnection(t *testing.T) {
+	base, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	admin := adminDSN(t, base)
+	defer admin.Close()
+
+	conn := newFakeConnector()
+	dbName, tenantDSN, db := provisionTenantDB(t, admin, base, "concurrent")
+
+	s := tenantStore(t, conn)
+	scope := store.Scope{Tenant: "t1"}
+
+	const callers = 8
+
+	type result struct {
+		unsub func()
+		err   error
+	}
+
+	subscribeAll := func() []result {
+		t.Helper()
+
+		results := make(chan result, callers)
+
+		var wg sync.WaitGroup
+
+		for range callers {
+			wg.Add(1)
+
+			go func() {
+				defer wg.Done()
+
+				unsub, err := s.Subscribe(context.Background(), scope, func(store.Event) {})
+				results <- result{unsub: unsub, err: err}
+			}()
+		}
+
+		done := make(chan struct{})
+
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+		case <-time.After(60 * time.Second):
+			t.Fatal("concurrent Subscribe calls blocked instead of returning")
+		}
+
+		close(results)
+
+		out := make([]result, 0, callers)
+		for r := range results {
+			out = append(out, r)
+		}
+
+		return out
+	}
+
+	for i, r := range subscribeAll() {
+		if r.err == nil {
+			r.unsub()
+			t.Fatalf("Subscribe %d succeeded for a tenant the connector cannot resolve", i)
+		}
+
+		if !strings.Contains(r.err.Error(), "unknown tenant") {
+			t.Errorf("Subscribe %d error = %v, want the connector's resolution failure", i, r.err)
+		}
+	}
+
+	if n := listenBackends(t, admin, dbName); n != 0 {
+		t.Fatalf("a failed feed creation left %d LISTEN connections on %s, want 0", n, dbName)
+	}
+
+	// The connector learns the tenant: every caller now succeeds on one feed.
+	conn.set("t1", db, tenantDSN)
+
+	unsubs := make([]func(), 0, callers)
+
+	for i, r := range subscribeAll() {
+		if r.err != nil {
+			t.Fatalf("Subscribe %d after the connector learned the tenant: %v", i, r.err)
+		}
+
+		unsubs = append(unsubs, r.unsub)
+	}
+
+	waitForListenBackends(t, admin, dbName, 1, "concurrent subscribers share one connection")
+
+	for _, unsub := range unsubs {
+		unsub()
+	}
+
+	waitForListenBackends(t, admin, dbName, 0, "the last unsubscribe closes the shared connection")
 }
