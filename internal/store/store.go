@@ -45,6 +45,13 @@ const (
 	// connection. Namespace, Key and Revision are empty; the engine reloads
 	// the whole scope in response.
 	OpResync = "resync"
+	// OpDisconnect is emitted by Subscribe exactly once when the changefeed
+	// loses its connection, before the first reconnect attempt. Namespace,
+	// Key and Revision are empty; the engine marks the scope Stale until the
+	// OpResync that follows the reconnect has been reconciled.
+	// (Amendment of 2026-09-17, after the contracts lane landed store.go:
+	// the storage lane adds this constant; signatures are unchanged.)
+	OpDisconnect = "disconnect"
 )
 
 // Sentinel errors returned by Store implementations.
