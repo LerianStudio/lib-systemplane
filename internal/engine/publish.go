@@ -76,6 +76,15 @@ func (e *Engine) publish(pub publication) (notify bool) {
 		UpdatedBy: pub.UpdatedBy,
 	}
 
+	// Still under the scope's write lock, on purpose: queueing a notification
+	// is what keeps deliveries in revision order. If the queueing happened
+	// after the unlock, a publication that won the fence could be overtaken on
+	// the way to the worker's mailbox by one that lost it, and the subscriber
+	// would see the older revision last. No callback runs here — the worker
+	// goroutine does that — so the lock is held for a mutex and a
+	// non-blocking channel send.
+	e.dispatch(pub)
+
 	return true
 }
 
