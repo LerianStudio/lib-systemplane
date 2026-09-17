@@ -475,3 +475,134 @@ func TestGroupSnapshotOnNilGroupReturnsErrClosed(t *testing.T) {
 		t.Fatalf("Snapshot = %#v, want the zero Snapshot", snap)
 	}
 }
+
+// stored reads a row straight out of the fake store, so a test can assert what
+// the write path actually persisted — including the actor — and that a rejected
+// write persisted nothing at all.
+func (s *groupMemoryStore) stored(namespace, key string) (systemplane.TestEntry, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e, ok := s.entries[groupMemoryKey(namespace, key)]
+
+	return e, ok
+}
+
+func TestGroupSetPersistsAndIsReadableBack(t *testing.T) {
+	t.Parallel()
+
+	c := newGroupClient(t)
+
+	g, err := systemplane.Bind(c, "runtime", "ingest", groupDefaults(), nil)
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	written := groupConfig{Name: "written", Retries: 42, Hosts: []string{"p", "q"}}
+	if err := g.Set(ctx, written, "actor"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	snap, err := g.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	if !reflect.DeepEqual(snap.Value, written) {
+		t.Fatalf("Snapshot.Value = %#v, want the written document %#v", snap.Value, written)
+	}
+}
+
+func TestGroupSetRejectsValueFailingValidate(t *testing.T) {
+	t.Parallel()
+
+	validate := func(cfg groupConfig) error {
+		if cfg.Name == "" {
+			return errors.New("name must not be empty")
+		}
+
+		return nil
+	}
+
+	s := newGroupMemoryStore()
+	c := newGroupClientOn(t, s)
+
+	g, err := systemplane.Bind(c, "runtime", "ingest", groupDefaults(), validate)
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	if err := g.Set(ctx, groupConfig{Retries: 1}, "actor"); !errors.Is(err, systemplane.ErrValidation) {
+		t.Fatalf("Set of an invalid document = %v, want ErrValidation", err)
+	}
+
+	if e, ok := s.stored("runtime", "ingest"); ok {
+		t.Fatalf("a rejected Set reached the store: %#v", e)
+	}
+}
+
+func TestGroupSetBeforeStartReturnsErrNotStarted(t *testing.T) {
+	t.Parallel()
+
+	c := newGroupClient(t)
+
+	g, err := systemplane.Bind(c, "runtime", "ingest", groupDefaults(), nil)
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	err = g.Set(context.Background(), groupDefaults(), "actor")
+	if !errors.Is(err, systemplane.ErrNotStarted) {
+		t.Fatalf("Set before Start = %v, want ErrNotStarted", err)
+	}
+}
+
+func TestGroupSetRecordsActor(t *testing.T) {
+	t.Parallel()
+
+	s := newGroupMemoryStore()
+	c := newGroupClientOn(t, s)
+
+	g, err := systemplane.Bind(c, "runtime", "ingest", groupDefaults(), nil)
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	if err := g.Set(ctx, groupDefaults(), "operator@lerian"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	e, ok := s.stored("runtime", "ingest")
+	if !ok {
+		t.Fatal("Set persisted no row")
+	}
+
+	if e.UpdatedBy != "operator@lerian" {
+		t.Fatalf("stored UpdatedBy = %q, want \"operator@lerian\"", e.UpdatedBy)
+	}
+}
+
+func TestGroupSetOnNilGroupReturnsErrClosed(t *testing.T) {
+	t.Parallel()
+
+	var g *systemplane.Group[groupConfig]
+
+	if err := g.Set(context.Background(), groupDefaults(), "actor"); !errors.Is(err, systemplane.ErrClosed) {
+		t.Fatalf("Set error = %v, want ErrClosed", err)
+	}
+}

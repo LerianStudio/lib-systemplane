@@ -121,3 +121,23 @@ func (g *Group[T]) Snapshot(ctx context.Context) (Snapshot[T], error) {
 		Stale:    entry.Stale,
 	}, nil
 }
+
+// Set writes value as the group's whole document in the caller's scope,
+// attributing the change to actor. The write is last-write-wins across every
+// field of the document — that single row is what makes a group atomic — so a
+// caller changing one field writes the rest back unchanged.
+//
+// value is validated by the group's registered validator before it reaches the
+// store, so a document validate rejects returns an error wrapping
+// [ErrValidation] and persists nothing. Set before [Client.Start] returns
+// ErrNotStarted; Set on a nil *Group returns ErrClosed. Errors from the Client
+// are returned unchanged.
+func (g *Group[T]) Set(ctx context.Context, value T, actor string) error {
+	if g == nil {
+		return ErrClosed
+	}
+
+	// value itself, not its canonical form: the facade marshals it and the
+	// registered validator accepts a typed T directly.
+	return g.client.Set(ctx, g.namespace, g.key, value, actor)
+}
