@@ -49,8 +49,6 @@ const (
 	// loses its connection, before the first reconnect attempt. Namespace,
 	// Key and Revision are empty; the engine marks the scope Stale until the
 	// OpResync that follows the reconnect has been reconciled.
-	// (Amendment of 2026-09-17, after the contracts lane landed store.go:
-	// the storage lane adds this constant; signatures are unchanged.)
 	OpDisconnect = "disconnect"
 )
 
@@ -119,9 +117,10 @@ type Store interface {
 	Set(ctx context.Context, scope Scope, e Entry) (revision int64, err error)
 	Delete(ctx context.Context, scope Scope, ns, key, actor string) error
 	List(ctx context.Context, scope Scope) ([]Entry, error)
-	// Subscribe opens a changefeed for scope for the lifetime of ctx and
-	// emits OpResync after every (re)connect. Returns
-	// ErrNotSupportedInMultiTenant when the backend has no changefeed for
-	// that scope (MongoDB with a non-empty tenant).
+	// Subscribe opens a changefeed for scope for the lifetime of ctx, emits
+	// OpDisconnect when the connection is lost and OpResync after every
+	// (re)connect. Returns ErrNotSupportedInMultiTenant only for a backend
+	// that has no changefeed for that scope (none of the two shipped
+	// backends today).
 	Subscribe(ctx context.Context, scope Scope, fn func(Event)) (unsubscribe func(), err error)
 }
