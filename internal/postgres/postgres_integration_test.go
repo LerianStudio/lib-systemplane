@@ -440,3 +440,159 @@ func jsonBytes(t *testing.T, v any) []byte {
 
 // ensure the sync/sync imports are used when only some sub-tests run.
 var _ = sync.Mutex{}
+
+// freshStore provisions a container-backed database with the published schema
+// and returns a Store over it. CRUD needs no Start: only the changefeed does.
+func freshStore(t *testing.T, prefix string) *postgres.Store {
+	t.Helper()
+
+	dsn, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	admin := adminDSN(t, dsn)
+	dbName := fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano())
+	freshDB(t, admin, dbName)
+	_ = admin.Close()
+
+	tenantDSN := dsnFor(dsn, dbName)
+
+	db, err := sql.Open("pgx", tenantDSN)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	t.Cleanup(func() { _ = db.Close() })
+
+	provisionSchema(t, db)
+
+	s, err := postgres.New(postgres.Config{DB: db, ListenDSN: tenantDSN})
+	if err != nil {
+		t.Fatalf("postgres.New: %v", err)
+	}
+
+	t.Cleanup(func() { _ = s.Close() })
+
+	return s
+}
+
+// TestIntegration_PostgresSetReturnsRevision pins FC-2's revision contract on
+// the Postgres write path: the first write stores revision 1, a write of a
+// DIFFERENT value advances it, a write of the SAME value does not (the BEFORE
+// UPDATE trigger is gated on OLD.value IS DISTINCT FROM NEW.value and the
+// ON CONFLICT DO UPDATE set-list deliberately omits revision), and both read
+// paths report exactly the number Set reported.
+func TestIntegration_PostgresSetReturnsRevision(t *testing.T) {
+	s := freshStore(t, "rev")
+	ctx := context.Background()
+
+	set := func(value string) int64 {
+		t.Helper()
+
+		rev, err := s.Set(ctx, store.Scope{}, store.Entry{Namespace: "ns", Key: "k", Value: jsonBytes(t, value)})
+		if err != nil {
+			t.Fatalf("set %q: %v", value, err)
+		}
+
+		return rev
+	}
+
+	if got := set("v1"); got != 1 {
+		t.Fatalf("first Set revision = %d, want 1", got)
+	}
+
+	assertRevision(t, s, ctx, 1)
+
+	if got := set("v2"); got != 2 {
+		t.Fatalf("Set of a different value revision = %d, want 2", got)
+	}
+
+	assertRevision(t, s, ctx, 2)
+
+	if got := set("v2"); got != 2 {
+		t.Fatalf("Set of an identical value revision = %d, want 2 (unchanged)", got)
+	}
+
+	assertRevision(t, s, ctx, 2)
+}
+
+// assertRevision checks that Get and the matching List entry both report want.
+func assertRevision(t *testing.T, s store.Store, ctx context.Context, want int64) {
+	t.Helper()
+
+	entry, found, err := s.Get(ctx, store.Scope{}, "ns", "k")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if !found {
+		t.Fatalf("get: not found")
+	}
+
+	if entry.Revision != want {
+		t.Errorf("Get revision = %d, want %d", entry.Revision, want)
+	}
+
+	entries, err := s.List(ctx, store.Scope{})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	for _, e := range entries {
+		if e.Namespace == "ns" && e.Key == "k" {
+			if e.Revision != want {
+				t.Errorf("List revision = %d, want %d", e.Revision, want)
+			}
+
+			return
+		}
+	}
+
+	t.Fatalf("list: entry ns/k not found")
+}
+
+// TestIntegration_PostgresDollarPrefixedStringsStoredVerbatim is the reference
+// behaviour that the MongoDB update pipeline must match: a namespace, key and
+// actor beginning with "$" round-trip byte-identical. Postgres gets this for
+// free — each one travels as a bind parameter and is never interpreted — and
+// the test exists so no future MongoDB fix can "solve" $-prefixed strings by
+// rejecting them.
+func TestIntegration_PostgresDollarPrefixedStringsStoredVerbatim(t *testing.T) {
+	s := freshStore(t, "dollar")
+	ctx := context.Background()
+
+	const (
+		ns    = "$ns"
+		key   = "$key"
+		actor = "$value"
+	)
+
+	if _, err := s.Set(ctx, store.Scope{}, store.Entry{
+		Namespace: ns,
+		Key:       key,
+		Value:     jsonBytes(t, "payload"),
+		UpdatedBy: actor,
+	}); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+
+	entry, found, err := s.Get(ctx, store.Scope{}, ns, key)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if !found {
+		t.Fatalf("get: not found")
+	}
+
+	if entry.Namespace != ns {
+		t.Errorf("namespace = %q, want %q", entry.Namespace, ns)
+	}
+
+	if entry.Key != key {
+		t.Errorf("key = %q, want %q", entry.Key, key)
+	}
+
+	if entry.UpdatedBy != actor {
+		t.Errorf("updated_by = %q, want %q", entry.UpdatedBy, actor)
+	}
+}

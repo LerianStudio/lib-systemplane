@@ -229,7 +229,7 @@ func (s *Store) List(ctx context.Context, scope store.Scope) ([]store.Entry, err
 	defer finish()
 
 	query := fmt.Sprintf( // #nosec G201 -- table validated as a Postgres identifier
-		`SELECT namespace, key, value, updated_at, updated_by FROM %s ORDER BY namespace, key`,
+		`SELECT namespace, key, value, revision, updated_at, updated_by FROM %s ORDER BY namespace, key`,
 		s.cfg.Table,
 	)
 
@@ -246,7 +246,7 @@ func (s *Store) List(ctx context.Context, scope store.Scope) ([]store.Entry, err
 	for rows.Next() {
 		var e store.Entry
 
-		if err := rows.Scan(&e.Namespace, &e.Key, &e.Value, &e.UpdatedAt, &e.UpdatedBy); err != nil {
+		if err := rows.Scan(&e.Namespace, &e.Key, &e.Value, &e.Revision, &e.UpdatedAt, &e.UpdatedBy); err != nil {
 			tracing.HandleSpanError(span, "list scan failed", err)
 
 			return nil, fmt.Errorf("systemplane/postgres: list scan: %w", err)
@@ -282,14 +282,14 @@ func (s *Store) Get(ctx context.Context, scope store.Scope, namespace, key strin
 	defer finish()
 
 	query := fmt.Sprintf( // #nosec G201 -- table validated as a Postgres identifier
-		`SELECT namespace, key, value, updated_at, updated_by FROM %s WHERE namespace = $1 AND key = $2`,
+		`SELECT namespace, key, value, revision, updated_at, updated_by FROM %s WHERE namespace = $1 AND key = $2`,
 		s.cfg.Table,
 	)
 
 	var e store.Entry
 
 	row := db.QueryRowContext(ctx, query, namespace, key)
-	if err := row.Scan(&e.Namespace, &e.Key, &e.Value, &e.UpdatedAt, &e.UpdatedBy); err != nil {
+	if err := row.Scan(&e.Namespace, &e.Key, &e.Value, &e.Revision, &e.UpdatedAt, &e.UpdatedBy); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return store.Entry{}, false, nil
 		}
@@ -302,7 +302,10 @@ func (s *Store) Get(ctx context.Context, scope store.Scope, namespace, key strin
 	return e, true, nil
 }
 
-// Set persists an entry using INSERT ... ON CONFLICT (namespace, key) DO UPDATE.
+// Set persists an entry using INSERT ... ON CONFLICT (namespace, key) DO UPDATE
+// and returns the revision now stored: 1 on insert, one higher than the
+// previous revision when the value changed, and unchanged when the written
+// value is identical to the stored one.
 func (s *Store) Set(ctx context.Context, scope store.Scope, e store.Entry) (int64, error) {
 	if s == nil || s.isClosed() {
 		return 0, store.ErrClosed
@@ -335,17 +338,25 @@ func (s *Store) Set(ctx context.Context, scope store.Scope, e store.Entry) (int6
 		`INSERT INTO %s (namespace, key, value, updated_at, updated_by)
 VALUES ($1, $2, $3, $4, $5)
 ON CONFLICT (namespace, key) DO UPDATE
-SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by`,
+SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by
+RETURNING revision`,
 		s.cfg.Table,
 	)
 
-	if _, err := db.ExecContext(ctx, query, e.Namespace, e.Key, e.Value, e.UpdatedAt, e.UpdatedBy); err != nil {
+	var revision int64
+
+	// revision is deliberately absent from the DO UPDATE set-list: an unlisted
+	// column keeps its stored value, so when systemplane_bump_revision_trigger
+	// declines to fire (identical value) RETURNING reports the revision the row
+	// already had. sql.ErrNoRows is not special-cased — an upsert with RETURNING
+	// always yields a row, so its appearance is a real error and must propagate.
+	if err := db.QueryRowContext(ctx, query, e.Namespace, e.Key, e.Value, e.UpdatedAt, e.UpdatedBy).Scan(&revision); err != nil {
 		tracing.HandleSpanError(span, "set upsert failed", err)
 
 		return 0, fmt.Errorf("systemplane/postgres: set: %w", err)
 	}
 
-	return 0, nil
+	return revision, nil
 }
 
 // Delete removes a single (namespace, key) row. Idempotent.
