@@ -220,3 +220,84 @@ func TestPostgresFeed_CloseRacingConnectionLoss_EmitsNoDisconnect(t *testing.T) 
 		t.Fatalf("beginDisconnect after teardown = (%d subs, ok true), want ok false", len(subs))
 	}
 }
+
+// A subscriber that joins an already-connected feed gets its own OpResync: it
+// missed everything published before it joined, and on the engine's path
+// Subscribe runs after Start has connected, so without this emission the scope
+// would never reconcile.
+//
+// The emission must go through deliverLocked rather than calling fn directly.
+// A callback that panics would otherwise escape through Subscribe to the
+// caller — a path the reader goroutine's recovery never covers — and unwind
+// past the unlock of sub.mu, wedging every later delivery to that
+// subscription. This test pins both halves: Subscribe returns normally after
+// the joining callback panics, and a second delivery to the same subscription
+// still completes.
+func TestPostgresSubscribe_PanickingCallbackDoesNotEscapeOrHoldLock(t *testing.T) {
+	s := newSubscribeStore()
+	f := s.zeroFeed()
+
+	f.beginResync() // mark the feed connected, as a successful LISTEN does
+
+	var (
+		mu     sync.Mutex
+		events []store.Event
+	)
+
+	record := func(evt store.Event) int {
+		mu.Lock()
+		defer mu.Unlock()
+
+		events = append(events, evt)
+
+		return len(events)
+	}
+
+	// Subscribe must return normally; a panic here fails the test by unwinding it.
+	unsub, err := s.Subscribe(context.Background(), store.Scope{}, func(evt store.Event) {
+		if record(evt) == 1 {
+			panic("callback exploded on its joining resync")
+		}
+	})
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	defer unsub()
+
+	mu.Lock()
+	got := append([]store.Event(nil), events...)
+	mu.Unlock()
+
+	if len(got) != 1 {
+		t.Fatalf("callback saw %d events during Subscribe, want 1 (the joining resync)", len(got))
+	}
+
+	if got[0].Op != store.OpResync || got[0].Scope != f.scope {
+		t.Fatalf("joining event = %+v, want {Scope:%+v Op:%q}", got[0], f.scope, store.OpResync)
+	}
+
+	// sub.mu must be free again: a second delivery has to complete rather than
+	// block forever on a mutex the panicking callback unwound past.
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		f.dispatch(s.cfg.Logger, store.Event{Namespace: "ns", Key: "k", Op: store.OpUpsert, Revision: 7})
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second delivery blocked: the panicking joining resync left sub.mu held")
+	}
+
+	mu.Lock()
+	n := len(events)
+	mu.Unlock()
+
+	if n != 2 {
+		t.Fatalf("callback saw %d events, want 2 (joining resync, then the upsert)", n)
+	}
+}

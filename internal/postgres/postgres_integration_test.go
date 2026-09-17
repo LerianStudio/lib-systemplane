@@ -761,3 +761,68 @@ func TestIntegration_PostgresScopedCRUDIsolation(t *testing.T) {
 		t.Errorf("unknown tenant error = %v, want it to name the tenant", err)
 	}
 }
+
+// TestIntegration_PostgresSubscribeAfterStartGetsResyncFirst pins the engine's
+// real sequence: Start connects the zero-scope feed, and only then does the
+// engine subscribe. The joining subscriber must still be told OpResync first —
+// otherwise it would never reconcile and a quiet scope would stay stale
+// forever — and key events from that same connection must arrive after it.
+func TestIntegration_PostgresSubscribeAfterStartGetsResyncFirst(t *testing.T) {
+	s := freshStore(t, "joinresync")
+	ctx := context.Background()
+
+	if err := s.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	// Start returns once LISTEN is installed; the feed marks itself connected
+	// from its reader goroutine a moment later.
+	time.Sleep(500 * time.Millisecond)
+
+	// Buffered: the joining resync is delivered synchronously inside Subscribe.
+	events := make(chan store.Event, 8)
+
+	unsub, err := s.Subscribe(ctx, store.Scope{}, func(evt store.Event) {
+		select {
+		case events <- evt:
+		default:
+		}
+	})
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	defer unsub()
+
+	first := recvEvent(t, events, "joining resync")
+	if first.Op != store.OpResync || first.Scope != (store.Scope{}) {
+		t.Fatalf("first event = %+v, want {Scope:{} Op:%q}", first, store.OpResync)
+	}
+
+	if _, err := s.Set(ctx, store.Scope{}, store.Entry{
+		Namespace: "ns",
+		Key:       "k",
+		Value:     jsonBytes(t, "v1"),
+	}); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+
+	next := recvEvent(t, events, "upsert after the joining resync")
+	if next.Op != store.OpUpsert || next.Namespace != "ns" || next.Key != "k" {
+		t.Fatalf("event after resync = %+v, want an upsert of ns/k", next)
+	}
+}
+
+// recvEvent waits for one changefeed event or fails the test.
+func recvEvent(t *testing.T, events <-chan store.Event, what string) store.Event {
+	t.Helper()
+
+	select {
+	case evt := <-events:
+		return evt
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+
+		return store.Event{}
+	}
+}

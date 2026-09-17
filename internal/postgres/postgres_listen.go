@@ -169,6 +169,13 @@ func (s *Store) zeroFeedLocked() *feed {
 // Subscribe registers fn to be invoked for every change event. The returned
 // unsubscribe func removes fn from the dispatch list.
 //
+// A subscriber that joins an already-connected feed receives its own
+// store.OpResync before any key event: it missed everything published before
+// it joined, and the engine subscribes after Start has already connected, so
+// without it a quiet scope would never reconcile. Joining while the feed is
+// down emits nothing — the scope is legitimately stale, and the next
+// successful (re)connect broadcasts one.
+//
 // In multi-tenant mode, and for any named tenant scope, the method returns
 // store.ErrNotSupportedInMultiTenant — every method resolves a per-call tenant
 // database, so there is no shared process-wide changefeed to attach to.
@@ -188,11 +195,31 @@ func (s *Store) Subscribe(ctx context.Context, scope store.Scope, fn func(store.
 	f := s.zeroFeed()
 	sub := &subscription{fn: fn}
 
+	// sub.mu is taken BEFORE the subscription becomes reachable and released
+	// only when Subscribe returns. The reader goroutine can reach this
+	// subscriber only after seeing it in f.subs, and any such delivery then
+	// blocks here until the joining resync below has returned — so the joining
+	// callback can never observe a key event before its own resync. The defer
+	// is load-bearing on the panicking path: a manual Unlock skipped by an
+	// unwinding callback would leave sub.mu held forever.
+	sub.mu.Lock()
+	defer sub.mu.Unlock()
+
 	f.mu.Lock()
 	f.nextID++
 	id := f.nextID
 	f.subs[id] = sub
+	connected := f.connected
 	f.mu.Unlock()
+
+	// deliverLocked, never sub.fn directly: it puts the joining emission under
+	// the same recovery guard as every reader-goroutine delivery, so a
+	// panicking callback cannot escape through Subscribe to the caller. A
+	// connection lost between the read above and this emission yields one
+	// extra OpResync, which is harmless — a resync is idempotent.
+	if connected {
+		sub.deliverLocked(s.cfg.Logger, store.Event{Scope: f.scope, Op: store.OpResync})
+	}
 
 	var once sync.Once
 
