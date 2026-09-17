@@ -190,6 +190,25 @@ func (f *feed) beginResync() (subs []*subscription, ok bool) {
 	return f.snapshotLocked(), true
 }
 
+// joiningOpLocked reports the marker a subscriber joining right now must be
+// told, or "" when the feed has announced nothing yet and the reader's first
+// announcement will reach this subscriber instead. The caller MUST hold f.mu,
+// in the same hold that adds the subscriber.
+//
+// f.disconnected, not !f.connected: the latter is also true of a feed whose
+// reader has not reached its first resync, and announcing a disconnect there
+// would either double the imminent resync or precede it for no reason.
+func (f *feed) joiningOpLocked() string {
+	switch {
+	case f.connected:
+		return store.OpResync
+	case f.disconnected:
+		return store.OpDisconnect
+	default:
+		return ""
+	}
+}
+
 // deliverLocked runs fn under runtime.RecoverAndLog. The caller MUST already
 // hold sub.mu; deliver is the variant that takes it. Both routes are
 // panic-safe, and every caller unlocks through defer, so a panicking callback
@@ -287,6 +306,15 @@ func (s *Store) acquireFeed(ctx context.Context, scope store.Scope) (*feed, erro
 
 	s.feedsMu.Lock()
 
+	// One shutdown fence for both branches, hoisted above them: a closing store
+	// must not reserve a slot and dial a tenant, which is exactly what the
+	// named branch did while only the zero scope was fenced.
+	if s.closing {
+		s.feedsMu.Unlock()
+
+		return nil, store.ErrClosed
+	}
+
 	if scope.Tenant == "" {
 		f, err := s.zeroFeedLocked()
 		if err != nil {
@@ -360,6 +388,10 @@ func (s *Store) createFeed(ctx context.Context, f *feed) error {
 	// rather than hand pgx a string it cannot dial.
 	if dsn == "" {
 		return s.retractFeed(f, fmt.Errorf("systemplane/postgres: resolve tenant %s DSN: %w", tenant, store.ErrTenantConnectorMissing))
+	}
+
+	if err := refuseSchemaIsolatedDSN(dsn); err != nil {
+		return s.retractFeed(f, fmt.Errorf("systemplane/postgres: tenant %s: %w", tenant, err))
 	}
 
 	f.dsn = dsn
@@ -478,12 +510,18 @@ func (s *Store) releaseFeed(f *feed) {
 // returned unsubscribe func removes fn from the dispatch list, and the last
 // subscriber to leave a tenant scope closes that tenant's LISTEN connection.
 //
-// A subscriber that joins an already-connected feed receives its own
-// store.OpResync before any key event: it missed everything published before
-// it joined, and the engine subscribes after Start has already connected, so
-// without it a quiet scope would never reconcile. Joining while the feed is
-// down emits nothing — the scope is legitimately stale, and the next
-// successful (re)connect broadcasts one.
+// A joining subscriber is told whatever the feed last ANNOUNCED, before any key
+// event. On a connected feed that is its own store.OpResync: it missed
+// everything published before it joined, and the engine subscribes after Start
+// has already connected, so without it a quiet scope would never reconcile. On
+// a feed in an announced outage it is store.OpDisconnect, so the engine marks
+// the scope stale immediately instead of reporting it fresh until the reconnect
+// lands — up to the 30s backoff cap away.
+//
+// A feed that has announced nothing yet — created, not yet through its reader's
+// first resync — emits nothing here: that resync is imminent and this
+// subscriber is already in the map, so it receives that one. Announcing here
+// too would double it.
 //
 // The zero scope in multi-tenant mode returns
 // store.ErrNotSupportedInMultiTenant: every method there resolves a per-call
@@ -530,20 +568,25 @@ func (s *Store) Subscribe(ctx context.Context, scope store.Scope, fn func(store.
 	sub.mu.Lock()
 	defer sub.mu.Unlock()
 
+	// The subscriber is added and the feed's announced state read in ONE hold,
+	// which is what keeps the announcement exactly-once: whichever of this and
+	// the reader's own beginResync/beginDisconnect runs second sees the other's
+	// work, so the joiner is either announced to here or included in the
+	// reader's broadcast, never both and never neither.
 	f.mu.Lock()
 	f.nextID++
 	id := f.nextID
 	f.subs[id] = sub
-	connected := f.connected
+	joining := f.joiningOpLocked()
 	f.mu.Unlock()
 
 	// deliverLocked, never sub.fn directly: it puts the joining emission under
 	// the same recovery guard as every reader-goroutine delivery, so a
 	// panicking callback cannot escape through Subscribe to the caller. A
 	// connection lost between the read above and this emission yields one
-	// extra OpResync, which is harmless — a resync is idempotent.
-	if connected {
-		sub.deliverLocked(s.cfg.Logger, store.Event{Scope: f.scope, Op: store.OpResync})
+	// extra marker, which is harmless — both markers are idempotent.
+	if joining != "" {
+		sub.deliverLocked(s.cfg.Logger, store.Event{Scope: f.scope, Op: joining})
 	}
 
 	// cancelCh stops the ctx observer below. Every teardown action — removing
@@ -714,7 +757,7 @@ func (s *Store) stopFeeds() {
 	waits := make([]<-chan struct{}, 0, len(feeds))
 
 	for _, f := range feeds {
-		if done := signalFeed(f); done != nil {
+		if done := s.signalFeed(f, false); done != nil {
 			waits = append(waits, done)
 		}
 	}
@@ -738,9 +781,17 @@ func (s *Store) stopFeeds() {
 // signalFeed marks the feed closing under f.mu BEFORE closing f.stop, so the
 // reader's beginDisconnect can never announce a disconnect for a shutdown. It
 // returns the channel to wait on, or nil when there is nothing to wait for:
-// the feed was already stopped, it never had a reader, or its reader is inside
-// a callback right now and the caller may BE that goroutine.
-func signalFeed(f *feed) <-chan struct{} {
+// the feed was already stopped, or it never had a reader.
+//
+// skipSelfWait is the self-teardown escape, and ONLY the last-unsubscribe path
+// sets it. A callback can drop its tenant's last subscription from inside the
+// reader's own delivery, and waiting for the reader there is waiting on the
+// goroutine doing the waiting — it can only end at closeTimeout, with the feed
+// frozen meanwhile. f.dispatching cannot tell "the caller IS the reader" from
+// "some other goroutine is mid-callback", so Close never skips on it: a Close
+// that did would return with a live LISTEN connection and a live reader behind
+// it whenever a subscriber happened to be running.
+func (s *Store) signalFeed(f *feed, skipSelfWait bool) <-chan struct{} {
 	f.mu.Lock()
 
 	if f.closing {
@@ -751,14 +802,19 @@ func signalFeed(f *feed) <-chan struct{} {
 
 	f.closing = true
 	done := f.done
-
-	if f.dispatching > 0 {
-		done = nil
-	}
+	selfTeardown := skipSelfWait && f.dispatching > 0
 
 	f.mu.Unlock()
 
 	close(f.stop)
+
+	if selfTeardown {
+		s.logDebug(context.Background(), "changefeed torn down from inside a callback; not waiting for its reader",
+			log.String("tenant", f.scope.Tenant),
+		)
+
+		return nil
+	}
 
 	return done
 }
@@ -767,7 +823,7 @@ func signalFeed(f *feed) <-chan struct{} {
 // exit. Used by the last unsubscribe of a tenant feed; Close signals all of its
 // feeds before waiting on any of them.
 func (s *Store) stopFeed(f *feed) {
-	done := signalFeed(f)
+	done := s.signalFeed(f, true)
 	if done == nil {
 		return
 	}
@@ -850,6 +906,7 @@ func (s *Store) consumeUntilFailure(f *feed, conn *pgx.Conn) {
 		if !ok {
 			s.logWarn(ctx, "failed to decode NOTIFY payload",
 				log.String("payload", truncateString(notification.Payload, 200)),
+				log.String("tenant", f.scope.Tenant),
 			)
 
 			continue

@@ -464,7 +464,7 @@ func TestPostgresFeed_BroadcastMarksTheDispatchWindow(t *testing.T) {
 
 	f.subs[1] = &subscription{fn: func(store.Event) {
 		delivered = true
-		wait = signalFeed(f)
+		wait = s.signalFeed(f, true)
 	}}
 
 	subs, ok := f.beginDisconnect()
@@ -506,18 +506,48 @@ func stalledFeed(tenant string) *feed {
 	return f
 }
 
+// feedSignalled reports whether a teardown reached this feed: closing marked
+// under f.mu and stop closed, the two halves signalFeed performs together.
+func feedSignalled(f *feed) bool {
+	select {
+	case <-f.stop:
+	default:
+		return false
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.closing
+}
+
 // Close must cost ONE closeTimeout no matter how many tenants the store
 // carries. Tearing feeds down one at a time costs tenants x closeTimeout, so
 // six slow tenants overrun the engine's 30s Close budget and, behind it, a
 // Kubernetes termination grace period — the pod is killed mid-shutdown.
+//
+// The assertion is structural rather than a tight stopwatch window: every feed
+// must be signalled and must carry a reader for the shutdown to wait on, and
+// five of them together must still finish well inside the budget a per-feed
+// deadline would spend (5 x closeTimeout). The remaining bound is deliberately
+// loose so a busy machine cannot turn correct behavior into a failure.
 func TestPostgresClose_SlowFeedsShareOneShutdownDeadline(t *testing.T) {
 	shrinkTimeouts(t, 200*time.Millisecond)
 
 	s := newSubscribeStore()
 
+	feeds := map[string]*feed{}
+
+	for _, tenant := range []string{"t1", "t2", "t3", "t4", "t5"} {
+		feeds[tenant] = stalledFeed(tenant)
+	}
+
 	s.feedsMu.Lock()
-	s.feeds["t1"] = stalledFeed("t1")
-	s.feeds["t2"] = stalledFeed("t2")
+
+	for tenant, f := range feeds {
+		s.feeds[tenant] = f
+	}
+
 	s.feedsMu.Unlock()
 
 	start := time.Now()
@@ -528,12 +558,22 @@ func TestPostgresClose_SlowFeedsShareOneShutdownDeadline(t *testing.T) {
 
 	elapsed := time.Since(start)
 
-	if elapsed >= 2*closeTimeout-50*time.Millisecond {
-		t.Fatalf("Close on two stalled feeds took %v; want about one closeTimeout (%v), not one per feed", elapsed, closeTimeout)
+	for tenant, f := range feeds {
+		if !feedSignalled(f) {
+			t.Errorf("feed %q was not signalled by Close", tenant)
+		}
+
+		f.mu.Lock()
+		done := f.done
+		f.mu.Unlock()
+
+		if done == nil {
+			t.Errorf("feed %q carried no reader for Close to wait on; the test no longer proves anything", tenant)
+		}
 	}
 
-	if elapsed < closeTimeout/2 {
-		t.Fatalf("Close on two stalled feeds took %v; it must still wait for the readers up to closeTimeout (%v)", elapsed, closeTimeout)
+	if elapsed >= 3*closeTimeout {
+		t.Fatalf("Close on %d stalled feeds took %v; want one shared closeTimeout (%v), not one per feed", len(feeds), elapsed, closeTimeout)
 	}
 }
 
@@ -643,5 +683,255 @@ func TestPostgresSubscribe_FirstConnectIsBounded(t *testing.T) {
 	// The blackhole is the test's own goroutine; shut it down before asking
 	// whether the STORE left anything behind.
 	stopBlackhole()
+	waitForObserverExit(t)
+}
+
+// A joining subscriber is told whatever the feed last ANNOUNCED, so the engine
+// never reports a scope fresh while its changefeed is down. Joining during an
+// outage used to deliver nothing at all, which left the scope looking current
+// for as long as the backoff took to reconnect — up to 30s.
+//
+// The third state is the one that must stay silent: a feed whose reader has not
+// yet announced anything. Its first OpResync is imminent and this subscriber is
+// already in the map, so it receives that one — announcing here too would
+// double it.
+func TestPostgresSubscribe_JoinerIsToldTheFeedState(t *testing.T) {
+	cases := []struct {
+		name string
+		arm  func(f *feed)
+		want []string
+	}{
+		{
+			name: "connected feed announces a resync",
+			arm:  func(f *feed) { f.beginResync() },
+			want: []string{store.OpResync},
+		},
+		{
+			name: "feed in an announced outage announces a disconnect",
+			arm:  func(f *feed) { f.beginResync(); f.beginDisconnect() },
+			want: []string{store.OpDisconnect},
+		},
+		{
+			name: "feed that has announced nothing yet stays silent",
+			arm:  func(*feed) {},
+			want: nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newSubscribeStore()
+
+			f, err := s.zeroFeed()
+			if err != nil {
+				t.Fatalf("zeroFeed: %v", err)
+			}
+
+			tc.arm(f)
+
+			var got []store.Event
+
+			unsub, subErr := s.Subscribe(context.Background(), store.Scope{}, func(evt store.Event) {
+				got = append(got, evt)
+			})
+			if subErr != nil {
+				t.Fatalf("subscribe: %v", subErr)
+			}
+
+			defer unsub()
+
+			if len(got) != len(tc.want) {
+				t.Fatalf("joining subscriber saw %+v, want %d event(s) %v", got, len(tc.want), tc.want)
+			}
+
+			for i, op := range tc.want {
+				if got[i].Op != op || got[i].Scope != f.scope {
+					t.Fatalf("joining event %d = %+v, want {Scope:%+v Op:%q}", i, got[i], f.scope, op)
+				}
+			}
+		})
+	}
+}
+
+// Close must wait for a feed whose reader is inside a callback. "Some goroutine
+// is mid-callback" is not "the caller IS the reader goroutine": skipping the
+// wait on that signal returns from Close with a live LISTEN connection and a
+// live reader behind it. Only the last-unsubscribe path, which a callback can
+// legitimately reach on the reader's own goroutine, may skip.
+func TestPostgresClose_WaitsForAFeedMidDispatch(t *testing.T) {
+	shrinkTimeouts(t, 200*time.Millisecond)
+
+	s := newSubscribeStore()
+
+	f := stalledFeed("t1")
+
+	f.mu.Lock()
+	f.dispatching = 1
+	f.mu.Unlock()
+
+	s.feedsMu.Lock()
+	s.feeds["t1"] = f
+	s.feedsMu.Unlock()
+
+	start := time.Now()
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	if elapsed := time.Since(start); elapsed < closeTimeout {
+		t.Fatalf("Close returned in %v on a feed whose reader is mid-callback; it must still wait up to closeTimeout (%v) for that reader to exit", elapsed, closeTimeout)
+	}
+}
+
+// A closing store must never open an outbound connection. The named-tenant
+// branch of feed acquisition reserved its slot and dialed the tenant without
+// ever looking at the shutdown flag the zero scope already fenced on.
+func TestPostgresSubscribe_ClosingStoreDialsNoTenant(t *testing.T) {
+	s := newSubscribeStore()
+	s.cfg.MultiTenantEnabled = true
+	s.cfg.Connector = &stubConnector{resolve: func(int) (string, error) { return unreachableDSN, nil }}
+
+	s.feedsMu.Lock()
+	s.closing = true
+	s.feedsMu.Unlock()
+
+	unsub, err := s.Subscribe(context.Background(), store.Scope{Tenant: "t1"}, func(store.Event) {})
+	if err == nil {
+		unsub()
+		t.Fatal("Subscribe on a closing store returned nil; want store.ErrClosed")
+	}
+
+	if !errors.Is(err, store.ErrClosed) {
+		t.Fatalf("Subscribe error = %v, want store.ErrClosed", err)
+	}
+
+	if calls := s.cfg.Connector.(*stubConnector).callCount(); calls != 0 {
+		t.Errorf("a closing store resolved %d tenant DSNs; want 0 — it must not dial", calls)
+	}
+
+	if n := feedCount(s); n != 1 {
+		t.Errorf("feeds map holds %d entries, want only the zero-scope feed", n)
+	}
+}
+
+// FAIL CLOSED on schema-per-tenant isolation. A tenant DSN that pins a
+// search_path means several tenants share ONE database, and NOTIFY is
+// database-wide: every tenant's feed would then receive every other tenant's
+// events stamped with its own scope, and the engine's revision fence would act
+// on them. Refusing costs a tenant its changefeed; accepting corrupts every
+// tenant in that database.
+//
+// unreachableDSN is the discriminator for "nothing was dialed": without the
+// refusal the call reaches pgx.Connect and fails with a connect error instead
+// of the sentinel.
+func TestPostgresSubscribe_SchemaIsolatedDSNIsRefused(t *testing.T) {
+	cases := []struct {
+		name string
+		dsn  string
+	}{
+		{name: "search_path parameter", dsn: unreachableDSN + "&search_path=tenant_a"},
+		{name: "options -c search_path", dsn: unreachableDSN + "&options=-csearch_path%3Dtenant_a"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			conn := &stubConnector{resolve: func(int) (string, error) { return tc.dsn, nil }}
+
+			s, err := New(Config{MultiTenantEnabled: true, Connector: conn})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+
+			unsub, subErr := s.Subscribe(context.Background(), store.Scope{Tenant: "t1"}, func(store.Event) {})
+			if subErr == nil {
+				unsub()
+				t.Fatal("Subscribe with a schema-isolated tenant DSN returned nil; want ErrSchemaIsolationUnsupported")
+			}
+
+			if !errors.Is(subErr, ErrSchemaIsolationUnsupported) {
+				t.Fatalf("Subscribe error = %v, want ErrSchemaIsolationUnsupported", subErr)
+			}
+
+			if !strings.Contains(subErr.Error(), "tenant t1") {
+				t.Errorf("Subscribe error %q must name the tenant", subErr)
+			}
+
+			if n := feedCount(s); n != 0 {
+				t.Errorf("feeds map holds %d entries after a refused DSN, want 0", n)
+			}
+
+			if err := s.Close(); err != nil {
+				t.Fatalf("close: %v", err)
+			}
+
+			waitForObserverExit(t)
+		})
+	}
+}
+
+// The refusal is narrow: a tenant DSN without a search_path still reaches the
+// dialer, which is what makes the sentinel above meaningful.
+func TestPostgresSubscribe_PlainTenantDSNStillDials(t *testing.T) {
+	conn := &stubConnector{resolve: func(int) (string, error) { return unreachableDSN, nil }}
+
+	s, err := New(Config{MultiTenantEnabled: true, Connector: conn})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	unsub, subErr := s.Subscribe(context.Background(), store.Scope{Tenant: "t1"}, func(store.Event) {})
+	if subErr == nil {
+		unsub()
+		t.Fatal("Subscribe to a closed port returned nil; want the dial to fail")
+	}
+
+	if errors.Is(subErr, ErrSchemaIsolationUnsupported) {
+		t.Fatalf("Subscribe error = %v; a DSN without a search_path must not be refused as schema-isolated", subErr)
+	}
+
+	if !strings.Contains(subErr.Error(), "listen connect") {
+		t.Errorf("Subscribe error %q must come from the dialer", subErr)
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	waitForObserverExit(t)
+}
+
+// A nil ctx is a caller bug the store absorbs rather than panics on: the
+// subscription is registered and usable, and it spawns no observer goroutine
+// because there is no Done channel to watch.
+func TestPostgresSubscribe_NilContext(t *testing.T) {
+	s := newSubscribeStore()
+
+	// Passed through a variable so the nil is not a literal: linters flag a
+	// literal nil context, and the point here is exactly that one cannot crash
+	// the store.
+	var nilCtx context.Context
+
+	unsub, err := s.Subscribe(nilCtx, store.Scope{}, func(store.Event) {})
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	if n := subscriberCount(s); n != 1 {
+		t.Fatalf("nil-ctx subscribe registered %d subscribers; want 1", n)
+	}
+
+	// No ctx to observe means no goroutine: assert it before unsubscribing,
+	// while a leaked observer would still be parked.
+	if err := goleak.Find(); err != nil {
+		t.Fatalf("nil-ctx subscribe spawned a goroutine: %v", err)
+	}
+
+	unsub()
+
+	if n := subscriberCount(s); n != 0 {
+		t.Errorf("subscriber map size = %d, want 0 after unsubscribe", n)
+	}
+
 	waitForObserverExit(t)
 }

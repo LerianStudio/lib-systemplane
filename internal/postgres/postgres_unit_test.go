@@ -333,8 +333,6 @@ func (nilHandleConnector) ResolveDSN(context.Context, string) (string, error) {
 // A connector that returns a nil handle with a nil error is refused at
 // resolution time rather than passed through to panic on the first query.
 func TestStore_NamedTenantScopeNilHandleIsRefused(t *testing.T) {
-	t.Parallel()
-
 	s, err := New(Config{MultiTenantEnabled: true, Connector: nilHandleConnector{}})
 	if err != nil {
 		t.Fatalf("New: %v", err)

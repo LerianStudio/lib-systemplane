@@ -28,6 +28,15 @@
 // schema: no statement this package issues names the revision sequence, and
 // the trigger that advances it is SECURITY DEFINER, so the runtime role needs
 // no grant on it either.
+//
+// # Connection budget
+//
+// Every ACTIVE tenant costs one extra Postgres backend per replica: its
+// changefeed holds a dedicated LISTEN connection that lives outside the
+// tenant-manager pool and is not shared with reads or writes. The budget is
+// therefore active tenants x replicas, on top of whatever the pools hold, and
+// max_connections on each tenant database must be sized against it. A tenant
+// releases its backend when its last subscriber leaves.
 package postgres
 
 import (
@@ -180,6 +189,13 @@ func (s *Store) Start(ctx context.Context) error {
 }
 
 // Close releases backend resources. Idempotent.
+//
+// It signals every changefeed and then waits for their readers under ONE
+// shared closeTimeout, so shutdown costs a single bound no matter how many
+// tenants the store carries. Called from INSIDE a subscriber callback it costs
+// exactly that bound: the reader it is waiting for is the goroutine running
+// the caller, so the wait can only end at the deadline. Close still returns,
+// and the feeds are still torn down.
 func (s *Store) Close() error {
 	if s == nil {
 		return nil
