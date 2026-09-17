@@ -294,7 +294,7 @@ func TestListen_ApplyEvent_DispatchesDeleteCallback(t *testing.T) {
 		gotValue atomic.Value
 	)
 
-	cb := func(_ context.Context, _, ns, key string, _ int64, newValue any) {
+	cb := func(_ context.Context, _, ns, key string, _ int64, _ bool, newValue any) {
 		gotNS.Store(ns)
 		gotKey.Store(key)
 		if newValue == nil {
@@ -407,7 +407,7 @@ func TestListen_ApplyEvent_UpsertSuccess_UpdatesCacheAndDispatches(t *testing.T)
 
 	var dispatched, dispatchedTenant atomic.Value
 
-	unsub := m.RegisterCallback("a", "k", func(_ context.Context, tenantID, _, _ string, _ int64, v any) {
+	unsub := m.RegisterCallback("a", "k", func(_ context.Context, tenantID, _, _ string, _ int64, _ bool, v any) {
 		dispatchedTenant.Store(tenantID)
 		dispatched.Store(fmt.Sprintf("%v", v))
 	})

@@ -73,6 +73,10 @@ func TestMT_WithManager_OnChangeRegistersAndUnsubscribes(t *testing.T) {
 
 	c := newMultiTenantClient(t, newMemStore(true))
 
+	if err := c.Register("ns", "k", "default"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
 	mgr := manager.New(nil)
 	c.BindManager(mgr)
 
@@ -131,8 +135,6 @@ func TestBackwardCompat_ST_Get_BypassesManager(t *testing.T) {
 // Manager observes a distinct Change.Tenant for every tenant whose row
 // changed, so a consumer can tell two tenants' deliveries apart.
 func TestMT_ManagerCallback_CarriesTenant(t *testing.T) {
-	t.Parallel()
-
 	c := newMultiTenantClient(t, newMemStore(true))
 
 	if err := c.Register("ns", "k", "default"); err != nil {
@@ -145,8 +147,8 @@ func TestMT_ManagerCallback_CarriesTenant(t *testing.T) {
 		got = append(got, ch)
 	})
 
-	cb(context.Background(), "t1", "ns", "k", 7, "v1")
-	cb(context.Background(), "t2", "ns", "k", 9, "v2")
+	cb(context.Background(), "t1", "ns", "k", 7, false, "v1")
+	cb(context.Background(), "t2", "ns", "k", 9, false, "v2")
 
 	if len(got) != 2 {
 		t.Fatalf("got %d changes, want 2", len(got))
@@ -168,8 +170,6 @@ func TestMT_ManagerCallback_CarriesTenant(t *testing.T) {
 // TestMT_ManagerCallback_DeleteDeliversDefault pins FC-4: a delete publishes
 // the registered default, never a nil value.
 func TestMT_ManagerCallback_DeleteDeliversDefault(t *testing.T) {
-	t.Parallel()
-
 	c := newMultiTenantClient(t, newMemStore(true))
 
 	if err := c.Register("ns", "k", "default"); err != nil {
@@ -182,7 +182,7 @@ func TestMT_ManagerCallback_DeleteDeliversDefault(t *testing.T) {
 		got = ch
 	})
 
-	cb(context.Background(), "t1", "ns", "k", 0, nil)
+	cb(context.Background(), "t1", "ns", "k", 0, true, nil)
 
 	if got.Value != "default" {
 		t.Errorf("delete delivered %v, want the registered default", got.Value)
@@ -193,13 +193,36 @@ func TestMT_ManagerCallback_DeleteDeliversDefault(t *testing.T) {
 	}
 }
 
+// TestMT_ManagerCallback_UpsertOfNullDeliversNil pins that the registered
+// default stands in for a delete ONLY. An upsert whose stored JSON decodes to
+// null must reach the subscriber as nil: substituting the default there would
+// report a key deliberately set to null as "no row, default in force", and a
+// subscriber could never tell the two apart.
+func TestMT_ManagerCallback_UpsertOfNullDeliversNil(t *testing.T) {
+	c := newMultiTenantClient(t, newMemStore(true))
+
+	if err := c.Register("ns", "k", "default"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	var got Change
+
+	cb := c.managerCallback(func(_ context.Context, ch Change) {
+		got = ch
+	})
+
+	cb(context.Background(), "t1", "ns", "k", 4, false, nil)
+
+	if got.Value != nil {
+		t.Errorf("upsert of a null value delivered %v, want nil", got.Value)
+	}
+}
+
 // TestMT_ManagerCallback_ClonesValue pins FC-4's "the receiver owns this
 // copy": a subscriber that mutates the delivered Change.Value must not reach
 // the Manager's live cached object, nor the registered default that every
 // later delete republishes.
 func TestMT_ManagerCallback_ClonesValue(t *testing.T) {
-	t.Parallel()
-
 	c := newMultiTenantClient(t, newMemStore(true))
 
 	if err := c.Register("ns", "k", map[string]any{"limit": 1}); err != nil {
@@ -223,7 +246,7 @@ func TestMT_ManagerCallback_ClonesValue(t *testing.T) {
 	// Upsert: the map the Manager holds in its cache must survive the
 	// subscriber's mutation.
 	cached := map[string]any{"limit": 1}
-	cb(context.Background(), "t1", "ns", "k", 7, cached)
+	cb(context.Background(), "t1", "ns", "k", 7, false, cached)
 
 	if cached["limit"] != 1 {
 		t.Errorf("subscriber mutation reached the cached map: limit = %v, want 1", cached["limit"])
@@ -231,8 +254,8 @@ func TestMT_ManagerCallback_ClonesValue(t *testing.T) {
 
 	// Delete publishes the registered default; mutating one delivery must not
 	// corrupt the default handed to the next one.
-	cb(context.Background(), "t1", "ns", "k", 0, nil)
-	cb(context.Background(), "t2", "ns", "k", 0, nil)
+	cb(context.Background(), "t1", "ns", "k", 0, true, nil)
+	cb(context.Background(), "t2", "ns", "k", 0, true, nil)
 
 	want := []any{1, 1, 1}
 	if len(observed) != len(want) {

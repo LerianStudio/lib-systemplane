@@ -89,7 +89,7 @@ func TestRegisterCallback_StoresAndUnsubscribes(t *testing.T) {
 	m := manager.New(nil)
 
 	called := 0
-	cb := func(_ context.Context, _, _, _ string, _ int64, _ any) {
+	cb := func(_ context.Context, _, _, _ string, _ int64, _ bool, _ any) {
 		called++
 	}
 

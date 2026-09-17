@@ -66,7 +66,7 @@ func TestApplyEvent_Delete_RemovesFromCacheAndFiresCallback(t *testing.T) {
 		gotTenant string
 	)
 
-	unsub := m.RegisterCallback("ns", "k", func(_ context.Context, tenantID, _, _ string, _ int64, newValue any) {
+	unsub := m.RegisterCallback("ns", "k", func(_ context.Context, tenantID, _, _ string, _ int64, _ bool, newValue any) {
 		fired = true
 		gotTenant = tenantID
 

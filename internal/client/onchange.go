@@ -3,13 +3,17 @@ package client
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
-	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/manager"
 )
 
 // OnChange registers a callback for backend-observed value changes.
+//
+// OnChange returns ErrUnknownKey for a key that was not registered: such a
+// subscription could never deliver anything, so refusing it surfaces the typo
+// instead of hiding it behind a callback that never fires.
 //
 // In single-tenant mode the callback fires whenever the changefeed echo for
 // (namespace, key) arrives.
@@ -22,11 +26,25 @@ import (
 // the Manager's per-tenant LISTEN dispatcher. It fires once per NOTIFY
 // observed across any active tenant's LISTEN goroutine; Change.Tenant names
 // the tenant whose row changed and a delete delivers the registered default.
+//
+// In this wave-1 shim the Manager path reports Change.Revision == 0 on every
+// delivery, upsert or delete, because the NOTIFY payload carries no revision
+// until the storage lane lands.
 func (c *Client) OnChange(namespace, key string, fn func(ctx context.Context, ch Change)) (func(), error) {
 	noop := func() {}
 
 	if c == nil || c.closed.Load() {
 		return noop, ErrClosed
+	}
+
+	nk := nskey{Namespace: namespace, Key: key}
+
+	c.registryMu.RLock()
+	_, registered := c.registry[nk]
+	c.registryMu.RUnlock()
+
+	if !registered {
+		return noop, fmt.Errorf("%w: %s/%s", ErrUnknownKey, namespace, key)
 	}
 
 	if c.multiTenant {
@@ -48,21 +66,6 @@ func (c *Client) OnChange(namespace, key string, fn func(ctx context.Context, ch
 	}
 
 	if fn == nil {
-		return noop, nil
-	}
-
-	nk := nskey{Namespace: namespace, Key: key}
-
-	c.registryMu.RLock()
-	_, registered := c.registry[nk]
-	c.registryMu.RUnlock()
-
-	if !registered {
-		c.logDebug(context.Background(), "OnChange called for unregistered key, returning no-op",
-			log.String("namespace", namespace),
-			log.String("key", key),
-		)
-
 		return noop, nil
 	}
 
@@ -101,12 +104,13 @@ func (c *Client) OnChange(namespace, key string, fn func(ctx context.Context, ch
 }
 
 // managerCallback adapts a subscriber to the Manager dispatch signature. The
-// Manager dispatches a nil value on delete; FC-4 publishes the registered
-// default in its place, and the value is cloned so each subscriber owns its
-// copy.
+// Manager flags a delete; FC-4 publishes the registered default in its place,
+// and the value is cloned so each subscriber owns its copy. An upsert is
+// delivered as it decoded, nil included, so a key stored as null stays
+// distinguishable from a deleted one.
 func (c *Client) managerCallback(fn func(ctx context.Context, ch Change)) manager.Callback {
-	return func(ctx context.Context, tenantID, ns, k string, revision int64, newValue any) {
-		if newValue == nil {
+	return func(ctx context.Context, tenantID, ns, k string, revision int64, isDelete bool, newValue any) {
+		if isDelete {
 			c.registryMu.RLock()
 			def, registered := c.registry[nskey{Namespace: ns, Key: k}]
 			c.registryMu.RUnlock()

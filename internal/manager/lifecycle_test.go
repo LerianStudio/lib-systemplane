@@ -141,12 +141,12 @@ func TestRegisterCallback_DispatchesAfterDispatchCall(t *testing.T) {
 
 	var received any
 
-	unsub := m.RegisterCallback("ns", "k", func(_ context.Context, _, _, _ string, _ int64, newValue any) {
+	unsub := m.RegisterCallback("ns", "k", func(_ context.Context, _, _, _ string, _ int64, _ bool, newValue any) {
 		received = newValue
 	})
 	defer unsub()
 
-	m.dispatchCallbacks(context.Background(), "", "ns", "k", 0, "hello")
+	m.dispatchCallbacks(context.Background(), "", "ns", "k", 0, false, "hello")
 
 	if received != "hello" {
 		t.Fatalf("callback received %v, want hello", received)
@@ -160,17 +160,17 @@ func TestRegisterCallback_MultipleCallbacksFire(t *testing.T) {
 
 	called := make(map[int]bool)
 
-	unsub1 := m.RegisterCallback("ns", "k", func(_ context.Context, _, _, _ string, _ int64, _ any) {
+	unsub1 := m.RegisterCallback("ns", "k", func(_ context.Context, _, _, _ string, _ int64, _ bool, _ any) {
 		called[1] = true
 	})
-	unsub2 := m.RegisterCallback("ns", "k", func(_ context.Context, _, _, _ string, _ int64, _ any) {
+	unsub2 := m.RegisterCallback("ns", "k", func(_ context.Context, _, _, _ string, _ int64, _ bool, _ any) {
 		called[2] = true
 	})
 
 	defer unsub1()
 	defer unsub2()
 
-	m.dispatchCallbacks(context.Background(), "", "ns", "k", 0, "v")
+	m.dispatchCallbacks(context.Background(), "", "ns", "k", 0, false, "v")
 
 	if !called[1] || !called[2] {
 		t.Fatalf("expected both callbacks to fire: called=%v", called)
@@ -184,14 +184,14 @@ func TestRegisterCallback_PanicDoesNotBreakDispatch(t *testing.T) {
 
 	good := false
 
-	_ = m.RegisterCallback("ns", "k", func(_ context.Context, _, _, _ string, _ int64, _ any) {
+	_ = m.RegisterCallback("ns", "k", func(_ context.Context, _, _, _ string, _ int64, _ bool, _ any) {
 		panic("intentional")
 	})
-	_ = m.RegisterCallback("ns", "k", func(_ context.Context, _, _, _ string, _ int64, _ any) {
+	_ = m.RegisterCallback("ns", "k", func(_ context.Context, _, _, _ string, _ int64, _ bool, _ any) {
 		good = true
 	})
 
-	m.dispatchCallbacks(context.Background(), "", "ns", "k", 0, "v")
+	m.dispatchCallbacks(context.Background(), "", "ns", "k", 0, false, "v")
 
 	if !good {
 		t.Fatal("dispatch must continue past a panicking callback")
@@ -268,14 +268,14 @@ func TestNotifyEvent_FlowsToCallbackOnDispatchCall(t *testing.T) {
 
 	var seen string
 
-	unsub := m.RegisterCallback("ns", "k", func(_ context.Context, _, _, _ string, _ int64, newValue any) {
+	unsub := m.RegisterCallback("ns", "k", func(_ context.Context, _, _, _ string, _ int64, _ bool, newValue any) {
 		if s, ok := newValue.(string); ok {
 			seen = s
 		}
 	})
 	defer unsub()
 
-	m.dispatchCallbacks(context.Background(), "", "ns", "k", 0, "fresh")
+	m.dispatchCallbacks(context.Background(), "", "ns", "k", 0, false, "fresh")
 
 	if seen != "fresh" {
 		t.Fatalf("expected callback to see fresh, got %q", seen)

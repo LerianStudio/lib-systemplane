@@ -24,7 +24,7 @@ func (m *Manager) applyEvent(ctx context.Context, tenantID string, ts *tenantSta
 		m.metrics.recordCacheEntries(ctx, tenantID, count)
 		// Revision is 0 for a delete, and the NOTIFY payload does not carry
 		// one yet; the storage lane adds it.
-		m.dispatchCallbacks(ctx, tenantID, evt.Namespace, evt.Key, 0, nil)
+		m.dispatchCallbacks(ctx, tenantID, evt.Namespace, evt.Key, 0, true, nil)
 
 	case "upsert":
 		// Read the fresh value from the tenant DB so the cache reflects the
@@ -73,14 +73,14 @@ func (m *Manager) applyEvent(ctx context.Context, tenantID string, ts *tenantSta
 		ts.mu.Unlock()
 
 		m.metrics.recordCacheEntries(ctx, tenantID, count)
-		m.dispatchCallbacks(ctx, tenantID, evt.Namespace, evt.Key, 0, value)
+		m.dispatchCallbacks(ctx, tenantID, evt.Namespace, evt.Key, 0, false, value)
 	}
 }
 
 // dispatchCallbacks fans out a value change to every registered OnChange
 // callback for (namespace, key). Each callback runs synchronously with
 // panic recovery; one bad callback cannot stall the LISTEN goroutine.
-func (m *Manager) dispatchCallbacks(ctx context.Context, tenantID, namespace, key string, revision int64, newValue any) {
+func (m *Manager) dispatchCallbacks(ctx context.Context, tenantID, namespace, key string, revision int64, isDelete bool, newValue any) {
 	cbs := m.snapshotCallbacks(namespace, key)
 	if len(cbs) == 0 {
 		return
@@ -90,7 +90,7 @@ func (m *Manager) dispatchCallbacks(ctx context.Context, tenantID, namespace, ke
 		func() {
 			defer libRuntime.RecoverAndLog(m.logger, "systemplane.manager.onchange")
 
-			cb(ctx, tenantID, namespace, key, revision, newValue)
+			cb(ctx, tenantID, namespace, key, revision, isDelete, newValue)
 		}()
 	}
 }
