@@ -18,7 +18,7 @@ type Connector interface {
 // ErrPgMgrUnavailable is returned when a connector resolves a tenant without
 // a bound tenant-manager Postgres Manager. Surfaces typically in tests that
 // constructed the connector with a nil manager.
-var ErrPgMgrUnavailable = errors.New("systemplane/manager: tenant-manager postgres manager is not configured")
+var ErrPgMgrUnavailable = errors.New("systemplane/postgres: tenant-manager postgres manager is not configured")
 
 // NewTenantManagerConnector wraps a lib-commons tenant-manager Postgres Manager.
 func NewTenantManagerConnector(mgr *tmpostgres.Manager) Connector {

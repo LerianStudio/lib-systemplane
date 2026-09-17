@@ -702,7 +702,7 @@ func record(declared map[string]declaration, file *ast.File) {
 // It cannot be derived from the import path. The path ends in the major-version
 // suffix (.../lib-systemplane/v4), and the directory above it is
 // "lib-systemplane" while the package is "systemplane" — so the usual
-// last-path-element rule yields "v3", which matches no declaration and would
+// last-path-element rule yields "v4", which matches no declaration and would
 // make every root type referenced from admin/ silently unresolvable.
 const rootPackageName = "systemplane"
 

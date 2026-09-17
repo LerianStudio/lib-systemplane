@@ -105,9 +105,10 @@ func TestNew_WiresTenantManagerConnector(t *testing.T) {
 	// Pin the constructor's pgMgr→connector wiring: New(pgMgr) MUST install a
 	// tenant-manager connector that talks to the supplied manager. Confirms a
 	// real production path (not a SetConnector test seam) is exercised
-	// end-to-end without needing a live tenant-manager. The connector's
-	// concrete type lives in internal/postgres and is asserted there; here we
-	// assert the behaviour it gives the Manager.
+	// end-to-end without needing a live tenant-manager. That the connector
+	// wraps the manager it was handed is asserted by
+	// TestNewTenantManagerConnector_WrapsSuppliedManager in internal/postgres;
+	// here we assert the behaviour it gives the Manager.
 	pg := tmpostgres.NewManager(nil, "systemplane.manager.test")
 	m := New(pg)
 

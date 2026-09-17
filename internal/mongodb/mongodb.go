@@ -195,8 +195,8 @@ func (s *Store) DroppedEvents() int64 {
 
 // resolveCollection returns the collection handle for the current call.
 func (s *Store) resolveCollection(ctx context.Context, scope store.Scope) (*mongo.Collection, error) {
-	// MongoDB has no tenant connector and never gets one: a named tenant has
-	// no database to resolve to.
+	// MongoDB has no tenant connector yet; the storage lane adds one per
+	// FC-3. Until then a named tenant is refused.
 	if scope.Tenant != "" {
 		return nil, store.ErrTenantConnectorMissing
 	}

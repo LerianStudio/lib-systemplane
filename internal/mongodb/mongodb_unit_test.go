@@ -219,8 +219,8 @@ func TestIsNamespaceExists(t *testing.T) {
 	}
 }
 
-// MongoDB never gets a tenant connector: a named tenant is refused outright,
-// and its changefeed has no per-tenant form.
+// MongoDB has no tenant connector yet; the storage lane adds one per FC-3.
+// Until then a named tenant is refused.
 func TestStore_NamedTenantScopeIsRefused(t *testing.T) {
 	t.Parallel()
 
