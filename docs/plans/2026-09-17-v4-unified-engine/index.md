@@ -7,7 +7,7 @@
 
 **Goal:** Ship lib-systemplane v4: one convergent, validated, tenant-aware runtime-config engine behind a typed-group API, so a consumer declares a config group once and gets hot reload without writing its own cache repair, event identification, or DDL tooling.
 
-**Architecture:** Today the library carries two engines that implement the same policy twice: the single-tenant `Client` (cache + LISTEN + hydrate/refresh) and the multi-tenant `Manager` (per-tenant cache + per-tenant LISTEN + warm-load/refresh). Every P0/P1 in the 2026-09-17 audit is the same defect present in one engine and fixed in the other. v4 collapses them into one engine (`internal/engine`) that tracks N scopes (single-tenant = one scope with empty tenant), reads every value through a single `decode → validate → publish` ingress, reconciles a scope from the store whenever its changefeed (re)connects, dispatches callbacks off the changefeed goroutine through a per-scope coalescing queue, and stamps every published value with a store revision. The `Store` interface gains `Scope` and `Revision`; Postgres and MongoDB implement them; a typed `Group[T]` API sits on top of the per-key facade. Backends keep their own SQL/BSON and transport.
+**Architecture:** Today the library carries two engines that implement the same policy twice: the single-tenant `Client` (cache + LISTEN + hydrate/refresh) and the multi-tenant `Manager` (per-tenant cache + per-tenant LISTEN + warm-load/refresh). Every P0/P1 in the 2026-09-17 audit is the same defect present in one engine and fixed in the other. v4 collapses them into one engine (`internal/engine`) that tracks N scopes (single-tenant = one scope with empty tenant), reads every value through a single `decode → validate → publish` ingress, reconciles a scope from the store whenever its changefeed (re)connects, dispatches callbacks off the changefeed goroutine through one coalescing queue per (scope, key), so a slow subscriber of one key never delays another key, and stamps every published value with a store revision. The `Store` interface gains `Scope` and `Revision`; Postgres and MongoDB implement them; a typed `Group[T]` API sits on top of the per-key facade. Backends keep their own SQL/BSON and transport.
 
 **Tech Stack:** Go 1.26 (generics), pgx/v5 LISTEN/NOTIFY, mongo-driver/v2 change streams, lib-commons/v7 tenant-manager, lib-observability/v4 (internal only), testcontainers for integration tests, semantic-release with manual major cut.
 
@@ -17,14 +17,14 @@
 
 - **D1 — One engine, not two.** `internal/manager` is deleted. `internal/client` keeps registry, options, catalog, redaction, value cloning and the facade adapter; cache, hydrate, refresh, subscribe and dispatch move to `internal/engine`. Root `Manager`, `NewManager`, `OnTenant*`, `Drain`, `IsClosed` are removed; `HandleTenantLifecycle` moves onto `Client`. Verified defects this closes in one place: no resync after reconnect (Postgres ST, Manager MT, Mongo re-open); `staleAfter` counter counts drops not retries so a hard outage never marks stale; warm-load before LISTEN; listener-open failure leaves a fresh-looking cache; validator skipped on hydrate/refresh/warm-load/per-request read; callback receives no tenant; delete publishes default in ST and `nil` in MT; MT callback runs on the LISTEN goroutine and receives the live cached object (data race); NOTIFY whose re-read finds no row drops the callback; `BindManager` accepts a Mongo client.
 - **D2 — Convergence by reconciliation, not by trusting the feed.** Every `Store.Subscribe` emits `OpResync` after each (re)connect. The engine answers `OpResync` with `List(scope)` and republishes every registered key whose revision differs. Until the first reconcile completes, and whenever the feed is down, the scope is `Stale`; reads keep serving the last published value (never block, never erase), and `Entry.Stale` / `Snapshot.Stale` expose it. No resume tokens (reconcile covers the gap).
-- **D3 — Revision is the identity of a published value.** Postgres gains a `revision BIGINT` column bumped by a BEFORE UPDATE trigger when `value` changes; NOTIFY carries it; MongoDB `$inc`s a `revision` field. Revision 0 means "no row: registered default in force". Same revision seen twice = no callback. No compare-and-set in v4.0 (additive later: `If-Match` on admin PUT).
+- **D3 — Revision is the identity of a published value.** Postgres gains a `revision BIGINT` column bumped by a BEFORE UPDATE trigger when `value` changes; NOTIFY carries it; MongoDB `$inc`s a `revision` field. Revision 0 means "no row: registered default in force". Same revision seen twice = no callback, but the re-read still refreshes the cached `updated_at` / `updated_by` so `GetEntry` provenance never lags the row. No compare-and-set in v4.0 (additive later: `If-Match` on admin PUT).
 - **D4 — Read-your-writes in every mode.** `Set` publishes to the caller's scope cache with the revision the store returned before returning; the feed echo dedupes by revision.
 - **D5 — Typed groups are one key each.** `Bind[T]` registers `(namespace, key)` whose value is the JSON document of `T`. Atomicity of a group = atomicity of one row. No cross-key transactions.
 - **D6 — Multi-tenant is Postgres only; MongoDB is single-tenant only.** `NewMongoDB` with `WithMultiTenantEnabled()` returns an error at construction. Zero consumers use the MongoDB backend today; MongoDB stays because the unified engine makes it nearly free, and Fred may delete it instead (open option, not blocking).
-- **D7 — Tenant activation: lazy on first read, plus lifecycle events.** With `WithTenantManager(pgMgr)`, the first read for tenant X activates its scope (resolve DSN via connector, subscribe, reconcile). `Client.HandleTenantLifecycle` keeps handling suspended/deleted/credentials-rotated (and activated, idempotently). Consumers no longer copy a `systemplane_lifecycle.go`.
-- **D8 — Canonical names only.** `WithTable`, `WithListenChannel`, `WithCollection` are removed (`systemplane_entries` / `systemplane_changes`). `DefaultSeedSQL()` and `ddl/default_seed.sql` are removed: defaults live in code; consumers who want persisted overrides write their own migration. Known breakage: billing-worker and plugin-br-pix-jd call `WithListenChannel`; billing-worker, plugin-br-pix-jd and finance-hub have DDL generators built on `DefaultSeedSQL()`. All three are on v1/v2 and migrate anyway; `MIGRATION-v4.md` names each.
+- **D7 — Tenant activation: lazy on first read, plus lifecycle events.** With `WithTenantManager(pgMgr)`, the first read for tenant X activates its scope (resolve DSN via connector, subscribe, reconcile). `Client.HandleTenantLifecycle` keeps handling suspended/deleted/credentials-rotated (and activated, idempotently). Suspended and Deleted drop the scope AND leave a `blocked` marker for that tenant: a read for a blocked tenant never re-activates it (it falls through to the per-request path, which the tenant-manager itself refuses for a suspended tenant); only an Activated event clears the marker. A failed activation leaves no marker and is retried on the next read. Consumers no longer copy a `systemplane_lifecycle.go`.
+- **D8 — Canonical names only.** `WithTable`, `WithListenChannel`, `WithCollection` are removed (`systemplane_entries` / `systemplane_changes`). `DefaultSeedSQL()` and `ddl/default_seed.sql` are removed: defaults live in code; consumers who want persisted overrides write their own migration. Known breakage: billing-worker and plugin-br-pix-jd call `WithListenChannel`; billing-worker, plugin-br-pix-jd and finance-hub have DDL generators built on `DefaultSeedSQL()`. billing-worker (v2.0.0) and finance-hub (v1.6.0) migrate majors anyway; plugin-br-pix-jd is on v3.0.0 and takes the v4 hop like everyone else; `MIGRATION-v4.md` names each.
 - **D9 — Facade kept for the per-key API.** `Register`, `Get*`, `Set`, `Delete`, `List`, `Catalog*`, `OnChange` (new signature), `KeyDescription`, `KeyRedaction`, `IsRegistered`, `Logger`, `NewForTesting` stay. Admin HTTP keeps its four routes.
-- **D10 — `Close` replaces `Drain`.** `Client.Close()` keeps its signature: it cancels every scope's feed, lets in-flight deliveries observe ctx cancellation, waits for dispatch workers to exit, and returns once no goroutine is left. Callers who need a bound wrap it in their own timeout.
+- **D10 — `Close` replaces `Drain`.** `Client.Close()` keeps its signature: it cancels every scope's feed and the ctx handed to every in-flight callback, then waits for dispatch workers to exit up to a bound (`WithCloseTimeout`, default 30s). Cancellation is cooperative: a callback that honors ctx ends and Close returns nil with no goroutine left; a callback that ignores ctx makes Close return `ErrCloseTimeout` naming the (scope, key) still running, and that goroutine is the subscriber's leak, made visible rather than hidden.
 
 ## Consumer matrix (2026-09-17)
 
@@ -182,7 +182,10 @@ type Change struct {
 }
 
 // OnChange fires fn for every published revision of (namespace, key) in every
-// scope the Client tracks, serialized per scope, off the changefeed goroutine.
+// scope the Client tracks, off the changefeed goroutine. Deliveries are
+// serialized per (scope, key): two revisions of the same key in the same scope
+// arrive in order, one at a time; different keys deliver independently, so a
+// blocked subscriber of key A never delays key B.
 // The same non-zero revision is never delivered twice to the same subscriber
 // (Revision 0 means unknown and is never deduplicated). A delete publishes
 // the registered default with Revision 0.
@@ -204,7 +207,9 @@ type Entry struct {
 }
 
 // GetEntry resolves the caller's scope like Get. ok is false for an
-// unregistered key.
+// unregistered key. Revision, UpdatedAt and UpdatedBy describe the persisted
+// row backing the cached value; only the wave-1 shim may report zeros for a
+// cached row, and engine-core removes that limitation.
 func (c *Client) GetEntry(ctx context.Context, namespace, key string) (e Entry, ok bool, err error)
 ```
 
@@ -219,9 +224,11 @@ func WithTenantManager(mgr *tmpostgres.Manager) Option
 
 // HandleTenantLifecycle has the tmevent.EventHandler signature so it can be
 // registered directly with the tenant-manager event dispatcher. Activated is
-// idempotent (lazy activation on first read already covers it); Suspended and
-// Deleted drop the scope; CredentialsRotated drops and re-activates. Errors
-// are returned, not swallowed; the engine retries activation on the next read.
+// idempotent (lazy activation on first read already covers it) and clears a
+// blocked marker; Suspended and Deleted drop the scope and mark the tenant
+// blocked, so no read re-activates it until the next Activated;
+// CredentialsRotated drops and re-activates. Errors are returned, not
+// swallowed; a FAILED activation (no marker) is retried on the next read.
 func (c *Client) HandleTenantLifecycle(ctx context.Context, event tmevent.TenantLifecycleEvent) error
 ```
 
@@ -259,7 +266,8 @@ type Applied[T any] struct {
 // scope the Client already tracks, so no revision can fall between the
 // initial delivery and the subscription; the same non-zero revision is never
 // delivered twice (Revision 0 is never deduplicated). Later revisions arrive
-// serialized per scope. fn returning an error records that revision as rejected for the
+// serialized per scope of this group (a group is one key, so this is the
+// per-(scope, key) rule of FC-4). fn returning an error records that revision as rejected for the
 // scope (visible in Status) and keeps the previously applied revision as
 // current; the engine does not retry. Before Start, OnApply registers and the
 // initial delivery happens during Start.
@@ -351,7 +359,7 @@ Document `_id` stays `{namespace, key}`. Top-level fields: `namespace`, `key`, `
 
 `NewPostgres(db *sql.DB, listenDSN string, opts ...Option)`, `NewMongoDB(client *mongo.Client, database string, opts ...Option)`, `NewForTesting`, `Register`, `Start`, `Close`, `Get`, `GetString`, `GetInt`, `GetBool`, `GetFloat64`, `GetDuration`, `Set`, `Delete`, `List`, `Catalog`, `CatalogKey`, `CatalogService`, `KeyDescription`, `KeyRedaction`, `IsRegistered`, `Logger`, key options `WithDescription`, `WithValidator`, `WithRedaction`, `WithCatalogMetadata`, client options `WithLogger`, `WithTelemetry`, `WithDebounce`, `WithPollInterval`, `WithMultiTenantEnabled`, `WithModule`, `WithCatalogService`. `admin.Mount` / `admin.MountCatalog` and their options unchanged.
 
-Removed in v4: `Manager`, `ManagerOption`, `NewManager`, `WithManagerLogger`, `WithManagerTelemetry`, `WithManagerAggregateTenantThreshold`, `(*Manager).*`, `WithTable`, `WithListenChannel`, `WithCollection`, `DefaultSeedSQL`. Replacement for the aggregate threshold: `WithAggregateTenantThreshold(n int) Option` on the Client (engine-tenants lane).
+Removed in v4: `Manager`, `ManagerOption`, `NewManager`, `WithManagerLogger`, `WithManagerTelemetry`, `WithManagerAggregateTenantThreshold`, `(*Manager).*`, `WithTable`, `WithListenChannel`, `WithCollection`, `DefaultSeedSQL`. Replacement for the aggregate threshold: `WithAggregateTenantThreshold(n int) Option` on the Client (engine-tenants lane). Added: `WithCloseTimeout(d time.Duration) Option` and sentinel `ErrCloseTimeout` (engine-core lane, D10).
 
 ## Lane blocks (not yet in flight)
 
@@ -360,7 +368,7 @@ Removed in v4: `Manager`, `ManagerOption`, `NewManager`, `WithManagerLogger`, `W
 **Goal:** One engine serves the single-tenant scope with every guarantee the audit asked for, and the second engine no longer exists.
 **Scope:** new `internal/engine/` (scope state, ingress, reconcile, dispatch queue, revision dedupe); `internal/client/` reduced to registry/options/catalog/redaction/clone/facade adapter; `internal/manager/` deleted; `internal/debounce/` reused or folded into the dispatch queue; root `api_boundary.go`, `api_client.go`, `api_change.go`, `api_constants.go`, `api_constructors.go`, `api_errors.go`, `api_testing.go`, `api_types.go` and their tests (NOT `api_group*.go`, which the groups lane owns), `manager.go`, `manager_methods.go` (deleted), `examples/manager/` (deleted; docs lane recreates examples); `boundary_test.go` kept green.
 **Depends on:** contracts.
-**Done when:** every unit test in the root package and `internal/client` passes against the new engine through `NewForTesting` fakes; a fake store that emits `OpResync` after a simulated gap makes a value written during the gap visible without a second write; a subscriber that mutates `Change.Value` cannot alter what a later `Get` returns (`-race` clean); a blocked subscriber does not stop other keys' delivery; `Set` then `Get` returns the new value before any feed event; deleting a row publishes the registered default with Revision 0; a value that decodes to the wrong type is rejected at ingress and the previous published value stays; `NewMongoDB(..., WithMultiTenantEnabled())` returns an error; `go build ./...` has no reference to `internal/manager`.
+**Done when:** every unit test in the root package and `internal/client` passes against the new engine through `NewForTesting` fakes; a fake store that emits `OpResync` after a simulated gap makes a value written during the gap visible without a second write; a subscriber that mutates `Change.Value` cannot alter what a later `Get` returns (`-race` clean); a blocked subscriber does not stop other keys' delivery; `Set` then `Get` returns the new value before any feed event; `GetEntry` on a cached key returns the row's real revision, `updated_at` and `updated_by` (the cache stores the whole entry, not only the value; Revision 0 is reserved for "no row" from this lane on); deleting a row publishes the registered default with Revision 0; a value that decodes to the wrong type is rejected at ingress and the previous published value stays; `NewMongoDB(..., WithMultiTenantEnabled())` returns an error; `go build ./...` has no reference to `internal/manager`.
 
 ### Lane: storage
 
@@ -381,7 +389,7 @@ Removed in v4: `Manager`, `ManagerOption`, `NewManager`, `WithManagerLogger`, `W
 **Goal:** Multi-tenant scopes get the same engine: lazy activation, lifecycle events, per-tenant feeds, stale marking, metrics.
 **Scope:** `internal/engine/` (all files; tenant scope management is added to the core landed in wave 2), `internal/client/options.go` (`WithTenantManager`, `WithAggregateTenantThreshold`), root `api_constructors.go`, `api_client.go` (`HandleTenantLifecycle`), metrics port from the deleted `internal/manager/metrics.go` semantics (cache entries, listen disconnects, per-tenant labels collapsing above the aggregate threshold).
 **Depends on:** engine-core, storage.
-**Done when:** first `Get` for tenant `t1` activates its scope (subscribe, then reconcile, then `Stale=false`) and later reads hit the cache; `HandleTenantLifecycle(Suspended)` drops the scope and reads fall back to per-request; `CredentialsRotated` re-activates on the new DSN; a `Change` for `t1` carries `Tenant == "t1"` and a callback registered once fires separately for `t1` and `t2`; a failed activation returns the error and the next read retries; metrics carry `tenant_id` up to the threshold and `aggregate` above it. Integration tests run on testcontainers Postgres with two tenant databases.
+**Done when:** first `Get` for tenant `t1` activates its scope (subscribe, then reconcile, then `Stale=false`) and later reads hit the cache; `HandleTenantLifecycle(Suspended)` drops the scope, reads fall back to per-request and do NOT re-activate the tenant until an Activated event arrives; `CredentialsRotated` re-activates on the new DSN; a `Change` for `t1` carries `Tenant == "t1"` and a callback registered once fires separately for `t1` and `t2`; a failed activation returns the error and the next read retries; metrics carry `tenant_id` up to the threshold and `aggregate` above it. Integration tests run on testcontainers Postgres with two tenant databases.
 
 ### Lane: admin
 
@@ -395,7 +403,7 @@ Removed in v4: `Manager`, `ManagerOption`, `NewManager`, `WithManagerLogger`, `W
 **Goal:** Every document and example describes v4 as it is, and the examples compile in CI.
 **Scope:** `README.md`, `CLAUDE.md`, `MIGRATION-v4.md` (new), `MIGRATION-v3.md` (kept), `.env.reference` (deleted), `docs/PROJECT_RULES.md`, `examples/single-tenant/`, `examples/multi-tenant/`, `examples/groups/`, `.github/workflows/go-combined-analysis.yml` (add `go build ./examples/...`), `doc.go`.
 **Depends on:** engine-core, storage, groups.
-**Done when:** no document mentions `lib-commons/v6`, `Manager`, `NewManager`, `Slice`, `WithLazyTenantLoad`, `WithTenantAuthorizer`, `WithTenantSchemaEnabled`, `DefaultSeedSQL`, `WithTable` or `WithListenChannel` except in `MIGRATION-v4.md` as removed items; `MIGRATION-v4.md` has one section per consumer in the matrix naming what breaks and what replaces it; the three examples build in CI and each demonstrates a value changing at runtime; `CLAUDE.md` API invariants match the facade.
+**Done when:** no product document (README, CLAUDE.md, `docs/PROJECT_RULES.md`, godoc, examples) mentions `lib-commons/v6`, `Manager`, `NewManager`, `Slice`, `WithLazyTenantLoad`, `WithTenantAuthorizer`, `WithTenantSchemaEnabled`, `DefaultSeedSQL`, `WithTable` or `WithListenChannel` except `MIGRATION-v4.md` as removed items; `CHANGELOG.md` and `docs/plans/` are out of scope for this check; `MIGRATION-v4.md` has one section per consumer in the matrix naming what breaks and what replaces it; the three examples build in CI and each demonstrates a value changing at runtime; `CLAUDE.md` API invariants match the facade.
 
 ### Lane: matcher-pilot (repo `matcher`)
 
@@ -409,7 +417,7 @@ Removed in v4: `Manager`, `ManagerOption`, `NewManager`, `WithManagerLogger`, `W
 **Goal:** The audit's acceptance criteria hold end to end, and v4.0.0 ships.
 **Scope:** new `internal/engine/*_integration_test.go` and `acceptance_integration_test.go` at the root package (testcontainers Postgres + Mongo), CI workflow adjustments, repo-wide absence checks, release cut.
 **Depends on:** every other lane.
-**Done when:** the scenarios in the Integration Lane section below pass under `-race` with goleak; `grep -rn "lib-systemplane/v3\|internal/manager\|Slice 1\|DefaultSeedSQL\|WithTable\|WithListenChannel" --include='*.go' --include='*.md' .` returns nothing outside `CHANGELOG.md` and `MIGRATION-*.md`; `make ci` green; `develop → release-candidate → main` promoted and `v4.0.0` hand-tagged per `.releaserc.yml`.
+**Done when:** the scenarios in the Integration Lane section below pass under `-race` with goleak; `grep -rn "lib-systemplane/v3\|internal/manager\|Slice 1\|DefaultSeedSQL\|WithTable\|WithListenChannel" --include='*.go' --include='*.md' --exclude-dir=plans .` returns nothing outside `CHANGELOG.md` and `MIGRATION-*.md`; `make ci` green; `develop → release-candidate → main` promoted and `v4.0.0` hand-tagged per `.releaserc.yml`.
 
 ## Integration Lane
 
@@ -424,7 +432,7 @@ Required: `engine-core`, `engine-tenants`, `storage` and `groups` all touch the 
 7. **Slow subscriber.** A subscriber for key A blocks 5s; changes for key B are delivered within 500ms; the LISTEN connection keeps draining.
 8. **Group atomicity.** `Group.Set` with three fields; a concurrent `Snapshot` never observes a mix of old and new fields.
 9. **Read-your-writes.** `Set` then `Get` in the same goroutine returns the new value in ST and MT (cached tenant).
-10. **Shutdown.** `Close` while subscribers run: no goroutine leak, no panic, in-flight deliveries finish or are cancelled through ctx.
+10. **Shutdown.** `Close` while subscribers run: with ctx-honoring callbacks, no goroutine leak (goleak clean), no panic, in-flight deliveries end through ctx; with one callback that ignores ctx, `Close` returns `ErrCloseTimeout` naming its (scope, key) within the configured bound.
 
 Absence checks deferred from lanes under rule 4 live here (see the lane's Done-when).
 
