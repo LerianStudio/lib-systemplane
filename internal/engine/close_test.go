@@ -5,7 +5,9 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -159,5 +161,55 @@ func TestPublishAfterCloseIsDropped(t *testing.T) {
 
 	if _, ok := e.Lookup(store.Scope{}, nk); ok {
 		t.Error("publish after Close created a scope entry, want none")
+	}
+}
+
+func TestPublishRacingCloseStartsNoWorker(t *testing.T) {
+	// publish's own closed check is a check-then-act: a publication that
+	// passes it can reach the dispatch WaitGroup microseconds later, while
+	// Close is already inside Wait. Go answers that with an unrecovered
+	// "WaitGroup misuse: Add called concurrently with Wait" — a process kill
+	// during shutdown, which this test reproduces by racing the two.
+	e := closeEngine(t, 5*time.Second)
+
+	for i := range 64 {
+		nk := NSKey{Namespace: "ns", Key: fmt.Sprintf("key-%d", i)}
+		e.OnChange(nk, func(context.Context, Change) {})
+	}
+
+	var wg sync.WaitGroup
+
+	start := make(chan struct{})
+
+	for i := range 64 {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			<-start
+			e.publish(pub(NSKey{Namespace: "ns", Key: fmt.Sprintf("key-%d", i)}, 1, "v1"))
+		}()
+	}
+
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+
+		<-start
+
+		if err := e.Close(); err != nil {
+			t.Errorf("Close() = %v, want nil", err)
+		}
+	}()
+
+	close(start)
+	wg.Wait()
+
+	// Nothing may start a worker once Close has shut the door, whichever side
+	// of the race a straggler landed on.
+	if w := e.workerFor(workerKey{NSKey: NSKey{Namespace: "ns", Key: "after"}}); w != nil {
+		t.Error("workerFor started a worker after Close")
 	}
 }

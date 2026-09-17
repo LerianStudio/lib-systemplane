@@ -41,15 +41,27 @@ type scopeState struct {
 	firstReconcileOnce sync.Once
 	firstReconcileErr  error // guarded by mu
 
-	// reconcileMu guards reconciling, touched and unusable. The feed callback
-	// records every key it publishes while a reconcile is in flight so the
-	// reconcile skips those keys when applying its List snapshot, and every
-	// key whose reread failed or was rejected so the reconcile does not treat
-	// it as absent.
-	reconcileMu sync.Mutex
-	reconciling bool
-	touched     map[NSKey]struct{}
-	unusable    map[NSKey]struct{}
+	// runMu serializes the List-and-apply body of a reconcile, so two
+	// OpResync events can never apply two snapshots at once. beginReconcile
+	// deliberately does NOT take it: arming runs on the changefeed goroutine
+	// and must never wait on a List that is still in flight.
+	runMu sync.Mutex
+
+	// reconcileMu guards reconciling, reconcileGen, touched and unusable. The
+	// feed callback records every key it publishes while a reconcile is in
+	// flight so the reconcile skips those keys when applying its List
+	// snapshot, and every key whose reread failed or was rejected so the
+	// reconcile does not treat it as absent.
+	//
+	// reconcileGen names the open window. Every beginReconcile bumps it, so a
+	// reconcile whose generation no longer matches knows a newer OpResync took
+	// the scope and abandons its snapshot instead of publishing a photograph
+	// of a connection that has already dropped.
+	reconcileMu  sync.Mutex
+	reconciling  bool
+	reconcileGen uint64
+	touched      map[NSKey]struct{}
+	unusable     map[NSKey]struct{}
 
 	unsubscribe func()
 }

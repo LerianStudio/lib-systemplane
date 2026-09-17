@@ -136,7 +136,12 @@ func (e *Engine) dispatch(pub publication) {
 		return
 	}
 
-	e.workerFor(workerKey{Scope: pub.Scope, NSKey: pub.NSKey}).submit(Change{
+	w := e.workerFor(workerKey{Scope: pub.Scope, NSKey: pub.NSKey})
+	if w == nil {
+		return
+	}
+
+	w.submit(Change{
 		Tenant:    pub.Scope.Tenant,
 		Namespace: pub.Namespace,
 		Key:       pub.Key,
@@ -149,9 +154,20 @@ func (e *Engine) dispatch(pub publication) {
 // the lifecycle context is canceled, so the goroutine count is bounded by the
 // number of (scope, key) pairs that actually published a change to a
 // subscribed key.
+//
+// It returns nil once Close has shut the door. That check and the
+// dispatchWG.Add below are under the same lock Close takes before it waits, so
+// every Add provably happens-before the Wait. Without it a publication that
+// passed publish's closed check microseconds earlier could reach Add while
+// Close is inside Wait, which Go answers with an unrecovered "WaitGroup misuse:
+// Add called concurrently with Wait" — a process kill during shutdown.
 func (e *Engine) workerFor(wk workerKey) *dispatchWorker {
 	e.workersMu.Lock()
 	defer e.workersMu.Unlock()
+
+	if e.workersClosed {
+		return nil
+	}
 
 	if w := e.workers[wk]; w != nil {
 		return w

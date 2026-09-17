@@ -679,3 +679,240 @@ func TestReconcileClearsStaleOnSuccess(t *testing.T) {
 		t.Error("Stale is true after a successful reconcile, want false")
 	}
 }
+
+func TestOverlappingReconcilesKeepFeedValue(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0)
+
+	settled(t, e, scope)
+
+	var rec recorder
+
+	unsub := e.OnChange(nk, rec.record)
+	defer unsub()
+
+	// Two Lists, each held: the older reconcile's is released first, so if it
+	// applies its snapshot at all it does so while the newer one is still
+	// waiting for its own photograph. Nothing here is a timing accident.
+	first, second := make(chan struct{}), make(chan struct{})
+
+	fs.onList(func(store.Scope) error {
+		fs.onList(func(store.Scope) error {
+			fs.onList(nil)
+			<-second
+
+			return nil
+		})
+		<-first
+
+		return nil
+	})
+
+	// The older reconcile photographs a store in which the key does not exist.
+	fs.freezeNextList(nil)
+
+	e.onEvent(disconnectEvent(scope))
+	e.onEvent(resyncEvent(scope))
+
+	// The world moves on behind that photograph: the row is created and the
+	// reconnected feed publishes it.
+	fs.seed(scope, jsonRow(nk, 9, `"live"`, "ops"))
+	e.onEvent(upsertEvent(scope, nk, 9))
+
+	waitFor(t, time.Second, "the feed publication", func() bool { return rec.len() == 1 })
+
+	// The feed drops and comes back, so a second reconcile owns the scope from
+	// here on. The first one is now holding a photograph of a dead connection.
+	e.onEvent(disconnectEvent(scope))
+	e.onEvent(resyncEvent(scope))
+
+	close(first)
+	close(second)
+
+	waitReconcileIdle(t, e, scope)
+
+	// Give a superseded reconcile every chance to publish its stale snapshot.
+	time.Sleep(50 * time.Millisecond)
+
+	got, ok := e.Lookup(scope, nk)
+	if !ok {
+		t.Fatal("Lookup reports a miss: a superseded reconcile erased the cache")
+	}
+
+	if got.Value != "live" || got.Revision != 9 {
+		t.Errorf("after two overlapping reconciles: got (%v, rev %d), want (\"live\", rev 9): "+
+			"the older snapshot reset the key to its registered default", got.Value, got.Revision)
+	}
+
+	for _, ch := range deliveries(&rec) {
+		if ch.Revision == 0 {
+			t.Fatalf("a Revision 0 default was delivered: deliveries = %v", rec.revisions())
+		}
+	}
+
+	if n := rec.len(); n != 1 {
+		t.Errorf("deliveries: got %d (%v), want 1: only the feed's revision 9", n, rec.revisions())
+	}
+}
+
+func TestFirstReconcileRejectsInvalidSnapshotRow(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	def := KeyDef{
+		Default: "fallback",
+		Validate: func(v any) error {
+			if _, ok := v.(string); !ok {
+				return errors.New("want a string")
+			}
+
+			return nil
+		},
+	}
+
+	t.Run("nothing cached yet", func(t *testing.T) {
+		fs := newFakeStore()
+		e := feedEngine(t, map[NSKey]KeyDef{nk: def}, fs, 0)
+
+		var rec recorder
+
+		unsub := e.OnChange(nk, rec.record)
+		defer unsub()
+
+		// The key's only row is one an operator hand-edited to the wrong type.
+		fs.seed(scope, jsonRow(nk, 7, `{"limit":10}`, "operator"))
+		settled(t, e, scope)
+
+		time.Sleep(50 * time.Millisecond)
+
+		// A rejected row is not an absent row: the key is NOT announced with
+		// the registered default, because that would be the silent revert the
+		// ingress exists to prevent. The Lookup miss is what makes the Client
+		// serve the registered default on a read without publishing it.
+		if _, ok := e.Lookup(scope, nk); ok {
+			t.Error("Lookup reports a hit: the rejected row was published")
+		}
+
+		if n := rec.len(); n != 0 {
+			t.Errorf("deliveries: got %d (%v), want 0", n, rec.revisions())
+		}
+	})
+
+	t.Run("a valid value is already cached", func(t *testing.T) {
+		fs := newFakeStore()
+		e := feedEngine(t, map[NSKey]KeyDef{nk: def}, fs, 0)
+
+		fs.seed(scope, jsonRow(nk, 2, `"live"`, "ops"))
+		settled(t, e, scope)
+
+		var rec recorder
+
+		unsub := e.OnChange(nk, rec.record)
+		defer unsub()
+
+		// The row is rewritten out from under the engine while the feed is
+		// down, so only the reconcile's snapshot carries it.
+		e.onEvent(disconnectEvent(scope))
+		fs.seed(scope, jsonRow(nk, 3, `{"limit":10}`, "operator"))
+		e.onEvent(resyncEvent(scope))
+
+		waitReconcileIdle(t, e, scope)
+		time.Sleep(50 * time.Millisecond)
+
+		got, ok := e.Lookup(scope, nk)
+		if !ok {
+			t.Fatal("Lookup reports a miss: the rejected snapshot row erased the cache")
+		}
+
+		if got.Value != "live" || got.Revision != 2 {
+			t.Errorf("after the reconcile: got (%v, rev %d), want the cached (\"live\", rev 2)",
+				got.Value, got.Revision)
+		}
+
+		if n := rec.len(); n != 0 {
+			t.Errorf("deliveries: got %d (%v), want 0", n, rec.revisions())
+		}
+	})
+}
+
+func TestReconcileSkipsUndecodableSnapshotRow(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0)
+
+	fs.seed(scope, jsonRow(nk, 2, `"live"`, "ops"))
+	settled(t, e, scope)
+
+	var rec recorder
+
+	unsub := e.OnChange(nk, rec.record)
+	defer unsub()
+
+	e.onEvent(disconnectEvent(scope))
+	fs.seed(scope, jsonRow(nk, 4, `{not json`, "operator"))
+	e.onEvent(resyncEvent(scope))
+
+	waitReconcileIdle(t, e, scope)
+	time.Sleep(50 * time.Millisecond)
+
+	got, ok := e.Lookup(scope, nk)
+	if !ok {
+		t.Fatal("Lookup reports a miss: an undecodable snapshot row erased the cache")
+	}
+
+	if got.Value != "live" || got.Revision != 2 {
+		t.Errorf("after the reconcile: got (%v, rev %d), want the cached (\"live\", rev 2)",
+			got.Value, got.Revision)
+	}
+
+	if n := rec.len(); n != 0 {
+		t.Errorf("deliveries: got %d (%v), want 0", n, rec.revisions())
+	}
+}
+
+func TestReconcileSurvivesPanickingValidator(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+
+	// The validator every consumer writes: an unchecked type assertion. It
+	// panics on a row an operator hand-edited to the wrong JSON type, and v4
+	// runs it on the engine's own reconcile goroutine.
+	def := KeyDef{
+		Default:  "fallback",
+		Validate: func(v any) error { _ = v.(string); return nil },
+	}
+
+	e := feedEngine(t, map[NSKey]KeyDef{nk: def}, fs, 0)
+
+	fs.seed(scope, jsonRow(nk, 2, `"live"`, "ops"))
+	settled(t, e, scope)
+
+	var rec recorder
+
+	unsub := e.OnChange(nk, rec.record)
+	defer unsub()
+
+	e.onEvent(disconnectEvent(scope))
+	fs.seed(scope, jsonRow(nk, 5, `{"limit":10}`, "operator"))
+	e.onEvent(resyncEvent(scope))
+
+	waitReconcileIdle(t, e, scope)
+	time.Sleep(50 * time.Millisecond)
+
+	got, ok := e.Lookup(scope, nk)
+	if !ok {
+		t.Fatal("Lookup reports a miss after a panicking validator")
+	}
+
+	if got.Value != "live" || got.Revision != 2 {
+		t.Errorf("after the reconcile: got (%v, rev %d), want the cached (\"live\", rev 2): "+
+			"a panicking validator must reject, not erase", got.Value, got.Revision)
+	}
+
+	if n := rec.len(); n != 0 {
+		t.Errorf("deliveries: got %d (%v), want 0", n, rec.revisions())
+	}
+}

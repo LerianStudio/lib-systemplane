@@ -34,6 +34,13 @@ type fakeStore struct {
 	// a backend that never resyncs simply by not turning it on.
 	autoResync bool
 
+	// frozenList is served to the next List that gets past its hook, and then
+	// cleared. It is how a test hands ONE reconcile a photograph of a world
+	// that has since moved on, while every later List reads the live table —
+	// which is the whole hazard a reconcile is fenced against.
+	frozenList  []store.Entry
+	frozenReady bool
+
 	getCalls       int
 	listCalls      int
 	subscribeCalls int
@@ -97,6 +104,16 @@ func (f *fakeStore) onSubscribe(hook func(scope store.Scope) error) {
 	defer f.mu.Unlock()
 
 	f.subscribeHook = hook
+}
+
+// freezeNextList makes the next List return entries instead of the live table,
+// once. A nil slice is a snapshot of an empty store.
+func (f *fakeStore) freezeNextList(entries []store.Entry) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.frozenList = entries
+	f.frozenReady = true
 }
 
 // resyncOnSubscribe makes every later Subscribe emit store.OpResync once the
@@ -222,6 +239,13 @@ func (f *fakeStore) List(ctx context.Context, scope store.Scope) ([]store.Entry,
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	if f.frozenReady {
+		frozen := f.frozenList
+		f.frozenList, f.frozenReady = nil, false
+
+		return frozen, nil
+	}
 
 	entries := make([]store.Entry, 0, len(f.rows))
 

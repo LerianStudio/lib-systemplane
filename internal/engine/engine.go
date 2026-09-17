@@ -48,10 +48,14 @@ type Engine struct {
 	// can wait for them. running holds the workerKey of every worker currently
 	// inside a subscriber callback, so a Close that times out names the real
 	// (scope, key) pairs it is stuck on instead of guessing.
-	workersMu  sync.Mutex
-	workers    map[workerKey]*dispatchWorker
-	dispatchWG sync.WaitGroup
-	running    sync.Map // workerKey -> struct{}
+	//
+	// workersClosed is set under workersMu before Close waits on dispatchWG,
+	// which is what makes every Add to that WaitGroup happen-before its Wait.
+	workersMu     sync.Mutex
+	workers       map[workerKey]*dispatchWorker
+	workersClosed bool
+	dispatchWG    sync.WaitGroup
+	running       sync.Map // workerKey -> struct{}
 
 	// startMu serializes scope bring-up so two concurrent Starts open one
 	// subscription instead of two. It is held across Store.Subscribe and never
@@ -354,10 +358,24 @@ func (e *Engine) Close() error {
 
 		e.debouncer.Close()
 
+		e.closeWorkers()
+
 		e.closeErr = e.waitForWorkers()
 	})
 
 	return e.closeErr
+}
+
+// closeWorkers shuts the door on new dispatch workers before Close waits for
+// the existing ones. The flag and workerFor's dispatchWG.Add are under the same
+// lock, so no straggler publication can increment the WaitGroup while it is
+// being waited on — a race Go answers by killing the process, not by returning
+// an error.
+func (e *Engine) closeWorkers() {
+	e.workersMu.Lock()
+	defer e.workersMu.Unlock()
+
+	e.workersClosed = true
 }
 
 // trackedScopes snapshots the scopes under the engine lock, so unsubscribing

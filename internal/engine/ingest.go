@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
@@ -56,16 +57,14 @@ func (e *Engine) ingest(ctx context.Context, scope store.Scope, se store.Entry) 
 		return false, false
 	}
 
-	if def.Validate != nil {
-		if err := def.Validate(decoded); err != nil {
-			e.logWarn(ctx, "stored value rejected by validator, keeping cached value",
-				log.String("namespace", se.Namespace),
-				log.String("key", se.Key),
-				log.Err(err),
-			)
+	if err := runValidator(def.Validate, decoded); err != nil {
+		e.logWarn(ctx, "stored value rejected by validator, keeping cached value",
+			log.String("namespace", se.Namespace),
+			log.String("key", se.Key),
+			log.Err(err),
+		)
 
-			return false, false
-		}
+		return false, false
 	}
 
 	return e.publish(publication{
@@ -103,6 +102,31 @@ func (e *Engine) ingestDefault(ctx context.Context, scope store.Scope, nk NSKey)
 		Revision: 0,
 		Value:    Clone(def.Default),
 	})
+}
+
+// runValidator runs the consumer's registered validator and turns a panic into
+// a rejection.
+//
+// The validator is consumer code, and v4 is the first version that runs it on
+// engine-owned goroutines: the reconcile, and the changefeed re-read. v3 only
+// ever ran it on the caller's own Set, where a panic was the caller's problem.
+// A validator doing an ordinary type assertion against a row an operator
+// hand-edited to the wrong JSON type would otherwise take the whole process
+// down at Start. A recovered panic is treated exactly like a returned error —
+// the key keeps its last valid value — which is what the ingress contract
+// promises for every rejection.
+func runValidator(validate func(any) error, value any) (err error) {
+	if validate == nil {
+		return nil
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%w: validator panicked: %v", store.ErrValidation, r)
+		}
+	}()
+
+	return validate(value)
 }
 
 // logWarn reports an ingress rejection. A nil logger is a no-op: the engine
