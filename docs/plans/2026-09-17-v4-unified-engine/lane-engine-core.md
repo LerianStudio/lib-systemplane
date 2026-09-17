@@ -170,9 +170,16 @@ type scopeState struct {
 	// disconnect just set. Guarded by mu, alongside stale.
 	disconnectGen uint64
 
-	// firstReconcileDone is closed once, when this scope's first reconcile
-	// completes. Start waits on it instead of running a reconcile of its own.
+	// firstReconcileDone is closed exactly once, when this scope's first
+	// reconcile finishes — successfully or not. Start waits on it instead of
+	// running a reconcile of its own. firstReconcileErr carries that
+	// reconcile's outcome to Start; it is written under mu BEFORE the channel
+	// is closed, so a reader that observed the close is guaranteed to see it.
+	// Both belong to the FIRST reconcile alone: no later reconcile writes
+	// either one.
 	firstReconcileDone chan struct{}
+	firstReconcileOnce sync.Once
+	firstReconcileErr  error // guarded by mu
 
 	// reconcileMu guards reconciling, touched and unusable. The feed callback
 	// records every key it publishes while a reconcile is in flight so the
@@ -341,7 +348,7 @@ Sequence, in this order and no other:
 2. `Store.List(ctx, scope)`.
 3. For every returned row: skip it if its key is in `touched` (the feed already published something fresher), otherwise put it through the ingress of Task 1.2.1, which applies the revision fence on top. The two fences are independent and both required: `touched` covers "the feed said something about this key at all", the revision fence covers "the snapshot row is older than what is cached".
 4. For every key in `Registry.Keys()` **absent** from the `List` result and **not** in `touched`: publish the registered default at revision 0 — **unless** the key is in the `unusable` set (below), in which case keep the cached value when there is one and publish the default only when the cache holds nothing for that key. A key the feed touched during the window is decided by the feed, not by the snapshot — this is what makes delete-then-recreate survive a concurrent reconcile.
-5. Clear `reconciling`, release `touched` and `unusable`, set `stale = false` (subject to the generation check below).
+5. Clear `reconciling`, release `touched` and `unusable`, set `stale = false` (subject to the generation check below), and run the **first-reconcile completion path**: if this scope has not completed a reconcile before, write the outcome (nil here) into `scopeState.firstReconcileErr` under `mu` and then close `firstReconcileDone` through `firstReconcileOnce`. Task 1.4.1 specifies the ordering and why `Start` depends on it; a later reconcile writes neither, so put both inside the `Once`.
 
 **The `unusable` set, and why it is not `touched`.** A feed reread that runs during the reconcile window has four outcomes, and only two of them mean the same thing:
 
@@ -356,7 +363,7 @@ Putting an error or a rejection into `touched` would be wrong in the other direc
 
 Without this, the sequence CodeRabbit found erases data: an upsert arrives while `List` is running, its reread errors, the `List` snapshot happens not to carry that key, and step 4 publishes the default over a valid cached value — a silent config reset triggered by one transient read failure.
 
-On a `List` error: leave `stale = true`, clear `reconciling`, log at WARN, publish nothing. A failed reconcile must never erase a cache — serving a possibly-old value is strictly better than serving defaults, and `Stale` is how the caller learns the difference.
+On a `List` error: leave `stale = true`, clear `reconciling`, log at WARN, publish nothing — and still run the first-reconcile completion path, recording the `List` error as `firstReconcileErr` before closing the channel, so a `Start` waiting on it returns that error instead of blocking until ctx. The completion path runs on **every** exit from the first reconcile, success or failure; putting it anywhere but a `defer` is how it gets missed on the error return. A failed reconcile must never erase a cache — serving a possibly-old value is strictly better than serving defaults, and `Stale` is how the caller learns the difference.
 
 Notifications produced by steps 3 and 4 go to the dispatch queue exactly as feed notifications do (Epic 1.3): a reconcile that finds a genuinely newer value fires subscribers, and one that finds nothing new fires nothing.
 
@@ -499,9 +506,11 @@ Failure handling, all three cases distinct:
 
 - `Subscribe` fails → drop the scope entirely and return the error. A half-built scope that looks fresh is exactly the "listener-open failure leaves a fresh-looking cache" defect the audit found.
 - `ctx` expires before `firstReconcileDone` closes → return the ctx error with the scope left in place and stale. A backend that never emits `OpResync` is broken per FC-2, and failing loudly at `Start` beats silently serving defaults forever.
-- The first reconcile runs and fails → it closes `firstReconcileDone` anyway (the attempt happened) and leaves the scope stale. `Start` returns the reconcile's error; the next `OpResync` retries. Closing the channel on failure is what stops `Start` hanging until ctx on a transient `List` error.
+- The first reconcile runs and fails → it closes `firstReconcileDone` anyway (the attempt happened) and leaves the scope stale. `Start` returns the reconcile's error wrapped; the next `OpResync` retries. Closing the channel on failure is what stops `Start` hanging until ctx on a transient `List` error.
 
-`firstReconcileDone` is closed exactly once, guarded by `sync.Once`, so later reconciles never touch it.
+**How the error reaches `Start`.** A closed channel carries no value, so the outcome travels in a field: `scopeState.firstReconcileErr`, guarded by the scope mutex. The first reconcile's completion path — success or failure, on every exit — writes that field under `mu` and then closes `firstReconcileDone` through `firstReconcileOnce`. Writing before closing is the whole ordering guarantee: the close is the release, the receive is the acquire, so a `Start` that observed the close is guaranteed to see the write (it still takes `mu` to read, which keeps the race detector honest and costs nothing on a once-per-scope path). `Start` then does one `select` over `firstReconcileDone` and `ctx.Done()`; on the channel it reads `firstReconcileErr` under `mu` and returns it wrapped with the scope, on ctx it returns the ctx error.
+
+**Only the first reconcile touches either.** Every later reconcile — the ones `OpResync` drives after a reconnect — must not write `firstReconcileErr` and must not close or reallocate `firstReconcileDone`. `firstReconcileOnce` makes the second close a no-op mechanically, but the field has no such protection: a later reconcile writing its own error there would hand a stale failure to a `Start` that already returned, or to a wave-3 caller inspecting scope state. The completion path therefore writes the field only inside the `Once`. `Start` is idempotent partly because of this: a second `Start` finds the channel already closed and returns the same recorded outcome rather than re-deriving one.
 
 The `Set` path is `(*Engine).Publish(scope store.Scope, e store.Entry)`: the Client has already validated and persisted, and hands the engine the entry it wrote — the marshaled bytes, the revision the store returned, and the provenance. `Publish` runs **the same ingress as the feed** (Task 1.2.1), which is what guarantees the cache holds one canonical shape for every key regardless of how the value arrived, and therefore what makes `publish`'s `reflect.DeepEqual` comparison meaningful. Do not add a second entry point that accepts an already-decoded Go value: `[]string{"a"}` from a caller and `[]any{"a"}` from the feed are not `DeepEqual`, and the mismatch would fire a spurious callback on every echo. (`internal/client/set.go:66` already round-trips through JSON for exactly this reason; the engine inherits the practice rather than reinventing it.) The feed echo for the same write then arrives with the same revision and the same canonical value, and the fence turns it into a provenance refresh with no second callback — which is the whole reason revisions exist.
 
@@ -514,9 +523,9 @@ Named edge cases: a `Publish` whose revision the store reported as 0 (a backend 
 - Create: `internal/engine/engine_test.go`
 - Create: `internal/engine/fakestore_test.go` — the shared fake `store.Store` for the package. It must offer: a blocking-capable `List` hook and `Get` hook (the reconcile-race tests inject events while `List` is held), a manual event injector, `Subscribe` call and live-subscription counters, a `Get` call counter (the debounce-coalescing test counts reads), and emitters for **both** `store.OpResync` and `store.OpDisconnect`.
 
-**Verification:** `make test-unit` and `go vet -tags=unit ./...` — plus these named tests: `TestPublishMakesSetVisibleBeforeFeedEcho` (publish rev 7 through `Publish`, `Lookup` returns it immediately; then deliver the feed echo at rev 7 with the same bytes and assert the subscriber fired exactly once), `TestStartSubscribesBeforeReconciling` (the fake store asserts the subscription exists when `List` is entered), `TestStartRunsExactlyOneInitialReconcile` (**the RED test for the double-delivery defect** — the fake store counts `List` calls across `Start`; the count is 1, and a subscriber for a key absent from the store received exactly one Revision 0 `Change`, not two), `TestStartRollsBackWhenSubscribeFails` (no scope is tracked afterwards and `Lookup` reports a miss, not a fresh-looking default), `TestStartReturnsCtxErrorWhenNoResyncArrives` (a fake store whose `Subscribe` never emits `OpResync`: `Start` with a 100ms ctx returns the ctx error rather than hanging or succeeding), `TestStartKeepsScopeStaleWhenFirstReconcileFails` (and returns, rather than blocking until ctx), `TestStartIsIdempotent`, `TestWriteDuringStartSurvives` (an event injected while `List` is blocked is not overwritten by the snapshot).
+**Verification:** `make test-unit` and `go vet -tags=unit ./...` — plus these named tests: `TestPublishMakesSetVisibleBeforeFeedEcho` (publish rev 7 through `Publish`, `Lookup` returns it immediately; then deliver the feed echo at rev 7 with the same bytes and assert the subscriber fired exactly once), `TestStartSubscribesBeforeReconciling` (the fake store asserts the subscription exists when `List` is entered), `TestStartRunsExactlyOneInitialReconcile` (**the RED test for the double-delivery defect** — the fake store counts `List` calls across `Start`; the count is 1, and a subscriber for a key absent from the store received exactly one Revision 0 `Change`, not two), `TestStartRollsBackWhenSubscribeFails` (no scope is tracked afterwards and `Lookup` reports a miss, not a fresh-looking default), `TestStartReturnsCtxErrorWhenNoResyncArrives` (a fake store whose `Subscribe` never emits `OpResync`: `Start` with a 100ms ctx returns the ctx error rather than hanging or succeeding), `TestStartReturnsWrappedFirstReconcileError` (**the RED test for the error handoff** — the fake store's `List` returns a sentinel; `Start` returns promptly rather than blocking until ctx, the returned error satisfies `errors.Is(err, thatSentinel)`, and the scope is left tracked and `Stale`), `TestLaterReconcileDoesNotOverwriteFirstReconcileOutcome` (first reconcile succeeds and `Start` returns nil; a later `OpResync` whose `List` errors leaves `firstReconcileErr` nil and the channel closed, and a second `Start` still returns nil), `TestStartIsIdempotent`, `TestWriteDuringStartSurvives` (an event injected while `List` is blocked is not overwritten by the snapshot).
 
-**Done when:** `Start` runs no reconcile of its own and returns only after the first `OpResync`-driven reconcile has completed or ctx expired; `go test -tags=unit -race ./internal/engine/...` is green under goleak, `make test-unit` is green across the repo, `go vet -tags=unit ./...` and `go vet -tags=integration ./...` are clean, and `go test -tags=unit -run=^TestPerf_ ./...` still exits 0.
+**Done when:** `Start` runs no reconcile of its own and returns only after the first `OpResync`-driven reconcile has completed or ctx expired; a failing first reconcile's error reaches `Start` wrapped, via `firstReconcileErr` written under the scope mutex before the channel closes; no later reconcile writes `firstReconcileErr` or closes `firstReconcileDone`; `go test -tags=unit -race ./internal/engine/...` is green under goleak, `make test-unit` is green across the repo, `go vet -tags=unit ./...` and `go vet -tags=integration ./...` are clean, and `go test -tags=unit -run=^TestPerf_ ./...` still exits 0.
 
 ---
 
