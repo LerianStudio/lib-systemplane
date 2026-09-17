@@ -78,7 +78,7 @@ Read `index.md` § Frozen Contracts FC-1 to FC-5 before starting. This lane MUST
 
 **Verification:** `gofmt -l internal/store` prints nothing; `go vet ./internal/store/` passes (the package itself has no dependents inside it).
 
-**Done when:** `internal/store/store.go` matches FC-2 for `Scope`, the op constants, `Entry`, `Event`, `Store`, and declares `ErrTenantConnectorMissing`.
+**Done when:** `internal/store/store.go` matches FC-2 for `Scope`, the op constants (including `OpDisconnect`, added to FC-2 on 2026-09-17 after this lane started; the orchestrator lands it as a follow-up commit if the harness built from the earlier FC-2 text), `Entry`, `Event`, `Store`, and declares `ErrTenantConnectorMissing`.
 
 #### Task 1.2.2: Move the Postgres connector into `internal/postgres`
 
