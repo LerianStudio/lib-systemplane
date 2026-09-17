@@ -3,12 +3,15 @@
 package postgres_test
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"testing"
 	"time"
 
 	systemplane "github.com/LerianStudio/lib-systemplane/v4"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/postgres"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -62,54 +65,165 @@ WHEN (OLD IS DISTINCT FROM NEW)
 EXECUTE FUNCTION systemplane_notify_v3('systemplane_changes');
 `
 
-// TestIntegration_DDLMigrationV3ToV4IsIdempotent upgrades a populated v3 database
-// with the published migration artifact and proves the published artifacts can be
-// re-applied at will: the migration runs twice (the second pass exercises
+// TestIntegration_DDLMigrationV3ToV4IsIdempotent is the documented upgrade
+// route for a consumer on v3: the delta twice (the second pass exercises
 // ADD COLUMN IF NOT EXISTS as a no-op and DROP FUNCTION IF EXISTS on an
-// already-dropped function) and SchemaSQL() then applies twice on top.
+// already-dropped function), then SchemaSQL() twice on top of the result.
 func TestIntegration_DDLMigrationV3ToV4IsIdempotent(t *testing.T) {
+	assertUpgradeRoute(t, "migration",
+		systemplane.MigrationV3ToV4SQL(),
+		systemplane.MigrationV3ToV4SQL(),
+		systemplane.SchemaSQL(),
+		systemplane.SchemaSQL(),
+	)
+}
+
+// TestIntegration_DDLSchemaUpgradesAV3DatabaseInPlace is the other route
+// SchemaSQL()'s own doc comment promises — "upgrades a v3 database in place" —
+// applied straight to a raw v3 database with no migration file involved, and
+// applied twice.
+func TestIntegration_DDLSchemaUpgradesAV3DatabaseInPlace(t *testing.T) {
+	assertUpgradeRoute(t, "schema",
+		systemplane.SchemaSQL(),
+		systemplane.SchemaSQL(),
+	)
+}
+
+// assertUpgradeRoute applies steps in order to a populated v3 database and
+// asserts the v4 shape plus the first-write-clears-1 rule they must all leave
+// behind.
+func assertUpgradeRoute(t *testing.T, label string, steps ...string) {
+	t.Helper()
+
 	base, cleanup := startContainer(t)
 	t.Cleanup(cleanup)
 
-	admin := adminDSN(t, base)
-	dbName := fmt.Sprintf("mig_%d", time.Now().UnixNano())
-	freshDB(t, admin, dbName)
+	dsn, db := populatedV3Database(t, base, label)
 
+	for i, statements := range steps {
+		if _, err := db.Exec(statements); err != nil {
+			t.Fatalf("apply step %d: %v", i+1, err)
+		}
+	}
+
+	assertV4Shape(t, db)
+	assertNextWriteClearsMigratedRevision(t, db, dsn)
+}
+
+// TestIntegration_DDLRecreatedKeyExceedsDeletedRevision pins the reason the
+// revision is drawn from a sequence instead of the row: a key deleted and
+// recreated must come back ABOVE the revision it last carried, so a subscriber
+// that missed both events still accepts the recreated value instead of fencing
+// it out as stale.
+func TestIntegration_DDLRecreatedKeyExceedsDeletedRevision(t *testing.T) {
+	base, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	dsn, db := freshV4Database(t, base, "recreate")
+	s := storeOn(t, db, dsn)
+	ctx := context.Background()
+
+	set := func(what, value string) int64 {
+		t.Helper()
+
+		rev, err := s.Set(ctx, store.Scope{}, store.Entry{
+			Namespace: "runtime_config",
+			Key:       "log_level",
+			Value:     []byte(fmt.Sprintf("%q", value)),
+		})
+		if err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+
+		return rev
+	}
+
+	first := set("first set", "debug")
+	changed := set("changed value", "info")
+
+	if changed <= first {
+		t.Fatalf("changed value: revision = %d, want greater than %d", changed, first)
+	}
+
+	if err := s.Delete(ctx, store.Scope{}, "runtime_config", "log_level", "tester"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	if recreated := set("recreate after delete", "warn"); recreated <= changed {
+		t.Fatalf("recreated after delete: revision = %d, want strictly greater than the deleted row's last revision %d", recreated, changed)
+	}
+}
+
+// populatedV3Database creates a database carrying the v3 schema and one row
+// written under it, and returns its DSN plus an open handle.
+func populatedV3Database(t *testing.T, base, label string) (string, *sql.DB) {
+	t.Helper()
+
+	dsn, db := newDatabase(t, base, label)
+
+	if _, err := db.Exec(v3SchemaSQL); err != nil {
+		t.Fatalf("apply v3 schema: %v", err)
+	}
+
+	if _, err := db.Exec(`INSERT INTO systemplane_entries (namespace, "key", value, updated_by)
+		VALUES ('runtime_config', 'log_level', '"debug"'::jsonb, 'operator')`); err != nil {
+		t.Fatalf("insert pre-existing row: %v", err)
+	}
+
+	return dsn, db
+}
+
+// freshV4Database creates a database provisioned straight from SchemaSQL().
+func freshV4Database(t *testing.T, base, label string) (string, *sql.DB) {
+	t.Helper()
+
+	dsn, db := newDatabase(t, base, label)
+	provisionSchema(t, db)
+
+	return dsn, db
+}
+
+func newDatabase(t *testing.T, base, label string) (string, *sql.DB) {
+	t.Helper()
+
+	admin := adminDSN(t, base)
+	dbName := fmt.Sprintf("ddl_%s_%d", label, time.Now().UnixNano())
+	freshDB(t, admin, dbName)
 	_ = admin.Close()
 
-	db, err := sql.Open("pgx", dsnFor(base, dbName))
+	dsn := dsnFor(base, dbName)
+
+	db, err := sql.Open("pgx", dsn)
 	if err != nil {
 		t.Fatalf("open %s: %v", dbName, err)
 	}
 
 	t.Cleanup(func() { _ = db.Close() })
 
-	exec := func(label, statements string) {
-		t.Helper()
+	return dsn, db
+}
 
-		if _, err := db.Exec(statements); err != nil {
-			t.Fatalf("apply %s: %v", label, err)
-		}
+// storeOn builds a Store over an already-provisioned database. Start is never
+// called: these tests exercise the write path, not the changefeed.
+func storeOn(t *testing.T, db *sql.DB, dsn string) *postgres.Store {
+	t.Helper()
+
+	s, err := postgres.New(postgres.Config{DB: db, ListenDSN: dsn})
+	if err != nil {
+		t.Fatalf("postgres.New: %v", err)
 	}
 
-	exec("v3 schema", v3SchemaSQL)
-	exec("pre-existing row", `INSERT INTO systemplane_entries (namespace, "key", value, updated_by)
-		VALUES ('runtime_config', 'log_level', '"debug"'::jsonb, 'operator')`)
+	t.Cleanup(func() { _ = s.Close() })
 
-	// Each of these must succeed against the database left by the step before it.
-	for _, step := range []struct {
-		label      string
-		statements string
-	}{
-		{"migration, first application", systemplane.MigrationV3ToV4SQL()},
-		{"migration, second application", systemplane.MigrationV3ToV4SQL()},
-		{"schema, first application", systemplane.SchemaSQL()},
-		{"schema, second application", systemplane.SchemaSQL()},
-	} {
-		exec(step.label, step.statements)
-	}
+	return s
+}
 
-	// revision column: present, bigint, NOT NULL.
+// assertV4Shape checks the catalog state every upgrade route must leave behind:
+// the revision column, the revision sequence, rows migrated at 1, exactly the
+// three v4 triggers, the two v4 functions, and no v3 notify function.
+func assertV4Shape(t *testing.T, db *sql.DB) {
+	t.Helper()
+
 	var dataType, isNullable string
 
 	if err := db.QueryRow(`SELECT data_type, is_nullable
@@ -123,7 +237,20 @@ func TestIntegration_DDLMigrationV3ToV4IsIdempotent(t *testing.T) {
 		t.Fatalf("revision column = (%s, nullable %s), want (bigint, nullable NO)", dataType, isNullable)
 	}
 
-	// The row written under v3 starts at revision 1.
+	var sequenceExists bool
+
+	if err := db.QueryRow(`SELECT EXISTS (
+		SELECT 1 FROM information_schema.sequences
+		WHERE sequence_name = 'systemplane_revision_seq')`).Scan(&sequenceExists); err != nil {
+		t.Fatalf("look up systemplane_revision_seq: %v", err)
+	}
+
+	if !sequenceExists {
+		t.Fatal("systemplane_revision_seq missing; revisions would have no source")
+	}
+
+	// The row written under v3 keeps revision 1: the ALTER seeds it, nothing
+	// rewrites it.
 	var revision int64
 
 	if err := db.QueryRow(`SELECT revision FROM systemplane_entries
@@ -135,7 +262,6 @@ func TestIntegration_DDLMigrationV3ToV4IsIdempotent(t *testing.T) {
 		t.Fatalf("pre-existing row revision = %d, want 1", revision)
 	}
 
-	// Exactly the three v4 triggers, and nothing else, on systemplane_entries.
 	rows, err := db.Query(`SELECT DISTINCT trigger_name FROM information_schema.triggers
 		WHERE event_object_table = 'systemplane_entries' ORDER BY trigger_name`)
 	if err != nil {
@@ -170,7 +296,6 @@ func TestIntegration_DDLMigrationV3ToV4IsIdempotent(t *testing.T) {
 		t.Fatalf("triggers on systemplane_entries = %v, want %v", got, want)
 	}
 
-	// The v4 functions exist; the v3 notify function is gone.
 	for _, fn := range []struct {
 		name string
 		want bool
@@ -189,5 +314,28 @@ func TestIntegration_DDLMigrationV3ToV4IsIdempotent(t *testing.T) {
 		if exists != fn.want {
 			t.Fatalf("function %s exists = %t, want %t", fn.name, exists, fn.want)
 		}
+	}
+}
+
+// assertNextWriteClearsMigratedRevision pins the point of seeding the sequence:
+// the first write after the upgrade must land above the revision 1 the ALTER
+// handed every migrated row, so a consumer's cache is never fenced against its
+// own newer value.
+func assertNextWriteClearsMigratedRevision(t *testing.T, db *sql.DB, dsn string) {
+	t.Helper()
+
+	s := storeOn(t, db, dsn)
+
+	rev, err := s.Set(context.Background(), store.Scope{}, store.Entry{
+		Namespace: "runtime_config",
+		Key:       "log_level",
+		Value:     []byte(`"warn"`),
+	})
+	if err != nil {
+		t.Fatalf("set after upgrade: %v", err)
+	}
+
+	if rev < 2 {
+		t.Fatalf("first write after the upgrade returned revision %d, want at least 2 (above the migrated rows' revision 1)", rev)
 	}
 }

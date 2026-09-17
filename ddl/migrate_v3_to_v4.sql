@@ -1,24 +1,36 @@
 -- systemplane v3 -> v4 migration — canonical, static artifact published by lib-systemplane.
 --
 -- lib-systemplane never executes this file: consumers fold it into their own
--- migration pipeline. It is the delta between the v3 and v4 schemas and
--- assumes the systemplane_entries table already exists; a consumer starting
--- from an empty database applies ddl/schema.sql instead.
+-- migration pipeline. It is ddl/schema.sql minus the table creation, so it
+-- assumes systemplane_entries already exists; a consumer starting from an
+-- empty database applies ddl/schema.sql instead.
 --
--- The file is idempotent: the column is added only when missing, the two
--- functions are replaced, and the triggers and the v3 notify function are
--- dropped only if still present. The DROP TRIGGER statements precede the DROP
--- of the v3 notify function that those triggers depend on.
+-- The file is idempotent: the sequence and the column are created only when
+-- missing, the two functions are replaced, and the triggers and the v3 notify
+-- function are dropped only if still present. The DROP TRIGGER statements
+-- precede the DROP of the v3 notify function that those triggers depend on.
 --
 -- No transaction wrapper and no data backfill: the consumer's migration tool
--- owns transaction boundaries, and ADD COLUMN ... NOT NULL DEFAULT 1 gives
--- every existing row revision 1 in one statement (revision 0 means "no row").
+-- owns transaction boundaries. ADD COLUMN ... NOT NULL DEFAULT 1 gives every
+-- existing row revision 1 in one statement (revision 0 means "no row"), the
+-- following ALTER points the column at the sequence, and the setval lifts the
+-- sequence past the highest revision already stored so the first
+-- post-migration write lands at 2 or higher. Revisions may skip numbers from
+-- then on, and a key deleted and recreated always exceeds every revision it
+-- previously had.
+
+CREATE SEQUENCE IF NOT EXISTS systemplane_revision_seq AS BIGINT;
 
 ALTER TABLE systemplane_entries ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;
+ALTER TABLE systemplane_entries ALTER COLUMN revision SET DEFAULT nextval('systemplane_revision_seq');
+SELECT setval('systemplane_revision_seq', GREATEST(
+	(SELECT COALESCE(MAX(revision), 1) FROM systemplane_entries),
+	(SELECT last_value FROM systemplane_revision_seq)
+));
 
 CREATE OR REPLACE FUNCTION systemplane_bump_revision_v4() RETURNS TRIGGER AS $$
 BEGIN
-	NEW.revision := OLD.revision + 1;
+	NEW.revision := nextval('systemplane_revision_seq');
 	RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;

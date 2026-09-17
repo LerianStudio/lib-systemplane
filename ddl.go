@@ -28,24 +28,41 @@ var defaultSeedSQL string
 
 // SchemaSQL returns the full systemplane schema DDL as an importable artifact.
 //
-// The returned SQL creates the systemplane_entries table, the
-// systemplane_bump_revision_v4() and systemplane_notify_v4() trigger
-// functions, and the three triggers that bump the revision on UPDATE and
-// NOTIFY on the systemplane_changes channel. It is idempotent, upgrades a v3
-// database in place, and is safe to fold into a consumer's own migration
-// pipeline; lib-systemplane does not execute it for the caller.
+// The returned SQL creates the systemplane_revision_seq sequence, the
+// systemplane_entries table, the systemplane_bump_revision_v4() and
+// systemplane_notify_v4() trigger functions, and the three triggers that bump
+// the revision on UPDATE and NOTIFY on the systemplane_changes channel.
+//
+// Every revision comes from the sequence: a fresh row takes it through the
+// column default, and an UPDATE that actually changes value takes it through
+// the BEFORE UPDATE trigger, so an identical rewrite keeps the revision it
+// had. Because the counter is table-level rather than per-row, a key deleted
+// and recreated always comes back above every revision it ever had, and
+// revisions may skip numbers.
+//
+// It is idempotent and upgrades a v3 database in place: the ALTERs add the
+// column at revision 1 for the rows already there and repoint its default at
+// the sequence, and the setval lifts the sequence past the highest revision
+// present so the first write after the upgrade lands at 2 or higher. It is
+// safe to fold into a consumer's own migration pipeline; lib-systemplane does
+// not execute it for the caller.
 func SchemaSQL() string {
 	return schemaSQL
 }
 
 // MigrationV3ToV4SQL returns the v3 -> v4 delta as an importable artifact.
 //
-// The returned SQL adds the revision column, installs
+// The returned SQL creates the systemplane_revision_seq sequence, adds the
+// revision column at 1 for every row already stored, repoints the column
+// default at the sequence, seeds the sequence past the highest revision
+// present so the first write after the upgrade lands at 2 or higher, installs
 // systemplane_bump_revision_v4() and systemplane_notify_v4() with the three v4
-// triggers, and drops the v3 notify function. It is idempotent and it does NOT
-// create the systemplane_entries table: it upgrades a database that already
-// carries the v3 schema. A consumer starting from an empty database applies
-// SchemaSQL() instead. lib-systemplane does not execute it for the caller.
+// triggers, and drops the v3 notify function.
+//
+// It is idempotent and it does NOT create the systemplane_entries table: it
+// upgrades a database that already carries the v3 schema. A consumer starting
+// from an empty database applies SchemaSQL() instead. lib-systemplane does not
+// execute it for the caller.
 func MigrationV3ToV4SQL() string {
 	return migrationV3ToV4SQL
 }

@@ -393,12 +393,13 @@ func runUnsubscribeStops(t *testing.T, s store.Store, opts RunOptions) {
 // non-zero revision, changing it advances the revision, rewriting the same
 // value does not, and every read path reports the revision the write returned.
 //
-// It also pins the boundary of those rules. The revision lives in the row, so a
-// delete destroys it and a recreated key starts over at 1 — Postgres by the
-// column DEFAULT, MongoDB by $setOnInsert (FC-8, FC-9). "Monotonic per
-// (namespace, key)" therefore holds only for the lifetime of one row, never
-// across a delete, and a key deleted and recreated while a changefeed is
-// disconnected comes back at a LOWER revision than the one already cached.
+// It also pins the rule across a delete, which is what makes "monotonic per
+// (namespace, key)" true for the whole life of a key and not just the life of
+// one row: a key deleted and recreated comes back STRICTLY ABOVE every
+// revision it previously had. The engine fences every publication on
+// "revision greater than cached", so a recreate that came back lower — a
+// per-row counter restarting at 1 — would be rejected for good whenever the
+// delete and the recreate both happened while the changefeed was down.
 func runRevisionMonotonic(t *testing.T, s store.Store, opts RunOptions) {
 	startStore(t, s)
 
@@ -446,21 +447,16 @@ func runRevisionMonotonic(t *testing.T, s store.Store, opts RunOptions) {
 		t.Errorf("list revision = %d, want %d", listed.Revision, r3)
 	}
 
-	// Delete then recreate: the counter restarts rather than continuing from
-	// r3. Asserted, not tolerated — a backend that silently carried the old
-	// revision forward would change what the engine's revision fence may
-	// assume, and a backend that restarts is what both shipped ones do.
+	// Delete then recreate: the revision must clear the one the deleted row
+	// last carried, so a subscriber holding r3 in cache accepts the recreated
+	// value instead of fencing it out.
 	if err := s.Delete(ctx, opts.Scope, "ns", "rev", "contract"); err != nil {
 		t.Fatalf("delete before recreate: %v", err)
 	}
 
 	recreated := setEntry(ctx, t, s, opts.Scope, entry("ns", "rev", 3))
-	if recreated != 1 {
-		t.Fatalf("recreated after delete: revision = %d, want 1 (the row's counter restarts)", recreated)
-	}
-
-	if recreated > r3 {
-		t.Fatalf("recreated after delete: revision = %d, unexpectedly still above the pre-delete %d", recreated, r3)
+	if recreated <= r3 {
+		t.Fatalf("recreated after delete: revision = %d, want strictly greater than the deleted row's last revision %d", recreated, r3)
 	}
 
 	got, found, err = s.Get(ctx, opts.Scope, "ns", "rev")

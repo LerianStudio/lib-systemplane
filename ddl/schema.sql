@@ -5,33 +5,46 @@
 -- NOTIFY channel to `systemplane_changes`; the artifact carries no
 -- table/channel placeholders.
 --
--- The DDL is fully idempotent and upgrades a v3 database in place: the ALTER
--- adds the `revision` column when it is missing, and the DROP TRIGGER
--- statements precede the DROP of the v3 notify function that those triggers
--- depend on. A consumer already on v3 may instead apply the smaller delta in
--- ddl/migrate_v3_to_v4.sql.
+-- The DDL is fully idempotent and upgrades a v3 database in place: the ALTERs
+-- add the `revision` column when it is missing and point it at the sequence,
+-- and the DROP TRIGGER statements precede the DROP of the v3 notify function
+-- that those triggers depend on. A consumer already on v3 may instead apply
+-- the smaller delta in ddl/migrate_v3_to_v4.sql.
 --
--- Revision semantics: a row starts at revision 1 and is bumped by the
--- BEFORE UPDATE trigger only when `value` actually changes, so re-setting an
--- identical value refreshes `updated_at` without advancing the revision. The
--- NOTIFY payload is {"namespace","key","op","revision"}, with revision 0 on
--- delete, meaning "no row".
+-- Revision semantics: every revision is drawn from the table-level sequence
+-- `systemplane_revision_seq` — a fresh row takes it through the column
+-- default, and a value-changing UPDATE takes it through the BEFORE UPDATE
+-- trigger, so re-setting an identical value refreshes `updated_at` without
+-- advancing the revision. Because the counter is table-level rather than
+-- per-row, a key deleted and recreated always comes back ABOVE every revision
+-- it ever had, and revisions may skip numbers. On a v3 table the ALTER seeds
+-- every existing row at revision 1 and the setval lifts the sequence past the
+-- highest revision present, so the first post-migration write lands at 2 or
+-- higher. The NOTIFY payload is {"namespace","key","op","revision"}, with
+-- revision 0 on delete, meaning "no row".
+
+CREATE SEQUENCE IF NOT EXISTS systemplane_revision_seq AS BIGINT;
 
 CREATE TABLE IF NOT EXISTS systemplane_entries (
 	namespace   TEXT NOT NULL,
 	"key"       TEXT NOT NULL,
 	value       JSONB NOT NULL,
-	revision    BIGINT NOT NULL DEFAULT 1,
+	revision    BIGINT NOT NULL DEFAULT nextval('systemplane_revision_seq'),
 	updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
 	updated_by  TEXT NOT NULL DEFAULT '',
 	PRIMARY KEY (namespace, "key")
 );
 
 ALTER TABLE systemplane_entries ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;
+ALTER TABLE systemplane_entries ALTER COLUMN revision SET DEFAULT nextval('systemplane_revision_seq');
+SELECT setval('systemplane_revision_seq', GREATEST(
+	(SELECT COALESCE(MAX(revision), 1) FROM systemplane_entries),
+	(SELECT last_value FROM systemplane_revision_seq)
+));
 
 CREATE OR REPLACE FUNCTION systemplane_bump_revision_v4() RETURNS TRIGGER AS $$
 BEGIN
-	NEW.revision := OLD.revision + 1;
+	NEW.revision := nextval('systemplane_revision_seq');
 	RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;

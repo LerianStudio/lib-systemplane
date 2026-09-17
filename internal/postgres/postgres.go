@@ -339,9 +339,13 @@ func (s *Store) Get(ctx context.Context, scope store.Scope, namespace, key strin
 }
 
 // Set persists an entry using INSERT ... ON CONFLICT (namespace, key) DO UPDATE
-// and returns the revision now stored: 1 on insert, one higher than the
-// previous revision when the value changed, and unchanged when the written
-// value is identical to the stored one.
+// and returns the revision now stored. The number comes from the table-level
+// systemplane_revision_seq sequence, never from the row: an insert takes it
+// through the column default, a write that changes the value takes it through
+// the BEFORE UPDATE trigger, and a write of an identical value leaves the
+// revision the row already carried (the set-list deliberately omits it). A key
+// deleted and recreated therefore always exceeds every revision it previously
+// had, and revisions may skip numbers.
 func (s *Store) Set(ctx context.Context, scope store.Scope, e store.Entry) (int64, error) {
 	if s == nil || s.isClosed() {
 		return 0, store.ErrClosed

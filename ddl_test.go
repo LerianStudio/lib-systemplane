@@ -26,17 +26,22 @@ func TestSchemaSQL_ContainsCanonicalStatements(t *testing.T) {
 	// nothing else fails when it drifts. These fragments are the drift guard:
 	// a change to the table/function/trigger shape has to be made here too.
 	wantFragments := []string{
+		"CREATE SEQUENCE IF NOT EXISTS systemplane_revision_seq AS BIGINT;",
 		"CREATE TABLE IF NOT EXISTS systemplane_entries (",
 		"namespace   TEXT NOT NULL,",
 		`"key"       TEXT NOT NULL,`,
 		"value       JSONB NOT NULL,",
-		"revision    BIGINT NOT NULL DEFAULT 1,",
+		"revision    BIGINT NOT NULL DEFAULT nextval('systemplane_revision_seq'),",
 		"updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),",
 		"updated_by  TEXT NOT NULL DEFAULT '',",
 		`PRIMARY KEY (namespace, "key")`,
 		"ALTER TABLE systemplane_entries ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;",
+		"ALTER TABLE systemplane_entries ALTER COLUMN revision SET DEFAULT nextval('systemplane_revision_seq');",
+		"SELECT setval('systemplane_revision_seq', GREATEST(",
+		"(SELECT COALESCE(MAX(revision), 1) FROM systemplane_entries),",
+		"(SELECT last_value FROM systemplane_revision_seq)",
 		"CREATE OR REPLACE FUNCTION systemplane_bump_revision_v4() RETURNS TRIGGER AS $$",
-		"NEW.revision := OLD.revision + 1;",
+		"NEW.revision := nextval('systemplane_revision_seq');",
 		"CREATE OR REPLACE FUNCTION systemplane_notify_v4() RETURNS TRIGGER AS $$",
 		"PERFORM pg_notify(TG_ARGV[0], json_build_object(",
 		"'op',        'delete'",
@@ -63,6 +68,43 @@ func TestSchemaSQL_ContainsCanonicalStatements(t *testing.T) {
 		if !strings.Contains(sql, frag) {
 			t.Errorf("SchemaSQL() missing canonical fragment:\n%q", frag)
 		}
+	}
+
+	assertDropsTriggersBeforeFunction(t, "SchemaSQL()", sql)
+	assertNoV3FunctionDefinition(t, "SchemaSQL()", sql)
+}
+
+// assertDropsTriggersBeforeFunction pins the ordering both published artifacts
+// depend on: the v3 triggers are bound to systemplane_notify_v3(), so EVERY
+// DROP TRIGGER has to precede the DROP FUNCTION or Postgres refuses the file
+// with a dependency error. LastIndex, not Index: one late DROP TRIGGER after
+// the function is gone is exactly the drift this guards.
+func assertDropsTriggersBeforeFunction(t *testing.T, artifact, sql string) {
+	t.Helper()
+
+	lastDropTrigger := strings.LastIndex(sql, "DROP TRIGGER IF EXISTS")
+	dropFunction := strings.Index(sql, "DROP FUNCTION IF EXISTS systemplane_notify_v3();")
+
+	if lastDropTrigger < 0 {
+		t.Fatalf("%s missing DROP TRIGGER statements", artifact)
+	}
+
+	if dropFunction < 0 {
+		t.Fatalf("%s missing DROP FUNCTION IF EXISTS systemplane_notify_v3();", artifact)
+	}
+
+	if lastDropTrigger > dropFunction {
+		t.Errorf("%s drops systemplane_notify_v3() at index %d before its last DROP TRIGGER at index %d; every dependent trigger must be dropped first", artifact, dropFunction, lastDropTrigger)
+	}
+}
+
+// assertNoV3FunctionDefinition pins that neither artifact re-creates the v3
+// notify function it just dropped.
+func assertNoV3FunctionDefinition(t *testing.T, artifact, sql string) {
+	t.Helper()
+
+	if strings.Contains(sql, "CREATE OR REPLACE FUNCTION systemplane_notify_v3()") {
+		t.Errorf("%s defines systemplane_notify_v3(); v4 replaces it with systemplane_notify_v4()", artifact)
 	}
 }
 
@@ -131,8 +173,24 @@ func TestMigrationV3ToV4SQL_IsTheDeltaOnly(t *testing.T) {
 
 	sql := systemplane.MigrationV3ToV4SQL()
 
-	if !strings.Contains(sql, "ALTER TABLE systemplane_entries ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;") {
-		t.Error("MigrationV3ToV4SQL() missing the revision ALTER TABLE")
+	// The sequence is what makes a migrated revision monotonic across a
+	// delete: the column is added at 1 for the rows already there, its default
+	// switches to the sequence, and the sequence is seeded past every existing
+	// revision so the first post-migration write lands above them.
+	wantFragments := []string{
+		"CREATE SEQUENCE IF NOT EXISTS systemplane_revision_seq AS BIGINT;",
+		"ALTER TABLE systemplane_entries ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;",
+		"ALTER TABLE systemplane_entries ALTER COLUMN revision SET DEFAULT nextval('systemplane_revision_seq');",
+		"SELECT setval('systemplane_revision_seq', GREATEST(",
+		"(SELECT COALESCE(MAX(revision), 1) FROM systemplane_entries),",
+		"(SELECT last_value FROM systemplane_revision_seq)",
+		"NEW.revision := nextval('systemplane_revision_seq');",
+	}
+
+	for _, frag := range wantFragments {
+		if !strings.Contains(sql, frag) {
+			t.Errorf("MigrationV3ToV4SQL() missing fragment:\n%q", frag)
+		}
 	}
 
 	// The migration upgrades an existing v3 database in place; provisioning a
@@ -141,21 +199,6 @@ func TestMigrationV3ToV4SQL_IsTheDeltaOnly(t *testing.T) {
 		t.Error("MigrationV3ToV4SQL() must not contain a table creation statement")
 	}
 
-	// The v3 triggers depend on systemplane_notify_v3(), so every DROP TRIGGER
-	// has to precede the DROP FUNCTION or Postgres refuses with a dependency
-	// error.
-	firstDropTrigger := strings.Index(sql, "DROP TRIGGER IF EXISTS")
-	dropFunction := strings.Index(sql, "DROP FUNCTION IF EXISTS systemplane_notify_v3();")
-
-	if firstDropTrigger < 0 {
-		t.Fatal("MigrationV3ToV4SQL() missing DROP TRIGGER statements")
-	}
-
-	if dropFunction < 0 {
-		t.Fatal("MigrationV3ToV4SQL() missing DROP FUNCTION IF EXISTS systemplane_notify_v3();")
-	}
-
-	if firstDropTrigger > dropFunction {
-		t.Errorf("MigrationV3ToV4SQL() drops systemplane_notify_v3() at index %d before the first DROP TRIGGER at index %d; the dependent triggers must be dropped first", dropFunction, firstDropTrigger)
-	}
+	assertDropsTriggersBeforeFunction(t, "MigrationV3ToV4SQL()", sql)
+	assertNoV3FunctionDefinition(t, "MigrationV3ToV4SQL()", sql)
 }

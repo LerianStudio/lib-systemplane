@@ -474,11 +474,13 @@ func freshStore(t *testing.T, prefix string) *postgres.Store {
 }
 
 // TestIntegration_PostgresSetReturnsRevision pins FC-2's revision contract on
-// the Postgres write path: the first write stores revision 1, a write of a
-// DIFFERENT value advances it, a write of the SAME value does not (the BEFORE
-// UPDATE trigger is gated on OLD.value IS DISTINCT FROM NEW.value and the
-// ON CONFLICT DO UPDATE set-list deliberately omits revision), and both read
-// paths report exactly the number Set reported.
+// the Postgres write path: the first write stores a non-zero revision, a write
+// of a DIFFERENT value advances it, a write of the SAME value does not (the
+// BEFORE UPDATE trigger is gated on OLD.value IS DISTINCT FROM NEW.value and
+// the ON CONFLICT DO UPDATE set-list deliberately omits revision), and both
+// read paths report exactly the number Set reported. The numbers themselves
+// come from the table-level systemplane_revision_seq, so the test asserts the
+// relations between them and never a literal — revisions may skip.
 func TestIntegration_PostgresSetReturnsRevision(t *testing.T) {
 	s := freshStore(t, "rev")
 	ctx := context.Background()
@@ -494,23 +496,25 @@ func TestIntegration_PostgresSetReturnsRevision(t *testing.T) {
 		return rev
 	}
 
-	if got := set("v1"); got != 1 {
-		t.Fatalf("first Set revision = %d, want 1", got)
+	first := set("v1")
+	if first <= 0 {
+		t.Fatalf("first Set revision = %d, want greater than 0", first)
 	}
 
-	assertRevision(t, s, ctx, 1)
+	assertRevision(t, s, ctx, first)
 
-	if got := set("v2"); got != 2 {
-		t.Fatalf("Set of a different value revision = %d, want 2", got)
+	changed := set("v2")
+	if changed <= first {
+		t.Fatalf("Set of a different value revision = %d, want greater than %d", changed, first)
 	}
 
-	assertRevision(t, s, ctx, 2)
+	assertRevision(t, s, ctx, changed)
 
-	if got := set("v2"); got != 2 {
-		t.Fatalf("Set of an identical value revision = %d, want 2 (unchanged)", got)
+	if got := set("v2"); got != changed {
+		t.Fatalf("Set of an identical value revision = %d, want the unchanged %d", got, changed)
 	}
 
-	assertRevision(t, s, ctx, 2)
+	assertRevision(t, s, ctx, changed)
 }
 
 // assertRevision checks that Get and the matching List entry both report want.
@@ -728,12 +732,14 @@ func TestIntegration_PostgresScopedCRUDIsolation(t *testing.T) {
 		return v, true
 	}
 
-	if rev := set(scope1, "value-t1"); rev != 1 {
-		t.Errorf("t1 first Set revision = %d, want 1", rev)
+	// Each tenant database carries its own revision sequence, so the only
+	// portable claim about a first write is that it stored something.
+	if rev := set(scope1, "value-t1"); rev <= 0 {
+		t.Errorf("t1 first Set revision = %d, want greater than 0", rev)
 	}
 
-	if rev := set(scope2, "value-t2"); rev != 1 {
-		t.Errorf("t2 first Set revision = %d, want 1", rev)
+	if rev := set(scope2, "value-t2"); rev <= 0 {
+		t.Errorf("t2 first Set revision = %d, want greater than 0", rev)
 	}
 
 	if got, found := get(scope1); !found || got != "value-t1" {
@@ -1804,11 +1810,12 @@ func TestIntegration_PostgresEventCarriesRevision(t *testing.T) {
 		t.Fatalf("delete event revision = %d, want 0", deleted.Revision)
 	}
 
-	// Recreate. INSERT ... ON CONFLICT leaves revision to the column DEFAULT
-	// and the bump trigger is BEFORE UPDATE only, so the new row is revision 1
-	// however high the old one had climbed.
-	if recreated := set("recreate after delete", "v3"); recreated != 1 {
-		t.Fatalf("recreated after delete: Set reported revision %d, want 1", recreated)
+	// Recreate. INSERT ... ON CONFLICT leaves revision to the column DEFAULT,
+	// which is nextval on the table-level sequence, so the new row lands above
+	// everything the key ever carried.
+	recreated := set("recreate after delete", "v3")
+	if recreated <= climbed {
+		t.Fatalf("recreated after delete: Set reported revision %d, want greater than the pre-delete %d", recreated, climbed)
 	}
 
 	back := recvEvent(t, events, "the upsert recreating ns/k")
@@ -1816,11 +1823,7 @@ func TestIntegration_PostgresEventCarriesRevision(t *testing.T) {
 		t.Fatalf("event = %+v, want an upsert of ns/k", back)
 	}
 
-	if back.Revision != 1 {
-		t.Fatalf("recreate event revision = %d, want 1", back.Revision)
-	}
-
-	if back.Revision >= climbed {
-		t.Fatalf("recreate event revision = %d, unexpectedly not below the pre-delete %d", back.Revision, climbed)
+	if back.Revision != recreated {
+		t.Fatalf("recreate event revision = %d, want %d (what Set reported)", back.Revision, recreated)
 	}
 }
