@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -604,5 +605,185 @@ func TestGroupSetOnNilGroupReturnsErrClosed(t *testing.T) {
 
 	if err := g.Set(context.Background(), groupDefaults(), "actor"); !errors.Is(err, systemplane.ErrClosed) {
 		t.Fatalf("Set error = %v, want ErrClosed", err)
+	}
+}
+
+// groupDocumentAlpha and groupDocumentBeta differ in every field, so a
+// snapshot that mixed the two — a name from one and a retry count from the
+// other — is detectable by comparing the whole document against each.
+func groupDocumentAlpha() groupConfig {
+	return groupConfig{Name: "alpha", Retries: 1, Hosts: []string{"a1"}}
+}
+
+func groupDocumentBeta() groupConfig {
+	return groupConfig{Name: "beta", Retries: 22, Hosts: []string{"b1", "b2", "b3"}}
+}
+
+// TestGroupDocumentIsAtomicAcrossFields pins the guarantee a group exists for:
+// a group is one key holding one JSON document, so a write replaces every
+// field at once and a concurrent reader never sees a mix of old and new.
+// The defaults are alpha, so alpha and beta are the only two documents that
+// ever exist and any third observation is a torn read.
+func TestGroupDocumentIsAtomicAcrossFields(t *testing.T) {
+	t.Parallel()
+
+	alpha, beta := groupDocumentAlpha(), groupDocumentBeta()
+
+	c := newGroupClient(t)
+
+	g, err := systemplane.Bind(c, "runtime", "ingest", alpha, nil)
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	var (
+		failMu  sync.Mutex
+		failure string
+	)
+
+	fail := func(format string, args ...any) {
+		failMu.Lock()
+		defer failMu.Unlock()
+
+		if failure == "" {
+			failure = fmt.Sprintf(format, args...)
+		}
+	}
+
+	const writes = 200
+
+	var (
+		wg    sync.WaitGroup
+		reads atomic.Int64
+		done  = make(chan struct{})
+	)
+
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+		defer close(done)
+
+		for i := range writes {
+			// Every write changes all three fields at once; the last one is
+			// alpha, so the settled document is known.
+			want := beta
+			if i%2 == 1 {
+				want = alpha
+			}
+
+			if err := g.Set(ctx, want, "actor"); err != nil {
+				fail("Set: %v", err)
+
+				return
+			}
+		}
+	}()
+
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+
+			snap, err := g.Snapshot(ctx)
+			if err != nil {
+				fail("Snapshot: %v", err)
+
+				return
+			}
+
+			reads.Add(1)
+
+			if !reflect.DeepEqual(snap.Value, alpha) && !reflect.DeepEqual(snap.Value, beta) {
+				fail("Snapshot.Value = %#v, which is neither %#v nor %#v — a reader saw a half-updated document", snap.Value, alpha, beta)
+
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+
+	failMu.Lock()
+	observed := failure
+	failMu.Unlock()
+
+	if observed != "" {
+		t.Fatal(observed)
+	}
+
+	if reads.Load() == 0 {
+		t.Fatal("the reader observed no snapshot at all, so the test asserted nothing")
+	}
+
+	settled, err := g.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot after the writer finished: %v", err)
+	}
+
+	if !reflect.DeepEqual(settled.Value, alpha) {
+		t.Fatalf("settled Snapshot.Value = %#v, want the last written document %#v", settled.Value, alpha)
+	}
+}
+
+// TestGroupDocumentPartialDecodeIsRejected covers the defensive decode path:
+// a document whose nested slice holds an object where a string belongs decodes
+// its scalar fields cleanly, so a decoder that kept whatever it managed to fill
+// would hand the consumer a T with a half-filled slice. Snapshot returns the
+// error and a zero Value instead.
+//
+// This is D-G4's defence-in-depth assertion, not a statement about invalid
+// rows in the shipped system: once the engine's ingress lands, such a row is
+// rejected before publication and the group keeps the last valid value, or the
+// registered default when nothing valid was ever published. It is assertable
+// here only because the wave-1 facade hydrates without validating, which is the
+// sole reason the row can reach a reader at all.
+func TestGroupDocumentPartialDecodeIsRejected(t *testing.T) {
+	t.Parallel()
+
+	s := newGroupMemoryStore()
+	s.seed(t, "runtime", "ingest", map[string]any{
+		"name":    "seeded",
+		"retries": 7,
+		"hosts":   []any{"ok", map[string]any{"not": "a host"}},
+	})
+
+	c := newGroupClientOn(t, s)
+
+	g, err := systemplane.Bind(c, "runtime", "ingest", groupDefaults(), nil)
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	snap, err := g.Snapshot(ctx)
+	if !errors.Is(err, systemplane.ErrValidation) {
+		t.Fatalf("Snapshot error = %v, want ErrValidation", err)
+	}
+
+	var typeErr *json.UnmarshalTypeError
+	if !errors.As(err, &typeErr) {
+		t.Fatalf("Snapshot error = %v, want one that resolves to *json.UnmarshalTypeError", err)
+	}
+
+	var zero groupConfig
+	if !reflect.DeepEqual(snap.Value, zero) {
+		t.Fatalf("Snapshot.Value = %#v, want the zero value — the scalar fields decoded, so anything else is a half-filled document", snap.Value)
 	}
 }
