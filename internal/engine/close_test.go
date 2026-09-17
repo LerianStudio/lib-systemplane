@@ -540,3 +540,29 @@ func TestDropScopeLeavesOtherScopesWorkersRunning(t *testing.T) {
 		t.Fatalf("Close() = %v, want nil", err)
 	}
 }
+
+// TestCloseDoesNotCloseTheStore pins the ownership line between the Client and
+// the engine. The Client opens the backend, hands it to the engine, and closes
+// it after the engine has stopped using it. An engine that closed the store
+// itself would break every caller that outlives one engine — NewForTesting
+// most visibly — by tearing down a connection it never opened.
+func TestCloseDoesNotCloseTheStore(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	fs := newFakeStore()
+
+	fs.resyncOnSubscribe()
+
+	e := startEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs)
+
+	if err := e.Start(startCtx(t, 2*time.Second)); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if got := fs.closeCount(); got != 0 {
+		t.Errorf("Engine.Close closed the store %d times, want 0: the Client owns the store's lifecycle", got)
+	}
+}

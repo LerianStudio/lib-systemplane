@@ -54,6 +54,13 @@ func (r *recorder) len() int {
 	return len(r.got)
 }
 
+func (r *recorder) changes() []Change {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return append([]Change(nil), r.got...)
+}
+
 func (r *recorder) revisions() []int64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -347,4 +354,105 @@ func TestSameRevisionPublishedTwiceDeliversOnce(t *testing.T) {
 	if got := rec.revisions(); len(got) != 1 || got[0] != 7 {
 		t.Errorf("delivered revisions: got %v, want [7]", got)
 	}
+}
+
+// TestUnsubscribeRemovesOnlyItsOwnSubscription pins that unsubscribe is
+// identity-based. Two subscriptions of one key are indistinguishable by
+// function value — the same func may be registered twice — so a removal that
+// drops whichever subscription happens to sit first silently cancels a
+// bystander. Here the dropped subscription is the SECOND one registered, so a
+// drop-the-first removal takes the survivor instead and the survivor's first
+// delivery never arrives.
+//
+// The second unsubscribe is the other half: repeating it must remove nothing,
+// not the next subscriber that inherited the freed slot.
+func TestUnsubscribeRemovesOnlyItsOwnSubscription(t *testing.T) {
+	e := dispatchEngine(t)
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+
+	var kept, dropped recorder
+
+	unsubKept := e.OnChange(nk, kept.record)
+	defer unsubKept()
+
+	unsubDropped := e.OnChange(nk, dropped.record)
+	unsubDropped()
+
+	e.publish(pub(nk, 1, "v1"))
+	waitFor(t, time.Second, "the surviving subscriber's first delivery", func() bool {
+		return kept.len() == 1
+	})
+
+	// Deliveries for one key run serially in registration order, so the
+	// survivor's delivery already proves the dropped one was skipped; the
+	// pause only covers a delivery ordered after it.
+	time.Sleep(50 * time.Millisecond)
+
+	if got := dropped.len(); got != 0 {
+		t.Fatalf("the unsubscribed subscriber received %d deliveries, want 0", got)
+	}
+
+	unsubDropped()
+
+	e.publish(pub(nk, 2, "v2"))
+	waitFor(t, time.Second, "the surviving subscriber's second delivery", func() bool {
+		return kept.len() == 2
+	})
+
+	if got := dropped.len(); got != 0 {
+		t.Errorf("after a repeated unsubscribe the dropped subscriber received %d deliveries, want 0", got)
+	}
+}
+
+// TestDispatchIsolatesScopesAndNamesTheTenant pins the two halves of FC-4's
+// scope rule with one subscription. OnChange covers a key in EVERY scope, so
+// the callback is told which one fired through Change.Tenant — hard-wiring it
+// to "" leaves a tenant subscriber unable to tell whose configuration changed.
+// And the delivery workers are keyed by (scope, key), not by key alone, so a
+// blocked single-tenant delivery cannot hold a tenant's delivery of the same
+// key behind it.
+func TestDispatchIsolatesScopesAndNamesTheTenant(t *testing.T) {
+	e := dispatchEngine(t)
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	tenant := store.Scope{Tenant: "t1"}
+
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+
+	var tenantRec recorder
+
+	var once sync.Once
+
+	unsub := e.OnChange(nk, func(ctx context.Context, ch Change) {
+		if ch.Tenant == "" {
+			once.Do(func() { close(blocked) })
+
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+
+			return
+		}
+
+		tenantRec.record(ctx, ch)
+	})
+	defer unsub()
+
+	e.publish(publication{Scope: store.Scope{}, NSKey: nk, Revision: 1, Value: "single"})
+	<-blocked
+
+	e.publish(publication{Scope: tenant, NSKey: nk, Revision: 1, Value: "t1"})
+
+	waitFor(t, 500*time.Millisecond, "the tenant delivery while the single-tenant one is blocked", func() bool {
+		return tenantRec.len() == 1
+	})
+
+	got := tenantRec.changes()[0]
+	if got.Tenant != "t1" || got.Namespace != nk.Namespace || got.Key != nk.Key {
+		t.Errorf("tenant delivery: got (%q, %q/%q), want (\"t1\", %q/%q)",
+			got.Tenant, got.Namespace, got.Key, nk.Namespace, nk.Key)
+	}
+
+	close(release)
 }

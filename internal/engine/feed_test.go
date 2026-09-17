@@ -5,6 +5,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -393,5 +394,140 @@ func TestRepeatedDisconnectIsIdempotent(t *testing.T) {
 
 	if gen != 2 {
 		t.Errorf("disconnect generation after two disconnects: got %d, want 2", gen)
+	}
+}
+
+// blockingSubscriber registers a subscriber of nk that parks inside its first
+// delivery until the test ends, and returns a channel closed once it is parked.
+// It is how a test holds one key's delivery worker hostage while asserting
+// that nothing upstream of it waits.
+func blockingSubscriber(t *testing.T, e *Engine, nk NSKey) (parked <-chan struct{}) {
+	t.Helper()
+
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+
+	var once sync.Once
+
+	unsub := e.OnChange(nk, func(ctx context.Context, _ Change) {
+		once.Do(func() { close(blocked) })
+
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+	})
+
+	// Released before the engine cleanup runs, so a failed assertion never
+	// leaves a parked callback for goleak to report as the real problem.
+	t.Cleanup(func() {
+		close(release)
+		unsub()
+	})
+
+	return blocked
+}
+
+// emitAsync plays evt into the engine from a goroutine of its own and returns
+// a channel closed when onEvent returns. Every event in these tests is played
+// this way, including the first: a callback that invoked subscribers inline
+// would park on the FIRST delivery, and a test that played that one
+// synchronously would hang instead of failing.
+func emitAsync(e *Engine, evt store.Event) <-chan struct{} {
+	returned := make(chan struct{})
+
+	go func() {
+		defer close(returned)
+
+		e.onEvent(evt)
+	}()
+
+	return returned
+}
+
+// mustReturnQuickly fails unless done is closed inside the window. It is the
+// assertion that the changefeed goroutine is not inside a subscriber.
+func mustReturnQuickly(t *testing.T, done <-chan struct{}, what string) {
+	t.Helper()
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("%s did not return within 500ms: the changefeed goroutine is waiting on a subscriber", what)
+	}
+}
+
+// TestUpsertEventNeverBlocksOnASubscriber pins the rule the whole dispatch
+// queue exists for: the callback the backend hands its changefeed goroutine to
+// must never wait on consumer code. One slow subscriber would otherwise stall
+// the pump for every other key — and, once tenants share a connection, for
+// every other tenant.
+func TestUpsertEventNeverBlocksOnASubscriber(t *testing.T) {
+	keyA := NSKey{Namespace: "billing", Key: "a"}
+	keyB := NSKey{Namespace: "billing", Key: "b"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	e := feedEngine(t, map[NSKey]KeyDef{keyA: {Default: "da"}, keyB: {Default: "db"}}, fs, 0)
+
+	fs.seed(scope, jsonRow(keyA, 1, `"a1"`, "ops"))
+
+	parked := blockingSubscriber(t, e, keyA)
+
+	var recB recorder
+
+	unsubB := e.OnChange(keyB, recB.record)
+	defer unsubB()
+
+	first := emitAsync(e, upsertEvent(scope, keyA, 1))
+	<-parked
+	mustReturnQuickly(t, first, "the changefeed callback that started the blocked delivery")
+
+	fs.seed(scope, jsonRow(keyA, 2, `"a2"`, "ops"))
+	mustReturnQuickly(t, emitAsync(e, upsertEvent(scope, keyA, 2)),
+		"the changefeed callback for a key whose subscriber is blocked")
+
+	fs.seed(scope, jsonRow(keyB, 1, `"b1"`, "ops"))
+	mustReturnQuickly(t, emitAsync(e, upsertEvent(scope, keyB, 1)), "the changefeed callback for another key")
+
+	waitFor(t, 500*time.Millisecond, "key b's delivery while key a's subscriber is blocked", func() bool {
+		return recB.len() == 1
+	})
+}
+
+// TestDeleteEventNeverBlocksOnASubscriber is the same rule for the delete
+// path, which reaches publish without passing through the debouncer: a delete
+// is self-describing, so it is applied inline on the changefeed goroutine and
+// would be the one operation able to park that goroutine in a subscriber.
+func TestDeleteEventNeverBlocksOnASubscriber(t *testing.T) {
+	keyA := NSKey{Namespace: "billing", Key: "a"}
+	keyB := NSKey{Namespace: "billing", Key: "b"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	e := feedEngine(t, map[NSKey]KeyDef{keyA: {Default: "da"}, keyB: {Default: "db"}}, fs, 0)
+
+	fs.seed(scope, jsonRow(keyA, 1, `"a1"`, "ops"))
+
+	parked := blockingSubscriber(t, e, keyA)
+
+	var recB recorder
+
+	unsubB := e.OnChange(keyB, recB.record)
+	defer unsubB()
+
+	first := emitAsync(e, upsertEvent(scope, keyA, 1))
+	<-parked
+	mustReturnQuickly(t, first, "the changefeed callback that started the blocked delivery")
+
+	mustReturnQuickly(t, emitAsync(e, deleteEvent(scope, keyA)),
+		"the changefeed delete callback for a key whose subscriber is blocked")
+
+	mustReturnQuickly(t, emitAsync(e, deleteEvent(scope, keyB)), "the changefeed delete callback for another key")
+
+	waitFor(t, 500*time.Millisecond, "key b's default while key a's subscriber is blocked", func() bool {
+		return recB.len() == 1
+	})
+
+	if got := recB.changes()[0]; got.Revision != 0 || got.Value != "db" {
+		t.Errorf("delete delivery for key b: got (%v, rev %d), want (\"db\", rev 0)", got.Value, got.Revision)
 	}
 }

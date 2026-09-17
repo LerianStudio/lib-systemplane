@@ -44,6 +44,7 @@ type fakeStore struct {
 	getCalls       int
 	listCalls      int
 	subscribeCalls int
+	closeCalls     int
 	liveSubs       int
 
 	nextSubID int
@@ -140,6 +141,18 @@ func (f *fakeStore) listCount() int {
 	return f.listCalls
 }
 
+// closeCount reports how often the engine closed the store. The Client opens
+// the store and owns its lifecycle, so the answer after Engine.Close must
+// stay zero: an engine that closed a store it did not open would pull the
+// backend out from under NewForTesting and under any Client that outlives one
+// engine.
+func (f *fakeStore) closeCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.closeCalls
+}
+
 func (f *fakeStore) subscribeCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -177,7 +190,14 @@ func (f *fakeStore) emit(evt store.Event) {
 
 func (f *fakeStore) Start(context.Context) error { return nil }
 
-func (f *fakeStore) Close() error { return nil }
+func (f *fakeStore) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.closeCalls++
+
+	return nil
+}
 
 func (f *fakeStore) Get(ctx context.Context, scope store.Scope, ns, key string) (store.Entry, bool, error) {
 	f.mu.Lock()

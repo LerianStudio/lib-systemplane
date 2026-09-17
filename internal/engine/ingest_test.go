@@ -5,9 +5,7 @@ package engine
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
@@ -155,31 +153,6 @@ func TestIngestClonesRegisteredDefault(t *testing.T) {
 	if registered["limit"] != float64(10) {
 		t.Errorf("mutating the cached default reached the registry: got %v, want 10", registered["limit"])
 	}
-}
-
-// recordingLogger captures every entry the engine emits, flattened to one
-// string per entry, which is all this file asserts on: that a panicking
-// validator produced a recovery entry, and that no entry carries the panic
-// value. The embedded no-op supplies the rest of log.Logger.
-type recordingLogger struct {
-	log.Logger
-
-	mu      sync.Mutex
-	entries []string
-}
-
-func (r *recordingLogger) Log(_ context.Context, level int, msg string, fields ...any) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	r.entries = append(r.entries, fmt.Sprintf("level=%d msg=%q fields=%v", level, msg, fields))
-}
-
-func (r *recordingLogger) all() []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	return append([]string(nil), r.entries...)
 }
 
 // TestIngestRejectsPanickingValidatorWithoutLeakingPanicValue pins the
