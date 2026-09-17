@@ -7,6 +7,15 @@
 // DSN comes from the tenant connector, so the first Subscribe for that tenant
 // opens a dedicated LISTEN connection, every later subscriber shares it, and
 // the last one to leave closes it.
+//
+// NOTIFY is database-scoped and every feed listens on the same channel name,
+// so the DSN resolved for a tenant MUST name a database no other tenant
+// shares. Two tenants sharing one database (schema-per-tenant through a
+// search_path in the DSN) would each receive the other's notifications
+// stamped with their OWN scope, and the engine's revision fence would treat
+// the other tenant's revision as authoritative. Values never cross — every
+// read re-resolves through the tenant's own handle — but notifications and
+// revisions would.
 package postgres
 
 import (

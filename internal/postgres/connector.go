@@ -12,6 +12,14 @@ import (
 // Connector resolves a tenant's Postgres handle and LISTEN DSN.
 type Connector interface {
 	ResolveDB(ctx context.Context, tenantID string) (dbresolver.DB, error)
+
+	// ResolveDSN returns the connection string for the tenant's LISTEN
+	// connection. The DSN MUST name a database no other tenant shares:
+	// NOTIFY is database-scoped and every feed listens on the same channel
+	// name, so two tenants in one database (schema-per-tenant through a
+	// search_path) would each receive the other's notifications stamped with
+	// their own scope, and the revision fence would act on them. Values never
+	// cross; notifications and revisions would.
 	ResolveDSN(ctx context.Context, tenantID string) (string, error)
 }
 
