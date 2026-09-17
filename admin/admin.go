@@ -228,14 +228,37 @@ func handleList(client *systemplane.Client) fiber.Handler {
 			Entries:   make([]entryResponse, 0, len(entries)),
 		}
 
+		// List is used only to enumerate the namespace's registered keys, in
+		// its already-sorted order; the value it returned is deliberately
+		// discarded. Value, revision, provenance and freshness all come from
+		// one GetEntry read per key, so an entry can never publish a value
+		// next to a revision that does not describe it.
+		//
+		// ponytail: N reads per listing, on an operator-facing route at
+		// roughly 50 registered keys. Upgrade path is a revision-carrying
+		// ListEntry from the engine, if a consumer ever registers enough keys
+		// for it to matter.
 		for _, e := range entries {
+			entry, ok, readErr := client.GetEntry(c.Context(), namespace, e.Key)
+			if readErr != nil {
+				return mapSentinelErr(c, readErr)
+			}
+
+			if !ok {
+				continue
+			}
+
 			policy := client.KeyRedaction(namespace, e.Key)
-			redacted := systemplane.ApplyRedaction(e.Value, policy)
+			redacted := systemplane.ApplyRedaction(entry.Value, policy)
 
 			resp.Entries = append(resp.Entries, entryResponse{
 				Key:         e.Key,
 				Value:       redacted,
 				Description: e.Description,
+				Revision:    entry.Revision,
+				UpdatedAt:   nilIfZeroTime(entry.UpdatedAt),
+				UpdatedBy:   entry.UpdatedBy,
+				Stale:       entry.Stale,
 			})
 		}
 

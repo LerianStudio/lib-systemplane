@@ -18,9 +18,13 @@ type listResponse struct {
 }
 
 type entryResponse struct {
-	Key         string `json:"key"`
-	Value       any    `json:"value"`
-	Description string `json:"description,omitempty"`
+	Key         string     `json:"key"`
+	Value       any        `json:"value"`
+	Description string     `json:"description,omitempty"`
+	Revision    int64      `json:"revision"`
+	UpdatedAt   *time.Time `json:"updatedAt"`
+	UpdatedBy   string     `json:"updatedBy"`
+	Stale       bool       `json:"stale"`
 }
 
 type getResponse struct {

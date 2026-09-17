@@ -31,6 +31,17 @@ type fakeStore struct {
 	// actor-extractor output all the way to the store.
 	lastDeleteActor string
 
+	// getErr, when non-nil, is returned by every Get so a test can drive the
+	// "one key of a listing cannot be read" path.
+	getErr error
+
+	// listValues overrides, per key, the value List reports while Get keeps
+	// reporting the one in entries. It exists so a test can prove the listing
+	// handler takes each value from its own GetEntry read and not from the
+	// List result: with the two disagreeing, reading the value from List
+	// renders the wrong string.
+	listValues map[string][]byte
+
 	getCalls    int
 	setCalls    int
 	deleteCalls int
@@ -45,7 +56,10 @@ type fakeStoreCalls struct {
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{entries: make(map[string]systemplane.TestEntry)}
+	return &fakeStore{
+		entries:    make(map[string]systemplane.TestEntry),
+		listValues: make(map[string][]byte),
+	}
 }
 
 func fakeKey(ns, key string) string { return ns + "\x00" + key }
@@ -58,9 +72,23 @@ func (f *fakeStore) Get(_ context.Context, _ systemplane.TestScope, ns, key stri
 	defer f.mu.Unlock()
 
 	f.getCalls++
+
+	if f.getErr != nil {
+		return systemplane.TestEntry{}, false, f.getErr
+	}
+
 	e, ok := f.entries[fakeKey(ns, key)]
 
 	return e, ok, nil
+}
+
+// SetGetErr makes every subsequent Get fail with err. Locked-write so it is
+// safe to flip after Start, while the client may already be reading.
+func (f *fakeStore) SetGetErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.getErr = err
 }
 
 func (f *fakeStore) Set(_ context.Context, _ systemplane.TestScope, e systemplane.TestEntry) (int64, error) {
@@ -101,10 +129,24 @@ func (f *fakeStore) List(_ context.Context, _ systemplane.TestScope) ([]systempl
 	out := make([]systemplane.TestEntry, 0, len(f.entries))
 
 	for _, e := range f.entries {
+		if v, overridden := f.listValues[fakeKey(e.Namespace, e.Key)]; overridden {
+			e.Value = v
+		}
+
 		out = append(out, e)
 	}
 
 	return out, nil
+}
+
+// SetListValue makes List report value for ns/key while Get keeps reporting
+// whatever entries holds. Locked-write, like SetGetErr, so it is safe to call
+// after Start.
+func (f *fakeStore) SetListValue(ns, key string, value []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.listValues[fakeKey(ns, key)] = value
 }
 
 func (f *fakeStore) ResetCalls() {
@@ -848,6 +890,8 @@ func decodeBody(t *testing.T, resp *http.Response) (map[string]any, string) {
 }
 
 func TestAdmin_GetOneCarriesRevisionAndProvenance(t *testing.T) {
+	t.Parallel()
+
 	updatedAt := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
 
 	// The registered default differs from the stored value so a
@@ -899,6 +943,8 @@ func TestAdmin_GetOneCarriesRevisionAndProvenance(t *testing.T) {
 }
 
 func TestAdmin_GetOneDefaultInForceRendersZeroRevision(t *testing.T) {
+	t.Parallel()
+
 	c, _ := setupClient(t, func(c *systemplane.Client) error {
 		return c.Register("ns", "k", "default")
 	})
@@ -940,6 +986,8 @@ func TestAdmin_GetOneDefaultInForceRendersZeroRevision(t *testing.T) {
 }
 
 func TestAdmin_GetOneRedactsValueWithProvenance(t *testing.T) {
+	t.Parallel()
+
 	updatedAt := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
 
 	c, _ := setupSeededMultiTenantClient(t, []systemplane.TestEntry{{
@@ -980,4 +1028,178 @@ func TestAdmin_GetOneRedactsValueWithProvenance(t *testing.T) {
 	if got["updatedBy"] != "operator" {
 		t.Errorf("updatedBy = %v, want operator", got["updatedBy"])
 	}
+}
+
+func TestAdmin_ListCarriesRevisionAndProvenancePerEntry(t *testing.T) {
+	t.Parallel()
+
+	updatedAt := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
+
+	// Only alpha has a stored row; beta is registered with a default and has
+	// none, so the listing must render both shapes side by side.
+	c, store := setupSeededMultiTenantClient(t, []systemplane.TestEntry{{
+		Namespace: "ns",
+		Key:       "alpha",
+		Value:     []byte(`"stored-alpha"`),
+		Revision:  7,
+		UpdatedAt: updatedAt,
+		UpdatedBy: "operator",
+	}}, func(c *systemplane.Client) error {
+		if err := c.Register("ns", "alpha", "default-alpha"); err != nil {
+			return err
+		}
+
+		return c.Register("ns", "beta", "default-beta")
+	})
+
+	// List reports a different value than Get for the same key, so an entry
+	// whose value came from the List result instead of its own read renders
+	// "from-list" next to revision 7 — a value and a revision describing two
+	// different instants.
+	store.SetListValue("ns", "alpha", []byte(`"from-list"`))
+
+	app := mountAndRun(t, c)
+
+	resp := doRequest(t, app, http.MethodGet, "/system/ns", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	defer resp.Body.Close()
+
+	var got struct {
+		Entries []map[string]any `json:"entries"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(got.Entries) != 2 {
+		t.Fatalf("entries = %d, want 2", len(got.Entries))
+	}
+
+	alpha, beta := got.Entries[0], got.Entries[1]
+
+	if alpha["key"] != "alpha" || beta["key"] != "beta" {
+		t.Fatalf("entry order = %v, %v, want alpha then beta", alpha["key"], beta["key"])
+	}
+
+	if alpha["value"] != "stored-alpha" {
+		t.Errorf("alpha value = %v, want stored-alpha (the value read alongside revision 7)", alpha["value"])
+	}
+
+	if alpha["revision"] != float64(7) {
+		t.Errorf("alpha revision = %v, want 7", alpha["revision"])
+	}
+
+	if alpha["updatedAt"] != "2026-09-17T12:00:00Z" {
+		t.Errorf("alpha updatedAt = %v, want 2026-09-17T12:00:00Z", alpha["updatedAt"])
+	}
+
+	if alpha["updatedBy"] != "operator" {
+		t.Errorf("alpha updatedBy = %v, want operator", alpha["updatedBy"])
+	}
+
+	if beta["revision"] != float64(0) {
+		t.Errorf("beta revision = %v, want 0", beta["revision"])
+	}
+
+	betaUpdatedAt, present := beta["updatedAt"]
+	if !present {
+		t.Fatalf("beta updatedAt absent from entry, want present and null")
+	}
+
+	if betaUpdatedAt != nil {
+		t.Errorf("beta updatedAt = %v, want null", betaUpdatedAt)
+	}
+
+	if beta["updatedBy"] != "" {
+		t.Errorf("beta updatedBy = %v, want empty string", beta["updatedBy"])
+	}
+
+	for _, e := range got.Entries {
+		stale, ok := e["stale"]
+		if !ok {
+			t.Fatalf("stale absent from entry %v, want present and false", e["key"])
+		}
+
+		if stale != false {
+			t.Errorf("entry %v stale = %v, want false", e["key"], stale)
+		}
+	}
+}
+
+func TestAdmin_ListRedactsValues(t *testing.T) {
+	t.Parallel()
+
+	// The listing mirror of TestAdmin_GetOneRedactsValueWithProvenance: a
+	// RedactFull key must never hand its raw value to every caller authorized
+	// for "read" just because the request asked for the whole namespace.
+	c, _ := setupSeededMultiTenantClient(t, []systemplane.TestEntry{{
+		Namespace: "security",
+		Key:       "secret",
+		Value:     []byte(`"super-secret"`),
+		Revision:  5,
+		UpdatedAt: time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC),
+		UpdatedBy: "operator",
+	}}, func(c *systemplane.Client) error {
+		return c.Register("security", "secret", "registered-default",
+			systemplane.WithRedaction(systemplane.RedactFull))
+	})
+
+	app := mountAndRun(t, c)
+
+	resp := doRequest(t, app, http.MethodGet, "/system/security", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+
+	if strings.Contains(string(raw), "super-secret") {
+		t.Fatalf("listing leaked the redacted value: %s", raw)
+	}
+
+	var got struct {
+		Entries []map[string]any `json:"entries"`
+	}
+
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(got.Entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(got.Entries))
+	}
+
+	if got.Entries[0]["value"] != obsconstants.ObfuscatedValue {
+		t.Errorf("value = %v, want %v", got.Entries[0]["value"], obsconstants.ObfuscatedValue)
+	}
+
+	// Revision describes the row, not the secret, so redaction must not blank it.
+	if got.Entries[0]["revision"] != float64(5) {
+		t.Errorf("revision = %v, want 5", got.Entries[0]["revision"])
+	}
+}
+
+func TestAdmin_ListFailsWhenAnEntryCannotBeRead(t *testing.T) {
+	t.Parallel()
+
+	// Multi-tenant on purpose: a single-tenant GetEntry serves from the
+	// in-process cache and would never reach the store's injected error.
+	c, store := setupSeededMultiTenantClient(t, nil, func(c *systemplane.Client) error {
+		return c.Register("ns", "alpha", "default-alpha")
+	})
+
+	store.SetGetErr(errors.New("row will not decode"))
+
+	app := mountAndRun(t, c)
+
+	resp := doRequest(t, app, http.MethodGet, "/system/ns", "")
+	assertErrorResponse(t, resp, http.StatusInternalServerError, "internal_error", "request failed")
 }
