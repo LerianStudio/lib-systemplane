@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
-	internalclient "github.com/LerianStudio/lib-systemplane/v3/internal/client"
+	internalclient "github.com/LerianStudio/lib-systemplane/v4/internal/client"
 )
 
 func asInternalClient(c *Client) *internalclient.Client {

@@ -14,8 +14,8 @@ package systemplane
 import (
 	tmpostgres "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/postgres"
 	"github.com/LerianStudio/lib-observability/v4/log"
-	internalclient "github.com/LerianStudio/lib-systemplane/v3/internal/client"
-	internalmanager "github.com/LerianStudio/lib-systemplane/v3/internal/manager"
+	internalclient "github.com/LerianStudio/lib-systemplane/v4/internal/client"
+	internalmanager "github.com/LerianStudio/lib-systemplane/v4/internal/manager"
 )
 
 // Manager owns per-tenant cache + push hot-reload bookkeeping for MT

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	systemplane "github.com/LerianStudio/lib-systemplane/v3"
+	systemplane "github.com/LerianStudio/lib-systemplane/v4"
 )
 
 func TestSchemaSQL_NonEmpty(t *testing.T) {

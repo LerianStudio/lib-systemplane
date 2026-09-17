@@ -39,7 +39,7 @@ import (
 
 	commonshttp "github.com/LerianStudio/lib-commons/v7/commons/net/http"
 	"github.com/LerianStudio/lib-observability/v4/log"
-	systemplane "github.com/LerianStudio/lib-systemplane/v3"
+	systemplane "github.com/LerianStudio/lib-systemplane/v4"
 	"github.com/gofiber/fiber/v3"
 )
 

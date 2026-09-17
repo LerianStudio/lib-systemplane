@@ -15,8 +15,8 @@ import (
 	"time"
 
 	obsconstants "github.com/LerianStudio/lib-observability/v4/constants"
-	systemplane "github.com/LerianStudio/lib-systemplane/v3"
-	"github.com/LerianStudio/lib-systemplane/v3/admin"
+	systemplane "github.com/LerianStudio/lib-systemplane/v4"
+	"github.com/LerianStudio/lib-systemplane/v4/admin"
 	"github.com/gofiber/fiber/v3"
 )
 

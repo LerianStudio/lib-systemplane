@@ -14,11 +14,11 @@ import (
 
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/runtime"
-	"github.com/LerianStudio/lib-systemplane/v3/internal/debounce"
-	"github.com/LerianStudio/lib-systemplane/v3/internal/manager"
-	mongoDB "github.com/LerianStudio/lib-systemplane/v3/internal/mongodb"
-	"github.com/LerianStudio/lib-systemplane/v3/internal/postgres"
-	"github.com/LerianStudio/lib-systemplane/v3/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/debounce"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/manager"
+	mongoDB "github.com/LerianStudio/lib-systemplane/v4/internal/mongodb"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/postgres"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
 // refreshTimeout bounds Get calls made by the changefeed-driven refresh loop.

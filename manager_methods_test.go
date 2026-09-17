@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	tmevent "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/event"
-	systemplane "github.com/LerianStudio/lib-systemplane/v3"
+	systemplane "github.com/LerianStudio/lib-systemplane/v4"
 )
 
 // These tests exercise the public HandleTenantLifecycle proxy. Routing

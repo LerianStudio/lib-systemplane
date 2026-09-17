@@ -1,6 +1,6 @@
 package systemplane
 
-import internalclient "github.com/LerianStudio/lib-systemplane/v3/internal/client"
+import internalclient "github.com/LerianStudio/lib-systemplane/v4/internal/client"
 
 // Client is the public runtime-config handle for systemplane.
 //
