@@ -5,9 +5,9 @@
 // Postgres so ResolveDB / ResolveDSN return non-nil DSN and non-nil
 // dbresolver.DB without invoking the gRPC tenant-config client.
 //
-// This file is internal (package manager) so the pgMgrConnector type stays
+// This file is internal (package postgres) so the pgMgrConnector type stays
 // unexported.
-package manager
+package postgres
 
 import (
 	"context"

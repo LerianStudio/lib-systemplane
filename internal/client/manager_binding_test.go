@@ -7,7 +7,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/LerianStudio/lib-systemplane/v3/internal/manager"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/manager"
 )
 
 // TestBackwardCompat_MTWithoutManager_OnChangeReturnsErr pins the v1.4.0
@@ -22,7 +22,7 @@ func TestBackwardCompat_MTWithoutManager_OnChangeReturnsErr(t *testing.T) {
 		t.Fatalf("register: %v", err)
 	}
 
-	_, err := c.OnChange("ns", "k", func(_ context.Context, _, _ string, _ any) {})
+	_, err := c.OnChange("ns", "k", func(_ context.Context, _ Change) {})
 	if !errors.Is(err, ErrNotSupportedInMultiTenant) {
 		t.Errorf("expected ErrNotSupportedInMultiTenant, got %v", err)
 	}
@@ -73,11 +73,15 @@ func TestMT_WithManager_OnChangeRegistersAndUnsubscribes(t *testing.T) {
 
 	c := newMultiTenantClient(t, newMemStore(true))
 
+	if err := c.Register("ns", "k", "default"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
 	mgr := manager.New(nil)
 	c.BindManager(mgr)
 
 	called := 0
-	unsub, err := c.OnChange("ns", "k", func(_ context.Context, _, _ string, _ any) {
+	unsub, err := c.OnChange("ns", "k", func(_ context.Context, _ Change) {
 		called++
 	})
 	if err != nil {
@@ -124,5 +128,143 @@ func TestBackwardCompat_ST_Get_BypassesManager(t *testing.T) {
 
 	if v != "default" {
 		t.Errorf("Get = %v, want default", v)
+	}
+}
+
+// TestMT_ManagerCallback_CarriesTenant pins FC-4: one subscriber bound to a
+// Manager observes a distinct Change.Tenant for every tenant whose row
+// changed, so a consumer can tell two tenants' deliveries apart.
+func TestMT_ManagerCallback_CarriesTenant(t *testing.T) {
+	c := newMultiTenantClient(t, newMemStore(true))
+
+	if err := c.Register("ns", "k", "default"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	var got []Change
+
+	cb := c.managerCallback(func(_ context.Context, ch Change) {
+		got = append(got, ch)
+	})
+
+	cb(context.Background(), "t1", "ns", "k", 7, false, "v1")
+	cb(context.Background(), "t2", "ns", "k", 9, false, "v2")
+
+	if len(got) != 2 {
+		t.Fatalf("got %d changes, want 2", len(got))
+	}
+
+	if got[0].Tenant != "t1" || got[1].Tenant != "t2" {
+		t.Errorf("tenants = %q, %q; want t1, t2", got[0].Tenant, got[1].Tenant)
+	}
+
+	if got[0].Revision != 7 || got[1].Revision != 9 {
+		t.Errorf("revisions = %d, %d; want 7, 9", got[0].Revision, got[1].Revision)
+	}
+
+	if got[0].Value != "v1" || got[1].Value != "v2" {
+		t.Errorf("values = %v, %v; want v1, v2", got[0].Value, got[1].Value)
+	}
+}
+
+// TestMT_ManagerCallback_DeleteDeliversDefault pins FC-4: a delete publishes
+// the registered default, never a nil value.
+func TestMT_ManagerCallback_DeleteDeliversDefault(t *testing.T) {
+	c := newMultiTenantClient(t, newMemStore(true))
+
+	if err := c.Register("ns", "k", "default"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	var got Change
+
+	cb := c.managerCallback(func(_ context.Context, ch Change) {
+		got = ch
+	})
+
+	cb(context.Background(), "t1", "ns", "k", 0, true, nil)
+
+	if got.Value != "default" {
+		t.Errorf("delete delivered %v, want the registered default", got.Value)
+	}
+
+	if got.Revision != 0 {
+		t.Errorf("delete Revision = %d, want 0", got.Revision)
+	}
+}
+
+// TestMT_ManagerCallback_UpsertOfNullDeliversNil pins that the registered
+// default stands in for a delete ONLY. An upsert whose stored JSON decodes to
+// null must reach the subscriber as nil: substituting the default there would
+// report a key deliberately set to null as "no row, default in force", and a
+// subscriber could never tell the two apart.
+func TestMT_ManagerCallback_UpsertOfNullDeliversNil(t *testing.T) {
+	c := newMultiTenantClient(t, newMemStore(true))
+
+	if err := c.Register("ns", "k", "default"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	var got Change
+
+	cb := c.managerCallback(func(_ context.Context, ch Change) {
+		got = ch
+	})
+
+	cb(context.Background(), "t1", "ns", "k", 4, false, nil)
+
+	if got.Value != nil {
+		t.Errorf("upsert of a null value delivered %v, want nil", got.Value)
+	}
+}
+
+// TestMT_ManagerCallback_ClonesValue pins FC-4's "the receiver owns this
+// copy": a subscriber that mutates the delivered Change.Value must not reach
+// the Manager's live cached object, nor the registered default that every
+// later delete republishes.
+func TestMT_ManagerCallback_ClonesValue(t *testing.T) {
+	c := newMultiTenantClient(t, newMemStore(true))
+
+	if err := c.Register("ns", "k", map[string]any{"limit": 1}); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	var observed []any
+
+	cb := c.managerCallback(func(_ context.Context, ch Change) {
+		m, ok := ch.Value.(map[string]any)
+		if !ok {
+			t.Errorf("delivered value is %T, want map[string]any", ch.Value)
+
+			return
+		}
+
+		observed = append(observed, m["limit"])
+		m["limit"] = 999
+	})
+
+	// Upsert: the map the Manager holds in its cache must survive the
+	// subscriber's mutation.
+	cached := map[string]any{"limit": 1}
+	cb(context.Background(), "t1", "ns", "k", 7, false, cached)
+
+	if cached["limit"] != 1 {
+		t.Errorf("subscriber mutation reached the cached map: limit = %v, want 1", cached["limit"])
+	}
+
+	// Delete publishes the registered default; mutating one delivery must not
+	// corrupt the default handed to the next one.
+	cb(context.Background(), "t1", "ns", "k", 0, true, nil)
+	cb(context.Background(), "t2", "ns", "k", 0, true, nil)
+
+	want := []any{1, 1, 1}
+	if len(observed) != len(want) {
+		t.Fatalf("observed %d deliveries, want %d", len(observed), len(want))
+	}
+
+	for i, w := range want {
+		if observed[i] != w {
+			t.Errorf("delivery %d carried limit = %v, want %v (a previous subscriber mutated the source)", i, observed[i], w)
+		}
 	}
 }

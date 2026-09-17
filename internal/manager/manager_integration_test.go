@@ -13,8 +13,8 @@ import (
 	"time"
 
 	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
-	systemplane "github.com/LerianStudio/lib-systemplane/v3"
-	"github.com/LerianStudio/lib-systemplane/v3/internal/manager"
+	systemplane "github.com/LerianStudio/lib-systemplane/v4"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/manager"
 	"github.com/bxcodec/dbresolver/v2"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/testcontainers/testcontainers-go"
@@ -314,7 +314,7 @@ func TestIntegration_Manager_NotifyEndToEnd(t *testing.T) {
 
 	received := make(chan any, 1)
 
-	unsub := m.RegisterCallback("ns", "k", func(_ context.Context, _, _ string, newValue any) {
+	unsub := m.RegisterCallback("ns", "k", func(_ context.Context, _, _, _ string, _ int64, _ bool, newValue any) {
 		received <- newValue
 	})
 	defer unsub()
@@ -457,7 +457,7 @@ func TestIntegration_Manager_ReconnectAfterTerminateBackend(t *testing.T) {
 	// After reconnect, a fresh NOTIFY should still be delivered.
 	received := make(chan any, 1)
 
-	unsub := m.RegisterCallback("ns", "k", func(_ context.Context, _, _ string, newValue any) {
+	unsub := m.RegisterCallback("ns", "k", func(_ context.Context, _, _, _ string, _ int64, _ bool, newValue any) {
 		select {
 		case received <- newValue:
 		default:
@@ -550,7 +550,7 @@ func TestIntegration_Manager_CredentialsRotated(t *testing.T) {
 	// After rotation, NOTIFYs should still flow.
 	received := make(chan any, 1)
 
-	unsub := m.RegisterCallback("ns", "k", func(_ context.Context, _, _ string, newValue any) {
+	unsub := m.RegisterCallback("ns", "k", func(_ context.Context, _, _, _ string, _ int64, _ bool, newValue any) {
 		select {
 		case received <- newValue:
 		default:

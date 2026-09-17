@@ -10,9 +10,9 @@ import (
 	"time"
 
 	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
-	"github.com/LerianStudio/lib-systemplane/v3/internal/mongodb"
-	"github.com/LerianStudio/lib-systemplane/v3/internal/store"
-	"github.com/LerianStudio/lib-systemplane/v3/systemplanetest"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/mongodb"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v4/systemplanetest"
 	"github.com/testcontainers/testcontainers-go"
 	mongocontainer "github.com/testcontainers/testcontainers-go/modules/mongodb"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -119,7 +119,7 @@ func TestIntegration_MongoDBMultiTenantIsolation(t *testing.T) {
 	}
 
 	// Tenant A's collection should not contain tenant B's value.
-	listA, err := s.List(ctxA)
+	listA, err := s.List(ctxA, store.Scope{})
 	if err != nil {
 		t.Fatalf("listA: %v", err)
 	}
@@ -134,7 +134,7 @@ func TestIntegration_MongoDBMultiTenantIsolation(t *testing.T) {
 	}
 
 	// Subscribe is not supported in multi-tenant mode.
-	if _, err := s.Subscribe(ctxA, func(_ store.Event) {}); err != store.ErrNotSupportedInMultiTenant {
+	if _, err := s.Subscribe(ctxA, store.Scope{}, func(_ store.Event) {}); err != store.ErrNotSupportedInMultiTenant {
 		t.Errorf("subscribe should fail with ErrNotSupportedInMultiTenant, got %v", err)
 	}
 }
@@ -159,7 +159,7 @@ func TestIntegration_MongoDBMultiTenantMissingCtx(t *testing.T) {
 		t.Fatalf("start: %v", err)
 	}
 
-	_, _, err = s.Get(context.Background(), "ns", "k")
+	_, _, err = s.Get(context.Background(), store.Scope{}, "ns", "k")
 	if err != store.ErrTenantConnectionMissing {
 		t.Errorf("expected ErrTenantConnectionMissing, got %v", err)
 	}
@@ -169,7 +169,7 @@ func mustSet(t *testing.T, s store.Store, ctx context.Context, ns, key, value st
 	t.Helper()
 
 	raw, _ := json.Marshal(value)
-	if err := s.Set(ctx, store.Entry{Namespace: ns, Key: key, Value: raw}); err != nil {
+	if _, err := s.Set(ctx, store.Scope{}, store.Entry{Namespace: ns, Key: key, Value: raw}); err != nil {
 		t.Fatalf("set: %v", err)
 	}
 }
@@ -177,7 +177,7 @@ func mustSet(t *testing.T, s store.Store, ctx context.Context, ns, key, value st
 func mustGet(t *testing.T, s store.Store, ctx context.Context, ns, key string) string {
 	t.Helper()
 
-	entry, found, err := s.Get(ctx, ns, key)
+	entry, found, err := s.Get(ctx, store.Scope{}, ns, key)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}

@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/LerianStudio/lib-systemplane/v3/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
 // Factory constructs a fresh Store for one test. Backends embed test-fixture
@@ -117,20 +117,33 @@ func entry(ns, key string, v any) store.Entry {
 	}
 }
 
+// setEntry writes e in the zero scope and returns the revision the store
+// reported. A successful Set never reports a negative revision.
+func setEntry(ctx context.Context, t *testing.T, s store.Store, e store.Entry) int64 {
+	t.Helper()
+
+	rev, err := s.Set(ctx, store.Scope{}, e)
+	if err != nil {
+		t.Fatalf("set %s/%s: %v", e.Namespace, e.Key, err)
+	}
+
+	if rev < 0 {
+		t.Fatalf("set %s/%s: revision = %d, want >= 0", e.Namespace, e.Key, rev)
+	}
+
+	return rev
+}
+
 func runSetGetList(t *testing.T, s store.Store) {
 	startStore(t, s)
 
 	ctx := context.Background()
 
-	if err := s.Set(ctx, entry("ns", "a", 1)); err != nil {
-		t.Fatalf("set a: %v", err)
-	}
+	setEntry(ctx, t, s, entry("ns", "a", 1))
 
-	if err := s.Set(ctx, entry("ns", "b", "hello")); err != nil {
-		t.Fatalf("set b: %v", err)
-	}
+	setEntry(ctx, t, s, entry("ns", "b", "hello"))
 
-	got, found, err := s.Get(ctx, "ns", "a")
+	got, found, err := s.Get(ctx, store.Scope{}, "ns", "a")
 	if err != nil {
 		t.Fatalf("get a: %v", err)
 	}
@@ -148,7 +161,7 @@ func runSetGetList(t *testing.T, s store.Store) {
 		t.Errorf("expected a=1, got %v", v)
 	}
 
-	missing, found, err := s.Get(ctx, "ns", "missing")
+	missing, found, err := s.Get(ctx, store.Scope{}, "ns", "missing")
 	if err != nil {
 		t.Fatalf("get missing: %v", err)
 	}
@@ -157,7 +170,7 @@ func runSetGetList(t *testing.T, s store.Store) {
 		t.Fatalf("get missing: should not be found, got %v", missing)
 	}
 
-	entries, err := s.List(ctx)
+	entries, err := s.List(ctx, store.Scope{})
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
@@ -175,15 +188,13 @@ func runDelete(t *testing.T, s store.Store) {
 
 	ctx := context.Background()
 
-	if err := s.Set(ctx, entry("ns", "doomed", 42)); err != nil {
-		t.Fatalf("set: %v", err)
-	}
+	setEntry(ctx, t, s, entry("ns", "doomed", 42))
 
-	if err := s.Delete(ctx, "ns", "doomed", "tester"); err != nil {
+	if err := s.Delete(ctx, store.Scope{}, "ns", "doomed", "tester"); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 
-	_, found, err := s.Get(ctx, "ns", "doomed")
+	_, found, err := s.Get(ctx, store.Scope{}, "ns", "doomed")
 	if err != nil {
 		t.Fatalf("get after delete: %v", err)
 	}
@@ -193,7 +204,7 @@ func runDelete(t *testing.T, s store.Store) {
 	}
 
 	// Idempotent: deleting again is not an error.
-	if err := s.Delete(ctx, "ns", "doomed", "tester"); err != nil {
+	if err := s.Delete(ctx, store.Scope{}, "ns", "doomed", "tester"); err != nil {
 		t.Fatalf("idempotent delete: %v", err)
 	}
 }
@@ -203,15 +214,11 @@ func runUpsert(t *testing.T, s store.Store) {
 
 	ctx := context.Background()
 
-	if err := s.Set(ctx, entry("ns", "k", 1)); err != nil {
-		t.Fatalf("set 1: %v", err)
-	}
+	setEntry(ctx, t, s, entry("ns", "k", 1))
 
-	if err := s.Set(ctx, entry("ns", "k", 2)); err != nil {
-		t.Fatalf("set 2: %v", err)
-	}
+	setEntry(ctx, t, s, entry("ns", "k", 2))
 
-	got, found, err := s.Get(ctx, "ns", "k")
+	got, found, err := s.Get(ctx, store.Scope{}, "ns", "k")
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -245,7 +252,7 @@ func runSubscribeUpsert(t *testing.T, s store.Store, wait time.Duration) {
 
 	events := newEventChan()
 
-	unsub, err := s.Subscribe(ctx, events.push)
+	unsub, err := s.Subscribe(ctx, store.Scope{}, events.push)
 	if errors.Is(err, store.ErrNotSupportedInMultiTenant) {
 		t.Skip("subscribe not supported in this mode")
 	}
@@ -256,9 +263,7 @@ func runSubscribeUpsert(t *testing.T, s store.Store, wait time.Duration) {
 
 	defer unsub()
 
-	if err := s.Set(ctx, entry("ns", "watched", 1)); err != nil {
-		t.Fatalf("set: %v", err)
-	}
+	setEntry(ctx, t, s, entry("ns", "watched", 1))
 
 	got := events.waitFor(t, "ns", "watched", wait)
 	if got.Op != store.OpUpsert {
@@ -274,7 +279,7 @@ func runSubscribeDelete(t *testing.T, s store.Store, wait time.Duration) {
 
 	events := newEventChan()
 
-	unsub, err := s.Subscribe(ctx, events.push)
+	unsub, err := s.Subscribe(ctx, store.Scope{}, events.push)
 	if errors.Is(err, store.ErrNotSupportedInMultiTenant) {
 		t.Skip("subscribe not supported in this mode")
 	}
@@ -286,16 +291,14 @@ func runSubscribeDelete(t *testing.T, s store.Store, wait time.Duration) {
 	defer unsub()
 
 	// Seed the row, observe the upsert echo, then exercise the delete path.
-	if err := s.Set(ctx, entry("ns", "watched-delete", 1)); err != nil {
-		t.Fatalf("set: %v", err)
-	}
+	setEntry(ctx, t, s, entry("ns", "watched-delete", 1))
 
 	upsert := events.waitFor(t, "ns", "watched-delete", wait)
 	if upsert.Op != store.OpUpsert {
 		t.Errorf("expected initial upsert, got %q", upsert.Op)
 	}
 
-	if err := s.Delete(ctx, "ns", "watched-delete", "tester"); err != nil {
+	if err := s.Delete(ctx, store.Scope{}, "ns", "watched-delete", "tester"); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 
@@ -313,7 +316,7 @@ func runUnsubscribeStops(t *testing.T, s store.Store, wait time.Duration) {
 
 	events := newEventChan()
 
-	unsub, err := s.Subscribe(ctx, events.push)
+	unsub, err := s.Subscribe(ctx, store.Scope{}, events.push)
 	if errors.Is(err, store.ErrNotSupportedInMultiTenant) {
 		t.Skip("subscribe not supported in this mode")
 	}
@@ -322,17 +325,13 @@ func runUnsubscribeStops(t *testing.T, s store.Store, wait time.Duration) {
 		t.Fatalf("subscribe: %v", err)
 	}
 
-	if err := s.Set(ctx, entry("ns", "unsub", 1)); err != nil {
-		t.Fatalf("set: %v", err)
-	}
+	setEntry(ctx, t, s, entry("ns", "unsub", 1))
 
 	events.waitFor(t, "ns", "unsub", wait)
 
 	unsub()
 
-	if err := s.Set(ctx, entry("ns", "unsub", 2)); err != nil {
-		t.Fatalf("set after unsub: %v", err)
-	}
+	setEntry(ctx, t, s, entry("ns", "unsub", 2))
 
 	// Give the changefeed a chance — we should NOT see a second event.
 	select {

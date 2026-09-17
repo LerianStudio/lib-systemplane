@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/LerianStudio/lib-systemplane/v3/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
 type catalogSpyStore struct {
@@ -23,31 +23,31 @@ type catalogSpyStore struct {
 func (s *catalogSpyStore) Start(context.Context) error { return nil }
 func (s *catalogSpyStore) Close() error                { return nil }
 
-func (s *catalogSpyStore) Get(context.Context, string, string) (store.Entry, bool, error) {
+func (s *catalogSpyStore) Get(context.Context, store.Scope, string, string) (store.Entry, bool, error) {
 	s.getCalls.Add(1)
 
 	return store.Entry{}, false, nil
 }
 
-func (s *catalogSpyStore) Set(context.Context, store.Entry) error {
+func (s *catalogSpyStore) Set(context.Context, store.Scope, store.Entry) (int64, error) {
 	s.setCalls.Add(1)
 
-	return nil
+	return 0, nil
 }
 
-func (s *catalogSpyStore) Delete(context.Context, string, string, string) error {
+func (s *catalogSpyStore) Delete(context.Context, store.Scope, string, string, string) error {
 	s.deleteCalls.Add(1)
 
 	return nil
 }
 
-func (s *catalogSpyStore) List(context.Context) ([]store.Entry, error) {
+func (s *catalogSpyStore) List(context.Context, store.Scope) ([]store.Entry, error) {
 	s.listCalls.Add(1)
 
 	return nil, nil
 }
 
-func (s *catalogSpyStore) Subscribe(context.Context, func(store.Event)) (func(), error) {
+func (s *catalogSpyStore) Subscribe(context.Context, store.Scope, func(store.Event)) (func(), error) {
 	return func() {}, nil
 }
 

@@ -9,7 +9,8 @@ import (
 	"time"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
-	"github.com/LerianStudio/lib-systemplane/v3/internal/manager"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/manager"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
 // ListEntry is a single entry returned by [Client.List].
@@ -26,12 +27,27 @@ type ListEntry struct {
 // tenant database from ctx and reads through, returning the registered
 // default when the row is absent.
 func (c *Client) Get(ctx context.Context, namespace, key string) (any, bool, error) {
+	e, ok, err := c.getEntry(ctx, namespace, key)
+
+	return e.Value, ok, err
+}
+
+// GetEntry resolves the caller's scope like Get. ok is false for an
+// unregistered key. Revision, UpdatedAt and UpdatedBy describe the persisted
+// row backing the cached value; only the wave-1 shim may report zeros for a
+// cached row, and engine-core removes that limitation.
+func (c *Client) GetEntry(ctx context.Context, namespace, key string) (e Entry, ok bool, err error) {
+	return c.getEntry(ctx, namespace, key)
+}
+
+// getEntry is the single read path behind Get and GetEntry.
+func (c *Client) getEntry(ctx context.Context, namespace, key string) (Entry, bool, error) {
 	if c == nil || c.closed.Load() {
-		return nil, false, ErrClosed
+		return Entry{}, false, ErrClosed
 	}
 
 	if ctx == nil {
-		return nil, false, ErrNilContext
+		return Entry{}, false, ErrNilContext
 	}
 
 	nk := nskey{Namespace: namespace, Key: key}
@@ -41,7 +57,7 @@ func (c *Client) Get(ctx context.Context, namespace, key string) (any, bool, err
 	c.registryMu.RUnlock()
 
 	if !registered {
-		return nil, false, nil
+		return Entry{}, false, nil
 	}
 
 	if !c.multiTenant {
@@ -50,10 +66,10 @@ func (c *Client) Get(ctx context.Context, namespace, key string) (any, bool, err
 		c.cacheMu.RUnlock()
 
 		if inCache {
-			return cloneValue(v), true, nil
+			return Entry{Value: cloneValue(v)}, true, nil
 		}
 
-		return cloneValue(def.defaultValue), true, nil
+		return Entry{Value: cloneValue(def.defaultValue)}, true, nil
 	}
 
 	// Multi-tenant: try the bound Manager's per-tenant cache first; fall
@@ -64,17 +80,17 @@ func (c *Client) Get(ctx context.Context, namespace, key string) (any, bool, err
 	mgr := c.boundManager()
 	if mgr != nil && tenantID != "" {
 		if v, hit, lookupErr := mgr.Lookup(ctx, tenantID, namespace, key); lookupErr == nil && hit {
-			return cloneValue(v), true, nil
+			return Entry{Value: cloneValue(v)}, true, nil
 		}
 	}
 
-	entry, found, err := c.store.Get(ctx, namespace, key)
+	entry, found, err := c.store.Get(ctx, store.Scope{}, namespace, key)
 	if err != nil {
-		return nil, false, fmt.Errorf("systemplane: Get: %w", err)
+		return Entry{}, false, fmt.Errorf("systemplane: Get: %w", err)
 	}
 
 	if !found {
-		return cloneValue(def.defaultValue), true, nil
+		return Entry{Value: cloneValue(def.defaultValue)}, true, nil
 	}
 
 	var decoded any
@@ -85,7 +101,7 @@ func (c *Client) Get(ctx context.Context, namespace, key string) (any, bool, err
 			log.Err(err),
 		)
 
-		return nil, false, fmt.Errorf("systemplane: decode value for %s/%s: %w", namespace, key, err)
+		return Entry{}, false, fmt.Errorf("systemplane: decode value for %s/%s: %w", namespace, key, err)
 	}
 
 	// Populate the per-tenant cache so subsequent reads bypass the DB.
@@ -95,7 +111,12 @@ func (c *Client) Get(ctx context.Context, namespace, key string) (any, bool, err
 		mgr.Populate(ctx, tenantID, namespace, key, decoded)
 	}
 
-	return decoded, true, nil
+	return Entry{
+		Value:     decoded,
+		Revision:  entry.Revision,
+		UpdatedAt: entry.UpdatedAt,
+		UpdatedBy: entry.UpdatedBy,
+	}, true, nil
 }
 
 // GetString returns the value as a string.
@@ -289,7 +310,7 @@ func (c *Client) listFromCache(keys []nskey) []ListEntry {
 }
 
 func (c *Client) listFromStore(ctx context.Context, namespace string, keys []nskey) ([]ListEntry, error) {
-	stored, err := c.store.List(ctx)
+	stored, err := c.store.List(ctx, store.Scope{})
 	if err != nil {
 		return nil, fmt.Errorf("systemplane: List: %w", err)
 	}

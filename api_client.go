@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
-	internalclient "github.com/LerianStudio/lib-systemplane/v3/internal/client"
+	internalclient "github.com/LerianStudio/lib-systemplane/v4/internal/client"
 )
 
 func asInternalClient(c *Client) *internalclient.Client {
@@ -37,6 +37,14 @@ func (c *Client) Close() error {
 // tenant-manager middleware) and reads through.
 func (c *Client) Get(ctx context.Context, namespace, key string) (any, bool, error) {
 	return asInternalClient(c).Get(ctx, namespace, key)
+}
+
+// GetEntry resolves the caller's scope like Get. ok is false for an
+// unregistered key. Revision, UpdatedAt and UpdatedBy describe the persisted
+// row backing the cached value; only the wave-1 shim may report zeros for a
+// cached row, and engine-core removes that limitation.
+func (c *Client) GetEntry(ctx context.Context, namespace, key string) (e Entry, ok bool, err error) {
+	return asInternalClient(c).GetEntry(ctx, namespace, key)
 }
 
 // GetString returns the value as a string.
@@ -108,9 +116,19 @@ func (c *Client) CatalogService() string {
 	return asInternalClient(c).CatalogService()
 }
 
-// OnChange registers a callback for backend-observed value changes.
-// Returns ErrNotSupportedInMultiTenant in multi-tenant mode.
-func (c *Client) OnChange(namespace, key string, fn func(ctx context.Context, ns, key string, newValue any)) (func(), error) {
+// OnChange registers a callback for backend-observed value changes of
+// (namespace, key). Change.Tenant names the tenant whose row changed ("" in
+// single-tenant mode) and a delete delivers the registered default with
+// Revision 0.
+//
+// In this wave-1 shim the Manager path reports Change.Revision == 0 on every
+// delivery, upsert or delete, because the NOTIFY payload carries no revision
+// until the storage lane lands.
+//
+// OnChange returns ErrUnknownKey for a key that was not registered. In
+// multi-tenant mode without a bound Manager, OnChange returns
+// ErrNotSupportedInMultiTenant; on a closed Client it returns ErrClosed.
+func (c *Client) OnChange(namespace, key string, fn func(ctx context.Context, ch Change)) (unsubscribe func(), err error) {
 	return asInternalClient(c).OnChange(namespace, key, fn)
 }
 

@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/LerianStudio/lib-systemplane/v3/internal/postgres"
-	"github.com/LerianStudio/lib-systemplane/v3/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/postgres"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -54,7 +54,7 @@ func TestIntegration_Postgres_ListenReaderCleansUpOnClose(t *testing.T) {
 
 	// Register a subscriber so the dispatch path is wired up at the moment
 	// of Close — exercises the full teardown sequence.
-	unsub, err := s.Subscribe(context.Background(), func(_ store.Event) {})
+	unsub, err := s.Subscribe(context.Background(), store.Scope{}, func(_ store.Event) {})
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}

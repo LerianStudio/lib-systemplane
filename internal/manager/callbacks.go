@@ -11,8 +11,13 @@ import (
 	"sync/atomic"
 )
 
-// Callback is the function signature OnChange registers.
-type Callback func(ctx context.Context, namespace, key string, newValue any)
+// Callback is the function signature OnChange registers. tenantID names the
+// tenant whose row changed; revision is the revision after the change, 0 when
+// unknown or when the row was deleted. isDelete distinguishes a removed row
+// from an upsert whose stored value decoded to nil — without it a key
+// deliberately set to null is indistinguishable from a delete, and the
+// receiver cannot decide whether the registered default is now in force.
+type Callback func(ctx context.Context, tenantID, namespace, key string, revision int64, isDelete bool, newValue any)
 
 // Unsubscribe removes a previously registered Callback. Safe to call more
 // than once.

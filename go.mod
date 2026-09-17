@@ -1,4 +1,4 @@
-module github.com/LerianStudio/lib-systemplane/v3
+module github.com/LerianStudio/lib-systemplane/v4
 
 go 1.26.3
 

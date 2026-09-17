@@ -15,7 +15,7 @@ import (
 	"github.com/LerianStudio/lib-commons/v7/commons/backoff"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/runtime"
-	"github.com/LerianStudio/lib-systemplane/v3/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -32,13 +32,14 @@ type changeEvent struct {
 }
 
 // Subscribe registers fn for the lifetime of ctx (or until unsubscribe is
-// called). Multi-tenant mode returns store.ErrNotSupportedInMultiTenant.
-func (s *Store) Subscribe(ctx context.Context, fn func(store.Event)) (func(), error) {
+// called). Multi-tenant mode and any named tenant scope return
+// store.ErrNotSupportedInMultiTenant.
+func (s *Store) Subscribe(ctx context.Context, scope store.Scope, fn func(store.Event)) (func(), error) {
 	if s == nil || s.isClosed() {
 		return nil, store.ErrClosed
 	}
 
-	if s.cfg.MultiTenantEnabled {
+	if s.cfg.MultiTenantEnabled || scope.Tenant != "" {
 		return nil, store.ErrNotSupportedInMultiTenant
 	}
 

@@ -6,7 +6,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/LerianStudio/lib-systemplane/v3/internal/manager"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/manager"
 )
 
 func TestNew_NilPgMgr_ReturnsNonNilManager(t *testing.T) {
@@ -89,7 +89,7 @@ func TestRegisterCallback_StoresAndUnsubscribes(t *testing.T) {
 	m := manager.New(nil)
 
 	called := 0
-	cb := func(_ context.Context, _, _ string, _ any) {
+	cb := func(_ context.Context, _, _, _ string, _ int64, _ bool, _ any) {
 		called++
 	}
 

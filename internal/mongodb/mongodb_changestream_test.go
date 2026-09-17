@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/LerianStudio/lib-systemplane/v3/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 	"go.uber.org/goleak"
 )
 
@@ -60,7 +60,7 @@ func TestSubscribe_ContextCancel_ObserverExits(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	unsub, err := s.Subscribe(ctx, func(_ store.Event) {})
+	unsub, err := s.Subscribe(ctx, store.Scope{}, func(_ store.Event) {})
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
@@ -82,7 +82,7 @@ func TestSubscribe_ExplicitUnsubscribe_ObserverExits(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	unsub, err := s.Subscribe(ctx, func(_ store.Event) {})
+	unsub, err := s.Subscribe(ctx, store.Scope{}, func(_ store.Event) {})
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestSubscribe_ConcurrentUnsubscribe_NoLeakNoPanic(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	unsub, err := s.Subscribe(ctx, func(_ store.Event) {})
+	unsub, err := s.Subscribe(ctx, store.Scope{}, func(_ store.Event) {})
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestSubscribe_CtxCancelRacingUnsubscribe_NoLeakNoPanic(t *testing.T) {
 		s := newSubscribeStore()
 		ctx, cancel := context.WithCancel(context.Background())
 
-		unsub, err := s.Subscribe(ctx, func(_ store.Event) {})
+		unsub, err := s.Subscribe(ctx, store.Scope{}, func(_ store.Event) {})
 		if err != nil {
 			t.Fatalf("subscribe: %v", err)
 		}
@@ -160,7 +160,7 @@ func TestSubscribe_CtxCancelRacingUnsubscribe_NoLeakNoPanic(t *testing.T) {
 func TestSubscribe_NilCtx_NoPanicNoObserver(t *testing.T) {
 	s := newSubscribeStore()
 
-	unsub, err := s.Subscribe(context.TODO(), func(_ store.Event) {})
+	unsub, err := s.Subscribe(context.TODO(), store.Scope{}, func(_ store.Event) {})
 	if err != nil {
 		t.Fatalf("subscribe (TODO): %v", err)
 	}
@@ -171,7 +171,7 @@ func TestSubscribe_NilCtx_NoPanicNoObserver(t *testing.T) {
 	//
 	//nolint:staticcheck // SA1012: intentionally passing nil context to verify
 	// the nil-ctx guard added in this fix.
-	unsub2, err := s.Subscribe(nil, func(_ store.Event) {})
+	unsub2, err := s.Subscribe(nil, store.Scope{}, func(_ store.Event) {})
 	if err != nil {
 		t.Fatalf("subscribe (nil): %v", err)
 	}

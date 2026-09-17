@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/LerianStudio/lib-systemplane/v3/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
 // Set writes a new value for (namespace, key). The value is validated against
@@ -56,7 +56,9 @@ func (c *Client) Set(ctx context.Context, namespace, key string, value any, acto
 		UpdatedBy: actor,
 	}
 
-	if err := c.store.Set(ctx, entry); err != nil {
+	// The revision the store reports is discarded here: publishing it is
+	// the engine's job, not the facade's.
+	if _, err := c.store.Set(ctx, store.Scope{}, entry); err != nil {
 		return err
 	}
 
@@ -98,7 +100,7 @@ func (c *Client) Delete(ctx context.Context, namespace, key, actor string) error
 		return fmt.Errorf("%w: %s/%s", ErrUnknownKey, namespace, key)
 	}
 
-	if err := c.store.Delete(ctx, namespace, key, actor); err != nil {
+	if err := c.store.Delete(ctx, store.Scope{}, namespace, key, actor); err != nil {
 		return err
 	}
 

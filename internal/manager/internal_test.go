@@ -61,10 +61,15 @@ func TestApplyEvent_Delete_RemovesFromCacheAndFiresCallback(t *testing.T) {
 	ts := m.tenantStateFor("tenant-a")
 	ts.entries[nsKey{Namespace: "ns", Key: "k"}] = "old"
 
-	var fired bool
+	var (
+		fired     bool
+		gotTenant string
+	)
 
-	unsub := m.RegisterCallback("ns", "k", func(_ context.Context, _, _ string, newValue any) {
+	unsub := m.RegisterCallback("ns", "k", func(_ context.Context, tenantID, _, _ string, _ int64, _ bool, newValue any) {
 		fired = true
+		gotTenant = tenantID
+
 		if newValue != nil {
 			t.Errorf("delete dispatch should pass nil, got %v", newValue)
 		}
@@ -81,6 +86,10 @@ func TestApplyEvent_Delete_RemovesFromCacheAndFiresCallback(t *testing.T) {
 
 	if !fired {
 		t.Fatal("delete event must fire OnChange callbacks")
+	}
+
+	if gotTenant != "tenant-a" {
+		t.Errorf("dispatch tenant = %q, want tenant-a", gotTenant)
 	}
 }
 

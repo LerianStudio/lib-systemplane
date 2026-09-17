@@ -700,9 +700,9 @@ func record(declared map[string]declaration, file *ast.File) {
 // rootPackageName is the package clause of this module's root package.
 //
 // It cannot be derived from the import path. The path ends in the major-version
-// suffix (.../lib-systemplane/v3), and the directory above it is
+// suffix (.../lib-systemplane/v4), and the directory above it is
 // "lib-systemplane" while the package is "systemplane" — so the usual
-// last-path-element rule yields "v3", which matches no declaration and would
+// last-path-element rule yields "v4", which matches no declaration and would
 // make every root type referenced from admin/ silently unresolvable.
 const rootPackageName = "systemplane"
 
@@ -958,7 +958,7 @@ func (c *Cache[K, V]) WithLogger(l log.Logger) {}
 		"a coupled type behind a root type imported through the /vN path": {
 			src: `package admin
 
-import systemplane "example.test/lib-systemplane/v3"
+import systemplane "example.test/lib-systemplane/v4"
 
 func Mount(l systemplane.Logger) {}
 `,
@@ -1215,7 +1215,7 @@ func recordFixture(declared map[string]declaration, file *ast.File) {
 }
 
 // rootPackageFixture stands in for this module's root package, so a fixture can
-// exercise the .../lib-systemplane/v3 import path whose last element is a
+// exercise the .../lib-systemplane/v4 import path whose last element is a
 // version rather than a package name.
 const rootPackageFixture = `package systemplane
 

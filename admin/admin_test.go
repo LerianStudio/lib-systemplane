@@ -15,8 +15,8 @@ import (
 	"time"
 
 	obsconstants "github.com/LerianStudio/lib-observability/v4/constants"
-	systemplane "github.com/LerianStudio/lib-systemplane/v3"
-	"github.com/LerianStudio/lib-systemplane/v3/admin"
+	systemplane "github.com/LerianStudio/lib-systemplane/v4"
+	"github.com/LerianStudio/lib-systemplane/v4/admin"
 	"github.com/gofiber/fiber/v3"
 )
 
@@ -53,7 +53,7 @@ func fakeKey(ns, key string) string { return ns + "\x00" + key }
 func (f *fakeStore) Start(_ context.Context) error { return nil }
 func (f *fakeStore) Close() error                  { return nil }
 
-func (f *fakeStore) Get(_ context.Context, ns, key string) (systemplane.TestEntry, bool, error) {
+func (f *fakeStore) Get(_ context.Context, _ systemplane.TestScope, ns, key string) (systemplane.TestEntry, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -63,17 +63,17 @@ func (f *fakeStore) Get(_ context.Context, ns, key string) (systemplane.TestEntr
 	return e, ok, nil
 }
 
-func (f *fakeStore) Set(_ context.Context, e systemplane.TestEntry) error {
+func (f *fakeStore) Set(_ context.Context, _ systemplane.TestScope, e systemplane.TestEntry) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	f.setCalls++
 	f.entries[fakeKey(e.Namespace, e.Key)] = e
 
-	return nil
+	return 0, nil
 }
 
-func (f *fakeStore) Delete(_ context.Context, ns, key, actor string) error {
+func (f *fakeStore) Delete(_ context.Context, _ systemplane.TestScope, ns, key, actor string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -93,7 +93,7 @@ func (f *fakeStore) LastDeleteActor() string {
 	return f.lastDeleteActor
 }
 
-func (f *fakeStore) List(_ context.Context) ([]systemplane.TestEntry, error) {
+func (f *fakeStore) List(_ context.Context, _ systemplane.TestScope) ([]systemplane.TestEntry, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -129,7 +129,7 @@ func (f *fakeStore) Calls() fakeStoreCalls {
 	}
 }
 
-func (f *fakeStore) Subscribe(_ context.Context, _ func(systemplane.TestEvent)) (func(), error) {
+func (f *fakeStore) Subscribe(_ context.Context, _ systemplane.TestScope, _ func(systemplane.TestEvent)) (func(), error) {
 	return func() {}, nil
 }
 
@@ -321,7 +321,7 @@ func TestAdmin_Delete(t *testing.T) {
 	}
 
 	// Sanity check: the value reached the backing store via the write path.
-	if _, ok, _ := store.Get(context.Background(), "ns", "k"); !ok {
+	if _, ok, _ := store.Get(context.Background(), systemplane.TestScope{}, "ns", "k"); !ok {
 		t.Fatal("pre-delete: entry missing from backing store")
 	}
 
@@ -339,7 +339,7 @@ func TestAdmin_Delete(t *testing.T) {
 	// the row-removed side effect; that would also pass for a handler that
 	// silently dropped the actor. Capturing it on the store eliminates that
 	// gap and pins the admin handler ↔ store contract.
-	if _, ok, _ := store.Get(context.Background(), "ns", "k"); ok {
+	if _, ok, _ := store.Get(context.Background(), systemplane.TestScope{}, "ns", "k"); ok {
 		t.Error("post-delete: entry still present in backing store")
 	}
 

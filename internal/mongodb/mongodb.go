@@ -32,7 +32,7 @@ import (
 	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/tracing"
-	"github.com/LerianStudio/lib-systemplane/v3/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -194,7 +194,13 @@ func (s *Store) DroppedEvents() int64 {
 }
 
 // resolveCollection returns the collection handle for the current call.
-func (s *Store) resolveCollection(ctx context.Context) (*mongo.Collection, error) {
+func (s *Store) resolveCollection(ctx context.Context, scope store.Scope) (*mongo.Collection, error) {
+	// MongoDB has no tenant connector yet; the storage lane adds one per
+	// FC-3. Until then a named tenant is refused.
+	if scope.Tenant != "" {
+		return nil, store.ErrTenantConnectorMissing
+	}
+
 	if !s.cfg.MultiTenantEnabled {
 		return s.coll, nil
 	}
@@ -289,12 +295,12 @@ func (s *Store) ensureSchemaByKey(ctx context.Context, cacheKey string, run func
 }
 
 // List returns every entry from the resolved collection ordered by (namespace, key).
-func (s *Store) List(ctx context.Context) ([]store.Entry, error) {
+func (s *Store) List(ctx context.Context, scope store.Scope) ([]store.Entry, error) {
 	if s == nil || s.isClosed() {
 		return nil, store.ErrClosed
 	}
 
-	coll, err := s.resolveCollection(ctx)
+	coll, err := s.resolveCollection(ctx, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -333,12 +339,12 @@ func (s *Store) List(ctx context.Context) ([]store.Entry, error) {
 }
 
 // Get returns a single entry by (namespace, key).
-func (s *Store) Get(ctx context.Context, namespace, key string) (store.Entry, bool, error) {
+func (s *Store) Get(ctx context.Context, scope store.Scope, namespace, key string) (store.Entry, bool, error) {
 	if s == nil || s.isClosed() {
 		return store.Entry{}, false, store.ErrClosed
 	}
 
-	coll, err := s.resolveCollection(ctx)
+	coll, err := s.resolveCollection(ctx, scope)
 	if err != nil {
 		return store.Entry{}, false, err
 	}
@@ -368,22 +374,22 @@ func (s *Store) Get(ctx context.Context, namespace, key string) (store.Entry, bo
 }
 
 // Set persists an entry using an upsert keyed on the compound _id.
-func (s *Store) Set(ctx context.Context, e store.Entry) error {
+func (s *Store) Set(ctx context.Context, scope store.Scope, e store.Entry) (int64, error) {
 	if s == nil || s.isClosed() {
-		return store.ErrClosed
+		return 0, store.ErrClosed
 	}
 
 	if e.Namespace == "" || e.Key == "" {
-		return fmt.Errorf("systemplane/mongodb: %w: namespace and key must be non-empty", store.ErrValidation)
+		return 0, fmt.Errorf("systemplane/mongodb: %w: namespace and key must be non-empty", store.ErrValidation)
 	}
 
 	if e.UpdatedAt.IsZero() {
 		e.UpdatedAt = time.Now().UTC()
 	}
 
-	coll, err := s.resolveCollection(ctx)
+	coll, err := s.resolveCollection(ctx, scope)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	ctx, span := s.tracer.Start(ctx, "systemplane.mongodb.set")
@@ -397,14 +403,14 @@ func (s *Store) Set(ctx context.Context, e store.Entry) error {
 	if err := upsert(ctx, coll, e); err != nil {
 		tracing.HandleSpanError(span, "set upsert failed", err)
 
-		return fmt.Errorf("systemplane/mongodb: set: %w", err)
+		return 0, fmt.Errorf("systemplane/mongodb: set: %w", err)
 	}
 
-	return nil
+	return 0, nil
 }
 
 // Delete removes a single (namespace, key) row. Idempotent.
-func (s *Store) Delete(ctx context.Context, namespace, key, actor string) error {
+func (s *Store) Delete(ctx context.Context, scope store.Scope, namespace, key, actor string) error {
 	if s == nil || s.isClosed() {
 		return store.ErrClosed
 	}
@@ -413,7 +419,7 @@ func (s *Store) Delete(ctx context.Context, namespace, key, actor string) error 
 		return fmt.Errorf("systemplane/mongodb: %w: namespace and key must be non-empty", store.ErrValidation)
 	}
 
-	coll, err := s.resolveCollection(ctx)
+	coll, err := s.resolveCollection(ctx, scope)
 	if err != nil {
 		return err
 	}

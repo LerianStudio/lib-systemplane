@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/LerianStudio/lib-systemplane/v3/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 	"go.uber.org/goleak"
 )
 
@@ -56,7 +56,7 @@ func waitForObserverExit(t *testing.T) {
 func TestPostgresSubscribe_UnsubscribeIsIdempotent(t *testing.T) {
 	s := newSubscribeStore()
 
-	unsub, err := s.Subscribe(context.Background(), func(_ store.Event) {})
+	unsub, err := s.Subscribe(context.Background(), store.Scope{}, func(_ store.Event) {})
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestPostgresSubscribe_UnsubscribeIsIdempotent(t *testing.T) {
 func TestPostgresSubscribe_NilCallback(t *testing.T) {
 	s := newSubscribeStore()
 
-	unsub, err := s.Subscribe(context.Background(), nil)
+	unsub, err := s.Subscribe(context.Background(), store.Scope{}, nil)
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}

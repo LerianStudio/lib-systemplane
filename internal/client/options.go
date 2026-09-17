@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
-	"github.com/LerianStudio/lib-systemplane/v3/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
 // clientConfig holds the merged configuration applied by Option functions.

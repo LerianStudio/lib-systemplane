@@ -5,8 +5,10 @@ package manager
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
+	tmpostgres "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/postgres"
 	"github.com/bxcodec/dbresolver/v2"
 )
 
@@ -95,4 +97,42 @@ func (*connectorStub) ResolveDB(_ context.Context, _ string) (dbresolver.DB, err
 
 func (*connectorStub) ResolveDSN(_ context.Context, _ string) (string, error) {
 	return "", errors.New("stub: no DSN")
+}
+
+func TestNew_WiresTenantManagerConnector(t *testing.T) {
+	t.Parallel()
+
+	// Pin the constructor's pgMgr→connector wiring: New(pgMgr) MUST install a
+	// tenant-manager connector that talks to the supplied manager. Confirms a
+	// real production path (not a SetConnector test seam) is exercised
+	// end-to-end without needing a live tenant-manager. That the connector
+	// wraps the manager it was handed is asserted by
+	// TestNewTenantManagerConnector_WrapsSuppliedManager in internal/postgres;
+	// here we assert the behaviour it gives the Manager.
+	pg := tmpostgres.NewManager(nil, "systemplane.manager.test")
+	m := New(pg)
+
+	if m.connector == nil {
+		t.Fatal("expected New to wire a connector for non-nil pgMgr")
+	}
+
+	// It must fail predictably (no gRPC client) — flows through the same
+	// error branches as the connector's own tests, confirming wiring.
+	if _, err := m.connector.ResolveDB(context.Background(), "x"); err == nil ||
+		!strings.Contains(err.Error(), "systemplane/postgres: get tenant connection") {
+		t.Fatalf("wired connector must surface GetConnection error, got %v", err)
+	}
+
+	// Make sure the manager isn't accidentally marked closed.
+	if m.IsClosed() {
+		t.Fatal("New must not return a closed Manager")
+	}
+
+	// Use errors.Is to assert ErrPgMgrUnavailable is NOT returned (the wired
+	// connector talks to a real tmpostgres.Manager, so the sentinel applies
+	// only to the nil-mgr case).
+	_, err := m.connector.ResolveDSN(context.Background(), "x")
+	if errors.Is(err, ErrPgMgrUnavailable) {
+		t.Fatal("ErrPgMgrUnavailable must not surface from a wired connector")
+	}
 }

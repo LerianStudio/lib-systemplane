@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 
 	"github.com/LerianStudio/lib-observability/v4/runtime"
-	"github.com/LerianStudio/lib-systemplane/v3/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
 func (s *Store) dispatchEvent(evt store.Event) {
@@ -42,7 +42,7 @@ func parseNotifyPayload(data string) (store.Event, bool) {
 		return store.Event{}, false
 	}
 
-	return store.Event{Namespace: p.Namespace, Key: p.Key, Op: op}, true
+	return store.Event{Namespace: p.Namespace, Key: p.Key, Op: op, Revision: p.Revision}, true
 }
 
 func truncateString(s string, maxLen int) string {

@@ -21,7 +21,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/LerianStudio/lib-systemplane/v3/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 	"github.com/testcontainers/testcontainers-go"
 	mongocontainer "github.com/testcontainers/testcontainers-go/modules/mongodb"
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -155,7 +155,7 @@ func TestIntegration_PollOnce_SameMsDifferentValue_EmitsBoth(t *testing.T) {
 	// Subscribe BEFORE invoking pollOnce so dispatch finds a subscriber.
 	add, snapshot := collectingSubscriber()
 
-	unsub, err := s.Subscribe(context.Background(), add)
+	unsub, err := s.Subscribe(context.Background(), store.Scope{}, add)
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
@@ -239,7 +239,7 @@ func TestIntegration_PollOnce_SameMsSameValue_EmitsOnce(t *testing.T) {
 
 	add, snapshot := collectingSubscriber()
 
-	unsub, err := s.Subscribe(context.Background(), add)
+	unsub, err := s.Subscribe(context.Background(), store.Scope{}, add)
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}

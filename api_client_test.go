@@ -28,22 +28,22 @@ func (s *apiMemoryStore) Close() error {
 	return nil
 }
 
-func (s *apiMemoryStore) Get(_ context.Context, ns, key string) (TestEntry, bool, error) {
+func (s *apiMemoryStore) Get(_ context.Context, _ TestScope, ns, key string) (TestEntry, bool, error) {
 	e, ok := s.entries[apiMemoryKey(ns, key)]
 
 	return e, ok, nil
 }
 
-func (s *apiMemoryStore) Set(_ context.Context, e TestEntry) error {
+func (s *apiMemoryStore) Set(_ context.Context, _ TestScope, e TestEntry) (int64, error) {
 	s.entries[apiMemoryKey(e.Namespace, e.Key)] = e
 	if s.sub != nil {
 		s.sub(TestEvent{Namespace: e.Namespace, Key: e.Key, Op: "upsert"})
 	}
 
-	return nil
+	return 0, nil
 }
 
-func (s *apiMemoryStore) Delete(_ context.Context, ns, key, _ string) error {
+func (s *apiMemoryStore) Delete(_ context.Context, _ TestScope, ns, key, _ string) error {
 	delete(s.entries, apiMemoryKey(ns, key))
 	if s.sub != nil {
 		s.sub(TestEvent{Namespace: ns, Key: key, Op: "delete"})
@@ -52,7 +52,7 @@ func (s *apiMemoryStore) Delete(_ context.Context, ns, key, _ string) error {
 	return nil
 }
 
-func (s *apiMemoryStore) List(context.Context) ([]TestEntry, error) {
+func (s *apiMemoryStore) List(context.Context, TestScope) ([]TestEntry, error) {
 	out := make([]TestEntry, 0, len(s.entries))
 	for _, e := range s.entries {
 		out = append(out, e)
@@ -61,7 +61,7 @@ func (s *apiMemoryStore) List(context.Context) ([]TestEntry, error) {
 	return out, nil
 }
 
-func (s *apiMemoryStore) Subscribe(_ context.Context, fn func(TestEvent)) (func(), error) {
+func (s *apiMemoryStore) Subscribe(_ context.Context, _ TestScope, fn func(TestEvent)) (func(), error) {
 	s.sub = fn
 
 	return func() { s.sub = nil }, nil
@@ -144,8 +144,8 @@ func TestPublicClientFacadeRuntimeMethods(t *testing.T) {
 	}
 
 	var changed any
-	unsub, err := c.OnChange("runtime", "name", func(_ context.Context, _, _ string, newValue any) {
-		changed = newValue
+	unsub, err := c.OnChange("runtime", "name", func(_ context.Context, ch Change) {
+		changed = ch.Value
 	})
 	if err != nil {
 		t.Fatalf("OnChange: %v", err)
@@ -214,5 +214,54 @@ func TestPublicConstructorsAndOptions(t *testing.T) {
 	}
 	if err := c.Set(context.Background(), "ns", "k", "bad", "actor"); !errors.Is(err, ErrValidation) {
 		t.Fatalf("Set invalid error = %v, want ErrValidation", err)
+	}
+}
+
+// TestPublicGetEntryCarriesRevisionAndProvenance pins FC-5 at the facade: the
+// exported Entry carries the stored revision and provenance of the row backing
+// the value, and an unregistered key reports not ok.
+func TestPublicGetEntryCarriesRevisionAndProvenance(t *testing.T) {
+	t.Parallel()
+
+	updatedAt := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
+
+	store := newAPIMemoryStore()
+	store.entries[apiMemoryKey("runtime", "name")] = TestEntry{
+		Namespace: "runtime",
+		Key:       "name",
+		Value:     []byte(`"stored"`),
+		Revision:  11,
+		UpdatedAt: updatedAt,
+		UpdatedBy: "operator",
+	}
+
+	c, err := NewForTesting(store, WithMultiTenantEnabled())
+	if err != nil {
+		t.Fatalf("NewForTesting: %v", err)
+	}
+
+	if err := c.Register("runtime", "name", "default"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	defer c.Close()
+
+	got, ok, err := c.GetEntry(ctx, "runtime", "name")
+	if err != nil || !ok {
+		t.Fatalf("GetEntry = (%+v, %v, %v)", got, ok, err)
+	}
+
+	want := Entry{Value: "stored", Revision: 11, UpdatedAt: updatedAt, UpdatedBy: "operator"}
+	if got != want {
+		t.Errorf("GetEntry = %+v, want %+v", got, want)
+	}
+
+	if _, ok, err := c.GetEntry(ctx, "runtime", "absent"); ok || err != nil {
+		t.Errorf("GetEntry for unregistered key = (%v, %v), want (false, nil)", ok, err)
 	}
 }

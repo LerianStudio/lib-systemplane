@@ -4,13 +4,17 @@ package client
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/LerianStudio/lib-systemplane/v3/internal/store"
+	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/manager"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
+	"github.com/bxcodec/dbresolver/v2"
 )
 
 // memStore is a minimal in-memory store.Store implementation used to exercise
@@ -56,7 +60,7 @@ func memKey(ns, key string) string { return ns + "\x00" + key }
 func (m *memStore) Start(_ context.Context) error { return nil }
 func (m *memStore) Close() error                  { return nil }
 
-func (m *memStore) Get(_ context.Context, ns, key string) (store.Entry, bool, error) {
+func (m *memStore) Get(_ context.Context, _ store.Scope, ns, key string) (store.Entry, bool, error) {
 	// Capture the hook outside the lock so it may touch m.* without deadlock.
 	m.mu.Lock()
 	hook := m.getHook
@@ -76,16 +80,16 @@ func (m *memStore) Get(_ context.Context, ns, key string) (store.Entry, bool, er
 	return e, ok, nil
 }
 
-func (m *memStore) Set(_ context.Context, e store.Entry) error {
+func (m *memStore) Set(_ context.Context, _ store.Scope, e store.Entry) (int64, error) {
 	m.mu.Lock()
 	m.entries[memKey(e.Namespace, e.Key)] = e
 	m.mu.Unlock()
 	m.fire(store.Event{Namespace: e.Namespace, Key: e.Key, Op: store.OpUpsert})
 
-	return nil
+	return 0, nil
 }
 
-func (m *memStore) Delete(_ context.Context, ns, key, _ string) error {
+func (m *memStore) Delete(_ context.Context, _ store.Scope, ns, key, _ string) error {
 	m.mu.Lock()
 	delete(m.entries, memKey(ns, key))
 	m.mu.Unlock()
@@ -94,7 +98,7 @@ func (m *memStore) Delete(_ context.Context, ns, key, _ string) error {
 	return nil
 }
 
-func (m *memStore) List(_ context.Context) ([]store.Entry, error) {
+func (m *memStore) List(_ context.Context, _ store.Scope) ([]store.Entry, error) {
 	// Capture and invoke the hook outside the lock so the hook itself can
 	// touch m.* (e.g., set/fire) without deadlock.
 	m.mu.Lock()
@@ -116,7 +120,7 @@ func (m *memStore) List(_ context.Context) ([]store.Entry, error) {
 	return out, nil
 }
 
-func (m *memStore) Subscribe(_ context.Context, fn func(store.Event)) (func(), error) {
+func (m *memStore) Subscribe(_ context.Context, _ store.Scope, fn func(store.Event)) (func(), error) {
 	if m.multiTenant {
 		return nil, store.ErrNotSupportedInMultiTenant
 	}
@@ -312,8 +316,8 @@ func TestOnChangeFiresOnUpsert(t *testing.T) {
 
 	received := make(chan any, 1)
 
-	unsub, err := c.OnChange("ns", "k", func(_ context.Context, _, _ string, newValue any) {
-		received <- newValue
+	unsub, err := c.OnChange("ns", "k", func(_ context.Context, ch Change) {
+		received <- ch.Value
 	})
 	if err != nil {
 		t.Fatalf("onchange: %v", err)
@@ -349,9 +353,49 @@ func TestOnChangeReturnsErrInMultiTenantMode(t *testing.T) {
 
 	defer c.Close()
 
-	_, err := c.OnChange("ns", "k", func(_ context.Context, _, _ string, _ any) {})
+	_, err := c.OnChange("ns", "k", func(_ context.Context, _ Change) {})
 	if !errors.Is(err, ErrNotSupportedInMultiTenant) {
 		t.Errorf("expected ErrNotSupportedInMultiTenant, got %v", err)
+	}
+}
+
+// TestOnChangeRefusesUnregisteredKey pins that subscribing to a key nobody
+// registered is refused in either mode. The subscription could never deliver
+// anything meaningful — no declared default, description or validator — so a
+// silent no-op only hides the typo until someone wonders why the callback
+// never fires.
+func TestOnChangeRefusesUnregisteredKey(t *testing.T) {
+	tests := map[string]func(t *testing.T) *Client{
+		"single-tenant": func(t *testing.T) *Client {
+			t.Helper()
+
+			return newSingleTenantClient(t, newMemStore(false))
+		},
+		"multi-tenant with a bound Manager": func(t *testing.T) *Client {
+			t.Helper()
+
+			c := newMultiTenantClient(t, newMemStore(true))
+			c.BindManager(manager.New(nil))
+
+			return c
+		},
+	}
+
+	for name, setup := range tests {
+		t.Run(name, func(t *testing.T) {
+			c := setup(t)
+
+			unsub, err := c.OnChange("ns", "never-registered", func(_ context.Context, _ Change) {})
+			if !errors.Is(err, ErrUnknownKey) {
+				t.Fatalf("OnChange for an unregistered key: got %v, want ErrUnknownKey", err)
+			}
+
+			if unsub == nil {
+				t.Fatal("OnChange must return a callable no-op unsubscribe even when it refuses")
+			}
+
+			unsub()
+		})
 	}
 }
 
@@ -885,7 +929,7 @@ func TestHydrationDoesNotOverwriteFresherChangefeedState(t *testing.T) {
 
 	// Seed an OLD value visible to List().
 	rawOld, _ := json.Marshal("old-from-list")
-	if err := m.Set(context.Background(), store.Entry{Namespace: "ns", Key: "k", Value: rawOld}); err != nil {
+	if _, err := m.Set(context.Background(), store.Scope{}, store.Entry{Namespace: "ns", Key: "k", Value: rawOld}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -957,7 +1001,7 @@ func TestRefreshKeepsCacheWhenReReadReportsNotFound(t *testing.T) {
 	}
 
 	raw, _ := json.Marshal("known-good")
-	if err := m.Set(context.Background(), store.Entry{Namespace: "ns", Key: "k", Value: raw}); err != nil {
+	if _, err := m.Set(context.Background(), store.Scope{}, store.Entry{Namespace: "ns", Key: "k", Value: raw}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -1027,7 +1071,7 @@ func TestRefreshOnDeleteEventRestoresDefault(t *testing.T) {
 	}
 
 	raw, _ := json.Marshal("known-good")
-	if err := m.Set(context.Background(), store.Entry{Namespace: "ns", Key: "k", Value: raw}); err != nil {
+	if _, err := m.Set(context.Background(), store.Scope{}, store.Entry{Namespace: "ns", Key: "k", Value: raw}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -1053,4 +1097,181 @@ func TestRefreshOnDeleteEventRestoresDefault(t *testing.T) {
 	if v.(string) != "default" {
 		t.Errorf("post-delete value = %v, want default", v)
 	}
+}
+
+// TestGetEntryPopulatesPublishedState pins FC-5: GetEntry reports the value in
+// force plus the provenance of the persisted row backing it, and reports
+// ok == false for an unregistered key. Stale is never true in wave 1, and the
+// caches hold only values, so a cached row reports Revision 0 and no
+// provenance until engine-core lands.
+func TestGetEntryPopulatesPublishedState(t *testing.T) {
+	updatedAt := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name   string
+		setup  func(t *testing.T) *Client
+		tenant string // non-empty puts a tenant in ctx, as middleware would
+		key    string
+		want   Entry
+		wantOK bool
+	}{
+		{
+			name: "single-tenant cache hit reports the cached value without provenance",
+			setup: func(t *testing.T) *Client {
+				t.Helper()
+
+				c := startedClient(t, newSingleTenantClient(t, newMemStore(false)))
+				if err := c.Set(context.Background(), "ns", "k", "from-cache", "actor"); err != nil {
+					t.Fatalf("set: %v", err)
+				}
+
+				return c
+			},
+			key:    "k",
+			want:   Entry{Value: "from-cache"},
+			wantOK: true,
+		},
+		{
+			name: "default in force reports the registered default at revision 0",
+			setup: func(t *testing.T) *Client {
+				t.Helper()
+
+				return startedClient(t, newSingleTenantClient(t, newMemStore(false)))
+			},
+			key:    "k",
+			want:   Entry{Value: "default"},
+			wantOK: true,
+		},
+		{
+			name: "store read-through reports the stored revision and provenance",
+			setup: func(t *testing.T) *Client {
+				t.Helper()
+
+				m := newMemStore(true)
+				m.entries[memKey("ns", "k")] = store.Entry{
+					Namespace: "ns",
+					Key:       "k",
+					Value:     []byte(`"from-store"`),
+					Revision:  7,
+					UpdatedAt: updatedAt,
+					UpdatedBy: "operator",
+				}
+
+				return startedClient(t, newMultiTenantClient(t, m))
+			},
+			key:    "k",
+			want:   Entry{Value: "from-store", Revision: 7, UpdatedAt: updatedAt, UpdatedBy: "operator"},
+			wantOK: true,
+		},
+		{
+			name: "bound-Manager cache hit reports the cached value without provenance",
+			setup: func(t *testing.T) *Client {
+				t.Helper()
+
+				c := startedClient(t, newMultiTenantClient(t, newMemStore(true)))
+
+				mgr := manager.New(nil)
+				c.BindManager(mgr)
+				mgr.SetConnector(warmLoadFailsConnector{})
+
+				// Activation fails at warm-load, but only after the per-tenant
+				// state exists and is non-stale — which is all the cache needs.
+				// Failing before LISTEN also keeps this test goroutine-free.
+				if err := mgr.OnTenantActivated(context.Background(), "t1"); err == nil {
+					t.Fatal("expected activation to fail at warm-load")
+				}
+
+				mgr.Populate(context.Background(), "t1", "ns", "k", "from-manager-cache")
+
+				return c
+			},
+			tenant: "t1",
+			key:    "k",
+			want:   Entry{Value: "from-manager-cache"},
+			wantOK: true,
+		},
+		{
+			name: "unregistered key reports not ok",
+			setup: func(t *testing.T) *Client {
+				t.Helper()
+
+				return startedClient(t, newSingleTenantClient(t, newMemStore(false)))
+			},
+			key:    "unregistered",
+			want:   Entry{},
+			wantOK: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := tt.setup(t)
+
+			ctx := context.Background()
+			if tt.tenant != "" {
+				ctx = tmcore.ContextWithTenantID(ctx, tt.tenant)
+			}
+
+			got, ok, err := c.GetEntry(ctx, "ns", tt.key)
+			if err != nil {
+				t.Fatalf("GetEntry: %v", err)
+			}
+
+			if ok != tt.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tt.wantOK)
+			}
+
+			if got != tt.want {
+				t.Errorf("GetEntry = %+v, want %+v", got, tt.want)
+			}
+
+			if got.Stale {
+				t.Error("Stale = true; wave 1 never reports a stale entry")
+			}
+
+			v, vOK, vErr := c.Get(ctx, "ns", tt.key)
+			if vErr != nil || vOK != tt.wantOK || v != tt.want.Value {
+				t.Errorf("Get = (%v, %v, %v); want (%v, %v, nil)", v, vOK, vErr, tt.want.Value, tt.wantOK)
+			}
+		})
+	}
+}
+
+// startedClient registers the table's key and starts c, closing it on cleanup.
+func startedClient(t *testing.T, c *Client) *Client {
+	t.Helper()
+
+	if err := c.Register("ns", "k", "default"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	t.Cleanup(func() { _ = c.Close() })
+
+	return c
+}
+
+// warmLoadFailsConnector activates a tenant far enough to give the Manager a
+// per-tenant cache, then stops: warm-load fails, so no LISTEN connection is
+// ever opened and the test stays goroutine-free.
+type warmLoadFailsConnector struct{}
+
+func (warmLoadFailsConnector) ResolveDB(_ context.Context, _ string) (dbresolver.DB, error) {
+	return queryFailsDB{}, nil
+}
+
+func (warmLoadFailsConnector) ResolveDSN(_ context.Context, _ string) (string, error) {
+	return "", errors.New("no LISTEN connection in this test")
+}
+
+// queryFailsDB answers the warm-load query with an error. Every other method
+// is nil by embedding: calling one is a bug this test should crash on rather
+// than silently tolerate.
+type queryFailsDB struct{ dbresolver.DB }
+
+func (queryFailsDB) QueryContext(_ context.Context, _ string, _ ...any) (*sql.Rows, error) {
+	return nil, errors.New("warm-load query unavailable")
 }
