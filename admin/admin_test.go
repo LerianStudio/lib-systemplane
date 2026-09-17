@@ -789,3 +789,195 @@ func TestAdmin_CatalogUsesReadAuthorization(t *testing.T) {
 		t.Fatalf("authorizer action = %q, want read", gotAction)
 	}
 }
+
+// setupSeededMultiTenantClient builds a multi-tenant client over a fakeStore
+// pre-seeded with rows. Multi-tenant reads bypass the single-tenant cache and
+// read through to the store, so the response carries the row's real revision
+// and provenance instead of the cache's zeros.
+func setupSeededMultiTenantClient(
+	t *testing.T,
+	seed []systemplane.TestEntry,
+	register func(c *systemplane.Client) error,
+) (*systemplane.Client, *fakeStore) {
+	t.Helper()
+
+	store := newFakeStore()
+	for _, e := range seed {
+		store.entries[fakeKey(e.Namespace, e.Key)] = e
+	}
+
+	c, err := systemplane.NewForTesting(store, systemplane.WithMultiTenantEnabled())
+	if err != nil {
+		t.Fatalf("NewForTesting: %v", err)
+	}
+
+	if register != nil {
+		if err := register(c); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+	}
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	t.Cleanup(func() { _ = c.Close() })
+
+	return c, store
+}
+
+// decodeBody returns the response body as a generic map plus its raw text. The
+// map lets a test tell an absent field from a zero-valued one, which a narrow
+// struct decode cannot; the raw text lets a redaction test assert the secret
+// never appears anywhere in the payload.
+func decodeBody(t *testing.T, resp *http.Response) (map[string]any, string) {
+	t.Helper()
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+
+	return got, string(raw)
+}
+
+func TestAdmin_GetOneCarriesRevisionAndProvenance(t *testing.T) {
+	updatedAt := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
+
+	// The registered default differs from the stored value so a
+	// default-in-force answer cannot pass this test by accident.
+	c, _ := setupSeededMultiTenantClient(t, []systemplane.TestEntry{{
+		Namespace: "runtime",
+		Key:       "name",
+		Value:     []byte(`"stored"`),
+		Revision:  11,
+		UpdatedAt: updatedAt,
+		UpdatedBy: "operator",
+	}}, func(c *systemplane.Client) error {
+		return c.Register("runtime", "name", "registered-default")
+	})
+
+	app := mountAndRun(t, c)
+
+	resp := doRequest(t, app, http.MethodGet, "/system/runtime/name", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	got, _ := decodeBody(t, resp)
+
+	if got["value"] != "stored" {
+		t.Errorf("value = %v, want stored", got["value"])
+	}
+
+	if got["revision"] != float64(11) {
+		t.Errorf("revision = %v, want 11", got["revision"])
+	}
+
+	if got["updatedAt"] != "2026-09-17T12:00:00Z" {
+		t.Errorf("updatedAt = %v, want 2026-09-17T12:00:00Z", got["updatedAt"])
+	}
+
+	if got["updatedBy"] != "operator" {
+		t.Errorf("updatedBy = %v, want operator", got["updatedBy"])
+	}
+
+	stale, present := got["stale"]
+	if !present {
+		t.Fatalf("stale absent from body, want present and false")
+	}
+
+	if stale != false {
+		t.Errorf("stale = %v, want false", stale)
+	}
+}
+
+func TestAdmin_GetOneDefaultInForceRendersZeroRevision(t *testing.T) {
+	c, _ := setupClient(t, func(c *systemplane.Client) error {
+		return c.Register("ns", "k", "default")
+	})
+
+	app := mountAndRun(t, c)
+
+	resp := doRequest(t, app, http.MethodGet, "/system/ns/k", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	got, _ := decodeBody(t, resp)
+
+	if got["revision"] != float64(0) {
+		t.Errorf("revision = %v, want 0", got["revision"])
+	}
+
+	updatedAt, present := got["updatedAt"]
+	if !present {
+		t.Fatalf("updatedAt absent from body, want present and null")
+	}
+
+	if updatedAt != nil {
+		t.Errorf("updatedAt = %v, want null", updatedAt)
+	}
+
+	if got["updatedBy"] != "" {
+		t.Errorf("updatedBy = %v, want empty string", got["updatedBy"])
+	}
+
+	stale, present := got["stale"]
+	if !present {
+		t.Fatalf("stale absent from body, want present and false")
+	}
+
+	if stale != false {
+		t.Errorf("stale = %v, want false", stale)
+	}
+}
+
+func TestAdmin_GetOneRedactsValueWithProvenance(t *testing.T) {
+	updatedAt := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
+
+	c, _ := setupSeededMultiTenantClient(t, []systemplane.TestEntry{{
+		Namespace: "runtime",
+		Key:       "name",
+		Value:     []byte(`"super-secret"`),
+		Revision:  11,
+		UpdatedAt: updatedAt,
+		UpdatedBy: "operator",
+	}}, func(c *systemplane.Client) error {
+		return c.Register("runtime", "name", "registered-default",
+			systemplane.WithRedaction(systemplane.RedactFull))
+	})
+
+	app := mountAndRun(t, c)
+
+	resp := doRequest(t, app, http.MethodGet, "/system/runtime/name", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	got, raw := decodeBody(t, resp)
+
+	if strings.Contains(raw, "super-secret") {
+		t.Fatalf("body leaked the redacted value: %s", raw)
+	}
+
+	if got["value"] != obsconstants.ObfuscatedValue {
+		t.Errorf("value = %v, want %v", got["value"], obsconstants.ObfuscatedValue)
+	}
+
+	// Revision and provenance describe the row, not the secret, so redaction
+	// must not blank them.
+	if got["revision"] != float64(11) {
+		t.Errorf("revision = %v, want 11", got["revision"])
+	}
+
+	if got["updatedBy"] != "operator" {
+		t.Errorf("updatedBy = %v, want operator", got["updatedBy"])
+	}
+}

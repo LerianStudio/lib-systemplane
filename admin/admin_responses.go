@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"time"
 
 	commonshttp "github.com/LerianStudio/lib-commons/v7/commons/net/http"
 	systemplane "github.com/LerianStudio/lib-systemplane/v4"
@@ -23,10 +24,24 @@ type entryResponse struct {
 }
 
 type getResponse struct {
-	Namespace   string `json:"namespace"`
-	Key         string `json:"key"`
-	Value       any    `json:"value"`
-	Description string `json:"description,omitempty"`
+	Namespace   string     `json:"namespace"`
+	Key         string     `json:"key"`
+	Value       any        `json:"value"`
+	Description string     `json:"description,omitempty"`
+	Revision    int64      `json:"revision"`
+	UpdatedAt   *time.Time `json:"updatedAt"`
+	UpdatedBy   string     `json:"updatedBy"`
+	Stale       bool       `json:"stale"`
+}
+
+// nilIfZeroTime renders an absent row's provenance as JSON null instead of
+// "0001-01-01T00:00:00Z".
+func nilIfZeroTime(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+
+	return &t
 }
 
 type catalogDetailResponse struct {

@@ -354,7 +354,7 @@ func handleGetOne(client *systemplane.Client) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		namespace, key := registeredPathParams(client, c)
 
-		value, ok, err := client.Get(c.Context(), namespace, key)
+		e, ok, err := client.GetEntry(c.Context(), namespace, key)
 		if err != nil {
 			return mapSentinelErr(c, err)
 		}
@@ -364,13 +364,17 @@ func handleGetOne(client *systemplane.Client) fiber.Handler {
 		}
 
 		policy := client.KeyRedaction(namespace, key)
-		redacted := systemplane.ApplyRedaction(value, policy)
+		redacted := systemplane.ApplyRedaction(e.Value, policy)
 
 		return c.Status(fiber.StatusOK).JSON(getResponse{
 			Namespace:   namespace,
 			Key:         key,
 			Value:       redacted,
 			Description: client.KeyDescription(namespace, key),
+			Revision:    e.Revision,
+			UpdatedAt:   nilIfZeroTime(e.UpdatedAt),
+			UpdatedBy:   e.UpdatedBy,
+			Stale:       e.Stale,
 		})
 	}
 }
