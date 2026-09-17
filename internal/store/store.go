@@ -120,7 +120,6 @@ type Store interface {
 	// Subscribe opens a changefeed for scope for the lifetime of ctx, emits
 	// OpDisconnect when the connection is lost and OpResync after every
 	// (re)connect. Returns ErrNotSupportedInMultiTenant only for a backend
-	// that has no changefeed for that scope (none of the two shipped
-	// backends today).
+	// that has no changefeed for that scope.
 	Subscribe(ctx context.Context, scope Scope, fn func(Event)) (unsubscribe func(), err error)
 }
