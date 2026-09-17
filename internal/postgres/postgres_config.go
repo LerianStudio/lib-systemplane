@@ -16,7 +16,7 @@ func New(cfg Config) (*Store, error) {
 		return nil, err
 	}
 
-	return &Store{cfg: cfg, feeds: make(map[string]*feed)}, nil
+	return &Store{cfg: cfg, feeds: make(map[string]*feed), closedCh: make(chan struct{})}, nil
 }
 
 func normalizeConfig(cfg *Config) error {

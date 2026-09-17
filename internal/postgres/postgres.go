@@ -150,6 +150,14 @@ type Store struct {
 
 	mu     sync.Mutex
 	closed bool
+
+	// closedCh is closed exactly once, by Close, in the same s.mu hold that
+	// sets closed — the early return above it is what makes that single. It is
+	// the store-wide shutdown signal every subscription's ctx observer selects
+	// on, so a subscriber whose ctx outlives the store does not leave a
+	// goroutine parked forever. Created by New; a Store is not usable without
+	// it.
+	closedCh chan struct{}
 }
 
 // Start opens the single-tenant LISTEN connection. The schema is NOT created
@@ -183,6 +191,8 @@ func (s *Store) Close() error {
 	}
 
 	s.closed = true
+
+	close(s.closedCh)
 	s.mu.Unlock()
 
 	s.stopFeeds()

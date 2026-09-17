@@ -9,6 +9,8 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -23,14 +25,21 @@ import (
 // constructor validates DB/DSN; Subscribe itself doesn't touch either.
 func newSubscribeStore() *Store {
 	return &Store{
-		cfg:   Config{Channel: defaultChannel, Table: defaultTable, Module: defaultModule},
-		feeds: map[string]*feed{"": newFeed(store.Scope{}, "")},
+		cfg:      Config{Channel: defaultChannel, Table: defaultTable, Module: defaultModule},
+		feeds:    map[string]*feed{"": newFeed(store.Scope{}, "")},
+		closedCh: make(chan struct{}),
 	}
 }
 
 // subscriberCount reports how many callbacks the zero-scope feed will fan out to.
 func subscriberCount(s *Store) int {
-	f := s.zeroFeed()
+	s.feedsMu.Lock()
+	f, ok := s.feeds[""]
+	s.feedsMu.Unlock()
+
+	if !ok {
+		return 0
+	}
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -117,8 +126,6 @@ func TestPostgresSubscribe_NilCallback(t *testing.T) {
 // connection loss get announced". It must fire exactly once per outage and
 // never during a clean teardown.
 func TestPostgresFeed_BeginDisconnectSuppressedWhenClosing(t *testing.T) {
-	t.Parallel()
-
 	f := newFeed(store.Scope{}, "")
 	f.subs[1] = &subscription{fn: func(store.Event) {}}
 	f.subs[2] = &subscription{fn: func(store.Event) {}}
@@ -138,8 +145,8 @@ func TestPostgresFeed_BeginDisconnectSuppressedWhenClosing(t *testing.T) {
 	}
 
 	// A successful reconnect re-arms the edge.
-	if n := len(f.beginResync()); n != 2 {
-		t.Fatalf("beginResync returned %d subscribers, want 2", n)
+	if subs, ok := f.beginResync(); !ok || len(subs) != 2 {
+		t.Fatalf("beginResync after a disconnect = (%d subs, ok %v), want (2, true)", len(subs), ok)
 	}
 
 	if subs, ok := f.beginDisconnect(); !ok || len(subs) != 2 {
@@ -235,7 +242,10 @@ func TestPostgresFeed_CloseRacingConnectionLoss_EmitsNoDisconnect(t *testing.T) 
 // still completes.
 func TestPostgresSubscribe_PanickingCallbackDoesNotEscapeOrHoldLock(t *testing.T) {
 	s := newSubscribeStore()
-	f := s.zeroFeed()
+	f, err := s.zeroFeed()
+	if err != nil {
+		t.Fatalf("zeroFeed: %v", err)
+	}
 
 	f.beginResync() // mark the feed connected, as a successful LISTEN does
 
@@ -254,13 +264,13 @@ func TestPostgresSubscribe_PanickingCallbackDoesNotEscapeOrHoldLock(t *testing.T
 	}
 
 	// Subscribe must return normally; a panic here fails the test by unwinding it.
-	unsub, err := s.Subscribe(context.Background(), store.Scope{}, func(evt store.Event) {
+	unsub, subErr := s.Subscribe(context.Background(), store.Scope{}, func(evt store.Event) {
 		if record(evt) == 1 {
 			panic("callback exploded on its joining resync")
 		}
 	})
-	if err != nil {
-		t.Fatalf("subscribe: %v", err)
+	if subErr != nil {
+		t.Fatalf("subscribe: %v", subErr)
 	}
 
 	defer unsub()
@@ -299,5 +309,136 @@ func TestPostgresSubscribe_PanickingCallbackDoesNotEscapeOrHoldLock(t *testing.T
 
 	if n != 2 {
 		t.Fatalf("callback saw %d events, want 2 (joining resync, then the upsert)", n)
+	}
+}
+
+// unreachableDSN points at a closed loopback port: any dial fails immediately
+// instead of hanging, so a test that sees a connect error is a test where the
+// shutdown guard failed to run.
+const unreachableDSN = "postgres://u:p@127.0.0.1:1/db?sslmode=disable"
+
+func newListenStore(t *testing.T) *Store {
+	t.Helper()
+
+	s, err := New(Config{DB: &sql.DB{}, ListenDSN: unreachableDSN})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	return s
+}
+
+// closingStore puts a real store into the state Close leaves the instant it
+// starts: the store-wide closing flag raised and the feeds map walked clean.
+// A Start or a Subscribe that already passed the s.closed check is racing
+// exactly this state.
+func closingStore(t *testing.T) *Store {
+	t.Helper()
+
+	s := newListenStore(t)
+
+	s.feedsMu.Lock()
+	s.closing = true
+
+	clear(s.feeds)
+	s.feedsMu.Unlock()
+
+	return s
+}
+
+func feedCount(s *Store) int {
+	s.feedsMu.Lock()
+	defer s.feedsMu.Unlock()
+
+	return len(s.feeds)
+}
+
+// Start losing the race to Close must open nothing. Without the recheck it
+// re-inserts the zero-scope feed into a shut-down store, opens a LISTEN
+// connection and launches its reader — and a second Close returns early at
+// s.closed, so that connection and goroutine live until the process dies.
+func TestPostgresStart_RacingCloseOpensNothing(t *testing.T) {
+	s := closingStore(t)
+
+	if err := s.Start(context.Background()); !errors.Is(err, store.ErrClosed) {
+		t.Fatalf("Start on a closing store = %v, want ErrClosed: it must not resurrect the zero-scope feed", err)
+	}
+
+	if n := feedCount(s); n != 0 {
+		t.Fatalf("feeds map holds %d entries after Start lost to Close, want 0", n)
+	}
+
+	waitForObserverExit(t)
+}
+
+// Subscribe losing the same race must refuse rather than hand back a
+// subscription on a feed nothing will ever drive.
+func TestPostgresSubscribe_ZeroScopeRacingCloseIsRefused(t *testing.T) {
+	s := closingStore(t)
+
+	unsub, err := s.Subscribe(context.Background(), store.Scope{}, func(store.Event) {})
+	if !errors.Is(err, store.ErrClosed) {
+		t.Fatalf("Subscribe on a closing store = %v, want ErrClosed: a dead store must not hand back a live-looking subscription", err)
+	}
+
+	if unsub != nil {
+		t.Error("Subscribe returned an unsubscribe func alongside its error")
+	}
+
+	if n := feedCount(s); n != 0 {
+		t.Fatalf("feeds map holds %d entries after Subscribe lost to Close, want 0", n)
+	}
+
+	waitForObserverExit(t)
+}
+
+// Close reaps every subscription's ctx observer. A subscriber whose ctx
+// outlives the store — an engine root ctx, or context.Background() — otherwise
+// keeps one goroutine parked forever, holding the feed graph it closes over
+// alive with it.
+func TestPostgresSubscribe_CloseReapsCtxObservers(t *testing.T) {
+	s := newListenStore(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// A cancellable ctx nobody cancels, and a ctx with no Done channel at all.
+	if _, err := s.Subscribe(ctx, store.Scope{}, func(store.Event) {}); err != nil {
+		t.Fatalf("subscribe (cancellable ctx): %v", err)
+	}
+
+	if _, err := s.Subscribe(context.Background(), store.Scope{}, func(store.Event) {}); err != nil {
+		t.Fatalf("subscribe (background ctx): %v", err)
+	}
+
+	if n := subscriberCount(s); n != 2 {
+		t.Fatalf("subscriber map size = %d, want 2 before Close", n)
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	waitForObserverExit(t)
+}
+
+// A reconnect that succeeds just as Close lands must announce nothing: the
+// scope is going away, and an OpResync there would send the engine off to
+// reconcile a feed that no longer exists.
+func TestPostgresFeed_BeginResyncSuppressedWhenClosing(t *testing.T) {
+	f := newFeed(store.Scope{}, "")
+	f.subs[1] = &subscription{fn: func(store.Event) {}}
+
+	if subs, ok := f.beginResync(); !ok || len(subs) != 1 {
+		t.Fatalf("beginResync on a live feed = (%d subs, ok %v), want (1, true)", len(subs), ok)
+	}
+
+	// Teardown wins, exactly as it does for beginDisconnect.
+	f.mu.Lock()
+	f.closing = true
+	f.mu.Unlock()
+
+	if subs, ok := f.beginResync(); ok || len(subs) != 0 {
+		t.Fatalf("beginResync during teardown = (%d subs, ok %v), want (0, false)", len(subs), ok)
 	}
 }

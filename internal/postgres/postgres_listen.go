@@ -142,14 +142,23 @@ func (f *feed) beginDisconnect() (subs []*subscription, ok bool) {
 // beginResync marks the feed connected again, clears f.disconnected so the
 // next real loss can emit once more, and returns the subscribers to receive
 // OpResync. Called after every successful (re)LISTEN.
-func (f *feed) beginResync() (subs []*subscription) {
+//
+// Like beginDisconnect it is atomic with teardown: ok is false once f.closing
+// is set, so a (re)connect that completes just as Close lands announces
+// nothing. A resync emitted then would tell the engine to reconcile a scope
+// whose feed is already gone.
+func (f *feed) beginResync() (subs []*subscription, ok bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	if f.closing {
+		return nil, false
+	}
 
 	f.connected = true
 	f.disconnected = false
 
-	return f.snapshotLocked()
+	return f.snapshotLocked(), true
 }
 
 // deliverLocked runs fn under runtime.RecoverAndLog. The caller MUST already
@@ -179,22 +188,31 @@ func (s *Store) broadcast(subs []*subscription, evt store.Event) {
 
 // zeroFeed returns the zero-scope feed, creating it when Subscribe runs before
 // Start. Callers must NOT hold feedsMu.
-func (s *Store) zeroFeed() *feed {
+func (s *Store) zeroFeed() (*feed, error) {
 	s.feedsMu.Lock()
 	defer s.feedsMu.Unlock()
 
 	return s.zeroFeedLocked()
 }
 
-func (s *Store) zeroFeedLocked() *feed {
+// zeroFeedLocked refuses to hand out — or resurrect — the zero-scope feed once
+// Close has begun. The caller MUST hold Store.feedsMu, which is what makes the
+// check atomic with the map walk in stopFeeds: a Start or a Subscribe that
+// already passed the s.closed check would otherwise re-insert a slot into a
+// shut-down store, and nothing would ever tear it down again.
+func (s *Store) zeroFeedLocked() (*feed, error) {
+	if s.closing {
+		return nil, store.ErrClosed
+	}
+
 	if f, ok := s.feeds[""]; ok {
-		return f
+		return f, nil
 	}
 
 	f := newFeed(store.Scope{}, s.cfg.ListenDSN)
 	s.feeds[""] = f
 
-	return f
+	return f, nil
 }
 
 // acquireFeed returns the live feed for scope — creating it when this caller is
@@ -214,7 +232,13 @@ func (s *Store) acquireFeed(ctx context.Context, scope store.Scope) (*feed, erro
 	s.feedsMu.Lock()
 
 	if scope.Tenant == "" {
-		f := s.zeroFeedLocked()
+		f, err := s.zeroFeedLocked()
+		if err != nil {
+			s.feedsMu.Unlock()
+
+			return nil, err
+		}
+
 		f.refs++
 		s.feedsMu.Unlock()
 
@@ -486,12 +510,21 @@ func (s *Store) Subscribe(ctx context.Context, scope store.Scope, fn func(store.
 		})
 	}
 
-	// A nil ctx would panic on ctx.Done(); such callers simply get no observer
-	// and the same unsubscribe func.
-	if ctx != nil {
+	// The observer exists only to watch a ctx that CAN end: a nil ctx would
+	// panic on ctx.Done(), and context.Background() has no Done channel at all,
+	// so both get no goroutine and the same unsubscribe func.
+	//
+	// s.closedCh is the third arm, and it is what bounds the observer's life by
+	// the STORE's: a subscription whose ctx outlives the store (an engine root
+	// ctx) would otherwise keep this goroutine — and the feed graph it closes
+	// over — parked forever after Close. Teardown runs on that arm too, so the
+	// subscriber slot goes with it.
+	if ctx != nil && ctx.Done() != nil {
 		go func() {
 			select {
 			case <-ctx.Done():
+				teardown()
+			case <-s.closedCh:
 				teardown()
 			case <-cancelCh:
 			}
@@ -545,8 +578,16 @@ func (s *Store) startFeedReader(f *feed, conn *pgx.Conn) {
 // and launches its reader. It synchronously verifies LISTEN was installed
 // before returning, so callers can immediately observe events and a bad DSN
 // surfaces as a Start error instead of looping in the background.
+//
+// It publishes through publishFeed for the same reason a tenant creator does:
+// the connection is opened outside the feeds-map lock, so a Close that lands
+// meanwhile must be able to throw it away instead of inheriting a live LISTEN
+// connection and a reader goroutine no later Close will ever stop.
 func (s *Store) startListener(ctx context.Context) error {
-	f := s.zeroFeed()
+	f, err := s.zeroFeed()
+	if err != nil {
+		return err
+	}
 
 	f.mu.Lock()
 	running := f.done != nil
@@ -561,9 +602,7 @@ func (s *Store) startListener(ctx context.Context) error {
 		return err
 	}
 
-	s.startFeedReader(f, conn)
-
-	return nil
+	return s.publishFeed(ctx, f, conn)
 }
 
 // stopFeeds tears down every feed the store owns. Idempotent.
@@ -638,7 +677,9 @@ func (s *Store) runFeed(f *feed, conn *pgx.Conn) {
 	attempt := 0
 
 	for {
-		s.broadcast(f.beginResync(), store.Event{Scope: f.scope, Op: store.OpResync})
+		if subs, ok := f.beginResync(); ok {
+			s.broadcast(subs, store.Event{Scope: f.scope, Op: store.OpResync})
+		}
 
 		s.consumeUntilFailure(f, conn)
 

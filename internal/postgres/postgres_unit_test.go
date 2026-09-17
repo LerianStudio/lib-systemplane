@@ -244,7 +244,11 @@ func TestNotifyPayloadParsingAndDispatch(t *testing.T) {
 	}
 
 	s := newSubscribeStore()
-	f := s.zeroFeed()
+	f, err := s.zeroFeed()
+	if err != nil {
+		t.Fatalf("zeroFeed: %v", err)
+	}
+
 	var got []store.Event
 	f.subs[1] = &subscription{fn: func(store.Event) { panic("handler panic must be recovered") }}
 	f.subs[2] = &subscription{fn: func(evt store.Event) { got = append(got, evt) }}
