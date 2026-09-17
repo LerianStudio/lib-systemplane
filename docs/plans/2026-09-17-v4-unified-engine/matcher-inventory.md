@@ -185,12 +185,13 @@ Eight groups. Grouping criterion used: **one group = one live resource or one en
 ### `http` — HOT only
 Fields: `body_limit_bytes`, `cors_allowed_origins`, `cors_allowed_methods`, `cors_allowed_headers`, `query_timeout_sec`, `health_check_timeout_ms`, `health_check_timeout_sec`.
 No apply hook: every field is resolved inside middleware per request (`fiber_middleware_runtime.go`, `health_huma.go`).
-Invariants that justify the grouping: `body_limit_bytes` ≤ the Fiber ceiling (128 MiB) AND `body_limit_bytes` must not be the governing limit for the streaming upload route — today that disjointness is documented only in a description string; a group struct can assert it. `health_check_timeout_ms` supersedes `health_check_timeout_sec` (`InfrastructureConfig.HealthCheckTimeout` already encodes the precedence); the two belong in one struct so the fallback rule is a method on the group, not a free function. `query_timeout_sec` should be ≥ `health_check_timeout_ms` or readiness probes can outlive their own DB query.
+Invariants that justify the grouping: `body_limit_bytes` ≤ the Fiber ceiling (128 MiB) AND `body_limit_bytes` must not be the governing limit for the streaming upload route — today that disjointness is documented only in a description string; a group struct can assert it. `health_check_timeout_ms` supersedes `health_check_timeout_sec` (`InfrastructureConfig.HealthCheckTimeout` already encodes the precedence); the two belong in one struct so the fallback rule is a method on the group, not a free function. `query_timeout_sec * 1000` ≥ `health_check_timeout_ms` — stated with the conversion because the two fields carry different units (seconds and milliseconds) and a direct `>=` would compare `30` against `800` and reject the default configuration. Unit rule for the whole document: the pilot's group validator receives the raw `int` fields, not `time.Duration`, so every cross-field time invariant here must spell out its unit conversion.
 
 ### `rate_limit` — HOT only
 Fields: `enabled`, plus five `(max, expiry_sec)` pairs: global, export, dispatch, admin, signup.
 No apply hook — `rate_limiter.go:settingsBackedRateLimitHandler` reads the whole group per request. This is the single strongest argument for typed groups in the repo: eleven separate `SystemplaneGetInt` round trips happen on **every** request today (`runtime_settings.go:runtimeSettingsResolver.rateLimit`), where a group read would be one.
 Invariants: every `expiry_sec` > 0 (a zero window makes the limiter a no-op); `admin_max` ≤ `max` (the admin plane must never be able to starve tenant traffic — the stated design intent, unenforced today); `signup_max` ≤ `max`; when `enabled` is false in production the value must be rejected, not silently corrected (today `config_loading.go:Config.enforceProductionSecurityDefaults` forces it back to `true` at boot only, so a runtime PUT of `false` in production is accepted and takes effect — a security regression a group-level validator closes).
+**`enabled` is not live in both directions today, and the pilot must make it so.** `rate_limiter.go:NewLibRateLimiter` delegates to `ratelimit.New`, which reads the `RATE_LIMIT_ENABLED` *process env var* itself (`commons.RateLimitEnabled()` in `vendor/.../lib-commons/v6/commons/net/http/ratelimit/middleware.go:New`) and returns `nil` when it is not truthy; a nil limiter is a pass-through. `rate_limiter.go:settingsBackedRateLimitHandler` then reads only the group's `enabled` field per request. So with `RATE_LIMIT_ENABLED=false` at boot there is no limiter to enforce with, and flipping `rate_limit.enabled` to `true` through `/system` changes nothing — the request still passes unlimited, with no error to the operator. The pilot must construct the limiter unconditionally at boot (its existence must not depend on any enabled flag, env or group) and let the group's `enabled` field be the only thing that decides enforcement per request. Required tests for the pilot lane, both of them: `false → true` must start enforcing without a restart, and `true → false` must stop enforcing without a restart.
 
 ### `ingestion` — HOT only
 Fields: `max_upload_bytes`, `dedupe_ttl_sec`, `idempotency_retry_window_sec`, `idempotency_success_ttl_hours`, `idempotency_hmac_secret` (redacted).
@@ -212,7 +213,7 @@ Invariants: `cleanup_grace_period_sec` ≥ `export_presign_expiry_sec` — other
 ### `archival` — APPLY (archival worker + its S3 client)
 Fields: `enabled`, `interval_hours`, `batch_size`, `partition_lookahead`, `hot_retention_days`, `warm_retention_months`, `cold_retention_months`, `storage_bucket`, `storage_class` (enum), `presign_expiry_sec`.
 Apply hook: yes, and the heaviest one — `worker_manager_runtime.go:applyArchivalRuntimeConfig` takes an `InfraConnector` because a change rebuilds the S3 client.
-Invariants (the clearest case in the repo): `hot_retention_days / 30` ≤ `warm_retention_months` ≤ `cold_retention_months`. Today all three are separate `int` keys with no validator at all, so an operator can PUT `warm=1, cold=0` and silently create a tier gap that destroys data. `partition_lookahead` × `interval_hours` must cover at least one sweep cycle or the worker archives into a partition that does not exist yet. `presign_expiry_sec` ≤ 604800.
+Invariants (the clearest case in the repo): `hot_retention_days` ≤ `warm_retention_months * 30` ≤ `cold_retention_months * 30` — multiplied rather than dividing the days, because integer division on the raw `int` truncates (`89 / 30 = 2`) and would accept a hot tier that outlives the warm tier. Today all three are separate `int` keys with no validator at all, so an operator can PUT `warm=1, cold=0` and silently create a tier gap that destroys data. `partition_lookahead` × `interval_hours` must cover at least one sweep cycle or the worker archives into a partition that does not exist yet. `presign_expiry_sec` ≤ 604800.
 
 ### `object_storage` — APPLY (shared S3 resource) + HOT delegate
 Fields: `endpoint`, `region`, `bucket`, `access_key_id` (redacted), `secret_access_key` (redacted), `use_path_style`, `allow_insecure_endpoint`.
@@ -222,12 +223,18 @@ Invariants: `allow_insecure_endpoint` must be false whenever `endpoint` is not `
 ### `tenancy` — APPLY (tenant-manager rebuild)
 Fields: the nine `multi_tenant_*` keys.
 Apply hook: yes — this group already *is* a hand-rolled apply hook. `dynamic_infrastructure_multi_tenant.go:dynamicMultiTenantKey` serialises nine fields plus a SHA-256 fingerprint of the API key into a string, compares it, and rebuilds via `:buildCanonicalTenantManager`. A typed group with struct equality plus a `Rebuild` hook deletes that entire fingerprinting apparatus.
-Invariants: `circuit_breaker_timeout_sec` ≥ `timeout` (a breaker that reopens faster than a single call can complete never closes); `cache_ttl_sec` ≥ `connections_check_interval_sec`; `max_tenant_pools` × per-tenant max-open ≤ the Postgres connection budget — the comment in `:tenantManagerPostgresOptions` spells this out but nothing enforces it. Note the group deliberately *excludes* `multi_tenant_max_open_conns_per_tenant`, `multi_tenant_max_idle_conns_per_tenant` and `multi_tenant_allow_insecure_http`, which are bootstrap-only; that exclusion is load-bearing and documented at `dynamic_infrastructure_multi_tenant.go:dynamicMultiTenantKey`.
+Invariants: `circuit_breaker_timeout_sec` ≥ `multi_tenant_timeout` (both seconds; a breaker that reopens faster than a single call can complete never closes); `cache_ttl_sec` ≥ `connections_check_interval_sec` (both seconds). The connection-budget rule is **not** in this list — see "Startup-only invariants" below. Note the group deliberately *excludes* `multi_tenant_max_open_conns_per_tenant`, `multi_tenant_max_idle_conns_per_tenant` and `multi_tenant_allow_insecure_http`, which are bootstrap-only; that exclusion is load-bearing and documented at `dynamic_infrastructure_multi_tenant.go:dynamicMultiTenantKey`.
 
 ### Groups requested in the brief that should **not** exist as typed groups
 
 - **`document_extraction`** and **`rule_suggestion`**: each is a single per-tenant boolean read fail-closed per request. The rest of each lane (`Enabled`, `APIKey`, `Model`) is genuinely bootstrap — the Anthropic client is built once. A one-field group is a struct with no invariant. Better shape: one `ai_gates` group with two booleans (`doc_extraction_tenant_opt_in`, `rule_advisor_tenant_opt_in`), which also makes the unregistered-key defect above impossible to reintroduce.
 - **A `telemetry`/`swagger` group**: both are INERT today. They should be *deregistered*, not regrouped, unless someone commits to an apply hook that re-creates the OTel exporter and re-mounts the spec route. Registering a knob with no reload path is the exact footgun `systemplane_keys_defs.go:matcherKeyDefs` spends 40 lines of comments warning against, and these four keys violate it.
+
+### Startup-only invariants (env, not systemplane)
+
+One invariant does not belong to any group, because no group validator can see both of its operands.
+
+- **Tenant connection budget**: `MULTI_TENANT_MAX_TENANT_POOLS` × `MULTI_TENANT_MAX_OPEN_CONNS_PER_TENANT` ≤ `POSTGRES_MAX_OPEN_CONNS`. The comment in `dynamic_infrastructure_multi_tenant.go:tenantManagerPostgresOptions` spells this out and nothing enforces it. It cannot become a `tenancy` group invariant: a group validator receives only the decoded `tenancy` value, and that value excludes `MULTI_TENANT_MAX_OPEN_CONNS_PER_TENANT` (bootstrap-only, deliberately outside the rebuild key) while `POSTGRES_MAX_OPEN_CONNS` belongs to no group at all. Enforce it **once at boot**, in the config loader, where all three env values are in hand — `config_loading.go:Config.Validate` is the natural home. Changing any of the three requires a restart anyway, so a startup check loses nothing.
 
 **Apply-hook summary**: `tenancy`, `matching` (partial), `reporting`, `archival`, `object_storage` need hooks. `http`, `rate_limit`, `ingestion`, `ai_gates` are hot reads only.
 
@@ -283,7 +290,7 @@ Classification: `bootstrap` (DSN/port/identity, restart required by nature) · `
 | `TLS_TERMINATED_UPSTREAM` | bool | `false` | `fiber_server.go:NewFiberApp` (HSTS) | bootstrap | no |
 | `TRUSTED_PROXIES` | string | `""` | `fiber_server.go:NewFiberApp` (ProxyHeader) | bootstrap | no |
 
-#### TenancyConfig (19)
+#### TenancyConfig (20)
 
 | Env var | Type | Default | Applied at | Class | Dup |
 |---|---|---|---|---|---|
@@ -308,7 +315,7 @@ Classification: `bootstrap` (DSN/port/identity, restart required by nature) · `
 | `MULTI_TENANT_MAX_IDLE_CONNS_PER_TENANT` | int | `0` | same | bootstrap | no |
 | `MULTI_TENANT_ALLOW_INSECURE_HTTP` | bool | `false` | `config_validation_tenancy.go` | bootstrap | no |
 
-#### PostgresConfig (18)
+#### PostgresConfig (20)
 
 | Env var | Type | Default | Applied at | Class | Dup |
 |---|---|---|---|---|---|
@@ -364,7 +371,7 @@ Classification: `bootstrap` (DSN/port/identity, restart required by nature) · `
 | `RABBITMQ_ALLOW_INSECURE_HEALTH_CHECK` | bool | `false` | same | bootstrap |
 | `RABBITMQ_TLS_REQUIRED` | bool | `false` | `tls_enforcement.go:ValidateRequiredTLS` | bootstrap |
 
-#### Auth / Swagger / Telemetry (13)
+#### Auth / Swagger / Telemetry (15)
 
 | Env var | Type | Default | Applied at | Class | Dup |
 |---|---|---|---|---|---|
@@ -400,7 +407,7 @@ Classification: `bootstrap` (DSN/port/identity, restart required by nature) · `
 | `SIGNUP_RATE_LIMIT_MAX` | int | `5` | seeds key | hot-read | **YES** |
 | `SIGNUP_RATE_LIMIT_EXPIRY_SEC` | int | `3600` | seeds key | hot-read | **YES** |
 
-#### Infrastructure / Idempotency / Outbox / Ingestion / Dedupe / Webhook / Exception / Governance (12)
+#### Infrastructure / Idempotency / Outbox / Ingestion / Dedupe / Webhook / Exception / Governance (13)
 
 | Env var | Type | Default | Applied at | Class | Dup |
 |---|---|---|---|---|---|
@@ -431,7 +438,7 @@ Classification: `bootstrap` (DSN/port/identity, restart required by nature) · `
 | `OBJECT_STORAGE_ALLOW_INSECURE_ENDPOINT` | bool | `false` | same; forced `false` in production at boot only | controlled-apply | **YES** |
 | `OBJECT_STORAGE_TLS_REQUIRED` | bool | `false` | `tls_enforcement.go:ValidateRequiredTLS` | bootstrap | no |
 
-#### Workers (19)
+#### Workers (22)
 
 | Env var | Type | Default | Applied at | Class | Dup |
 |---|---|---|---|---|---|
@@ -473,7 +480,7 @@ Classification: `bootstrap` (DSN/port/identity, restart required by nature) · `
 | `ARCHIVAL_PARTITION_LOOKAHEAD` | int | `3` | seeds key | controlled-apply | **YES** |
 | `ARCHIVAL_PRESIGN_EXPIRY_SEC` | int | `3600` | seeds key | hot-read | **YES** |
 
-#### Fetcher / AI lanes (11)
+#### Fetcher / AI lanes (14)
 
 | Env var | Type | Default | Applied at | Class | Dup |
 |---|---|---|---|---|---|
@@ -518,7 +525,7 @@ Classification: `bootstrap` (DSN/port/identity, restart required by nature) · `
 | `HUB_WEBHOOK_DRAIN_MAX_ATTEMPTS` | int | `0` (unbounded) | same | controlled-apply |
 | `HUB_WEBHOOK_DRAIN_ROUTES` | string | `""` | same | controlled-apply |
 
-#### Onboarding / billing (23) — never loaded from env; the largest secret cluster in the service
+#### Onboarding / billing (25) — never loaded from env; the largest secret cluster in the service
 
 | Env var | Type | Default | Applied at | Class |
 |---|---|---|---|---|
@@ -548,7 +555,7 @@ Classification: `bootstrap` (DSN/port/identity, restart required by nature) · `
 | `ONBOARDING_BILLING_WEBHOOK_SECRET` | string | `""` | `init_billing_webhook.go` | secret |
 | `ONBOARDING_CONSOLE_BASE_URL` | string | `""` | `init_onboarding.go` | bootstrap |
 
-#### Library-owned env, outside matcher's `Config` (41)
+#### Library-owned env, outside matcher's `Config` (44)
 
 - **`SYSTEMPLANE_POSTGRES_DSN`** — string, empty. Read directly by `systemplane_init.go:buildSystemplaneDSN`; when set it overrides the DSN composed from `POSTGRES_*`. Class: **bootstrap**. This is the only env var lib-systemplane integration reads itself, and v4 should keep it (or take the DSN as a parameter).
 - **38 `STREAMING_*` vars** — consumed by `streaming.LoadConfig()` at `internal/bootstrap/init_modules.go`, never by matcher's `Config`. `STREAMING_TLS_ENABLED` is additionally asserted in production by `config_validation_production.go`. Class: **bootstrap** (broker identity, SASL/TLS) and **secret** (`STREAMING_SASL_PASSWORD`, `STREAMING_TLS_CA_CERT`). Not in scope for matcher's groups.

@@ -81,7 +81,7 @@ Written before any lane starts. A lane that needs to change one stops and the or
 module github.com/LerianStudio/lib-systemplane/v4
 ```
 
-Every in-repo import uses `/v4`. Semantic-release cannot cut a Go major: the `contracts` lane renames the path, and the orchestrator hand-tags `v4.0.0-beta.1` on the merge commit into `develop` so the beta channel stays consumable for a `/v4` module (see Merge Order). `v4.0.0` is hand-tagged on `main` by the `integration` lane.
+Every in-repo import uses `/v4`. Semantic-release cannot cut a Go major: the `contracts` lane renames the path, and the orchestrator hand-tags `v4.0.0-beta.1` on the contracts PR head before the merge (see § Merge Order step 1 for why before, not after). `v4.0.0` is hand-tagged on `main` by the `integration` lane.
 
 ### FC-2 `internal/store` — Scope, Revision, OpResync, Store
 
@@ -480,7 +480,7 @@ Absence checks deferred from lanes under rule 4 live here (see the lane's Done-w
 
 ## Merge Order
 
-1. `contracts` → `develop`. Orchestrator then runs `git tag v4.0.0-beta.1 <merge-sha> && git push origin v4.0.0-beta.1` and watches the next `release.yml` run on `develop`: it must compute `v4.0.0-beta.2`, not a `v3.x` tag. If it computes `v3.x`, stop and fix `release.yml` / tags before wave 2 merges anything.
+1. `contracts` → `develop`. The orchestrator tags the PR head BEFORE merging, once it is final and green: `git tag v4.0.0-beta.1 <pr-head-sha> && git push origin v4.0.0-beta.1`. Reason: `release.yml` runs on every push to `develop` and `.releaserc.yml` maps breaking→minor, so a merge with no v4 tag reachable would cut `v3.1.0-beta.1` on a commit whose `go.mod` declares `/v4`, poisoning the v3 beta channel that br-sfn and plugin-br-pix-jd resolve against. With `v4.0.0-beta.1` reachable through the merge commit, the post-merge run must compute `v4.0.0-beta.2`. If it computes `v3.x`, stop and fix `release.yml` / tags before wave 2 merges anything.
 2. Wave 2 opens: `storage`, `engine-core`, `groups`, `admin` (four worktrees). Merge in the order they go green; after each merge the two still-open lanes rebase onto `develop` before continuing.
 3. Wave 3 opens as dependencies read Merged: `docs` after `engine-core`, `storage` and `groups`; `engine-tenants` after `engine-core` and `storage`; `matcher-pilot` after `engine-core`, `storage`, `groups`. Same rebase discipline.
 4. `integration` opens after every other lane is Merged. Its PR carries the acceptance suite; when green, promote `develop → release-candidate → main` (the repo gates `main` to `develop|hotfix/*` sources) and hand-tag `v4.0.0` on `main`.

@@ -46,8 +46,12 @@ Try `v.(T)` with the comma-ok form (never a bare assertion — `forcetypeassert`
 `Bind` builds a single `func(any) error` that decodes into `T` and then calls `validate` (when non-nil), and passes it to `Register` via `WithValidator`. That one function is what the facade calls when `Register` checks the default, what `Set` calls before persisting, and what the engine calls on hydration, refresh and reconcile once engine-core lands. There is no second validation mechanism in this lane.
 Ordering matters: `Bind` appends its own `WithValidator` AFTER the caller's `opts`, so a consumer passing `WithValidator` cannot silently disable type checking on its own group.
 
-**D-G4 — A wrong-shaped document in the store surfaces as an error from the read, not as a zero value.**
-Once engine-core lands, such a value never enters the cache: the registered validator rejects it at ingress and the previously published value stays. In this lane, and on any path where a raw value still reaches a reader, `Snapshot` decodes AND validates, and returns the error rather than a half-filled `T`. The engine keeps holding the raw value; the group refuses to pretend it is a `T`. The cost is one consumer callback per `Snapshot`; the JSON decode already dominates that call.
+**D-G4 — An invalid stored row never reaches a group, and the group never re-validates on read.**
+The engine rejects an undecodable or validator-failing row at its `decode → validate → publish` ingress: nothing is published, the value already in force stays in force, and the rejection is logged and counted by the engine. A group sits downstream of that ingress, so `Snapshot` cannot receive the invalid row and cannot surface its validation error. What `Snapshot` returns for a key whose stored row is invalid is the last value that DID pass — or the registered default, when nothing valid was ever published for that key. The rejection is observable only through the engine's log and telemetry, never through the group's API.
+Two consequences the implementation must honor:
+1. `Snapshot` does NOT run the consumer's `validate`. Whatever is in force already passed it at ingress — the registered validator IS this group's decode-plus-validate closure (D-G3) — so a second call would be a consumer callback per read that can never fail. There is no `validate` field on `Group[T]`.
+2. `Snapshot` still returns an error rather than a half-filled `T` if a decode fails. Through an engine-backed Client that path is unreachable, because a document that cannot decode into `T` cannot pass the registered validator either; it is defense-in-depth against a facade bug, not the specified handling of an invalid stored row, and no test asserts it as the latter.
+On this lane's base the wave-1 facade still hydrates without validating, so a seeded invalid row can reach a reader. The lane does not compensate for that (the same stance D-G5 takes on revisions): the end-to-end "an invalid row keeps the last valid value" assertion belongs to engine-core's ingress tests and to the integration lane.
 
 **D-G5 — `Snapshot` field derivation.**
 `Value` ← decoded `Entry.Value`. `Revision` ← `Entry.Revision`. `Stale` ← `Entry.Stale`, unchanged. `Tenant` ← `tmcore.GetTenantIDContext(ctx)` from `lib-commons/v7/commons/tenant-manager/core`, which is the same helper the client already uses to identify a request's tenant; it returns `""` in single-tenant mode and for a context no middleware has touched, which is exactly the FC-7 contract (`"" in single-tenant mode`).
@@ -56,12 +60,17 @@ On the contracts base the single-tenant read path reports `Revision 0` for every
 **D-G6 — A delivered `Applied` always carries `Stale: false`.**
 Staleness describes a read, not a publication: the engine publishes a value it has just observed, while `Stale` reports that a scope's changefeed is down or has not yet reconciled. A subscriber that needs to know whether its scope is currently converged calls `Snapshot`. The godoc on `Applied` says this in one sentence.
 
-**D-G7 — The group owns one subscription, taken at `Bind`, and its own per-scope publication cache. That cache is what makes `OnApply` correct before AND after `Start`.**
-`Bind` registers a single `OnChange` for the group's key (the facade permits `OnChange` before `Start`). Every publication updates `latest[scope]` inside the group and fans out to the registered appliers. `OnApply` then appends its function and synchronously replays `latest` for every scope already observed — which is FC-7's "delivers the current snapshot of every scope the Client already tracks", read literally.
-- Called **before** `Start`: no scope has been observed, so nothing is delivered now. The initial delivery is the publication the engine makes when it reconciles the scope at `Start` (see **R1** in `## Requests to index.md`).
-- Called **after** `Start`: the scope's publication is already cached, so the replay delivers it inside the `OnApply` call, before it returns.
-This design needs no way to ask the Client whether it has started — the group's own observation history is the discriminator — and it performs no `GetEntry` read on the `OnApply` path at all. It also closes FC-7's ordering requirement structurally rather than by dedupe: the subscription predates every publication, so no revision can fall between the subscription and the initial delivery.
+**D-G7 — The group owns one subscription, taken at `Bind`, plus a per-scope publication cache that a synchronous read seeds when a delivery has not landed yet. That pair is what makes `OnApply` correct before AND after `Start`.**
+`Bind` registers a single `OnChange` for the group's key (the facade permits `OnChange` before `Start`). Every publication updates `latest[scope]` inside the group and fans out to the registered appliers. `OnApply` appends its function and synchronously replays `latest` for every scope already observed — FC-7's "delivers the current snapshot of every scope the Client already tracks", read literally.
+The replay alone is not enough, and this is the gap that forces the seed: `Client.Start` returns once the scope's first reconcile has completed (FC-11), but the engine hands each publication to a per-(scope, key) dispatch worker that invokes `OnChange` on its own goroutine. For a moment after `Start` returns, `latest` is therefore still empty, and an `OnApply` landing in that window would replay nothing — while FC-7 promises the current snapshot before the call returns.
+The fallback: when `OnApply` runs and the group has observed no publication for a scope the Client already tracks, the group reads that scope's current entry synchronously with `Client.GetEntry` (FC-5), decodes it with the group codec, and seeds `latest` from it under the group's state mutex before replaying. The replay then always has a value.
+"A scope the Client already tracks" is FC-7's own phrase, and `Entry.Stale` is how the group asks it: `Stale == false` means the scope has completed a reconcile, so the entry is a published value worth seeding; `Stale == true` means it has not, which is exactly the pre-`Start` case, and no seed is taken.
+- Called **before** `Start`: no scope is tracked, the read reports `Stale`, so nothing is seeded and nothing is delivered now. The initial delivery is the publication the engine makes when it reconciles the scope at `Start` (**R1** in `## Requests to index.md`, frozen as FC-11) — which is FC-7 verbatim: "Before `Start`, `OnApply` registers and the initial delivery happens during `Start`."
+- Called **after** `Start`: either the scope's publication is already cached and the replay delivers it, or that publication is still in flight and the seed supplies the same value out of the engine's own state. Either way the applier runs before `OnApply` returns.
+A seed and the in-flight publication it anticipates are ONE observation, so the group must not deliver both. A seed records the revision it read as that scope's seeded watermark, and the FIRST publication arriving for that scope afterwards is dropped when its revision is less than or equal to the watermark (revision monotonicity, D3). Only that first one: after it, FC-4's normal rules resume, including "Revision 0 is never deduplicated", so a later delete still delivers. A publication newer than the seed is delivered as usual, which is why no revision can fall between the seed and the subscription — the subscription was taken at `Bind`, before any publication existed.
+The seed reads with `context.Background()`, so a seeded snapshot carries `Tenant: ""` — correct in single-tenant mode, and multi-tenant `OnApply` is refused on this lane's base anyway. `Snapshot` needs no seeding: it already reads through `GetEntry` on every call, which is the same read.
 Multi-tenant on the contracts base: `OnChange` returns `ErrNotSupportedInMultiTenant`. `Bind` records that error instead of failing (so `Snapshot` and `Set` still work for a multi-tenant consumer) and `OnApply` returns it.
+Wave-1 caveat: the shim reports `Stale false` always (D-G5), so the pre-`Start` gate cannot be exercised through the facade on this lane's base. The coordinator takes the seed as an injected function and its tests drive both outcomes directly (D-G9's pattern); end to end it is deferred to the integration lane.
 
 **D-G8 — Serialization and coalescing use two locks and no goroutines.**
 Per scope: a delivery mutex held while applier functions run, plus a state mutex guarding `latest`, a monotonically increasing publication sequence number, and the per-applier bookkeeping. A publication records itself under the state mutex, then takes the delivery mutex and drains: if the sequence number has not advanced since the last fan-out it exits, which is precisely the trailing-edge coalescing FC-7 asks for. The sequence number, not the revision, drives the drain, because Revision 0 repeats legitimately and would otherwise look like "nothing new".
@@ -172,7 +181,7 @@ Watch the parameter names against D-G11 — `defaults`, `validate`, `opts`, `c`,
 **Goal:** `Snapshot` returns the document as `T` with its revision, tenant and staleness; `Set` persists a `T` after validation. Both resolve the caller's scope exactly as the underlying facade does.
 **Scope:** root `api_group.go`, `api_group_test.go`.
 **Dependencies:** Epic 1.1.
-**Done when:** `Snapshot` decodes and validates and maps all four fields; a document that is not a valid `T` surfaces as an error instead of a zero value; `Set` rejects an invalid value before it reaches the store; both are nil-receiver safe; `make test-unit` green.
+**Done when:** `Snapshot` decodes and maps all four fields WITHOUT re-running the consumer's `validate` (D-G4); a document that cannot decode into `T` surfaces as an error instead of a half-filled value; `Set` rejects an invalid value before it reaches the store; both are nil-receiver safe; `make test-unit` green.
 **Status:** Pending
 
 #### Task 1.2.1: Implement `Group[T].Snapshot`
@@ -185,9 +194,9 @@ Watch the parameter names against D-G11 — `defaults`, `validate`, `opts`, `c`,
 
 Nil receiver returns `(Snapshot[T]{}, ErrClosed)`. Call `g.client.GetEntry(ctx, g.namespace, g.key)` and return its error untouched — `ErrClosed`, `ErrNilContext` and any store error must reach the caller as themselves, not re-wrapped, so `errors.Is` keeps working. `!ok` returns an error wrapping `ErrUnknownKey` naming the namespace and key.
 
-Decode with `group.Decode[T]`, then run the group's `validate` when non-nil (D-G4), returning either failure as an error that wraps `ErrValidation` and names the namespace and key. On success build the `Snapshot[T]` per D-G5: `Value` from the decode, `Revision` and `Stale` copied from the entry, `Tenant` from `tmcore.GetTenantIDContext(ctx)`.
+Decode with `group.Decode[T]` and stop there: do NOT run the consumer's `validate` (D-G4). The engine's ingress rejects anything that would fail it before publication, so whatever is in force always decodes, and the group's job on read is to hand back a `T` — not to re-litigate a document the engine already accepted. A decode failure returns an error wrapping `ErrValidation` that names the namespace and key, with a zero `Value`; that is the defensive path, not the specified handling of an invalid stored row. On success build the `Snapshot[T]` per D-G5: `Value` from the decode, `Revision` and `Stale` copied from the entry, `Tenant` from `tmcore.GetTenantIDContext(ctx)`.
 
-Store the caller's `validate` on the `Group[T]` at `Bind` time — the ingress closure registered with the facade cannot be read back, and re-deriving it is not possible.
+Do NOT store the caller's `validate` on the `Group[T]`. It lives inside the ingress closure `Bind` hands to `Register`, which is where every ingress FC-7 names calls it (D-G3); no read path in this lane needs it, and a field nothing reads is an invitation to grow a second validation mechanism.
 
 The import of `github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core` adds no module: it is already a direct requirement and already imported elsewhere in the repo. Do not touch `go.mod` or `go.sum`; if `go mod tidy` wants a change, stop and report to the orchestrator.
 
@@ -197,7 +206,7 @@ The import of `github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/cor
 
 **Verification:** `go test -tags=unit -race -run 'TestGroupSnapshot' ./...`
 
-**Done when:** RED-first tests named `TestGroupSnapshotReturnsDefaultsBeforeAnyWrite`, `TestGroupSnapshotReturnsStoredDocument`, `TestGroupSnapshotRejectsWrongShapedRow`, `TestGroupSnapshotRejectsRowFailingValidate`, `TestGroupSnapshotCarriesTenantFromContext` and `TestGroupSnapshotOnNilGroupReturnsErrClosed` prove: before any write, `Snapshot` returns the defaults as a populated `T`; after the fake store is seeded with a document and the Client started, `Snapshot` returns it decoded with nested fields intact; a row holding a JSON string where the struct belongs returns an error matching `ErrValidation` and a zero `Value`; a structurally valid row the consumer's `validate` rejects returns an error matching `ErrValidation`; a context carrying a tenant id yields that id in `Snapshot.Tenant` while a bare `context.Background()` yields `""`; a nil `*Group[T]` returns `ErrClosed`.
+**Done when:** RED-first tests named `TestGroupSnapshotReturnsDefaultsBeforeAnyWrite`, `TestGroupSnapshotReturnsStoredDocument`, `TestGroupSnapshotReturnsDecodeErrorNotPartialValue`, `TestGroupSnapshotDoesNotRunConsumerValidate`, `TestGroupSnapshotCarriesTenantFromContext` and `TestGroupSnapshotOnNilGroupReturnsErrClosed` prove: before any write, `Snapshot` returns the defaults as a populated `T`; after the fake store is seeded with a document and the Client started, `Snapshot` returns it decoded with nested fields intact; a row holding a JSON string where the struct belongs returns an error matching `ErrValidation` with a zero `Value` — never a half-filled `T` — which is D-G4's defensive path, not a claim that an invalid row reaches a group; a group whose `validate` counts its calls records ZERO calls across a hundred `Snapshot`s while that same `validate` still rejects a bad `Set`, proving the read path does not re-validate and the ingress still does (D-G4); a context carrying a tenant id yields that id in `Snapshot.Tenant` while a bare `context.Background()` yields `""`; a nil `*Group[T]` returns `ErrClosed`.
 
 **Estimated size:** ~25 turns.
 
@@ -239,7 +248,7 @@ Nil receiver returns `ErrClosed`. Document the inherited behavior explicitly in 
 
 The fake store must fire its subscriber callback from inside `Set`, as `apiMemoryStore` does — that is the shape that makes the single-tenant cache update and the change echo both land, and it is also what Phase 2 relies on to simulate a publication during `Start`. Guard the fake's map with a mutex: the existing `apiMemoryStore` is unsynchronized and would trip `-race` the moment two goroutines touch it.
 
-Also add the "wrong shape never becomes a partial `T`" case at this level: seed the store with a document whose nested slice holds an object of the wrong type, start, and assert `Snapshot` errors rather than returning a `T` with a half-filled slice.
+Also add the "a broken document never becomes a partial `T`" case at this level: seed the store with a document whose nested slice holds an object of the wrong type, start, and assert `Snapshot` errors rather than returning a `T` with a half-filled slice. This is D-G4's defensive decode assertion, not a statement about invalid rows in the shipped system: once engine-core's ingress lands, such a row is rejected before publication and the group keeps the last valid value, or the registered default when nothing valid was ever published. It is assertable here only because the wave-1 facade hydrates without validating, which is the sole reason the row can reach a reader at all.
 
 **Files:**
 - Modify: `api_group_test.go`
@@ -258,10 +267,10 @@ At the end of Phase 2 a consumer registers an apply function once and receives e
 
 ### Epic 2.1: The publication coordinator in `internal/group`
 
-**Goal:** The non-generic semantics of FC-7 exist and are tested with explicit revisions: per-scope publication cache, per-applier revision dedupe, trailing-edge coalescing, `Previous` tracking, rejection recording, and status aggregation.
+**Goal:** The non-generic semantics of FC-7 exist and are tested with explicit revisions: per-scope publication cache, the seed that covers a publication still in flight, per-applier revision dedupe, trailing-edge coalescing, `Previous` tracking, rejection recording, and status aggregation.
 **Scope:** `internal/group/` (new files alongside the codec).
 **Dependencies:** Phase 1.
-**Done when:** the coordinator's tests drive revision 0, a repeated non-zero revision, an advancing revision, a publication arriving while an applier is running, an applier returning an error, and two scopes interleaved — all with no goroutine surviving `goleak`.
+**Done when:** the coordinator's tests drive revision 0, a repeated non-zero revision, an advancing revision, a publication arriving while an applier is running, an applier returning an error, two scopes interleaved, and a `Register` with nothing observed yet that seeds from the injected read and then drops the publication following it at the same revision — all with no goroutine surviving `goleak`.
 **Status:** Pending
 
 The contract between this epic and Epic 2.2 is the coordinator's surface, written here so the two cannot disagree:
@@ -281,7 +290,16 @@ type Publication struct {
 // goroutine that published.
 type Coordinator[T any] struct { /* unexported */ }
 
-func NewCoordinator[T any](decode func(any) (T, error)) *Coordinator[T]
+// NewCoordinator builds a coordinator. decode converts a published document
+// into T. seed reads the group's current entry through the Client and reports
+// ok=false when the Client does not yet track the scope (Entry.Stale, FC-5);
+// it is consulted only by a Register that finds no observed publication at
+// all, which is the window between Start returning and the first dispatch
+// delivery landing (D-G7).
+func NewCoordinator[T any](
+	decode func(any) (T, error),
+	seed func() (Publication, bool),
+) *Coordinator[T]
 
 // Publish records pub as the newest state of its scope and delivers it to
 // every registered applier, serialized per scope. A publication that arrives
@@ -290,7 +308,10 @@ func NewCoordinator[T any](decode func(any) (T, error)) *Coordinator[T]
 func (c *Coordinator[T]) Publish(ctx context.Context, pub Publication)
 
 // Register adds fn and synchronously delivers the cached publication of every
-// scope already observed. Returns a function that removes fn.
+// scope already observed. When no scope has been observed it takes one seed
+// and delivers that instead, so a caller registering between Start and the
+// first dispatch delivery is never left without a value. Returns a function
+// that removes fn.
 func (c *Coordinator[T]) Register(fn func(ctx context.Context, snap, prev Publication, value T) error) func()
 
 // Status reports desired and applied revisions per scope, sorted by tenant.
@@ -312,14 +333,19 @@ Semantics this epic implements, each of them an FC-7 sentence:
 - A publication whose value fails `decode` is recorded identically to an applier rejection, and logged by the caller — the coordinator must never hand a garbage `T` to an applier.
 - `Previous` is the last snapshot that applier ACCEPTED for that scope, nil on its first delivery and unchanged by a rejection.
 - Coalescing is driven by an internal sequence number, not by the revision, because Revision 0 legitimately repeats.
+- A seed records its revision as that scope's seeded watermark, and the FIRST publication arriving for the scope afterwards is dropped when its revision is less than or equal to the watermark: the seed and that publication are one observation, not two (D-G7). Only the first is droppable — afterwards the ordinary rules resume, so a later Revision 0 (a delete) still delivers.
+- A seed is an observation like any other for status purposes: a seeded delivery an applier accepts sets that scope's `Desired` and `Applied` to the seeded revision.
+- `seed` returning ok=false (the Client does not track the scope yet, which is the pre-`Start` case) delivers nothing and records nothing. The coordinator never calls `seed` again once any publication has been observed for that scope.
 
 ### Epic 2.2: `OnApply`, `Status` and the subscription wiring
 
 **Goal:** The FC-7 surface is complete at the root and wired to the coordinator through the facade's `OnChange`.
 **Scope:** root `api_group.go`, `api_group_test.go`.
 **Dependencies:** Epic 2.1.
-**Done when:** `Bind` takes the group's single `OnChange` subscription and feeds the coordinator; `OnApply` before `Start` registers and receives its initial delivery when the engine publishes at `Start`; `OnApply` after `Start` delivers the current snapshot before returning; the same non-zero revision is never delivered twice; a slow applier does not lose a revision, only intermediate ones; `Status` reports per tenant; multi-tenant `OnApply` returns `ErrNotSupportedInMultiTenant` until engine-tenants lands. The root test that pins the pre-`Start` case uses a fake store whose `Subscribe` fires an event for the seeded key, so the publication lands DURING `Start` — the same shape the engine's reconcile will take.
+**Done when:** `Bind` takes the group's single `OnChange` subscription and feeds the coordinator; `OnApply` before `Start` registers and receives its initial delivery when the engine publishes at `Start`; `OnApply` after `Start` delivers the current snapshot before returning, seeding it from `GetEntry` when the publication has not been delivered yet (D-G7); the same non-zero revision is never delivered twice; a slow applier does not lose a revision, only intermediate ones; `Status` reports per tenant; multi-tenant `OnApply` returns `ErrNotSupportedInMultiTenant` until engine-tenants lands. The root test that pins the pre-`Start` case uses a fake store whose `Subscribe` fires an event for the seeded key, so the publication lands DURING `Start` — the same shape the engine's reconcile will take.
 **Status:** Pending
+
+The RED test for the seed, `TestGroupOnApplyAfterStartSeedsUndeliveredPublication`: the fake store is seeded with a row and its `Subscribe` HOLDS the publication instead of firing it during `Start`, standing in for a dispatch worker that has not run yet. `OnApply` called immediately after `Start` returns fires the applier exactly once, with the stored document rather than the registered default. Releasing the held publication at the same revision does NOT fire it again. The matching coordinator-level tests in Epic 2.1 drive the revision arithmetic the wave-1 facade cannot express (D-G9): a released publication at a HIGHER revision does fire, and a Revision 0 delete arriving after the dropped first publication fires too.
 
 ### Epic 2.3: Compiling package example and godoc sweep
 
@@ -376,8 +402,8 @@ Consequence the orchestrator should route to the docs lane: a per-key `OnChange`
 | `Applied[T]` with embedded `Snapshot[T]` and `Previous *Snapshot[T]` | Epic 2.2 |
 | "`Previous` is the snapshot fn last accepted for that scope, nil on the first delivery" | Epic 2.1 |
 | `OnApply` signature and unsubscribe | Epic 2.2 |
-| "subscribes first and then delivers the current snapshot of every scope the Client already tracks" | Epic 2.1 (`Coordinator.Register` replay), Epic 2.2 (subscription taken at `Bind`, D-G7) |
-| "so no revision can fall between the initial delivery and the subscription" | D-G7 — structural: the subscription predates every publication |
+| "subscribes first and then delivers the current snapshot of every scope the Client already tracks" | Epic 2.1 (`Coordinator.Register` replay plus the seed for a publication still in flight), Epic 2.2 (subscription taken at `Bind`, D-G7) |
+| "so no revision can fall between the initial delivery and the subscription" | D-G7 — structural: the subscription predates every publication, and the seed's watermark drops the one publication it duplicates |
 | "the same non-zero revision is never delivered twice; Revision 0 is never deduplicated" | Epic 2.1 |
 | "serialized and coalesced per scope of this group" | Epic 2.1 (D-G8) |
 | "`Status.Desired` always names the newest published revision even when fn has not seen intermediate ones" | Epic 2.1 |
@@ -388,7 +414,7 @@ Consequence the orchestrator should route to the docs lane: a per-key `OnChange`
 
 ### Vagueness scan
 
-Every Phase 1 task names its edge cases and their handling: wrong-shaped row (error, not zero value), unknown fields (accepted, with the rolling-deploy reason), nil input (zero `T`), caller-supplied `WithValidator` (cannot displace the type check), nil receiver (`ErrClosed`), `Set` before `Start` (`ErrNotStarted` inherited), `append` aliasing the caller's option slice, unsynchronized fake store under `-race`. No "appropriate", "TBD" or unnamed edge case remains in Phase 1. Deferrals exist only in Phase 2 epics, which is what rolling detail is for.
+Every Phase 1 task names its edge cases and their handling: wrong-shaped row (decode error, never a half-filled `T` — and through an engine-backed Client it never reaches the group at all, D-G4), unknown fields (accepted, with the rolling-deploy reason), nil input (zero `T`), caller-supplied `WithValidator` (cannot displace the type check), nil receiver (`ErrClosed`), `Set` before `Start` (`ErrNotStarted` inherited), `append` aliasing the caller's option slice, unsynchronized fake store under `-race`. No "appropriate", "TBD" or unnamed edge case remains in Phase 1. Deferrals exist only in Phase 2 epics, which is what rolling detail is for.
 
 ### File disjointness
 
@@ -408,4 +434,5 @@ All are new. The index assigns `api_group*.go` to this lane explicitly and exclu
 Two assertions this lane cannot make green on its own base, both because they depend on engine behavior that has not landed:
 
 1. A non-zero revision arriving through the single-tenant facade — `Snapshot.Revision` and `Applied.Revision` end to end. The wave-1 shim zeroes both (FC-5 documents this). Covered here at coordinator level with synthetic revisions (D-G9) and end to end by integration scenario 4.
-2. The real (non-fake) pre-`Start` initial delivery under R1, which is integration scenario 4's `Group.OnApply` `Status()` assertion.
+2. The real (non-fake) pre-`Start` initial delivery under R1, which is integration scenario 4's `Group.OnApply` `Status()` assertion. The pre-`Start` gate on the seed rides with it: the wave-1 shim reports `Stale false` always, so only a real engine distinguishes "not started yet" from "tracked and reconciled" (D-G7).
+3. The end-to-end rule that an invalid stored row keeps the last valid value in force — or the registered default when nothing valid was ever published — and is visible only in the engine's log and telemetry (D-G4). The rejection happens in engine-core's ingress, which is not on this lane's base; engine-core asserts it directly and the integration lane's "invalid external row keeps last valid" scenario covers it against real backends.
