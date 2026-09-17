@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
+	"github.com/LerianStudio/lib-observability/v4/runtime"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -58,7 +59,7 @@ func (e *Engine) ingest(ctx context.Context, scope store.Scope, se store.Entry) 
 		return false
 	}
 
-	if err := runValidator(def.Validate, decoded); err != nil {
+	if err := e.runValidator(ctx, def.Validate, decoded); err != nil {
 		e.logWarn(ctx, "stored value rejected by validator, keeping cached value",
 			log.String("namespace", se.Namespace),
 			log.String("key", se.Key),
@@ -118,18 +119,35 @@ func (e *Engine) ingestDefault(ctx context.Context, scope store.Scope, nk NSKey)
 // down at Start. A recovered panic is treated exactly like a returned error —
 // the key keeps its last valid value — which is what the ingress contract
 // promises for every rejection.
-func runValidator(validate func(any) error, value any) (err error) {
+//
+// The panic itself is reported through lib-observability's recovery pipeline,
+// never by this package: that is what redacts the panic value in production
+// mode, truncates the stack, counts the panic metric and records the span
+// event. The value a validator panics on is a value it was handed — a
+// configuration row, which is exactly where a secret can be — so the error
+// returned here names only that the validator panicked. Interpolating the
+// panic value into it would put that row's contents into a WARN line the
+// redaction never sees.
+func (e *Engine) runValidator(ctx context.Context, validate func(any) error, value any) (err error) {
 	if validate == nil {
 		return nil
 	}
 
+	// Set back to false only if validate returns, so the deferred rejection
+	// fires exactly when the recovery below swallowed a panic.
+	panicked := true
+
 	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("%w: validator panicked: %v", store.ErrValidation, r)
+		if panicked {
+			err = fmt.Errorf("%w: validator panicked", store.ErrValidation)
 		}
 	}()
+	defer runtime.RecoverAndLogWithContext(ctx, e.logger, "systemplane.engine", "validator")
 
-	return validate(value)
+	err = validate(value)
+	panicked = false
+
+	return err
 }
 
 // logWarn reports an ingress rejection. A nil logger is a no-op: the engine

@@ -205,10 +205,18 @@ func (e *Engine) workerFor(wk workerKey) *dispatchWorker {
 // dropped, dropping whatever is still pending: a Change nobody has started
 // delivering is not worth holding shutdown for, and one addressed to a scope
 // the engine no longer tracks has nowhere to go.
+//
+// The whole goroutine, not just the callback, runs under lib-observability's
+// recovery: a panic anywhere in the loop — cloning a pathological value, say —
+// would otherwise kill the process. It is registered BEFORE the WaitGroup
+// Done, so Done runs first on the way out of a panic and Close is never left
+// waiting on a goroutine that is already gone.
 func (e *Engine) runWorker(wk workerKey, w *dispatchWorker) {
-	defer e.dispatchWG.Done()
-
 	ctx := e.dispatchContext()
+
+	defer runtime.RecoverWithPolicyAndContext(ctx, e.logger,
+		"systemplane.engine", "dispatch", runtime.KeepRunning)
+	defer e.dispatchWG.Done()
 
 	for {
 		select {
@@ -231,9 +239,10 @@ func (e *Engine) runWorker(wk workerKey, w *dispatchWorker) {
 // deliver invokes every subscriber of nk serially, each with its own deep copy
 // of the value: two subscribers of one key must not be able to see each
 // other's mutations, and neither may reach the cached object. Each invocation
-// runs under RecoverAndLog, so a panicking callback kills neither the worker
-// nor the process, and the subscriber list is copied before any callback runs,
-// so a callback may unsubscribe itself without deadlocking.
+// runs under lib-observability's context-ful recovery, so a panicking callback
+// kills neither the worker nor the process and is counted and recorded on the
+// span rather than merely logged; the subscriber list is copied before any
+// callback runs, so a callback may unsubscribe itself without deadlocking.
 func (e *Engine) deliver(ctx context.Context, nk NSKey, ch Change) {
 	e.subsMu.RLock()
 	subs := make([]subscription, len(e.subscribers[nk]))
@@ -242,7 +251,8 @@ func (e *Engine) deliver(ctx context.Context, nk NSKey, ch Change) {
 
 	for _, sub := range subs {
 		func() {
-			defer runtime.RecoverAndLog(e.logger, "systemplane.engine.onchange")
+			defer runtime.RecoverAndLogWithContext(ctx, e.logger,
+				"systemplane.engine", "onchange")
 
 			delivered := ch
 			delivered.Value = Clone(ch.Value)

@@ -5,8 +5,13 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
+	"sync"
 	"testing"
 
+	"github.com/LerianStudio/lib-observability/v4/log"
+	"github.com/LerianStudio/lib-observability/v4/runtime"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -149,5 +154,91 @@ func TestIngestClonesRegisteredDefault(t *testing.T) {
 
 	if registered["limit"] != float64(10) {
 		t.Errorf("mutating the cached default reached the registry: got %v, want 10", registered["limit"])
+	}
+}
+
+// recordingLogger captures every entry the engine emits, flattened to one
+// string per entry, which is all this file asserts on: that a panicking
+// validator produced a recovery entry, and that no entry carries the panic
+// value. The embedded no-op supplies the rest of log.Logger.
+type recordingLogger struct {
+	log.Logger
+
+	mu      sync.Mutex
+	entries []string
+}
+
+func (r *recordingLogger) Log(_ context.Context, level int, msg string, fields ...any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.entries = append(r.entries, fmt.Sprintf("level=%d msg=%q fields=%v", level, msg, fields))
+}
+
+func (r *recordingLogger) all() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return append([]string(nil), r.entries...)
+}
+
+// TestIngestRejectsPanickingValidatorWithoutLeakingPanicValue pins the
+// contract for a validator that panics while inspecting a row: the row is
+// rejected, the key keeps the last value that passed, and the panic is
+// reported through lib-observability's recovery pipeline, which redacts the
+// panic value in production mode. A validator that panics on the secret it was
+// handed must not be the thing that turns that secret into a log line.
+func TestIngestRejectsPanickingValidatorWithoutLeakingPanicValue(t *testing.T) {
+	runtime.SetProductionMode(true)
+	t.Cleanup(func() { runtime.SetProductionMode(false) })
+
+	const secret = "sk_live_7Rq2pAnIcKeDtOkEn"
+
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	logger := &recordingLogger{Logger: log.NewNop()}
+	e := engineWithRegistry(fakeRegistry{defs: map[NSKey]KeyDef{
+		nk: {
+			Default: "default",
+			Validate: func(v any) error {
+				if v == "a" {
+					return nil
+				}
+
+				panic(secret)
+			},
+		},
+	}})
+	e.logger = logger
+
+	valid := store.Entry{Namespace: nk.Namespace, Key: nk.Key, Value: []byte(`"a"`), Revision: 1, UpdatedBy: "ops"}
+	if !e.ingest(context.Background(), store.Scope{}, valid) {
+		t.Fatal("first valid row: usable is false, want true")
+	}
+
+	panicking := store.Entry{Namespace: nk.Namespace, Key: nk.Key, Value: []byte(`42`), Revision: 2, UpdatedBy: "typo"}
+	if e.ingest(context.Background(), store.Scope{}, panicking) {
+		t.Error("row whose validator panicked: usable is true, want false")
+	}
+
+	if got := cachedEntry(t, e, store.Scope{}, nk); got.Value != "a" || got.Revision != 1 {
+		t.Errorf("cached after a panicking validator: got (%v, rev %d), want (\"a\", rev 1)",
+			got.Value, got.Revision)
+	}
+
+	entries := logger.all()
+	recovered := false
+
+	for _, entry := range entries {
+		if strings.Contains(entry, "panic recovered") {
+			recovered = true
+		}
+
+		if strings.Contains(entry, secret) {
+			t.Errorf("a log entry carries the panic value: %s", entry)
+		}
+	}
+
+	if !recovered {
+		t.Errorf("no panic-recovery entry was logged, got %v", entries)
 	}
 }
