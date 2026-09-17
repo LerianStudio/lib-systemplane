@@ -187,11 +187,21 @@ func (s *Store) isClosed() bool {
 
 // resolveDB returns the database handle for the current call.
 //
-// Single-tenant mode returns the constructor-supplied *sql.DB unchanged.
-// Multi-tenant mode extracts the dbresolver.DB stored in ctx by tenant-manager
-// middleware. The schema is assumed to be provisioned externally; the store
-// does not create it.
-func (s *Store) resolveDB(ctx context.Context) (dbExecutor, error) {
+// The zero scope keeps today's behavior: single-tenant mode returns the
+// constructor-supplied *sql.DB unchanged, multi-tenant mode extracts the
+// dbresolver.DB stored in ctx by tenant-manager middleware. A named tenant
+// resolves through the connector, which is not wired yet — both branches
+// refuse the call with store.ErrTenantConnectorMissing. The schema is assumed
+// to be provisioned externally; the store does not create it.
+func (s *Store) resolveDB(ctx context.Context, scope store.Scope) (dbExecutor, error) {
+	if scope.Tenant != "" {
+		if s.cfg.Connector == nil {
+			return nil, store.ErrTenantConnectorMissing
+		}
+
+		return nil, fmt.Errorf("systemplane/postgres: %w: scoped resolution not implemented", store.ErrTenantConnectorMissing)
+	}
+
 	if !s.cfg.MultiTenantEnabled {
 		return s.cfg.DB, nil
 	}
@@ -205,12 +215,12 @@ func (s *Store) resolveDB(ctx context.Context) (dbExecutor, error) {
 }
 
 // List returns every entry in the resolved database, ordered by (namespace, key).
-func (s *Store) List(ctx context.Context) ([]store.Entry, error) {
+func (s *Store) List(ctx context.Context, scope store.Scope) ([]store.Entry, error) {
 	if s == nil || s.isClosed() {
 		return nil, store.ErrClosed
 	}
 
-	db, err := s.resolveDB(ctx)
+	db, err := s.resolveDB(ctx, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -255,12 +265,12 @@ func (s *Store) List(ctx context.Context) ([]store.Entry, error) {
 }
 
 // Get returns a single entry by (namespace, key).
-func (s *Store) Get(ctx context.Context, namespace, key string) (store.Entry, bool, error) {
+func (s *Store) Get(ctx context.Context, scope store.Scope, namespace, key string) (store.Entry, bool, error) {
 	if s == nil || s.isClosed() {
 		return store.Entry{}, false, store.ErrClosed
 	}
 
-	db, err := s.resolveDB(ctx)
+	db, err := s.resolveDB(ctx, scope)
 	if err != nil {
 		return store.Entry{}, false, err
 	}
@@ -293,26 +303,26 @@ func (s *Store) Get(ctx context.Context, namespace, key string) (store.Entry, bo
 }
 
 // Set persists an entry using INSERT ... ON CONFLICT (namespace, key) DO UPDATE.
-func (s *Store) Set(ctx context.Context, e store.Entry) error {
+func (s *Store) Set(ctx context.Context, scope store.Scope, e store.Entry) (int64, error) {
 	if s == nil || s.isClosed() {
-		return store.ErrClosed
+		return 0, store.ErrClosed
 	}
 
 	if e.Namespace == "" {
-		return fmt.Errorf("systemplane/postgres: %w: namespace must not be empty", store.ErrValidation)
+		return 0, fmt.Errorf("systemplane/postgres: %w: namespace must not be empty", store.ErrValidation)
 	}
 
 	if e.Key == "" {
-		return fmt.Errorf("systemplane/postgres: %w: key must not be empty", store.ErrValidation)
+		return 0, fmt.Errorf("systemplane/postgres: %w: key must not be empty", store.ErrValidation)
 	}
 
 	if e.UpdatedAt.IsZero() {
 		e.UpdatedAt = time.Now().UTC()
 	}
 
-	db, err := s.resolveDB(ctx)
+	db, err := s.resolveDB(ctx, scope)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	ctx, span, finish := s.startSpan(ctx, "systemplane.postgres.set",
@@ -332,14 +342,14 @@ SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at, updated_by = EXCLU
 	if _, err := db.ExecContext(ctx, query, e.Namespace, e.Key, e.Value, e.UpdatedAt, e.UpdatedBy); err != nil {
 		tracing.HandleSpanError(span, "set upsert failed", err)
 
-		return fmt.Errorf("systemplane/postgres: set: %w", err)
+		return 0, fmt.Errorf("systemplane/postgres: set: %w", err)
 	}
 
-	return nil
+	return 0, nil
 }
 
 // Delete removes a single (namespace, key) row. Idempotent.
-func (s *Store) Delete(ctx context.Context, namespace, key, actor string) error {
+func (s *Store) Delete(ctx context.Context, scope store.Scope, namespace, key, actor string) error {
 	if s == nil || s.isClosed() {
 		return store.ErrClosed
 	}
@@ -352,7 +362,7 @@ func (s *Store) Delete(ctx context.Context, namespace, key, actor string) error 
 		return fmt.Errorf("systemplane/postgres: %w: key must not be empty", store.ErrValidation)
 	}
 
-	db, err := s.resolveDB(ctx)
+	db, err := s.resolveDB(ctx, scope)
 	if err != nil {
 		return err
 	}

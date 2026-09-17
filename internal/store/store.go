@@ -31,10 +31,20 @@ type Telemetry interface {
 	Meter(name string) (metric.Meter, error)
 }
 
-// Op classifies a change event delivered by a backend changefeed.
+// Scope identifies whose configuration a call refers to.
+// The zero Scope is the single-tenant scope.
+type Scope struct {
+	Tenant string
+}
+
 const (
 	OpUpsert = "upsert"
 	OpDelete = "delete"
+	// OpResync is emitted by Subscribe exactly once after every successful
+	// (re)connect of the changefeed, before any per-key event from the new
+	// connection. Namespace, Key and Revision are empty; the engine reloads
+	// the whole scope in response.
+	OpResync = "resync"
 )
 
 // Sentinel errors returned by Store implementations.
@@ -60,65 +70,51 @@ var (
 	// invoking the Client.
 	ErrTenantConnectionMissing = errors.New("systemplane/store: tenant database missing from context")
 
+	// ErrTenantConnectorMissing is returned when a call names Scope.Tenant but
+	// the backend was constructed without a tenant connector.
+	ErrTenantConnectorMissing = errors.New("systemplane/store: tenant connector not configured")
+
 	// ErrValidation is returned when a backend rejects input that fails a
 	// structural precondition (e.g. empty namespace or key). The admin layer
 	// maps this to HTTP 400 via the client's ErrValidation alias.
 	ErrValidation = errors.New("systemplane/store: validation failed")
 )
 
-// Entry is the persisted shape of a single configuration key.
 type Entry struct {
 	Namespace string
 	Key       string
 	Value     []byte // JSON-encoded
+	Revision  int64  // monotonic per (namespace, key); 0 = unknown
 	UpdatedAt time.Time
 	UpdatedBy string
 }
 
-// Event is what a changefeed delivers when a key is modified.
-//
-// Op is either OpUpsert (insert/update) or OpDelete (row removed).
 type Event struct {
+	Scope     Scope
 	Namespace string
 	Key       string
 	Op        string
+	Revision  int64 // revision after the change; 0 for OpDelete, OpResync, or unknown
 }
 
 // Store is the contract implemented by internal/postgres and internal/mongodb.
 //
-// All methods take a context; in multi-tenant mode the context MUST carry the
-// tenant database for the configured module (set by lib-commons
-// tenant-manager's TenantMiddleware via tmcore.ContextWithPG / ContextWithMB).
-// In single-tenant mode the context is used only for cancellation and
-// telemetry; the constructor-supplied handle is the database.
+// Get, Set, Delete and List resolve the database from scope: the zero Scope
+// uses the constructor handle (single-tenant) or the tenant database carried
+// by ctx (multi-tenant request path, set by tenant-manager middleware); a
+// non-empty Scope.Tenant resolves through the tenant connector regardless of
+// ctx and returns ErrTenantConnectorMissing when none is configured.
 type Store interface {
-	// Start performs any one-time bootstrap work that needs the live ctx
-	// (e.g. opening the LISTEN connection in single-tenant Postgres). It is
-	// idempotent and safe to call multiple times.
 	Start(ctx context.Context) error
-
-	// Close releases backend resources. Idempotent. Does NOT close any
-	// externally-supplied database handle.
 	Close() error
-
-	// Get returns a single entry by namespace and key.
-	Get(ctx context.Context, ns, key string) (Entry, bool, error)
-
-	// Set persists an entry using last-write-wins semantics.
-	Set(ctx context.Context, e Entry) error
-
-	// Delete removes a single (ns, key) row. actor is recorded for audit
-	// purposes via spans/logs; it is not persisted. Idempotent — deleting a
-	// row that does not exist returns nil.
-	Delete(ctx context.Context, ns, key, actor string) error
-
-	// List returns every entry in the underlying database/collection,
-	// ordered by (namespace, key).
-	List(ctx context.Context) ([]Entry, error)
-
-	// Subscribe registers a changefeed listener for the lifetime of ctx. The
-	// returned unsubscribe func can be called to remove the listener early.
-	// Returns ErrNotSupportedInMultiTenant when the backend was constructed
-	// with WithMultiTenantEnabled().
-	Subscribe(ctx context.Context, fn func(ev Event)) (unsubscribe func(), err error)
+	Get(ctx context.Context, scope Scope, ns, key string) (Entry, bool, error)
+	// Set upserts with last-write-wins and returns the revision now stored.
+	Set(ctx context.Context, scope Scope, e Entry) (revision int64, err error)
+	Delete(ctx context.Context, scope Scope, ns, key, actor string) error
+	List(ctx context.Context, scope Scope) ([]Entry, error)
+	// Subscribe opens a changefeed for scope for the lifetime of ctx and
+	// emits OpResync after every (re)connect. Returns
+	// ErrNotSupportedInMultiTenant when the backend has no changefeed for
+	// that scope (MongoDB with a non-empty tenant).
+	Subscribe(ctx context.Context, scope Scope, fn func(Event)) (unsubscribe func(), err error)
 }

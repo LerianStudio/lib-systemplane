@@ -32,13 +32,14 @@ type changeEvent struct {
 }
 
 // Subscribe registers fn for the lifetime of ctx (or until unsubscribe is
-// called). Multi-tenant mode returns store.ErrNotSupportedInMultiTenant.
-func (s *Store) Subscribe(ctx context.Context, fn func(store.Event)) (func(), error) {
+// called). Multi-tenant mode and any named tenant scope return
+// store.ErrNotSupportedInMultiTenant.
+func (s *Store) Subscribe(ctx context.Context, scope store.Scope, fn func(store.Event)) (func(), error) {
 	if s == nil || s.isClosed() {
 		return nil, store.ErrClosed
 	}
 
-	if s.cfg.MultiTenantEnabled {
+	if s.cfg.MultiTenantEnabled || scope.Tenant != "" {
 		return nil, store.ErrNotSupportedInMultiTenant
 	}
 

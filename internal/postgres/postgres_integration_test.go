@@ -225,7 +225,7 @@ func TestIntegration_PostgresMultiTenantIsolation(t *testing.T) {
 	}
 
 	// Confirm tenant A cannot see tenant B's value or vice-versa.
-	listA, err := s.List(ctxA)
+	listA, err := s.List(ctxA, store.Scope{})
 	if err != nil {
 		t.Fatalf("listA: %v", err)
 	}
@@ -246,7 +246,7 @@ func TestIntegration_PostgresMultiTenantIsolation(t *testing.T) {
 		t.Fatalf("drop trigger: %v", err)
 	}
 
-	if err := s.Set(ctxA, store.Entry{Namespace: "ns", Key: "k2", Value: jsonBytes(t, "again")}); err != nil {
+	if _, err := s.Set(ctxA, store.Scope{}, store.Entry{Namespace: "ns", Key: "k2", Value: jsonBytes(t, "again")}); err != nil {
 		t.Fatalf("second set on A: %v", err)
 	}
 
@@ -265,7 +265,7 @@ func TestIntegration_PostgresMultiTenantIsolation(t *testing.T) {
 	}
 
 	// Multi-tenant mode disables Subscribe.
-	if _, err := s.Subscribe(ctxA, func(_ store.Event) {}); err != store.ErrNotSupportedInMultiTenant {
+	if _, err := s.Subscribe(ctxA, store.Scope{}, func(_ store.Event) {}); err != store.ErrNotSupportedInMultiTenant {
 		t.Errorf("subscribe should fail with ErrNotSupportedInMultiTenant, got %v", err)
 	}
 }
@@ -289,7 +289,7 @@ func TestIntegration_PostgresMultiTenantMissingCtx(t *testing.T) {
 		t.Fatalf("start: %v", err)
 	}
 
-	_, _, err = s.Get(context.Background(), "ns", "k")
+	_, _, err = s.Get(context.Background(), store.Scope{}, "ns", "k")
 	if err != store.ErrTenantConnectionMissing {
 		t.Errorf("expected ErrTenantConnectionMissing, got %v", err)
 	}
@@ -365,7 +365,7 @@ func TestIntegration_PostgresLeastPrivilegeRole_NoRuntimeDDL(t *testing.T) {
 
 	ctx := context.Background()
 
-	if err := s.Set(ctx, store.Entry{Namespace: "ns", Key: "k", Value: jsonBytes(t, "value")}); err != nil {
+	if _, err := s.Set(ctx, store.Scope{}, store.Entry{Namespace: "ns", Key: "k", Value: jsonBytes(t, "value")}); err != nil {
 		t.Fatalf("Set with least-privilege role: %v", err)
 	}
 
@@ -374,7 +374,7 @@ func TestIntegration_PostgresLeastPrivilegeRole_NoRuntimeDDL(t *testing.T) {
 		t.Fatalf("Get = %q, want value", got)
 	}
 
-	if err := s.Delete(ctx, "ns", "k", "actor"); err != nil {
+	if err := s.Delete(ctx, store.Scope{}, "ns", "k", "actor"); err != nil {
 		t.Fatalf("Delete with least-privilege role: %v", err)
 	}
 }
@@ -401,7 +401,7 @@ func dsnWithUser(base, user, pass string) string {
 func mustSet(t *testing.T, s store.Store, ctx context.Context, ns, key, value string) {
 	t.Helper()
 
-	if err := s.Set(ctx, store.Entry{Namespace: ns, Key: key, Value: jsonBytes(t, value)}); err != nil {
+	if _, err := s.Set(ctx, store.Scope{}, store.Entry{Namespace: ns, Key: key, Value: jsonBytes(t, value)}); err != nil {
 		t.Fatalf("set: %v", err)
 	}
 }
@@ -409,7 +409,7 @@ func mustSet(t *testing.T, s store.Store, ctx context.Context, ns, key, value st
 func mustGet(t *testing.T, s store.Store, ctx context.Context, ns, key string) string {
 	t.Helper()
 
-	entry, found, err := s.Get(ctx, ns, key)
+	entry, found, err := s.Get(ctx, store.Scope{}, ns, key)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}

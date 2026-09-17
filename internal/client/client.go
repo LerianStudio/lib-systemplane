@@ -237,7 +237,7 @@ func (c *Client) Start(ctx context.Context) error {
 
 		// Subscribe BEFORE hydration so writes that land between List() and
 		// the change feed's first event are still observed.
-		unsub, err := c.store.Subscribe(ctx, c.onEvent)
+		unsub, err := c.store.Subscribe(ctx, store.Scope{}, c.onEvent)
 		if err != nil {
 			c.hydratingMu.Lock()
 			c.hydrating = false
@@ -276,7 +276,7 @@ func (c *Client) Start(ctx context.Context) error {
 }
 
 func (c *Client) hydrate(ctx context.Context) error {
-	entries, err := c.store.List(ctx)
+	entries, err := c.store.List(ctx, store.Scope{})
 	if err != nil {
 		return err
 	}
@@ -413,7 +413,7 @@ func (c *Client) refreshFromStore(nk nskey, op string) {
 	newValue := cloneValue(def.defaultValue)
 
 	if op != store.OpDelete {
-		entry, found, err := c.store.Get(ctx, nk.Namespace, nk.Key)
+		entry, found, err := c.store.Get(ctx, store.Scope{}, nk.Namespace, nk.Key)
 		if err != nil {
 			c.logWarn(ctx, "refresh from store failed",
 				log.String("namespace", nk.Namespace),

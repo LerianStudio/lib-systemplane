@@ -22,7 +22,7 @@ type facadeTestStore struct {
 
 func (s *facadeTestStore) Start(context.Context) error { return nil }
 func (s *facadeTestStore) Close() error                { return nil }
-func (s *facadeTestStore) Get(_ context.Context, ns, key string) (TestEntry, bool, error) {
+func (s *facadeTestStore) Get(_ context.Context, _ TestScope, ns, key string) (TestEntry, bool, error) {
 	for _, e := range s.entries {
 		if e.Namespace == ns && e.Key == key {
 			return e, true, nil
@@ -32,21 +32,23 @@ func (s *facadeTestStore) Get(_ context.Context, ns, key string) (TestEntry, boo
 	return TestEntry{}, false, nil
 }
 
-func (s *facadeTestStore) Set(_ context.Context, e TestEntry) error {
+func (s *facadeTestStore) Set(_ context.Context, _ TestScope, e TestEntry) (int64, error) {
 	s.gotSet = e
 
-	return nil
+	return 0, nil
 }
 
-func (s *facadeTestStore) Delete(_ context.Context, ns, key, actor string) error {
+func (s *facadeTestStore) Delete(_ context.Context, _ TestScope, ns, key, actor string) error {
 	s.gotDeleteNS = ns
 	s.gotDeleteKey = key
 	s.gotActor = actor
 
 	return nil
 }
-func (s *facadeTestStore) List(context.Context) ([]TestEntry, error) { return s.entries, nil }
-func (s *facadeTestStore) Subscribe(_ context.Context, fn func(TestEvent)) (func(), error) {
+func (s *facadeTestStore) List(context.Context, TestScope) ([]TestEntry, error) {
+	return s.entries, nil
+}
+func (s *facadeTestStore) Subscribe(_ context.Context, _ TestScope, fn func(TestEvent)) (func(), error) {
 	s.subscribeFn = fn
 
 	return func() { s.subscribeFn = nil }, nil
@@ -103,7 +105,7 @@ func TestNewForTestingAdapterAndOptions(t *testing.T) {
 		t.Fatalf("backend Delete = %q/%q by %q", backend.gotDeleteNS, backend.gotDeleteKey, backend.gotActor)
 	}
 
-	unsub, err := c.store.Subscribe(context.Background(), func(evt store.Event) {
+	unsub, err := c.store.Subscribe(context.Background(), store.Scope{}, func(evt store.Event) {
 		if evt.Namespace != "ns" || evt.Key != "k" || evt.Op != store.OpUpsert {
 			t.Fatalf("event = %#v", evt)
 		}

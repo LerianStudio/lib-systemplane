@@ -70,26 +70,26 @@ func TestStore_MultiTenantPreIOPaths(t *testing.T) {
 	if got := s.DroppedEvents(); got != 0 {
 		t.Fatalf("DroppedEvents = %d, want 0", got)
 	}
-	if _, err := s.Subscribe(context.Background(), func(store.Event) {}); !errors.Is(err, store.ErrNotSupportedInMultiTenant) {
+	if _, err := s.Subscribe(context.Background(), store.Scope{}, func(store.Event) {}); !errors.Is(err, store.ErrNotSupportedInMultiTenant) {
 		t.Fatalf("Subscribe error = %v, want ErrNotSupportedInMultiTenant", err)
 	}
 
-	if _, err := s.List(context.Background()); !errors.Is(err, store.ErrTenantConnectionMissing) {
+	if _, err := s.List(context.Background(), store.Scope{}); !errors.Is(err, store.ErrTenantConnectionMissing) {
 		t.Fatalf("List error = %v, want ErrTenantConnectionMissing", err)
 	}
-	if _, _, err := s.Get(context.Background(), "ns", "k"); !errors.Is(err, store.ErrTenantConnectionMissing) {
+	if _, _, err := s.Get(context.Background(), store.Scope{}, "ns", "k"); !errors.Is(err, store.ErrTenantConnectionMissing) {
 		t.Fatalf("Get error = %v, want ErrTenantConnectionMissing", err)
 	}
-	if err := s.Set(context.Background(), store.Entry{}); !errors.Is(err, store.ErrValidation) {
+	if _, err := s.Set(context.Background(), store.Scope{}, store.Entry{}); !errors.Is(err, store.ErrValidation) {
 		t.Fatalf("Set empty entry error = %v, want ErrValidation", err)
 	}
-	if err := s.Set(context.Background(), store.Entry{Namespace: "ns", Key: "k", Value: []byte(`1`)}); !errors.Is(err, store.ErrTenantConnectionMissing) {
+	if _, err := s.Set(context.Background(), store.Scope{}, store.Entry{Namespace: "ns", Key: "k", Value: []byte(`1`)}); !errors.Is(err, store.ErrTenantConnectionMissing) {
 		t.Fatalf("Set error = %v, want ErrTenantConnectionMissing", err)
 	}
-	if err := s.Delete(context.Background(), "", "k", "actor"); !errors.Is(err, store.ErrValidation) {
+	if err := s.Delete(context.Background(), store.Scope{}, "", "k", "actor"); !errors.Is(err, store.ErrValidation) {
 		t.Fatalf("Delete empty namespace error = %v, want ErrValidation", err)
 	}
-	if err := s.Delete(context.Background(), "ns", "k", "actor"); !errors.Is(err, store.ErrTenantConnectionMissing) {
+	if err := s.Delete(context.Background(), store.Scope{}, "ns", "k", "actor"); !errors.Is(err, store.ErrTenantConnectionMissing) {
 		t.Fatalf("Delete error = %v, want ErrTenantConnectionMissing", err)
 	}
 }
@@ -126,19 +126,19 @@ func TestStore_ClosedAndNilPaths(t *testing.T) {
 	if err := s.Start(context.Background()); !errors.Is(err, store.ErrClosed) {
 		t.Fatalf("Start after Close error = %v, want ErrClosed", err)
 	}
-	if _, err := s.List(context.Background()); !errors.Is(err, store.ErrClosed) {
+	if _, err := s.List(context.Background(), store.Scope{}); !errors.Is(err, store.ErrClosed) {
 		t.Fatalf("List after Close error = %v, want ErrClosed", err)
 	}
-	if _, _, err := s.Get(context.Background(), "ns", "k"); !errors.Is(err, store.ErrClosed) {
+	if _, _, err := s.Get(context.Background(), store.Scope{}, "ns", "k"); !errors.Is(err, store.ErrClosed) {
 		t.Fatalf("Get after Close error = %v, want ErrClosed", err)
 	}
-	if err := s.Set(context.Background(), store.Entry{Namespace: "ns", Key: "k"}); !errors.Is(err, store.ErrClosed) {
+	if _, err := s.Set(context.Background(), store.Scope{}, store.Entry{Namespace: "ns", Key: "k"}); !errors.Is(err, store.ErrClosed) {
 		t.Fatalf("Set after Close error = %v, want ErrClosed", err)
 	}
-	if err := s.Delete(context.Background(), "ns", "k", "actor"); !errors.Is(err, store.ErrClosed) {
+	if err := s.Delete(context.Background(), store.Scope{}, "ns", "k", "actor"); !errors.Is(err, store.ErrClosed) {
 		t.Fatalf("Delete after Close error = %v, want ErrClosed", err)
 	}
-	if _, err := s.Subscribe(context.Background(), func(store.Event) {}); !errors.Is(err, store.ErrClosed) {
+	if _, err := s.Subscribe(context.Background(), store.Scope{}, func(store.Event) {}); !errors.Is(err, store.ErrClosed) {
 		t.Fatalf("Subscribe after Close error = %v, want ErrClosed", err)
 	}
 }
@@ -216,5 +216,39 @@ func TestIsNamespaceExists(t *testing.T) {
 				t.Fatalf("isNamespaceExists(%v) = %v, want %v", tt.err, got, tt.want)
 			}
 		})
+	}
+}
+
+// MongoDB never gets a tenant connector: a named tenant is refused outright,
+// and its changefeed has no per-tenant form.
+func TestStore_NamedTenantScopeIsRefused(t *testing.T) {
+	t.Parallel()
+
+	s, err := New(Config{Client: &mongo.Client{}, Database: "db"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	scope := store.Scope{Tenant: "t1"}
+	ctx := context.Background()
+
+	if _, _, err := s.Get(ctx, scope, "ns", "k"); !errors.Is(err, store.ErrTenantConnectorMissing) {
+		t.Fatalf("Get error = %v, want ErrTenantConnectorMissing", err)
+	}
+
+	if _, err := s.Set(ctx, scope, store.Entry{Namespace: "ns", Key: "k", Value: []byte(`1`)}); !errors.Is(err, store.ErrTenantConnectorMissing) {
+		t.Fatalf("Set error = %v, want ErrTenantConnectorMissing", err)
+	}
+
+	if err := s.Delete(ctx, scope, "ns", "k", "actor"); !errors.Is(err, store.ErrTenantConnectorMissing) {
+		t.Fatalf("Delete error = %v, want ErrTenantConnectorMissing", err)
+	}
+
+	if _, err := s.List(ctx, scope); !errors.Is(err, store.ErrTenantConnectorMissing) {
+		t.Fatalf("List error = %v, want ErrTenantConnectorMissing", err)
+	}
+
+	if _, err := s.Subscribe(ctx, scope, func(store.Event) {}); !errors.Is(err, store.ErrNotSupportedInMultiTenant) {
+		t.Fatalf("Subscribe error = %v, want ErrNotSupportedInMultiTenant", err)
 	}
 }

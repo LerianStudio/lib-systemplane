@@ -56,7 +56,7 @@ func memKey(ns, key string) string { return ns + "\x00" + key }
 func (m *memStore) Start(_ context.Context) error { return nil }
 func (m *memStore) Close() error                  { return nil }
 
-func (m *memStore) Get(_ context.Context, ns, key string) (store.Entry, bool, error) {
+func (m *memStore) Get(_ context.Context, _ store.Scope, ns, key string) (store.Entry, bool, error) {
 	// Capture the hook outside the lock so it may touch m.* without deadlock.
 	m.mu.Lock()
 	hook := m.getHook
@@ -76,16 +76,16 @@ func (m *memStore) Get(_ context.Context, ns, key string) (store.Entry, bool, er
 	return e, ok, nil
 }
 
-func (m *memStore) Set(_ context.Context, e store.Entry) error {
+func (m *memStore) Set(_ context.Context, _ store.Scope, e store.Entry) (int64, error) {
 	m.mu.Lock()
 	m.entries[memKey(e.Namespace, e.Key)] = e
 	m.mu.Unlock()
 	m.fire(store.Event{Namespace: e.Namespace, Key: e.Key, Op: store.OpUpsert})
 
-	return nil
+	return 0, nil
 }
 
-func (m *memStore) Delete(_ context.Context, ns, key, _ string) error {
+func (m *memStore) Delete(_ context.Context, _ store.Scope, ns, key, _ string) error {
 	m.mu.Lock()
 	delete(m.entries, memKey(ns, key))
 	m.mu.Unlock()
@@ -94,7 +94,7 @@ func (m *memStore) Delete(_ context.Context, ns, key, _ string) error {
 	return nil
 }
 
-func (m *memStore) List(_ context.Context) ([]store.Entry, error) {
+func (m *memStore) List(_ context.Context, _ store.Scope) ([]store.Entry, error) {
 	// Capture and invoke the hook outside the lock so the hook itself can
 	// touch m.* (e.g., set/fire) without deadlock.
 	m.mu.Lock()
@@ -116,7 +116,7 @@ func (m *memStore) List(_ context.Context) ([]store.Entry, error) {
 	return out, nil
 }
 
-func (m *memStore) Subscribe(_ context.Context, fn func(store.Event)) (func(), error) {
+func (m *memStore) Subscribe(_ context.Context, _ store.Scope, fn func(store.Event)) (func(), error) {
 	if m.multiTenant {
 		return nil, store.ErrNotSupportedInMultiTenant
 	}
@@ -885,7 +885,7 @@ func TestHydrationDoesNotOverwriteFresherChangefeedState(t *testing.T) {
 
 	// Seed an OLD value visible to List().
 	rawOld, _ := json.Marshal("old-from-list")
-	if err := m.Set(context.Background(), store.Entry{Namespace: "ns", Key: "k", Value: rawOld}); err != nil {
+	if _, err := m.Set(context.Background(), store.Scope{}, store.Entry{Namespace: "ns", Key: "k", Value: rawOld}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -957,7 +957,7 @@ func TestRefreshKeepsCacheWhenReReadReportsNotFound(t *testing.T) {
 	}
 
 	raw, _ := json.Marshal("known-good")
-	if err := m.Set(context.Background(), store.Entry{Namespace: "ns", Key: "k", Value: raw}); err != nil {
+	if _, err := m.Set(context.Background(), store.Scope{}, store.Entry{Namespace: "ns", Key: "k", Value: raw}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -1027,7 +1027,7 @@ func TestRefreshOnDeleteEventRestoresDefault(t *testing.T) {
 	}
 
 	raw, _ := json.Marshal("known-good")
-	if err := m.Set(context.Background(), store.Entry{Namespace: "ns", Key: "k", Value: raw}); err != nil {
+	if _, err := m.Set(context.Background(), store.Scope{}, store.Entry{Namespace: "ns", Key: "k", Value: raw}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 

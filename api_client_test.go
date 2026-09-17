@@ -28,22 +28,22 @@ func (s *apiMemoryStore) Close() error {
 	return nil
 }
 
-func (s *apiMemoryStore) Get(_ context.Context, ns, key string) (TestEntry, bool, error) {
+func (s *apiMemoryStore) Get(_ context.Context, _ TestScope, ns, key string) (TestEntry, bool, error) {
 	e, ok := s.entries[apiMemoryKey(ns, key)]
 
 	return e, ok, nil
 }
 
-func (s *apiMemoryStore) Set(_ context.Context, e TestEntry) error {
+func (s *apiMemoryStore) Set(_ context.Context, _ TestScope, e TestEntry) (int64, error) {
 	s.entries[apiMemoryKey(e.Namespace, e.Key)] = e
 	if s.sub != nil {
 		s.sub(TestEvent{Namespace: e.Namespace, Key: e.Key, Op: "upsert"})
 	}
 
-	return nil
+	return 0, nil
 }
 
-func (s *apiMemoryStore) Delete(_ context.Context, ns, key, _ string) error {
+func (s *apiMemoryStore) Delete(_ context.Context, _ TestScope, ns, key, _ string) error {
 	delete(s.entries, apiMemoryKey(ns, key))
 	if s.sub != nil {
 		s.sub(TestEvent{Namespace: ns, Key: key, Op: "delete"})
@@ -52,7 +52,7 @@ func (s *apiMemoryStore) Delete(_ context.Context, ns, key, _ string) error {
 	return nil
 }
 
-func (s *apiMemoryStore) List(context.Context) ([]TestEntry, error) {
+func (s *apiMemoryStore) List(context.Context, TestScope) ([]TestEntry, error) {
 	out := make([]TestEntry, 0, len(s.entries))
 	for _, e := range s.entries {
 		out = append(out, e)
@@ -61,7 +61,7 @@ func (s *apiMemoryStore) List(context.Context) ([]TestEntry, error) {
 	return out, nil
 }
 
-func (s *apiMemoryStore) Subscribe(_ context.Context, fn func(TestEvent)) (func(), error) {
+func (s *apiMemoryStore) Subscribe(_ context.Context, _ TestScope, fn func(TestEvent)) (func(), error) {
 	s.sub = fn
 
 	return func() { s.sub = nil }, nil

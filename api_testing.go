@@ -8,6 +8,9 @@ import internalclient "github.com/LerianStudio/lib-systemplane/v4/internal/clien
 // exposed solely for [NewForTesting].
 type TestStore = internalclient.TestStore
 
+// TestScope is the public mirror of internal store.Scope.
+type TestScope = internalclient.TestScope
+
 // TestEntry is the public mirror of internal store.Entry.
 type TestEntry = internalclient.TestEntry
 

@@ -42,7 +42,7 @@ func parseNotifyPayload(data string) (store.Event, bool) {
 		return store.Event{}, false
 	}
 
-	return store.Event{Namespace: p.Namespace, Key: p.Key, Op: op}, true
+	return store.Event{Namespace: p.Namespace, Key: p.Key, Op: op, Revision: p.Revision}, true
 }
 
 func truncateString(s string, maxLen int) string {

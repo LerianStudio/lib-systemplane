@@ -44,7 +44,7 @@ func TestIntegration_MongoDB_ChangeStreamWatcherCleansUpOnClose(t *testing.T) {
 
 	// Drive at least one event through the stream so we know the watcher is
 	// running before we tear it down.
-	if err := s.Set(context.Background(), store.Entry{
+	if _, err := s.Set(context.Background(), store.Scope{}, store.Entry{
 		Namespace: "ns", Key: "k", Value: []byte(`"v"`), UpdatedAt: time.Now().UTC(),
 	}); err != nil {
 		t.Fatalf("set: %v", err)
@@ -88,7 +88,7 @@ func TestIntegration_MongoDB_PollingTickerCleansUpOnClose(t *testing.T) {
 	}
 
 	// Subscribe + unsubscribe to also exercise the subscriber bookkeeping.
-	unsub, err := s.Subscribe(context.Background(), func(_ store.Event) {})
+	unsub, err := s.Subscribe(context.Background(), store.Scope{}, func(_ store.Event) {})
 	if err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}

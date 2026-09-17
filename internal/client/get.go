@@ -10,6 +10,7 @@ import (
 
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/manager"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
 // ListEntry is a single entry returned by [Client.List].
@@ -68,7 +69,7 @@ func (c *Client) Get(ctx context.Context, namespace, key string) (any, bool, err
 		}
 	}
 
-	entry, found, err := c.store.Get(ctx, namespace, key)
+	entry, found, err := c.store.Get(ctx, store.Scope{}, namespace, key)
 	if err != nil {
 		return nil, false, fmt.Errorf("systemplane: Get: %w", err)
 	}
@@ -289,7 +290,7 @@ func (c *Client) listFromCache(keys []nskey) []ListEntry {
 }
 
 func (c *Client) listFromStore(ctx context.Context, namespace string, keys []nskey) ([]ListEntry, error) {
-	stored, err := c.store.List(ctx)
+	stored, err := c.store.List(ctx, store.Scope{})
 	if err != nil {
 		return nil, fmt.Errorf("systemplane: List: %w", err)
 	}

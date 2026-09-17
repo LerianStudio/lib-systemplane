@@ -26,24 +26,28 @@ const (
 )
 
 // notifyPayload is the JSON shape emitted by the systemplane_notify_v3 trigger.
+//
+// Revision is optional: a v3 trigger omits it and the event carries revision 0
+// ("unknown"), which the engine never deduplicates.
 type notifyPayload struct {
 	Namespace string `json:"namespace"`
 	Key       string `json:"key"`
 	Op        string `json:"op"`
+	Revision  int64  `json:"revision"`
 }
 
 // Subscribe registers fn to be invoked for every change event. The returned
 // unsubscribe func removes fn from the dispatch list.
 //
-// In multi-tenant mode the method returns store.ErrNotSupportedInMultiTenant
-// — every method resolves a per-call tenant database, so there is no shared
-// process-wide changefeed to attach to.
-func (s *Store) Subscribe(ctx context.Context, fn func(store.Event)) (func(), error) {
+// In multi-tenant mode, and for any named tenant scope, the method returns
+// store.ErrNotSupportedInMultiTenant — every method resolves a per-call tenant
+// database, so there is no shared process-wide changefeed to attach to.
+func (s *Store) Subscribe(ctx context.Context, scope store.Scope, fn func(store.Event)) (func(), error) {
 	if s == nil || s.isClosed() {
 		return nil, store.ErrClosed
 	}
 
-	if s.cfg.MultiTenantEnabled {
+	if s.cfg.MultiTenantEnabled || scope.Tenant != "" {
 		return nil, store.ErrNotSupportedInMultiTenant
 	}
 
