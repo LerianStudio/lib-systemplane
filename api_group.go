@@ -33,8 +33,12 @@ type Snapshot[T any] struct {
 }
 
 // Bind registers (namespace, key) with defaults as the value in force when no
-// row exists. validate (may be nil) runs on every ingress: defaults at Bind,
-// Set, hydration, refresh, reconcile. Must be called before c.Start.
+// row exists. validate (may be nil) becomes the key's registered validator: the
+// client runs it on the default at Bind, on every Set, and on every other
+// ingress the client validates. A row already in the store is decoded on read
+// and never re-validated by the group, so a row that entered the store without
+// passing the registered validator surfaces from [Group.Snapshot] as a decode
+// error at worst, not as a validated document. Must be called before c.Start.
 //
 // The value registered is not defaults itself but its canonical JSON document:
 // defaults marshaled and unmarshaled back into an any. A stored row, a Set
