@@ -1,4 +1,4 @@
-package client
+package engine
 
 import (
 	"fmt"
@@ -8,7 +8,10 @@ import (
 
 var timeType = reflect.TypeFor[time.Time]()
 
-func cloneValue(v any) any {
+// Clone returns a deep copy of v, so a subscriber may mutate what it receives
+// without reaching the engine's cache. A value reflection cannot copy, such as
+// a channel or a func, is returned unchanged.
+func Clone(v any) any {
 	cloned, ok := cloneReflectValue(reflect.ValueOf(v))
 	if !ok {
 		return v
@@ -139,22 +142,11 @@ func setClonedValue(dst, src reflect.Value) {
 	dst.Set(cloned)
 }
 
-func validateCloneSafe(v any) error {
+// ValidateCloneSafe reports whether v can be deep-copied by Clone without the
+// copy aliasing the original: it rejects an unexported mutable field, which
+// Clone cannot reach, and a cyclic reference, which Clone cannot terminate on.
+func ValidateCloneSafe(v any) error {
 	return validateCloneSafeValue(reflect.ValueOf(v), make(map[visit]struct{}), "value")
-}
-
-func validateCatalogCloneSafe(meta CatalogKeyMetadata) error {
-	if err := validateCloneSafe(meta.Schema); err != nil {
-		return fmt.Errorf("schema: %w", err)
-	}
-
-	for i, example := range meta.Examples {
-		if err := validateCloneSafe(example.Value); err != nil {
-			return fmt.Errorf("examples[%d].value: %w", i, err)
-		}
-	}
-
-	return nil
 }
 
 type visit struct {

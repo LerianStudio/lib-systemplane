@@ -4,6 +4,8 @@ package client
 import (
 	"fmt"
 	"strings"
+
+	"github.com/LerianStudio/lib-systemplane/v4/internal/engine"
 )
 
 const (
@@ -43,14 +45,14 @@ func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOp
 		return fmt.Errorf("%w: namespace/key is reserved for the admin catalog", ErrValidation)
 	}
 
-	if err := validateCloneSafe(defaultValue); err != nil {
+	if err := engine.ValidateCloneSafe(defaultValue); err != nil {
 		return fmt.Errorf("%w: default value is not safely cloneable: %w", ErrValidation, err)
 	}
 
 	nk := nskey{Namespace: namespace, Key: key}
 
 	def := keyDef{
-		defaultValue: cloneValue(defaultValue),
+		defaultValue: engine.Clone(defaultValue),
 		redaction:    RedactNone,
 	}
 

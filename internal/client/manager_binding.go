@@ -9,6 +9,7 @@ package client
 import (
 	"context"
 
+	"github.com/LerianStudio/lib-systemplane/v4/internal/engine"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/manager"
 )
 
@@ -74,7 +75,7 @@ func (h *clientHook) RegisteredKeys() []manager.RegisteredKey {
 		out = append(out, manager.RegisteredKey{
 			Namespace:    nk.Namespace,
 			Key:          nk.Key,
-			DefaultValue: cloneValue(def.defaultValue),
+			DefaultValue: engine.Clone(def.defaultValue),
 		})
 	}
 

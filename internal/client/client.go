@@ -15,6 +15,7 @@ import (
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/runtime"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/debounce"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/engine"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/manager"
 	mongoDB "github.com/LerianStudio/lib-systemplane/v4/internal/mongodb"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/postgres"
@@ -220,7 +221,7 @@ func (c *Client) Start(ctx context.Context) error {
 		c.cacheMu.Lock()
 
 		for nk, def := range c.registry {
-			c.cache[nk] = cloneValue(def.defaultValue)
+			c.cache[nk] = engine.Clone(def.defaultValue)
 		}
 
 		c.cacheMu.Unlock()
@@ -410,7 +411,7 @@ func (c *Client) refreshFromStore(nk nskey, op string) {
 	ctx, cancel := context.WithTimeout(parent, refreshTimeout)
 	defer cancel()
 
-	newValue := cloneValue(def.defaultValue)
+	newValue := engine.Clone(def.defaultValue)
 
 	if op != store.OpDelete {
 		entry, found, err := c.store.Get(ctx, store.Scope{}, nk.Namespace, nk.Key)
@@ -465,7 +466,7 @@ func (c *Client) refreshFromStore(nk nskey, op string) {
 	c.hydratingMu.Unlock()
 
 	c.cacheMu.Lock()
-	c.cache[nk] = cloneValue(newValue)
+	c.cache[nk] = engine.Clone(newValue)
 	c.cacheMu.Unlock()
 
 	// Fire subscribers with the lifecycle context (NOT the per-refresh timeout
@@ -475,7 +476,7 @@ func (c *Client) refreshFromStore(nk nskey, op string) {
 		dispatchCtx = context.Background()
 	}
 
-	c.fireSubscribers(dispatchCtx, nk, cloneValue(newValue))
+	c.fireSubscribers(dispatchCtx, nk, engine.Clone(newValue))
 }
 
 // fireSubscribers invokes all OnChange callbacks for a key with panic
@@ -493,7 +494,7 @@ func (c *Client) fireSubscribers(ctx context.Context, nk nskey, newValue any) {
 		func() {
 			defer runtime.RecoverAndLog(c.logger, "systemplane.onchange")
 
-			fn(ctx, cloneValue(newValue))
+			fn(ctx, engine.Clone(newValue))
 		}()
 	}
 }
