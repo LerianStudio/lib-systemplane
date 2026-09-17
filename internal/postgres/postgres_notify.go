@@ -10,7 +10,14 @@ import (
 // dispatch fans one event out to the feed's subscribers. The snapshot is
 // taken under f.mu and the lock is RELEASED before any callback runs: a
 // callback that unsubscribes from inside itself would otherwise deadlock.
+//
+// This is the ONE place a NOTIFY-derived event learns its scope: the payload
+// cannot name it (the trigger knows nothing about tenants — the tenant IS the
+// database it fired in), so the feed that read it stamps it, and
+// parseNotifyPayload stays a pure function of the payload.
 func (f *feed) dispatch(logger log.Logger, evt store.Event) {
+	evt.Scope = f.scope
+
 	f.mu.Lock()
 	subs := f.snapshotLocked()
 	f.mu.Unlock()

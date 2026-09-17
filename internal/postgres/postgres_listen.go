@@ -29,7 +29,7 @@ const (
 	closeTimeout = 5 * time.Second
 )
 
-// notifyPayload is the JSON shape emitted by the systemplane_notify_v3 trigger.
+// notifyPayload is the JSON shape emitted by the systemplane_notify_v4 trigger.
 //
 // Revision is optional: a v3 trigger omits it and the event carries revision 0
 // ("unknown"), which the engine never deduplicates.

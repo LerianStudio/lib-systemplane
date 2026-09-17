@@ -209,11 +209,19 @@ func TestNotifyPayloadParsingAndDispatch(t *testing.T) {
 		t.Fatalf("delete payload parsed as (%#v, %v)", deleteEvt, ok)
 	}
 
+	// A NOTIFY payload is attacker-adjacent input: anyone with NOTIFY rights on
+	// the channel can forge one. OpResync and OpDisconnect are synthesized by
+	// the feed and must never be accepted from the wire — a forged resync would
+	// trigger a pointless full reconcile, a forged disconnect would mark a
+	// healthy scope Stale. Both payloads below are otherwise well-formed, so
+	// the op whitelist is the only thing that can reject them.
 	for _, payload := range []string{
 		`not-json`,
 		`{"namespace":"","key":"k","op":"upsert"}`,
 		`{"namespace":"ns","key":"","op":"upsert"}`,
 		`{"namespace":"ns","key":"k","op":"noop"}`,
+		`{"namespace":"ns","key":"k","op":"resync"}`,
+		`{"namespace":"ns","key":"k","op":"disconnect"}`,
 	} {
 		if evt, ok := parseNotifyPayload(payload); ok {
 			t.Fatalf("parseNotifyPayload(%q) = (%#v, true), want false", payload, evt)
@@ -244,6 +252,25 @@ func TestNotifyPayloadParsingAndDispatch(t *testing.T) {
 	f.dispatch(s.cfg.Logger, valid)
 	if len(got) != 1 || got[0] != valid {
 		t.Fatalf("dispatch events = %#v, want %#v", got, []store.Event{valid})
+	}
+
+	// The parser leaves Scope zero on purpose — it is a pure function of the
+	// payload, and a payload cannot name its own scope. dispatch is the single
+	// place that stamps it, so a tenant feed's events reach the subscriber
+	// attributed to that tenant instead of looking single-tenant.
+	tenantFeed := newFeed(store.Scope{Tenant: "t1"}, "")
+
+	var tenantGot []store.Event
+
+	tenantFeed.subs[1] = &subscription{fn: func(evt store.Event) { tenantGot = append(tenantGot, evt) }}
+
+	tenantFeed.dispatch(s.cfg.Logger, valid)
+
+	want := valid
+	want.Scope = store.Scope{Tenant: "t1"}
+
+	if len(tenantGot) != 1 || tenantGot[0] != want {
+		t.Fatalf("tenant feed dispatch = %#v, want %#v", tenantGot, []store.Event{want})
 	}
 }
 

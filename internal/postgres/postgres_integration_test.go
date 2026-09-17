@@ -1330,3 +1330,385 @@ func waitForFeedRefs(t *testing.T, s *postgres.Store, tenant string, want int) {
 		time.Sleep(time.Millisecond)
 	}
 }
+
+// eventLog records every delivered event in arrival order, so a test can
+// assert on the SEQUENCE as a whole — "exactly one disconnect, then exactly
+// one resync, then key events" is a claim about order, not about any single
+// event.
+type eventLog struct {
+	mu     sync.Mutex
+	events []store.Event
+}
+
+func (l *eventLog) record(evt store.Event) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.events = append(l.events, evt)
+}
+
+func (l *eventLog) snapshot() []store.Event {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return append([]store.Event(nil), l.events...)
+}
+
+// waitFor polls the recorded sequence until pred accepts it, then returns that
+// snapshot. Polling, not a channel, because the assertions are about the whole
+// sequence including what must NOT be in it.
+func (l *eventLog) waitFor(t *testing.T, what string, pred func([]store.Event) bool) []store.Event {
+	t.Helper()
+
+	deadline := time.Now().Add(60 * time.Second)
+
+	for {
+		got := l.snapshot()
+		if pred(got) {
+			return got
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s; recorded %+v", what, got)
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// listenBackendPID returns the backend pid of the single LISTEN connection on
+// dbName. A feed parks its dedicated connection in `LISTEN "..."` for its whole
+// life, so that query text isolates it from the test's own pooled handles.
+func listenBackendPID(t *testing.T, admin *sql.DB, dbName string) int {
+	t.Helper()
+
+	deadline := time.Now().Add(15 * time.Second)
+
+	for {
+		var pid int
+
+		err := admin.QueryRow(
+			`SELECT pid FROM pg_stat_activity WHERE datname = $1 AND query LIKE 'LISTEN%'`,
+			dbName,
+		).Scan(&pid)
+		if err == nil {
+			return pid
+		}
+
+		if !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("find LISTEN backend on %s: %v", dbName, err)
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("no LISTEN backend on %s", dbName)
+		}
+
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// TestIntegration_PostgresResyncAfterListenGap is the audit's headline defect,
+// pinned: a value written while the LISTEN connection was down used to be lost
+// in silence — the feed reconnected, announced nothing in either direction, and
+// the cache stayed stale but looked fresh until someone wrote again.
+//
+// The kill is a real one (pg_terminate_backend on the feed's own backend from a
+// separate admin connection), and the assertion is the SEQUENCE: exactly one
+// OpDisconnect, then exactly one OpResync, then key events — never a key event
+// of the new connection ahead of the resync, never a second disconnect for one
+// loss — with both markers naming the feed's scope and carrying no key.
+//
+// The gap write's NOTIFY is deliberately NOT asserted to be redelivered: it is
+// not, and that is precisely why the resync exists. What IS asserted is that
+// the value is recoverable afterwards, at a higher revision.
+func TestIntegration_PostgresResyncAfterListenGap(t *testing.T) {
+	base, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	admin := adminDSN(t, base)
+	defer admin.Close()
+
+	conn := newFakeConnector()
+	dbName, tenantDSN, db := provisionTenantDB(t, admin, base, "gap")
+	conn.set("t1", db, tenantDSN)
+
+	s := tenantStore(t, conn)
+	scope := store.Scope{Tenant: "t1"}
+	ctx := context.Background()
+
+	log := &eventLog{}
+
+	unsub, err := s.Subscribe(ctx, scope, log.record)
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	defer unsub()
+
+	// The prefix everything else is measured against: the joining resync, then
+	// the pre-gap write's own upsert — which also pins scope stamping on a
+	// NOTIFY-derived event, the one thing the payload itself cannot carry.
+	preRev, err := s.Set(ctx, scope, store.Entry{
+		Namespace: "ns",
+		Key:       "gap",
+		Value:     jsonBytes(t, "before-the-gap"),
+	})
+	if err != nil {
+		t.Fatalf("pre-gap set: %v", err)
+	}
+
+	prefix := log.waitFor(t, "the joining resync and the pre-gap upsert", func(evts []store.Event) bool {
+		return len(evts) >= 2
+	})
+
+	if prefix[0].Op != store.OpResync || prefix[0].Scope != scope {
+		t.Fatalf("first event = %+v, want {Scope:%+v Op:%q}", prefix[0], scope, store.OpResync)
+	}
+
+	if prefix[1].Op != store.OpUpsert || prefix[1].Namespace != "ns" || prefix[1].Key != "gap" {
+		t.Fatalf("pre-gap event = %+v, want an upsert of ns/gap", prefix[1])
+	}
+
+	if prefix[1].Scope != scope {
+		t.Fatalf("pre-gap event scope = %+v, want %+v", prefix[1].Scope, scope)
+	}
+
+	if prefix[1].Revision != preRev {
+		t.Fatalf("pre-gap event revision = %d, want %d (what Set reported)", prefix[1].Revision, preRev)
+	}
+
+	mark := 2
+
+	// Kill the feed's own backend from a connection it does not own.
+	pid := listenBackendPID(t, admin, dbName)
+
+	var terminated bool
+
+	if err := admin.QueryRow(`SELECT pg_terminate_backend($1)`, pid).Scan(&terminated); err != nil {
+		t.Fatalf("terminate LISTEN backend %d: %v", pid, err)
+	}
+
+	if !terminated {
+		t.Fatalf("pg_terminate_backend(%d) reported false", pid)
+	}
+
+	// The gap write: a separate *sql.DB, so the value lands in the database
+	// through a path the store under test has no connection to.
+	writerDB, err := sql.Open("pgx", tenantDSN)
+	if err != nil {
+		t.Fatalf("open gap writer: %v", err)
+	}
+
+	t.Cleanup(func() { _ = writerDB.Close() })
+
+	// ListenDSN only satisfies the constructor: the writer is never started, so
+	// it opens no LISTEN connection and the feed under test stays the only one.
+	writer, err := postgres.New(postgres.Config{DB: writerDB, ListenDSN: tenantDSN})
+	if err != nil {
+		t.Fatalf("postgres.New (gap writer): %v", err)
+	}
+
+	gapRev, err := writer.Set(ctx, store.Scope{}, store.Entry{
+		Namespace: "ns",
+		Key:       "gap",
+		Value:     jsonBytes(t, "written-during-the-gap"),
+	})
+	if err != nil {
+		t.Fatalf("gap set: %v", err)
+	}
+
+	if gapRev <= preRev {
+		t.Fatalf("gap write revision = %d, want greater than the pre-gap %d", gapRev, preRev)
+	}
+
+	log.waitFor(t, "the reconnect's OpResync", func(evts []store.Event) bool {
+		for _, evt := range evts[mark:] {
+			if evt.Op == store.OpResync {
+				return true
+			}
+		}
+
+		return false
+	})
+
+	// A write AFTER the reconnect proves key events flow again on the new
+	// connection, and gives the sequence assertion something to land behind
+	// the resync.
+	if _, err := s.Set(ctx, scope, store.Entry{
+		Namespace: "ns",
+		Key:       "after",
+		Value:     jsonBytes(t, "after-the-reconnect"),
+	}); err != nil {
+		t.Fatalf("post-reconnect set: %v", err)
+	}
+
+	seq := log.waitFor(t, "the post-reconnect upsert of ns/after", func(evts []store.Event) bool {
+		for _, evt := range evts[mark:] {
+			if evt.Op == store.OpUpsert && evt.Key == "after" {
+				return true
+			}
+		}
+
+		return false
+	})[mark:]
+
+	if seq[0].Op != store.OpDisconnect {
+		t.Fatalf("sequence after the kill = %+v; first event must be OpDisconnect", seq)
+	}
+
+	if seq[1].Op != store.OpResync {
+		t.Fatalf("sequence after the kill = %+v; second event must be OpResync", seq)
+	}
+
+	for i, marker := range seq[:2] {
+		if marker.Scope != scope {
+			t.Errorf("marker %d scope = %+v, want %+v", i, marker.Scope, scope)
+		}
+
+		if marker.Namespace != "" || marker.Key != "" || marker.Revision != 0 {
+			t.Errorf("marker %d = %+v, want empty Namespace/Key and Revision 0", i, marker)
+		}
+	}
+
+	for _, evt := range seq[2:] {
+		if evt.Op == store.OpDisconnect {
+			t.Fatalf("second OpDisconnect for a single connection loss: %+v in %+v", evt, seq)
+		}
+
+		if evt.Op == store.OpResync {
+			t.Fatalf("second OpResync for a single reconnect: %+v in %+v", evt, seq)
+		}
+	}
+
+	// The gap write is recoverable from the resync alone. Its NOTIFY was never
+	// redelivered; the value is simply there, at a higher revision than the one
+	// the subscriber last saw.
+	entry, found, err := s.Get(ctx, scope, "ns", "gap")
+	if err != nil {
+		t.Fatalf("get after the gap: %v", err)
+	}
+
+	if !found {
+		t.Fatal("get after the gap: ns/gap not found")
+	}
+
+	if entry.Revision != gapRev {
+		t.Fatalf("ns/gap revision after the gap = %d, want %d", entry.Revision, gapRev)
+	}
+
+	if entry.Revision <= preRev {
+		t.Fatalf("ns/gap revision after the gap = %d, want greater than the pre-gap %d", entry.Revision, preRev)
+	}
+}
+
+// TestIntegration_PostgresCleanCloseEmitsNoDisconnect is the other half of the
+// "exactly one disconnect per connection LOSS" contract. Close tears the
+// connection down deliberately, so the reader's wait fails exactly as it would
+// in a real outage; only the closing flag keeps that from being announced. A
+// disconnect here would leave every scope permanently Stale in the engine after
+// an ordinary shutdown.
+func TestIntegration_PostgresCleanCloseEmitsNoDisconnect(t *testing.T) {
+	s := freshStore(t, "cleanclose")
+	ctx := context.Background()
+
+	if err := s.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	log := &eventLog{}
+
+	unsub, err := s.Subscribe(ctx, store.Scope{}, log.record)
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	defer unsub()
+
+	log.waitFor(t, "the joining resync", func(evts []store.Event) bool {
+		return len(evts) >= 1
+	})
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Close waits for the reader to exit, so nothing more can be delivered; the
+	// grace only catches an emission racing that exit.
+	time.Sleep(500 * time.Millisecond)
+
+	for _, evt := range log.snapshot() {
+		if evt.Op == store.OpDisconnect {
+			t.Fatalf("clean Close delivered %+v; want no OpDisconnect at all", evt)
+		}
+	}
+}
+
+// TestIntegration_PostgresEventCarriesRevision pins FC-2's revision on the
+// changefeed: what Set reports and what the subscriber is told are the same
+// number, an identical rewrite reports it again (the trigger still fires on the
+// updated_at change — deduplicating that is the engine's job, not the store's),
+// and a delete arrives as OpDelete with revision 0, the "no row, registered
+// default in force" marker.
+func TestIntegration_PostgresEventCarriesRevision(t *testing.T) {
+	s := freshStore(t, "evtrev")
+	ctx := context.Background()
+
+	if err := s.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	events, unsub := subscribeScope(t, s, store.Scope{})
+	defer unsub()
+
+	if first := recvEvent(t, events, "the joining resync"); first.Op != store.OpResync {
+		t.Fatalf("first event = %+v, want %q", first, store.OpResync)
+	}
+
+	set := func(what string, value string) int64 {
+		t.Helper()
+
+		rev, err := s.Set(ctx, store.Scope{}, store.Entry{
+			Namespace: "ns",
+			Key:       "k",
+			Value:     jsonBytes(t, value),
+		})
+		if err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+
+		return rev
+	}
+
+	rev := set("first set", "v1")
+
+	upsert := recvEvent(t, events, "the upsert of ns/k")
+	if upsert.Op != store.OpUpsert || upsert.Namespace != "ns" || upsert.Key != "k" {
+		t.Fatalf("event = %+v, want an upsert of ns/k", upsert)
+	}
+
+	if upsert.Revision != rev {
+		t.Fatalf("upsert revision = %d, want %d (what Set reported)", upsert.Revision, rev)
+	}
+
+	if again := set("identical rewrite", "v1"); again != rev {
+		t.Fatalf("identical rewrite returned revision %d, want the unchanged %d", again, rev)
+	}
+
+	rewrite := recvEvent(t, events, "the identical rewrite's upsert")
+	if rewrite.Op != store.OpUpsert || rewrite.Revision != rev {
+		t.Fatalf("identical rewrite event = %+v, want an upsert carrying revision %d", rewrite, rev)
+	}
+
+	if err := s.Delete(ctx, store.Scope{}, "ns", "k", "tester"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	deleted := recvEvent(t, events, "the delete of ns/k")
+	if deleted.Op != store.OpDelete || deleted.Namespace != "ns" || deleted.Key != "k" {
+		t.Fatalf("event = %+v, want a delete of ns/k", deleted)
+	}
+
+	if deleted.Revision != 0 {
+		t.Fatalf("delete event revision = %d, want 0", deleted.Revision)
+	}
+}
