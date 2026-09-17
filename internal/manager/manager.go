@@ -28,6 +28,7 @@ import (
 
 	tmpostgres "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/postgres"
 	"github.com/LerianStudio/lib-observability/v4/log"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/postgres"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -203,7 +204,7 @@ func New(pgMgr *tmpostgres.Manager, opts ...Option) *Manager {
 	}
 
 	if pgMgr != nil {
-		m.connector = &pgMgrConnector{mgr: pgMgr}
+		m.connector = postgres.NewTenantManagerConnector(pgMgr)
 	}
 
 	// Default the lifecycle routing seams to the real handlers. Tests may
@@ -215,6 +216,10 @@ func New(pgMgr *tmpostgres.Manager, opts ...Option) *Manager {
 
 	return m
 }
+
+// Connector resolves a tenant's Postgres handle and LISTEN DSN. The
+// interface and its production adapter live in internal/postgres.
+type Connector = postgres.Connector
 
 // SetConnector replaces the Connector used to resolve tenant handles. Tests
 // use this to inject in-memory fakes; production callers should rely on the

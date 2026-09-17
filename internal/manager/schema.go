@@ -11,8 +11,8 @@ package manager
 
 import (
 	"context"
-	"errors"
 
+	"github.com/LerianStudio/lib-systemplane/v4/internal/postgres"
 	"github.com/bxcodec/dbresolver/v2"
 )
 
@@ -42,4 +42,4 @@ func (m *Manager) resolveTenantDB(ctx context.Context, tenantID string) (dbresol
 // ErrPgMgrUnavailable is returned when a lifecycle handler runs without a
 // bound tenant-manager Postgres Manager. Surfaces typically in tests that
 // constructed the Manager with a nil pgMgr.
-var ErrPgMgrUnavailable = errors.New("systemplane/manager: tenant-manager postgres manager is not configured")
+var ErrPgMgrUnavailable = postgres.ErrPgMgrUnavailable

@@ -1,6 +1,6 @@
 //go:build unit
 
-package manager
+package postgres
 
 import (
 	"context"
@@ -33,5 +33,37 @@ func TestPgMgrConnector_NilManager_ReturnsErr(t *testing.T) {
 
 	if _, err := c.ResolveDSN(context.Background(), "t"); !errors.Is(err, ErrPgMgrUnavailable) {
 		t.Fatalf("nil mgr ResolveDSN: got %v", err)
+	}
+}
+
+func TestNewTenantManagerConnector_NilManager_ReturnsErr(t *testing.T) {
+	t.Parallel()
+
+	c := NewTenantManagerConnector(nil)
+	if c == nil {
+		t.Fatal("NewTenantManagerConnector must return a Connector")
+	}
+
+	if _, err := c.ResolveDB(context.Background(), "t"); !errors.Is(err, ErrPgMgrUnavailable) {
+		t.Fatalf("nil mgr ResolveDB: got %v", err)
+	}
+
+	if _, err := c.ResolveDSN(context.Background(), "t"); !errors.Is(err, ErrPgMgrUnavailable) {
+		t.Fatalf("nil mgr ResolveDSN: got %v", err)
+	}
+}
+
+func TestConfig_CarriesConnector(t *testing.T) {
+	t.Parallel()
+
+	c := NewTenantManagerConnector(nil)
+
+	s, err := New(Config{MultiTenantEnabled: true, Connector: c})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if s.cfg.Connector != c {
+		t.Fatal("Config.Connector must survive construction")
 	}
 }
