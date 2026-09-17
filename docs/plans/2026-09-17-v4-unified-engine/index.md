@@ -106,8 +106,6 @@ const (
 	// loses its connection, before the first reconnect attempt. Namespace,
 	// Key and Revision are empty; the engine marks the scope Stale until the
 	// OpResync that follows the reconnect has been reconciled.
-	// (Amendment of 2026-09-17, after the contracts lane landed store.go:
-	// the storage lane adds this constant; signatures are unchanged.)
 	OpDisconnect = "disconnect"
 )
 
@@ -220,6 +218,9 @@ type Change struct {
 // The same non-zero revision is never delivered twice to the same subscriber
 // (Revision 0 means unknown and is never deduplicated). A delete publishes
 // the registered default with Revision 0.
+// Returns ErrUnknownKey for a key that was not registered, in both modes: a
+// subscription to an unregistered key can never deliver anything, so it is
+// refused instead of silently returning a no-op unsubscribe.
 func (c *Client) OnChange(namespace, key string, fn func(ctx context.Context, ch Change)) (unsubscribe func(), err error)
 ```
 
