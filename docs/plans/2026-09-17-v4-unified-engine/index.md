@@ -17,7 +17,7 @@
 
 - **D1 — One engine, not two.** `internal/manager` is deleted. `internal/client` keeps registry, options, catalog, redaction, value cloning and the facade adapter; cache, hydrate, refresh, subscribe and dispatch move to `internal/engine`. Root `Manager`, `NewManager`, `OnTenant*`, `Drain`, `IsClosed` are removed; `HandleTenantLifecycle` moves onto `Client`. Verified defects this closes in one place: no resync after reconnect (Postgres ST, Manager MT, Mongo re-open); `staleAfter` counter counts drops not retries so a hard outage never marks stale; warm-load before LISTEN; listener-open failure leaves a fresh-looking cache; validator skipped on hydrate/refresh/warm-load/per-request read; callback receives no tenant; delete publishes default in ST and `nil` in MT; MT callback runs on the LISTEN goroutine and receives the live cached object (data race); NOTIFY whose re-read finds no row drops the callback; `BindManager` accepts a Mongo client.
 - **D2 — Convergence by reconciliation, not by trusting the feed.** Every `Store.Subscribe` emits `OpResync` after each (re)connect. The engine answers `OpResync` with `List(scope)` and republishes every registered key whose revision differs, fenced two ways against the feed: (a) every publication into a scope's cache, whether from a feed event, a `Set`, or a resync, goes through one per-(scope, key) publish step that accepts an upsert only when its revision is greater than the cached revision (or the cached revision is unknown), so a stale `List` row can never overwrite a newer feed publication; (b) while a reconcile is in flight the engine records every key the feed touched since the `List` began and skips those keys when applying the `List` result, so a key deleted-then-recreated, or absent in an old `List`, is decided by the feed, not by the snapshot (this is the `hydrationTouched` pattern the v3 single-tenant client already uses at `Start`). A feed delete (revision 0) always publishes the default; a resync-absent only publishes the default when the feed did not touch the key during the reconcile. Until the first reconcile completes, and from the feed's `OpDisconnect` until the `OpResync` that follows has been reconciled, the scope is `Stale`; reads keep serving the last published value (never block, never erase), and `Entry.Stale` / `Snapshot.Stale` expose it. No resume tokens (reconcile covers the gap).
-- **D3 — Revision is the identity of a published value.** Postgres gains a `revision BIGINT` column bumped by a BEFORE UPDATE trigger when `value` changes; NOTIFY carries it; MongoDB `$inc`s a `revision` field through the lib's writer; MongoDB has no triggers, so a foreign writer (a Console process writing the collection directly) may change `value` without bumping `revision`. The engine therefore also publishes when the revision is unchanged but the value bytes differ, so a non-bumping writer is observed rather than deduplicated away. Revision 0 means "no row: registered default in force". The same non-zero revision seen twice = no callback (Revision 0 is never deduplicated), but the re-read still refreshes the cached `updated_at` / `updated_by` so `GetEntry` provenance never lags the row. No compare-and-set in v4.0 (additive later: `If-Match` on admin PUT).
+- **D3 — Revision is the identity of a published value.** Postgres gains a `revision BIGINT` column drawn from the table-level sequence `systemplane_revision_seq` on insert and, by a BEFORE UPDATE trigger, on every `value` change, so a key deleted and recreated always comes back above every revision it ever had (D11); NOTIFY carries it; MongoDB's writer sets `revision = max(previous + 1, server time in ms)` (FC-9, D11); MongoDB has no triggers, so a foreign writer (a Console process writing the collection directly) may change `value` without bumping `revision`. The engine therefore also publishes when the revision is unchanged but the value bytes differ, so a non-bumping writer is observed rather than deduplicated away. Revision 0 means "no row: registered default in force". The same non-zero revision seen twice = no callback (Revision 0 is never deduplicated), but the re-read still refreshes the cached `updated_at` / `updated_by` so `GetEntry` provenance never lags the row. No compare-and-set in v4.0 (additive later: `If-Match` on admin PUT).
 - **D4 — Read-your-writes in every mode.** `Set` publishes to the caller's scope cache with the revision the store returned before returning; the feed echo dedupes by revision.
 - **D5 — Typed groups are one key each.** `Bind[T]` registers `(namespace, key)` whose value is the JSON document of `T`. Atomicity of a group = atomicity of one row. No cross-key transactions.
 - **D6 — Both backends, both modes (Fred, 2026-09-17).** MongoDB is a first-class backend in single- AND multi-tenant mode, with the same guarantees as Postgres: revision per document, `OpResync` after every change-stream (re)open, per-tenant change streams through the tenant-manager Mongo connector, per-tenant cached scopes in the engine. Reason: the Console (product-console) will consume systemplane and runs on MongoDB only; Fred decided (2026-09-17) that the Console's Go service imports this lib with `WithMongoTenantManager` and exposes the admin HTTP surface to the Next.js front end, so the lib is the only writer of the collection and FC-9 stays an internal shape. Change streams need a replica set; `WithPollInterval` remains the fallback for standalone Mongo and must honor the same `OpResync` and revision rules.
@@ -25,6 +25,7 @@
 - **D8 — Canonical names only.** `WithTable`, `WithListenChannel`, `WithCollection` are removed (`systemplane_entries` / `systemplane_changes`). `DefaultSeedSQL()` and `ddl/default_seed.sql` are removed: defaults live in code; consumers who want persisted overrides write their own migration. Known breakage: billing-worker and plugin-br-pix-jd call `WithListenChannel`; billing-worker, plugin-br-pix-jd and finance-hub have DDL generators built on `DefaultSeedSQL()`. billing-worker (v2.0.0) and finance-hub (v1.6.0) migrate majors anyway; plugin-br-pix-jd is on v3.0.0 and takes the v4 hop like everyone else; `MIGRATION-v4.md` names each.
 - **D9 — Facade kept for the per-key API.** `Register`, `Get*`, `Set`, `Delete`, `List`, `Catalog*`, `OnChange` (new signature), `KeyDescription`, `KeyRedaction`, `IsRegistered`, `Logger`, `NewForTesting` stay. Admin HTTP keeps its four routes.
 - **D10 — `Close` replaces `Drain`.** `Client.Close()` keeps its signature: it cancels every scope's feed and the ctx handed to every in-flight callback, then waits for dispatch workers to exit up to a bound (`WithCloseTimeout`, default 30s). Cancellation is cooperative: a callback that honors ctx ends and Close returns nil with no goroutine left; a callback that ignores ctx makes Close return `ErrCloseTimeout` naming the (scope, key) still running, and that goroutine is the subscriber's leak, made visible rather than hidden.
+- **D11 — Revision is monotonic per (namespace, key) across the row's lifetimes, and the database assigns it.** Amended 2026-09-17 after the storage lane's review. FC-8 as first frozen used a per-row counter (`OLD.revision + 1`, default 1), so a key deleted and recreated during a changefeed outage came back BELOW the cached revision and D2's fence would have rejected the recreated value for good, serving a stale value that reports itself fresh. Postgres now draws every revision from one table-level sequence, on insert and on every value-changing update alike; the v3→v4 migration seeds the sequence above the highest existing revision. MongoDB has no sequences: its writer sets `revision = max(previous + 1, $toLong($$NOW))` inside the existing aggregation-pipeline update, which is strictly increasing per row and, after a delete, resumes above the old value unless the primary's clock stepped backward by more than the gap between the delete and the recreate; that residual case lands on the equal-or-lower revision path the engine already handles (equal revision with different bytes publishes; lower waits for the next write). The contract suite asserts recreate > last revision on both backends. Consumers treat revisions as opaque monotonic integers: magnitude differs between backends and may jump.
 
 ## Consumer matrix (2026-09-17)
 
@@ -117,7 +118,7 @@ type Entry struct {
 	Namespace string
 	Key       string
 	Value     []byte // JSON-encoded
-	Revision  int64  // monotonic per (namespace, key); 0 = unknown
+	Revision  int64  // monotonic per (namespace, key), across delete and re-create (D11); 0 = unknown
 	UpdatedAt time.Time
 	UpdatedBy string
 }
@@ -324,21 +325,28 @@ func (g *Group[T]) Status() []ApplyStatus
 ### FC-8 DDL v4 (`ddl/schema.sql` becomes this; `ddl/migrate_v3_to_v4.sql` is the delta)
 
 ```sql
+CREATE SEQUENCE IF NOT EXISTS systemplane_revision_seq AS BIGINT;
+
 CREATE TABLE IF NOT EXISTS systemplane_entries (
 	namespace   TEXT NOT NULL,
 	"key"       TEXT NOT NULL,
 	value       JSONB NOT NULL,
-	revision    BIGINT NOT NULL DEFAULT 1,
+	revision    BIGINT NOT NULL DEFAULT nextval('systemplane_revision_seq'),
 	updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
 	updated_by  TEXT NOT NULL DEFAULT '',
 	PRIMARY KEY (namespace, "key")
 );
 
 ALTER TABLE systemplane_entries ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;
+ALTER TABLE systemplane_entries ALTER COLUMN revision SET DEFAULT nextval('systemplane_revision_seq');
+SELECT setval('systemplane_revision_seq', GREATEST(
+	(SELECT COALESCE(MAX(revision), 1) FROM systemplane_entries),
+	(SELECT last_value FROM systemplane_revision_seq)
+));
 
 CREATE OR REPLACE FUNCTION systemplane_bump_revision_v4() RETURNS TRIGGER AS $$
 BEGIN
-	NEW.revision := OLD.revision + 1;
+	NEW.revision := nextval('systemplane_revision_seq');
 	RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -387,15 +395,15 @@ WHEN (OLD IS DISTINCT FROM NEW)
 EXECUTE FUNCTION systemplane_notify_v4('systemplane_changes');
 ```
 
-Re-setting an identical value bumps `updated_at` but not `revision`; the NOTIFY fires with the same revision and the engine dedupes it. `SchemaSQL()` returns the full file; `MigrationV3ToV4SQL()` returns the delta (the `ALTER` plus the function/trigger replacement). NOTIFY payload is `{"namespace","key","op","revision"}`; decoders treat a missing `revision` as 0.
+Re-setting an identical value bumps `updated_at` but not `revision`; the NOTIFY fires with the same revision and the engine dedupes it. Every revision comes from `systemplane_revision_seq` (D11): a fresh row takes the column default, a value-changing update takes the trigger's `nextval`, so a recreated key is always above the revision it had before the delete; the sequence may skip numbers (an upsert that lands on the conflict path burns one), which the engine never depends on. `MigrationV3ToV4SQL()` is this file minus the `CREATE TABLE`; on a v3 table it adds the column at 1, switches the default to the sequence and seeds the sequence at the highest existing revision, so the first post-migration write lands at 2 or higher. `SchemaSQL()` returns the full file; `MigrationV3ToV4SQL()` returns the delta (the `ALTER` plus the function/trigger replacement). NOTIFY payload is `{"namespace","key","op","revision"}`; decoders treat a missing `revision` as 0.
 
 ### FC-9 MongoDB document
 
-Document `_id` stays `{namespace, key}`. Top-level fields: `namespace`, `key`, `value`, `revision` (int64, `$setOnInsert: 1`, `$inc: 1` when `value` changes), `updated_at` (BSON date), `updated_by` (string). Collection `systemplane_entries`, one per tenant database in multi-tenant mode (D6). The lib is the only intended writer (the Console goes through its Go service and this lib). A direct writer (an operator in a Mongo shell) that changes `value` without `$inc` on `revision` is still observed because of the defensive rule in D3, at the cost of dedupe for that key. The change stream watches the collection with `fullDocument: updateLookup`; a resume token is not required because `OpResync` reloads after every re-open.
+Document `_id` stays `{namespace, key}`. Top-level fields: `namespace`, `key`, `value`, `revision` (int64; the writer's aggregation-pipeline update sets it to `max(previous + 1, $toLong($$NOW))` on insert and whenever `value` changes, and leaves it untouched on an identical rewrite, per D11), `updated_at` (BSON date), `updated_by` (string). Collection `systemplane_entries`, one per tenant database in multi-tenant mode (D6). The lib is the only intended writer (the Console goes through its Go service and this lib). A direct writer (an operator in a Mongo shell) that changes `value` without `$inc` on `revision` is still observed because of the defensive rule in D3, at the cost of dedupe for that key. The change stream watches the collection with `fullDocument: updateLookup`; a resume token is not required because `OpResync` reloads after every re-open.
 
 ### FC-11 Initial publication at Start
 
-When a scope completes its first reconcile (single-tenant at `Start`, a tenant at activation), the engine publishes EVERY registered key of that scope, including keys whose row is absent (default in force, Revision 0), and dispatches those publications to subscribers registered before that moment. Consequence: an `OnChange` callback registered before `Start` fires once at `Start` with the current value; `Group.OnApply` registered before `Start` gets its initial delivery from this publication. v3 skipped callbacks during hydration; v4 does not. `MIGRATION-v4.md` names this (br-sfn registers 17 callbacks before `Start`).
+When a scope completes its first reconcile (single-tenant at `Start`, a tenant at activation), the engine publishes EVERY registered key of that scope, including keys whose row is absent (default in force, Revision 0), and dispatches those publications to subscribers registered before that moment. Consequence: an `OnChange` callback registered before `Start` fires once at `Start` with the current value; `Group.OnApply` registered before `Start` gets its initial delivery from this publication. v3 skipped callbacks during hydration; v4 does not. `MIGRATION-v4.md` names this (br-sfn registers 17 callbacks before `Start`). A registered key whose only stored row the ingress rejects on that first reconcile (undecodable, or failing the registered validator) is announced with the registered default at Revision 0, exactly like an absent row: the default is what reads serve for it, and the rejection is logged. Later reconciles do not repeat that announcement while the row stays rejected; the value in force stays in force (D-G4).
 
 ### FC-10 Facade surface kept unchanged (admin and consumers rely on it)
 
