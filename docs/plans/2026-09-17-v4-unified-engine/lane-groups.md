@@ -23,7 +23,7 @@
 
 | Phase | Milestone | Epics | Status |
 |-------|-----------|-------|--------|
-| 1 | A consumer binds a typed document, reads it back as `T` with revision/tenant/staleness, and writes it; an invalid document is rejected at every ingress the facade owns | 1.1, 1.2 | Detailed |
+| 1 | A consumer binds a typed document, reads it back as `T` with revision/tenant/staleness, and writes it; an invalid document is rejected at every ingress the facade owns | 1.1, 1.2 | Complete |
 | 2 | The same group delivers hot reload: `OnApply` fires serialized, coalesced, never twice for the same revision, and `Status` reports desired vs applied per tenant | 2.1, 2.2, 2.3 | Epic-level |
 
 ---
@@ -54,7 +54,8 @@ Two consequences the implementation must honor:
 On this lane's base the wave-1 facade still hydrates without validating, so a seeded invalid row can reach a reader. The lane does not compensate for that (the same stance D-G5 takes on revisions): the end-to-end "an invalid row keeps the last valid value" assertion belongs to engine-core's ingress tests and to the integration lane.
 
 **D-G5 — `Snapshot` field derivation.**
-`Value` ← decoded `Entry.Value`. `Revision` ← `Entry.Revision`. `Stale` ← `Entry.Stale`, unchanged. `Tenant` ← `tmcore.GetTenantIDContext(ctx)` from `lib-commons/v7/commons/tenant-manager/core`, which is the same helper the client already uses to identify a request's tenant; it returns `""` in single-tenant mode and for a context no middleware has touched, which is exactly the FC-7 contract (`"" in single-tenant mode`).
+`Value` ← decoded `Entry.Value`. `Revision` ← `Entry.Revision`. `Stale` ← `Entry.Stale`, unchanged. `Tenant` ← `tmcore.GetTenantIDContext(ctx)` from `lib-commons/v7/commons/tenant-manager/core`, which is the same helper the client already uses to identify a request's tenant.
+In wave 1 `Snapshot.Tenant` is read from the caller's ctx because the facade cannot see which scope served the entry. That is not FC-7's rule: the ctx reports whatever tenant middleware put there, including on a single-tenant Client, where FC-7 requires `""`. FC-7's rule is honored in groups Phase 2, once engine-core Phase 2 exposes the served scope through the Client, at which point `Snapshot.Tenant` becomes the scope the value came from and the ctx is no longer consulted.
 On the contracts base the single-tenant read path reports `Revision 0` for every cached row and `Stale false` always — FC-5 already documents that as the wave-1 shim's limitation. This lane maps the fields faithfully; it does not compensate, and it does not assert non-zero revisions through the single-tenant facade (see D-G9).
 
 **D-G6 — A delivered `Applied` always carries `Stale: false`.**
@@ -83,6 +84,9 @@ The wave-1 facade zeroes `Revision` on both the single-tenant read path and the 
 **D-G10 — Nil-receiver behavior, matching the rest of the package.**
 `Bind` on a nil `*Client` returns `(nil, ErrClosed)`. On a nil `*Group[T]`: `Snapshot` returns `(zero, ErrClosed)`, `Set` returns `ErrClosed`, `OnApply` returns `(no-op, ErrClosed)`, `Status` returns `nil`. `Status` returns its slice sorted by `Tenant`, so a test can compare it without ordering flake.
 
+**D-G12 — The ingress canonicalizes before it judges, and `Snapshot` refuses a null row.**
+Ingress rule: the ingress validator `Bind` registers runs, in this order, `group.Canonical(value)` (so every ingress path validates exactly the document that will be persisted, not the caller's raw `T`), then a nullness check on the CANONICAL result (a canonical `nil` means JSON null); for a non-nilable `T` (struct, string, number, bool, array) a null document is rejected with an `ErrValidation`-wrapped error and the value in force stays; for a nilable `T` (pointer, map, slice, interface) null is a legitimate document and is passed on; then `group.Decode[T]`, then the caller's `validate` when non-nil — a typed nil such as `(*cfg)(nil)` or `map[string]any(nil)` marshals to null and must be caught, so the canonical-form test is the primary one and a `tmcore.IsNilInterface` check would only be belt and braces. Snapshot rule, defence in depth: `Group[T]` keeps `nullIsDocument` (computed in `Bind`) and `Snapshot`, when `entry.Value == nil` and the type is not nilable, returns `Snapshot[T]{}` and an `ErrValidation`-wrapped error naming namespace/key instead of a zeroed `T` with nil error; `internal/group.Decode` is NOT touched, because D-G2 freezes nil→zero. Note on wrapping: the ingress returns its rejection unwrapped, because `Client.Register` and `Client.Set` both wrap a validator error with `ErrValidation` already and a second wrap would print the sentinel twice for one condition — `errors.Is(err, ErrValidation)` holds at every caller either way. `Snapshot` wraps explicitly, because nothing downstream of it does.
+
 **D-G11 — Parameter naming trap.** The root package is scanned by an AST test that flags exported parameters whose NAME suggests a logger or telemetry sink: `logger`, `log`, `l`, `recorder`, `factory`, `metrics`, `metricsfactory`, `telemetry`, `t`. No exported function or method added by this lane may name a parameter any of those. `T` as a type parameter is fine; a value parameter called `t` is not.
 
 ---
@@ -97,11 +101,11 @@ At the end of Phase 1 a consumer can declare a typed configuration document, rea
 **Scope:** `internal/group/` (new), root `api_group.go` (new).
 **Dependencies:** none.
 **Done when:** `Bind` before `Start` registers the key; the registered default round-trips through JSON; invalid defaults are rejected through the caller's `validate`; a caller-supplied `WithValidator` cannot displace the type check; `Bind` on a nil Client returns `ErrClosed`; `make test-unit` green.
-**Status:** Pending
+**Status:** Done
 
 #### Task 1.1.1: Build the typed codec in `internal/group`
 
-- [ ] Done
+- [x] Done
 
 **Context:** Every path in this lane converts between a consumer's `T` and the untyped JSON document the facade stores. There is no such helper anywhere in the repository today — the facade handles `any` end to end and leaves decoding to the caller. This task creates the single conversion point that Phase 1 and Phase 2 both build on, in a package that did not exist before, so nothing else in the repo changes.
 
@@ -144,7 +148,7 @@ Add `internal/group/main_test.go` with `goleak.VerifyTestMain`, mirroring the ex
 
 #### Task 1.1.2: Add `Bind`, `Group[T]` and `Snapshot[T]` to the root package
 
-- [ ] Done
+- [x] Done
 
 **Context:** FC-7 fixes the public shape of the typed group API verbatim. The facade methods it must sit on — `Register`, `IsRegistered` and the key options `WithDescription`, `WithValidator`, `WithRedaction`, `WithCatalogMetadata` — already exist on `*Client` in the root package. Nothing in the repository declares a generic exported type yet, though the boundary AST test already handles generic receivers, so no test needs adjusting.
 
@@ -182,11 +186,11 @@ Watch the parameter names against D-G11 — `defaults`, `validate`, `opts`, `c`,
 **Scope:** root `api_group.go`, `api_group_test.go`.
 **Dependencies:** Epic 1.1.
 **Done when:** `Snapshot` decodes and maps all four fields WITHOUT re-running the consumer's `validate` (D-G4); a document that cannot decode into `T` surfaces as an error instead of a half-filled value; `Set` rejects an invalid value before it reaches the store; both are nil-receiver safe; `make test-unit` green.
-**Status:** Pending
+**Status:** Done
 
 #### Task 1.2.1: Implement `Group[T].Snapshot`
 
-- [ ] Done
+- [x] Done
 
 **Context:** `GetEntry` on `*Client` is the scope-resolving read the contracts lane landed; it returns a struct carrying the decoded value, the revision, provenance and a staleness flag, and reports `ok == false` only for an unregistered key. A group's key is registered by construction, so `!ok` means the Client was torn down underneath the group.
 
@@ -214,7 +218,7 @@ The import of `github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/cor
 
 #### Task 1.2.2: Implement `Group[T].Set`
 
-- [ ] Done
+- [x] Done
 
 **Context:** `Client.Set` already validates through the key's registered validator, marshals, persists and — in single-tenant mode — updates the cache with the JSON-canonical value. The group's registered validator (Task 1.1.2) is exactly the type check, so the typed write needs no validation of its own.
 
@@ -240,7 +244,7 @@ Nil receiver returns `ErrClosed`. Document the inherited behavior explicitly in 
 
 #### Task 1.2.3: Prove the whole-document semantics end to end
 
-- [ ] Done
+- [x] Done
 
 **Context:** D5 says the atomicity of a group is the atomicity of one row, and the index's integration scenario 8 asserts that a concurrent reader never observes a mix of old and new fields. That scenario runs against real backends in the integration lane; this task pins the same property at the level this lane owns, where the guarantee actually comes from — one key, one JSON document, one write.
 
@@ -431,8 +435,9 @@ All are new. The index assigns `api_group*.go` to this lane explicitly and exclu
 
 ### Deferred to the integration lane
 
-Two assertions this lane cannot make green on its own base, both because they depend on engine behavior that has not landed:
+Four assertions this lane cannot make green on its own base, each because it depends on engine behavior that has not landed:
 
 1. A non-zero revision arriving through the single-tenant facade — `Snapshot.Revision` and `Applied.Revision` end to end. The wave-1 shim zeroes both (FC-5 documents this). Covered here at coordinator level with synthetic revisions (D-G9) and end to end by integration scenario 4.
 2. The real (non-fake) pre-`Start` initial delivery under R1, which is integration scenario 4's `Group.OnApply` `Status()` assertion. The pre-`Start` gate on the seed rides with it: the wave-1 shim reports `Stale false` always, so only a real engine distinguishes "not started yet" from "tracked and reconciled" (D-G7).
-3. The end-to-end rule that an invalid stored row keeps the last valid value in force — or the registered default when nothing valid was ever published — and is visible only in the engine's log and telemetry (D-G4). The rejection happens in engine-core's ingress, which is not on this lane's base; engine-core asserts it directly and the integration lane's "invalid external row keeps last valid" scenario covers it against real backends.
+3. `Snapshot.Tenant` naming the scope that served the value, which is FC-7's rule (`""` in single-tenant mode). In wave 1 it is read from the caller's ctx, because the facade does not report which scope answered a read, so a single-tenant Client whose ctx carries a tenant id reports that id instead of `""` (D-G5). Groups Phase 2 switches the field to the served scope once engine-core Phase 2 exposes it; until then no test asserts FC-7's single-tenant rule, only the faithful ctx mapping.
+4. The end-to-end rule that an invalid stored row keeps the last valid value in force — or the registered default when nothing valid was ever published — and is visible only in the engine's log and telemetry (D-G4). The rejection happens in engine-core's ingress, which is not on this lane's base; engine-core asserts it directly and the integration lane's "invalid external row keeps last valid" scenario covers it against real backends.
