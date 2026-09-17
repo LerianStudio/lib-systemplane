@@ -30,7 +30,15 @@
 
 ---
 
-## Scope change applied (2026-09-17, after this plan was commissioned)
+## Amendments applied after this plan was commissioned (all 2026-09-17)
+
+Three late changes are already folded into the phases below; this document is current against them, and § Self-review § Contract amendments records what each one consumed.
+
+- **FC-2 gains `store.OpDisconnect`** — the changefeed now says when it loses its connection, so `Stale` is true for the whole outage window instead of only across the reconcile. Tasks 1.2.2, 1.2.3, 1.4.1. The constant lands in the `storage` lane's file, so this branch carries a local const until rebase (Task 1.2.2 specifies it).
+- **FC-11 — the first reconcile announces every registered key** to subscribers registered before it, Revision 0 for keys with no row. This removes v3's deliberate suppression of callbacks during hydration. Tasks 1.1.2, 1.2.3, 1.4.1.
+- **D6 — MongoDB is first-class in both modes**, detailed immediately below.
+
+### MongoDB scope change
 
 The CEO decided that **MongoDB stays a first-class backend in BOTH modes**; `index.md` D6 is being rewritten to "both backends, both modes". Two consequences for this lane, already folded into the phases below:
 
@@ -172,6 +180,8 @@ type scopeState struct {
 
 Cache reads land here as `(*Engine).Lookup(scope store.Scope, nk NSKey) (Entry, bool)`: it returns the cached `entry` widened into the exported `Entry`, with `Value` passed through `Clone` so the caller owns it and `Stale` copied from the scope. On a scope that is not tracked, or a key not in its map, `ok` is false — the caller (the Client, in Phase 2) then falls back to the registered default. A new scope is created `stale: true`: until its first reconcile completes nothing has confirmed the cache against the store.
 
+**A new scope's `entries` map starts EMPTY.** It is not pre-seeded with registered defaults, and this is load-bearing rather than incidental: FC-11 (Task 1.2.3) requires the first reconcile to announce every registered key, and an empty cache is what makes each of those publications a first publication that the fence accepts and notifies on. `internal/client/client.go` seeds defaults at `Start` today; the engine does not. A `Lookup` miss is the signal the Client uses to fall back to the registered default, which is how reads before the first reconcile keep working.
+
 Named edge cases: a nil `Engine` receiver returns `(Entry{}, false)` rather than panicking, matching the nil-receiver safety the Client's read methods promise. `Lookup` takes `RLock` on the scope and must not call `Clone` under that lock held for write — read lock is fine and keeps a slow reflective clone from blocking publishers.
 
 **Files:**
@@ -239,7 +249,7 @@ Decisions the implementer does not re-litigate:
 **Goal:** Every value reaches the cache through one `decode → validate → publish` path, the changefeed drives it, an `OpDisconnect` marks the scope stale for exactly as long as it is out of touch with the store, and an `OpResync` reloads the whole scope fenced against the feed.
 **Scope:** `internal/engine/` (ingress, feed handling, reconcile), `internal/debounce/` (re-keyed, reused)
 **Dependencies:** Epic 1.1
-**Done when:** a value written while the feed was down becomes visible after a single `OpResync` with no second write; a feed event that lands between a reconcile's `List` and its application wins over the `List` row, for both a newer upsert and a delete-then-recreate; a row whose JSON decodes to a type the registered validator rejects leaves the previous published value in place and fires no callback; a delete publishes the registered default at revision 0; `Stale` is true from the moment an `OpDisconnect` arrives until the reconcile triggered by the following `OpResync` completes, and false otherwise.
+**Done when:** a value written while the feed was down becomes visible after a single `OpResync` with no second write; a feed event that lands between a reconcile's `List` and its application wins over the `List` row, for both a newer upsert and a delete-then-recreate; a row whose JSON decodes to a type the registered validator rejects leaves the previous published value in place and fires no callback; a delete publishes the registered default at revision 0; `Stale` is true from the moment an `OpDisconnect` arrives until the reconcile triggered by the following `OpResync` completes, and false otherwise; a subscriber registered before `Start` receives exactly one `Change` per registered key during `Start` (FC-11), Revision 0 for keys with no row.
 **Status:** Pending
 
 #### Task 1.2.1: Implement the `decode → validate → publish` ingress
@@ -321,7 +331,24 @@ On a `List` error: leave `stale = true`, clear `reconciling`, log at WARN, publi
 
 Notifications produced by steps 3 and 4 go to the dispatch queue exactly as feed notifications do (Epic 1.3): a reconcile that finds a genuinely newer value fires subscribers, and one that finds nothing new fires nothing.
 
-**On `Stale` and the feed-down window — read this before writing the test.** `Store.Subscribe` (FC-2) signals reconnect, not disconnect. The engine therefore marks a scope stale from creation until its first reconcile completes, and again from the moment an `OpResync` arrives until that reconcile completes. It does **not** know the feed is down *while* it is down and must not pretend to: no heartbeat, no liveness probe, no timer. Assert what is true — stale before the first reconcile, stale across the reconcile, false after — and nothing about the outage window itself. See § Self-review for the note the orchestrator needs about the integration lane's scenario 1.
+**FC-11 — the first reconcile announces every key.** When a scope completes its **first** reconcile (for the single-tenant scope, that is inside `Start`), the engine publishes every registered key of that scope and dispatches those publications to subscribers registered before that moment — including keys with no row, which publish the registered default at Revision 0. A subscriber registered before `Start` therefore fires exactly once per registered key during `Start`, and never twice for the same key.
+
+**v3 did the opposite and v4 removes the special case.** `internal/client/client.go` seeds the cache with registered defaults at `Start` and then uses the `hydrating` / `hydrationTouched` pair to suppress exactly this announcement, so a consumer's `OnChange` never learned the starting value and had to read it separately. Do not port that suppression. Two concrete consequences for the implementer:
+
+- **Never pre-seed `scopeState.entries` with registered defaults** (Task 1.1.2 already specifies an empty map at scope creation). An empty cache is what makes every step-3 and step-4 publication of the first reconcile a first publication for its key, which the fence accepts and notifies on. Seeding defaults first would be a silent behavior change dressed as an optimisation.
+- The `touched` set survives unchanged. It exists to stop a stale `List` row overwriting a fresher feed publication; it never suppresses a callback. A key the feed published during the first reconcile window was already announced by that publication, so it is still announced exactly once.
+
+Later reconciles announce nothing extra: the fence dedupes every key whose revision has not moved, which is why only the first one behaves this way and why it needs no flag beyond "this scope has not reconciled yet".
+
+**The complete `Stale` rule — this is the whole specification, do not add to it.** A scope is stale in exactly three situations and no others:
+
+1. From its creation until its first reconcile completes. Nothing has confirmed the cache against the store yet.
+2. From the moment an `OpDisconnect` arrives (Task 1.2.2) until the reconcile triggered by the following `OpResync` completes. This is the outage window, and it is observable because the store now says when it loses its connection — FC-2 gained `store.OpDisconnect` on 2026-09-17 precisely so the engine does not have to guess.
+3. From a failed reconcile until a later one succeeds.
+
+Nothing else sets it. No heartbeat, no liveness probe, no timer, no "it has been a while since the last event". If the engine has not been told the feed is down, the feed is up.
+
+`Stale` is a property of the scope, not of a key: every `GetEntry` in a stale scope reports `Stale: true`, including keys whose cached value happens to be current. That is the honest answer — the engine cannot know which keys drifted during an outage, which is the entire reason the reconcile exists.
 
 **Files:**
 - Create: `internal/engine/reconcile.go`
@@ -334,9 +361,11 @@ Notifications produced by steps 3 and 4 go to the dispatch queue exactly as feed
 - `TestReconcileAbsentKeyFallsBackToDefault` — a registered key missing from `List` and untouched ends at the registered default, revision 0.
 - `TestReconcileAbsentButTouchedKeyKeepsFeedValue` — same, but the feed published the key during the window: the feed value stands.
 - `TestReconcileFailureKeepsCacheAndLeavesScopeStale` — `List` returns an error; the previously cached value and revision survive and `Lookup` reports `Stale` true.
+- `TestStaleIsTrueBetweenDisconnectAndCompletedReconcile` — the single assertion FC-2's `OpDisconnect` was added for. Start and let the first reconcile finish: `Stale` false. Emit `OpDisconnect`: `Stale` true, and it stays true while the store is written behind the engine's back. Emit `OpResync` with the reconcile's `List` blocked: still true. Release `List`: `Stale` false and the new value is cached. Assert `Stale` at each of the four points through `Lookup`, not through a private field.
+- `TestFirstReconcileAnnouncesEveryRegisteredKey` — **FC-11's RED test.** Register three keys; seed the fake store with a row for one of them at revision 4; subscribe to all three **before** `Start`. After `Start` returns, the subscriber has received exactly one `Change` per registered key: revision 4 for the seeded key, revision 0 carrying the registered default for the two absent ones. No key is delivered twice, and a second reconcile (`OpResync` with the store unchanged) delivers nothing at all.
 - `TestReconcileClearsStaleOnSuccess`.
 
-**Done when:** both fences are implemented and separately tested; a failing `List` cannot erase a cached value; `stale` is true exactly from scope creation or `OpResync` arrival until the matching reconcile completes.
+**Done when:** both fences are implemented and separately tested; a failing `List` cannot erase a cached value; `stale` follows the three-situation rule above and is observable through `Lookup`; the first reconcile announces every registered key exactly once and no later reconcile re-announces an unchanged one.
 
 ---
 
@@ -431,12 +460,14 @@ Named edge cases. `Close` does **not** close the `store.Store` — the Client ow
 
 The `Set` path is `(*Engine).Publish(scope, nk, value, revision, updatedAt, updatedBy)`: the Client has already validated and persisted, and hands the engine the revision the store returned. It clones the value, publishes through the fence, and dispatches if `publish` says to. The feed echo for the same write then arrives with the same revision and is de-duplicated by the fence into a provenance refresh with no second callback — which is the whole reason revisions exist.
 
+`Start`'s reconcile is the **first** reconcile, so FC-11 fires there: every registered key is announced to subscribers registered before `Start` returns, absent rows at Revision 0. That behavior is implemented and tested in Task 1.2.3; `Start` owes it only the ordering — subscribe, then reconcile, and do not return until the reconcile has completed — so that a subscriber registered before `Start` cannot miss the announcement and a caller that reads after `Start` returns is looking at a confirmed cache.
+
 Named edge cases: a `Publish` whose revision the store reported as 0 (a backend that cannot report one) still takes effect, because revision 0 always wins — at the cost of the echo firing a second callback for that key. That is the correct trade: a value the caller just wrote must be readable. `Start` on a closed engine returns the closed sentinel. `Publish` before `Start` creates the scope lazily and works, so a Client that writes before starting is not silently dropped.
 
 **Files:**
 - Modify: `internal/engine/engine.go` (`New`, `Config`, `Start`, `Publish`)
 - Create: `internal/engine/engine_test.go`
-- Create: `internal/engine/fakestore_test.go` (the shared fake `store.Store` for the package: controllable `List` / `Get` hooks, a manual event injector, `Subscribe` call and live-subscription counters, an `OpResync` emitter)
+- Create: `internal/engine/fakestore_test.go` — the shared fake `store.Store` for the package. It must offer: a blocking-capable `List` hook and `Get` hook (the reconcile-race tests inject events while `List` is held), a manual event injector, `Subscribe` call and live-subscription counters, a `Get` call counter (the debounce-coalescing test counts reads), and emitters for **both** `store.OpResync` and `OpDisconnect` — the latter using the local `opDisconnect` constant from Task 1.2.2 until the `storage` lane's `store.OpDisconnect` arrives at rebase.
 
 **Verification:** `make test-unit` and `go vet -tags=unit ./...` — plus these named tests: `TestPublishMakesSetVisibleBeforeFeedEcho` (publish rev 7 through `Publish`, `Lookup` returns it immediately; then deliver the feed echo at rev 7 and assert the subscriber fired exactly once), `TestStartSubscribesBeforeReconciling` (the fake store asserts the subscription exists when `List` is entered), `TestStartRollsBackWhenSubscribeFails` (no scope is tracked afterwards and `Lookup` reports a miss, not a fresh-looking default), `TestStartKeepsScopeStaleWhenFirstReconcileFails`, `TestStartIsIdempotent`, `TestWriteDuringStartSurvives` (an event injected while `List` is blocked is not overwritten by the snapshot).
 
@@ -509,7 +540,9 @@ Phase 2 makes the engine the only cache in the library for the single-tenant sco
 | D2 — fence (a): per-(scope, key) revision fence | Task 1.1.3 |
 | D2 — fence (b): touched-during-reconcile set | Tasks 1.2.2, 1.2.3 |
 | D2 — feed delete always publishes the default; resync-absent only when untouched | Tasks 1.2.2, 1.2.3 |
-| D2 — `Stale` while the feed is down or not yet reconciled | Tasks 1.1.2, 1.2.3 (+ deviation below) |
+| D2 — `Stale` while the feed is down or not yet reconciled | Tasks 1.2.2 (`OpDisconnect`), 1.2.3 (the three-situation rule) |
+| FC-2 amendment — `store.OpDisconnect` marks a scope stale for the whole outage window | Tasks 1.2.2, 1.2.3, 1.4.1 (fake store) |
+| FC-11 — the first reconcile announces every registered key once, absent rows at Revision 0 | Tasks 1.1.2 (empty cache), 1.2.3 (announcement + test), 1.4.1 (ordering) |
 | D3 — revision is the identity; equal non-zero revision refreshes provenance with no callback | Task 1.1.3 |
 | D3 — revision 0 means "no row", never de-duplicated | Tasks 1.1.3, 1.2.1 |
 | D4 — read-your-writes: `Set` publishes the store's revision before returning | Task 1.4.1, Epic 2.1 |
@@ -536,6 +569,8 @@ Phase 2 makes the engine the only cache in the library for the single-tenant sco
 | Set-then-Get read-your-writes | `TestPublishMakesSetVisibleBeforeFeedEcho` (engine), `TestSetThenGetReturnsNewValue` (Client) | 1.4.1, Epic 2.3 |
 | Delete publishes the default at revision 0 | `TestDeleteEventPublishesDefaultAtRevisionZero`, `TestDeletePublishesDefaultAtRevisionZero` | 1.2.2, Epic 2.3 |
 | `Close` with ctx-honoring vs ctx-ignoring callbacks | `TestCloseWaitsForCtxHonoringCallbacks`, `TestCloseReportsTimeoutNamingStuckKey` | 1.3.2 |
+| `Stale` true across the whole outage, false outside it | `TestStaleIsTrueBetweenDisconnectAndCompletedReconcile`, `TestDisconnectMarksScopeStaleWithoutPublishing` | 1.2.3, 1.2.2 |
+| First reconcile announces every registered key exactly once (FC-11) | `TestFirstReconcileAnnouncesEveryRegisteredKey` | 1.2.3 |
 | goleak clean | `TestMain` (`goleak.VerifyTestMain`) over every Phase 1 test | 1.1.1 |
 
 ### Vagueness scan
@@ -548,14 +583,18 @@ This lane's `**Files:**` lists touch only `internal/engine/**`, `internal/client
 
 Verified by import graph rather than by grep: `internal/manager` is imported only by the root package (`manager.go`, `manager_methods_test.go`), by `internal/client`, and by itself — every one of them lane-owned. `ddl.go` and `ddl_test.go` name it in **comments only**, not imports, so deleting the package breaks no file this lane does not own.
 
-### Deviations to recommend to the orchestrator (index.md is not edited by this lane)
+### Contract amendments consumed, and open deviations
 
-Re-read against `index.md` as of its 2026-09-17 16:16 revision, which carries the new D6 ("Both backends, both modes"). Two stale clauses survived that rewrite:
+This lane raised four deviations while authoring. All four are closed; none remains open against the orchestrator, and this plan is written against the amended contracts rather than around them.
 
-1. **`index.md` § Lane: engine-core, Done-when, last-but-one clause** — "`NewMongoDB(..., WithMultiTenantEnabled())` returns an error" is superseded by the D6 rewrite. There is no such task in this plan. The clause should be struck.
-2. **FC-2, `Store.Subscribe` doc comment (index.md line 146)** — "Returns `ErrNotSupportedInMultiTenant` when the backend has no changefeed for that scope (MongoDB with a non-empty tenant)" carries the same superseded parenthetical, and the same text is live Go source in `internal/store/store.go`. The rule itself stays useful and backend-agnostic; only the example is now wrong. `internal/store` belongs to the `contracts` lane and is frozen, so this lane cannot touch it — the orchestrator should re-cut the comment or hand it to `storage`.
-3. **Integration Lane scenario 1, "`Stale` was true during the gap"** — not satisfiable with FC-2 as frozen. `Subscribe` signals reconnect, never disconnect, so the engine cannot know a feed is down while it is down without a heartbeat this plan deliberately refuses to invent. What engine-core delivers is: stale from scope creation until the first reconcile completes, and stale again from `OpResync` arrival until that reconcile completes. Either reword the scenario to assert stale **across the reconcile** rather than across the outage, or add a feed-down signal to `Store.Subscribe` — which is a frozen-contract re-cut and a `storage` lane change, not this one's.
-4. **`ddl.go` doc comment** names `internal/manager/schema.go`, which Epic 2.2 deletes. `ddl.go` belongs to the `storage` lane; hand them the one-line comment fix so no stale reference survives the integration lane's absence check.
+**Closed by an `index.md` amendment the plan now consumes:**
+
+- **FC-2 gains `store.OpDisconnect = "disconnect"`** (orchestrator, 2026-09-17), emitted by `Subscribe` exactly once when the changefeed loses its connection, before the first reconnect attempt, with empty `Namespace`, `Key` and `Revision`. This replaces the deviation that said "`Stale` during the gap is not satisfiable" — it now is, and integration scenario 1 stands as written. Consumed by Tasks 1.2.2 (branch and mark stale), 1.2.3 (the three-situation `Stale` rule and `TestStaleIsTrueBetweenDisconnectAndCompletedReconcile`) and 1.4.1 (the fake store emits it). **The constant itself lands in `internal/store/store.go`, owned by the `storage` lane**, so this branch uses a local unexported `opDisconnect` const until rebase — the full workaround and its single-deletion retirement are specified in Task 1.2.2.
+- **FC-11 — the first reconcile announces every registered key** (orchestrator, 2026-09-17): one `Change` per registered key to subscribers registered before that moment, Revision 0 for keys with no row. This is a behavior change against v3, which deliberately suppressed callbacks during hydration via `hydrating` / `hydrationTouched` in `internal/client/client.go`. Consumed by Tasks 1.1.2 (the cache must start empty, which is what makes the announcement fall out of the fence), 1.2.3 (the rule, the removal of the v3 suppression, and `TestFirstReconcileAnnouncesEveryRegisteredKey`) and 1.4.1 (`Start` must not return before the reconcile completes, or a subscriber can miss it).
+
+**Closed in `index.md` by the orchestrator, no action left for this lane:** the stale engine-core Done-when clause requiring `NewMongoDB(..., WithMultiTenantEnabled())` to error (superseded by the D6 rewrite), FC-2's "(MongoDB with a non-empty tenant)" parenthetical on `Store.Subscribe`, and `ddl.go`'s doc comment naming `internal/manager/schema.go` which Epic 2.2 deletes. The last one is a one-line fix in a file the `storage` lane owns.
+
+**Open deviations: none.**
 
 ### Phase boundaries and verification plausibility
 
