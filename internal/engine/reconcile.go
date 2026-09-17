@@ -49,35 +49,117 @@ type reconcileArming struct {
 // It runs on the changefeed goroutine and therefore does exactly two things.
 // It arms the scope synchronously — stale, reconciling, the touched and
 // unusable sets, both generations recorded — and then hands the snapshot to
-// its own goroutine. The split is the point: the store guarantees OpResync
-// precedes every per-key event of that connection, so arming before returning
-// means no event from the new connection can slip past the fence, while the
-// List never blocks the feed.
+// the scope's ONE reconcile goroutine. The split is the point: the store
+// guarantees OpResync precedes every per-key event of that connection, so
+// arming before returning means no event from the new connection can slip
+// past the fence, while the List never blocks the feed.
+//
+// The handoff is a single-slot mailbox, not a goroutine per event. A flapping
+// connection emits a burst of OpResync, and a goroutine each meant N
+// untracked goroutines queued behind one List, none of which Close waited for.
+// The burst now coalesces to one pending reconcile, and the one goroutine
+// draining the slot is registered in the WaitGroup Close drains.
 func (e *Engine) onResync(scope store.Scope) {
 	sc := e.scopeFor(scope)
+	if sc == nil {
+		return
+	}
+
 	arm := sc.beginReconcile()
 
-	runtime.SafeGo(e.logger, "systemplane.engine.reconcile", runtime.KeepRunning, func() {
-		e.reconcileScope(sc, arm)
-	})
+	if displaced := sc.submitReconcile(arm); displaced != nil {
+		sc.closeWindow(*displaced)
+	}
+
+	if !e.ensureReconcileWorker(sc) {
+		// Shutdown won the race: nothing will drain the mailbox, so this
+		// arming's fences are released rather than left open on a scope the
+		// engine is tearing down.
+		if pending, ok := sc.takeReconcile(); ok {
+			sc.closeWindow(pending)
+		}
+	}
 }
 
-// reconcileScope reloads scope from the store and republishes what changed,
-// one reconcile at a time.
+// ensureReconcileWorker starts sc's one reconcile goroutine, at most once, and
+// reports whether the scope has one.
 //
-// Two OpResync events must never apply two snapshots at once. runMu is what
-// serializes them; beginReconcile deliberately does not take it, so arming
-// stays instant on the changefeed goroutine and only the List and its
-// application queue here.
+// The started flag and the WaitGroup Add are under the same lock Close takes
+// before it waits, so every Add provably happens-before that Wait. It returns
+// false once Close has shut the door: a goroutine started then would either be
+// waited on by a Wait already in progress — which Go answers by killing the
+// process — or never be waited on at all.
+func (e *Engine) ensureReconcileWorker(sc *scopeState) bool {
+	e.workersMu.Lock()
+
+	if e.workersClosed {
+		e.workersMu.Unlock()
+
+		return false
+	}
+
+	if sc.workerStarted {
+		e.workersMu.Unlock()
+
+		return true
+	}
+
+	sc.workerStarted = true
+
+	e.dispatchWG.Add(1)
+	e.workersMu.Unlock()
+
+	runtime.SafeGoWithContextAndComponent(e.dispatchContext(), e.logger,
+		"systemplane.engine", "reconcile", runtime.KeepRunning,
+		func(ctx context.Context) {
+			defer e.dispatchWG.Done()
+
+			e.runReconcileWorker(ctx, sc)
+		})
+
+	return true
+}
+
+// runReconcileWorker drains sc's reconcile mailbox until the engine shuts down
+// or the scope is dropped. It is the only goroutine that reconciles this
+// scope, which is what serializes two OpResync events without a mutex a
+// reconcile could queue on for the whole of a hung List.
+func (e *Engine) runReconcileWorker(ctx context.Context, sc *scopeState) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-sc.reconcileStop:
+			return
+		case <-sc.resyncSignal:
+			if arm, ok := sc.takeReconcile(); ok {
+				e.runOneReconcile(ctx, sc, arm)
+			}
+		}
+	}
+}
+
+// runOneReconcile keeps a panicking reconcile from taking the scope's only
+// reconcile goroutine with it. The validator the ingress runs is consumer
+// code: recovering per reconcile rather than per goroutine is what makes the
+// next OpResync still reconcile after one bad row.
+func (e *Engine) runOneReconcile(ctx context.Context, sc *scopeState, arm reconcileArming) {
+	defer runtime.RecoverAndLogWithContext(ctx, e.logger, "systemplane.engine", "reconcile")
+
+	e.reconcileScope(sc, arm)
+}
+
+// reconcileScope reloads scope from the store and republishes what changed.
+//
+// Two OpResync events must never apply two snapshots at once. The scope's one
+// reconcile goroutine is what serializes them: this function is only ever
+// called from it, one mailbox item at a time.
 //
 // A reconcile that finds itself superseded publishes nothing and completes
 // nothing. The newer window owns the scope, takes its own photograph, and is
 // what hands Start the first reconcile's outcome — announcing a result here
 // would let Start return on a snapshot that was never applied.
 func (e *Engine) reconcileScope(sc *scopeState, arm reconcileArming) {
-	sc.runMu.Lock()
-	defer sc.runMu.Unlock()
-
 	// Every exit releases this reconcile's OWN window, superseded or not: the
 	// fences exist only for the span between this reconcile's List and its
 	// application, and a window nobody closes goes on collecting every feed
@@ -122,7 +204,7 @@ func (e *Engine) reconcileScope(sc *scopeState, arm reconcileArming) {
 func (e *Engine) applyScope(sc *scopeState, arm reconcileArming) (superseded bool, err error) {
 	ctx := e.dispatchContext()
 
-	entries, err := e.store.List(ctx, sc.scope)
+	entries, err := e.listSnapshot(ctx, sc.scope)
 	if err != nil {
 		e.logWarn(ctx, "scope reconcile failed to list, keeping cached values",
 			log.String("tenant", sc.scope.Tenant),
@@ -163,6 +245,21 @@ func (e *Engine) applyScope(sc *scopeState, arm reconcileArming) (superseded boo
 	sc.clearStale(arm)
 
 	return false, nil
+}
+
+// listSnapshot takes the photograph under a bound.
+//
+// The lifecycle context alone is not a bound: it is canceled only by Close, so
+// a backend that accepted the call and never answered would hold the scope's
+// one reconcile goroutine — and therefore every later OpResync for that scope
+// — for as long as the process ran. The timeout turns that into an ordinary
+// reconcile failure: the cache is kept, the scope stays Stale, and the next
+// OpResync retries.
+func (e *Engine) listSnapshot(ctx context.Context, scope store.Scope) ([]store.Entry, error) {
+	ctx, cancel := context.WithTimeout(ctx, reconcileTimeout)
+	defer cancel()
+
+	return e.store.List(ctx, scope)
 }
 
 // applySnapshotRow decides one row of the photograph, holding the scope's

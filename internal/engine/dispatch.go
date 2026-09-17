@@ -30,10 +30,23 @@ type workerKey struct {
 // the worker is inside a subscriber overwrites whatever was pending, so a
 // subscriber may skip intermediate revisions but always ends on the newest and
 // never sees two revisions out of order.
+//
+// done is closed when this one worker is stopped ahead of the engine — a
+// dropped scope. Stopping per worker is what keeps a suspended or deleted
+// tenant from leaving one parked goroutine per key behind until Close.
 type dispatchWorker struct {
 	mu      sync.Mutex
 	pending *Change
 	signal  chan struct{}
+
+	done     chan struct{}
+	stopOnce sync.Once
+}
+
+// stop ends the worker's goroutine. It is idempotent: a scope dropped twice,
+// or dropped and then closed, must not close the channel twice.
+func (w *dispatchWorker) stop() {
+	w.stopOnce.Do(func() { close(w.done) })
 }
 
 // submit replaces the pending Change and wakes the worker. The signal send is
@@ -177,7 +190,7 @@ func (e *Engine) workerFor(wk workerKey) *dispatchWorker {
 		e.workers = make(map[workerKey]*dispatchWorker)
 	}
 
-	w := &dispatchWorker{signal: make(chan struct{}, 1)}
+	w := &dispatchWorker{signal: make(chan struct{}, 1), done: make(chan struct{})}
 	e.workers[wk] = w
 
 	e.dispatchWG.Add(1)
@@ -188,9 +201,10 @@ func (e *Engine) workerFor(wk workerKey) *dispatchWorker {
 }
 
 // runWorker is the one goroutine that invokes subscribers of wk. It exits when
-// the engine's lifecycle context is canceled, dropping whatever is still
-// pending: a Change nobody has started delivering is not worth holding
-// shutdown for.
+// the engine's lifecycle context is canceled or this worker's scope is
+// dropped, dropping whatever is still pending: a Change nobody has started
+// delivering is not worth holding shutdown for, and one addressed to a scope
+// the engine no longer tracks has nowhere to go.
 func (e *Engine) runWorker(wk workerKey, w *dispatchWorker) {
 	defer e.dispatchWG.Done()
 
@@ -199,6 +213,8 @@ func (e *Engine) runWorker(wk workerKey, w *dispatchWorker) {
 	for {
 		select {
 		case <-ctx.Done():
+			return
+		case <-w.done:
 			return
 		case <-w.signal:
 			if ch, ok := w.take(); ok {

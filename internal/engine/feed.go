@@ -14,6 +14,12 @@ import (
 // re-read instead of holding shutdown for up to the full window.
 const feedTimeout = 5 * time.Second
 
+// reconcileTimeout bounds a reconcile's whole-scope Store.List. It is longer
+// than feedTimeout because a snapshot of every key is a bigger read than one
+// row, and deliberately shorter than the default close timeout, so a hung List
+// can never be the reason Close reports a timeout.
+const reconcileTimeout = 15 * time.Second
+
 // scopeNSKey is the debouncer's key: one quiet window per key per scope, so a
 // burst of notifications for one tenant's key never collapses another tenant's
 // notification for the same key.
@@ -81,7 +87,35 @@ func (e *Engine) onEvent(evt store.Event) {
 		return
 	}
 
+	// With a real quiet window the debouncer fires the re-read on a timer
+	// goroutine of its own, which Close must wait for: an untracked one is
+	// still inside Store.Get after Close has returned and the Client is about
+	// to close the store under it. With no window Submit runs inline on this
+	// changefeed goroutine, whose lifetime the store owns — registering THAT
+	// in the WaitGroup would make Close wait on the goroutine it is
+	// unsubscribing.
+	if e.debounceAsync {
+		refresh = func() { e.trackedRefresh(evt.Scope, nk) }
+	}
+
 	e.debouncer.Submit(key, refresh)
+}
+
+// trackedRefresh runs a debounced re-read as engine work Close waits for.
+//
+// A timer that has already fired cannot be canceled, so the only way Close can
+// promise "no store call after I return" is to know about the goroutine. The
+// door beginWork checks is the same one dispatch workers pass, so a re-read
+// that loses the race to Close is dropped whole rather than reaching a store
+// the Client is about to close.
+func (e *Engine) trackedRefresh(scope store.Scope, nk NSKey) {
+	if !e.beginWork() {
+		return
+	}
+
+	defer e.dispatchWG.Done()
+
+	e.refreshKey(scope, nk)
 }
 
 // markStale records that the scope's changefeed is down. The generation is
@@ -90,6 +124,9 @@ func (e *Engine) onEvent(evt store.Event) {
 // repeat, so a second disconnect changes nothing else.
 func (e *Engine) markStale(scope store.Scope) {
 	sc := e.scopeFor(scope)
+	if sc == nil {
+		return
+	}
 
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
@@ -109,6 +146,9 @@ func (e *Engine) markStale(scope store.Scope) {
 // this delete — which is exactly how a deleted key came back to life.
 func (e *Engine) applyDelete(scope store.Scope, nk NSKey) {
 	sc := e.scopeFor(scope)
+	if sc == nil {
+		return
+	}
 
 	sc.reconcileMu.Lock()
 	defer sc.reconcileMu.Unlock()
@@ -172,6 +212,9 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
 	// The store read above deliberately stays outside the lock — holding it
 	// across a network round trip would stall every reconcile of the scope.
 	sc := e.scopeFor(scope)
+	if sc == nil {
+		return
+	}
 
 	sc.reconcileMu.Lock()
 	defer sc.reconcileMu.Unlock()
@@ -190,6 +233,9 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
 // calls record directly, so the two are indivisible to a reconcile.
 func (e *Engine) recordFeedOutcome(scope store.Scope, nk NSKey, usable bool) {
 	sc := e.scopeFor(scope)
+	if sc == nil {
+		return
+	}
 
 	sc.reconcileMu.Lock()
 	defer sc.reconcileMu.Unlock()

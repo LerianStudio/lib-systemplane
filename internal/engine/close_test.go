@@ -213,3 +213,330 @@ func TestPublishRacingCloseStartsNoWorker(t *testing.T) {
 		t.Error("workerFor started a worker after Close")
 	}
 }
+
+// storeEngine builds the engine the way the Client will — through New — and
+// leaves Close to the test, because Close is the thing under test here and a
+// cleanup that canceled the lifecycle context would hide a Close that never
+// waited. The cleanup only covers a test that fails before reaching its own
+// Close; Close is idempotent, so a second one is free.
+func storeEngine(t *testing.T, defs map[NSKey]KeyDef, fs *fakeStore, window, timeout time.Duration) *Engine {
+	t.Helper()
+
+	e := New(Config{
+		Store:        fs,
+		Registry:     fakeRegistry{defs: defs},
+		Debounce:     window,
+		CloseTimeout: timeout,
+	})
+
+	t.Cleanup(func() { _ = e.Close() })
+
+	return e
+}
+
+// heldGet blocks the NEXT Get until release is called and leaves every later
+// Get unhooked, so a test can catch the engine inside a debounced re-read
+// instead of guessing at the window with a sleep.
+func heldGet(fs *fakeStore) (release func()) {
+	gate := make(chan struct{})
+
+	fs.onGet(func(store.Scope, NSKey) error {
+		fs.onGet(nil)
+		<-gate
+
+		return nil
+	})
+
+	var once sync.Once
+
+	return func() { once.Do(func() { close(gate) }) }
+}
+
+// closeInBackground calls Close on its own goroutine and hands back the
+// channel its outcome arrives on, so a test can assert that Close is still
+// waiting rather than merely that it eventually returned.
+func closeInBackground(e *Engine) <-chan error {
+	done := make(chan error, 1)
+
+	go func() { done <- e.Close() }()
+
+	return done
+}
+
+// openWindows counts the reconcile windows armed on a scope: one per reconcile
+// that is taking a snapshot or waiting to.
+func openWindows(e *Engine, scope store.Scope) int {
+	sc := e.scopeFor(scope)
+
+	sc.reconcileMu.Lock()
+	defer sc.reconcileMu.Unlock()
+
+	return len(sc.windows)
+}
+
+// pendingReconciles counts what the scope's single-slot reconcile mailbox
+// holds, which is 0 or 1 by construction — that is the coalescing.
+func pendingReconciles(e *Engine, scope store.Scope) int {
+	sc := e.scopeFor(scope)
+
+	sc.resyncMu.Lock()
+	defer sc.resyncMu.Unlock()
+
+	if sc.resyncPending == nil {
+		return 0
+	}
+
+	return 1
+}
+
+func mustStillBeWaiting(t *testing.T, done <-chan error, what string) {
+	t.Helper()
+
+	select {
+	case err := <-done:
+		t.Fatalf("Close() returned %v while %s", err, what)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func mustCloseCleanly(t *testing.T, done <-chan error) {
+	t.Helper()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Close() = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close() never returned")
+	}
+}
+
+func TestCloseWaitsForAReconcileInsideList(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	e := storeEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0, 2*time.Second)
+
+	release := heldList(fs)
+
+	e.onEvent(resyncEvent(scope))
+	waitFor(t, time.Second, "the reconcile to reach its List", func() bool { return fs.listCount() == 1 })
+
+	done := closeInBackground(e)
+	mustStillBeWaiting(t, done, "a reconcile was still inside Store.List")
+
+	release()
+	mustCloseCleanly(t, done)
+
+	// Nothing may touch the store once Close has returned.
+	gets, lists := fs.getCount(), fs.listCount()
+
+	e.onEvent(upsertEvent(scope, nk, 9))
+	e.onEvent(resyncEvent(scope))
+	time.Sleep(100 * time.Millisecond)
+
+	if got := fs.getCount(); got != gets {
+		t.Errorf("Store.Get called %d times after Close returned, want %d", got, gets)
+	}
+
+	if got := fs.listCount(); got != lists {
+		t.Errorf("Store.List called %d times after Close returned, want %d", got, lists)
+	}
+}
+
+func TestCloseWaitsForADebouncedReReadInFlight(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	e := storeEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, time.Millisecond, 2*time.Second)
+
+	fs.seed(scope, jsonRow(nk, 1, `"live"`, "ops"))
+
+	release := heldGet(fs)
+
+	e.onEvent(upsertEvent(scope, nk, 1))
+	waitFor(t, time.Second, "the debounced re-read to reach its Get", func() bool { return fs.getCount() == 1 })
+
+	done := closeInBackground(e)
+	mustStillBeWaiting(t, done, "a debounced re-read was still inside Store.Get")
+
+	release()
+	mustCloseCleanly(t, done)
+}
+
+func TestClosePendingReReadNeverReachesTheStore(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	e := storeEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 200*time.Millisecond, 2*time.Second)
+
+	fs.seed(scope, jsonRow(nk, 1, `"live"`, "ops"))
+	e.onEvent(upsertEvent(scope, nk, 1))
+
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close() = %v, want nil", err)
+	}
+
+	// Well past the quiet window: a pending re-read Close discarded must never
+	// reach the store afterwards.
+	time.Sleep(400 * time.Millisecond)
+
+	if got := fs.getCount(); got != 0 {
+		t.Errorf("Store.Get called %d times after Close, want 0", got)
+	}
+}
+
+func TestEventsAfterCloseAreDroppedWhole(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	e := storeEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0, 2*time.Second)
+
+	var rec recorder
+
+	unsub := e.OnChange(nk, rec.record)
+	defer unsub()
+
+	fs.seed(scope, jsonRow(nk, 1, `"live"`, "ops"))
+
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close() = %v, want nil", err)
+	}
+
+	e.onEvent(upsertEvent(scope, nk, 1))
+	e.onEvent(deleteEvent(scope, nk))
+	e.onEvent(resyncEvent(scope))
+	e.onEvent(disconnectEvent(scope))
+
+	time.Sleep(100 * time.Millisecond)
+
+	if tracked(e, scope) {
+		t.Error("an event after Close created a scope, want none tracked")
+	}
+
+	if got := fs.getCount(); got != 0 {
+		t.Errorf("Store.Get called %d times after Close, want 0", got)
+	}
+
+	if got := fs.listCount(); got != 0 {
+		t.Errorf("Store.List called %d times after Close, want 0", got)
+	}
+
+	if got := rec.len(); got != 0 {
+		t.Errorf("%d deliveries after Close, want 0", got)
+	}
+}
+
+func TestScopeForRefusesToCreateAfterClose(t *testing.T) {
+	e := closeEngine(t, time.Second)
+
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close() = %v, want nil", err)
+	}
+
+	if sc := e.scopeFor(store.Scope{}); sc != nil {
+		t.Error("scopeFor created a scope after Close, want none")
+	}
+}
+
+func TestResyncBurstCoalescesAndCloseWaitsForIt(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	e := storeEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0, 2*time.Second)
+
+	release := heldList(fs)
+
+	e.onEvent(resyncEvent(scope))
+	waitFor(t, time.Second, "the reconcile to reach its List", func() bool { return fs.listCount() == 1 })
+
+	// Five more reconnects while the first snapshot is still being taken.
+	for range 5 {
+		e.onEvent(resyncEvent(scope))
+	}
+
+	// The burst coalesced: the one reconcile taking its snapshot, and ONE
+	// pending behind it. A reconcile per event would leave six armed windows
+	// and six goroutines queued on the held List.
+	if got := openWindows(e, scope); got != 2 {
+		t.Errorf("%d reconcile windows open for a burst of six resyncs, want 2 "+
+			"(one taking its snapshot, one pending)", got)
+	}
+
+	if got := pendingReconciles(e, scope); got != 1 {
+		t.Errorf("%d pending reconciles for a burst of six resyncs, want 1", got)
+	}
+
+	done := closeInBackground(e)
+	mustStillBeWaiting(t, done, "a reconcile was still inside Store.List")
+
+	release()
+	mustCloseCleanly(t, done)
+
+	// Close waited for the reconcile it found in flight and for nothing else:
+	// the pending one either ran once or was abandoned by the cancellation, so
+	// a burst of six can never have listed more than twice.
+	if got := fs.listCount(); got > 2 {
+		t.Errorf("Store.List called %d times for a burst of six resyncs, want at most 2", got)
+	}
+}
+
+func TestDropScopeStopsThatScopesWorkers(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	tenant := store.Scope{Tenant: "acme"}
+	fs := newFakeStore()
+	e := storeEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0, 2*time.Second)
+
+	var rec recorder
+
+	unsub := e.OnChange(nk, rec.record)
+	defer unsub()
+
+	// A reconcile goroutine and a delivery worker, both belonging to the
+	// tenant scope and nothing else.
+	e.onEvent(resyncEvent(tenant))
+	waitFor(t, 2*time.Second, "the tenant's first reconcile to announce its keys",
+		func() bool { return rec.len() == 1 })
+
+	e.dropScope(tenant)
+
+	drained := make(chan struct{})
+
+	go func() {
+		e.dispatchWG.Wait()
+		close(drained)
+	}()
+
+	mustReceive(t, drained, "the dropped scope's goroutines to exit")
+
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close() = %v, want nil", err)
+	}
+}
+
+func TestDropScopeLeavesOtherScopesWorkersRunning(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	tenant := store.Scope{Tenant: "acme"}
+	fs := newFakeStore()
+	e := storeEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0, 2*time.Second)
+
+	var rec recorder
+
+	unsub := e.OnChange(nk, rec.record)
+	defer unsub()
+
+	e.publish(publication{Scope: tenant, NSKey: nk, Revision: 1, Value: "tenant"})
+	e.publish(publication{NSKey: nk, Revision: 1, Value: "single"})
+	waitFor(t, time.Second, "both scopes to deliver", func() bool { return rec.len() == 2 })
+
+	e.dropScope(tenant)
+
+	// The surviving scope's worker must still deliver.
+	e.publish(publication{NSKey: nk, Revision: 2, Value: "single-again"})
+	waitFor(t, time.Second, "the surviving scope to keep delivering", func() bool { return rec.len() == 3 })
+
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close() = %v, want nil", err)
+	}
+}

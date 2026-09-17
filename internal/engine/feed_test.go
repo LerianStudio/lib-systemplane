@@ -42,6 +42,10 @@ func registryEngine(t *testing.T, reg Registry, fs *fakeStore, window time.Durat
 	t.Cleanup(func() {
 		e.debouncer.Close()
 		cancel()
+		// The same door Close uses, for the same reason: a straggler re-read
+		// or reconcile that reached the WaitGroup while this Wait ran would
+		// kill the test binary rather than fail a test.
+		e.closeWorkers()
 		e.dispatchWG.Wait()
 	})
 

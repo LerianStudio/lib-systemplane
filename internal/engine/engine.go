@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
+	"github.com/LerianStudio/lib-observability/v4/runtime"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/debounce"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
@@ -31,7 +32,13 @@ type Engine struct {
 	// debouncer collapses a burst of changefeed notifications for one key in
 	// one scope into a single store re-read. It is keyed by scope as well as
 	// by key so a busy tenant never swallows another tenant's notification.
-	debouncer *debounce.Debouncer[scopeNSKey]
+	//
+	// debounceAsync records whether the quiet window is non-zero, and
+	// therefore whether the re-read runs on a timer goroutine of the
+	// debouncer's own — engine work Close must wait for — or inline on the
+	// changefeed goroutine, which it must not.
+	debouncer     *debounce.Debouncer[scopeNSKey]
+	debounceAsync bool
 
 	scopesMu sync.RWMutex
 	scopes   map[store.Scope]*scopeState
@@ -119,6 +126,7 @@ func New(cfg Config) *Engine {
 		logger:          logger,
 		telemetry:       cfg.Telemetry,
 		debouncer:       debounce.New(cfg.Debounce, debounce.WithLogger[scopeNSKey](logger)),
+		debounceAsync:   cfg.Debounce > 0,
 		scopes:          make(map[store.Scope]*scopeState),
 		subscribers:     make(map[NSKey][]subscription),
 		workers:         make(map[workerKey]*dispatchWorker),
@@ -204,6 +212,9 @@ func (e *Engine) bringUpScope(scope store.Scope) (*scopeState, error) {
 	defer e.startMu.Unlock()
 
 	sc := e.scopeFor(scope)
+	if sc == nil {
+		return nil, store.ErrClosed
+	}
 
 	sc.mu.RLock()
 	subscribed := sc.unsubscribe != nil
@@ -230,11 +241,60 @@ func (e *Engine) bringUpScope(scope store.Scope) (*scopeState, error) {
 // dropScope stops tracking scope. Everything it held — cached entries, the
 // stale flag, the first-reconcile channel — goes with it, which is the point:
 // a scope nothing feeds must not be readable as though it were current.
+//
+// Its goroutines go with it too: the reconcile goroutine and every delivery
+// worker of that scope are stopped here, not at Close. A tenant that is
+// suspended, deleted or rotated is dropped while the process keeps running, so
+// leaving its workers parked on a channel nobody will ever signal would mean
+// one goroutine per key per dropped tenant, alive until shutdown.
 func (e *Engine) dropScope(scope store.Scope) {
 	e.scopesMu.Lock()
-	defer e.scopesMu.Unlock()
-
+	sc := e.scopes[scope]
 	delete(e.scopes, scope)
+	e.scopesMu.Unlock()
+
+	if sc != nil {
+		sc.stopReconcileWorker()
+	}
+
+	e.stopScopeWorkers(scope)
+}
+
+// stopScopeWorkers ends every delivery worker of scope and forgets them, under
+// the same lock that starts one: a worker created between the stop and the
+// delete would otherwise survive with nothing to feed it.
+func (e *Engine) stopScopeWorkers(scope store.Scope) {
+	e.workersMu.Lock()
+	defer e.workersMu.Unlock()
+
+	for wk, w := range e.workers {
+		if wk.Scope != scope {
+			continue
+		}
+
+		w.stop()
+		delete(e.workers, wk)
+	}
+}
+
+// beginWork registers one engine-owned goroutine in the WaitGroup Close
+// drains, reporting false once the door is shut.
+//
+// The flag and the Add are under one lock Close takes before it waits, which
+// is what makes every Add happen-before that Wait. Go answers an Add that
+// races a Wait by killing the process, so this is the only way work may join
+// the drain.
+func (e *Engine) beginWork() bool {
+	e.workersMu.Lock()
+	defer e.workersMu.Unlock()
+
+	if e.workersClosed {
+		return false
+	}
+
+	e.dispatchWG.Add(1)
+
+	return true
 }
 
 // scopeLabel renders a scope for an error message.
@@ -278,6 +338,9 @@ func (e *Engine) Publish(scope store.Scope, se store.Entry) {
 	}
 
 	sc := e.scopeFor(scope)
+	if sc == nil {
+		return
+	}
 
 	sc.reconcileMu.Lock()
 	defer sc.reconcileMu.Unlock()
@@ -413,10 +476,10 @@ func (e *Engine) trackedScopes() []*scopeState {
 func (e *Engine) waitForWorkers() error {
 	drained := make(chan struct{})
 
-	go func() {
+	runtime.SafeGo(e.logger, "systemplane.engine.close", runtime.KeepRunning, func() {
 		e.dispatchWG.Wait()
 		close(drained)
-	}()
+	})
 
 	timeout := e.closeTimeout
 	if timeout <= 0 {

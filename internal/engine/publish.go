@@ -48,6 +48,9 @@ func (e *Engine) publish(pub publication) (notify bool) {
 	}
 
 	sc := e.scopeFor(pub.Scope)
+	if sc == nil {
+		return false
+	}
 
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
@@ -98,6 +101,12 @@ func (e *Engine) publish(pub publication) (notify bool) {
 // scopeFor returns the tracked state for scope, creating it — stale — when the
 // engine is not tracking it yet. A Set that lands before the scope's first
 // reconcile is what makes the lazy creation necessary.
+//
+// It returns nil once Close has begun, and every caller treats that as "drop
+// this work". A scope created during shutdown has no changefeed, no reconcile
+// goroutine and no worker, so it could only ever be read as a fresh-looking
+// cache nobody is confirming — and creating one after Close has snapshotted
+// the scopes it must unsubscribe leaves state behind that nothing tears down.
 func (e *Engine) scopeFor(scope store.Scope) *scopeState {
 	e.scopesMu.RLock()
 	sc := e.scopes[scope]
@@ -107,11 +116,19 @@ func (e *Engine) scopeFor(scope store.Scope) *scopeState {
 		return sc
 	}
 
+	if e.closed.Load() {
+		return nil
+	}
+
 	e.scopesMu.Lock()
 	defer e.scopesMu.Unlock()
 
 	if sc = e.scopes[scope]; sc != nil {
 		return sc
+	}
+
+	if e.closed.Load() {
+		return nil
 	}
 
 	if e.scopes == nil {

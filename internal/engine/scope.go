@@ -41,11 +41,23 @@ type scopeState struct {
 	firstReconcileOnce sync.Once
 	firstReconcileErr  error // guarded by mu
 
-	// runMu serializes the List-and-apply body of a reconcile, so two
-	// OpResync events can never apply two snapshots at once. beginReconcile
-	// deliberately does NOT take it: arming runs on the changefeed goroutine
-	// and must never wait on a List that is still in flight.
-	runMu sync.Mutex
+	// resyncMu guards the single-slot reconcile mailbox below. One goroutine
+	// per scope drains that slot, which is what serializes reconciles — two
+	// OpResync events can never apply two snapshots at once — and what makes a
+	// burst of reconnects coalesce into ONE pending reconcile instead of one
+	// goroutine each. beginReconcile still runs on the changefeed goroutine
+	// and never waits on a List that is in flight.
+	//
+	// reconcileStop is closed when the scope is dropped, so the goroutine ends
+	// with the scope instead of lingering until Close. workerStarted is
+	// guarded by Engine.workersMu, alongside the WaitGroup the goroutine is
+	// registered in.
+	resyncMu      sync.Mutex
+	resyncPending *reconcileArming
+	resyncSignal  chan struct{}
+	reconcileStop chan struct{}
+	stopOnce      sync.Once
+	workerStarted bool
 
 	// reconcileMu guards reconcileGen and windows, and is held across every
 	// check-and-publish pair on both sides of the fence: a reconcile deciding
@@ -86,5 +98,52 @@ func newScopeState(scope store.Scope) *scopeState {
 		entries:            make(map[NSKey]entry),
 		stale:              true,
 		firstReconcileDone: make(chan struct{}),
+		resyncSignal:       make(chan struct{}, 1),
+		reconcileStop:      make(chan struct{}),
 	}
+}
+
+// submitReconcile puts arm in the scope's single-slot mailbox and wakes its
+// reconcile goroutine. The send is non-blocking: a full buffer already means
+// "there is work", and blocking here would push a reconcile's List latency
+// onto the changefeed goroutine.
+//
+// It returns the arming it displaced, if any. A displaced reconcile will never
+// take a photograph, so the caller releases its window: fences nobody closes
+// go on collecting every feed event for the life of the scope.
+func (sc *scopeState) submitReconcile(arm reconcileArming) (displaced *reconcileArming) {
+	sc.resyncMu.Lock()
+	displaced, sc.resyncPending = sc.resyncPending, &arm
+	sc.resyncMu.Unlock()
+
+	select {
+	case sc.resyncSignal <- struct{}{}:
+	default:
+	}
+
+	return displaced
+}
+
+// takeReconcile empties the mailbox, reporting whether anything was in it. A
+// wake with an empty slot is normal: two submits can coalesce into one
+// buffered signal.
+func (sc *scopeState) takeReconcile() (reconcileArming, bool) {
+	sc.resyncMu.Lock()
+	defer sc.resyncMu.Unlock()
+
+	if sc.resyncPending == nil {
+		return reconcileArming{}, false
+	}
+
+	arm := *sc.resyncPending
+	sc.resyncPending = nil
+
+	return arm, true
+}
+
+// stopReconcileWorker ends this scope's reconcile goroutine. It is what a
+// dropped scope uses: the scope is gone, so a goroutine still waiting for its
+// next OpResync has nothing left to reconcile.
+func (sc *scopeState) stopReconcileWorker() {
+	sc.stopOnce.Do(func() { close(sc.reconcileStop) })
 }
