@@ -1054,3 +1054,125 @@ func TestRefreshOnDeleteEventRestoresDefault(t *testing.T) {
 		t.Errorf("post-delete value = %v, want default", v)
 	}
 }
+
+// TestGetEntryPopulatesPublishedState pins FC-5: GetEntry reports the value in
+// force plus the provenance of the persisted row backing it, and reports
+// ok == false for an unregistered key. Stale is never true in wave 1, and the
+// caches hold only values, so a cached row reports Revision 0 and no
+// provenance until engine-core lands.
+func TestGetEntryPopulatesPublishedState(t *testing.T) {
+	updatedAt := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name   string
+		setup  func(t *testing.T) *Client
+		key    string
+		want   Entry
+		wantOK bool
+	}{
+		{
+			name: "single-tenant cache hit reports the cached value without provenance",
+			setup: func(t *testing.T) *Client {
+				t.Helper()
+
+				c := startedClient(t, newSingleTenantClient(t, newMemStore(false)))
+				if err := c.Set(context.Background(), "ns", "k", "from-cache", "actor"); err != nil {
+					t.Fatalf("set: %v", err)
+				}
+
+				return c
+			},
+			key:    "k",
+			want:   Entry{Value: "from-cache"},
+			wantOK: true,
+		},
+		{
+			name: "default in force reports the registered default at revision 0",
+			setup: func(t *testing.T) *Client {
+				t.Helper()
+
+				return startedClient(t, newSingleTenantClient(t, newMemStore(false)))
+			},
+			key:    "k",
+			want:   Entry{Value: "default"},
+			wantOK: true,
+		},
+		{
+			name: "store read-through reports the stored revision and provenance",
+			setup: func(t *testing.T) *Client {
+				t.Helper()
+
+				m := newMemStore(true)
+				m.entries[memKey("ns", "k")] = store.Entry{
+					Namespace: "ns",
+					Key:       "k",
+					Value:     []byte(`"from-store"`),
+					Revision:  7,
+					UpdatedAt: updatedAt,
+					UpdatedBy: "operator",
+				}
+
+				return startedClient(t, newMultiTenantClient(t, m))
+			},
+			key:    "k",
+			want:   Entry{Value: "from-store", Revision: 7, UpdatedAt: updatedAt, UpdatedBy: "operator"},
+			wantOK: true,
+		},
+		{
+			name: "unregistered key reports not ok",
+			setup: func(t *testing.T) *Client {
+				t.Helper()
+
+				return startedClient(t, newSingleTenantClient(t, newMemStore(false)))
+			},
+			key:    "unregistered",
+			want:   Entry{},
+			wantOK: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := tt.setup(t)
+
+			got, ok, err := c.GetEntry(context.Background(), "ns", tt.key)
+			if err != nil {
+				t.Fatalf("GetEntry: %v", err)
+			}
+
+			if ok != tt.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tt.wantOK)
+			}
+
+			if got != tt.want {
+				t.Errorf("GetEntry = %+v, want %+v", got, tt.want)
+			}
+
+			if got.Stale {
+				t.Error("Stale = true; wave 1 never reports a stale entry")
+			}
+
+			v, vOK, vErr := c.Get(context.Background(), "ns", tt.key)
+			if vErr != nil || vOK != tt.wantOK || v != tt.want.Value {
+				t.Errorf("Get = (%v, %v, %v); want (%v, %v, nil)", v, vOK, vErr, tt.want.Value, tt.wantOK)
+			}
+		})
+	}
+}
+
+// startedClient registers the table's key and starts c, closing it on cleanup.
+func startedClient(t *testing.T, c *Client) *Client {
+	t.Helper()
+
+	if err := c.Register("ns", "k", "default"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	t.Cleanup(func() { _ = c.Close() })
+
+	return c
+}

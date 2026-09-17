@@ -39,6 +39,14 @@ func (c *Client) Get(ctx context.Context, namespace, key string) (any, bool, err
 	return asInternalClient(c).Get(ctx, namespace, key)
 }
 
+// GetEntry resolves the caller's scope like Get. ok is false for an
+// unregistered key. Revision, UpdatedAt and UpdatedBy describe the persisted
+// row backing the cached value; only the wave-1 shim may report zeros for a
+// cached row, and engine-core removes that limitation.
+func (c *Client) GetEntry(ctx context.Context, namespace, key string) (e Entry, ok bool, err error) {
+	return asInternalClient(c).GetEntry(ctx, namespace, key)
+}
+
 // GetString returns the value as a string.
 func (c *Client) GetString(ctx context.Context, namespace, key string) (string, bool, error) {
 	return asInternalClient(c).GetString(ctx, namespace, key)

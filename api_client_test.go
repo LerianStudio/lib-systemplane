@@ -216,3 +216,52 @@ func TestPublicConstructorsAndOptions(t *testing.T) {
 		t.Fatalf("Set invalid error = %v, want ErrValidation", err)
 	}
 }
+
+// TestPublicGetEntryCarriesRevisionAndProvenance pins FC-5 at the facade: the
+// exported Entry carries the stored revision and provenance of the row backing
+// the value, and an unregistered key reports not ok.
+func TestPublicGetEntryCarriesRevisionAndProvenance(t *testing.T) {
+	t.Parallel()
+
+	updatedAt := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
+
+	store := newAPIMemoryStore()
+	store.entries[apiMemoryKey("runtime", "name")] = TestEntry{
+		Namespace: "runtime",
+		Key:       "name",
+		Value:     []byte(`"stored"`),
+		Revision:  11,
+		UpdatedAt: updatedAt,
+		UpdatedBy: "operator",
+	}
+
+	c, err := NewForTesting(store, WithMultiTenantEnabled())
+	if err != nil {
+		t.Fatalf("NewForTesting: %v", err)
+	}
+
+	if err := c.Register("runtime", "name", "default"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	defer c.Close()
+
+	got, ok, err := c.GetEntry(ctx, "runtime", "name")
+	if err != nil || !ok {
+		t.Fatalf("GetEntry = (%+v, %v, %v)", got, ok, err)
+	}
+
+	want := Entry{Value: "stored", Revision: 11, UpdatedAt: updatedAt, UpdatedBy: "operator"}
+	if got != want {
+		t.Errorf("GetEntry = %+v, want %+v", got, want)
+	}
+
+	if _, ok, err := c.GetEntry(ctx, "runtime", "absent"); ok || err != nil {
+		t.Errorf("GetEntry for unregistered key = (%v, %v), want (false, nil)", ok, err)
+	}
+}
