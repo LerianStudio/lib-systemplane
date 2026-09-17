@@ -14,11 +14,12 @@ import (
 // re-read instead of holding shutdown for up to the full window.
 const feedTimeout = 5 * time.Second
 
-// reconcileTimeout bounds a reconcile's whole-scope Store.List. It is longer
-// than feedTimeout because a snapshot of every key is a bigger read than one
-// row, and deliberately shorter than the default close timeout, so a hung List
-// can never be the reason Close reports a timeout.
-const reconcileTimeout = 15 * time.Second
+// defaultReconcileTimeout bounds a reconcile's whole-scope Store.List for any
+// engine that does not lower it. It is longer than feedTimeout because a
+// snapshot of every key is a bigger read than one row, and shorter than the
+// DEFAULT close timeout — a consumer that configures a close timeout below it
+// can still see a hung List hold shutdown until this bound expires.
+const defaultReconcileTimeout = 15 * time.Second
 
 // scopeNSKey is the debouncer's key: one quiet window per key per scope, so a
 // burst of notifications for one tenant's key never collapses another tenant's
@@ -183,12 +184,12 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
 		if errors.Is(err, context.Canceled) {
 			e.logDebug(ctx, "changefeed re-read canceled during shutdown",
 				log.String("namespace", nk.Namespace),
-				log.String("key", nk.Key),
+				log.String("keyname", nk.Key),
 			)
 		} else {
 			e.logWarn(ctx, "changefeed re-read failed, keeping current value",
 				log.String("namespace", nk.Namespace),
-				log.String("key", nk.Key),
+				log.String("keyname", nk.Key),
 				log.Err(err),
 			)
 		}
@@ -201,7 +202,7 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
 	if !found {
 		e.logDebug(ctx, "changefeed re-read found no row, keeping current value",
 			log.String("namespace", nk.Namespace),
-			log.String("key", nk.Key),
+			log.String("keyname", nk.Key),
 		)
 
 		return

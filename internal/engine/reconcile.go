@@ -256,7 +256,12 @@ func (e *Engine) applyScope(sc *scopeState, arm reconcileArming) (superseded boo
 // reconcile failure: the cache is kept, the scope stays Stale, and the next
 // OpResync retries.
 func (e *Engine) listSnapshot(ctx context.Context, scope store.Scope) ([]store.Entry, error) {
-	ctx, cancel := context.WithTimeout(ctx, reconcileTimeout)
+	timeout := e.reconcileTimeout
+	if timeout <= 0 {
+		timeout = defaultReconcileTimeout
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	return e.store.List(ctx, scope)

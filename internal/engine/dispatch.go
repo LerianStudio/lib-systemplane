@@ -195,7 +195,13 @@ func (e *Engine) workerFor(wk workerKey) *dispatchWorker {
 
 	e.dispatchWG.Add(1)
 
-	go e.runWorker(wk, w)
+	runtime.SafeGoWithContextAndComponent(e.dispatchContext(), e.logger,
+		"systemplane.engine", "dispatch", runtime.KeepRunning,
+		func(ctx context.Context) {
+			defer e.dispatchWG.Done()
+
+			e.runWorker(ctx, wk, w)
+		})
 
 	return w
 }
@@ -207,17 +213,13 @@ func (e *Engine) workerFor(wk workerKey) *dispatchWorker {
 // the engine no longer tracks has nowhere to go.
 //
 // The whole goroutine, not just the callback, runs under lib-observability's
-// recovery: a panic anywhere in the loop — cloning a pathological value, say —
-// would otherwise kill the process. It is registered BEFORE the WaitGroup
-// Done, so Done runs first on the way out of a panic and Close is never left
-// waiting on a goroutine that is already gone.
-func (e *Engine) runWorker(wk workerKey, w *dispatchWorker) {
-	ctx := e.dispatchContext()
-
-	defer runtime.RecoverWithPolicyAndContext(ctx, e.logger,
-		"systemplane.engine", "dispatch", runtime.KeepRunning)
-	defer e.dispatchWG.Done()
-
+// recovery — a panic anywhere in the loop, cloning a pathological value say,
+// would otherwise kill the process — because its caller launches it through
+// runtime.SafeGoWithContextAndComponent rather than a raw go statement. The
+// WaitGroup Done is deferred inside that launch, so it runs BEFORE the
+// recovery on the way out of a panic and Close is never left waiting on a
+// goroutine that is already gone.
+func (e *Engine) runWorker(ctx context.Context, wk workerKey, w *dispatchWorker) {
 	for {
 		select {
 		case <-ctx.Done():

@@ -76,6 +76,11 @@ type Engine struct {
 	closeOnce    sync.Once
 	closeErr     error
 
+	// reconcileTimeout bounds a reconcile's whole-scope Store.List. It is a
+	// field rather than a constant so a test can lower it to a few
+	// milliseconds and prove the bound is what ends a hung List.
+	reconcileTimeout time.Duration
+
 	// lifecycleCtx is the engine's process-wide context, canceled when the
 	// engine shuts down. Feed rereads, reconciles and subscriber dispatch
 	// derive from it so nothing outlives the engine.
@@ -116,21 +121,21 @@ func New(cfg Config) *Engine {
 		closeTimeout = defaultCloseTimeout
 	}
 
-	//nolint:gosec // G118: the lifecycle cancel is stored as lifecycleCancel and invoked by Close
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &Engine{
-		store:           cfg.Store,
-		registry:        cfg.Registry,
-		logger:          logger,
-		debouncer:       debounce.New(cfg.Debounce, debounce.WithLogger[scopeNSKey](logger)),
-		debounceAsync:   cfg.Debounce > 0,
-		scopes:          make(map[store.Scope]*scopeState),
-		subscribers:     make(map[NSKey][]subscription),
-		workers:         make(map[workerKey]*dispatchWorker),
-		closeTimeout:    closeTimeout,
-		lifecycleCtx:    ctx,
-		lifecycleCancel: cancel,
+		store:            cfg.Store,
+		registry:         cfg.Registry,
+		logger:           logger,
+		debouncer:        debounce.New(cfg.Debounce, debounce.WithLogger[scopeNSKey](logger)),
+		debounceAsync:    cfg.Debounce > 0,
+		scopes:           make(map[store.Scope]*scopeState),
+		subscribers:      make(map[NSKey][]subscription),
+		workers:          make(map[workerKey]*dispatchWorker),
+		closeTimeout:     closeTimeout,
+		reconcileTimeout: defaultReconcileTimeout,
+		lifecycleCtx:     ctx,
+		lifecycleCancel:  cancel,
 	}
 }
 
@@ -334,11 +339,17 @@ func scopeLabel(scope store.Scope) string {
 // scope during shutdown.
 //
 // The write is fenced against a reconcile in flight exactly as a changefeed
-// publication is: the key is recorded as touched, under the same lock, in the
-// same step. Without that, a reconcile whose List predates the write finds the
-// key absent from its photograph and publishes the registered default at
-// revision 0 — which always wins the fence — over the value the caller just
-// wrote and already read back.
+// publication is: the outcome is recorded, under the same lock, in the same
+// step. Without that, a reconcile whose List predates the write finds the key
+// absent from its photograph and publishes the registered default at revision
+// 0 — which always wins the fence — over the value the caller just wrote and
+// already read back.
+//
+// The outcome is recorded whether or not the ingress accepted it, for the same
+// reason the changefeed's re-read records both: a row the registered validator
+// rejects still means the engine learned nothing usable about that key, and a
+// concurrent reconcile that sees neither fence treats the key as absent and
+// publishes the registered default over the cached value.
 func (e *Engine) Publish(scope store.Scope, se store.Entry) {
 	if e == nil || e.closed.Load() {
 		return
@@ -352,9 +363,7 @@ func (e *Engine) Publish(scope store.Scope, se store.Entry) {
 	sc.reconcileMu.Lock()
 	defer sc.reconcileMu.Unlock()
 
-	if e.ingest(e.dispatchContext(), scope, se) {
-		sc.record(NSKey{Namespace: se.Namespace, Key: se.Key}, true)
-	}
+	sc.record(NSKey{Namespace: se.Namespace, Key: se.Key}, e.ingest(e.dispatchContext(), scope, se))
 }
 
 // Lookup returns the published state of nk in scope.

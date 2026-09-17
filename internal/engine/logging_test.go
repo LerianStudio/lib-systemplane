@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
+	"github.com/LerianStudio/lib-observability/v4/redaction"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -111,7 +112,9 @@ func requireLogged(t *testing.T, r *recordingLogger, level int, msg string, nk N
 		t.Errorf("%q logged at level %s, want %s", msg, log.LevelName(got.Level), log.LevelName(level))
 	}
 
-	for key, want := range map[string]string{"namespace": nk.Namespace, "key": nk.Key} {
+	requireNotRedacted(t, got)
+
+	for key, want := range map[string]string{"namespace": nk.Namespace, "keyname": nk.Key} {
 		f, ok := got.field(key)
 		if !ok {
 			t.Errorf("%q carries no %q field, so an operator cannot tell which key it is about: %s", msg, key, got)
@@ -121,6 +124,27 @@ func requireLogged(t *testing.T, r *recordingLogger, level int, msg string, nk N
 
 		if f.Value != want {
 			t.Errorf("%q field %q: got %v, want %q", msg, key, f.Value, want)
+		}
+	}
+}
+
+// requireNotRedacted fails when a field name the engine chose is one
+// lib-observability erases before an operator ever reads it.
+//
+// "key" is an exact entry in its default sensitive-field list, so
+// log.String("key", ...) renders as key=[REDACTED] on both the stdlib logger
+// and the production zap logger — every line below would then name the
+// namespace and withhold the key, which is the only thing that line exists to
+// publish. The check runs over every field of every entry these tests assert
+// on, so a rename back into that list turns them red instead of silently
+// blinding the operator.
+func requireNotRedacted(t *testing.T, rec logRecord) {
+	t.Helper()
+
+	for _, f := range rec.fields() {
+		if redaction.IsSensitiveField(f.Key) {
+			t.Errorf("%q carries field %q, which lib-observability redacts: the line reaches "+
+				"the operator with its value replaced by [REDACTED]", rec.Msg, f.Key)
 		}
 	}
 }

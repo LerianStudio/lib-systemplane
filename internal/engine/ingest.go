@@ -42,7 +42,7 @@ func (e *Engine) ingest(ctx context.Context, scope store.Scope, se store.Entry) 
 	if !registered {
 		e.logDebug(ctx, "value for unregistered key, skipping",
 			log.String("namespace", se.Namespace),
-			log.String("key", se.Key),
+			log.String("keyname", se.Key),
 		)
 
 		return false
@@ -52,7 +52,7 @@ func (e *Engine) ingest(ctx context.Context, scope store.Scope, se store.Entry) 
 	if err := json.Unmarshal(se.Value, &decoded); err != nil {
 		e.logWarn(ctx, "failed to unmarshal stored value, keeping cached value",
 			log.String("namespace", se.Namespace),
-			log.String("key", se.Key),
+			log.String("keyname", se.Key),
 			log.Err(err),
 		)
 
@@ -62,7 +62,7 @@ func (e *Engine) ingest(ctx context.Context, scope store.Scope, se store.Entry) 
 	if err := e.runValidator(ctx, def.Validate, decoded); err != nil {
 		e.logWarn(ctx, "stored value rejected by validator, keeping cached value",
 			log.String("namespace", se.Namespace),
-			log.String("key", se.Key),
+			log.String("keyname", se.Key),
 			log.Err(err),
 		)
 
@@ -94,7 +94,7 @@ func (e *Engine) ingestDefault(ctx context.Context, scope store.Scope, nk NSKey)
 	if !registered {
 		e.logDebug(ctx, "no-row event for unregistered key, skipping",
 			log.String("namespace", nk.Namespace),
-			log.String("key", nk.Key),
+			log.String("keyname", nk.Key),
 		)
 
 		return false
@@ -152,6 +152,14 @@ func (e *Engine) runValidator(ctx context.Context, validate func(any) error, val
 
 // logWarn reports an ingress rejection. A nil logger is a no-op: the engine
 // stays usable when the Client was built without one.
+//
+// Every operator-facing line here names the affected key with a "keyname"
+// field, never "key": "key" is an exact entry in lib-observability's default
+// sensitive-field list, so both the stdlib and the zap logger render it as
+// key=[REDACTED] and erase the one identifier the line exists to publish.
+// "config_key", "entry_key" and "keyName" are redacted too — the matcher splits
+// on word boundaries and case. requireNotRedacted in logging_test.go fails the
+// build if a field name drifts back into that list.
 func (e *Engine) logWarn(ctx context.Context, msg string, fields ...log.Field) {
 	if e.logger == nil {
 		return

@@ -1473,3 +1473,147 @@ func TestFailedReconcileLeavesTheNewerWindowArmed(t *testing.T) {
 	releaseNewer()
 	waitReconcileIdle(t, e, scope)
 }
+
+// TestPublishRecordsARejectedWriteAgainstAConcurrentReconcile is the RED test
+// for the asymmetry between the two halves of the ingress.
+//
+// The changefeed's re-read records BOTH outcomes: a value it published, and a
+// row it could not use. Set recorded only the first, so a write whose stored
+// value the registered validator rejects left both fences empty — and a
+// reconcile holding a photograph taken before that write then found the key
+// absent, concluded the row was gone, and published the registered default at
+// revision 0 over the value that was cached. One transient rejection, one
+// silent config reset, announced to every subscriber.
+func TestPublishRecordsARejectedWriteAgainstAConcurrentReconcile(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	e := feedEngine(t, map[NSKey]KeyDef{nk: {
+		Default: "fallback",
+		Validate: func(v any) error {
+			if _, ok := v.(string); !ok {
+				return errors.New("want a string")
+			}
+
+			return nil
+		},
+	}}, fs, 0)
+
+	fs.seed(scope, jsonRow(nk, 3, `"cached"`, "ops"))
+	settled(t, e, scope)
+
+	var rec recorder
+
+	unsub := e.OnChange(nk, rec.record)
+	defer unsub()
+
+	release := heldList(fs)
+	defer release()
+
+	// The photograph is taken before the write: it carries no row for the key.
+	fs.freezeNextList(nil)
+
+	e.onEvent(disconnectEvent(scope))
+	e.onEvent(resyncEvent(scope))
+
+	waitFor(t, time.Second, "the reconcile to reach its List", func() bool { return fs.listCount() >= 2 })
+
+	// A Set whose persisted value the registered validator refuses: the row is
+	// in the store, and the engine learned nothing usable from it.
+	row := jsonRow(nk, 4, `42`, "ops")
+	fs.seed(scope, row)
+	e.Publish(scope, row)
+
+	release()
+
+	waitReconcileIdle(t, e, scope)
+	quiesce(t, e)
+
+	got, ok := e.Lookup(scope, nk)
+	if !ok {
+		t.Fatal("Lookup reports a miss: the reconcile erased the cached value")
+	}
+
+	if got.Value != "cached" || got.Revision != 3 {
+		t.Errorf("after the reconcile: got (%v, rev %d), want (\"cached\", rev 3): the snapshot "+
+			"published the registered default over a value only a rejected write touched",
+			got.Value, got.Revision)
+	}
+
+	for _, ch := range deliveries(&rec) {
+		if ch.Revision == 0 {
+			t.Fatalf("a Revision 0 default was announced to subscribers: deliveries = %v", rec.revisions())
+		}
+	}
+}
+
+// TestReconcileListIsBoundedAndTheScopeRecovers pins the timeout on the
+// whole-scope List.
+//
+// The lifecycle context alone is not a bound — only Close cancels it — so a
+// backend that accepts the call and answers far too late would hold the
+// scope's ONE reconcile goroutine, and with it every later OpResync and any
+// Start waiting on the first reconcile. The bound turns that into an ordinary
+// reconcile failure: cache kept, scope Stale, next OpResync converges.
+func TestReconcileListIsBoundedAndTheScopeRecovers(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0)
+
+	fs.seed(scope, jsonRow(nk, 3, `"cached"`, "ops"))
+	settled(t, e, scope)
+
+	// Lowering the bound here is ordered against the reconcile goroutine: the
+	// first reconcile completed before settled returned, and the next one only
+	// reads the field after receiving the resync this test sends below.
+	e.reconcileTimeout = 20 * time.Millisecond
+
+	fs.onList(func(store.Scope) error {
+		fs.onList(nil)
+		// Fifteen times the bound: a backend that took the call and answers
+		// long after anyone is still waiting for it.
+		time.Sleep(300 * time.Millisecond)
+
+		return nil
+	})
+
+	fs.seed(scope, jsonRow(nk, 4, `"written"`, "ops"))
+	e.onEvent(resyncEvent(scope))
+
+	waitReconcileIdle(t, e, scope)
+	quiesce(t, e)
+
+	got, ok := e.Lookup(scope, nk)
+	if !ok {
+		t.Fatal("Lookup reports a miss: a reconcile that never got its snapshot erased the cache")
+	}
+
+	if got.Value != "cached" || got.Revision != 3 {
+		t.Errorf("after the timed-out reconcile: got (%v, rev %d), want (\"cached\", rev 3)",
+			got.Value, got.Revision)
+	}
+
+	if !got.Stale {
+		t.Error("Stale is false after a reconcile whose List never answered: the scope is " +
+			"reporting a cache nothing confirmed as current")
+	}
+
+	// The scope's one reconcile goroutine is free again, so the next OpResync
+	// converges normally instead of queueing behind a call nobody bounded.
+	e.reconcileTimeout = defaultReconcileTimeout
+
+	e.onEvent(resyncEvent(scope))
+	waitReconcileIdle(t, e, scope)
+	quiesce(t, e)
+
+	got, ok = e.Lookup(scope, nk)
+	if !ok || got.Value != "written" || got.Revision != 4 {
+		t.Errorf("after the following resync: got (%v, rev %d, ok %v), want (\"written\", rev 4, true): "+
+			"the scope never reconciled again", got.Value, got.Revision, ok)
+	}
+
+	if got.Stale {
+		t.Error("Stale is still true after a reconcile that succeeded")
+	}
+}
