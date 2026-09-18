@@ -183,7 +183,8 @@ func TestRegisterValidatesTheDefaultWithANonNilContext(t *testing.T) {
 // options, in both orders, and that a nil function changes nothing.
 func TestLastValidatorOptionAppliedWins(t *testing.T) {
 	reject := func(any) error { return errors.New("plain validator rejected") }
-	rejectCtx := func(context.Context, any) error { return errors.New("context validator rejected") }
+	ctxSentinel := errors.New("context validator rejected")
+	rejectCtx := func(context.Context, any) error { return ctxSentinel }
 	accept := func(any) error { return nil }
 	acceptCtx := func(context.Context, any) error { return nil }
 
@@ -209,6 +210,10 @@ func TestLastValidatorOptionAppliedWins(t *testing.T) {
 		err := c.Register("ns", "k", "default", WithContextValidator(rejectCtx), WithContextValidator(nil))
 		if !errors.Is(err, ErrValidation) {
 			t.Errorf("register: got %v, want ErrValidation — a nil WithContextValidator must not clear the validator", err)
+		}
+
+		if !errors.Is(err, ctxSentinel) {
+			t.Errorf("register: got %v, want the validator's own error preserved through the \"default value rejected\" wrap", err)
 		}
 	})
 }

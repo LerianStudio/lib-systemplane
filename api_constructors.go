@@ -90,17 +90,30 @@ func WithDescription(s string) KeyOption { return internalclient.WithDescription
 
 // WithValidator sets a validation function invoked on every Set. The function
 // sees the value alone; [WithContextValidator] sees the Set context too. Both
-// set the same single validator, so the last one applied to a key wins.
+// set the same single validator: a nil function is ignored, and the last
+// NON-NIL validator option applied to a key wins.
 func WithValidator(fn func(any) error) KeyOption { return internalclient.WithValidator(fn) }
 
 // WithContextValidator sets a validation function invoked on every Set with
 // that Set's own context, so validation can use what the caller carried into
 // the write — a tenant, a deadline — to consult another system.
 //
+// Two callers invoke it today: [Client.Set], with the context of that write,
+// and [Client.Register], with context.Background(). A context validator must
+// therefore treat a context that lacks the scope it expects as "cannot verify"
+// and decide by its own policy — accept it, or refuse it with its own error —
+// rather than assume request scope is there to read.
+//
 // The registered default is validated at [Client.Register] time with a
 // non-nil, empty context.Background(), because registering a default is not a
-// write. Both this and [WithValidator] set the same single validator, so the
-// last one applied to a key wins.
+// write, and that call runs while the client holds its start lock. For the
+// registered default the function MUST NOT perform I/O or block: a validator
+// that blocks there blocks registration, [Client.Start] and [Client.Close]
+// with it. Recognise the default (or empty) value and return before any
+// external call.
+//
+// Both this and [WithValidator] set the same single validator: a nil function
+// is ignored, and the last NON-NIL validator option applied to a key wins.
 func WithContextValidator(fn func(ctx context.Context, value any) error) KeyOption {
 	return internalclient.WithContextValidator(fn)
 }

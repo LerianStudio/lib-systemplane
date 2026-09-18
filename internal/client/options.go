@@ -170,8 +170,8 @@ func WithDescription(s string) KeyOption {
 // [WithContextValidator] instead.
 //
 // A nil fn is ignored. WithValidator and [WithContextValidator] set the same
-// single validator, so when both are applied to one key the LAST one applied
-// wins, exactly as two WithValidator calls already do.
+// single validator, so when both are applied to one key the last NON-NIL one
+// applied wins, exactly as two WithValidator calls already do.
 func WithValidator(fn func(any) error) KeyOption {
 	return func(k *keyDef) {
 		if fn != nil {
@@ -185,15 +185,24 @@ func WithValidator(fn func(any) error) KeyOption {
 // the write — a tenant, a deadline, a trace — and consult another system with
 // it.
 //
+// Two callers invoke it today: [Client.Set], with the context of that write,
+// and [Client.Register], with context.Background(). A context validator must
+// therefore treat a context that lacks the scope it expects as "cannot verify"
+// and decide by its own policy — accept it, or refuse it with its own error —
+// rather than assume request scope is there to read.
+//
 // The same function validates the registered default at [Client.Register]
 // time. Registering a default is not a write and carries no request scope, so
-// it is called there with a non-nil but empty context.Background(): a validator
-// that needs request scope MUST accept that context for the default rather
-// than reject it.
+// it is called there with a non-nil but empty context.Background(), while the
+// client holds its start lock. For the registered default the function MUST
+// NOT perform I/O or block: a validator that blocks there blocks registration,
+// [Client.Start] and [Client.Close] with it. Recognise the default (or empty)
+// value and return before any external call. A validator that needs request
+// scope MUST accept that context for the default rather than reject it.
 //
 // A nil fn is ignored. [WithValidator] and WithContextValidator set the same
-// single validator, so when both are applied to one key the LAST one applied
-// wins.
+// single validator, so when both are applied to one key the last NON-NIL one
+// applied wins.
 func WithContextValidator(fn func(ctx context.Context, value any) error) KeyOption {
 	return func(k *keyDef) {
 		if fn != nil {

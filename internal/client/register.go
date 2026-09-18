@@ -62,10 +62,8 @@ func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOp
 	}
 
 	if def.validator != nil {
-		// Registering a default is not a write: there is no caller and no
-		// request to take scope from, so the validator gets an empty
-		// background context here. A context validator that needs request
-		// scope must accept that context for the registered default.
+		// Background context, under startMu: see the register-time contract
+		// stated on WithContextValidator (no request scope, no I/O, no blocking).
 		if err := def.validator(context.Background(), def.defaultValue); err != nil {
 			return fmt.Errorf("%w: default value rejected: %w", ErrValidation, err)
 		}
