@@ -25,6 +25,7 @@
 |-------|-----------|-------|--------|
 | 1 | A consumer binds a typed document, reads it back as `T` with revision/tenant/staleness, and writes it; an invalid document is rejected at every ingress the facade owns | 1.1, 1.2 | Complete |
 | 2 | The same group delivers hot reload: `OnApply` fires serialized, coalesced, never twice for the same revision, and `Status` reports desired vs applied per tenant | 2.1, 2.2, 2.3 | Detailed |
+| 3 | A group document renders per field on the admin surface: fields tagged `systemplane:"redact=full"` or `redact=mask` are redacted, every other field is in clear (FC-13); opens after engine-core Phase 2 merges, in its own worktree `/srv/worktrees/v4-groups-redaction` / `feat/v4-groups-redaction` | 3.1, 3.2 | Epic-level |
 
 ---
 
@@ -981,6 +982,28 @@ landed; `make ci` is green on the lane branch.
 - **A2, A3, A4** accepted and written into Epic 2.1, D-G7 and D-G8 above. FC-7 is unchanged.
 - **B1–B9** accepted as the lane's decisions: no applier means `Applied = Desired`; a rejected revision advances `Desired` only and is never re-offered; a decode failure is a rejection and never becomes the replayable `current`; `Desired` is assigned from the publication, never maxed (a delete at Revision 0 is the newest state); the error surface is `Status().LastErr` only, a panicking applier becomes an error and is logged with the stack; the decoded value is shared across a group's appliers and documented read-only; `OnApply` after `Close` registers, replays and returns nil; `Bind` records any `OnChange` error and surfaces it at `OnApply`; `Group[T]` has no `Close`.
 - **C1** written into D-G8. **C2** accepted: the coordinator recovers panics itself because every `lib-observability/v4/runtime` helper swallows the recovered value and cannot produce `LastErr`; it logs through the injected logger at error level with the same fields. **C3** routed: integration scenario 4 asserts the applier holds the current document, never a delivery count. **C4** noted.
+
+---
+
+## Phase 3: Field-level redaction (FC-13)
+
+Decided by Fred on 2026-09-18 for the matcher pilot: secrets stay inside group documents and the library redacts per field, instead of moving the secrets out of systemplane or masking the whole document.
+
+### Epic 3.1: Derive and register per-field policies
+
+**Goal:** `Bind[T]` walks `T` and registers the key with a per-field redaction map derived from `systemplane:"redact=full|mask"` struct tags; `WithFieldRedaction` sets the same map on a per-key registration; `KeyFieldRedaction` reports it.
+**Scope:** root `api_group.go`, root key options file, `api_client.go`, `internal/client` registry and its tests.
+**Dependencies:** engine-core Phase 2 merged (it rewrites `internal/client`), groups Phase 2 merged.
+**Done when:** the tag walk handles nested structs (dotted json-tag path), pointer fields, slices and maps (policy applies to every element), a tagged struct field (whole sub-document), an untagged `T` (nil map), an explicit `WithRedaction` (whole-document policy kept, map still reported); paths use json tag names and fall back to the Go field name only when no json tag exists; an unknown tag value fails `Bind` with a wrapped `ErrValidation`.
+**Status:** Pending
+
+### Epic 3.2: Render per field on the admin surface
+
+**Goal:** admin GET (single and list) applies the per-field map when the key policy is `RedactNone`, using the existing full and mask renderers per field; stored values are untouched.
+**Scope:** `admin/admin.go`, `admin/admin_responses.go`, `admin/admin_test.go`.
+**Dependencies:** Epic 3.1.
+**Done when:** a tagged group renders with only its tagged fields redacted on both routes; a non-string value under `mask` renders as the full placeholder; a key with a whole-document policy renders as today; `release_policy_test.go` green; the matcher pilot's `object_storage` group shows endpoint, bucket and region in clear with both credentials masked against a beta carrying this phase.
+**Status:** Pending
 
 ---
 
