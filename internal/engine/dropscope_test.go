@@ -68,6 +68,12 @@ func TestDropScopeUnsubscribesTheFeed(t *testing.T) {
 // Answering them re-created the scope: stale, unreconciled, with no feed and
 // no reconcile goroutine, and readable as though it were current. That is the
 // resurrection, and it is worse than the leak it followed.
+//
+// All four operations the engine branches on are played, because the guard
+// sits in four separate call sites — onResync, refreshKey, markStale and
+// applyDelete — and each can regress alone. A late delete is the worst of
+// them: it re-creates the scope AND publishes the registered default into it,
+// so the dropped tenant reads as current with a value nothing confirms.
 func TestLateFeedEventAfterDropDoesNotRecreateScope(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 	fs := newFakeStore()
@@ -86,12 +92,25 @@ func TestLateFeedEventAfterDropDoesNotRecreateScope(t *testing.T) {
 
 	lists, gets := fs.listCount(), fs.getCount()
 
-	feed(resyncEvent(dropTenant))
-	feed(upsertEvent(dropTenant, nk, 7))
+	late := []struct {
+		op  string
+		evt store.Event
+	}{
+		{"resync", resyncEvent(dropTenant)},
+		{"upsert", upsertEvent(dropTenant, nk, 7)},
+		{"disconnect", disconnectEvent(dropTenant)},
+		{"delete", deleteEvent(dropTenant, nk)},
+	}
 
-	if tracked(e, dropTenant) {
-		t.Error("a late changefeed event re-created the dropped scope: " +
-			"it has no feed and no reconcile goroutine, and reads would report it as current")
+	// Fatal rather than Error: a re-created scope makes every assertion below
+	// report the consequence instead of the cause.
+	for _, ev := range late {
+		feed(ev.evt)
+
+		if tracked(e, dropTenant) {
+			t.Fatalf("a late %s event re-created the dropped scope: "+
+				"it has no feed and no reconcile goroutine, and reads would report it as current", ev.op)
+		}
 	}
 
 	if got := fs.listCount(); got != lists {
@@ -102,6 +121,9 @@ func TestLateFeedEventAfterDropDoesNotRecreateScope(t *testing.T) {
 		t.Errorf("Store.Get called %d times after the drop, want %d: a re-read ran for a dropped scope", got, gets)
 	}
 
+	// After the delete above, specifically: a delete that reaches a re-created
+	// scope publishes the registered default, which is the one late event that
+	// makes a dropped tenant readable rather than merely tracked.
 	if _, ok := e.Lookup(dropTenant, nk); ok {
 		t.Error("the dropped scope is readable again after a late changefeed event")
 	}

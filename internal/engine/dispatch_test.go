@@ -639,11 +639,20 @@ func TestQuiesceNeverReturnsBeforeAPendingDelivery(t *testing.T) {
 		t.Fatal("no dispatch worker for the key a delivery just went to")
 	}
 
-	w.submit(Change{Namespace: nk.Namespace, Key: nk.Key, Revision: 2, Value: "v2"})
-
-	// The worker wakes on that signal and blocks inside take() until this is
-	// released, which is the gap under test.
+	// Deliberately not w.submit: it releases the mutex BEFORE signalling, so
+	// the worker it wakes races this goroutine for the lock and can finish the
+	// whole delivery — marker set and cleared — before the poll below takes
+	// its first sample. That made this test fail against correct code under
+	// load, blaming the engine for the very defect it guards. Filling the slot
+	// and signalling under the lock parks the worker inside take() on every
+	// run, which is the gap under test.
 	w.mu.Lock()
+	w.pending = &Change{Namespace: nk.Namespace, Key: nk.Key, Revision: 2, Value: "v2"}
+
+	select {
+	case w.signal <- struct{}{}:
+	default:
+	}
 
 	// Polled inline rather than through waitFor: waitFor fails with Fatalf,
 	// and failing while this mutex is held would park the worker in take()
