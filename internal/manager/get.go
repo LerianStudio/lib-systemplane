@@ -61,8 +61,9 @@ func (m *Manager) Lookup(ctx context.Context, tenantID, namespace, key string) (
 
 // Populate records a freshly-resolved value in the cache. Called from the
 // Client.Get fallback path when a tenant-DB read succeeds, so subsequent Gets
-// for the same key bypass the DB. Bounded by MaxEntriesPerTenant; over-bound
-// writes are dropped silently (with a metric in slice 6).
+// for the same key bypass the DB, and from the write path so a write is
+// immediately visible in-process. Bounded by MaxEntriesPerTenant: at capacity
+// a new key is dropped silently, while an existing key is still overwritten.
 func (m *Manager) Populate(ctx context.Context, tenantID, namespace, key string, value any) {
 	if m == nil || m.IsClosed() || tenantID == "" {
 		return
@@ -79,11 +80,16 @@ func (m *Manager) Populate(ctx context.Context, tenantID, namespace, key string,
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 
-	if len(ts.entries) >= m.cfg.maxEntriesPerTenantOverride {
+	nk := nsKey{Namespace: namespace, Key: key}
+
+	// The bound rejects only NEW keys. Replacing a key the cache already
+	// holds costs no entry, and dropping it would strand readers on a value
+	// the store has already replaced.
+	if _, known := ts.entries[nk]; !known && len(ts.entries) >= m.cfg.maxEntriesPerTenantOverride {
 		return
 	}
 
-	ts.entries[nsKey{Namespace: namespace, Key: key}] = value
+	ts.entries[nk] = value
 
 	m.metrics.recordCacheEntries(ctx, tenantID, len(ts.entries))
 }
