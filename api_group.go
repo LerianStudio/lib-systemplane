@@ -348,13 +348,14 @@ type ApplyStatus struct {
 // every delivery therefore loops forever.
 //
 // The initial delivery — the replay, or the seeded one — normally runs on the
-// calling goroutine under a background context, before OnApply returns. It does
-// not when a fan-out for the same scope is already running on another
-// goroutine: OnApply then returns without waiting, and that fan-out makes the
-// delivery under its own context. Every later delivery is driven by a
-// publication and carries the context the Client hands its subscribers, which
-// [Client.Close] cancels. OnApply after Close registers and replays the last
-// observed snapshot, and no further delivery can arrive.
+// calling goroutine, before OnApply returns. It does not when a fan-out for the
+// same scope is already running on another goroutine: OnApply then returns
+// without waiting, and that fan-out makes the delivery. Which goroutine
+// delivers never decides the context fn receives: a published snapshot always
+// carries the context the Client handed its subscribers when it published,
+// which [Client.Close] cancels, and a seeded one carries a background context.
+// OnApply after Close registers and replays the last observed snapshot, and no
+// further delivery can arrive.
 //
 // A nil fn registers nothing and returns no error, matching [Client.OnChange].
 // unsubscribe is idempotent, is safe to call from inside fn itself, and

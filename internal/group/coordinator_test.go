@@ -4,9 +4,12 @@ package group
 
 import (
 	"context"
+	goruntime "runtime"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/LerianStudio/lib-observability/v4/log"
 )
 
 type coordDoc struct {
@@ -586,4 +589,226 @@ func TestCoordinatorPanicUnderTheStateMutexDoesNotWedgeTheGroup(t *testing.T) {
 
 		stillResponsive(t, c)
 	})
+}
+
+// alwaysPanickingLogger is a consumer logger that panics on every line. The
+// coordinator's recovery path writes a recovered applier panic through the
+// consumer's own logger, so a logger like this raises a second panic from
+// inside the recovery itself — the one place a scope could be left marked as
+// delivering forever.
+type alwaysPanickingLogger struct {
+	*log.NopLogger
+}
+
+func (*alwaysPanickingLogger) Log(context.Context, int, string, ...any) {
+	panic("the consumer logger exploded")
+}
+
+func publishWithoutPanicking(t *testing.T, c *Coordinator[coordDoc], pub Publication) {
+	t.Helper()
+
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Errorf("Publish unwound into the publisher: %v", recovered)
+		}
+	}()
+
+	c.Publish(context.Background(), pub)
+}
+
+func TestCoordinatorAPanickingLoggerDoesNotWedgeTheScope(t *testing.T) {
+	c := NewCoordinator[coordDoc](&alwaysPanickingLogger{NopLogger: &log.NopLogger{}}, Decode[coordDoc], nil)
+
+	var (
+		mu       sync.Mutex
+		names    []string
+		exploded bool
+	)
+
+	applier := func(_ context.Context, current Decoded[coordDoc], _ *Decoded[coordDoc]) error {
+		mu.Lock()
+		defer mu.Unlock()
+
+		names = append(names, current.Value.Name)
+
+		if !exploded {
+			exploded = true
+
+			panic("the apply function exploded")
+		}
+
+		return nil
+	}
+
+	unsubscribe := c.Register(applier)
+	defer unsubscribe()
+
+	publishWithoutPanicking(t, c, publication("t1", 1, "one"))
+	publishWithoutPanicking(t, c, publication("t1", 2, "two"))
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(names) != 2 || names[0] != "one" || names[1] != "two" {
+		t.Fatalf("deliveries = %v, want [one two]: hot reload for the scope stopped after the recovery panicked", names)
+	}
+}
+
+type publisherCtxKey struct{}
+
+func TestCoordinatorDeliversUnderThePublishersContext(t *testing.T) {
+	c := newCoordinator(t)
+
+	var (
+		mu     sync.Mutex
+		values []any
+		once   sync.Once
+	)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+
+	applier := func(ctx context.Context, _ Decoded[coordDoc], _ *Decoded[coordDoc]) error {
+		mu.Lock()
+		values = append(values, ctx.Value(publisherCtxKey{}))
+		mu.Unlock()
+
+		once.Do(func() {
+			close(entered)
+			<-release
+		})
+
+		return nil
+	}
+
+	c.Publish(context.Background(), publication("t1", 1, "one"))
+
+	registered := make(chan struct{})
+
+	var unsubscribe func()
+
+	go func() {
+		defer close(registered)
+
+		unsubscribe = c.Register(applier)
+	}()
+
+	waitFor(t, entered, "the registration replay to reach the applier")
+
+	// The publisher's context must reach the applier even though another
+	// goroutine's fan-out is the one that picks the publication up.
+	c.Publish(context.WithValue(context.Background(), publisherCtxKey{}, "publisher"), publication("t1", 2, "two"))
+
+	close(release)
+	waitFor(t, registered, "the registration to return")
+
+	defer unsubscribe()
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(values) != 2 {
+		t.Fatalf("deliveries = %d, want 2", len(values))
+	}
+
+	if values[1] != "publisher" {
+		t.Errorf("second delivery ran under ctx value %v, want %q: a publication delivered by another goroutine's fan-out lost its publisher's context", values[1], "publisher")
+	}
+}
+
+func TestCoordinatorDiscardsAPublicationThatDecodedAfterANewerOne(t *testing.T) {
+	var once sync.Once
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+
+	slowDecode := func(value any) (coordDoc, error) {
+		doc, err := Decode[coordDoc](value)
+		if err != nil {
+			return doc, err
+		}
+
+		if doc.Name == "old" {
+			once.Do(func() {
+				close(entered)
+				<-release
+			})
+		}
+
+		return doc, nil
+	}
+
+	c := NewCoordinator[coordDoc](nil, slowDecode, nil)
+
+	var rec recorder
+
+	unsubscribe := c.Register(rec.apply)
+	defer unsubscribe()
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		c.Publish(context.Background(), publication("t1", 1, "old"))
+	}()
+
+	waitFor(t, entered, "the older publication to reach its decode")
+
+	c.Publish(context.Background(), publication("t1", 2, "new"))
+
+	close(release)
+	waitFor(t, done, "the older publication to finish committing")
+
+	if names := rec.names(); len(names) != 1 || names[0] != "new" {
+		t.Fatalf("deliveries = %v, want [new]: an older publication whose decode finished late overwrote the newer one", names)
+	}
+
+	if st := statusOf(t, c, "t1"); st.Desired != 2 {
+		t.Errorf("Desired = %d, want 2: a late older publication moved the scope backwards", st.Desired)
+	}
+}
+
+// TestCoordinatorAnAbandonedApplierReleasesTheScope covers the exit path no
+// recover can catch: an applier that ends its goroutine outright, which is what
+// a t.Fatal inside a consumer's own apply hook does. Deferred bookkeeping still
+// runs on that path, so the scope must not be left marked as delivering with
+// hot reload stopped for good.
+func TestCoordinatorAnAbandonedApplierReleasesTheScope(t *testing.T) {
+	c := newCoordinator(t)
+
+	var (
+		rec  recorder
+		once sync.Once
+	)
+
+	abandoning := func(ctx context.Context, current Decoded[coordDoc], previous *Decoded[coordDoc]) error {
+		abandon := false
+		once.Do(func() { abandon = true })
+
+		if abandon {
+			goruntime.Goexit()
+		}
+
+		return rec.apply(ctx, current, previous)
+	}
+
+	unsubscribe := c.Register(abandoning)
+	defer unsubscribe()
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		c.Publish(context.Background(), publication("t1", 1, "one"))
+	}()
+
+	waitFor(t, done, "the abandoned delivery to end its goroutine")
+
+	c.Publish(context.Background(), publication("t1", 2, "two"))
+
+	if names := rec.names(); len(names) != 1 || names[0] != "two" {
+		t.Fatalf("deliveries after the abandoned one = %v, want [two]: the scope stayed marked as delivering", names)
+	}
 }

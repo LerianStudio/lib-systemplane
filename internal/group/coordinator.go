@@ -47,7 +47,16 @@ type Status struct {
 // coalescing: Revision 0 repeats legitimately (a delete, or a row that carries
 // no revision) and would otherwise look like "nothing new".
 type observation[T any] struct {
-	seq   uint64
+	seq uint64
+
+	// ctx is the context the publisher supplied. An observation is routinely
+	// delivered by a goroutine other than the one that published it — a fan-out
+	// already running for the scope picks it up, and a later registration
+	// replays it — so the context travels with the observation instead of being
+	// taken from whoever happens to deliver it. A seed has no publisher and
+	// carries the background context of the goroutine that registered.
+	ctx context.Context
+
 	value Decoded[T]
 }
 
@@ -175,10 +184,21 @@ func (c *Coordinator[T]) Publish(ctx context.Context, pub Publication) {
 		return
 	}
 
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// The observation sequence is stamped here, at ingress, so that arrival
+	// order is what orders a scope's observations. Decoding runs outside the
+	// mutex because it is the consumer's codec, which means an older
+	// publication can finish decoding after a newer one has already committed;
+	// commit discards it there rather than letting the scope move backwards.
+	seq := c.stamp()
+
 	value, err := c.decode(pub.Value)
 
-	sc, spent := c.record(pub, value, err)
-	if spent {
+	sc := c.commit(ctx, pub, seq, value, err)
+	if sc == nil {
 		return
 	}
 
@@ -192,24 +212,50 @@ func (c *Coordinator[T]) Publish(ctx context.Context, pub Publication) {
 	c.drain(ctx, sc)
 }
 
-// record stores pub as the scope's newest state and reports whether the seed
-// watermark spent it. The unlock is deferred rather than manual because this
-// critical section runs code the consumer owns — json.Marshal on its own
-// document, reached through the watermark — and a panic in it must not leave
-// the group's mutex held: every later Publish and every Status would then block
-// forever, silently, with hot reload stopped and no signal anywhere. The decode
-// failure is logged by the caller, outside the lock, for the same reason: the
-// logger is the consumer's too.
-func (c *Coordinator[T]) record(pub Publication, value T, decodeErr error) (*scope[T], bool) {
+// stamp draws the next observation sequence at ingress, before the decode the
+// caller is about to run outside the lock.
+func (c *Coordinator[T]) stamp() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.nextSeqLocked()
+}
+
+// commit stores pub as the scope's newest state and returns the scope to drain,
+// or nil when the publication is not worth delivering: superseded by a newer
+// one that committed first, or spent by the seed watermark. The unlock is
+// deferred rather than manual because this critical section runs code the
+// consumer owns — json.Marshal on its own document, reached through the
+// watermark — and a panic in it must not leave the group's mutex held: every
+// later Publish and every Status would then block forever, silently, with hot
+// reload stopped and no signal anywhere. The decode failure is logged by the
+// caller, outside the lock, for the same reason: the logger is the consumer's
+// too.
+func (c *Coordinator[T]) commit(
+	ctx context.Context,
+	pub Publication,
+	seq uint64,
+	value T,
+	decodeErr error,
+) *scope[T] {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	sc := c.scopeLocked(pub.Tenant)
 
+	// A publication stamped before one that has already committed is an
+	// intermediate revision that arrived late: coalescing permits skipping it,
+	// and skipping is what keeps Desired from moving backwards and keeps
+	// observations committing in the order they arrived. Checked before the
+	// watermark so a publication nobody will ever see cannot spend it.
+	if seq < sc.latestSeq {
+		return nil
+	}
+
 	// The one publication a seed anticipates is the same observation as the
 	// seed, so it is spent here rather than delivered a second time.
 	if dropsAfterSeedLocked(sc, pub) {
-		return nil, true
+		return nil
 	}
 
 	// Assignment, not max: a delete publishes Revision 0 and that IS the newest
@@ -221,27 +267,29 @@ func (c *Coordinator[T]) record(pub Publication, value T, decodeErr error) (*sco
 		// current: no applier can have accepted it, so the scope stays
 		// unconverged and the error stays readable until a document that does
 		// decode is accepted by everyone.
-		sc.latestSeq = c.nextSeqLocked()
+		sc.latestSeq = seq
 		sc.lastErr = decodeErr
 
-		return sc, false
+		return sc
 	}
 
-	c.observeLocked(sc, pub, value)
+	c.observeLocked(ctx, sc, pub, value, seq)
 
-	return sc, false
+	return sc
 }
 
-// observeLocked records value as the scope's newest observation. The sequence
-// number, never the revision, is what every dedupe and coalescing decision
-// downstream reads. The caller holds the state mutex.
-func (c *Coordinator[T]) observeLocked(sc *scope[T], pub Publication, value T) {
+// observeLocked records value as the scope's newest observation under seq and
+// the context it will be delivered with, wherever it is finally picked up. The
+// sequence number, never the revision, is what every dedupe and coalescing
+// decision downstream reads. The caller holds the state mutex.
+func (c *Coordinator[T]) observeLocked(ctx context.Context, sc *scope[T], pub Publication, value T, seq uint64) {
 	sc.current = observation[T]{
-		seq:   c.nextSeqLocked(),
+		seq:   seq,
+		ctx:   ctx,
 		value: Decoded[T]{Tenant: pub.Tenant, Revision: pub.Revision, Value: value},
 	}
 	sc.observed = true
-	sc.latestSeq = sc.current.seq
+	sc.latestSeq = seq
 }
 
 // nextSeqLocked hands out the next observation sequence. The caller holds the
@@ -430,15 +478,19 @@ func (c *Coordinator[T]) seedLocked() (Publication, error) {
 	sc := c.scopeLocked(pub.Tenant)
 	sc.desired = pub.Revision
 
+	seq := c.nextSeqLocked()
+
 	value, err := c.decode(pub.Value)
 	if err != nil {
-		sc.latestSeq = c.nextSeqLocked()
+		sc.latestSeq = seq
 		sc.lastErr = err
 
 		return pub, err
 	}
 
-	c.observeLocked(sc, pub, value)
+	// A seed has no publisher of its own: it is read and delivered by the
+	// goroutine that registered, whose context is the background one.
+	c.observeLocked(context.Background(), sc, pub, value, seq)
 
 	sc.seedArmed = true
 	sc.seedRev = pub.Revision
@@ -478,36 +530,67 @@ func (c *Coordinator[T]) scopeLocked(tenant string) *scope[T] {
 // drain is the serialization, ordering and coalescing mechanism. One goroutine
 // at a time fans a scope out; every other caller records its observation and
 // returns, leaving the running fan-out to pick it up on its next iteration.
+//
+// ctx is only the fallback: every publication is delivered under the context
+// its own publisher supplied, even when the goroutine that picks it up is
+// another one's fan-out.
+//
+// The delivering flag is released on EVERY exit path, a panic included. The
+// invocation below runs code the consumer owns — the applier, and the panic
+// reporting that serializes through the consumer's logger — and a panic
+// escaping it with the flag still set would stop hot reload for that scope
+// forever, silently, while Desired kept advancing. The flag is cleared while
+// the state mutex is still held, because a publisher records its observation
+// under that same mutex and then drains: releasing the flag any earlier would
+// leave a window where a publication is recorded and the fan-out has already
+// decided it has nothing left to do, and a burst would silently drop its last
+// item.
 func (c *Coordinator[T]) drain(ctx context.Context, sc *scope[T]) {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	if sc.delivering {
-		c.mu.Unlock()
-
 		return
 	}
 
 	sc.delivering = true
 
+	defer func() { sc.delivering = false }()
+
 	for {
 		observed := sc.current
+
 		pending := c.pendingLocked(sc, observed)
-
 		if len(pending) == 0 {
-			sc.delivering = false
-			c.mu.Unlock()
-
 			return
 		}
 
-		c.mu.Unlock()
-
-		for i := range pending {
-			pending[i].err = c.invoke(ctx, pending[i].ap.fn, pending[i].current, pending[i].previous)
-		}
-
-		c.mu.Lock()
+		c.deliver(deliveryCtx(ctx, observed), pending)
 		c.recordLocked(sc, pending)
+	}
+}
+
+// deliveryCtx is the context an observation is delivered under: the one its
+// publisher supplied, or the draining goroutine's own when the observation has
+// no publisher (a seed) or no observation has landed yet.
+func deliveryCtx[T any](fallback context.Context, observed observation[T]) context.Context {
+	if observed.ctx != nil {
+		return observed.ctx
+	}
+
+	return fallback
+}
+
+// deliver runs each pending applier with no lock held and re-takes the state
+// mutex before returning — on the panic path too, so the caller's deferred
+// bookkeeping still runs under the lock and still releases it however an
+// applier fails.
+func (c *Coordinator[T]) deliver(ctx context.Context, pending []delivery[T]) {
+	c.mu.Unlock()
+	defer c.mu.Lock()
+
+	for i := range pending {
+		pending[i].err = c.invoke(ctx, pending[i].ap.fn, pending[i].current, pending[i].previous)
 	}
 }
 
@@ -554,7 +637,7 @@ func (c *Coordinator[T]) invoke(
 		if recovered := recover(); recovered != nil {
 			err = fmt.Errorf("systemplane/group: apply function panicked: %v", recovered)
 
-			runtime.HandlePanicValue(ctx, c.logger, recovered, "systemplane", "group.apply")
+			c.reportPanic(ctx, recovered)
 		}
 	}()
 
@@ -569,12 +652,33 @@ func (c *Coordinator[T]) invoke(
 	return err
 }
 
+// reportPanic hands a recovered applier panic to lib-observability and refuses
+// to let the reporting escape: HandlePanicValue serializes the recovered value
+// through the consumer's logger, so a logger that panics would otherwise unwind
+// out of invoke — past the error return that LastErr is built on, and out
+// through the fan-out that recorded the scope as delivering.
+func (c *Coordinator[T]) reportPanic(ctx context.Context, recovered any) {
+	defer swallowPanic()
+
+	runtime.HandlePanicValue(ctx, c.logger, recovered, "systemplane", "group.apply")
+}
+
 func (c *Coordinator[T]) logError(ctx context.Context, msg string, fields ...log.Field) {
 	if c.logger == nil {
 		return
 	}
 
+	defer swallowPanic()
+
 	c.logger.Log(ctx, log.LevelError, msg, fields)
+}
+
+// swallowPanic discards a panic raised by the consumer's own observability
+// code. There is nowhere left to report it — the logger is what panicked — and
+// the alternative is unwinding a publication, or a recovered applier panic,
+// over a log line.
+func swallowPanic() {
+	_ = recover()
 }
 
 // recordLocked writes back what each applier did with its delivery: an
