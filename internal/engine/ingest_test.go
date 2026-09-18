@@ -34,8 +34,13 @@ func (r fakeRegistry) Keys() []NSKey {
 	return keys
 }
 
+// engineWithRegistry tracks the single-tenant scope, the way Start leaves it:
+// ingest publishes, and a publication into an untracked scope is dropped.
 func engineWithRegistry(reg Registry) *Engine {
-	return &Engine{registry: reg, scopes: map[store.Scope]*scopeState{}}
+	e := &Engine{registry: reg, scopes: map[store.Scope]*scopeState{}}
+	e.scopeFor(store.Scope{})
+
+	return e
 }
 
 func TestIngestRejectsInvalidValueKeepingPrevious(t *testing.T) {
@@ -81,8 +86,14 @@ func TestIngestSkipsUnregisteredKey(t *testing.T) {
 		t.Error("unregistered key: usable is true, want false")
 	}
 
-	if len(e.scopes) != 0 {
-		t.Errorf("unregistered key created %d scope(s), want 0: it must not reach publish", len(e.scopes))
+	sc := e.trackedScope(store.Scope{})
+
+	sc.mu.RLock()
+	cached := len(sc.entries)
+	sc.mu.RUnlock()
+
+	if cached != 0 {
+		t.Errorf("unregistered key cached %d entries, want 0: it must not reach publish", cached)
 	}
 }
 

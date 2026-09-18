@@ -103,18 +103,28 @@ func newScopeState(scope store.Scope) *scopeState {
 	}
 }
 
-// submitReconcile puts arm in the scope's single-slot mailbox and wakes its
-// reconcile goroutine. The send is non-blocking: a full buffer already means
-// "there is work", and blocking here would push a reconcile's List latency
-// onto the changefeed goroutine.
+// armReconcile opens a reconcile window and puts it in the scope's single-slot
+// mailbox as ONE indivisible step, waking the reconcile goroutine. The send is
+// non-blocking: a full buffer already means "there is work", and blocking here
+// would push a reconcile's List latency onto the changefeed goroutine.
 //
 // It returns the arming it displaced, if any. A displaced reconcile will never
 // take a photograph, so the caller releases its window: fences nobody closes
 // go on collecting every feed event for the life of the scope.
-func (sc *scopeState) submitReconcile(arm reconcileArming) (displaced *reconcileArming) {
+//
+// Arming and queueing are one step because two OpResync events that armed
+// under one lock and queued under another could reach the mailbox in the
+// opposite order to the one they armed in. The mailbox then held the OLDER
+// arming — which the reconcile goroutine drops as superseded — while the newer
+// window had already been released as the one it displaced. Nothing
+// reconciled, and the scope stayed stale until another resync happened to
+// arrive. Under one lock, mailbox order is arming order.
+func (sc *scopeState) armReconcile() (displaced *reconcileArming) {
 	sc.resyncMu.Lock()
+	defer sc.resyncMu.Unlock()
+
+	arm := sc.beginReconcile()
 	displaced, sc.resyncPending = sc.resyncPending, &arm
-	sc.resyncMu.Unlock()
 
 	select {
 	case sc.resyncSignal <- struct{}{}:

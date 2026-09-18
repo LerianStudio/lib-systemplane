@@ -47,7 +47,11 @@ func (e *Engine) publish(pub publication) (notify bool) {
 		return false
 	}
 
-	sc := e.scopeFor(pub.Scope)
+	// Lookup-only: a publication never creates a scope. The paths that reach
+	// here have already resolved the scope and logged the drop if it was gone,
+	// and re-creating one at the last step would rebuild the cache of a tenant
+	// nothing feeds.
+	sc := e.trackedScope(pub.Scope)
 	if sc == nil {
 		return false
 	}
@@ -98,9 +102,27 @@ func (e *Engine) publish(pub publication) (notify bool) {
 	return true
 }
 
+// trackedScope returns scope's state, or nil when the engine is not tracking
+// it. It never creates one.
+//
+// Every path except bring-up resolves a scope through this: a changefeed
+// event, a reconcile, a debounced re-read and a write all address a scope
+// somebody else brought up, and a scope that has since been dropped — a
+// suspended, deleted or rotated tenant — must stay dropped. Creating one there
+// gave the tenant a cache with no changefeed behind it, no reconcile goroutine
+// to confirm it, and a delivery worker registered in the WaitGroup Close
+// drains: a resurrection that reads as current forever.
+func (e *Engine) trackedScope(scope store.Scope) *scopeState {
+	e.scopesMu.RLock()
+	defer e.scopesMu.RUnlock()
+
+	return e.scopes[scope]
+}
+
 // scopeFor returns the tracked state for scope, creating it — stale — when the
-// engine is not tracking it yet. A Set that lands before the scope's first
-// reconcile is what makes the lazy creation necessary.
+// engine is not tracking it yet. It is the bring-up path's resolver and
+// nothing else's: a scope exists because Start or a tenant activation opened a
+// changefeed for it, never because an event arrived addressed to it.
 //
 // It returns nil once Close has begun, and every caller treats that as "drop
 // this work". A scope created during shutdown has no changefeed, no reconcile

@@ -159,6 +159,8 @@ func loggingEngine(t *testing.T, defs map[NSKey]KeyDef, fs *fakeStore) (*Engine,
 	rec := &recordingLogger{Logger: log.NewNop()}
 	e := New(Config{Store: fs, Registry: fakeRegistry{defs: defs}, Logger: rec})
 
+	track(t, e, store.Scope{})
+
 	t.Cleanup(func() {
 		if err := e.Close(); err != nil {
 			t.Errorf("Close: %v", err)

@@ -128,6 +128,10 @@ func TestPublishWithoutRegistryIsDropped(t *testing.T) {
 		}
 	})
 
+	// The scope is tracked, so the registry guard is what drops this write
+	// rather than the scope resolution in front of it.
+	track(t, e, store.Scope{})
+
 	e.Publish(store.Scope{}, store.Entry{
 		Namespace: nk.Namespace,
 		Key:       nk.Key,

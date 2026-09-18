@@ -119,12 +119,40 @@ func (e *Engine) trackedRefresh(scope store.Scope, nk NSKey) {
 	e.refreshKey(scope, nk)
 }
 
+// scopeForEvent resolves the scope a changefeed event, a reconcile or a
+// debounced re-read addresses, and reports nil for a scope the engine has
+// stopped tracking.
+//
+// Such work is dropped, not answered. The event was produced by a feed that is
+// being torn down — a dropped tenant's subscription is released while its
+// changefeed goroutine may already be inside the callback — and answering it
+// would rebuild the scope with no feed, no reconcile goroutine and a cache
+// nothing confirms. DEBUG, not WARN: it is the ordinary end of a subscription,
+// not a fault.
+//
+// Namespace and Key are empty for the events that carry none (OpResync,
+// OpDisconnect); the tenant is what identifies the drop.
+func (e *Engine) scopeForEvent(scope store.Scope, nk NSKey) *scopeState {
+	sc := e.trackedScope(scope)
+	if sc != nil {
+		return sc
+	}
+
+	e.logDebug(e.dispatchContext(), "changefeed work for an untracked scope, dropping",
+		log.String("tenant", scope.Tenant),
+		log.String("namespace", nk.Namespace),
+		log.String("keyname", nk.Key),
+	)
+
+	return nil
+}
+
 // markStale records that the scope's changefeed is down. The generation is
 // bumped on every disconnect, which is what lets a reconcile that spans one
 // detect it and refuse to clear the flag; the flag itself is already true on a
 // repeat, so a second disconnect changes nothing else.
 func (e *Engine) markStale(scope store.Scope) {
-	sc := e.scopeFor(scope)
+	sc := e.scopeForEvent(scope, NSKey{})
 	if sc == nil {
 		return
 	}
@@ -146,7 +174,7 @@ func (e *Engine) markStale(scope store.Scope) {
 // read an empty fence, wait, and then republish a snapshot row that predates
 // this delete — which is exactly how a deleted key came back to life.
 func (e *Engine) applyDelete(scope store.Scope, nk NSKey) {
-	sc := e.scopeFor(scope)
+	sc := e.scopeForEvent(scope, nk)
 	if sc == nil {
 		return
 	}
@@ -176,6 +204,13 @@ func (e *Engine) applyDelete(scope store.Scope, nk NSKey) {
 //     recorded as unusable, so a concurrent reconcile keeps the cached value
 //     instead of concluding the key is absent.
 func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
+	// Checked before the store call, not only after it: a re-read for a
+	// dropped tenant would otherwise open a connection to a database that
+	// tenant no longer has, to publish into a scope nothing tracks.
+	if e.scopeForEvent(scope, nk) == nil {
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(e.dispatchContext(), feedTimeout)
 	defer cancel()
 
@@ -213,7 +248,9 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
 	// both or neither, never an empty fence followed by this publication.
 	// The store read above deliberately stays outside the lock — holding it
 	// across a network round trip would stall every reconcile of the scope.
-	sc := e.scopeFor(scope)
+	// The scope is resolved again because it can be dropped during that round
+	// trip, and this publication must not bring it back.
+	sc := e.scopeForEvent(scope, nk)
 	if sc == nil {
 		return
 	}
@@ -232,7 +269,7 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
 // errored. Anything that DOES publish holds reconcileMu across the pair and
 // calls record directly, so the two are indivisible to a reconcile.
 func (e *Engine) recordFeedOutcome(scope store.Scope, nk NSKey, usable bool) {
-	sc := e.scopeFor(scope)
+	sc := e.scopeForEvent(scope, nk)
 	if sc == nil {
 		return
 	}

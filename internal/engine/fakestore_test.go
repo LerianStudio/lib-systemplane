@@ -46,6 +46,11 @@ type fakeStore struct {
 	subscribeCalls int
 	closeCalls     int
 	liveSubs       int
+	// unsubCalls counts every call of an unsubscribe handed out by Subscribe,
+	// including repeats. liveSubs alone cannot see a second call — the closure
+	// is idempotent, the way a real backend's is — and "unsubscribed twice" is
+	// a different defect from "never unsubscribed".
+	unsubCalls int
 
 	nextSubID int
 	feeds     map[int]feedSubscription
@@ -165,6 +170,31 @@ func (f *fakeStore) liveSubscriptions() int {
 	defer f.mu.Unlock()
 
 	return f.liveSubs
+}
+
+func (f *fakeStore) unsubscribeCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.unsubCalls
+}
+
+// feedFor hands back the callback of a live subscription for scope, so a test
+// can keep driving the changefeed after the engine has unsubscribed. That is
+// not a fiction: unsubscribe does not preempt a backend goroutine already
+// inside the callback, so an event delivered after a scope was dropped is the
+// ordinary case, not the exotic one.
+func (f *fakeStore) feedFor(scope store.Scope) func(store.Event) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	for _, sub := range f.feeds {
+		if sub.scope == scope {
+			return sub.fn
+		}
+	}
+
+	return nil
 }
 
 // emit plays evt into every live subscription of its scope, the way a backend
@@ -309,6 +339,10 @@ func (f *fakeStore) Subscribe(_ context.Context, scope store.Scope, fn func(stor
 	var once sync.Once
 
 	unsubscribe := func() {
+		f.mu.Lock()
+		f.unsubCalls++
+		f.mu.Unlock()
+
 		once.Do(func() {
 			f.mu.Lock()
 			defer f.mu.Unlock()

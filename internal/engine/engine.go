@@ -261,20 +261,44 @@ func (e *Engine) bringUpScope(scope store.Scope) (*scopeState, error) {
 // stale flag, the first-reconcile channel — goes with it, which is the point:
 // a scope nothing feeds must not be readable as though it were current.
 //
+// Its changefeed goes with it: the subscription is released here, not at
+// Close. A tenant that is suspended, deleted or rotated is dropped while the
+// process keeps running, so a subscription left open is one live connection
+// per dropped tenant for the life of the process, still delivering events into
+// an engine that no longer tracks the scope.
+//
 // Its goroutines go with it too: the reconcile goroutine and every delivery
-// worker of that scope are stopped here, not at Close. A tenant that is
-// suspended, deleted or rotated is dropped while the process keeps running, so
-// leaving its workers parked on a channel nobody will ever signal would mean
-// one goroutine per key per dropped tenant, alive until shutdown.
+// worker of that scope are stopped here, for the same reason — otherwise one
+// parked goroutine per key per dropped tenant, alive until shutdown.
+//
+// It is idempotent. A tenant suspended and then deleted arrives as two
+// lifecycle events, and the second must not release a subscription the backend
+// has already forgotten, so the unsubscribe is taken out of the scope as it is
+// called. It runs OUTSIDE the scope lock: a backend's unsubscribe waits for
+// its changefeed goroutine, which may be inside onEvent, which takes that
+// lock.
 func (e *Engine) dropScope(scope store.Scope) {
 	e.scopesMu.Lock()
 	sc := e.scopes[scope]
 	delete(e.scopes, scope)
 	e.scopesMu.Unlock()
 
-	if sc != nil {
-		sc.stopReconcileWorker()
+	if sc == nil {
+		e.stopScopeWorkers(scope)
+
+		return
 	}
+
+	sc.mu.Lock()
+	unsubscribe := sc.unsubscribe
+	sc.unsubscribe = nil
+	sc.mu.Unlock()
+
+	if unsubscribe != nil {
+		unsubscribe()
+	}
+
+	sc.stopReconcileWorker()
 
 	e.stopScopeWorkers(scope)
 }
@@ -340,10 +364,12 @@ func scopeLabel(scope store.Scope) string {
 // because revision 0 always wins the fence — at the cost of the echo
 // publishing a second time. A value the caller just wrote must be readable.
 //
-// Publish before Start creates the scope lazily, so a Client that writes
-// before starting is not silently dropped. A nil Engine ignores the write
-// instead of panicking, and a closed one drops it rather than resurrecting a
-// scope during shutdown.
+// Publish takes no write into a scope the engine is not tracking: before
+// Start, or after the scope was dropped. Caching it would rebuild that scope
+// around one value with no changefeed behind it and no reconcile goroutine to
+// confirm it — readable forever as though it were current. A nil Engine
+// ignores the write instead of panicking, and a closed one drops it rather
+// than resurrecting a scope during shutdown.
 //
 // The write is fenced against a reconcile in flight exactly as a changefeed
 // publication is: the outcome is recorded, under the same lock, in the same
@@ -362,8 +388,14 @@ func (e *Engine) Publish(scope store.Scope, se store.Entry) {
 		return
 	}
 
-	sc := e.scopeFor(scope)
+	sc := e.trackedScope(scope)
 	if sc == nil {
+		e.logDebug(e.dispatchContext(), "write for an untracked scope, dropping",
+			log.String("tenant", scope.Tenant),
+			log.String("namespace", se.Namespace),
+			log.String("keyname", se.Key),
+		)
+
 		return
 	}
 
@@ -385,10 +417,7 @@ func (e *Engine) Lookup(scope store.Scope, nk NSKey) (Entry, bool) {
 		return Entry{}, false
 	}
 
-	e.scopesMu.RLock()
-	sc := e.scopes[scope]
-	e.scopesMu.RUnlock()
-
+	sc := e.trackedScope(scope)
 	if sc == nil {
 		return Entry{}, false
 	}

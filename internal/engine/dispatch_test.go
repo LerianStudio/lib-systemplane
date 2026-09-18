@@ -27,6 +27,8 @@ func dispatchEngine(t *testing.T) *Engine {
 		lifecycleCancel: cancel,
 	}
 
+	track(t, e, store.Scope{})
+
 	t.Cleanup(func() {
 		cancel()
 		e.dispatchWG.Wait()
@@ -439,6 +441,8 @@ func TestDispatchIsolatesScopesAndNamesTheTenant(t *testing.T) {
 		tenantRec.record(ctx, ch)
 	})
 	defer unsub()
+
+	track(t, e, tenant)
 
 	e.publish(publication{Scope: store.Scope{}, NSKey: nk, Revision: 1, Value: "single"})
 	<-blocked

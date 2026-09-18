@@ -33,8 +33,14 @@ func cachedEntry(t *testing.T, e *Engine, scope store.Scope, nk NSKey) entry {
 	return cached
 }
 
+// emptyEngine holds nothing but the single-tenant scope, which exists in
+// production from the moment Start has run. These tests drive publish
+// directly, and publish no longer creates a scope for itself.
 func emptyEngine() *Engine {
-	return &Engine{scopes: map[store.Scope]*scopeState{}}
+	e := &Engine{scopes: map[store.Scope]*scopeState{}}
+	e.scopeFor(store.Scope{})
+
+	return e
 }
 
 func TestPublishAcceptsHigherRevision(t *testing.T) {
@@ -190,26 +196,26 @@ func TestPublishRevisionZeroAlwaysWinsAndResetsRevision(t *testing.T) {
 	}
 }
 
-func TestPublishCreatesScopeLazilyAsStale(t *testing.T) {
+// TestPublishRefusesAnUntrackedScope pins what a publication may NOT do:
+// bring a scope into existence. A tenant that was never activated, or one that
+// was dropped when it was suspended, must not get a cache with no changefeed
+// behind it and no reconcile goroutine to confirm it — that cache would read
+// as current forever.
+func TestPublishRefusesAnUntrackedScope(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 	scope := store.Scope{Tenant: "t1"}
 
 	e := emptyEngine()
-	if notify := e.publish(publication{Scope: scope, NSKey: nk, Revision: 1, Value: "a"}); !notify {
-		t.Error("publish into an untracked scope: notify is false, want true")
+	if notify := e.publish(publication{Scope: scope, NSKey: nk, Revision: 1, Value: "a"}); notify {
+		t.Error("publish into an untracked scope: notify is true, want false")
 	}
 
-	got, ok := e.Lookup(scope, nk)
-	if !ok {
-		t.Fatal("Lookup after publish into an untracked scope: ok is false, want true")
+	if _, ok := e.Lookup(scope, nk); ok {
+		t.Error("Lookup after publish into an untracked scope: ok is true, want false")
 	}
 
-	if got.Value != "a" || got.Revision != 1 {
-		t.Errorf("cached: got (%v, rev %d), want (\"a\", rev 1)", got.Value, got.Revision)
-	}
-
-	if !got.Stale {
-		t.Error("stale: got false, want true — a lazily created scope has not reconciled yet")
+	if tracked := e.trackedScope(scope); tracked != nil {
+		t.Error("a publication created a scope the engine never brought up")
 	}
 
 	if _, ok := e.Lookup(store.Scope{}, nk); ok {

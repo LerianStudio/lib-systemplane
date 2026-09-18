@@ -61,14 +61,12 @@ type reconcileArming struct {
 // The burst now coalesces to one pending reconcile, and the one goroutine
 // draining the slot is registered in the WaitGroup Close drains.
 func (e *Engine) onResync(scope store.Scope) {
-	sc := e.scopeFor(scope)
+	sc := e.scopeForEvent(scope, NSKey{})
 	if sc == nil {
 		return
 	}
 
-	arm := sc.beginReconcile()
-
-	if displaced := sc.submitReconcile(arm); displaced != nil {
+	if displaced := sc.armReconcile(); displaced != nil {
 		sc.closeWindow(*displaced)
 	}
 
@@ -437,13 +435,17 @@ func (e *Engine) keepsCachedValue(sc *scopeState, arm reconcileArming, nk NSKey)
 // Both windows stay open and the feed fills both, so neither photograph can
 // overwrite a publication the feed made while it was being taken.
 func (sc *scopeState) beginReconcile() reconcileArming {
+	// One acquisition covers marking the scope stale AND bumping the
+	// generation, so clearStale — which holds the same lock across its own
+	// check-and-write — can never land between the two and clear a flag this
+	// arming has just set.
+	sc.reconcileMu.Lock()
+	defer sc.reconcileMu.Unlock()
+
 	sc.mu.Lock()
 	sc.stale = true
 	disconnect := sc.disconnectGen
 	sc.mu.Unlock()
-
-	sc.reconcileMu.Lock()
-	defer sc.reconcileMu.Unlock()
 
 	sc.reconcileGen++
 
@@ -494,8 +496,17 @@ func (sc *scopeState) closeWindow(arm reconcileArming) {
 // It is called only by a reconcile that applied a snapshot: a failed List
 // never reaches it, so stale survives even when both generations are
 // unchanged.
+//
+// The check and the write are ONE acquisition of reconcileMu, the lock
+// beginReconcile holds across arming. Split in two, an OpResync arriving
+// between them marked the scope stale and armed its window, and this reconcile
+// then cleared the flag that resync had just set — a scope reporting itself
+// confirmed against a connection that had already dropped.
 func (sc *scopeState) clearStale(arm reconcileArming) {
-	if sc.superseded(arm) {
+	sc.reconcileMu.Lock()
+	defer sc.reconcileMu.Unlock()
+
+	if sc.reconcileGen != arm.reconcile {
 		return
 	}
 

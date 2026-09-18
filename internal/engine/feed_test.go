@@ -40,6 +40,8 @@ func registryEngine(t *testing.T, reg Registry, fs *fakeStore, window time.Durat
 		lifecycleCancel: cancel,
 	}
 
+	track(t, e, store.Scope{})
+
 	t.Cleanup(func() {
 		e.debouncer.Close()
 		cancel()

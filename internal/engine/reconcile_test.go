@@ -4,6 +4,7 @@ package engine
 
 import (
 	"errors"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -80,6 +81,7 @@ func waitReconcileIdle(t *testing.T, e *Engine, scope store.Scope) {
 func settled(t *testing.T, e *Engine, scope store.Scope) {
 	t.Helper()
 
+	bringUp(t, e, scope)
 	e.onEvent(resyncEvent(scope))
 
 	if err := waitFirstReconcile(t, e, scope); err != nil {
@@ -1615,5 +1617,116 @@ func TestReconcileListIsBoundedAndTheScopeRecovers(t *testing.T) {
 
 	if got.Stale {
 		t.Error("Stale is still true after a reconcile that succeeded")
+	}
+}
+
+// TestConcurrentResyncsCannotStrandAScope drives two OpResync events into one
+// scope at the same instant, which is what a flapping connection does.
+//
+// Arming a reconcile and queueing it were two separate steps under two
+// separate locks, so the two could land in the mailbox in the opposite order
+// to the one they armed in: the mailbox then held the OLDER arming, which the
+// reconcile goroutine drops as superseded, while the newer window had already
+// been released as the one it displaced. Nothing reconciled, and the scope
+// stayed stale until some later resync happened to arrive — for a knob nobody
+// touches again, never.
+//
+// The assertion is the product-level one: after a reconnect, the scope ends up
+// confirmed against the store. Which of the two armings runs is the engine's
+// business.
+func TestConcurrentResyncsCannotStrandAScope(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	e := storeEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0, 5*time.Second)
+
+	fs.seed(scope, jsonRow(nk, 1, `"one"`, "ops"))
+
+	if _, err := e.bringUpScope(scope); err != nil {
+		t.Fatalf("bringUpScope: %v", err)
+	}
+
+	// One plain reconnect first, so the scope starts this test converged and
+	// its reconcile goroutine is already running.
+	e.onEvent(resyncEvent(scope))
+	waitFor(t, 5*time.Second, "the first reconcile to confirm the scope",
+		func() bool { return !scopeStale(t, e, scope) })
+
+	for round := range 500 {
+		start := make(chan struct{})
+
+		var wg sync.WaitGroup
+
+		wg.Add(2)
+
+		for range 2 {
+			go func() {
+				defer wg.Done()
+				<-start
+
+				e.onEvent(resyncEvent(scope))
+			}()
+		}
+
+		close(start)
+		wg.Wait()
+
+		waitFor(t, 5*time.Second,
+			"round "+strconv.Itoa(round)+": the scope to reconcile after two simultaneous resyncs",
+			func() bool { return !scopeStale(t, e, scope) })
+	}
+
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close() = %v, want nil", err)
+	}
+}
+
+// TestClearStaleRespectsANewerResync pins the last step of a reconcile against
+// the first step of the next one.
+//
+// A finishing reconcile asked "has a newer OpResync taken the scope?" under
+// one lock and wrote the stale flag under another. Between the two, a resync
+// could arrive, mark the scope stale and arm its own window — and the older
+// reconcile would then clear the flag that resync had just set, reporting a
+// scope as confirmed against a connection that had already dropped.
+//
+// Whatever order the two land in, a scope with a reconcile armed and not yet
+// run is stale.
+func TestClearStaleRespectsANewerResync(t *testing.T) {
+	for round := range 2000 {
+		sc := newScopeState(store.Scope{})
+		arm := sc.beginReconcile()
+
+		start := make(chan struct{})
+
+		var wg sync.WaitGroup
+
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			<-start
+
+			sc.clearStale(arm)
+		}()
+
+		go func() {
+			defer wg.Done()
+			<-start
+
+			sc.beginReconcile()
+		}()
+
+		close(start)
+		wg.Wait()
+
+		sc.mu.RLock()
+		stale := sc.stale
+		sc.mu.RUnlock()
+
+		if !stale {
+			t.Fatalf("round %d: a finishing reconcile cleared the stale flag a newer OpResync had just set: "+
+				"the scope reports itself confirmed while nothing has reconciled it", round)
+		}
 	}
 }

@@ -21,6 +21,8 @@ func startEngine(t *testing.T, defs map[NSKey]KeyDef, fs *fakeStore) *Engine {
 
 	e := New(Config{Store: fs, Registry: fakeRegistry{defs: defs}})
 
+	track(t, e, store.Scope{})
+
 	t.Cleanup(func() {
 		if err := e.Close(); err != nil {
 			t.Errorf("Close: %v", err)
@@ -39,6 +41,30 @@ func startCtx(t *testing.T, d time.Duration) context.Context {
 	t.Cleanup(cancel)
 
 	return ctx
+}
+
+// bringUp opens a scope's changefeed the way Start and a tenant activation do.
+// Bring-up is the only path that creates a scope — a changefeed event, a
+// reconcile and a write all refuse to — so a test that drives any of those has
+// to bring its scope up first, exactly as production does.
+func bringUp(t *testing.T, e *Engine, scope store.Scope) {
+	t.Helper()
+
+	if _, err := e.bringUpScope(scope); err != nil {
+		t.Fatalf("bringUpScope(%+v) = %v, want nil", scope, err)
+	}
+}
+
+// track makes the engine treat scope as one it brought up, without opening a
+// changefeed for it. Tests that drive publish, dispatch or the feed directly
+// need the scope to exist — in production it does, from the moment Start or a
+// tenant activation created it — and most of them are not about the feed.
+func track(t *testing.T, e *Engine, scope store.Scope) {
+	t.Helper()
+
+	if e.scopeFor(scope) == nil {
+		t.Fatalf("could not track scope %+v: the engine is closed", scope)
+	}
 }
 
 // tracked reports whether the engine still holds scope in its map. It is the

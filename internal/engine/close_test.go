@@ -29,6 +29,8 @@ func closeEngine(t *testing.T, timeout time.Duration) *Engine {
 		closeTimeout:    timeout,
 	}
 
+	track(t, e, store.Scope{})
+
 	return e
 }
 
@@ -229,6 +231,8 @@ func storeEngine(t *testing.T, defs map[NSKey]KeyDef, fs *fakeStore, window, tim
 		CloseTimeout: timeout,
 	})
 
+	track(t, e, store.Scope{})
+
 	t.Cleanup(func() { _ = e.Close() })
 
 	return e
@@ -395,7 +399,9 @@ func TestClosePendingReReadNeverReachesTheStore(t *testing.T) {
 
 func TestEventsAfterCloseAreDroppedWhole(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
-	scope := store.Scope{}
+	// A scope the engine never brought up, so "no scope was created" is an
+	// assertion about the events rather than about the test's own setup.
+	scope := store.Scope{Tenant: "late"}
 	fs := newFakeStore()
 	e := storeEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0, 2*time.Second)
 
@@ -443,7 +449,7 @@ func TestScopeForRefusesToCreateAfterClose(t *testing.T) {
 		t.Fatalf("Close() = %v, want nil", err)
 	}
 
-	if sc := e.scopeFor(store.Scope{}); sc != nil {
+	if sc := e.scopeFor(store.Scope{Tenant: "late"}); sc != nil {
 		t.Error("scopeFor created a scope after Close, want none")
 	}
 }
@@ -503,6 +509,7 @@ func TestDropScopeStopsThatScopesWorkers(t *testing.T) {
 
 	// A reconcile goroutine and a delivery worker, both belonging to the
 	// tenant scope and nothing else.
+	bringUp(t, e, tenant)
 	e.onEvent(resyncEvent(tenant))
 	waitFor(t, 2*time.Second, "the tenant's first reconcile to announce its keys",
 		func() bool { return rec.len() == 1 })
@@ -533,6 +540,9 @@ func TestDropScopeLeavesOtherScopesWorkersRunning(t *testing.T) {
 
 	unsub := e.OnChange(nk, rec.record)
 	defer unsub()
+
+	bringUp(t, e, tenant)
+	bringUp(t, e, store.Scope{})
 
 	e.publish(publication{Scope: tenant, NSKey: nk, Revision: 1, Value: "tenant"})
 	e.publish(publication{NSKey: nk, Revision: 1, Value: "single"})
