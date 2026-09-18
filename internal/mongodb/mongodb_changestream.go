@@ -247,6 +247,17 @@ func (s *Store) releaseFeed(f *feed) {
 // Subscribe registers fn to be invoked for every change event in scope. The
 // returned unsubscribe func removes fn from the dispatch list.
 //
+// A subscriber joining a feed that has already announced its state is told that
+// state before anything else: store.OpResync on a connected feed,
+// store.OpDisconnect on one in an announced outage. Without it a subscriber
+// joining a quiet scope after Start — which is exactly what the engine does —
+// would hear nothing and never reconcile.
+//
+// A feed that has announced nothing yet — created, not yet through its reader's
+// first resync — emits nothing here: that resync is imminent and this
+// subscriber is already in the map, so it receives that one. Announcing here
+// too would double it.
+//
 // The zero scope in multi-tenant mode returns
 // store.ErrNotSupportedInMultiTenant: every method there resolves a per-call
 // tenant database, so there is no shared process-wide changefeed to attach to.
@@ -276,11 +287,36 @@ func (s *Store) Subscribe(ctx context.Context, scope store.Scope, fn func(store.
 
 	sub := &subscription{fn: fn}
 
+	// sub.mu is taken BEFORE the subscription becomes reachable and released
+	// only when Subscribe returns. The reader goroutine can reach this
+	// subscriber only after seeing it in f.subs, and any such delivery then
+	// blocks here until the joining marker below has returned — so the joining
+	// callback can never observe a key event before its own marker. The defer
+	// is load-bearing on the panicking path: a manual Unlock skipped by an
+	// unwinding callback would leave sub.mu held forever.
+	sub.mu.Lock()
+	defer sub.mu.Unlock()
+
+	// The subscriber is added and the feed's announced state read in ONE hold,
+	// which is what keeps the announcement exactly-once: whichever of this and
+	// the reader's own beginResync/beginDisconnect runs second sees the other's
+	// work, so the joiner is either announced to here or included in the
+	// reader's broadcast, never both and never neither.
 	f.mu.Lock()
 	f.nextID++
 	id := f.nextID
 	f.subs[id] = sub
+	joining := f.joiningOpLocked()
 	f.mu.Unlock()
+
+	// deliverLocked, never sub.fn directly: it puts the joining emission under
+	// the same recovery guard as every reader-goroutine delivery, so a
+	// panicking callback cannot escape through Subscribe to the caller. A
+	// connection lost between the read above and this emission yields one
+	// extra marker, which is harmless — both markers are idempotent.
+	if joining != "" {
+		sub.deliverLocked(s.cfg.Logger, store.Event{Scope: f.scope, Op: joining})
+	}
 
 	// cancelCh stops the ctx observer below. Every teardown action — removing
 	// the callback, releasing the feed, stopping the observer — runs inside one

@@ -856,3 +856,46 @@ func sawUpsert(mu *sync.Mutex, events *[]store.Event) bool {
 
 	return false
 }
+
+// The engine subscribes AFTER Start has already connected the stream, so
+// without a joining marker a subscriber on a quiet scope would hear nothing and
+// never reconcile. The very first event it receives must be OpResync for its own
+// scope, carrying no namespace, no key and no revision.
+func TestIntegration_MongoSubscribeAfterStartGetsResyncFirst(t *testing.T) {
+	client, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	s, _ := freshSingleTenantStore(t, client, "joinresync")
+	ctx := context.Background()
+
+	if err := s.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	first := make(chan store.Event, 4)
+
+	unsub, err := s.Subscribe(ctx, store.Scope{}, func(evt store.Event) {
+		select {
+		case first <- evt:
+		default:
+		}
+	})
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	defer unsub()
+
+	select {
+	case evt := <-first:
+		if evt.Op != store.OpResync {
+			t.Fatalf("first event after Subscribe = %#v, want Op %q", evt, store.OpResync)
+		}
+
+		if evt.Scope != (store.Scope{}) || evt.Namespace != "" || evt.Key != "" || evt.Revision != 0 {
+			t.Fatalf("joining resync = %#v, want the zero scope with no namespace, key or revision", evt)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a subscriber joining a connected feed never received its own OpResync")
+	}
+}

@@ -580,3 +580,150 @@ func TestMongoSubscribe_CloseReapsCtxObservers(t *testing.T) {
 
 	waitForObserverExit(t)
 }
+
+// A joining subscriber is told whatever the feed last ANNOUNCED, so the engine
+// never reports a scope fresh while its change stream is down. Joining during
+// an outage used to deliver nothing at all, which left the scope looking
+// current for as long as the backoff took to reconnect.
+//
+// The third state is the one that must stay silent: a feed whose reader has not
+// yet announced anything. Its first OpResync is imminent and this subscriber is
+// already in the map, so it receives that one — announcing here too would
+// double it.
+func TestMongoSubscribe_JoinerIsToldTheFeedState(t *testing.T) {
+	cases := []struct {
+		name string
+		arm  func(f *feed)
+		want []string
+	}{
+		{
+			name: "connected feed announces a resync",
+			arm:  func(f *feed) { f.beginResync() },
+			want: []string{store.OpResync},
+		},
+		{
+			name: "feed in an announced outage announces a disconnect",
+			arm:  func(f *feed) { f.beginResync(); f.beginDisconnect() },
+			want: []string{store.OpDisconnect},
+		},
+		{
+			name: "feed that has announced nothing yet stays silent",
+			arm:  func(*feed) {},
+			want: nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newSubscribeStore()
+
+			f, err := s.zeroFeed()
+			if err != nil {
+				t.Fatalf("zeroFeed: %v", err)
+			}
+
+			tc.arm(f)
+
+			var got []store.Event
+
+			unsub, subErr := s.Subscribe(context.Background(), store.Scope{}, func(evt store.Event) {
+				got = append(got, evt)
+			})
+			if subErr != nil {
+				t.Fatalf("subscribe: %v", subErr)
+			}
+
+			defer unsub()
+
+			if len(got) != len(tc.want) {
+				t.Fatalf("joining subscriber saw %+v, want %d event(s) %v", got, len(tc.want), tc.want)
+			}
+
+			for i, op := range tc.want {
+				if got[i].Op != op || got[i].Scope != f.scope {
+					t.Fatalf("joining event %d = %+v, want {Scope:%+v Op:%q}", i, got[i], f.scope, op)
+				}
+			}
+		})
+	}
+}
+
+// The joining emission must go through deliverLocked rather than calling fn
+// directly. A callback that panics would otherwise escape through Subscribe to
+// the caller — a path the reader goroutine's recovery never covers — and unwind
+// past the unlock of sub.mu, wedging every later delivery to that subscription.
+// This test pins both halves: Subscribe returns normally after the joining
+// callback panics, and a second delivery to the same subscription still
+// completes.
+func TestMongoSubscribe_PanickingCallbackDoesNotEscapeOrHoldLock(t *testing.T) {
+	s := newSubscribeStore()
+
+	f, err := s.zeroFeed()
+	if err != nil {
+		t.Fatalf("zeroFeed: %v", err)
+	}
+
+	f.beginResync() // mark the feed connected, as a successful open does
+
+	var (
+		mu     sync.Mutex
+		events []store.Event
+	)
+
+	record := func(evt store.Event) int {
+		mu.Lock()
+		defer mu.Unlock()
+
+		events = append(events, evt)
+
+		return len(events)
+	}
+
+	// Subscribe must return normally; a panic here fails the test by unwinding it.
+	unsub, subErr := s.Subscribe(context.Background(), store.Scope{}, func(evt store.Event) {
+		if record(evt) == 1 {
+			panic("callback exploded on its joining resync")
+		}
+	})
+	if subErr != nil {
+		t.Fatalf("subscribe: %v", subErr)
+	}
+
+	defer unsub()
+
+	mu.Lock()
+	got := append([]store.Event(nil), events...)
+	mu.Unlock()
+
+	if len(got) != 1 {
+		t.Fatalf("callback saw %d events during Subscribe, want 1 (the joining resync)", len(got))
+	}
+
+	if got[0].Op != store.OpResync || got[0].Scope != f.scope {
+		t.Fatalf("joining event = %+v, want {Scope:%+v Op:%q}", got[0], f.scope, store.OpResync)
+	}
+
+	// sub.mu must be free again: a second delivery has to complete rather than
+	// block forever on a mutex the panicking callback unwound past.
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		f.dispatch(s.cfg.Logger, store.Event{Namespace: "ns", Key: "k", Op: store.OpUpsert, Revision: 7})
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second delivery blocked: the panicking joining resync left sub.mu held")
+	}
+
+	mu.Lock()
+	n := len(events)
+	mu.Unlock()
+
+	if n != 2 {
+		t.Fatalf("callback saw %d events, want 2 (joining resync, then the upsert)", n)
+	}
+}

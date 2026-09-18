@@ -92,6 +92,25 @@ func (f *feed) snapshotLocked() []*subscription {
 	return subs
 }
 
+// joiningOpLocked reports the marker a subscriber joining right now must be
+// told, or "" when the feed has announced nothing yet and the reader's first
+// announcement will reach this subscriber instead. The caller MUST hold f.mu,
+// in the same hold that adds the subscriber.
+//
+// f.disconnected, not !f.connected: the latter is also true of a feed whose
+// reader has not reached its first resync, and announcing a disconnect there
+// would either double the imminent resync or precede it for no reason.
+func (f *feed) joiningOpLocked() string {
+	switch {
+	case f.connected:
+		return store.OpResync
+	case f.disconnected:
+		return store.OpDisconnect
+	default:
+		return ""
+	}
+}
+
 // deliverLocked runs fn under runtime.RecoverAndLog. The caller MUST already
 // hold sub.mu; deliver is the variant that takes it. Both routes are
 // panic-safe, and every caller unlocks through defer, so a panicking callback
