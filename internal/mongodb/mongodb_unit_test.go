@@ -13,6 +13,7 @@ import (
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 func TestEntryDocToEntry(t *testing.T) {
@@ -37,6 +38,46 @@ func TestEntryDocToEntry(t *testing.T) {
 
 	if entry.Revision != 42 {
 		t.Fatalf("toEntry revision = %d, want 42", entry.Revision)
+	}
+}
+
+// TestEntryDoc_PreV4DocumentReadsAtRevisionZero pins FC-9's "no revision, no
+// deleted field" state on the decode path. MongoDB ships no v3→v4 migration, so
+// after the upgrade EVERY document in a consumer's collection looks like this
+// one: it must read as a live value at revision 0 — unknown to the engine,
+// never fenced, never deduplicated — and never as a tombstone.
+func TestEntryDoc_PreV4DocumentReadsAtRevisionZero(t *testing.T) {
+	t.Parallel()
+
+	// A BSON date holds milliseconds, so the round trip truncates anything
+	// finer and an untruncated stamp would compare unequal for that reason
+	// alone.
+	now := time.Now().UTC().Truncate(time.Millisecond)
+
+	raw, err := bson.Marshal(bson.D{
+		{Key: fieldID, Value: bson.D{{Key: fieldNamespace, Value: "ns"}, {Key: fieldKey, Value: "k"}}},
+		{Key: fieldNamespace, Value: "ns"},
+		{Key: fieldKey, Value: "k"},
+		{Key: fieldValue, Value: `{"enabled":true}`},
+		{Key: fieldUpdatedAt, Value: now},
+		{Key: fieldUpdatedBy, Value: "v3-writer"},
+	})
+	if err != nil {
+		t.Fatalf("marshal v3 document: %v", err)
+	}
+
+	var doc entryDoc
+	if err := bson.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("decode v3 document: %v", err)
+	}
+
+	if doc.Deleted {
+		t.Error("a document with no deleted field decoded as a tombstone")
+	}
+
+	entry := doc.toEntry()
+	if string(entry.Value) != `{"enabled":true}` || entry.Revision != 0 || entry.UpdatedBy != "v3-writer" || !entry.UpdatedAt.Equal(now) {
+		t.Errorf("toEntry = %#v, want the stored value at revision 0", entry)
 	}
 }
 
@@ -121,8 +162,22 @@ func TestUpsertPipeline_WrapsEveryCallerString(t *testing.T) {
 		t.Fatalf("stage 1 sets %d fields, want only %s", len(revisionSet), fieldRevision)
 	}
 
-	if _, found := revisionSet[fieldRevision]; !found {
-		t.Fatalf("stage 1 does not set %s: %#v", fieldRevision, revisionSet)
+	cond, isDoc := revisionSet[fieldRevision].(bson.D)
+	if !isDoc || len(cond) != 1 || cond[0].Key != "$cond" {
+		t.Fatalf("stage 1 %s = %#v, want a $cond", fieldRevision, revisionSet[fieldRevision])
+	}
+
+	branches, isArr := cond[0].Value.(bson.A)
+	if !isArr || len(branches) != 3 {
+		t.Fatalf("stage 1 $cond = %#v, want three branches", cond[0].Value)
+	}
+
+	// The changed-value branch is the SHARED bump expression, the same one the
+	// tombstone writes, so the two writers cannot drift: "previous + 1" is what
+	// keeps a recreate above every revision the key ever had (D11), and a
+	// branch that only read the clock would reopen that hole.
+	if got := branches[2]; !reflect.DeepEqual(got, bumpRevisionExpr()) {
+		t.Errorf("stage 1 changed-value branch = %#v, want the shared bump expression", got)
 	}
 }
 
@@ -259,63 +314,12 @@ func TestStore_ClosedAndNilPaths(t *testing.T) {
 	}
 }
 
+// TestChangeEventAndDispatch covers what surrounds classification: an event
+// missing either half of its identifier is dropped, and fan-out is the one
+// place an event learns its scope. The classification rules themselves live in
+// TestChangeEventDecodesTombstoneAsDelete.
 func TestChangeEventAndDispatch(t *testing.T) {
 	t.Parallel()
-
-	// Every classification rule of FC-9, in the order eventFromChange applies
-	// them. The revision an upsert carries is the after-image's, which is what
-	// lets the engine dedupe an echo of its own Set; a delete carries 0, which
-	// FC-2 reads as unknown and never fences or deduplicates.
-	classify := []struct {
-		name         string
-		ce           changeEvent
-		wantOp       string
-		wantRevision int64
-	}{
-		{
-			name:         "insert carries the after-image revision",
-			ce:           changeEventFor("insert", &entryDoc{Namespace: "ns", Key: "k", Revision: 7}),
-			wantOp:       store.OpUpsert,
-			wantRevision: 7,
-		},
-		{
-			// A tombstone is written as an UPDATE (FC-9), so the operation type
-			// alone cannot tell a delete from a write: the after-image decides,
-			// and the revision it carries is discarded with it.
-			name:         "tombstone after-image is a delete at revision 0",
-			ce:           changeEventFor("update", &entryDoc{Namespace: "ns", Key: "k", Revision: 42, Deleted: true}),
-			wantOp:       store.OpDelete,
-			wantRevision: 0,
-		},
-		{
-			name:         "raw delete from a foreign writer has no after-image",
-			ce:           changeEventFor(operationTypeDelete, nil),
-			wantOp:       store.OpDelete,
-			wantRevision: 0,
-		},
-		{
-			// The lookup runs at delivery time, so a foreign deleteOne between
-			// the change and the lookup leaves it empty. Publishing revision 0
-			// costs only the dedupe hint — store.Event never carries a value.
-			name:         "empty lookup publishes an upsert at revision 0",
-			ce:           changeEventFor("update", nil),
-			wantOp:       store.OpUpsert,
-			wantRevision: 0,
-		},
-	}
-
-	var upsert store.Event
-
-	for _, tt := range classify {
-		evt, ok := eventFromChange(tt.ce)
-		if !ok || evt.Op != tt.wantOp || evt.Revision != tt.wantRevision || evt.Namespace != "ns" || evt.Key != "k" {
-			t.Fatalf("%s: eventFromChange = (%#v, %v), want Op %q at revision %d for ns/k", tt.name, evt, ok, tt.wantOp, tt.wantRevision)
-		}
-
-		if tt.wantOp == store.OpUpsert && tt.wantRevision != 0 {
-			upsert = evt
-		}
-	}
 
 	for _, ce := range []changeEvent{
 		{},
@@ -329,6 +333,15 @@ func TestChangeEventAndDispatch(t *testing.T) {
 		if evt, ok := eventFromChange(ce); ok {
 			t.Fatalf("eventFromChange(%#v) = (%#v, true), want false", ce, evt)
 		}
+	}
+
+	upsert, ok := eventFromChange(changeEventFor(t, "insert", bson.D{
+		{Key: fieldNamespace, Value: "ns"},
+		{Key: fieldKey, Value: "k"},
+		{Key: fieldRevision, Value: int64(7)},
+	}))
+	if !ok {
+		t.Fatalf("eventFromChange dropped a well-formed insert")
 	}
 
 	// Fan-out runs on the feed, which is also the one place an event learns
@@ -349,16 +362,6 @@ func TestChangeEventAndDispatch(t *testing.T) {
 	if len(got) != 1 || got[0] != want {
 		t.Fatalf("dispatch events = %#v, want %#v", got, []store.Event{want})
 	}
-}
-
-// changeEventFor builds a decoded change-stream event for one document. The
-// documentKey is always well-formed: the identifier-missing cases are built
-// inline, since that is the field they are about.
-func changeEventFor(operationType string, full *entryDoc) changeEvent {
-	ce := changeEvent{OperationType: operationType, FullDocument: full}
-	ce.DocumentKey.ID = compoundID{Namespace: "ns", Key: "k"}
-
-	return ce
 }
 
 func TestIsNamespaceExists(t *testing.T) {
@@ -524,5 +527,53 @@ func TestNotDeleted_MatchesMissingField(t *testing.T) {
 	cond, ok := guard.Value.(bson.D)
 	if !ok || len(cond) != 1 || cond[0].Key != "$ne" || cond[0].Value != true {
 		t.Fatalf("guard = %#v, want {$ne: true}", guard.Value)
+	}
+}
+
+// TestSchemaCacheKey_DistinguishesClients pins the bootstrap memo on the
+// CONNECTION, not just the name: two tenants on two clusters may both call
+// their database "systemplane", and a key that cannot tell them apart would
+// report the second tenant's collection as already materialized and never
+// create it.
+func TestSchemaCacheKey_DistinguishesClients(t *testing.T) {
+	t.Parallel()
+
+	clusterA := &mongo.Client{}
+	clusterB := &mongo.Client{}
+
+	same := schemaCacheKey(clusterA.Database("systemplane").Collection(defaultCollection))
+	if again := schemaCacheKey(clusterA.Database("systemplane").Collection(defaultCollection)); again != same {
+		t.Fatalf("two handles onto the same database key differently: %q vs %q", same, again)
+	}
+
+	if other := schemaCacheKey(clusterB.Database("systemplane").Collection(defaultCollection)); other == same {
+		t.Fatalf("two clusters sharing a database name share the key %q", same)
+	}
+
+	if other := schemaCacheKey(clusterA.Database("systemplane").Collection("other")); other == same {
+		t.Fatalf("two collections share the key %q", same)
+	}
+}
+
+// TestScopeAttrs_NamesTheTenant pins what a CRUD span says about whose data it
+// touched: a named tenant is on every span, and the single-tenant scope adds
+// nothing.
+func TestScopeAttrs_NamesTheTenant(t *testing.T) {
+	t.Parallel()
+
+	key := attribute.String(fieldKey, "k")
+
+	zero := scopeAttrs(store.Scope{}, key)
+	if len(zero) != 1 || zero[0] != key {
+		t.Errorf("zero scope attributes = %#v, want only the caller's", zero)
+	}
+
+	tenant := scopeAttrs(store.Scope{Tenant: "t1"}, key)
+	if len(tenant) != 2 || tenant[0] != key || tenant[1] != attribute.String("tenant", "t1") {
+		t.Errorf("tenant scope attributes = %#v, want the caller's plus tenant=t1", tenant)
+	}
+
+	if got := scopeAttrs(store.Scope{Tenant: "t1"}); len(got) != 1 || got[0] != attribute.String("tenant", "t1") {
+		t.Errorf("bare tenant attributes = %#v, want tenant=t1", got)
 	}
 }

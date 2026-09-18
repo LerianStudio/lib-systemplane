@@ -6,6 +6,7 @@ import (
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/runtime"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 // seenEntry records what we already emitted at the current watermark boundary.
@@ -68,12 +69,14 @@ func eventFromChange(ce changeEvent) (store.Event, bool) {
 		return store.Event{}, false
 	}
 
+	revision, deleted := afterImage(ce.FullDocument)
+
 	// A tombstone is written as an UPDATE that unsets the value and raises
 	// deleted (FC-9), so the operation type alone cannot tell a delete from a
 	// write: the after-image decides. A raw delete — a foreign writer removing
 	// the document outright — carries no after-image and is still a delete.
 	// Either way the event carries no revision: FC-2 fixes a delete at 0.
-	if ce.OperationType == operationTypeDelete || (ce.FullDocument != nil && ce.FullDocument.Deleted) {
+	if ce.OperationType == operationTypeDelete || deleted {
 		return store.Event{Namespace: id.Namespace, Key: id.Key, Op: store.OpDelete}, true
 	}
 
@@ -84,19 +87,35 @@ func eventFromChange(ce changeEvent) (store.Event, bool) {
 	// backends is final-state convergence rather than point-in-time replay
 	// (FC-9).
 	//
-	// A nil after-image is the one case the lookup cannot fill: a FOREIGN
+	// An empty after-image is the one case the lookup cannot fill: a FOREIGN
 	// deleteOne removed the document between the change and the lookup (the
 	// library's own delete always leaves the tombstone). Revision 0 means
 	// unknown to FC-2 — never fenced, never deduplicated — so the engine
 	// re-reads the row, and the deleteOne's own delete event converges the key
 	// right behind this one. store.Event carries an identity and a revision and
 	// never a value, so the only thing an empty lookup costs is the dedupe hint.
-	var revision int64
-	if ce.FullDocument != nil {
-		revision = ce.FullDocument.Revision
+	return store.Event{Namespace: id.Namespace, Key: id.Key, Op: store.OpUpsert, Revision: revision}, true
+}
+
+// afterImage reads the only two fields classification needs out of a change
+// event's after-image, one lookup each, so a neighbouring field a foreign
+// writer stored with the wrong type costs nothing. An absent or unreadable
+// revision is 0, which FC-2 reads as unknown: the engine re-reads the row
+// rather than fencing or deduplicating on it.
+func afterImage(raw bson.Raw) (revision int64, deleted bool) {
+	if len(raw) == 0 {
+		return 0, false
 	}
 
-	return store.Event{Namespace: id.Namespace, Key: id.Key, Op: store.OpUpsert, Revision: revision}, true
+	if v, err := raw.LookupErr(fieldDeleted); err == nil {
+		deleted, _ = v.BooleanOK()
+	}
+
+	if v, err := raw.LookupErr(fieldRevision); err == nil {
+		revision, _ = v.AsInt64OK()
+	}
+
+	return revision, deleted
 }
 
 // snapshotLocked copies the subscriber set so it can be fanned out to after

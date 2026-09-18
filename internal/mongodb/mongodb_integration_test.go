@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -652,6 +653,144 @@ func setEntry(t *testing.T, s store.Store, namespace, key, value string) int64 {
 	return rev
 }
 
+// TestIntegration_MongoPreV4DocumentReadsAtRevisionZero pins the state every
+// consumer's collection is in the moment it upgrades: MongoDB ships no v3→v4
+// migration, so every stored document carries no revision and no deleted field.
+// Such a document must read as a live value at revision 0 — unknown to the
+// engine, never fenced, never deduplicated — and never as a tombstone.
+func TestIntegration_MongoPreV4DocumentReadsAtRevisionZero(t *testing.T) {
+	client, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	s, coll := freshSingleTenantStore(t, client, "prev4")
+	ctx := context.Background()
+
+	if _, err := coll.InsertOne(ctx, bson.D{
+		{Key: "_id", Value: rawID{Namespace: "ns", Key: "legacy"}},
+		{Key: "namespace", Value: "ns"},
+		{Key: "key", Value: "legacy"},
+		{Key: "value", Value: `{"enabled":true}`},
+		{Key: "updated_at", Value: time.Now().UTC()},
+		{Key: "updated_by", Value: "v3-writer"},
+	}); err != nil {
+		t.Fatalf("insert pre-v4 document: %v", err)
+	}
+
+	entry, found, err := s.Get(ctx, store.Scope{}, "ns", "legacy")
+	if err != nil {
+		t.Fatalf("get pre-v4 document: %v", err)
+	}
+
+	if !found {
+		t.Fatal("get: a document with no deleted field was treated as absent")
+	}
+
+	if string(entry.Value) != `{"enabled":true}` || entry.Revision != 0 || entry.UpdatedBy != "v3-writer" {
+		t.Errorf("get = %#v, want the stored value at revision 0", entry)
+	}
+
+	entries, err := s.List(ctx, store.Scope{})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	var listed *store.Entry
+
+	for i := range entries {
+		if entries[i].Namespace == "ns" && entries[i].Key == "legacy" {
+			listed = &entries[i]
+		}
+	}
+
+	if listed == nil {
+		t.Fatal("list: the pre-v4 document is missing")
+	}
+
+	if string(listed.Value) != `{"enabled":true}` || listed.Revision != 0 {
+		t.Errorf("list entry = %#v, want the stored value at revision 0", *listed)
+	}
+
+	// The first v4 write over it must climb off the floor, so the engine can
+	// fence on it from then on.
+	if rev := setEntry(t, s, "ns", "legacy", `{"enabled":false}`); rev <= 0 {
+		t.Errorf("set over a pre-v4 document returned revision %d, want one above 0", rev)
+	}
+}
+
+// TestIntegration_MongoConcurrentSetsLoseNoBump pins the write rule under
+// contention: concurrent writers of the same NEW key race on the insert, and
+// the loser is retried onto the update path rather than failing. Every write
+// must be reported with its own revision, strictly above the one before it, and
+// the document the collection keeps must be the winner's — a lost bump would
+// show up here as two writers reporting the same number.
+func TestIntegration_MongoConcurrentSetsLoseNoBump(t *testing.T) {
+	client, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	s, coll := freshSingleTenantStore(t, client, "concurrent")
+
+	const writers = 8
+
+	revisions := make([]int64, writers)
+	errs := make([]error, writers)
+	start := make(chan struct{})
+
+	var wg sync.WaitGroup
+
+	for i := range writers {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			<-start
+
+			revisions[i], errs[i] = s.Set(context.Background(), store.Scope{}, store.Entry{
+				Namespace: "ns",
+				Key:       "hot",
+				Value:     []byte(fmt.Sprintf(`{"writer":%d}`, i)),
+				UpdatedBy: "writer",
+			})
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+
+	winner, best := -1, int64(0)
+	seen := map[int64]int{}
+
+	for i := range writers {
+		if errs[i] != nil {
+			t.Fatalf("writer %d: set: %v", i, errs[i])
+		}
+
+		if revisions[i] <= 0 {
+			t.Errorf("writer %d reported revision %d, want one above 0", i, revisions[i])
+		}
+
+		if other, clash := seen[revisions[i]]; clash {
+			t.Errorf("writers %d and %d both reported revision %d: one bump was lost", other, i, revisions[i])
+		}
+
+		seen[revisions[i]] = i
+
+		if revisions[i] > best {
+			winner, best = i, revisions[i]
+		}
+	}
+
+	doc := readRaw(t, coll, "ns", "hot")
+
+	if doc.Revision != best {
+		t.Errorf("stored revision = %d, want the highest reported one (%d)", doc.Revision, best)
+	}
+
+	if doc.Value == nil || *doc.Value != fmt.Sprintf(`{"writer":%d}`, winner) {
+		t.Errorf("stored value = %v, want writer %d's, which reported the highest revision", doc.Value, winner)
+	}
+}
+
 // TestIntegration_MongoDeleteLeavesTombstone pins FC-9/D11: Delete never
 // removes the document. It rewrites it as a tombstone that the store surface
 // treats as absent, so the revision the key reached survives the delete and a
@@ -968,15 +1107,32 @@ func tenantStore(t *testing.T, conn mongodb.Connector) *mongodb.Store {
 // subscribeScope subscribes to scope and returns the delivered events. The
 // channel is buffered because a joining subscriber's OpResync is delivered
 // synchronously inside Subscribe.
+//
+// An overflow is counted and reported when the test ends rather than dropped:
+// several callers assert EXACT event counts, and a silent drop here would turn
+// a real regression into a pass. It is reported at cleanup rather than from the
+// callback because the callback can run after the test body has returned, where
+// a t.Errorf would panic instead of failing.
 func subscribeScope(t *testing.T, s store.Store, scope store.Scope) (<-chan store.Event, func()) {
 	t.Helper()
 
-	events := make(chan store.Event, 32)
+	const buffer = 128
+
+	events := make(chan store.Event, buffer)
+
+	var dropped atomic.Int64
+
+	t.Cleanup(func() {
+		if n := dropped.Load(); n > 0 {
+			t.Errorf("subscriber for tenant %q dropped %d events: the %d-slot buffer overflowed, so every count this test asserted is unreliable", scope.Tenant, n, buffer)
+		}
+	})
 
 	unsub, err := s.Subscribe(context.Background(), scope, func(evt store.Event) {
 		select {
 		case events <- evt:
 		default:
+			dropped.Add(1)
 		}
 	})
 	if err != nil {

@@ -10,10 +10,15 @@
 //   - Multi-tenant. The constructor receives no client; the caller wires
 //     lib-commons tenant-manager middleware so each request context carries
 //     the per-tenant *mongo.Database. resolveCollection(ctx) extracts the
-//     database, lazily ensures the collection's compound _id index on first
-//     use, and returns the collection to the CRUD helpers. Change streams are
-//     disabled in this mode — Subscribe returns
-//     store.ErrNotSupportedInMultiTenant.
+//     database, lazily ensures the collection on first use, and returns it to
+//     the CRUD helpers. The ZERO scope has no durable collection to watch
+//     there — every call resolves a fresh database from ctx — so subscribing
+//     to it is refused with store.ErrNotSupportedInMultiTenant.
+//
+// Changefeeds are per scope, and a named Scope.Tenant is served in BOTH modes:
+// it resolves its database through Config.Connector regardless of ctx and of
+// MultiTenantEnabled, and opens its own change stream (or polling loop) on that
+// database's collection.
 //
 // The document _id is the compound sub-document {namespace, key} — no
 // tenant_id field. Storing the tuple in _id is what makes change-stream
@@ -288,9 +293,15 @@ func (s *Store) resolveCollection(ctx context.Context, scope store.Scope) (*mong
 
 // schemaCacheKey returns the stable key used to memoize the per-database
 // schema bootstrap. The mongo-driver/v2 Collection handle is not guaranteed
-// to be reused across calls, so we key by ("<db.Name()>/<collection>").
+// to be reused across calls, so we key by the CONNECTION plus the names:
+// ("<client>/<db.Name()>/<collection>"). The client identity is load-bearing —
+// two tenants on two clusters may both call their database "systemplane", and
+// a name-only key would report the second one as already bootstrapped and
+// never materialize its collection.
 func schemaCacheKey(coll *mongo.Collection) string {
-	return coll.Database().Name() + "/" + coll.Name()
+	db := coll.Database()
+
+	return fmt.Sprintf("%p/%s/%s", db.Client(), db.Name(), coll.Name())
 }
 
 // ensureSchema memoizes the per-database bootstrap. tenantScoped marks a
@@ -365,6 +376,18 @@ func (s *Store) ensureSchemaByKey(ctx context.Context, cacheKey string, run func
 	return nil
 }
 
+// scopeAttrs names the tenant a CRUD span touched, when the call named one.
+// The tenant is a span attribute and never a metric label: a tenant id is
+// unbounded, so it belongs where a trace already costs one entry per call
+// rather than in a time series per tenant.
+func scopeAttrs(scope store.Scope, attrs ...attribute.KeyValue) []attribute.KeyValue {
+	if scope.Tenant == "" {
+		return attrs
+	}
+
+	return append(attrs, attribute.String("tenant", scope.Tenant))
+}
+
 // List returns every entry from the resolved collection ordered by (namespace, key).
 func (s *Store) List(ctx context.Context, scope store.Scope) ([]store.Entry, error) {
 	if s == nil || s.isClosed() {
@@ -378,6 +401,8 @@ func (s *Store) List(ctx context.Context, scope store.Scope) ([]store.Entry, err
 
 	ctx, span := s.tracer.Start(ctx, "systemplane.mongodb.list")
 	defer span.End()
+
+	span.SetAttributes(scopeAttrs(scope)...)
 
 	findOpts := options.Find().SetSort(bson.D{
 		{Key: fieldNamespace, Value: 1},
@@ -423,10 +448,10 @@ func (s *Store) Get(ctx context.Context, scope store.Scope, namespace, key strin
 	ctx, span := s.tracer.Start(ctx, "systemplane.mongodb.get")
 	defer span.End()
 
-	span.SetAttributes(
+	span.SetAttributes(scopeAttrs(scope,
 		attribute.String("namespace", namespace),
 		attribute.String("key", key),
-	)
+	)...)
 
 	filter := bson.D{{Key: fieldID, Value: compoundID{Namespace: namespace, Key: key}}, notDeleted()}
 
@@ -466,10 +491,10 @@ func (s *Store) Set(ctx context.Context, scope store.Scope, e store.Entry) (int6
 	ctx, span := s.tracer.Start(ctx, "systemplane.mongodb.set")
 	defer span.End()
 
-	span.SetAttributes(
+	span.SetAttributes(scopeAttrs(scope,
 		attribute.String("namespace", e.Namespace),
 		attribute.String("key", e.Key),
-	)
+	)...)
 
 	revision, err := upsertReturningRevision(ctx, coll, e)
 	if err != nil && mongo.IsDuplicateKeyError(err) {
@@ -516,10 +541,10 @@ func (s *Store) Delete(ctx context.Context, scope store.Scope, namespace, key, a
 	// actor is intentionally NOT a span attribute: it is unbounded caller
 	// identity and would create a high-cardinality / potentially PII tag. It
 	// is recorded where audit trails read it: the tombstone's updated_by.
-	span.SetAttributes(
+	span.SetAttributes(scopeAttrs(scope,
 		attribute.String("namespace", namespace),
 		attribute.String("key", key),
-	)
+	)...)
 
 	filter := bson.D{{Key: fieldID, Value: compoundID{Namespace: namespace, Key: key}}, notDeleted()}
 

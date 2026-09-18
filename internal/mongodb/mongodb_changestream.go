@@ -67,7 +67,14 @@ type changeEvent struct {
 	// because the stream is opened with fullDocument: updateLookup. A raw
 	// delete never carries one, which is why documentKey._id stays the
 	// identity source and is never replaced by this.
-	FullDocument *entryDoc `bson:"fullDocument"`
+	//
+	// It is kept RAW on purpose. Decoding it into entryDoc here would make the
+	// whole event — identity included — fail on one badly typed foreign field:
+	// an operator who stored the value as a sub-document, or updated_at as a
+	// string, would silently unsubscribe the engine from that key. FC-9 and D3
+	// require the opposite, so classification reads the two fields it needs
+	// out of this, field by field, and tolerates everything else.
+	FullDocument bson.Raw `bson:"fullDocument"`
 }
 
 // feed is one changefeed for one scope. The zero-scope feed is created by

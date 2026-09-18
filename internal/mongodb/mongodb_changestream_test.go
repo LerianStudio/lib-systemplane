@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
+	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.uber.org/goleak"
 )
@@ -1152,4 +1153,161 @@ func TestPollBackoffAdvancesTheStreakAndStopsWithTheFeed(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("a stopped feed waited %s for its backoff, want the wait abandoned at once", elapsed)
 	}
+}
+
+// TestChangeEventDecodesTombstoneAsDelete pins FC-9's classification of one
+// change-stream event, and the tolerance the classification rests on: the
+// after-image is read field by field, so a foreign writer that stored the
+// value as a sub-document or the timestamp as a string cannot fail the decode
+// and take the event's identity down with it. The revision an upsert carries
+// is the after-image's, which is what lets the engine dedupe an echo of its own
+// Set; a delete carries 0, which FC-2 reads as unknown and never fences or
+// deduplicates.
+func TestChangeEventDecodesTombstoneAsDelete(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+
+	// What the library itself writes.
+	healthy := bson.D{
+		{Key: fieldNamespace, Value: "ns"},
+		{Key: fieldKey, Value: "k"},
+		{Key: fieldValue, Value: `{"enabled":true}`},
+		{Key: fieldRevision, Value: int64(7)},
+		{Key: fieldUpdatedAt, Value: now},
+		{Key: fieldUpdatedBy, Value: "writer"},
+	}
+
+	// What an operator in a Mongo shell can leave behind: the value is a BSON
+	// document instead of the JSON string the library stores, and updated_at is
+	// a string instead of a date. Neither field is read by classification.
+	foreign := bson.D{
+		{Key: fieldNamespace, Value: "ns"},
+		{Key: fieldKey, Value: "k"},
+		{Key: fieldValue, Value: bson.D{{Key: "enabled", Value: true}}},
+		{Key: fieldRevision, Value: int64(7)},
+		{Key: fieldUpdatedAt, Value: "2026-09-18T00:00:00Z"},
+	}
+
+	tests := []struct {
+		name         string
+		ce           changeEvent
+		wantOp       string
+		wantRevision int64
+	}{
+		{
+			name:         "insert carries the after-image revision",
+			ce:           changeEventFor(t, "insert", healthy),
+			wantOp:       store.OpUpsert,
+			wantRevision: 7,
+		},
+		{
+			// A tombstone is written as an UPDATE (FC-9), so the operation type
+			// alone cannot tell a delete from a write: the after-image decides,
+			// and the revision it carries is discarded with it.
+			name: "tombstone after-image is a delete at revision 0",
+			ce: changeEventFor(t, "update", bson.D{
+				{Key: fieldNamespace, Value: "ns"},
+				{Key: fieldKey, Value: "k"},
+				{Key: fieldRevision, Value: int64(42)},
+				{Key: fieldDeleted, Value: true},
+			}),
+			wantOp:       store.OpDelete,
+			wantRevision: 0,
+		},
+		{
+			// deleted: false is the same state as no deleted field at all —
+			// a live value — and must not be read as a tombstone.
+			name: "an explicit deleted false is a live value",
+			ce: changeEventFor(t, "replace", bson.D{
+				{Key: fieldNamespace, Value: "ns"},
+				{Key: fieldKey, Value: "k"},
+				{Key: fieldValue, Value: `{"enabled":true}`},
+				{Key: fieldRevision, Value: int64(7)},
+				{Key: fieldDeleted, Value: false},
+			}),
+			wantOp:       store.OpUpsert,
+			wantRevision: 7,
+		},
+		{
+			name:         "raw delete from a foreign writer has no after-image",
+			ce:           changeEventFor(t, operationTypeDelete, nil),
+			wantOp:       store.OpDelete,
+			wantRevision: 0,
+		},
+		{
+			// The lookup runs at delivery time, so a foreign deleteOne between
+			// the change and the lookup leaves it empty. Publishing revision 0
+			// costs only the dedupe hint — store.Event never carries a value.
+			name:         "empty lookup publishes an upsert at revision 0",
+			ce:           changeEventFor(t, "update", nil),
+			wantOp:       store.OpUpsert,
+			wantRevision: 0,
+		},
+		{
+			name:         "badly typed neighbours still yield the revision",
+			ce:           changeEventFor(t, "update", foreign),
+			wantOp:       store.OpUpsert,
+			wantRevision: 7,
+		},
+		{
+			name:         "badly typed neighbours still yield the tombstone",
+			ce:           changeEventFor(t, "update", append(foreign, bson.E{Key: fieldDeleted, Value: true})),
+			wantOp:       store.OpDelete,
+			wantRevision: 0,
+		},
+		{
+			// A revision nobody can read is unknown, not a value: FC-2 never
+			// fences or deduplicates 0, so the engine re-reads the row.
+			name: "unreadable revision publishes an upsert at revision 0",
+			ce: changeEventFor(t, "update", bson.D{
+				{Key: fieldNamespace, Value: "ns"},
+				{Key: fieldKey, Value: "k"},
+				{Key: fieldRevision, Value: "seven"},
+			}),
+			wantOp:       store.OpUpsert,
+			wantRevision: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		evt, ok := eventFromChange(tt.ce)
+		if !ok || evt.Op != tt.wantOp || evt.Revision != tt.wantRevision || evt.Namespace != "ns" || evt.Key != "k" {
+			t.Errorf("%s: eventFromChange = (%#v, %v), want Op %q at revision %d for ns/k", tt.name, evt, ok, tt.wantOp, tt.wantRevision)
+		}
+	}
+}
+
+// changeEventFor builds a change-stream event the way the reader loop receives
+// one: the raw BSON goes through the same decode, so a test exercises the
+// tolerance of that decode rather than a struct a test filled in by hand. full
+// is the after-image; nil means the event carries none. The documentKey is
+// always well-formed — the identifier-missing cases are built inline, since
+// that is the field they are about.
+func changeEventFor(t *testing.T, operationType string, full bson.D) changeEvent {
+	t.Helper()
+
+	doc := bson.D{
+		{Key: "operationType", Value: operationType},
+		{Key: "documentKey", Value: bson.D{{Key: fieldID, Value: bson.D{
+			{Key: fieldNamespace, Value: "ns"},
+			{Key: fieldKey, Value: "k"},
+		}}}},
+	}
+
+	if full != nil {
+		doc = append(doc, bson.E{Key: "fullDocument", Value: full})
+	}
+
+	raw, err := bson.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal change event: %v", err)
+	}
+
+	var ce changeEvent
+	if err := bson.Unmarshal(raw, &ce); err != nil {
+		t.Fatalf("decode change event: %v", err)
+	}
+
+	return ce
 }
