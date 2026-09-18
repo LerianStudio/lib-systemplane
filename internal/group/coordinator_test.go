@@ -5,6 +5,7 @@ package group
 import (
 	"context"
 	goruntime "runtime"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -173,36 +174,31 @@ func TestCoordinatorCoalescesWhileAnApplierIsBusy(t *testing.T) {
 	waitFor(t, entered, "the applier to block on its first delivery")
 
 	for revision := int64(2); revision <= 50; revision++ {
-		c.Publish(ctx, publication("t1", revision, "v"+itoa(revision)))
+		c.Publish(ctx, publication("t1", revision, "v"+strconv.FormatInt(revision, 10)))
 	}
 
 	close(release)
 	wg.Wait()
 
+	// The count is exact rather than a bound, and deterministic on every
+	// interleaving: the applier is provably inside its first delivery before
+	// any of revisions 2..50 is published, so every one of them is recorded
+	// against a scope already marked delivering and they collapse into the
+	// single trailing delivery the drain makes once the applier unblocks.
+	// A bound of "fewer than 50" would also pass on a coordinator that
+	// delivered nothing at all.
 	got := rec.all()
-	if len(got) >= 50 {
-		t.Fatalf("delivered %d times for 50 publications, want far fewer", len(got))
+	if len(got) != 2 {
+		t.Fatalf("delivered %d times for 50 publications, want exactly 2 — the first and the newest: %v", len(got), rec.names())
 	}
 
-	last := got[len(got)-1]
-	if last.current.Revision != 50 {
-		t.Errorf("last delivery was revision %d, want 50 (the newest publication must always land)", last.current.Revision)
-	}
-}
-
-func itoa(v int64) string {
-	if v == 0 {
-		return "0"
+	if got[0].current.Revision != 1 {
+		t.Errorf("first delivery was revision %d, want 1", got[0].current.Revision)
 	}
 
-	digits := ""
-
-	for v > 0 {
-		digits = string(rune('0'+v%10)) + digits
-		v /= 10
+	if got[1].current.Revision != 50 {
+		t.Errorf("trailing delivery was revision %d, want 50 (the newest publication must always land)", got[1].current.Revision)
 	}
-
-	return digits
 }
 
 func TestCoordinatorSerializesDeliveriesPerScope(t *testing.T) {
@@ -470,14 +466,124 @@ func TestCoordinatorPublishFromInsideAnApplierIsDeliveredAfterIt(t *testing.T) {
 
 	waitFor(t, done, "the re-entrant publish to finish without deadlocking")
 
-	want := []string{"enter:outer", "exit:outer", "enter:inner", "exit:inner"}
-	if len(events) != len(want) {
-		t.Fatalf("events = %v, want %v", events, want)
+	assertEvents(t, events, []string{"enter:outer", "exit:outer", "enter:inner", "exit:inner"})
+}
+
+// TestCoordinatorRegisterFromInsideAnApplierIsDeliveredAfterIt pins A7: a
+// registration made while its own scope is already delivering cannot deliver on
+// the spot, because the fan-out is inside an applier. The new function is
+// appended and its first delivery is deferred to the drain's next iteration, on
+// the delivering goroutine, after the applier that registered it returns — and
+// an unsubscribe reaching the coordinator before that iteration cancels the
+// delivery outright, so the function never runs at all.
+//
+// events is deliberately unguarded in both cases. Every delivery here must run
+// on the publishing goroutine, so -race is what proves the same-goroutine half
+// of the claim: a delivery from anywhere else has no happens-before edge to the
+// read at the end and is reported as a race.
+func TestCoordinatorRegisterFromInsideAnApplierIsDeliveredAfterIt(t *testing.T) {
+	t.Run("deferred to the next iteration", func(t *testing.T) {
+		c := newCoordinator(t)
+		ctx := context.Background()
+
+		var (
+			events []string
+			once   sync.Once
+		)
+
+		second := func(_ context.Context, current Decoded[coordDoc], previous *Decoded[coordDoc]) error {
+			events = append(events, "second:"+current.Value.Name)
+
+			if previous != nil {
+				t.Errorf("previous on a deferred first delivery = %#v, want nil", *previous)
+			}
+
+			return nil
+		}
+
+		first := func(_ context.Context, current Decoded[coordDoc], _ *Decoded[coordDoc]) error {
+			events = append(events, "enter:"+current.Value.Name)
+
+			once.Do(func() { c.Register(second) })
+
+			events = append(events, "exit:"+current.Value.Name)
+
+			return nil
+		}
+
+		unsubscribe := c.Register(first)
+		defer unsubscribe()
+
+		done := make(chan struct{})
+
+		go func() {
+			defer close(done)
+
+			c.Publish(ctx, publication("t1", 1, "one"))
+		}()
+
+		waitFor(t, done, "the re-entrant registration to finish without deadlocking")
+
+		assertEvents(t, events, []string{"enter:one", "exit:one", "second:one"})
+	})
+
+	t.Run("unsubscribed before the next iteration", func(t *testing.T) {
+		c := newCoordinator(t)
+		ctx := context.Background()
+
+		var (
+			events []string
+			once   sync.Once
+		)
+
+		second := func(_ context.Context, current Decoded[coordDoc], _ *Decoded[coordDoc]) error {
+			events = append(events, "second:"+current.Value.Name)
+
+			return nil
+		}
+
+		first := func(_ context.Context, current Decoded[coordDoc], _ *Decoded[coordDoc]) error {
+			events = append(events, "enter:"+current.Value.Name)
+
+			once.Do(func() {
+				drop := c.Register(second)
+				drop()
+			})
+
+			events = append(events, "exit:"+current.Value.Name)
+
+			return nil
+		}
+
+		unsubscribe := c.Register(first)
+		defer unsubscribe()
+
+		done := make(chan struct{})
+
+		go func() {
+			defer close(done)
+
+			c.Publish(ctx, publication("t1", 1, "one"))
+		}()
+
+		waitFor(t, done, "the cancelled registration to finish without deadlocking")
+
+		assertEvents(t, events, []string{"enter:one", "exit:one"})
+	})
+}
+
+// assertEvents compares a delivery trace in order, so a test reads as the
+// sequence it is pinning rather than as a loop.
+func assertEvents(t *testing.T, got, want []string) {
+	t.Helper()
+
+	if len(got) != len(want) {
+		t.Fatalf("events = %v, want %v", got, want)
 	}
 
 	for i := range want {
-		if events[i] != want[i] {
-			t.Fatalf("events = %v, want %v", events, want)
+		if got[i] != want[i] {
+			t.Fatalf("events = %v, want %v", got, want)
 		}
 	}
 }

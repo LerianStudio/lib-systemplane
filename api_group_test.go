@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
 	systemplane "github.com/LerianStudio/lib-systemplane/v4"
@@ -1923,7 +1924,17 @@ func TestGroupOnApplyCoalescesABurst(t *testing.T) {
 		defer wg.Done()
 		defer close(release)
 
-		<-delivered
+		// Never a bare receive. If the registration delivers nothing this
+		// goroutine would block forever and take the test with it, so the
+		// failure would arrive as a package timeout with no diagnosis instead
+		// of as the assertion below.
+		select {
+		case <-delivered:
+		case <-time.After(5 * time.Second):
+			t.Errorf("timed out waiting for the first delivery, so the burst was never written")
+
+			return
+		}
 
 		for i := range burst {
 			if err := g.Set(context.Background(), groupBurstDocument(i), "operator"); err != nil {
@@ -1942,13 +1953,14 @@ func TestGroupOnApplyCoalescesABurst(t *testing.T) {
 	t.Cleanup(unsubscribe)
 	wg.Wait()
 
+	// Exactly two, not merely "fewer than 50". The first delivery is provably
+	// still inside the applier when every one of the writes lands, so all of
+	// them collapse into the single trailing delivery the fan-out makes once
+	// that applier unblocks. A loose bound would also pass on a facade that
+	// delivered once and then stopped hot reload altogether.
 	seen := rec.all()
-	if len(seen) == 0 {
-		t.Fatal("no delivery at all")
-	}
-
-	if len(seen) >= burst {
-		t.Errorf("deliveries for a burst of %d writes = %d, want fewer: writes landing while an applier runs coalesce", burst, len(seen))
+	if len(seen) != 2 {
+		t.Fatalf("deliveries for a burst of %d writes = %d, want exactly 2: the document in force at registration and the newest write", burst, len(seen))
 	}
 
 	final := groupBurstDocument(burst - 1)
@@ -2059,4 +2071,194 @@ func TestGroupOnApplyRefusesAPublishedNullDocument(t *testing.T) {
 			t.Errorf("Status entry = %#v, want the refused null document visible in LastErr", st)
 		}
 	}
+}
+
+// TestGroupOnApplySetFromInsideAnApplierIsDeliveredAfterIt pins the re-entrancy
+// rule the OnApply godoc promises, in the one shape A10 says it holds in: with
+// debouncing disabled the Client publishes a write inline on the writing
+// goroutine, so a hook that calls Set has its own echo delivered on the
+// fan-out's next iteration — after the delivery that wrote it returns, never
+// nested inside it, and never as a deadlock. Reading Status from inside the
+// hook is part of the same claim: no lock is held across an apply, so a hook
+// may ask whether its own group has converged.
+//
+// A hook that writes on EVERY delivery would loop forever, which is why this
+// one writes once; the loop terminating is what the exact delivery count below
+// asserts.
+func TestGroupOnApplySetFromInsideAnApplierIsDeliveredAfterIt(t *testing.T) {
+	t.Parallel()
+
+	c := newGroupHotClient(t, newGroupMemoryStore())
+	g := bindGroupOn(t, c)
+	startGroupClient(t, c)
+
+	written := groupConfig{Name: "written-by-the-hook", Retries: 4, Hosts: []string{"inner"}}
+
+	// depth, nested, scopes and setErr are deliberately unguarded: every
+	// delivery here must run on this goroutine, so -race reports it if the echo
+	// of the re-entrant write arrives on another one.
+	var (
+		rec    applyRecorder
+		once   sync.Once
+		depth  int
+		nested bool
+		scopes = -1
+		setErr error
+	)
+
+	applier := func(ctx context.Context, a systemplane.Applied[groupConfig]) error {
+		depth++
+		if depth > 1 {
+			nested = true
+		}
+
+		defer func() { depth-- }()
+
+		if err := rec.apply(ctx, a); err != nil {
+			return err
+		}
+
+		once.Do(func() {
+			setErr = g.Set(context.Background(), written, "operator")
+			scopes = len(g.Status())
+		})
+
+		return nil
+	}
+
+	unsubscribe, err := g.OnApply(applier)
+	if err != nil {
+		t.Fatalf("OnApply: %v", err)
+	}
+
+	t.Cleanup(unsubscribe)
+
+	if setErr != nil {
+		t.Fatalf("Set from inside the apply hook: %v", setErr)
+	}
+
+	if nested {
+		t.Error("the write's own delivery ran nested inside the hook that wrote it, want it deferred until that hook returned")
+	}
+
+	if scopes != 1 {
+		t.Errorf("Status from inside the apply hook reported %d scopes, want 1", scopes)
+	}
+
+	seen := rec.all()
+	if len(seen) != 2 {
+		t.Fatalf("deliveries = %d, want exactly 2: the document in force at registration and the hook's own write", len(seen))
+	}
+
+	if !reflect.DeepEqual(seen[0].Value, groupDefaults()) {
+		t.Errorf("first delivery = %#v, want the registered defaults %#v", seen[0].Value, groupDefaults())
+	}
+
+	if !reflect.DeepEqual(seen[1].Value, written) {
+		t.Errorf("second delivery = %#v, want the document the hook wrote %#v", seen[1].Value, written)
+	}
+
+	if seen[1].Previous == nil || !reflect.DeepEqual(seen[1].Previous.Value, groupDefaults()) {
+		t.Errorf("Previous on the hook's own write = %#v, want the defaults it had already accepted", seen[1].Previous)
+	}
+}
+
+// TestGroupOnApplyAfterCloseRegistersAndReplays covers the registration-time
+// seed gate, which refuses a seed on any of three conditions — the read failed,
+// the key is unknown, or the scope has not reconciled — and says so to nobody.
+// Close is the one condition reachable through this facade: GetEntry then
+// returns ErrClosed.
+//
+// The two halves pin one behaviour between them: registering after Close
+// registers and returns no error, it replays whatever was already observed, and
+// when nothing was ever observed it delivers nothing and still returns no
+// error. That is the OnApply godoc's promise and the lane's B7 resolution.
+// A9 would have the unreadable-seed case surface its error from OnApply; the
+// coordinator's seed closure returns no error at all, so this file pins the
+// silent refusal rather than inventing a second contract for it.
+func TestGroupOnApplyAfterCloseRegistersAndReplays(t *testing.T) {
+	t.Parallel()
+
+	t.Run("replays what was already observed", func(t *testing.T) {
+		t.Parallel()
+
+		s := newGroupMemoryStore()
+		stored := groupConfig{Name: "stored", Retries: 2, Hosts: []string{"q"}}
+		s.seed(t, "runtime", "ingest", stored)
+
+		c := newGroupHotClient(t, s)
+		g := bindGroupOn(t, c)
+		startGroupClient(t, c)
+
+		var first applyRecorder
+
+		unsubscribe, err := g.OnApply(first.apply)
+		if err != nil {
+			t.Fatalf("OnApply before Close: %v", err)
+		}
+
+		t.Cleanup(unsubscribe)
+
+		if got := first.count(); got != 1 {
+			t.Fatalf("deliveries to the first hook = %d, want 1", got)
+		}
+
+		if err := c.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+
+		var second applyRecorder
+
+		unsubscribeAfter, err := g.OnApply(second.apply)
+		if err != nil {
+			t.Fatalf("OnApply after Close = %v, want no error: it registers and replays", err)
+		}
+
+		t.Cleanup(unsubscribeAfter)
+
+		seen := second.all()
+		if len(seen) != 1 {
+			t.Fatalf("deliveries to a hook registered after Close = %d, want 1: the last observed document is replayed", len(seen))
+		}
+
+		if !reflect.DeepEqual(seen[0].Value, stored) {
+			t.Errorf("replayed document = %#v, want the last one observed %#v", seen[0].Value, stored)
+		}
+
+		if seen[0].Previous != nil {
+			t.Errorf("Previous on a replay to a new hook = %#v, want nil", seen[0].Previous)
+		}
+	})
+
+	t.Run("refuses a seed it cannot read", func(t *testing.T) {
+		t.Parallel()
+
+		s := newGroupMemoryStore()
+		s.seed(t, "runtime", "ingest", groupConfig{Name: "stored", Retries: 2, Hosts: []string{"q"}})
+
+		c := newGroupHotClient(t, s)
+		g := bindGroupOn(t, c)
+		startGroupClient(t, c)
+
+		if err := c.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+
+		var rec applyRecorder
+
+		unsubscribe, err := g.OnApply(rec.apply)
+		if err != nil {
+			t.Fatalf("OnApply after Close with nothing observed = %v, want no error", err)
+		}
+
+		t.Cleanup(unsubscribe)
+
+		if got := rec.count(); got != 0 {
+			t.Errorf("deliveries = %d, want 0: the seed read reports ErrClosed, so there is nothing to deliver", got)
+		}
+
+		if status := g.Status(); len(status) != 0 {
+			t.Errorf("Status = %#v, want empty: a refused seed observes no scope", status)
+		}
+	})
 }
