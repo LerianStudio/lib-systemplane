@@ -3,6 +3,9 @@ package group
 
 import (
 	"context"
+	"fmt"
+	"math"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
@@ -50,6 +53,7 @@ type observation[T any] struct {
 // the coordinator's state mutex, which is what makes a publication recorded
 // mid-fan-out impossible to miss.
 type scope[T any] struct {
+	tenant     string
 	current    observation[T]
 	observed   bool
 	delivering bool
@@ -58,9 +62,11 @@ type scope[T any] struct {
 }
 
 // applierScope is one applier's bookkeeping for one scope: the newest
-// observation it has been offered, and the newest snapshot it accepted.
+// observation it has been offered, and the revision and snapshot it last
+// accepted. A rejection moves neither of the latter two.
 type applierScope[T any] struct {
 	deliveredSeq uint64
+	appliedRev   int64
 	accepted     *Decoded[T]
 }
 
@@ -153,6 +159,9 @@ func (c *Coordinator[T]) Publish(ctx context.Context, pub Publication) {
 		sc.lastErr = err
 		c.mu.Unlock()
 
+		c.logError(ctx, "systemplane.group: published document failed to decode",
+			log.Err(err), log.String("tenant", pub.Tenant), log.Any("revision", pub.Revision))
+
 		return
 	}
 
@@ -208,8 +217,17 @@ func (c *Coordinator[T]) Register(fn ApplyFunc[T]) func() {
 	}
 }
 
-// Status reports desired and applied revisions per observed scope, sorted by
-// tenant.
+// Status reports desired and applied revisions per scope the coordinator has
+// seen a publication for, sorted by tenant.
+//
+// Desired is the newest revision observed, advancing even when coalescing meant
+// no applier saw the intermediate ones and even when the publication was
+// rejected at decode. Applied is the newest revision EVERY registered applier
+// has accepted, so it means the document is in force everywhere; with no
+// applier registered nothing can lag and the scope reads as converged. LastErr
+// holds the last rejection and is nil whenever Applied equals Desired; the
+// converse does not hold, because a delivery in flight leaves Desired ahead of
+// Applied with no error and Status is a point-in-time read.
 func (c *Coordinator[T]) Status() []Status {
 	if c == nil {
 		return nil
@@ -221,11 +239,14 @@ func (c *Coordinator[T]) Status() []Status {
 	out := make([]Status, 0, len(c.scopes))
 
 	for tenant, sc := range c.scopes {
-		if !sc.observed {
-			continue
+		applied := c.appliedLocked(sc)
+
+		lastErr := sc.lastErr
+		if applied == sc.desired {
+			lastErr = nil
 		}
 
-		out = append(out, Status{Tenant: tenant, Desired: sc.desired, LastErr: sc.lastErr})
+		out = append(out, Status{Tenant: tenant, Desired: sc.desired, Applied: applied, LastErr: lastErr})
 	}
 
 	slices.SortFunc(out, func(a, b Status) int { return strings.Compare(a.Tenant, b.Tenant) })
@@ -250,7 +271,7 @@ func (c *Coordinator[T]) remove(id uint64) {
 func (c *Coordinator[T]) scopeLocked(tenant string) *scope[T] {
 	sc, ok := c.scopes[tenant]
 	if !ok {
-		sc = &scope[T]{}
+		sc = &scope[T]{tenant: tenant}
 		c.scopes[tenant] = sc
 	}
 
@@ -285,11 +306,11 @@ func (c *Coordinator[T]) drain(ctx context.Context, sc *scope[T]) {
 		c.mu.Unlock()
 
 		for i := range pending {
-			pending[i].err = pending[i].ap.fn(ctx, pending[i].current, pending[i].previous)
+			pending[i].err = c.invoke(ctx, pending[i].ap.fn, pending[i].current, pending[i].previous)
 		}
 
 		c.mu.Lock()
-		recordLocked(sc, pending)
+		c.recordLocked(sc, pending)
 	}
 }
 
@@ -313,9 +334,43 @@ func (c *Coordinator[T]) pendingLocked(sc *scope[T], observed observation[T]) []
 	return pending
 }
 
-// recordLocked writes back what each applier did with its delivery. The caller
-// holds the state mutex.
-func recordLocked[T any](sc *scope[T], pending []delivery[T]) {
+// invoke runs one applier and turns every failure mode into an error: a
+// returned error passes through, and a panic is recovered into one. The recover
+// is the coordinator's own rather than a lib-observability helper because those
+// swallow the recovered value, and FC-7 needs it as the scope's LastErr.
+func (c *Coordinator[T]) invoke(
+	ctx context.Context,
+	fn ApplyFunc[T],
+	current Decoded[T],
+	previous *Decoded[T],
+) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("systemplane/group: apply function panicked: %v", recovered)
+
+			c.logError(ctx, "systemplane.group: apply function panicked",
+				log.Any("panic", recovered), log.String("stack", string(debug.Stack())))
+		}
+	}()
+
+	return fn(ctx, current, previous)
+}
+
+func (c *Coordinator[T]) logError(ctx context.Context, msg string, fields ...log.Field) {
+	if c.logger == nil {
+		return
+	}
+
+	c.logger.Log(ctx, log.LevelError, msg, fields)
+}
+
+// recordLocked writes back what each applier did with its delivery: an
+// acceptance moves that applier's applied revision and becomes its next
+// previous, while a rejection leaves both untouched and is recorded on the
+// scope. Nothing is ever retried — the drain marked the observation as offered
+// before invoking. The scope's error clears as soon as every applier has caught
+// up with the newest revision. The caller holds the state mutex.
+func (c *Coordinator[T]) recordLocked(sc *scope[T], pending []delivery[T]) {
 	for i := range pending {
 		d := &pending[i]
 		st := d.ap.scopeState(d.current.Tenant)
@@ -327,8 +382,37 @@ func recordLocked[T any](sc *scope[T], pending []delivery[T]) {
 		}
 
 		accepted := d.current
+		st.appliedRev = accepted.Revision
 		st.accepted = &accepted
 	}
+
+	if c.appliedLocked(sc) == sc.desired {
+		sc.lastErr = nil
+	}
+}
+
+// appliedLocked is the minimum applied revision across the CURRENTLY registered
+// appliers, so an unsubscribed applier stops holding the scope down. With no
+// applier registered there is nothing that could lag and the scope is converged
+// by definition. The caller holds the state mutex.
+func (c *Coordinator[T]) appliedLocked(sc *scope[T]) int64 {
+	if len(c.appliers) == 0 {
+		return sc.desired
+	}
+
+	applied := int64(math.MaxInt64)
+
+	for _, ap := range c.appliers {
+		var revision int64
+
+		if st, ok := ap.state[sc.tenant]; ok {
+			revision = st.appliedRev
+		}
+
+		applied = min(applied, revision)
+	}
+
+	return applied
 }
 
 func (a *applier[T]) scopeState(tenant string) *applierScope[T] {
