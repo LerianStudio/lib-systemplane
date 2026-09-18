@@ -22,6 +22,22 @@ type Group[T any] struct {
 	// null for every other T; Snapshot refuses to decode one, so a row that
 	// predates the guard cannot be read back as a wholly blank configuration.
 	nullIsDocument bool
+
+	// coordinator holds the per-scope publication cache and the registered
+	// apply functions. It is built at Bind, so it is never nil on a group the
+	// caller holds.
+	coordinator *group.Coordinator[T]
+
+	// unsubscribe releases the single OnChange subscription Bind took, so the
+	// handle owns what it created. Nothing calls it today: a group has no
+	// Close, and the Client's own teardown drops its subscribers.
+	unsubscribe func()
+
+	// subscribeErr is the refusal OnChange returned at Bind, reported by
+	// OnApply. A multi-tenant Client refuses the subscription and must still
+	// get a working Snapshot and Set, so Bind records the error instead of
+	// failing.
+	subscribeErr error
 }
 
 // Snapshot is the state of a group's document in one scope.
@@ -130,7 +146,56 @@ func Bind[T any](c *Client, namespace, key string, defaults T, validate func(T) 
 		return nil, err
 	}
 
-	return &Group[T]{client: c, namespace: namespace, key: key, nullIsDocument: nullIsDocument}, nil
+	g := &Group[T]{client: c, namespace: namespace, key: key, nullIsDocument: nullIsDocument}
+
+	g.coordinator = group.NewCoordinator[T](c.Logger(), g.decodePublished, g.seedCurrentEntry)
+
+	// The group's one subscription, taken here — before Start, and therefore
+	// before any publication can exist. That is the structural half of FC-7's
+	// "no revision can fall between the initial delivery and the
+	// subscription"; the coordinator's seed watermark is the other half.
+	unsubscribe, subscribeErr := c.OnChange(namespace, key, func(ctx context.Context, ch Change) {
+		g.coordinator.Publish(ctx, group.Publication{Tenant: ch.Tenant, Revision: ch.Revision, Value: ch.Value})
+	})
+	if subscribeErr != nil {
+		g.subscribeErr = subscribeErr
+	} else {
+		g.unsubscribe = unsubscribe
+	}
+
+	return g, nil
+}
+
+// decodePublished is the codec the coordinator decodes every publication with.
+// It is not bare group.Decode: it repeats Snapshot's null rule, so a published
+// null for a group whose zero T is not nil is recorded as a rejection instead
+// of blanking the whole document through an applier.
+func (g *Group[T]) decodePublished(value any) (T, error) {
+	if value == nil && !g.nullIsDocument {
+		var zero T
+
+		return zero, fmt.Errorf("%w: %s/%s published a null document, which is not a %T", ErrValidation, g.namespace, g.key, zero)
+	}
+
+	return group.Decode[T](value)
+}
+
+// seedCurrentEntry reads the scope's current entry for a registration that
+// finds no publication cached yet — the window after Start returns and before
+// the engine's dispatch has delivered the scope's first publication. Entry.Stale
+// is how the group asks whether the Client already tracks the scope: a stale
+// entry means the scope has not reconciled, which is the pre-Start case, and
+// nothing is seeded.
+//
+// The read uses context.Background() because OnApply takes no context, so a
+// seeded snapshot carries the single-tenant scope.
+func (g *Group[T]) seedCurrentEntry() (group.Publication, bool) {
+	entry, ok, err := g.client.GetEntry(context.Background(), g.namespace, g.key)
+	if err != nil || !ok || entry.Stale {
+		return group.Publication{}, false
+	}
+
+	return group.Publication{Revision: entry.Revision, Value: entry.Value}, true
 }
 
 // Snapshot returns the group's document in the caller's scope, decoded into T,
@@ -209,4 +274,127 @@ func (g *Group[T]) Set(ctx context.Context, value T, actor string) error {
 	// value itself, not its canonical form: the facade marshals it and the
 	// registered validator accepts a typed T directly.
 	return g.client.Set(ctx, g.namespace, g.key, value, actor)
+}
+
+// Applied is delivered to an OnApply function for the newest published
+// revision per scope, serially; revisions published while fn runs are
+// coalesced into the next delivery (FC-4). Previous is the snapshot fn last
+// accepted for that scope, nil on the first delivery.
+//
+// A delivered Applied always carries Stale false. Staleness describes a read,
+// while a publication is a value the engine has just observed; a subscriber
+// that needs to know whether its scope is currently converged calls
+// [Group.Snapshot].
+//
+// Tenant names the scope that published, which is not the same rule
+// [Snapshot] follows on a read.
+//
+// Value is the one decoded document every applier of the group receives, and
+// is what Previous carries on the next delivery, so an applier must treat it
+// as read-only. A caller that wants an owned copy calls [Group.Snapshot],
+// which decodes per call.
+type Applied[T any] struct {
+	Snapshot[T]
+	Previous *Snapshot[T]
+}
+
+// ApplyStatus reports one scope's desired and applied revisions.
+//
+// Desired is the newest revision published for the scope, advancing even when
+// coalescing meant no applier saw the intermediate ones. Applied is the newest
+// revision every registered function has accepted, so it means the document is
+// in force everywhere; with no function registered nothing can lag and the
+// scope reads as converged. LastErr is nil whenever Applied equals Desired;
+// the converse does not hold, because a delivery in flight leaves Desired
+// ahead of Applied with no error.
+type ApplyStatus struct {
+	Tenant  string
+	Desired int64 // latest published revision
+	Applied int64 // latest revision fn accepted
+	LastErr error // nil when Desired == Applied
+}
+
+// OnApply subscribes first and then delivers the current snapshot of every
+// scope the Client already tracks, so no revision can fall between the
+// initial delivery and the subscription; the same non-zero revision with the
+// same value bytes is never delivered twice (Revision 0 is never deduplicated). Later revisions arrive
+// serialized and coalesced per scope of this group (a group is one key, so
+// this is the per-(scope, key) rule of FC-4); Status.Desired always names the
+// newest published revision even when fn has not seen intermediate ones. fn returning an error records that revision as rejected for the
+// scope (visible in Status) and keeps the previously applied revision as
+// current; the engine does not retry. Before Start, OnApply registers and the
+// initial delivery happens during Start.
+//
+// fn runs with no lock held and may call [Group.Snapshot], [Group.Status],
+// [Group.Set] or OnApply for its own group: the resulting delivery runs after
+// the current one returns, on the same goroutine. An applier that writes on
+// every delivery therefore loops forever.
+//
+// OnApply blocks while a delivery for the same scope is in flight. The replay
+// and the seeded delivery run on the calling goroutine with a background
+// context; a delivery driven by a publication carries the context the Client
+// hands its subscribers, which [Client.Close] cancels. OnApply after Close
+// registers and replays the last observed snapshot, and no further delivery
+// can arrive.
+//
+// A nil fn registers nothing and returns no error, matching [Client.OnChange].
+// unsubscribe is idempotent, is safe to call from inside fn itself, and
+// releases that function's hold on the scope's applied revision. In
+// multi-tenant mode OnApply returns ErrNotSupportedInMultiTenant, while
+// [Group.Snapshot] and [Group.Set] keep working; on a nil *Group it returns
+// ErrClosed. unsubscribe is never nil, so a caller may defer it before
+// checking err.
+func (g *Group[T]) OnApply(fn func(ctx context.Context, a Applied[T]) error) (unsubscribe func(), err error) {
+	noop := func() {}
+
+	if g == nil {
+		return noop, ErrClosed
+	}
+
+	if g.subscribeErr != nil {
+		return noop, g.subscribeErr
+	}
+
+	if fn == nil {
+		return noop, nil
+	}
+
+	return g.coordinator.Register(func(ctx context.Context, current group.Decoded[T], previous *group.Decoded[T]) error {
+		a := Applied[T]{Snapshot: appliedSnapshot(current)}
+
+		if previous != nil {
+			earlier := appliedSnapshot(*previous)
+			a.Previous = &earlier
+		}
+
+		return fn(ctx, a)
+	}), nil
+}
+
+// Status reports the desired and applied revisions of every scope the group
+// has observed a publication for, sorted by tenant. Status on a nil *Group
+// returns nil.
+func (g *Group[T]) Status() []ApplyStatus {
+	if g == nil {
+		return nil
+	}
+
+	observed := g.coordinator.Status()
+
+	out := make([]ApplyStatus, len(observed))
+	for i, st := range observed {
+		// A struct conversion, not a field-by-field copy: it stops compiling
+		// the moment the two shapes drift, which is the cheapest lock between
+		// the contract here and the aggregation in internal/group.
+		out[i] = ApplyStatus(st)
+	}
+
+	return out
+}
+
+// appliedSnapshot maps a delivered publication onto the snapshot shape. Stale
+// is false by construction: a publication is a value the engine has just
+// observed, never a read that could be lagging.
+func appliedSnapshot[T any](d group.Decoded[T]) Snapshot[T] {
+	return Snapshot[T]{Value: d.Value, Revision: d.Revision, Tenant: d.Tenant}
 }

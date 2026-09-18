@@ -1247,3 +1247,454 @@ func TestGroupNullIsADocumentForANilableType(t *testing.T) {
 		t.Fatalf("Snapshot.Value = %#v, want nil", snap.Value)
 	}
 }
+
+// newGroupHotClient builds a Client over s with debouncing disabled, so the
+// changefeed echo of a Set reaches the group's appliers on the calling
+// goroutine and no test has to wait on a window.
+func newGroupHotClient(t *testing.T, s *groupMemoryStore) *systemplane.Client {
+	t.Helper()
+
+	c, err := systemplane.NewForTesting(s, systemplane.WithDebounce(0))
+	if err != nil {
+		t.Fatalf("NewForTesting: %v", err)
+	}
+
+	t.Cleanup(func() { _ = c.Close() })
+
+	return c
+}
+
+// applyRecorder is an OnApply function that keeps everything it was handed, so
+// a test can assert on the whole sequence of deliveries. err, when set before
+// the recorder is registered, makes every delivery a rejection.
+type applyRecorder struct {
+	mu   sync.Mutex
+	seen []systemplane.Applied[groupConfig]
+	err  error
+}
+
+func (r *applyRecorder) apply(_ context.Context, a systemplane.Applied[groupConfig]) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.seen = append(r.seen, a)
+
+	return r.err
+}
+
+func (r *applyRecorder) all() []systemplane.Applied[groupConfig] {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return append([]systemplane.Applied[groupConfig](nil), r.seen...)
+}
+
+func (r *applyRecorder) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return len(r.seen)
+}
+
+// bindGroupOn binds the standard group over c and fails the test if it cannot.
+func bindGroupOn(t *testing.T, c *systemplane.Client) *systemplane.Group[groupConfig] {
+	t.Helper()
+
+	g, err := systemplane.Bind(c, "runtime", "ingest", groupDefaults(), nil)
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	return g
+}
+
+func startGroupClient(t *testing.T, c *systemplane.Client) {
+	t.Helper()
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+}
+
+// TestGroupOnApplyDeliversTheCurrentDocumentBeforeReturning pins FC-7's
+// "delivers the current snapshot of every scope the Client already tracks":
+// the applier has run, with the document actually in force, by the time
+// OnApply hands its unsubscribe back.
+func TestGroupOnApplyDeliversTheCurrentDocumentBeforeReturning(t *testing.T) {
+	t.Parallel()
+
+	s := newGroupMemoryStore()
+	stored := groupConfig{Name: "stored", Retries: 9, Hosts: []string{"z"}}
+	s.seed(t, "runtime", "ingest", stored)
+
+	c := newGroupHotClient(t, s)
+	g := bindGroupOn(t, c)
+	startGroupClient(t, c)
+
+	var rec applyRecorder
+
+	unsubscribe, err := g.OnApply(rec.apply)
+	if err != nil {
+		t.Fatalf("OnApply: %v", err)
+	}
+
+	t.Cleanup(unsubscribe)
+
+	seen := rec.all()
+	if len(seen) != 1 {
+		t.Fatalf("deliveries by the time OnApply returned = %d, want 1", len(seen))
+	}
+
+	if !reflect.DeepEqual(seen[0].Value, stored) {
+		t.Errorf("first delivery = %#v, want the stored document %#v", seen[0].Value, stored)
+	}
+
+	if seen[0].Previous != nil {
+		t.Errorf("Previous on the first delivery = %#v, want nil", seen[0].Previous)
+	}
+}
+
+// TestGroupOnApplyDeliversLaterWrites proves the subscription taken at Bind is
+// live: a write after the initial delivery reaches the applier too.
+func TestGroupOnApplyDeliversLaterWrites(t *testing.T) {
+	t.Parallel()
+
+	c := newGroupHotClient(t, newGroupMemoryStore())
+	g := bindGroupOn(t, c)
+	startGroupClient(t, c)
+
+	var rec applyRecorder
+
+	unsubscribe, err := g.OnApply(rec.apply)
+	if err != nil {
+		t.Fatalf("OnApply: %v", err)
+	}
+
+	t.Cleanup(unsubscribe)
+
+	rolled := groupConfig{Name: "rolled", Retries: 7, Hosts: []string{"c"}}
+	if err := g.Set(context.Background(), rolled, "operator"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	seen := rec.all()
+	if len(seen) != 2 {
+		t.Fatalf("deliveries after one write = %d, want 2", len(seen))
+	}
+
+	if !reflect.DeepEqual(seen[0].Value, groupDefaults()) {
+		t.Errorf("initial delivery = %#v, want the registered defaults %#v", seen[0].Value, groupDefaults())
+	}
+
+	if !reflect.DeepEqual(seen[1].Value, rolled) {
+		t.Errorf("delivery after the write = %#v, want %#v", seen[1].Value, rolled)
+	}
+}
+
+// TestGroupOnApplyCarriesPreviousAfterTheFirstDelivery pins FC-7's Previous:
+// nil on the first delivery, the last snapshot this function accepted after.
+func TestGroupOnApplyCarriesPreviousAfterTheFirstDelivery(t *testing.T) {
+	t.Parallel()
+
+	c := newGroupHotClient(t, newGroupMemoryStore())
+	g := bindGroupOn(t, c)
+	startGroupClient(t, c)
+
+	var rec applyRecorder
+
+	unsubscribe, err := g.OnApply(rec.apply)
+	if err != nil {
+		t.Fatalf("OnApply: %v", err)
+	}
+
+	t.Cleanup(unsubscribe)
+
+	rolled := groupConfig{Name: "rolled", Retries: 7, Hosts: []string{"c"}}
+	if err := g.Set(context.Background(), rolled, "operator"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	seen := rec.all()
+	if len(seen) != 2 {
+		t.Fatalf("deliveries after one write = %d, want 2", len(seen))
+	}
+
+	if seen[1].Previous == nil {
+		t.Fatal("Previous on the second delivery = nil, want the document the applier accepted first")
+	}
+
+	if !reflect.DeepEqual(seen[1].Previous.Value, groupDefaults()) {
+		t.Errorf("Previous = %#v, want the registered defaults %#v", seen[1].Previous.Value, groupDefaults())
+	}
+}
+
+// TestGroupOnApplyAlwaysReportsNotStale pins D-G6: staleness describes a read,
+// so a delivered Applied never carries it — on the seeded delivery or on a
+// later publication. The wave-1 facade reports Stale false on every read
+// (D-G5), so what this test can prove is that the field is not sourced from
+// the entry at all; the engine-backed case belongs to the integration lane.
+func TestGroupOnApplyAlwaysReportsNotStale(t *testing.T) {
+	t.Parallel()
+
+	s := newGroupMemoryStore()
+	s.seed(t, "runtime", "ingest", groupConfig{Name: "stored", Retries: 2, Hosts: []string{"z"}})
+
+	c := newGroupHotClient(t, s)
+	g := bindGroupOn(t, c)
+	startGroupClient(t, c)
+
+	var rec applyRecorder
+
+	unsubscribe, err := g.OnApply(rec.apply)
+	if err != nil {
+		t.Fatalf("OnApply: %v", err)
+	}
+
+	t.Cleanup(unsubscribe)
+
+	if err := g.Set(context.Background(), groupConfig{Name: "rolled", Retries: 7, Hosts: []string{"c"}}, "operator"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	seen := rec.all()
+	if len(seen) < 2 {
+		t.Fatalf("deliveries = %d, want the seeded one and the write", len(seen))
+	}
+
+	for i, a := range seen {
+		if a.Stale {
+			t.Errorf("delivery %d reported Stale, want false on every delivery", i)
+		}
+
+		if a.Previous != nil && a.Previous.Stale {
+			t.Errorf("Previous on delivery %d reported Stale, want false", i)
+		}
+	}
+}
+
+// TestGroupOnApplyErrorIsVisibleInStatus pins how a rejection travels out of an
+// applier. What "visible" can mean here is bounded by the wave-1 facade: it
+// publishes every revision as 0 (D-G9), and FC-7 makes LastErr nil whenever
+// Desired equals Applied, so a scope whose revisions are all 0 reports
+// converged with a nil LastErr however many rejections it saw. The revision
+// arithmetic — LastErr surviving while Applied lags Desired — is driven
+// directly in internal/group's coordinator tests, which publish explicit
+// revisions. What the root proves is that the rejection reached the
+// coordinator's bookkeeping at all: a rejected document never becomes
+// Previous, the rejecting applier keeps receiving later documents, and a
+// second applier is unaffected.
+func TestGroupOnApplyErrorIsVisibleInStatus(t *testing.T) {
+	t.Parallel()
+
+	c := newGroupHotClient(t, newGroupMemoryStore())
+	g := bindGroupOn(t, c)
+	startGroupClient(t, c)
+
+	rejecting := &applyRecorder{err: errors.New("applier refused the document")}
+
+	var accepting applyRecorder
+
+	unsubscribeRejecting, err := g.OnApply(rejecting.apply)
+	if err != nil {
+		t.Fatalf("OnApply (rejecting): %v", err)
+	}
+
+	t.Cleanup(unsubscribeRejecting)
+
+	unsubscribeAccepting, err := g.OnApply(accepting.apply)
+	if err != nil {
+		t.Fatalf("OnApply (accepting): %v", err)
+	}
+
+	t.Cleanup(unsubscribeAccepting)
+
+	rolled := groupConfig{Name: "rolled", Retries: 7, Hosts: []string{"c"}}
+	if err := g.Set(context.Background(), rolled, "operator"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	rejected := rejecting.all()
+	if len(rejected) != 2 {
+		t.Fatalf("deliveries to the rejecting applier = %d, want 2", len(rejected))
+	}
+
+	// A rejection is never retried and never becomes Previous.
+	if rejected[1].Previous != nil {
+		t.Errorf("Previous after a rejection = %#v, want nil", rejected[1].Previous)
+	}
+
+	accepted := accepting.all()
+	if len(accepted) != 2 || !reflect.DeepEqual(accepted[1].Value, rolled) {
+		t.Fatalf("deliveries to the accepting applier = %#v, want the defaults then %#v", accepted, rolled)
+	}
+
+	if accepted[1].Previous == nil {
+		t.Error("Previous for the accepting applier = nil, want the document it accepted first")
+	}
+
+	status := g.Status()
+	if len(status) != 1 {
+		t.Fatalf("Status = %#v, want one scope", status)
+	}
+
+	if status[0].Tenant != "" {
+		t.Errorf("Status[0].Tenant = %q, want the single-tenant scope", status[0].Tenant)
+	}
+
+	// Every revision the single-tenant facade publishes is 0, so FC-7's
+	// "LastErr is nil when Desired == Applied" holds here by construction.
+	if status[0].Desired != status[0].Applied || status[0].LastErr != nil {
+		t.Errorf("Status[0] = %#v, want a converged scope with a nil LastErr on the wave-1 facade", status[0])
+	}
+}
+
+// TestGroupOnApplyUnsubscribeStopsDelivery proves the handle OnApply returns
+// detaches the applier and releases its hold on the scope's applied revision.
+func TestGroupOnApplyUnsubscribeStopsDelivery(t *testing.T) {
+	t.Parallel()
+
+	c := newGroupHotClient(t, newGroupMemoryStore())
+	g := bindGroupOn(t, c)
+	startGroupClient(t, c)
+
+	var rec applyRecorder
+
+	unsubscribe, err := g.OnApply(rec.apply)
+	if err != nil {
+		t.Fatalf("OnApply: %v", err)
+	}
+
+	before := rec.count()
+	if before == 0 {
+		t.Fatal("no initial delivery, want the current document before OnApply returned")
+	}
+
+	unsubscribe()
+	unsubscribe()
+
+	if err := g.Set(context.Background(), groupConfig{Name: "rolled", Retries: 7, Hosts: []string{"c"}}, "operator"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	if after := rec.count(); after != before {
+		t.Errorf("deliveries after unsubscribing = %d, want the %d from before", after, before)
+	}
+
+	status := g.Status()
+	if len(status) != 1 || status[0].Desired != status[0].Applied || status[0].LastErr != nil {
+		t.Errorf("Status after unsubscribing = %#v, want a converged scope", status)
+	}
+}
+
+// TestGroupOnApplyWithNilFunctionIsANoOp matches Client.OnChange: a nil
+// function is accepted and registers nothing.
+func TestGroupOnApplyWithNilFunctionIsANoOp(t *testing.T) {
+	t.Parallel()
+
+	c := newGroupHotClient(t, newGroupMemoryStore())
+	g := bindGroupOn(t, c)
+	startGroupClient(t, c)
+
+	unsubscribe, err := g.OnApply(nil)
+	if err != nil {
+		t.Fatalf("OnApply(nil) = %v, want no error", err)
+	}
+
+	if unsubscribe == nil {
+		t.Fatal("OnApply(nil) returned a nil unsubscribe")
+	}
+
+	unsubscribe()
+
+	if err := g.Set(context.Background(), groupConfig{Name: "rolled", Retries: 7, Hosts: []string{"c"}}, "operator"); err != nil {
+		t.Fatalf("Set after a nil OnApply: %v", err)
+	}
+}
+
+// TestGroupOnApplyInMultiTenantReturnsErrNotSupported pins D-G7's multi-tenant
+// stance: the group records the refusal at Bind and reports it from OnApply,
+// while Snapshot and Set keep working for that consumer.
+func TestGroupOnApplyInMultiTenantReturnsErrNotSupported(t *testing.T) {
+	t.Parallel()
+
+	s := newGroupMemoryStore()
+
+	c, err := systemplane.NewForTesting(s, systemplane.WithMultiTenantEnabled())
+	if err != nil {
+		t.Fatalf("NewForTesting: %v", err)
+	}
+
+	t.Cleanup(func() { _ = c.Close() })
+
+	g := bindGroupOn(t, c)
+	startGroupClient(t, c)
+
+	unsubscribe, err := g.OnApply(func(context.Context, systemplane.Applied[groupConfig]) error { return nil })
+	if !errors.Is(err, systemplane.ErrNotSupportedInMultiTenant) {
+		t.Fatalf("OnApply in multi-tenant mode = %v, want ErrNotSupportedInMultiTenant", err)
+	}
+
+	if unsubscribe == nil {
+		t.Fatal("OnApply returned a nil unsubscribe alongside its error")
+	}
+
+	unsubscribe()
+
+	ctx := context.Background()
+
+	rolled := groupConfig{Name: "rolled", Retries: 7, Hosts: []string{"c"}}
+	if err := g.Set(ctx, rolled, "operator"); err != nil {
+		t.Fatalf("Set in multi-tenant mode: %v", err)
+	}
+
+	snapshot, err := g.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot in multi-tenant mode: %v", err)
+	}
+
+	if !reflect.DeepEqual(snapshot.Value, rolled) {
+		t.Errorf("Snapshot = %#v, want %#v", snapshot.Value, rolled)
+	}
+}
+
+// TestGroupStatusIsEmptyBeforeAnyObservation: nothing has been published and
+// nothing registered, so there is no scope to report.
+func TestGroupStatusIsEmptyBeforeAnyObservation(t *testing.T) {
+	t.Parallel()
+
+	c := newGroupHotClient(t, newGroupMemoryStore())
+	g := bindGroupOn(t, c)
+
+	if status := g.Status(); len(status) != 0 {
+		t.Errorf("Status before any observation = %#v, want empty", status)
+	}
+}
+
+// TestGroupOnApplyOnNilGroupReturnsErrClosed pins D-G10.
+func TestGroupOnApplyOnNilGroupReturnsErrClosed(t *testing.T) {
+	t.Parallel()
+
+	var g *systemplane.Group[groupConfig]
+
+	unsubscribe, err := g.OnApply(func(context.Context, systemplane.Applied[groupConfig]) error { return nil })
+	if !errors.Is(err, systemplane.ErrClosed) {
+		t.Fatalf("OnApply on a nil group = %v, want ErrClosed", err)
+	}
+
+	if unsubscribe == nil {
+		t.Fatal("OnApply on a nil group returned a nil unsubscribe")
+	}
+
+	unsubscribe()
+}
+
+// TestGroupStatusOnNilGroupReturnsNil pins the other half of D-G10.
+func TestGroupStatusOnNilGroupReturnsNil(t *testing.T) {
+	t.Parallel()
+
+	var g *systemplane.Group[groupConfig]
+
+	if status := g.Status(); status != nil {
+		t.Errorf("Status on a nil group = %#v, want nil", status)
+	}
+}
