@@ -7,6 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -24,6 +27,18 @@ import (
 )
 
 func startContainer(t *testing.T) (*mongo.Client, func()) {
+	t.Helper()
+
+	client, _, cleanup := startContainerAt(t)
+
+	return client, cleanup
+}
+
+// startContainerAt is startContainer plus the container's own host:port. A test
+// that severs the store's connection needs the real address to forward to,
+// because the store reaches MongoDB through a proxy it can take down and the
+// gap write must not.
+func startContainerAt(t *testing.T) (*mongo.Client, string, func()) {
 	t.Helper()
 
 	ctx := context.Background()
@@ -62,7 +77,14 @@ func startContainer(t *testing.T) (*mongo.Client, func()) {
 		t.Fatalf("wait for writable primary: %v", err)
 	}
 
-	return client, cleanup
+	parsed, err := url.Parse(uri)
+	if err != nil {
+		cleanup()
+
+		t.Fatalf("parse connection string %q: %v", uri, err)
+	}
+
+	return client, parsed.Host, cleanup
 }
 
 func waitForWritablePrimary(client *mongo.Client) error {
@@ -614,8 +636,8 @@ func TestIntegration_MongoDollarPrefixedStringsStoredVerbatim(t *testing.T) {
 	}
 }
 
-// setForDelete writes one entry through the store and returns its revision.
-func setForDelete(t *testing.T, s store.Store, namespace, key, value string) int64 {
+// setEntry writes one entry through the store and returns its revision.
+func setEntry(t *testing.T, s store.Store, namespace, key, value string) int64 {
 	t.Helper()
 
 	rev, err := s.Set(context.Background(), store.Scope{}, store.Entry{
@@ -642,7 +664,7 @@ func TestIntegration_MongoDeleteLeavesTombstone(t *testing.T) {
 	s, coll := freshSingleTenantStore(t, client, "tombstone")
 	ctx := context.Background()
 
-	r1 := setForDelete(t, s, "ns", "k", `{"a":1}`)
+	r1 := setEntry(t, s, "ns", "k", `{"a":1}`)
 
 	if err := s.Delete(ctx, store.Scope{}, "ns", "k", "deleter"); err != nil {
 		t.Fatalf("delete: %v", err)
@@ -695,7 +717,7 @@ func TestIntegration_MongoRecreateAfterDeleteExceedsTombstone(t *testing.T) {
 	s, coll := freshSingleTenantStore(t, client, "recreate")
 	ctx := context.Background()
 
-	r1 := setForDelete(t, s, "ns", "k", `{"a":1}`)
+	r1 := setEntry(t, s, "ns", "k", `{"a":1}`)
 
 	if err := s.Delete(ctx, store.Scope{}, "ns", "k", "deleter"); err != nil {
 		t.Fatalf("delete: %v", err)
@@ -706,7 +728,7 @@ func TestIntegration_MongoRecreateAfterDeleteExceedsTombstone(t *testing.T) {
 		t.Fatalf("tombstone revision = %d, want > %d", tombstone, r1)
 	}
 
-	r2 := setForDelete(t, s, "ns", "k", `{"a":2}`)
+	r2 := setEntry(t, s, "ns", "k", `{"a":2}`)
 	if r2 <= tombstone {
 		t.Fatalf("recreated revision = %d, want strictly greater than the tombstone's %d", r2, tombstone)
 	}
@@ -742,7 +764,7 @@ func TestIntegration_MongoRepeatDeleteWritesNothing(t *testing.T) {
 	s, coll := freshSingleTenantStore(t, client, "repeatdelete")
 	ctx := context.Background()
 
-	setForDelete(t, s, "ns", "k", `{"a":1}`)
+	setEntry(t, s, "ns", "k", `{"a":1}`)
 
 	if err := s.Delete(ctx, store.Scope{}, "ns", "k", "deleter"); err != nil {
 		t.Fatalf("first delete: %v", err)
@@ -947,7 +969,7 @@ func tenantStore(t *testing.T, conn mongodb.Connector) *mongodb.Store {
 // subscribeScope subscribes to scope and returns the delivered events. The
 // channel is buffered because a joining subscriber's OpResync is delivered
 // synchronously inside Subscribe.
-func subscribeScope(t *testing.T, s *mongodb.Store, scope store.Scope) (<-chan store.Event, func()) {
+func subscribeScope(t *testing.T, s store.Store, scope store.Scope) (<-chan store.Event, func()) {
 	t.Helper()
 
 	events := make(chan store.Event, 32)
@@ -1406,4 +1428,503 @@ func TestIntegration_MongoSubscribeReturnsErrorWhenWatchFails(t *testing.T) {
 			t.Fatalf("Start error = %v, want the Watch failure", err)
 		}
 	})
+}
+
+// collectUntil drains events until pred accepts one, returning every event seen
+// including it. On timeout it fails the test printing the whole sequence, which
+// is the only useful thing to look at when an outage narrates the wrong order.
+func collectUntil(t *testing.T, events <-chan store.Event, what string, timeout time.Duration, pred func(store.Event) bool) []store.Event {
+	t.Helper()
+
+	var seen []store.Event
+
+	deadline := time.After(timeout)
+
+	for {
+		select {
+		case evt := <-events:
+			seen = append(seen, evt)
+
+			if pred(evt) {
+				return seen
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for %s; sequence = %#v", what, seen)
+
+			return seen
+		}
+	}
+}
+
+// drainKeyEvents collects every event for namespace/key until the feed has been
+// quiet for quiet, or limit elapses. The quiet timer only starts once something
+// has arrived, so a slow first delivery cannot end the drain early.
+//
+// FC-9 pins only the FINAL state a key converges to, never the intermediate
+// sequence, so a test judging a collapse has to look at the whole settled run
+// rather than at the next event.
+func drainKeyEvents(events <-chan store.Event, namespace, key string, quiet, limit time.Duration) []store.Event {
+	var seen []store.Event
+
+	hard := time.After(limit)
+
+	for {
+		var settled <-chan time.Time
+		if len(seen) > 0 {
+			settled = time.After(quiet)
+		}
+
+		select {
+		case evt := <-events:
+			if evt.Namespace == namespace && evt.Key == key {
+				seen = append(seen, evt)
+			}
+		case <-settled:
+			return seen
+		case <-hard:
+			return seen
+		}
+	}
+}
+
+func countOps(events []store.Event, op string) int {
+	n := 0
+
+	for _, evt := range events {
+		if evt.Op == op {
+			n++
+		}
+	}
+
+	return n
+}
+
+// startFeed builds a single-tenant store on its own database, starts it and
+// subscribes, returning the events channel with the joining OpResync already
+// consumed. Every changefeed test opens this way.
+func startFeed(t *testing.T, client *mongo.Client, prefix string) (store.Store, <-chan store.Event) {
+	t.Helper()
+
+	s, _ := freshSingleTenantStore(t, client, prefix)
+
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	events, unsub := subscribeScope(t, s, store.Scope{})
+	t.Cleanup(unsub)
+
+	if evt := recvEvent(t, events, "the joining resync"); evt.Op != store.OpResync {
+		t.Fatalf("first event after Subscribe = %#v, want %q", evt, store.OpResync)
+	}
+
+	return s, events
+}
+
+// TestIntegration_MongoEventCarriesRevision pins FC-2 on the changefeed: an
+// upsert event carries the revision the write reported. Without it every event
+// would arrive at revision 0 — "unknown" — and the engine would re-read and
+// republish on every echo of its own Set instead of deduplicating it.
+func TestIntegration_MongoEventCarriesRevision(t *testing.T) {
+	client, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	s, events := startFeed(t, client, "eventrev")
+
+	rev := setEntry(t, s, "ns", "k", `{"a":1}`)
+
+	evt := recvEvent(t, events, "the upsert for ns/k")
+	if evt.Op != store.OpUpsert || evt.Namespace != "ns" || evt.Key != "k" {
+		t.Fatalf("event after Set = %#v, want an upsert for ns/k", evt)
+	}
+
+	if evt.Revision != rev {
+		t.Fatalf("upsert event revision = %d, want %d — the revision Set reported", evt.Revision, rev)
+	}
+
+	if evt.Scope != (store.Scope{}) {
+		t.Fatalf("upsert event scope = %#v, want the zero scope the subscription named", evt.Scope)
+	}
+}
+
+// TestIntegration_MongoTombstoneEventIsADelete pins the other half of FC-9's
+// classification: Delete writes a tombstone through an UPDATE, so the operation
+// type would report an upsert and publish a deleted key as if it still had a
+// value. The after-image decides instead, and the event is indistinguishable
+// from the one a foreign writer's raw delete produces.
+//
+// The repeat Delete at the end is the assertion Task 2.2.2's filter buys and
+// this is the first test with a subscriber to make it: an existing tombstone
+// matches nothing, so nothing is written and nothing reaches the change stream.
+// A write there would land as a second OpDelete at revision 0, which nothing
+// deduplicates.
+func TestIntegration_MongoTombstoneEventIsADelete(t *testing.T) {
+	client, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	s, events := startFeed(t, client, "tombevent")
+	ctx := context.Background()
+
+	setEntry(t, s, "ns", "k", `{"a":1}`)
+
+	if evt := recvEvent(t, events, "the upsert that proves the stream is attached"); evt.Op != store.OpUpsert {
+		t.Fatalf("event after Set = %#v, want an upsert", evt)
+	}
+
+	if err := s.Delete(ctx, store.Scope{}, "ns", "k", "actor"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	evt := recvEvent(t, events, "the delete for ns/k")
+	if evt.Op != store.OpDelete || evt.Namespace != "ns" || evt.Key != "k" || evt.Revision != 0 {
+		t.Fatalf("tombstone event = %#v, want OpDelete for ns/k at revision 0", evt)
+	}
+
+	if err := s.Delete(ctx, store.Scope{}, "ns", "k", "actor"); err != nil {
+		t.Fatalf("second Delete: %v", err)
+	}
+
+	assertNoEvent(t, events, 5*time.Second, "a repeat Delete of an existing tombstone")
+}
+
+// TestIntegration_MongoDeleteThenRecreateConvergesToLiveValue pins the
+// observation model FC-9 states outright: classification reads the document as
+// updateLookup returns it at PROCESSING time — the current majority-committed
+// document, not a point-in-time image — so a delete and a recreate landing
+// inside one lookup window collapse into a single upsert at the recreate's
+// revision. The store contract on both backends is final-state convergence, the
+// same model Postgres has where NOTIFY carries no value and the engine re-reads
+// the row.
+//
+// The test therefore judges only the LAST event for the key. Asserting that the
+// intermediate OpDelete was observed would encode a guarantee the contract does
+// not make, and would flake exactly when the collapse happens.
+func TestIntegration_MongoDeleteThenRecreateConvergesToLiveValue(t *testing.T) {
+	client, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	s, events := startFeed(t, client, "converge")
+	ctx := context.Background()
+
+	setEntry(t, s, "ns", "k", `{"a":1}`)
+
+	if evt := recvEvent(t, events, "the upsert that proves the stream is attached"); evt.Op != store.OpUpsert {
+		t.Fatalf("event after Set = %#v, want an upsert", evt)
+	}
+
+	if err := s.Delete(ctx, store.Scope{}, "ns", "k", "actor"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	rev := setEntry(t, s, "ns", "k", `{"a":2}`)
+
+	seen := drainKeyEvents(events, "ns", "k", 3*time.Second, 25*time.Second)
+	if len(seen) == 0 {
+		t.Fatal("the delete-then-recreate produced no event at all for ns/k")
+	}
+
+	last := seen[len(seen)-1]
+	if last.Op != store.OpUpsert || last.Revision != rev {
+		t.Fatalf("last event for ns/k = %#v, want an upsert at revision %d; sequence = %#v", last, rev, seen)
+	}
+
+	entry, found, err := s.Get(ctx, store.Scope{}, "ns", "k")
+	if err != nil || !found {
+		t.Fatalf("Get after recreate = (%#v, %v, %v), want the recreated entry", entry, found, err)
+	}
+
+	if entry.Revision != rev || string(entry.Value) != `{"a":2}` {
+		t.Fatalf("Get after recreate = value %q at revision %d, want %q at %d", entry.Value, entry.Revision, `{"a":2}`, rev)
+	}
+}
+
+// tcpProxy forwards a local port to the container's MongoDB port so a test can
+// sever the store's connection and restore it on the same address.
+//
+// This is how an outage is produced deterministically. killCursors would also
+// work — a CursorKilled carries no ResumableChangeStreamError label, so the
+// driver does not resume it transparently — but obtaining the live cursor id
+// means exposing the feed's *mongo.ChangeStream from production code purely for
+// a test. Dropping the container is worse: a plain network error IS resumable,
+// the driver resumes it internally, and a short outage would announce nothing
+// at all. The same hazard applies here, which is why the store's client is
+// built with a 2s server-selection bound and every outage below outlasts it.
+type tcpProxy struct {
+	target string
+	addr   string
+
+	mu      sync.Mutex
+	ln      net.Listener
+	conns   []net.Conn
+	severed bool
+
+	wg sync.WaitGroup
+}
+
+func newTCPProxy(t *testing.T, target string) *tcpProxy {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for proxy: %v", err)
+	}
+
+	p := &tcpProxy{target: target, addr: ln.Addr().String()}
+	p.serve(ln)
+
+	t.Cleanup(p.sever)
+
+	return p
+}
+
+func (p *tcpProxy) serve(ln net.Listener) {
+	p.mu.Lock()
+	p.ln = ln
+	p.severed = false
+	p.mu.Unlock()
+
+	p.wg.Add(1)
+
+	go func() {
+		defer p.wg.Done()
+
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+
+			p.handle(conn)
+		}
+	}()
+}
+
+// handle wires one accepted connection to the target. The severed check and the
+// append happen in ONE hold: a connection admitted after sever snapshotted the
+// list would otherwise keep its io.Copy goroutines alive forever, and the
+// package's goleak guard would fail the whole suite over it.
+func (p *tcpProxy) handle(client net.Conn) {
+	upstream, err := net.Dial("tcp", p.target)
+	if err != nil {
+		_ = client.Close()
+
+		return
+	}
+
+	p.mu.Lock()
+
+	if p.severed {
+		p.mu.Unlock()
+
+		_ = client.Close()
+		_ = upstream.Close()
+
+		return
+	}
+
+	p.conns = append(p.conns, client, upstream)
+	p.mu.Unlock()
+
+	p.pipe(client, upstream)
+	p.pipe(upstream, client)
+}
+
+func (p *tcpProxy) pipe(dst, src net.Conn) {
+	p.wg.Add(1)
+
+	go func() {
+		defer p.wg.Done()
+
+		_, _ = io.Copy(dst, src)
+
+		_ = dst.Close()
+		_ = src.Close()
+	}()
+}
+
+// sever takes the proxy down: no new connections, and every live one dropped.
+// It waits for the forwarding goroutines so a severed proxy leaves nothing
+// running, and is safe to call twice — t.Cleanup always calls it once more.
+func (p *tcpProxy) sever() {
+	p.mu.Lock()
+	p.severed = true
+	ln, conns := p.ln, p.conns
+	p.ln, p.conns = nil, nil
+	p.mu.Unlock()
+
+	if ln != nil {
+		_ = ln.Close()
+	}
+
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
+
+	p.wg.Wait()
+}
+
+// restore brings the proxy back on the SAME address, which is what lets the
+// store's own client reconnect without knowing anything happened.
+func (p *tcpProxy) restore(t *testing.T) {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", p.addr)
+	if err != nil {
+		t.Fatalf("restore proxy on %s: %v", p.addr, err)
+	}
+
+	p.serve(ln)
+}
+
+// proxiedStore builds a store whose every connection travels through proxy. The
+// short server-selection bound is what makes the failure fast and the outage
+// deterministic: without it a severed feed would sit in selection for 30s and
+// the test would be timing out rather than observing anything.
+func proxiedStore(t *testing.T, proxy *tcpProxy, prefix string) (store.Store, string) {
+	t.Helper()
+
+	client, err := mongo.Connect(options.Client().
+		ApplyURI("mongodb://" + proxy.addr).
+		SetDirect(true).
+		SetServerSelectionTimeout(2 * time.Second))
+	if err != nil {
+		t.Fatalf("connect through proxy: %v", err)
+	}
+
+	dbName := fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano())
+
+	s, err := mongodb.New(mongodb.Config{Client: client, Database: dbName})
+	if err != nil {
+		t.Fatalf("mongodb.New: %v", err)
+	}
+
+	t.Cleanup(func() {
+		_ = s.Close()
+		_ = client.Disconnect(context.Background())
+	})
+
+	return s, dbName
+}
+
+// outageHarness stands up the whole severable setup: a store that reaches
+// MongoDB only through the proxy, already started and subscribed with its
+// joining OpResync consumed, plus a second store wired DIRECTLY to the
+// container for the write that has to land while the feed is blind.
+func outageHarness(t *testing.T, prefix string) (proxied store.Store, direct store.Store, events <-chan store.Event, proxy *tcpProxy) {
+	t.Helper()
+
+	client, endpoint, cleanup := startContainerAt(t)
+	t.Cleanup(cleanup)
+
+	proxy = newTCPProxy(t, endpoint)
+
+	proxied, dbName := proxiedStore(t, proxy, prefix)
+
+	direct, err := mongodb.New(mongodb.Config{Client: client, Database: dbName})
+	if err != nil {
+		t.Fatalf("mongodb.New direct: %v", err)
+	}
+
+	t.Cleanup(func() { _ = direct.Close() })
+
+	if err := proxied.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	eventsCh, unsub := subscribeScope(t, proxied, store.Scope{})
+	t.Cleanup(unsub)
+
+	if evt := recvEvent(t, eventsCh, "the joining resync"); evt.Op != store.OpResync {
+		t.Fatalf("first event after Subscribe = %#v, want %q", evt, store.OpResync)
+	}
+
+	setEntry(t, proxied, "ns", "k", `{"a":1}`)
+
+	if evt := recvEvent(t, eventsCh, "the upsert that proves the stream is attached"); evt.Op != store.OpUpsert {
+		t.Fatalf("event after Set = %#v, want an upsert", evt)
+	}
+
+	return proxied, direct, eventsCh, proxy
+}
+
+// TestIntegration_MongoResyncAfterCursorKill pins the outage narration FC-2
+// requires. One lost connection produces exactly one OpDisconnect, the
+// reconnect exactly one OpResync, and in that order. The change stream is
+// reopened with no resume token, so a write that landed while the feed was
+// blind is never replayed as an event: OpResync is the ONLY thing that tells
+// the engine to go and find it, and the Get at the end is what proves it is
+// there to be found.
+func TestIntegration_MongoResyncAfterCursorKill(t *testing.T) {
+	proxied, direct, events, proxy := outageHarness(t, "resync")
+
+	proxy.sever()
+
+	// Through the severed proxy this write would never land at all.
+	gapRev := setEntry(t, direct, "ns", "k", `{"a":2}`)
+
+	// The outage must outlast the driver's own resume attempt, which the 2s
+	// server-selection bound caps. A shorter one is resumed transparently and
+	// announces nothing.
+	time.Sleep(5 * time.Second)
+
+	proxy.restore(t)
+
+	narration := collectUntil(t, events, "the OpResync after the reconnect", 60*time.Second,
+		func(evt store.Event) bool { return evt.Op == store.OpResync })
+
+	if narration[0].Op != store.OpDisconnect {
+		t.Fatalf("outage began with %#v, want OpDisconnect first; sequence = %#v", narration[0], narration)
+	}
+
+	if got := countOps(narration, store.OpDisconnect); got != 1 {
+		t.Fatalf("outage narrated %d disconnects, want exactly 1; sequence = %#v", got, narration)
+	}
+
+	if got := countOps(narration, store.OpResync); got != 1 {
+		t.Fatalf("outage narrated %d resyncs, want exactly 1; sequence = %#v", got, narration)
+	}
+
+	entry, found, err := proxied.Get(context.Background(), store.Scope{}, "ns", "k")
+	if err != nil || !found {
+		t.Fatalf("Get after the resync = (%#v, %v, %v), want the gap write", entry, found, err)
+	}
+
+	if entry.Revision != gapRev || string(entry.Value) != `{"a":2}` {
+		t.Fatalf("Get after the resync = value %q at revision %d, want %q at %d — the write that landed while the feed was blind", entry.Value, entry.Revision, `{"a":2}`, gapRev)
+	}
+}
+
+// TestIntegration_MongoRepeatedReopenFailuresEmitOneDisconnect is the same
+// outage held open long enough for several reopen attempts to fail: the backoff
+// starts at 500ms and each attempt burns the 2s server-selection bound, so the
+// window below covers at least two of them. However many fail, the engine must
+// hear ONE disconnect and ONE resync — a disconnect per failed attempt would
+// have it marking a scope stale it already believes is stale, and a resync per
+// attempt would have it reloading a scope that never came back.
+func TestIntegration_MongoRepeatedReopenFailuresEmitOneDisconnect(t *testing.T) {
+	_, _, events, proxy := outageHarness(t, "reopenfail")
+
+	proxy.sever()
+	time.Sleep(12 * time.Second)
+	proxy.restore(t)
+
+	narration := collectUntil(t, events, "the OpResync after a long outage", 90*time.Second,
+		func(evt store.Event) bool { return evt.Op == store.OpResync })
+
+	if narration[0].Op != store.OpDisconnect {
+		t.Fatalf("outage began with %#v, want OpDisconnect first; sequence = %#v", narration[0], narration)
+	}
+
+	if got := countOps(narration, store.OpDisconnect); got != 1 {
+		t.Fatalf("a long outage narrated %d disconnects, want exactly 1; sequence = %#v", got, narration)
+	}
+
+	if got := countOps(narration, store.OpResync); got != 1 {
+		t.Fatalf("a long outage narrated %d resyncs, want exactly 1; sequence = %#v", got, narration)
+	}
+
+	// Nothing but the pair: a failed reopen attempt announces nothing of its own.
+	if len(narration) != 2 {
+		t.Fatalf("outage narrated %d events, want exactly the disconnect/resync pair; sequence = %#v", len(narration), narration)
+	}
 }

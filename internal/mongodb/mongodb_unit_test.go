@@ -262,37 +262,59 @@ func TestStore_ClosedAndNilPaths(t *testing.T) {
 func TestChangeEventAndDispatch(t *testing.T) {
 	t.Parallel()
 
-	upsert, ok := eventFromChange(changeEvent{
-		OperationType: "insert",
-		DocumentKey: struct {
-			ID compoundID `bson:"_id"`
-		}{ID: compoundID{Namespace: "ns", Key: "k"}},
-	})
-	if !ok || upsert.Op != store.OpUpsert || upsert.Namespace != "ns" || upsert.Key != "k" {
-		t.Fatalf("upsert event = (%#v, %v)", upsert, ok)
+	// Every classification rule of FC-9, in the order eventFromChange applies
+	// them. The revision an upsert carries is the after-image's, which is what
+	// lets the engine dedupe an echo of its own Set; a delete carries 0, which
+	// FC-2 reads as unknown and never fences or deduplicates.
+	classify := []struct {
+		name         string
+		ce           changeEvent
+		wantOp       string
+		wantRevision int64
+	}{
+		{
+			name:         "insert carries the after-image revision",
+			ce:           changeEventFor("insert", &entryDoc{Namespace: "ns", Key: "k", Revision: 7}),
+			wantOp:       store.OpUpsert,
+			wantRevision: 7,
+		},
+		{
+			// A tombstone is written as an UPDATE (FC-9), so the operation type
+			// alone cannot tell a delete from a write: the after-image decides,
+			// and the revision it carries is discarded with it.
+			name:         "tombstone after-image is a delete at revision 0",
+			ce:           changeEventFor("update", &entryDoc{Namespace: "ns", Key: "k", Revision: 42, Deleted: true}),
+			wantOp:       store.OpDelete,
+			wantRevision: 0,
+		},
+		{
+			name:         "raw delete from a foreign writer has no after-image",
+			ce:           changeEventFor(operationTypeDelete, nil),
+			wantOp:       store.OpDelete,
+			wantRevision: 0,
+		},
+		{
+			// The lookup runs at delivery time, so a foreign deleteOne between
+			// the change and the lookup leaves it empty. Publishing revision 0
+			// costs only the dedupe hint — store.Event never carries a value.
+			name:         "empty lookup publishes an upsert at revision 0",
+			ce:           changeEventFor("update", nil),
+			wantOp:       store.OpUpsert,
+			wantRevision: 0,
+		},
 	}
 
-	deleted, ok := eventFromChange(changeEvent{
-		OperationType: operationTypeDelete,
-		DocumentKey: struct {
-			ID compoundID `bson:"_id"`
-		}{ID: compoundID{Namespace: "ns", Key: "k"}},
-	})
-	if !ok || deleted.Op != store.OpDelete {
-		t.Fatalf("delete event = (%#v, %v)", deleted, ok)
-	}
+	var upsert store.Event
 
-	// A tombstone is written as an UPDATE (FC-9), so the operation type alone
-	// cannot tell a delete from a write: the after-image decides.
-	tombstoned, ok := eventFromChange(changeEvent{
-		OperationType: "update",
-		DocumentKey: struct {
-			ID compoundID `bson:"_id"`
-		}{ID: compoundID{Namespace: "ns", Key: "k"}},
-		FullDocument: &entryDoc{Namespace: "ns", Key: "k", Deleted: true},
-	})
-	if !ok || tombstoned.Op != store.OpDelete {
-		t.Fatalf("tombstone event = (%#v, %v), want OpDelete", tombstoned, ok)
+	for _, tt := range classify {
+		evt, ok := eventFromChange(tt.ce)
+		if !ok || evt.Op != tt.wantOp || evt.Revision != tt.wantRevision || evt.Namespace != "ns" || evt.Key != "k" {
+			t.Fatalf("%s: eventFromChange = (%#v, %v), want Op %q at revision %d for ns/k", tt.name, evt, ok, tt.wantOp, tt.wantRevision)
+		}
+
+		if tt.wantOp == store.OpUpsert && tt.wantRevision != 0 {
+			upsert = evt
+		}
 	}
 
 	for _, ce := range []changeEvent{
@@ -327,6 +349,16 @@ func TestChangeEventAndDispatch(t *testing.T) {
 	if len(got) != 1 || got[0] != want {
 		t.Fatalf("dispatch events = %#v, want %#v", got, []store.Event{want})
 	}
+}
+
+// changeEventFor builds a decoded change-stream event for one document. The
+// documentKey is always well-formed: the identifier-missing cases are built
+// inline, since that is the field they are about.
+func changeEventFor(operationType string, full *entryDoc) changeEvent {
+	ce := changeEvent{OperationType: operationType, FullDocument: full}
+	ce.DocumentKey.ID = compoundID{Namespace: "ns", Key: "k"}
+
+	return ce
 }
 
 func TestIsNamespaceExists(t *testing.T) {

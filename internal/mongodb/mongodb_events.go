@@ -72,12 +72,31 @@ func eventFromChange(ce changeEvent) (store.Event, bool) {
 	// deleted (FC-9), so the operation type alone cannot tell a delete from a
 	// write: the after-image decides. A raw delete — a foreign writer removing
 	// the document outright — carries no after-image and is still a delete.
-	op := store.OpUpsert
+	// Either way the event carries no revision: FC-2 fixes a delete at 0.
 	if ce.OperationType == operationTypeDelete || (ce.FullDocument != nil && ce.FullDocument.Deleted) {
-		op = store.OpDelete
+		return store.Event{Namespace: id.Namespace, Key: id.Key, Op: store.OpDelete}, true
 	}
 
-	return store.Event{Namespace: id.Namespace, Key: id.Key, Op: op}, true
+	// The after-image is read as updateLookup returns it at PROCESSING time —
+	// the current majority-committed document, not a point-in-time image. That
+	// is the observation model Postgres already has, where NOTIFY carries no
+	// value and the engine re-reads the row, and the store contract on both
+	// backends is final-state convergence rather than point-in-time replay
+	// (FC-9).
+	//
+	// A nil after-image is the one case the lookup cannot fill: a FOREIGN
+	// deleteOne removed the document between the change and the lookup (the
+	// library's own delete always leaves the tombstone). Revision 0 means
+	// unknown to FC-2 — never fenced, never deduplicated — so the engine
+	// re-reads the row, and the deleteOne's own delete event converges the key
+	// right behind this one. store.Event carries an identity and a revision and
+	// never a value, so the only thing an empty lookup costs is the dedupe hint.
+	var revision int64
+	if ce.FullDocument != nil {
+		revision = ce.FullDocument.Revision
+	}
+
+	return store.Event{Namespace: id.Namespace, Key: id.Key, Op: store.OpUpsert, Revision: revision}, true
 }
 
 // snapshotLocked copies the subscriber set so it can be fanned out to after
