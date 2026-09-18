@@ -301,22 +301,32 @@ func (s *Store) resolveDB(ctx context.Context, scope store.Scope) (dbExecutor, e
 // changefeed is reconciling against, since the feed LISTENs on the primary
 // DSN. Read-your-write and revision coherence are worth more than offloading a
 // five-column configuration table, so a resolver carrying replicas is narrowed
-// to its primary. A resolver with no replicas is handed back untouched: it
-// already resolves everything to the primary, and keeping the wrapper
-// preserves its failover behavior.
+// to its primaries. A resolver with no replicas is handed back untouched: it
+// already resolves everything to a primary, and keeping the wrapper preserves
+// its failover behavior.
+//
+// Narrowing keeps EVERY primary, and hands back a resolver rather than one
+// *sql.DB, for the same reason: a tenant whose config declares several
+// writable connection strings would otherwise be pinned to whichever one came
+// first for the life of the process, so losing that node would take the
+// tenant's configuration down while its other primaries were healthy. The
+// narrowed resolver keeps dbresolver's rotation across primaries and its retry
+// on another primary when a read fails with a connection error; only the
+// standbys are excluded.
 func pinPrimary(db dbresolver.DB) dbExecutor {
 	if len(db.ReplicaDBs()) == 0 {
 		return db
 	}
 
 	// A resolver with replicas but no primary is a connector bug; there is
-	// nothing better to fall back to than the resolver itself.
+	// nothing better to fall back to than the resolver itself. It also keeps
+	// the narrowing below out of dbresolver.New's no-primary panic.
 	primaries := db.PrimaryDBs()
 	if len(primaries) == 0 {
 		return db
 	}
 
-	return primaries[0]
+	return dbresolver.New(dbresolver.WithPrimaryDBs(primaries...))
 }
 
 // List returns every entry in the resolved database, ordered by (namespace, key).

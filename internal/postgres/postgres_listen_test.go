@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 	"go.uber.org/goleak"
 )
@@ -1075,4 +1076,180 @@ func TestPostgresSubscribe_CloseDuringResolutionSkipsTheDial(t *testing.T) {
 	}
 
 	waitForObserverExit(t)
+}
+
+// captureLogger records what the store logs so a test can pin an operator-
+// facing message. Log is the only method with behavior; the rest satisfy the
+// interface. Entries are appended from the calling goroutine only — every test
+// below drives the logging path synchronously.
+type captureLogger struct {
+	entries []captureEntry
+}
+
+type captureEntry struct {
+	level  int
+	msg    string
+	fields []log.Field
+}
+
+// Log normalizes the ...any variadic the way the library does: the store hands
+// its []log.Field over as a single element, so the assertions below still read
+// f.Key/f.Value.
+func (c *captureLogger) Log(_ context.Context, level int, msg string, fields ...any) {
+	c.entries = append(c.entries, captureEntry{level: level, msg: msg, fields: log.Fields(fields...)})
+}
+
+func (c *captureLogger) With(...any) log.Logger      { return c }
+func (c *captureLogger) WithGroup(string) log.Logger { return c }
+func (c *captureLogger) Enabled(int) bool            { return true }
+func (c *captureLogger) Sync(context.Context) error  { return nil }
+
+// only returns the single entry logged at level, failing when the count is not
+// exactly one.
+func (c *captureLogger) only(t *testing.T, level int, what string) captureEntry {
+	t.Helper()
+
+	var found []captureEntry
+
+	for _, e := range c.entries {
+		if e.level == level {
+			found = append(found, e)
+		}
+	}
+
+	if len(found) != 1 {
+		t.Fatalf("%s: logged %d entries at level %d, want exactly 1 (%+v)", what, len(found), level, c.entries)
+	}
+
+	return found[0]
+}
+
+// field returns the value of the named field, failing when it is absent.
+func (e captureEntry) field(t *testing.T, key string) any {
+	t.Helper()
+
+	for _, f := range e.fields {
+		if f.Key == key {
+			return f.Value
+		}
+	}
+
+	t.Fatalf("log entry %q carries no %q field (%+v)", e.msg, key, e.fields)
+
+	return nil
+}
+
+// loggingStore builds the Store of newSubscribeStore with a capturing logger.
+func loggingStore() (*Store, *captureLogger) {
+	logger := &captureLogger{}
+
+	s := newSubscribeStore()
+	s.cfg.Logger = logger
+
+	return s, logger
+}
+
+// TestFeed_SelfTeardownSkipIsLoggedWithItsTenant pins the one line an operator
+// has to explain a feed that was torn down without waiting for its reader: the
+// last subscriber of a tenant feed unsubscribed from inside that feed's own
+// callback, so waiting would have been the reader waiting on itself. Without
+// the tenant on the line, a process carrying dozens of feeds cannot say which
+// one skipped the wait.
+func TestFeed_SelfTeardownSkipIsLoggedWithItsTenant(t *testing.T) {
+	t.Parallel()
+
+	s, logger := loggingStore()
+
+	f := newFeed(store.Scope{Tenant: "t1"}, "")
+	f.done = make(chan struct{})
+	f.dispatching = 1
+
+	if done := s.signalFeed(f, true); done != nil {
+		t.Fatal("signalFeed returned a channel to wait on for a self-teardown")
+	}
+
+	entry := logger.only(t, log.LevelDebug, "self-teardown")
+
+	if !strings.Contains(entry.msg, "not waiting for its reader") {
+		t.Errorf("skip message = %q, want it to say the reader is not waited for", entry.msg)
+	}
+
+	if got := entry.field(t, "tenant"); got != "t1" {
+		t.Errorf("tenant field = %v, want t1", got)
+	}
+}
+
+// TestFeed_TeardownFromOutsideACallbackLogsNothing is the other half: a
+// teardown that is NOT the reader tearing itself down waits for the reader and
+// says nothing, so the line above stays a signal rather than shutdown noise.
+func TestFeed_TeardownFromOutsideACallbackLogsNothing(t *testing.T) {
+	t.Parallel()
+
+	s, logger := loggingStore()
+
+	f := newFeed(store.Scope{Tenant: "t1"}, "")
+	f.done = make(chan struct{})
+
+	if done := s.signalFeed(f, true); done == nil {
+		t.Fatal("signalFeed skipped the wait for a teardown reached from outside a callback")
+	}
+
+	if len(logger.entries) != 0 {
+		t.Errorf("teardown logged %+v, want nothing", logger.entries)
+	}
+}
+
+// TestStore_NotifyDecodeWarningNamesItsTenant pins the warning a garbage NOTIFY
+// payload produces. The payload cannot name its tenant — the trigger fires in
+// the tenant's database and knows nothing about tenants — so the feed that read
+// it is the only thing that can, and an operator staring at a process with many
+// tenant feeds needs exactly that. The payload rides along truncated: it is
+// written by whoever holds NOTIFY rights on the channel and must not be able to
+// stretch a log line without bound.
+func TestStore_NotifyDecodeWarningNamesItsTenant(t *testing.T) {
+	t.Parallel()
+
+	s, logger := loggingStore()
+
+	f := newFeed(store.Scope{Tenant: "t1"}, "")
+
+	var delivered []store.Event
+
+	f.subs[1] = &subscription{fn: func(evt store.Event) { delivered = append(delivered, evt) }}
+
+	s.handleNotification(context.Background(), f, `{"namespace":"ns","key":`+strings.Repeat("x", 500))
+
+	entry := logger.only(t, log.LevelWarn, "undecodable payload")
+
+	if !strings.Contains(entry.msg, "decode NOTIFY payload") {
+		t.Errorf("warning = %q, want it to name the NOTIFY payload", entry.msg)
+	}
+
+	if got := entry.field(t, "tenant"); got != "t1" {
+		t.Errorf("tenant field = %v, want t1", got)
+	}
+
+	payload, ok := entry.field(t, "payload").(string)
+	if !ok {
+		t.Fatalf("payload field = %T, want a string", entry.field(t, "payload"))
+	}
+
+	if len(payload) != 203 || !strings.HasSuffix(payload, "...") {
+		t.Errorf("payload field is %d chars ending %q, want 200 plus an ellipsis", len(payload), payload[max(0, len(payload)-3):])
+	}
+
+	if len(delivered) != 0 {
+		t.Errorf("an undecodable payload was delivered as %+v", delivered)
+	}
+
+	// A payload that decodes is dispatched and logs nothing.
+	s.handleNotification(context.Background(), f, `{"namespace":"ns","key":"k","op":"upsert","revision":7}`)
+
+	if len(logger.entries) != 1 {
+		t.Errorf("a valid payload logged %+v, want nothing beyond the warning above", logger.entries[1:])
+	}
+
+	if len(delivered) != 1 || delivered[0].Key != "k" || delivered[0].Revision != 7 || delivered[0].Scope != f.scope {
+		t.Errorf("delivered = %+v, want one ns/k upsert at revision 7 stamped with the feed's scope", delivered)
+	}
 }

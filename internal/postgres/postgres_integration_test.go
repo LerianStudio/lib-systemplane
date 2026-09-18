@@ -607,13 +607,19 @@ func TestIntegration_PostgresDollarPrefixedStringsStoredVerbatim(t *testing.T) {
 type fakeConnector struct {
 	mu       sync.Mutex
 	dbs      map[string]*sql.DB
+	extras   map[string][]*sql.DB
 	replicas map[string]*sql.DB
 	dsns     map[string]string
 	dsnCalls int
 }
 
 func newFakeConnector() *fakeConnector {
-	return &fakeConnector{dbs: map[string]*sql.DB{}, replicas: map[string]*sql.DB{}, dsns: map[string]string{}}
+	return &fakeConnector{
+		dbs:      map[string]*sql.DB{},
+		extras:   map[string][]*sql.DB{},
+		replicas: map[string]*sql.DB{},
+		dsns:     map[string]string{},
+	}
 }
 
 func (c *fakeConnector) set(tenantID string, db *sql.DB, dsn string) {
@@ -634,6 +640,15 @@ func (c *fakeConnector) setReplica(tenantID string, replica *sql.DB) {
 	c.replicas[tenantID] = replica
 }
 
+// addPrimary gives the tenant a second primary, the way lib-commons registers
+// one for a tenant whose config declares several writable connection strings.
+func (c *fakeConnector) addPrimary(tenantID string, db *sql.DB) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.extras[tenantID] = append(c.extras[tenantID], db)
+}
+
 func (c *fakeConnector) resolveDSNCalls() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -650,11 +665,13 @@ func (c *fakeConnector) ResolveDB(_ context.Context, tenantID string) (dbresolve
 		return nil, fmt.Errorf("fakeConnector: unknown tenant %q", tenantID)
 	}
 
+	primaries := append([]*sql.DB{db}, c.extras[tenantID]...)
+
 	if replica, ok := c.replicas[tenantID]; ok {
-		return dbresolver.New(dbresolver.WithPrimaryDBs(db), dbresolver.WithReplicaDBs(replica)), nil
+		return dbresolver.New(dbresolver.WithPrimaryDBs(primaries...), dbresolver.WithReplicaDBs(replica)), nil
 	}
 
-	return dbresolver.New(dbresolver.WithPrimaryDBs(db)), nil
+	return dbresolver.New(dbresolver.WithPrimaryDBs(primaries...)), nil
 }
 
 func (c *fakeConnector) ResolveDSN(_ context.Context, tenantID string) (string, error) {
@@ -764,6 +781,89 @@ func TestIntegration_PostgresScopedReadsStayOnThePrimary(t *testing.T) {
 
 	// The decoy is live and was never written to, so a passing test above means
 	// the reads went to the primary rather than that the replica was unusable.
+	var onStandby int
+
+	if err := standby.QueryRow(`SELECT count(*) FROM systemplane_entries`).Scan(&onStandby); err != nil {
+		t.Fatalf("count rows on the standby: %v", err)
+	}
+
+	if onStandby != 0 {
+		t.Errorf("standby holds %d rows, want 0: it is a decoy and nothing should write to it", onStandby)
+	}
+}
+
+// TestIntegration_PostgresPrimaryFailover pins that a tenant declaring several
+// primaries keeps all of them.
+//
+// Narrowing a resolver to its primaries is what keeps reads off a standby (see
+// TestIntegration_PostgresScopedReadsStayOnThePrimary); narrowing it to ONE
+// primary would trade a stale read for an outage, because that tenant would
+// then be pinned to a single node for the life of the process and lose the
+// resolver's own primary rotation and its fallback on a connection error.
+//
+// The two primaries here are separate databases carrying the same row rather
+// than a real multi-master pair, and the replica is an empty decoy: a read
+// served by the replica comes back missing, and a read served by a closed
+// handle comes back as an error, so both failures are loud and deterministic.
+func TestIntegration_PostgresPrimaryFailover(t *testing.T) {
+	base, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	admin := adminDSN(t, base)
+	t.Cleanup(func() { _ = admin.Close() })
+
+	_, primaryDSN, primary1 := provisionTenantDB(t, admin, base, "failover_primary1")
+	_, _, primary2 := provisionTenantDB(t, admin, base, "failover_primary2")
+	_, _, standby := provisionTenantDB(t, admin, base, "failover_standby")
+
+	// Both primaries hold the row; the decoy replica stays empty.
+	for _, db := range []*sql.DB{primary1, primary2} {
+		if _, err := db.Exec(
+			`INSERT INTO systemplane_entries (namespace, key, value, updated_at, updated_by)
+			 VALUES ('ns', 'k', '"seeded"'::jsonb, now(), 'seed')`,
+		); err != nil {
+			t.Fatalf("seed primary: %v", err)
+		}
+	}
+
+	conn := newFakeConnector()
+	conn.set("t1", primary1, primaryDSN)
+	conn.addPrimary("t1", primary2)
+	conn.setReplica("t1", standby)
+
+	s := tenantStore(t, conn)
+
+	ctx := context.Background()
+	scope := store.Scope{Tenant: "t1"}
+
+	entry, found, err := s.Get(ctx, scope, "ns", "k")
+	if err != nil {
+		t.Fatalf("get before the outage: %v", err)
+	}
+
+	if !found {
+		t.Fatal("Get missed the seeded row: the read was served by the empty replica")
+	}
+
+	if entry.Revision == 0 {
+		t.Errorf("revision = 0, want the revision the insert trigger assigned")
+	}
+
+	// One primary goes away. The tenant still has another, so the read must
+	// still be served — a resolver narrowed to primaries[0] would report
+	// "sql: database is closed" here for the rest of the process's life.
+	if err := primary1.Close(); err != nil {
+		t.Fatalf("close the first primary: %v", err)
+	}
+
+	if _, found, err = s.Get(ctx, scope, "ns", "k"); err != nil {
+		t.Fatalf("get after the first primary was closed: %v", err)
+	}
+
+	if !found {
+		t.Fatal("Get after the outage missed the seeded row")
+	}
+
 	var onStandby int
 
 	if err := standby.QueryRow(`SELECT count(*) FROM systemplane_entries`).Scan(&onStandby); err != nil {
@@ -927,27 +1027,35 @@ func TestIntegration_PostgresSubscribeAfterStartGetsResyncFirst(t *testing.T) {
 	}
 
 	// Start returns once LISTEN is installed; the feed marks itself connected
-	// from its reader goroutine a moment later.
-	time.Sleep(500 * time.Millisecond)
+	// from its reader goroutine a moment later. A probe subscriber is how that
+	// moment is observed from outside the package: the probe is told OpResync
+	// either synchronously, because the reader is already through its first
+	// resync, or by that resync's broadcast when it lands — so once the probe
+	// holds its marker the feed IS connected, and the subscriber below takes
+	// the joining path. Waiting on the feed instead of on the clock is what
+	// keeps this test from quietly drifting onto the broadcast path.
+	probe, unsubProbe := subscribeScope(t, s, store.Scope{})
+	defer unsubProbe()
 
-	// Buffered: the joining resync is delivered synchronously inside Subscribe.
-	events := make(chan store.Event, 8)
-
-	unsub, err := s.Subscribe(ctx, store.Scope{}, func(evt store.Event) {
-		select {
-		case events <- evt:
-		default:
-		}
-	})
-	if err != nil {
-		t.Fatalf("subscribe: %v", err)
+	if first := recvEvent(t, probe, "the probe's resync"); first.Op != store.OpResync {
+		t.Fatalf("probe first event = %+v, want %q", first, store.OpResync)
 	}
 
+	events, unsub := subscribeScope(t, s, store.Scope{})
 	defer unsub()
 
-	first := recvEvent(t, events, "joining resync")
-	if first.Op != store.OpResync || first.Scope != (store.Scope{}) {
-		t.Fatalf("first event = %+v, want {Scope:{} Op:%q}", first, store.OpResync)
+	// Which path delivered it, asserted rather than assumed: the joining resync
+	// is emitted synchronously INSIDE Subscribe, so it is already buffered by
+	// the time Subscribe returns. A marker broadcast by the reader goroutine
+	// instead would still be in flight, and this non-blocking receive is what
+	// tells the two apart.
+	select {
+	case first := <-events:
+		if first.Op != store.OpResync || first.Scope != (store.Scope{}) {
+			t.Fatalf("first event = %+v, want {Scope:{} Op:%q}", first, store.OpResync)
+		}
+	default:
+		t.Fatal("Subscribe returned without delivering the joining resync: the subscriber is waiting on the reader's broadcast instead")
 	}
 
 	if _, err := s.Set(ctx, store.Scope{}, store.Entry{
@@ -1019,6 +1127,13 @@ func tenantStore(t *testing.T, conn postgres.Connector) *postgres.Store {
 // subscribeScope subscribes to scope and returns the delivered events. The
 // channel is buffered because a joining subscriber's OpResync is delivered
 // synchronously inside Subscribe.
+//
+// A full buffer FAILS the test rather than dropping the event: assertNoEvent
+// asks this channel to prove that nothing was delivered, and a sink that
+// silently discards what it cannot hold would let a leaked cross-tenant event
+// vanish and the negative assertion pass for the wrong reason. Every caller
+// unsubscribes before it returns, so no delivery — and no t.Errorf — can land
+// after the test completes.
 func subscribeScope(t *testing.T, s *postgres.Store, scope store.Scope) (<-chan store.Event, func()) {
 	t.Helper()
 
@@ -1028,6 +1143,7 @@ func subscribeScope(t *testing.T, s *postgres.Store, scope store.Scope) (<-chan 
 		select {
 		case events <- evt:
 		default:
+			t.Errorf("subscriber sink for scope %+v overflowed and dropped %+v", scope, evt)
 		}
 	})
 	if err != nil {

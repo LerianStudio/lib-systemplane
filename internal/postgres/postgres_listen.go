@@ -936,18 +936,28 @@ func (s *Store) consumeUntilFailure(f *feed, conn *pgx.Conn) {
 			return
 		}
 
-		evt, ok := parseNotifyPayload(notification.Payload)
-		if !ok {
-			s.logWarn(ctx, "failed to decode NOTIFY payload",
-				log.String("payload", truncateString(notification.Payload, 200)),
-				log.String("tenant", f.scope.Tenant),
-			)
-
-			continue
-		}
-
-		f.dispatch(s.cfg.Logger, evt)
+		s.handleNotification(ctx, f, notification.Payload)
 	}
+}
+
+// handleNotification decodes one NOTIFY payload and fans it out to the feed's
+// subscribers. A payload that does not decode is dropped with a warning naming
+// the feed's tenant — without it an operator reading the logs of a process
+// carrying dozens of tenant feeds cannot tell which database is emitting
+// garbage — and the payload itself, truncated, so the warning cannot be turned
+// into an unbounded log line by whatever wrote it.
+func (s *Store) handleNotification(ctx context.Context, f *feed, payload string) {
+	evt, ok := parseNotifyPayload(payload)
+	if !ok {
+		s.logWarn(ctx, "failed to decode NOTIFY payload",
+			log.String("payload", truncateString(payload, 200)),
+			log.String("tenant", f.scope.Tenant),
+		)
+
+		return
+	}
+
+	f.dispatch(s.cfg.Logger, evt)
 }
 
 func (s *Store) reconnect(f *feed, attempt *int) (*pgx.Conn, error) {
