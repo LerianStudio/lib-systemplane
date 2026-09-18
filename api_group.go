@@ -311,17 +311,24 @@ type Applied[T any] struct {
 // ApplyStatus reports one scope's desired and applied revisions.
 //
 // Desired is the newest revision published for the scope, advancing even when
-// coalescing meant no applier saw the intermediate ones. Applied is the newest
-// revision every registered function has accepted, so it means the document is
-// in force everywhere; with no function registered nothing can lag and the
-// scope reads as converged. LastErr is nil whenever Applied equals Desired;
-// the converse does not hold, because a delivery in flight leaves Desired
-// ahead of Applied with no error.
+// coalescing meant no applier saw the intermediate ones. Applied is the revision
+// accepted by the function furthest behind, so it means the document is in force
+// everywhere; with no function registered nothing can lag and the scope reads as
+// converged. LastErr holds the last rejection and survives until every
+// registered function has accepted the newest published revision.
+//
+// Desired equal to Applied is not convergence on its own: a delete publishes
+// Revision 0, and until this Client is engine-backed every publication carries
+// Revision 0, so a function that refused everything reports the very revision
+// the scope desires. LastErr is the field that answers "is my configuration
+// actually in force". A delivery in flight also leaves Applied behind with no
+// error at all, because Status is a point-in-time read rather than a
+// transaction.
 type ApplyStatus struct {
 	Tenant  string
 	Desired int64 // latest published revision
 	Applied int64 // latest revision fn accepted
-	LastErr error // nil when Desired == Applied
+	LastErr error // nil once every registered fn has accepted the newest published revision
 }
 
 // OnApply subscribes first and then delivers the current snapshot of every

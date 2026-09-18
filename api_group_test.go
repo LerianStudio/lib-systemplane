@@ -1546,16 +1546,15 @@ func TestGroupOnApplyAlwaysReportsNotStale(t *testing.T) {
 }
 
 // TestGroupOnApplyErrorIsVisibleInStatus pins how a rejection travels out of an
-// applier. What "visible" can mean here is bounded by the wave-1 facade: it
-// publishes every revision as 0 (D-G9), and FC-7 makes LastErr nil whenever
-// Desired equals Applied, so a scope whose revisions are all 0 reports
-// converged with a nil LastErr however many rejections it saw. The revision
-// arithmetic — LastErr surviving while Applied lags Desired — is driven
-// directly in internal/group's coordinator tests, which publish explicit
-// revisions. What the root proves is that the rejection reached the
-// coordinator's bookkeeping at all: a rejected document never becomes
-// Previous, the rejecting applier keeps receiving later documents, and a
-// second applier is unaffected.
+// applier and stays visible. The wave-1 facade publishes every revision as 0
+// (D-G9), so the two revision fields cannot show the lag: both read 0 while one
+// applier keeps refusing the document. LastErr is what makes the refusal
+// visible, and it survives until that applier accepts. The revision arithmetic
+// is driven directly in internal/group's coordinator tests, which publish
+// explicit revisions. What the root proves is that the rejection reached the
+// coordinator's bookkeeping and the consumer's status surface: a rejected
+// document never becomes Previous, the rejecting applier keeps receiving later
+// documents, and a second applier is unaffected.
 func TestGroupOnApplyErrorIsVisibleInStatus(t *testing.T) {
 	t.Parallel()
 
@@ -1614,10 +1613,14 @@ func TestGroupOnApplyErrorIsVisibleInStatus(t *testing.T) {
 		t.Errorf("Status[0].Tenant = %q, want the single-tenant scope", status[0].Tenant)
 	}
 
-	// Every revision the single-tenant facade publishes is 0, so FC-7's
-	// "LastErr is nil when Desired == Applied" holds here by construction.
-	if status[0].Desired != status[0].Applied || status[0].LastErr != nil {
-		t.Errorf("Status[0] = %#v, want a converged scope with a nil LastErr on the wave-1 facade", status[0])
+	// The rejecting applier has accepted nothing, so the scope is not applied
+	// however the revisions read: both are 0 on the wave-1 facade.
+	if status[0].Desired != 0 || status[0].Applied != 0 {
+		t.Errorf("Status[0] = %#v, want both revisions 0 on the wave-1 facade", status[0])
+	}
+
+	if status[0].LastErr == nil {
+		t.Errorf("Status[0] = %#v, want the applier's refusal visible in LastErr", status[0])
 	}
 }
 
@@ -2048,15 +2051,12 @@ func TestGroupOnApplyRefusesAPublishedNullDocument(t *testing.T) {
 		}
 	}
 
-	// The rejection is recorded on the scope but erased on the way out: every
-	// revision the wave-1 facade publishes is 0, and an applier that accepted
-	// nothing reports Applied 0 too, so FC-7's "LastErr is nil when Desired ==
-	// Applied" clears it. Pinned here for the same reason as
-	// TestCoordinatorRejectionAtRevisionZeroReadsAsConverged in internal/group:
-	// it is a contract amendment away, not a code fix.
+	// The refusal is the whole point, so it must be readable: no applier ever
+	// accepted the null, and the scope says so even though both revisions read
+	// 0 on the wave-1 facade.
 	for _, st := range g.Status() {
-		if st.Desired != st.Applied || st.LastErr != nil {
-			t.Errorf("Status entry = %#v, want a converged scope with a nil LastErr on the wave-1 facade", st)
+		if st.LastErr == nil {
+			t.Errorf("Status entry = %#v, want the refused null document visible in LastErr", st)
 		}
 	}
 }

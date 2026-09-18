@@ -230,7 +230,7 @@ func TestCoordinatorSeedThatFailsToDecodeIsRecorded(t *testing.T) {
 	}
 
 	lines := logger.recorded()
-	if len(lines) != 1 || !strings.Contains(lines[0], "failed to decode") {
+	if len(lines) != 1 || !strings.Contains(lines[0].msg, "failed to decode") {
 		t.Fatalf("logged = %v, want the decode failure at error level", lines)
 	}
 

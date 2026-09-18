@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/runtime"
 )
@@ -62,6 +63,13 @@ type scope[T any] struct {
 	desired    int64
 	lastErr    error
 
+	// latestSeq is the sequence of the newest observation of this scope,
+	// INCLUDING one that failed to decode and therefore never became current.
+	// It is what convergence is measured against, so a document nobody could
+	// apply keeps the scope unconverged instead of being forgotten the moment
+	// a later registration replays the last good one.
+	latestSeq uint64
+
 	// Seed watermark. A seed and the publication it anticipates are one
 	// observation, not two: a recorded seed arms the watermark, and the next
 	// publication for the scope disarms it, dropped only when it is proven to
@@ -75,10 +83,17 @@ type scope[T any] struct {
 }
 
 // applierScope is one applier's bookkeeping for one scope: the newest
-// observation it has been offered, and the revision and snapshot it last
-// accepted. A rejection moves neither of the latter two.
+// observation it has been offered, the observation it last accepted, and the
+// revision and snapshot that observation carried. A rejection moves none of the
+// last three.
+//
+// acceptedSeq, not appliedRev, is what says how far this applier has got.
+// Revisions cannot: a delete publishes Revision 0, and every publication the
+// wave-1 facade makes carries Revision 0, so an applier that has accepted
+// nothing and one that has accepted everything report the same number.
 type applierScope[T any] struct {
 	deliveredSeq uint64
+	acceptedSeq  uint64
 	appliedRev   int64
 	accepted     *Decoded[T]
 }
@@ -169,7 +184,7 @@ func (c *Coordinator[T]) Publish(ctx context.Context, pub Publication) {
 
 	if err != nil {
 		c.logError(ctx, "systemplane.group: published document failed to decode",
-			log.Err(err), log.String("tenant", pub.Tenant), log.Any("revision", pub.Revision))
+			log.Err(err), log.String(constants.AttrKeyTenantID, pub.Tenant), log.Any("revision", pub.Revision))
 
 		return
 	}
@@ -202,6 +217,11 @@ func (c *Coordinator[T]) record(pub Publication, value T, decodeErr error) (*sco
 	sc.desired = pub.Revision
 
 	if decodeErr != nil {
+		// The failure counts as an observation even though it never becomes
+		// current: no applier can have accepted it, so the scope stays
+		// unconverged and the error stays readable until a document that does
+		// decode is accepted by everyone.
+		sc.latestSeq = c.nextSeqLocked()
 		sc.lastErr = decodeErr
 
 		return sc, false
@@ -216,12 +236,20 @@ func (c *Coordinator[T]) record(pub Publication, value T, decodeErr error) (*sco
 // number, never the revision, is what every dedupe and coalescing decision
 // downstream reads. The caller holds the state mutex.
 func (c *Coordinator[T]) observeLocked(sc *scope[T], pub Publication, value T) {
-	c.seq++
 	sc.current = observation[T]{
-		seq:   c.seq,
+		seq:   c.nextSeqLocked(),
 		value: Decoded[T]{Tenant: pub.Tenant, Revision: pub.Revision, Value: value},
 	}
 	sc.observed = true
+	sc.latestSeq = sc.current.seq
+}
+
+// nextSeqLocked hands out the next observation sequence. The caller holds the
+// state mutex.
+func (c *Coordinator[T]) nextSeqLocked() uint64 {
+	c.seq++
+
+	return c.seq
 }
 
 // dropsAfterSeedLocked spends the seed watermark on the first publication that
@@ -265,7 +293,7 @@ func (c *Coordinator[T]) Register(fn ApplyFunc[T]) func() {
 	id, observed, seeded, seedErr := c.add(fn)
 	if seedErr != nil {
 		c.logError(ctx, "systemplane.group: seeded document failed to decode",
-			log.Err(seedErr), log.String("tenant", seeded.Tenant), log.Any("revision", seeded.Revision))
+			log.Err(seedErr), log.String(constants.AttrKeyTenantID, seeded.Tenant), log.Any("revision", seeded.Revision))
 	}
 
 	// The replay is the same code path as a publication, which is why a
@@ -316,12 +344,18 @@ func (c *Coordinator[T]) add(fn ApplyFunc[T]) (uint64, []*scope[T], Publication,
 //
 // Desired is the newest revision observed, advancing even when coalescing meant
 // no applier saw the intermediate ones and even when the publication was
-// rejected at decode. Applied is the newest revision EVERY registered applier
-// has accepted, so it means the document is in force everywhere; with no
-// applier registered nothing can lag and the scope reads as converged. LastErr
-// holds the last rejection and is nil whenever Applied equals Desired; the
-// converse does not hold, because a delivery in flight leaves Desired ahead of
-// Applied with no error and Status is a point-in-time read.
+// rejected at decode. Applied is the revision the applier furthest behind has
+// accepted, so it means the document is in force everywhere; with no applier
+// registered nothing can lag and the scope reads as converged. LastErr holds
+// the last rejection and survives until every registered applier has accepted
+// the scope's newest observation.
+//
+// Desired equal to Applied is therefore not convergence on its own: a delete
+// publishes Revision 0 and every publication the wave-1 facade makes carries
+// Revision 0, so an applier that refused everything reports the very revision
+// the scope desires. Read LastErr. A delivery in flight also leaves Applied
+// behind with no error at all, because Status is a point-in-time read rather
+// than a transaction.
 func (c *Coordinator[T]) Status() []Status {
 	if c == nil {
 		return nil
@@ -333,14 +367,12 @@ func (c *Coordinator[T]) Status() []Status {
 	out := make([]Status, 0, len(c.scopes))
 
 	for tenant, sc := range c.scopes {
-		applied := c.appliedLocked(sc)
-
-		lastErr := sc.lastErr
-		if applied == sc.desired {
-			lastErr = nil
-		}
-
-		out = append(out, Status{Tenant: tenant, Desired: sc.desired, Applied: applied, LastErr: lastErr})
+		out = append(out, Status{
+			Tenant:  tenant,
+			Desired: sc.desired,
+			Applied: c.appliedLocked(sc),
+			LastErr: sc.lastErr,
+		})
 	}
 
 	slices.SortFunc(out, func(a, b Status) int { return strings.Compare(a.Tenant, b.Tenant) })
@@ -353,11 +385,19 @@ func (c *Coordinator[T]) remove(id uint64) {
 	defer c.mu.Unlock()
 
 	for i, ap := range c.appliers {
-		if ap.id == id {
-			c.appliers = append(c.appliers[:i], c.appliers[i+1:]...)
-
-			return
+		if ap.id != id {
+			continue
 		}
+
+		c.appliers = append(c.appliers[:i], c.appliers[i+1:]...)
+
+		// The applier that left may have been the one holding the scope back,
+		// and its rejection no longer describes anybody still registered.
+		for _, sc := range c.scopes {
+			c.clearErrIfConvergedLocked(sc)
+		}
+
+		return
 	}
 }
 
@@ -392,6 +432,7 @@ func (c *Coordinator[T]) seedLocked() (Publication, error) {
 
 	value, err := c.decode(pub.Value)
 	if err != nil {
+		sc.latestSeq = c.nextSeqLocked()
 		sc.lastErr = err
 
 		return pub, err
@@ -499,6 +540,10 @@ func (c *Coordinator[T]) pendingLocked(sc *scope[T], observed observation[T]) []
 // hot-reload hook on the fleet's panic counter, on the publication's span and
 // at the error reporter, and what redacts the value and the stack in
 // production mode.
+//
+// Both failure modes are logged here, at error level, naming the scope and the
+// revision: Status is a surface somebody has to think to read, while a
+// configuration that stopped being applied is something an operator needs told.
 func (c *Coordinator[T]) invoke(
 	ctx context.Context,
 	fn ApplyFunc[T],
@@ -513,7 +558,15 @@ func (c *Coordinator[T]) invoke(
 		}
 	}()
 
-	return fn(ctx, current, previous)
+	err = fn(ctx, current, previous)
+	if err != nil {
+		c.logError(ctx, "systemplane.group: apply function rejected the published document",
+			log.Err(err),
+			log.String(constants.AttrKeyTenantID, current.Tenant),
+			log.Any("revision", current.Revision))
+	}
+
+	return err
 }
 
 func (c *Coordinator[T]) logError(ctx context.Context, msg string, fields ...log.Field) {
@@ -525,11 +578,10 @@ func (c *Coordinator[T]) logError(ctx context.Context, msg string, fields ...log
 }
 
 // recordLocked writes back what each applier did with its delivery: an
-// acceptance moves that applier's applied revision and becomes its next
-// previous, while a rejection leaves both untouched and is recorded on the
-// scope. Nothing is ever retried — the drain marked the observation as offered
-// before invoking. The scope's error clears as soon as every applier has caught
-// up with the newest revision. The caller holds the state mutex.
+// acceptance moves that applier's accepted observation and applied revision and
+// becomes its next previous, while a rejection leaves all three untouched and is
+// recorded on the scope. Nothing is ever retried — the drain marked the
+// observation as offered before invoking. The caller holds the state mutex.
 func (c *Coordinator[T]) recordLocked(sc *scope[T], pending []delivery[T]) {
 	for i := range pending {
 		d := &pending[i]
@@ -542,34 +594,60 @@ func (c *Coordinator[T]) recordLocked(sc *scope[T], pending []delivery[T]) {
 		}
 
 		accepted := d.current
+		st.acceptedSeq = st.deliveredSeq
 		st.appliedRev = accepted.Revision
 		st.accepted = &accepted
 	}
 
-	if c.appliedLocked(sc) == sc.desired {
-		sc.lastErr = nil
-	}
+	c.clearErrIfConvergedLocked(sc)
 }
 
-// appliedLocked is the minimum applied revision across the CURRENTLY registered
-// appliers, so an unsubscribed applier stops holding the scope down. With no
-// applier registered there is nothing that could lag and the scope is converged
-// by definition. The caller holds the state mutex.
+// clearErrIfConvergedLocked drops the scope's error once every applier still
+// registered has accepted its newest observation. What decides is the
+// observation, never the revisions matching: through the wave-1 facade every
+// publication carries Revision 0, so a revision test would erase each rejection
+// the instant it was recorded and leave a consumer with no error surface at all.
+// The caller holds the state mutex.
+func (c *Coordinator[T]) clearErrIfConvergedLocked(sc *scope[T]) {
+	for _, ap := range c.appliers {
+		if st, ok := ap.state[sc.tenant]; !ok || st.acceptedSeq < sc.latestSeq {
+			return
+		}
+	}
+
+	sc.lastErr = nil
+}
+
+// appliedLocked is the revision accepted by the applier furthest behind among
+// the CURRENTLY registered ones, so an unsubscribed applier stops holding the
+// scope down and "applied" keeps meaning in force everywhere. Furthest behind is
+// decided by observation and not by revision: a delete publishes Revision 0, so
+// the lowest revision can be the newest thing the scope published, and reporting
+// it while another applier still has the pre-delete document in force would call
+// a half-applied delete convergence. With no applier registered there is nothing
+// that could lag and the scope is converged by definition. The caller holds the
+// state mutex.
 func (c *Coordinator[T]) appliedLocked(sc *scope[T]) int64 {
 	if len(c.appliers) == 0 {
 		return sc.desired
 	}
 
-	applied := int64(math.MaxInt64)
+	oldest := uint64(math.MaxUint64)
+
+	var applied int64
 
 	for _, ap := range c.appliers {
-		var revision int64
-
-		if st, ok := ap.state[sc.tenant]; ok {
-			revision = st.appliedRev
+		st, ok := ap.state[sc.tenant]
+		if !ok {
+			// An applier that has never been offered this scope is as far
+			// behind as it gets.
+			return 0
 		}
 
-		applied = min(applied, revision)
+		if st.acceptedSeq < oldest {
+			oldest = st.acceptedSeq
+			applied = st.appliedRev
+		}
 	}
 
 	return applied

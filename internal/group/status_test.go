@@ -9,32 +9,65 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
+	"github.com/LerianStudio/lib-observability/v4/runtime"
 )
 
 var errRejected = errors.New("applier rejected the document")
 
+// logLine is one line the coordinator wrote. The fields are normalized through
+// log.Fields because the two call sites shape them differently: the coordinator
+// hands one []log.Field, while the panic handler in lib-observability passes
+// several separate Fields.
+type logLine struct {
+	level  int
+	msg    string
+	fields map[string]any
+}
+
 // recordingLogger keeps the lines the coordinator writes so a test can prove a
-// recovered panic reached the logger as well as ApplyStatus.
+// rejection and a recovered panic reached the logger as well as ApplyStatus.
 type recordingLogger struct {
 	*log.NopLogger
 
 	mu    sync.Mutex
-	lines []string
+	lines []logLine
 }
 
-func (r *recordingLogger) Log(_ context.Context, level int, msg string, _ ...any) {
+func (r *recordingLogger) Log(_ context.Context, level int, msg string, fields ...any) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.lines = append(r.lines, log.LevelName(level)+": "+msg)
+	line := logLine{level: level, msg: msg, fields: map[string]any{}}
+	for _, f := range log.Fields(fields...) {
+		line.fields[f.Key] = f.Value
+	}
+
+	r.lines = append(r.lines, line)
 }
 
-func (r *recordingLogger) recorded() []string {
+func (r *recordingLogger) recorded() []logLine {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	return append([]string(nil), r.lines...)
+	return append([]logLine(nil), r.lines...)
+}
+
+// lineContaining returns the recorded line whose message contains want, and
+// fails the test when nothing matched.
+func (r *recordingLogger) lineContaining(t *testing.T, want string) logLine {
+	t.Helper()
+
+	for _, line := range r.recorded() {
+		if strings.Contains(line.msg, want) {
+			return line
+		}
+	}
+
+	t.Fatalf("logged %v, want a line whose message contains %q", r.recorded(), want)
+
+	return logLine{}
 }
 
 func newRecordingLogger() *recordingLogger {
@@ -122,13 +155,87 @@ func TestCoordinatorApplierPanicIsRecordedLikeAnError(t *testing.T) {
 		t.Errorf("LastErr = %v, want the recovered value in the message", got.LastErr)
 	}
 
-	lines := logger.recorded()
-	if len(lines) == 0 {
-		t.Fatal("the recovered panic was never logged")
+	line := logger.lineContaining(t, "panic recovered")
+	if line.level != log.LevelError {
+		t.Errorf("the recovered panic logged at %s level, want error", log.LevelName(line.level))
 	}
 
-	if !strings.HasPrefix(lines[0], "error: ") {
-		t.Errorf("logged %q, want an error-level line", lines[0])
+	if line.fields["source"] != "group.apply" {
+		t.Errorf("source = %v, want group.apply: the line must name the hook that panicked", line.fields["source"])
+	}
+
+	if value, _ := line.fields["value"].(string); value != "boom" {
+		t.Errorf("value = %v, want the recovered value", line.fields["value"])
+	}
+
+	if stack, _ := line.fields["stack_trace"].(string); stack == "" {
+		t.Error("stack_trace is empty, want the panicking goroutine's stack")
+	}
+}
+
+// TestCoordinatorApplierPanicIsRedactedInProductionMode pins the other half of
+// the panic path: in production mode the recovered value and the stack stay out
+// of the log line, while Status still carries the value to the consumer that
+// asked for it.
+func TestCoordinatorApplierPanicIsRedactedInProductionMode(t *testing.T) {
+	runtime.SetProductionMode(true)
+
+	defer runtime.SetProductionMode(false)
+
+	logger := newRecordingLogger()
+	c := NewCoordinator[coordDoc](logger, Decode[coordDoc], nil)
+
+	unsubscribe := c.Register(func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
+		panic("boom")
+	})
+	defer unsubscribe()
+
+	c.Publish(context.Background(), publication("t1", 3, "three"))
+
+	line := logger.lineContaining(t, "panic recovered")
+	if value, _ := line.fields["value"].(string); !strings.Contains(value, "redacted") {
+		t.Errorf("value = %v, want the redacted placeholder in production mode", line.fields["value"])
+	}
+
+	if _, logged := line.fields["stack_trace"]; logged {
+		t.Error("stack_trace was logged in production mode, want it withheld")
+	}
+
+	if got := statusOf(t, c, "t1"); got.LastErr == nil || !strings.Contains(got.LastErr.Error(), "boom") {
+		t.Errorf("LastErr = %v, want the recovered value on the status surface even in production mode", got.LastErr)
+	}
+}
+
+// TestCoordinatorApplierErrorIsLogged pins the operational half of a rejection:
+// Status is a pull surface nobody reads at 3am, so an applier refusing a
+// configuration must also reach the consumer's logger, naming the scope, the
+// revision and the error.
+func TestCoordinatorApplierErrorIsLogged(t *testing.T) {
+	logger := newRecordingLogger()
+	c := NewCoordinator[coordDoc](logger, Decode[coordDoc], nil)
+
+	unsubscribe := c.Register(func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
+		return errRejected
+	})
+	defer unsubscribe()
+
+	c.Publish(context.Background(), publication("t1", 5, "five"))
+
+	line := logger.lineContaining(t, "rejected")
+	if line.level != log.LevelError {
+		t.Errorf("the rejection logged at %s level, want error", log.LevelName(line.level))
+	}
+
+	if got := line.fields[constants.AttrKeyTenantID]; got != "t1" {
+		t.Errorf("%s = %v, want the rejecting scope", constants.AttrKeyTenantID, got)
+	}
+
+	if revision, _ := line.fields["revision"].(int64); revision != 5 {
+		t.Errorf("revision = %v, want 5", line.fields["revision"])
+	}
+
+	if err, _ := line.fields["error"].(error); !errors.Is(err, errRejected) {
+		t.Errorf("error = %v, want the applier's rejection", line.fields["error"])
 	}
 }
 
@@ -423,29 +530,28 @@ func TestCoordinatorStatusIsSortedByTenant(t *testing.T) {
 	}
 }
 
-// TestCoordinatorRejectionAtRevisionZeroReadsAsConverged pins a hole this lane
-// cannot close on its own. FC-7 freezes ApplyStatus.LastErr as "nil when
-// Desired == Applied", and an applier that has accepted nothing reports Applied
-// 0 — the very value a publication at Revision 0 desires. A rejected Revision-0
-// document therefore reads back as a converged, error-free scope, and through
-// the wave-1 facade EVERY publication is Revision 0, so an applier refusing a
-// configuration is invisible on the only error surface FC-7 gives a consumer.
-//
-// Closing it means either letting LastErr outlive Desired == Applied, or giving
-// Applied a "nothing accepted yet" value that is not a revision. Both change
-// what FC-7 promises, so it is the orchestrator's call, not this lane's. The
-// behaviour is pinned here instead of fixed: this test flips the day FC-7 is
-// amended, which is exactly when it should.
-func TestCoordinatorRejectionAtRevisionZeroReadsAsConverged(t *testing.T) {
+// TestCoordinatorRejectionAtRevisionZeroStaysVisible drives the case the
+// wave-1 facade makes universal: every publication it makes carries Revision 0,
+// so an applier that has accepted nothing reports the very revision the scope
+// desires. Convergence is decided by which observation each applier accepted,
+// never by that arithmetic, so the rejection stays visible until the applier
+// accepts something (A12) — otherwise the only error surface FC-7 gives a
+// consumer is erased the instant it is written.
+func TestCoordinatorRejectionAtRevisionZeroStaysVisible(t *testing.T) {
 	c := newCoordinator(t)
 	ctx := context.Background()
 
 	invocations := 0
+	reject := true
 
 	unsubscribe := c.Register(func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
 		invocations++
 
-		return errRejected
+		if reject {
+			return errRejected
+		}
+
+		return nil
 	})
 	defer unsubscribe()
 
@@ -460,7 +566,57 @@ func TestCoordinatorRejectionAtRevisionZeroReadsAsConverged(t *testing.T) {
 		t.Fatalf("Status = %#v, want Desired 0 and Applied 0", got)
 	}
 
-	if got.LastErr != nil {
-		t.Fatalf("Status.LastErr = %v, but FC-7 requires nil when Desired == Applied; changing this is a contract amendment, not a test fix", got.LastErr)
+	if !errors.Is(got.LastErr, errRejected) {
+		t.Fatalf("Status.LastErr = %v, want the rejection to survive Desired == Applied == 0", got.LastErr)
+	}
+
+	// Only an acceptance clears it.
+	reject = false
+
+	c.Publish(ctx, publication("t1", 0, "zero again"))
+
+	if got := statusOf(t, c, "t1"); got.LastErr != nil {
+		t.Errorf("Status.LastErr = %v, want nil once the applier accepted a later publication", got.LastErr)
+	}
+}
+
+// TestCoordinatorAppliedIsTheOldestObservationNotTheLowestRevision drives a
+// delete past two appliers where one refuses it. The refusing applier still has
+// the pre-delete document in force, so the scope is applied at that revision —
+// reporting the delete's Revision 0 because it is the lower number would call a
+// half-applied delete convergence.
+func TestCoordinatorAppliedIsTheOldestObservationNotTheLowestRevision(t *testing.T) {
+	c := newCoordinator(t)
+	ctx := context.Background()
+
+	accepting := func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error { return nil }
+	refusesTheDelete := func(_ context.Context, current Decoded[coordDoc], _ *Decoded[coordDoc]) error {
+		if current.Revision == 0 {
+			return errRejected
+		}
+
+		return nil
+	}
+
+	unsubscribeA := c.Register(accepting)
+	defer unsubscribeA()
+
+	unsubscribeB := c.Register(refusesTheDelete)
+	defer unsubscribeB()
+
+	c.Publish(ctx, publication("t1", 7, "seven"))
+	c.Publish(ctx, publication("t1", 0, "deleted"))
+
+	got := statusOf(t, c, "t1")
+	if got.Desired != 0 {
+		t.Errorf("Desired = %d, want 0: a delete is the newest state of the scope", got.Desired)
+	}
+
+	if got.Applied != 7 {
+		t.Errorf("Applied = %d, want 7: the applier furthest behind still has revision 7 in force", got.Applied)
+	}
+
+	if !errors.Is(got.LastErr, errRejected) {
+		t.Errorf("LastErr = %v, want the refused delete", got.LastErr)
 	}
 }
