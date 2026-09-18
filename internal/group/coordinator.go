@@ -2,7 +2,9 @@
 package group
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"runtime/debug"
@@ -59,6 +61,17 @@ type scope[T any] struct {
 	delivering bool
 	desired    int64
 	lastErr    error
+
+	// Seed watermark. A seed and the publication it anticipates are one
+	// observation, not two: a recorded seed arms the watermark, and the next
+	// publication for the scope disarms it, dropped only when it is proven to
+	// be that same document (revision no newer AND equal marshalled bytes).
+	// Bytes as well as revision because the wave-1 facade publishes every
+	// revision as 0, where a revision-only rule would swallow a genuinely
+	// different document.
+	seedArmed bool
+	seedRev   int64
+	seedBytes []byte
 }
 
 // applierScope is one applier's bookkeeping for one scope: the newest
@@ -109,11 +122,12 @@ type Coordinator[T any] struct {
 	decode func(any) (T, error)
 	seed   func() (Publication, bool)
 
-	mu       sync.Mutex
-	seq      uint64
-	nextID   uint64
-	scopes   map[string]*scope[T]
-	appliers []*applier[T]
+	mu        sync.Mutex
+	seq       uint64
+	nextID    uint64
+	seedTaken bool
+	scopes    map[string]*scope[T]
+	appliers  []*applier[T]
 }
 
 // NewCoordinator builds a coordinator. logger (may be nil) receives decode
@@ -151,6 +165,15 @@ func (c *Coordinator[T]) Publish(ctx context.Context, pub Publication) {
 	c.mu.Lock()
 
 	sc := c.scopeLocked(pub.Tenant)
+
+	// The one publication a seed anticipates is the same observation as the
+	// seed, so it is spent here rather than delivered a second time.
+	if dropsAfterSeedLocked(sc, pub) {
+		c.mu.Unlock()
+
+		return
+	}
+
 	// Assignment, not max: a delete publishes Revision 0 and that IS the newest
 	// state of the scope, so max would report a converged group as lagging.
 	sc.desired = pub.Revision
@@ -165,31 +188,70 @@ func (c *Coordinator[T]) Publish(ctx context.Context, pub Publication) {
 		return
 	}
 
-	c.seq++
-	sc.current = observation[T]{
-		seq:   c.seq,
-		value: Decoded[T]{Tenant: pub.Tenant, Revision: pub.Revision, Value: value},
-	}
-	sc.observed = true
+	c.observeLocked(sc, pub, value)
 
 	c.mu.Unlock()
 
 	c.drain(ctx, sc)
 }
 
+// observeLocked records value as the scope's newest observation. The sequence
+// number, never the revision, is what every dedupe and coalescing decision
+// downstream reads. The caller holds the state mutex.
+func (c *Coordinator[T]) observeLocked(sc *scope[T], pub Publication, value T) {
+	c.seq++
+	sc.current = observation[T]{
+		seq:   c.seq,
+		value: Decoded[T]{Tenant: pub.Tenant, Revision: pub.Revision, Value: value},
+	}
+	sc.observed = true
+}
+
+// dropsAfterSeedLocked spends the seed watermark on the first publication that
+// follows a seed and reports whether that publication is the seed's own
+// document arriving late. Anything else — a newer revision, or the same
+// revision carrying different bytes — is delivered, and the ordinary rules
+// resume from there, so a later Revision 0 delete still reaches its appliers.
+// A marshal failure on either side means "not proven identical": deliver. The
+// caller holds the state mutex.
+func dropsAfterSeedLocked[T any](sc *scope[T], pub Publication) bool {
+	if !sc.seedArmed {
+		return false
+	}
+
+	sc.seedArmed = false
+
+	if pub.Revision > sc.seedRev || sc.seedBytes == nil {
+		return false
+	}
+
+	data, err := json.Marshal(pub.Value)
+	if err != nil {
+		return false
+	}
+
+	return bytes.Equal(data, sc.seedBytes)
+}
+
 // Register adds fn and synchronously delivers the cached publication of every
-// scope already observed. Returns a function that removes fn; calling it more
-// than once, or from inside fn itself, is safe.
+// scope already observed. When nothing has been observed at all it takes one
+// seed and delivers that instead, which is what covers a publication still in
+// flight on its way out of the engine. Returns a function that removes fn;
+// calling it more than once, or from inside fn itself, is safe.
 func (c *Coordinator[T]) Register(fn ApplyFunc[T]) func() {
 	if c == nil || fn == nil {
 		return func() {}
 	}
+
+	ctx := context.Background()
 
 	c.mu.Lock()
 
 	c.nextID++
 	id := c.nextID
 	c.appliers = append(c.appliers, &applier[T]{id: id, fn: fn, state: map[string]*applierScope[T]{}})
+
+	seeded, seedErr := c.seedLocked()
 
 	observed := make([]*scope[T], 0, len(c.scopes))
 
@@ -201,9 +263,13 @@ func (c *Coordinator[T]) Register(fn ApplyFunc[T]) func() {
 
 	c.mu.Unlock()
 
+	if seedErr != nil {
+		c.logError(ctx, "systemplane.group: seeded document failed to decode",
+			log.Err(seedErr), log.String("tenant", seeded.Tenant), log.Any("revision", seeded.Revision))
+	}
+
 	// The replay is the same code path as a publication, which is why a
 	// concurrent fan-out can neither double-deliver nor invert the order.
-	ctx := context.Background()
 	for _, sc := range observed {
 		c.drain(ctx, sc)
 	}
@@ -265,6 +331,68 @@ func (c *Coordinator[T]) remove(id uint64) {
 			return
 		}
 	}
+}
+
+// seedLocked takes one seed when the coordinator has observed no publication at
+// all — the window between the Client reconciling a scope and the first
+// dispatch delivery landing, where a registration would otherwise replay
+// nothing. ok=false means the Client does not track the scope yet (the
+// pre-Start case): nothing is delivered, nothing is recorded, and the next
+// registration tries again. A taken seed is an observation like any other, so
+// an applier that accepts it sets the scope's desired and applied revisions to
+// the seeded one, and it arms the watermark that spends the publication it
+// anticipates.
+//
+// It returns the publication it took and the decode error, for the caller to
+// log outside the mutex: a seed that fails to decode is recorded exactly like a
+// published document that does, reaches no applier, and is never retried. The
+// caller holds the state mutex.
+func (c *Coordinator[T]) seedLocked() (Publication, error) {
+	if c.seed == nil || c.seedTaken || c.decode == nil || c.anyObservedLocked() {
+		return Publication{}, nil
+	}
+
+	pub, ok := c.seed()
+	if !ok {
+		return Publication{}, nil
+	}
+
+	c.seedTaken = true
+
+	sc := c.scopeLocked(pub.Tenant)
+	sc.desired = pub.Revision
+
+	value, err := c.decode(pub.Value)
+	if err != nil {
+		sc.lastErr = err
+
+		return pub, err
+	}
+
+	c.observeLocked(sc, pub, value)
+
+	sc.seedArmed = true
+	sc.seedRev = pub.Revision
+
+	// Bytes that fail to marshal stay nil, which disarms the drop: the next
+	// publication can then never be proven identical, so it is delivered.
+	if data, marshalErr := json.Marshal(pub.Value); marshalErr == nil {
+		sc.seedBytes = data
+	}
+
+	return pub, nil
+}
+
+// anyObservedLocked reports whether any scope has a publication behind it. The
+// caller holds the state mutex.
+func (c *Coordinator[T]) anyObservedLocked() bool {
+	for _, sc := range c.scopes {
+		if sc.observed {
+			return true
+		}
+	}
+
+	return false
 }
 
 // scopeLocked resolves or creates a scope. The caller holds the state mutex.
