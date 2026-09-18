@@ -21,6 +21,19 @@
 -- already on v3 may instead apply the smaller delta in
 -- ddl/migrate_v3_to_v4.sql.
 --
+-- THE EXISTING TABLE MUST LIVE IN THE FIRST SCHEMA OF THE APPLYING ROLE'S
+-- SEARCH_PATH. Every other statement here resolves systemplane_entries through
+-- the whole search_path, but CREATE TABLE IF NOT EXISTS only ever looks at —
+-- and creates in — the first schema. Applying this file with search_path =
+-- public, app to an install that lives in `app` would therefore create a
+-- SECOND, empty systemplane_entries in `public`, exit 0, and leave the
+-- populated one orphaned and invisible to the runtime: every registered key
+-- would silently fall back to its default after a `successful` migration. The
+-- guard DO block below refuses that outright rather than forking the install.
+-- An install that cannot be put first in search_path is upgraded with
+-- ddl/migrate_v3_to_v4.sql instead, which creates no table and so follows the
+-- search_path to wherever the table actually is.
+--
 -- THE TABLE AND THE SEQUENCE LIVE IN THE SAME SCHEMA. The bump trigger
 -- resolves `TG_TABLE_SCHEMA.systemplane_revision_seq`, so the DO block
 -- resolves the schema that owns systemplane_entries — via its regclass, the
@@ -52,6 +65,24 @@
 -- installing the bump trigger nothing would assign it and a concurrent insert
 -- would fail — this file is not wrapped in a transaction, because the
 -- consumer's migration tool owns transaction boundaries.
+
+DO $$
+DECLARE
+	existing_schema TEXT := (
+		SELECT n.nspname
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE c.oid = to_regclass('systemplane_entries')
+	);
+BEGIN
+	IF existing_schema IS NOT NULL AND existing_schema IS DISTINCT FROM current_schema() THEN
+		RAISE EXCEPTION
+			'systemplane_entries already exists in schema %, but this role would provision into %; applying the full schema here would fork the install into a second, empty table and orphan the populated one',
+			existing_schema, current_schema()
+			USING HINT = 'put the existing schema first in search_path, or upgrade that install with ddl/migrate_v3_to_v4.sql, which creates no table';
+	END IF;
+END
+$$;
 
 CREATE TABLE IF NOT EXISTS systemplane_entries (
 	namespace   TEXT NOT NULL,

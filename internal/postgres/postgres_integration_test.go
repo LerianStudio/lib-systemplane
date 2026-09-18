@@ -607,12 +607,13 @@ func TestIntegration_PostgresDollarPrefixedStringsStoredVerbatim(t *testing.T) {
 type fakeConnector struct {
 	mu       sync.Mutex
 	dbs      map[string]*sql.DB
+	replicas map[string]*sql.DB
 	dsns     map[string]string
 	dsnCalls int
 }
 
 func newFakeConnector() *fakeConnector {
-	return &fakeConnector{dbs: map[string]*sql.DB{}, dsns: map[string]string{}}
+	return &fakeConnector{dbs: map[string]*sql.DB{}, replicas: map[string]*sql.DB{}, dsns: map[string]string{}}
 }
 
 func (c *fakeConnector) set(tenantID string, db *sql.DB, dsn string) {
@@ -621,6 +622,16 @@ func (c *fakeConnector) set(tenantID string, db *sql.DB, dsn string) {
 
 	c.dbs[tenantID] = db
 	c.dsns[tenantID] = dsn
+}
+
+// setReplica gives the tenant a read replica, the way lib-commons registers one
+// for any tenant whose config declares a secondary connection string. The
+// resolver then routes anything that does not look like a write to it.
+func (c *fakeConnector) setReplica(tenantID string, replica *sql.DB) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.replicas[tenantID] = replica
 }
 
 func (c *fakeConnector) resolveDSNCalls() int {
@@ -639,6 +650,10 @@ func (c *fakeConnector) ResolveDB(_ context.Context, tenantID string) (dbresolve
 		return nil, fmt.Errorf("fakeConnector: unknown tenant %q", tenantID)
 	}
 
+	if replica, ok := c.replicas[tenantID]; ok {
+		return dbresolver.New(dbresolver.WithPrimaryDBs(db), dbresolver.WithReplicaDBs(replica)), nil
+	}
+
 	return dbresolver.New(dbresolver.WithPrimaryDBs(db)), nil
 }
 
@@ -654,6 +669,110 @@ func (c *fakeConnector) ResolveDSN(_ context.Context, tenantID string) (string, 
 	}
 
 	return dsn, nil
+}
+
+// TestIntegration_PostgresScopedReadsStayOnThePrimary pins that a tenant with a
+// read replica still reads what it just wrote.
+//
+// dbresolver decides where a statement goes from its text, and its default
+// checker calls a statement a write only when it contains "RETURNING": Set
+// ends in RETURNING revision and Delete goes through ExecContext, so both land
+// on the primary, while the plain SELECTs in Get and List would be served by a
+// standby — and lib-commons registers a replica for every tenant whose config
+// declares one. A tenant could therefore read a revision older than the one
+// Set just returned, and older than the NOTIFY the changefeed is reconciling
+// against, since the feed LISTENs on the primary DSN.
+//
+// The replica here is a decoy rather than a streaming standby: a separate,
+// permanently empty database provisioned with the same schema. That removes
+// replication lag from the test entirely — any read routed to it comes back
+// missing, which is a harder signal than a stale one and fails deterministically.
+func TestIntegration_PostgresScopedReadsStayOnThePrimary(t *testing.T) {
+	base, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	admin := adminDSN(t, base)
+	t.Cleanup(func() { _ = admin.Close() })
+
+	open := func(role string) (*sql.DB, string) {
+		t.Helper()
+
+		dbName := fmt.Sprintf("replica_%s_%d", role, time.Now().UnixNano())
+		freshDB(t, admin, dbName)
+
+		dsn := dsnFor(base, dbName)
+
+		db, err := sql.Open("pgx", dsn)
+		if err != nil {
+			t.Fatalf("open %s: %v", role, err)
+		}
+
+		t.Cleanup(func() { _ = db.Close() })
+
+		provisionSchema(t, db)
+
+		return db, dsn
+	}
+
+	primary, primaryDSN := open("primary")
+	standby, _ := open("standby")
+
+	conn := newFakeConnector()
+	conn.set("t1", primary, primaryDSN)
+	conn.setReplica("t1", standby)
+
+	s, err := postgres.New(postgres.Config{MultiTenantEnabled: true, Connector: conn})
+	if err != nil {
+		t.Fatalf("postgres.New: %v", err)
+	}
+
+	t.Cleanup(func() { _ = s.Close() })
+
+	ctx := context.Background()
+	scope := store.Scope{Tenant: "t1"}
+
+	written, err := s.Set(ctx, scope, store.Entry{Namespace: "ns", Key: "k", Value: jsonBytes(t, "value-t1")})
+	if err != nil {
+		t.Fatalf("set: %v", err)
+	}
+
+	entry, found, err := s.Get(ctx, scope, "ns", "k")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if !found {
+		t.Fatal("Get missed the value Set just stored: the read was served by the replica")
+	}
+
+	if entry.Revision != written {
+		t.Errorf("Get revision = %d, want the %d Set returned", entry.Revision, written)
+	}
+
+	entries, err := s.List(ctx, scope)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	if len(entries) != 1 {
+		t.Fatalf("List returned %d entries, want 1: the read was served by the replica", len(entries))
+	}
+
+	if entries[0].Revision != written {
+		t.Errorf("List revision = %d, want the %d Set returned", entries[0].Revision, written)
+	}
+
+	// The decoy is live and was never written to, so a passing test above means
+	// the reads went to the primary rather than that the replica was unusable.
+	var onStandby int
+
+	if err := standby.QueryRow(`SELECT count(*) FROM systemplane_entries`).Scan(&onStandby); err != nil {
+		t.Fatalf("count rows on the standby: %v", err)
+	}
+
+	if onStandby != 0 {
+		t.Errorf("standby holds %d rows, want 0: it is a decoy and nothing should write to it", onStandby)
+	}
 }
 
 // TestIntegration_PostgresScopedCRUDIsolation pins FC-2's scoped resolution on

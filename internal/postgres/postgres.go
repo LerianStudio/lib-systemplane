@@ -237,6 +237,9 @@ func (s *Store) isClosed() bool {
 // refused with store.ErrTenantConnectorMissing when no connector is
 // configured. The schema is assumed to be provisioned externally; the store
 // does not create it.
+//
+// Whatever route produced the handle, a resolver that carries read replicas is
+// narrowed to its primary here — see pinPrimary.
 func (s *Store) resolveDB(ctx context.Context, scope store.Scope) (dbExecutor, error) {
 	if scope.Tenant != "" {
 		if s.cfg.Connector == nil {
@@ -254,7 +257,7 @@ func (s *Store) resolveDB(ctx context.Context, scope store.Scope) (dbExecutor, e
 			return nil, fmt.Errorf("systemplane/postgres: resolve tenant %s: %w", scope.Tenant, store.ErrTenantConnectorMissing)
 		}
 
-		return db, nil
+		return pinPrimary(db), nil
 	}
 
 	if !s.cfg.MultiTenantEnabled {
@@ -266,7 +269,37 @@ func (s *Store) resolveDB(ctx context.Context, scope store.Scope) (dbExecutor, e
 		return nil, store.ErrTenantConnectionMissing
 	}
 
-	return db, nil
+	return pinPrimary(db), nil
+}
+
+// pinPrimary keeps the whole systemplane path on the primary, reads included.
+//
+// dbresolver sends a statement to a replica unless it looks like a write, and
+// its default checker recognizes a write only by the string "RETURNING"
+// (dbresolver/v2 query.go). Set ends in RETURNING revision and Delete goes
+// through ExecContext, so both reach the primary — while the plain SELECTs in
+// Get and List would be served by a standby, and lib-commons registers a
+// replica for every tenant that declares one. A caller could then read back a
+// revision older than the one Set just returned, and older than the NOTIFY the
+// changefeed is reconciling against, since the feed LISTENs on the primary
+// DSN. Read-your-write and revision coherence are worth more than offloading a
+// five-column configuration table, so a resolver carrying replicas is narrowed
+// to its primary. A resolver with no replicas is handed back untouched: it
+// already resolves everything to the primary, and keeping the wrapper
+// preserves its failover behavior.
+func pinPrimary(db dbresolver.DB) dbExecutor {
+	if len(db.ReplicaDBs()) == 0 {
+		return db
+	}
+
+	// A resolver with replicas but no primary is a connector bug; there is
+	// nothing better to fall back to than the resolver itself.
+	primaries := db.PrimaryDBs()
+	if len(primaries) == 0 {
+		return db
+	}
+
+	return primaries[0]
 }
 
 // List returns every entry in the resolved database, ordered by (namespace, key).

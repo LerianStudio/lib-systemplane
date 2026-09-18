@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -437,11 +438,90 @@ func TestIntegration_DDLSchemaCreatesTheSequenceBesideTheTable(t *testing.T) {
 	)
 }
 
+// TestIntegration_DDLSchemaRefusesToForkAnInstallInAnotherSchema is the
+// failure this guard exists for, and the one shape of it the sibling test
+// above cannot cover.
+//
+// CREATE TABLE IF NOT EXISTS looks at, and creates in, only the FIRST schema
+// of search_path — every other statement in the artifact resolves the table
+// through the whole path. Applied with search_path = public, app to an install
+// that lives in `app`, the unguarded file therefore provisioned a second,
+// EMPTY systemplane_entries in `public`, exited 0, and left the populated one
+// orphaned: the runtime then read the empty table and every registered key
+// fell back to its default after a migration that reported success. Refusing
+// is the only safe answer, because the file has no way to tell "upgrade the
+// install over there" from "provision a fresh one here".
+func TestIntegration_DDLSchemaRefusesToForkAnInstallInAnotherSchema(t *testing.T) {
+	db, _ := seedV3InsideAppSchema(t, "seqfork", "public, app")
+
+	_, err := db.Exec(systemplane.SchemaSQL())
+	if err == nil {
+		t.Fatal("SchemaSQL() applied under search_path \"public, app\" to an install living in app: want a loud failure, got success")
+	}
+
+	if !strings.Contains(err.Error(), "systemplane_entries already exists in schema app") {
+		t.Fatalf("SchemaSQL() failed, but not with the fork guard: %v", err)
+	}
+
+	// The refusal left the install alone: no second table, no stray sequence.
+	assertRelationSchemas(t, db, "systemplane_entries", []string{"app"})
+	assertRelationSchemas(t, db, "systemplane_revision_seq", nil)
+}
+
 // assertUpgradeOutsideTheDefaultSchema builds a populated v3 install inside the
 // `app` schema, applies the given steps under searchPath, and asserts the
 // sequence followed the table rather than the search_path — then proves it by
 // writing through the Store, which is where a misplaced sequence surfaces.
 func assertUpgradeOutsideTheDefaultSchema(t *testing.T, label, searchPath string, steps ...string) {
+	t.Helper()
+
+	db, dsn := seedV3InsideAppSchema(t, label, searchPath)
+
+	for i, statements := range steps {
+		if _, err := db.Exec(statements); err != nil {
+			t.Fatalf("apply step %d under search_path %q: %v", i+1, searchPath, err)
+		}
+	}
+
+	assertRelationSchemas(t, db, "systemplane_entries", []string{"app"})
+	assertRelationSchemas(t, db, "systemplane_revision_seq", []string{"app"})
+
+	s := storeOn(t, db, dsn)
+	ctx := context.Background()
+
+	updated, err := s.Set(ctx, store.Scope{}, store.Entry{
+		Namespace: "runtime_config",
+		Key:       "log_level",
+		Value:     []byte(`"warn"`),
+	})
+	if err != nil {
+		t.Fatalf("update the migrated key under search_path %q: %v", searchPath, err)
+	}
+
+	if updated < 2 {
+		t.Fatalf("updating the migrated key returned revision %d, want at least 2", updated)
+	}
+
+	created, err := s.Set(ctx, store.Scope{}, store.Entry{
+		Namespace: "runtime_config",
+		Key:       "rate_limit.max",
+		Value:     []byte(`100`),
+	})
+	if err != nil {
+		t.Fatalf("insert a new key under search_path %q: %v", searchPath, err)
+	}
+
+	if created <= updated {
+		t.Fatalf("inserting a new key returned revision %d, want greater than the %d the update drew from the same sequence", created, updated)
+	}
+}
+
+// seedV3InsideAppSchema builds a populated v3 install inside the `app` schema
+// of a fresh database, then re-points the database default search_path at
+// searchPath and returns an open handle plus its DSN. It is the setup both
+// out-of-the-default-schema cases share: the one that upgrades successfully
+// and the one that must be refused.
+func seedV3InsideAppSchema(t *testing.T, label, searchPath string) (*sql.DB, string) {
 	t.Helper()
 
 	base, cleanup := startContainer(t)
@@ -481,49 +561,14 @@ func assertUpgradeOutsideTheDefaultSchema(t *testing.T, label, searchPath string
 
 	_ = legacy.Close()
 
-	// Now upgrade under a search_path that does not describe where the table is.
+	// Hand the caller a handle whose search_path does not describe where the
+	// table is.
 	setDatabaseSearchPath(t, admin, dbName, searchPath)
 
 	db := openDatabase(t, dsn)
 	t.Cleanup(func() { _ = db.Close() })
 
-	for i, statements := range steps {
-		if _, err := db.Exec(statements); err != nil {
-			t.Fatalf("apply step %d under search_path %q: %v", i+1, searchPath, err)
-		}
-	}
-
-	assertRelationSchemas(t, db, "systemplane_entries", []string{"app"})
-	assertRelationSchemas(t, db, "systemplane_revision_seq", []string{"app"})
-
-	s := storeOn(t, db, dsn)
-	ctx := context.Background()
-
-	updated, err := s.Set(ctx, store.Scope{}, store.Entry{
-		Namespace: "runtime_config",
-		Key:       "log_level",
-		Value:     []byte(`"warn"`),
-	})
-	if err != nil {
-		t.Fatalf("update the migrated key under search_path %q: %v", searchPath, err)
-	}
-
-	if updated < 2 {
-		t.Fatalf("updating the migrated key returned revision %d, want at least 2", updated)
-	}
-
-	created, err := s.Set(ctx, store.Scope{}, store.Entry{
-		Namespace: "runtime_config",
-		Key:       "rate_limit.max",
-		Value:     []byte(`100`),
-	})
-	if err != nil {
-		t.Fatalf("insert a new key under search_path %q: %v", searchPath, err)
-	}
-
-	if created <= updated {
-		t.Fatalf("inserting a new key returned revision %d, want greater than the %d the update drew from the same sequence", created, updated)
-	}
+	return db, dsn
 }
 
 // setDatabaseSearchPath pins search_path as a database default rather than a

@@ -58,6 +58,16 @@ var defaultSeedSQL string
 // skip numbers, and on a fresh database the first write lands at revision 2
 // rather than 1.
 //
+// systemplane_entries MUST live in the FIRST schema of the applying role's
+// search_path. Every statement but one resolves the table through the whole
+// search_path; CREATE TABLE IF NOT EXISTS only ever looks at the first schema,
+// so applying this to an install that sits further down the path would create
+// a second, empty table there and orphan the populated one — a migration that
+// exits 0 and leaves every registered key reading its default. The DDL refuses
+// that case loudly instead. An install that cannot be put first in search_path
+// is upgraded with MigrationV3ToV4SQL(), which creates no table and therefore
+// follows the search_path to wherever the table actually is.
+//
 // It is idempotent and upgrades a v3 database in place: the ALTER adds the
 // column at revision 1 for the rows already there and the setval lifts the
 // sequence past the highest revision present, so the first write after the
