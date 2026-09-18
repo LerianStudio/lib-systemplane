@@ -1,6 +1,7 @@
 package systemplane
 
 import (
+	"context"
 	"database/sql"
 	"time"
 
@@ -87,8 +88,22 @@ func WithCatalogService(name string) Option { return internalclient.WithCatalogS
 // WithDescription sets a human-readable description for the key.
 func WithDescription(s string) KeyOption { return internalclient.WithDescription(s) }
 
-// WithValidator sets a validation function invoked on every Set.
+// WithValidator sets a validation function invoked on every Set. The function
+// sees the value alone; [WithContextValidator] sees the Set context too. Both
+// set the same single validator, so the last one applied to a key wins.
 func WithValidator(fn func(any) error) KeyOption { return internalclient.WithValidator(fn) }
+
+// WithContextValidator sets a validation function invoked on every Set with
+// that Set's own context, so validation can use what the caller carried into
+// the write — a tenant, a deadline — to consult another system.
+//
+// The registered default is validated at [Client.Register] time with a
+// non-nil, empty context.Background(), because registering a default is not a
+// write. Both this and [WithValidator] set the same single validator, so the
+// last one applied to a key wins.
+func WithContextValidator(fn func(ctx context.Context, value any) error) KeyOption {
+	return internalclient.WithContextValidator(fn)
+}
 
 // WithRedaction sets the redaction policy.
 func WithRedaction(policy RedactPolicy) KeyOption {

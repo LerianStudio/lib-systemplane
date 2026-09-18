@@ -2,6 +2,7 @@
 package client
 
 import (
+	"context"
 	"fmt"
 	"strings"
 )
@@ -15,7 +16,7 @@ const (
 type keyDef struct {
 	defaultValue any
 	description  string
-	validator    func(any) error
+	validator    func(context.Context, any) error
 	redaction    RedactPolicy
 	catalog      CatalogKeyMetadata
 }
@@ -61,7 +62,11 @@ func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOp
 	}
 
 	if def.validator != nil {
-		if err := def.validator(def.defaultValue); err != nil {
+		// Registering a default is not a write: there is no caller and no
+		// request to take scope from, so the validator gets an empty
+		// background context here. A context validator that needs request
+		// scope must accept that context for the registered default.
+		if err := def.validator(context.Background(), def.defaultValue); err != nil {
 			return fmt.Errorf("%w: default value rejected: %w", ErrValidation, err)
 		}
 	}

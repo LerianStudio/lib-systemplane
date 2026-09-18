@@ -2,6 +2,7 @@
 package client
 
 import (
+	"context"
 	"time"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
@@ -163,7 +164,37 @@ func WithDescription(s string) KeyOption {
 }
 
 // WithValidator sets a validation function invoked on every Set.
+//
+// The function sees the value alone. A validator that has to read the request
+// scope of the write — the tenant a caller carried into Set, say — takes
+// [WithContextValidator] instead.
+//
+// A nil fn is ignored. WithValidator and [WithContextValidator] set the same
+// single validator, so when both are applied to one key the LAST one applied
+// wins, exactly as two WithValidator calls already do.
 func WithValidator(fn func(any) error) KeyOption {
+	return func(k *keyDef) {
+		if fn != nil {
+			k.validator = func(_ context.Context, value any) error { return fn(value) }
+		}
+	}
+}
+
+// WithContextValidator sets a validation function invoked on every Set with
+// that Set's own context, so validation can read what the caller carried into
+// the write — a tenant, a deadline, a trace — and consult another system with
+// it.
+//
+// The same function validates the registered default at [Client.Register]
+// time. Registering a default is not a write and carries no request scope, so
+// it is called there with a non-nil but empty context.Background(): a validator
+// that needs request scope MUST accept that context for the default rather
+// than reject it.
+//
+// A nil fn is ignored. [WithValidator] and WithContextValidator set the same
+// single validator, so when both are applied to one key the LAST one applied
+// wins.
+func WithContextValidator(fn func(ctx context.Context, value any) error) KeyOption {
 	return func(k *keyDef) {
 		if fn != nil {
 			k.validator = fn
