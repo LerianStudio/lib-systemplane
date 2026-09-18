@@ -98,6 +98,7 @@ type entryDoc struct {
 	Namespace string     `bson:"namespace"`
 	Key       string     `bson:"key"`
 	Value     string     `bson:"value"`
+	Revision  int64      `bson:"revision"`
 	UpdatedAt time.Time  `bson:"updated_at"`
 	UpdatedBy string     `bson:"updated_by"`
 }
@@ -437,13 +438,21 @@ func (s *Store) Set(ctx context.Context, scope store.Scope, e store.Entry) (int6
 		attribute.String("key", e.Key),
 	)
 
-	if err := upsert(ctx, coll, e); err != nil {
+	revision, err := upsertReturningRevision(ctx, coll, e)
+	if err != nil && mongo.IsDuplicateKeyError(err) {
+		// Two concurrent upserts of a not-yet-existing _id can both attempt the
+		// insert and one loses on the unique _id. Retry exactly once: the
+		// document now exists, so the pipeline takes the update path.
+		revision, err = upsertReturningRevision(ctx, coll, e)
+	}
+
+	if err != nil {
 		tracing.HandleSpanError(span, "set upsert failed", err)
 
 		return 0, fmt.Errorf("systemplane/mongodb: set: %w", err)
 	}
 
-	return 0, nil
+	return revision, nil
 }
 
 // Delete removes a single (namespace, key) row. Idempotent.

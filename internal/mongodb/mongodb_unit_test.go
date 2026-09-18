@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
+	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
@@ -22,6 +23,7 @@ func TestEntryDocToEntry(t *testing.T) {
 		Namespace: "ns",
 		Key:       "k",
 		Value:     `{"enabled":true}`,
+		Revision:  42,
 		UpdatedAt: now,
 		UpdatedBy: "actor",
 	}
@@ -30,6 +32,111 @@ func TestEntryDocToEntry(t *testing.T) {
 	if entry.Namespace != "ns" || entry.Key != "k" || string(entry.Value) != doc.Value || !entry.UpdatedAt.Equal(now) || entry.UpdatedBy != "actor" {
 		t.Fatalf("toEntry = %#v", entry)
 	}
+
+	if entry.Revision != 42 {
+		t.Fatalf("toEntry revision = %d, want 42", entry.Revision)
+	}
+}
+
+// TestUpsertPipeline_WrapsEveryCallerString is the cheap server-free guard on
+// the $-prefix hazard: the Set pipeline is an aggregation update, so every
+// caller-supplied string it writes must be wrapped in $literal or the server
+// evaluates it as a field path. updated_at must stay bare — a BSON date is
+// never parsed as a path.
+func TestUpsertPipeline_WrapsEveryCallerString(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	pipeline := upsertPipeline(store.Entry{
+		Namespace: "$ns",
+		Key:       "$key",
+		Value:     []byte("$payload"),
+		UpdatedAt: now,
+		UpdatedBy: "$value",
+	})
+
+	if len(pipeline) != 2 {
+		t.Fatalf("pipeline has %d stages, want 2", len(pipeline))
+	}
+
+	set, ok := stageSet(t, pipeline[1])
+	if !ok {
+		t.Fatalf("stage 2 is not a $set: %#v", pipeline[1])
+	}
+
+	for field, want := range map[string]string{
+		fieldNamespace: "$ns",
+		fieldKey:       "$key",
+		fieldValue:     "$payload",
+		fieldUpdatedBy: "$value",
+	} {
+		wrapped, found := set[field]
+		if !found {
+			t.Errorf("%s missing from stage 2", field)
+
+			continue
+		}
+
+		doc, isDoc := wrapped.(bson.D)
+		if !isDoc || len(doc) != 1 || doc[0].Key != opLiteral {
+			t.Errorf("%s = %#v, want a %s wrapper", field, wrapped, opLiteral)
+
+			continue
+		}
+
+		if got, _ := doc[0].Value.(string); got != want {
+			t.Errorf("%s literal = %q, want %q", field, got, want)
+		}
+	}
+
+	stamp, found := set[fieldUpdatedAt]
+	if !found {
+		t.Fatalf("%s missing from stage 2", fieldUpdatedAt)
+	}
+
+	if _, wrapped := stamp.(bson.D); wrapped {
+		t.Errorf("%s = %#v, want a bare BSON date", fieldUpdatedAt, stamp)
+	}
+
+	if got, isTime := stamp.(time.Time); !isTime || !got.Equal(now) {
+		t.Errorf("%s = %#v, want %v", fieldUpdatedAt, stamp, now)
+	}
+
+	// Stage 1 writes only the revision, and it must come first so "$value"
+	// there still means the PRE-update value.
+	revisionSet, ok := stageSet(t, pipeline[0])
+	if !ok {
+		t.Fatalf("stage 1 is not a $set: %#v", pipeline[0])
+	}
+
+	if len(revisionSet) != 1 {
+		t.Fatalf("stage 1 sets %d fields, want only %s", len(revisionSet), fieldRevision)
+	}
+
+	if _, found := revisionSet[fieldRevision]; !found {
+		t.Fatalf("stage 1 does not set %s: %#v", fieldRevision, revisionSet)
+	}
+}
+
+// stageSet flattens one $set stage into a field→expression map.
+func stageSet(t *testing.T, stage bson.D) (map[string]any, bool) {
+	t.Helper()
+
+	if len(stage) != 1 || stage[0].Key != opSet {
+		return nil, false
+	}
+
+	body, ok := stage[0].Value.(bson.D)
+	if !ok {
+		return nil, false
+	}
+
+	out := make(map[string]any, len(body))
+	for _, elem := range body {
+		out[elem.Key] = elem.Value
+	}
+
+	return out, true
 }
 
 func TestNew_ConfigValidationAndDefaults(t *testing.T) {

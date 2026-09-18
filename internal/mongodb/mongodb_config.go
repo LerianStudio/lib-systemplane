@@ -12,6 +12,7 @@ func (d entryDoc) toEntry() store.Entry {
 		Namespace: d.Namespace,
 		Key:       d.Key,
 		Value:     []byte(d.Value),
+		Revision:  d.Revision,
 		UpdatedAt: d.UpdatedAt,
 		UpdatedBy: d.UpdatedBy,
 	}

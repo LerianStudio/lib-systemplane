@@ -17,6 +17,7 @@ import (
 	"github.com/LerianStudio/lib-systemplane/v4/systemplanetest"
 	"github.com/testcontainers/testcontainers-go"
 	mongocontainer "github.com/testcontainers/testcontainers-go/modules/mongodb"
+	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
@@ -50,7 +51,43 @@ func startContainer(t *testing.T) (*mongo.Client, func()) {
 		_ = testcontainers.TerminateContainer(container)
 	}
 
+	// The replica-set member transitions SECONDARY→PRIMARY shortly after the
+	// container reports ready, and a write landing in that window fails with
+	// NotWritablePrimary. The connection is direct, so the driver does no
+	// primary selection of its own: wait here before handing the client out.
+	if err := waitForWritablePrimary(client); err != nil {
+		cleanup()
+
+		t.Fatalf("wait for writable primary: %v", err)
+	}
+
 	return client, cleanup
+}
+
+func waitForWritablePrimary(client *mongo.Client) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var lastErr error
+
+	for {
+		var hello struct {
+			IsWritablePrimary bool `bson:"isWritablePrimary"`
+		}
+
+		lastErr = client.Database("admin").
+			RunCommand(ctx, bson.D{{Key: "hello", Value: 1}}).
+			Decode(&hello)
+		if lastErr == nil && hello.IsWritablePrimary {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("node never became writable primary (last error: %v): %w", lastErr, ctx.Err())
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
 
 func TestIntegration_MongoDBSingleTenant(t *testing.T) {
@@ -358,5 +395,175 @@ func TestIntegration_MongoScopedCRUDIsolation(t *testing.T) {
 		t.Fatal("List for an unknown tenant succeeded, want a resolution error")
 	} else if !strings.Contains(err.Error(), "resolve tenant unknown") {
 		t.Errorf("unknown tenant error = %v, want it to name the tenant", err)
+	}
+}
+
+// freshSingleTenantStore builds a single-tenant store over its own database on
+// the shared container. CRUD needs no Start — Start only opens the change
+// stream — so these revision tests leave no feed goroutine behind.
+func freshSingleTenantStore(t *testing.T, client *mongo.Client, prefix string) store.Store {
+	t.Helper()
+
+	dbName := fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano())
+
+	s, err := mongodb.New(mongodb.Config{Client: client, Database: dbName})
+	if err != nil {
+		t.Fatalf("mongodb.New: %v", err)
+	}
+
+	t.Cleanup(func() {
+		_ = s.Close()
+		_ = client.Database(dbName).Drop(context.Background())
+	})
+
+	return s
+}
+
+// TestIntegration_MongoIdenticalWriteKeepsRevision pins FC-2/FC-9 on the
+// MongoDB write path: the first write reports a revision above zero, a changed
+// value strictly increases it, an identical rewrite leaves it alone, and both
+// read paths report the number the write returned.
+func TestIntegration_MongoIdenticalWriteKeepsRevision(t *testing.T) {
+	client, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	s := freshSingleTenantStore(t, client, "rev")
+	ctx := context.Background()
+
+	set := func(value string) int64 {
+		t.Helper()
+
+		rev, err := s.Set(ctx, store.Scope{}, store.Entry{
+			Namespace: "ns",
+			Key:       "k",
+			Value:     []byte(value),
+			UpdatedBy: "actor",
+		})
+		if err != nil {
+			t.Fatalf("set %s: %v", value, err)
+		}
+
+		return rev
+	}
+
+	r1 := set(`{"a":1}`)
+	if r1 <= 0 {
+		t.Fatalf("first write revision = %d, want > 0", r1)
+	}
+
+	r2 := set(`{"a":2}`)
+	if r2 <= r1 {
+		t.Fatalf("changed-value revision = %d, want > %d", r2, r1)
+	}
+
+	r3 := set(`{"a":2}`)
+	if r3 != r2 {
+		t.Fatalf("identical rewrite revision = %d, want %d unchanged", r3, r2)
+	}
+
+	entry, found, err := s.Get(ctx, store.Scope{}, "ns", "k")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if !found {
+		t.Fatal("get: not found")
+	}
+
+	if entry.Revision != r2 {
+		t.Errorf("Get revision = %d, want %d", entry.Revision, r2)
+	}
+
+	entries, err := s.List(ctx, store.Scope{})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	var listed bool
+
+	for _, e := range entries {
+		if e.Namespace == "ns" && e.Key == "k" {
+			listed = true
+
+			if e.Revision != r2 {
+				t.Errorf("List revision = %d, want %d", e.Revision, r2)
+			}
+		}
+	}
+
+	if !listed {
+		t.Fatal("list: entry ns/k not found")
+	}
+}
+
+// TestIntegration_MongoDollarPrefixedStringsStoredVerbatim is the MongoDB half
+// of the cross-backend parity case whose Postgres twin is
+// TestIntegration_PostgresDollarPrefixedStringsStoredVerbatim. The write is an
+// aggregation-pipeline update, where a bare string beginning with "$" is an
+// expression: unwrapped, an actor of "$value" would persist the document's own
+// JSON payload and a namespace of "$ns" would resolve to missing and drop the
+// field. $literal is the only permitted fix — neither backend rejects
+// $-prefixed identifiers.
+func TestIntegration_MongoDollarPrefixedStringsStoredVerbatim(t *testing.T) {
+	client, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	s := freshSingleTenantStore(t, client, "dollar")
+	ctx := context.Background()
+
+	const (
+		ns      = "$ns"
+		key     = "$key"
+		actor   = "$value"
+		payload = `{"payload":true}`
+	)
+
+	write := func() int64 {
+		t.Helper()
+
+		rev, err := s.Set(ctx, store.Scope{}, store.Entry{
+			Namespace: ns,
+			Key:       key,
+			Value:     []byte(payload),
+			UpdatedBy: actor,
+		})
+		if err != nil {
+			t.Fatalf("set: %v", err)
+		}
+
+		return rev
+	}
+
+	r1 := write()
+
+	entry, found, err := s.Get(ctx, store.Scope{}, ns, key)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if !found {
+		t.Fatal("get: not found")
+	}
+
+	if entry.Namespace != ns {
+		t.Errorf("namespace = %q, want %q", entry.Namespace, ns)
+	}
+
+	if entry.Key != key {
+		t.Errorf("key = %q, want %q", entry.Key, key)
+	}
+
+	if entry.UpdatedBy != actor {
+		t.Errorf("updated_by = %q, want %q", entry.UpdatedBy, actor)
+	}
+
+	if string(entry.Value) != payload {
+		t.Errorf("value = %q, want %q", string(entry.Value), payload)
+	}
+
+	// Rewriting the same value must still compare equal with every surrounding
+	// field wrapped, so the revision must not move.
+	if r2 := write(); r2 != r1 {
+		t.Errorf("identical rewrite revision = %d, want %d unchanged", r2, r1)
 	}
 }

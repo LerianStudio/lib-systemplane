@@ -59,25 +59,85 @@ func (s *Store) runSchema(ctx context.Context, coll *mongo.Collection, tenantSco
 	return nil
 }
 
-// upsert writes an entry using an upsert keyed on the compound _id.
-func upsert(ctx context.Context, coll *mongo.Collection, e store.Entry) error {
-	id := compoundID{Namespace: e.Namespace, Key: e.Key}
+// upsertPipeline builds the aggregation-pipeline update that backs Set.
+//
+// It is a function returning a pipeline rather than inline code so a unit test
+// can assert the $literal wrapping without a live server; the expressions
+// themselves are evaluated server-side and are covered by integration tests.
+//
+// Two stages, and the split is load-bearing. Stage 1 computes the revision
+// against the PRE-UPDATE document, so "$value" there unambiguously means the
+// value the document carried before this write; folding both stages into one
+// $set would lean on same-stage input-document semantics. On an insert (and on
+// a tombstone) "$value" is missing, so $ifNull yields BSON null, the $eq
+// against the new value is false — a JSON payload is always a string, even a
+// JSON null, which is the four-character string "null" — and the bump branch
+// runs. $setOnInsert is illegal in a pipeline update, which is why the $ifNull
+// defaults carry the insert case instead.
+func upsertPipeline(e store.Entry) mongo.Pipeline {
+	newValue := string(e.Value)
 
-	filter := bson.D{{Key: fieldID, Value: id}}
-	update := bson.D{
-		{Key: opSet, Value: bson.D{
-			{Key: fieldNamespace, Value: e.Namespace},
-			{Key: fieldKey, Value: e.Key},
-			{Key: fieldValue, Value: string(e.Value)},
+	return mongo.Pipeline{
+		// Stage 1 — revision, computed against the PRE-UPDATE document.
+		bson.D{{Key: opSet, Value: bson.D{{Key: fieldRevision, Value: bson.D{{Key: "$cond", Value: bson.A{
+			bson.D{{Key: "$eq", Value: bson.A{
+				bson.D{{Key: opIfNull, Value: bson.A{"$" + fieldValue, nil}}},
+				bson.D{{Key: opLiteral, Value: newValue}},
+			}}},
+			bson.D{{Key: opIfNull, Value: bson.A{"$" + fieldRevision, int64(1)}}}, // unchanged value → keep
+			bumpRevisionExpr(), // changed → bump above the old revision AND above the clock floor (D11)
+		}}}}}}},
+		// Stage 2 — the rest of the document. EVERY caller-supplied string is
+		// wrapped in $literal: in a pipeline $set, a bare string beginning with
+		// "$" is an expression, not a value. An UpdatedBy of "$value" would
+		// otherwise persist the document's own JSON payload as the actor, and a
+		// "$x" namespace would resolve to missing and DROP the field.
+		bson.D{{Key: opSet, Value: bson.D{
+			{Key: fieldNamespace, Value: bson.D{{Key: opLiteral, Value: e.Namespace}}},
+			{Key: fieldKey, Value: bson.D{{Key: opLiteral, Value: e.Key}}},
+			{Key: fieldValue, Value: bson.D{{Key: opLiteral, Value: newValue}}},
+			// updated_at is left BARE on purpose: a BSON date is never parsed as
+			// a field path, so it needs no $literal. This is a decision, not an
+			// oversight — do not "fix" it.
 			{Key: fieldUpdatedAt, Value: e.UpdatedAt},
-			{Key: fieldUpdatedBy, Value: e.UpdatedBy},
-		}},
+			{Key: fieldUpdatedBy, Value: bson.D{{Key: opLiteral, Value: e.UpdatedBy}}},
+		}}},
+	}
+}
+
+// bumpRevisionExpr is the revision bump: strictly above the revision the
+// document already carried, and never below the server clock in milliseconds.
+// The clock is only a floor for a key's first-ever write; "previous + 1" is
+// what makes the revision strictly increasing across a delete and recreate
+// whatever the clock does (D11).
+func bumpRevisionExpr() bson.D {
+	return bson.D{{Key: "$max", Value: bson.A{
+		bson.D{{Key: "$add", Value: bson.A{
+			bson.D{{Key: opIfNull, Value: bson.A{"$" + fieldRevision, int64(0)}}},
+			int64(1),
+		}}},
+		bson.D{{Key: "$toLong", Value: "$$NOW"}},
+	}}}
+}
+
+// upsertReturningRevision writes an entry through upsertPipeline and returns
+// the revision the document carries afterwards.
+func upsertReturningRevision(ctx context.Context, coll *mongo.Collection, e store.Entry) (int64, error) {
+	filter := bson.D{{Key: fieldID, Value: compoundID{Namespace: e.Namespace, Key: e.Key}}}
+
+	opts := options.FindOneAndUpdate().
+		SetUpsert(true).
+		SetReturnDocument(options.After)
+
+	var doc entryDoc
+
+	// mongo.ErrNoDocuments is deliberately NOT special-cased: an upsert
+	// returning the after-image always produces a document, so if it ever
+	// appears it is a real error and must propagate rather than be swallowed
+	// into revision 0.
+	if err := coll.FindOneAndUpdate(ctx, filter, upsertPipeline(e), opts).Decode(&doc); err != nil {
+		return 0, err //nolint:wrapcheck // caller wraps with method context
 	}
 
-	opts := options.UpdateOne().SetUpsert(true)
-	if _, err := coll.UpdateOne(ctx, filter, update, opts); err != nil {
-		return err //nolint:wrapcheck // caller wraps with method context
-	}
-
-	return nil
+	return doc.Revision, nil
 }
