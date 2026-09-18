@@ -80,7 +80,9 @@ type feed struct {
 	// with err nil the feed is live, with err non-nil creation failed and the
 	// slot has already been retracted from the feeds map. err is written BEFORE
 	// the close, so the close is the happens-before edge that publishes it.
-	// Both are nil on the zero-scope feed, which Start owns and never waits on.
+	// On the zero-scope feed it is Start's reservation marker: a non-nil ready
+	// means some Start is already opening this feed, so a concurrent one waits
+	// on it instead of opening a second stream.
 	// readyClosed guards the single close of ready. Both the creator and Close
 	// can reach a reserved slot, so the flag lives under Store.feedsMu — the
 	// lock both of them already take — not under f.mu.
@@ -216,15 +218,6 @@ func (f *feed) markConnectedLocked() []*subscription {
 	return f.snapshotLocked()
 }
 
-// zeroFeed returns the zero-scope feed, creating it when Subscribe runs before
-// Start. Callers must NOT hold feedsMu.
-func (s *Store) zeroFeed() (*feed, error) {
-	s.feedsMu.Lock()
-	defer s.feedsMu.Unlock()
-
-	return s.zeroFeedLocked()
-}
-
 // zeroFeedLocked refuses to hand out — or resurrect — the zero-scope feed once
 // Close has begun. The caller MUST hold Store.feedsMu, which is what makes the
 // check atomic with the map walk in stopFeeds: a Start or a Subscribe that
@@ -334,10 +327,10 @@ func (s *Store) awaitFeed(ctx context.Context, f *feed) (*feed, error) {
 // Subscribe call instead of looping in the background, then publishes the feed
 // to every waiter.
 //
-// The connector is consulted ONCE per feed lifetime, not once per reopen: a
-// credentials rotation is picked up when the last subscriber leaves and a later
-// Subscribe builds a fresh feed, which is exactly what releaseFeed removing the
-// named slot buys.
+// The connector is consulted again on every reopen, through refreshFeedColl:
+// the tenant manager owns the client behind this handle and disconnects it on
+// LRU eviction or a credentials swap, so a feed that kept the handle it was
+// built with would reopen forever against a dead client.
 func (s *Store) createFeed(ctx context.Context, f *feed) error {
 	tenant := f.scope.Tenant
 
@@ -555,18 +548,27 @@ func (s *Store) Subscribe(ctx context.Context, scope store.Scope, fn func(store.
 // on this goroutine, and its reader is launched with a nil stream. A first
 // round trip that fails returns the error and retracts the slot, so Start
 // leaves no feed and no ticker behind.
+//
+// Two concurrent Starts open ONE stream between them: reserveZeroFeed picks the
+// opener under the feeds-map lock and the loser waits for its outcome here.
 func (s *Store) startListener(ctx context.Context) error {
-	f, err := s.zeroFeed()
+	f, mine, err := s.reserveZeroFeed()
 	if err != nil {
 		return err
 	}
 
-	f.mu.Lock()
-	running := f.done != nil
-	f.mu.Unlock()
-
-	if running {
+	// Already running: Start is idempotent.
+	if f == nil {
 		return nil
+	}
+
+	// Another Start reserved this feed and is opening it. Wait for its outcome
+	// rather than open a second stream; the opener is bounded by watchTimeout
+	// (or pollRoundTimeout), so this wait is bounded with it.
+	if !mine {
+		<-f.ready
+
+		return f.err
 	}
 
 	if s.cfg.PollInterval > 0 {
@@ -579,10 +581,51 @@ func (s *Store) startListener(ctx context.Context) error {
 
 	stream, err := s.openWatch(ctx, f)
 	if err != nil {
-		return err
+		return s.retractFeed(f, err)
 	}
 
 	return s.publishFeed(ctx, f, stream)
+}
+
+// reserveZeroFeed decides, under the feeds-map lock, which of the concurrent
+// Starts opens the zero-scope feed.
+//
+// The check and the reservation are ONE interlock, and that is the whole point.
+// A Start that merely read "no reader yet", released the lock and then opened a
+// stream would open a second one behind a Start already opening the first: both
+// would publish, the second startFeedReader would overwrite f.done, and from
+// then on every document event and every marker would be delivered twice by two
+// readers while Close waited on only one of them.
+//
+// Returns (nil, false, nil) when the feed already has a reader — Start is
+// idempotent. Returns (f, false, nil) when another Start reserved it: the
+// caller waits on f.ready and returns that attempt's outcome. Returns
+// (f, true, nil) to the one caller that owns the open; it publishes or retracts,
+// and either way closes ready.
+func (s *Store) reserveZeroFeed() (*feed, bool, error) {
+	s.feedsMu.Lock()
+	defer s.feedsMu.Unlock()
+
+	f, err := s.zeroFeedLocked()
+	if err != nil {
+		return nil, false, err
+	}
+
+	f.mu.Lock()
+	running := f.done != nil
+	f.mu.Unlock()
+
+	if running {
+		return nil, false, nil
+	}
+
+	if f.ready != nil {
+		return f, false, nil
+	}
+
+	f.ready = make(chan struct{})
+
+	return f, true, nil
 }
 
 // openWatch opens one change stream on the feed's collection, bounded by
@@ -820,6 +863,15 @@ func (s *Store) reopenWatch(f *feed, attempt *int) (*mongo.ChangeStream, error) 
 		case <-time.After(delay):
 		}
 
+		if err := s.refreshFeedColl(context.Background(), f); err != nil {
+			s.logDebug(context.Background(), "tenant re-resolve before reopen failed",
+				log.Err(err),
+				log.String("tenant", f.scope.Tenant),
+			)
+
+			continue
+		}
+
 		stream, err := s.openWatch(context.Background(), f)
 		if err != nil {
 			s.logDebug(context.Background(), "change stream reopen failed",
@@ -834,6 +886,46 @@ func (s *Store) reopenWatch(f *feed, attempt *int) (*mongo.ChangeStream, error) 
 
 		return stream, nil
 	}
+}
+
+// refreshFeedColl re-resolves a NAMED scope's collection through the connector,
+// before a reopen or after a failed poll round trip. It is a no-op for the zero
+// scope and for a store with no connector.
+//
+// The tenant manager owns the client behind that handle and Disconnect()s it on
+// LRU eviction or a credentials swap — and it ranks eviction candidates by the
+// last GetConnection, which changefeed I/O never touches, so a tenant this store
+// serves entirely from its feed looks perfectly idle and is evicted FIRST. A
+// feed that pinned its handle for life would then fail every reopen with
+// mongo.ErrClientDisconnected, forever, leaving the scope permanently stale
+// behind a reader spinning the backoff for the life of the process. Re-resolving
+// also picks up rotated credentials without waiting for the last subscriber to
+// leave.
+//
+// Called only from the reader goroutine, which owns f.coll once the feed is
+// published, so the write needs no lock.
+func (s *Store) refreshFeedColl(ctx context.Context, f *feed) error {
+	if f.scope.Tenant == "" || s.cfg.Connector == nil {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, watchTimeout)
+	defer cancel()
+
+	db, err := s.cfg.Connector.ResolveDatabase(ctx, f.scope.Tenant)
+	if err != nil {
+		return fmt.Errorf("systemplane/mongodb: resolve tenant %s: %w", f.scope.Tenant, err)
+	}
+
+	// A nil handle with a nil error is a connector bug; refuse it rather than
+	// reopen against something that panics on the first command.
+	if db == nil {
+		return fmt.Errorf("systemplane/mongodb: resolve tenant %s: %w", f.scope.Tenant, store.ErrTenantConnectorMissing)
+	}
+
+	f.coll = db.Collection(s.cfg.Collection)
+
+	return nil
 }
 
 // closeStream closes a dead or abandoned cursor on a ctx of its own: the one
@@ -1059,6 +1151,16 @@ func (s *Store) pollForever(f *feed, st pollState) {
 
 				if subs, ok := f.beginDisconnect(); ok {
 					s.broadcast(f, subs, store.Event{Scope: f.scope, Op: store.OpDisconnect})
+				}
+
+				// The tenant manager may have Disconnect()ed the client behind
+				// f.coll, in which case every later round trip fails on the
+				// dead handle forever. Re-resolve before the next tick.
+				if err := s.refreshFeedColl(context.Background(), f); err != nil {
+					s.logWarn(context.Background(), "tenant re-resolve after a failed poll failed",
+						log.Err(err),
+						log.String("tenant", f.scope.Tenant),
+					)
 				}
 
 				// st is deliberately left untouched: the failed round trip

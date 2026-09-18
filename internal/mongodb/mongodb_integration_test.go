@@ -1988,3 +1988,136 @@ func TestIntegration_MongoPollingDisconnectAndResyncAroundFailedRound(t *testing
 	// nothing, because nothing happened to the collection.
 	assertNoEvent(t, events, time.Second, "after the polling recovery")
 }
+
+// Two Starts landing together must open ONE change stream between them. Before
+// the interlock, both callers read "no reader yet", both opened a cursor and
+// the second publish overwrote the first reader's done channel: every document
+// event and every marker was then delivered twice by two readers, two resyncs
+// were announced on open, and Close waited on only one of them.
+func TestIntegration_MongoConcurrentStartOpensOneStream(t *testing.T) {
+	client, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	dbName := fmt.Sprintf("concurrentstart_%d", time.Now().UnixNano())
+
+	s, err := mongodb.New(mongodb.Config{Client: client, Database: dbName})
+	if err != nil {
+		t.Fatalf("mongodb.New: %v", err)
+	}
+
+	t.Cleanup(func() {
+		_ = s.Close()
+		_ = client.Database(dbName).Drop(context.Background())
+	})
+
+	ctx := context.Background()
+
+	var (
+		mu     sync.Mutex
+		events []store.Event
+	)
+
+	// Subscribed BEFORE Start, so the feed has announced nothing yet: every
+	// marker this subscriber sees comes from a reader, and one reader means one
+	// resync.
+	unsub, err := s.Subscribe(ctx, store.Scope{}, func(evt store.Event) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		events = append(events, evt)
+	})
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	defer unsub()
+
+	startTwice(t, s.Start)
+
+	if total, _ := s.FeedsSnapshot(""); total != 1 {
+		t.Fatalf("feeds after two concurrent Starts = %d, want exactly 1", total)
+	}
+
+	if _, err := s.Set(ctx, store.Scope{}, store.Entry{
+		Namespace: "ns",
+		Key:       "k",
+		Value:     []byte(`{"a":1}`),
+		UpdatedBy: "actor",
+	}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	assertOneReaderDelivered(t, &mu, &events)
+}
+
+// startTwice runs two Starts from one released barrier and fails on either
+// error. Both must report success: the loser of the interlock returns the
+// winner's outcome, not a refusal.
+func startTwice(t *testing.T, start func(context.Context) error) {
+	t.Helper()
+
+	var (
+		barrier sync.WaitGroup
+		done    sync.WaitGroup
+	)
+
+	barrier.Add(1)
+	done.Add(2)
+
+	for i := range 2 {
+		go func() {
+			defer done.Done()
+
+			barrier.Wait()
+
+			if err := start(context.Background()); err != nil {
+				t.Errorf("concurrent Start %d: %v", i, err)
+			}
+		}()
+	}
+
+	barrier.Done()
+	done.Wait()
+}
+
+// assertOneReaderDelivered waits for the upsert of key "k" and then asserts that
+// exactly one reader produced the feed's events: one resync for the open, one
+// copy of the write. A second reader doubles both.
+func assertOneReaderDelivered(t *testing.T, mu *sync.Mutex, events *[]store.Event) {
+	t.Helper()
+
+	deadline := time.Now().Add(10 * time.Second)
+
+	for !sawUpsert(mu, events) {
+		if time.Now().After(deadline) {
+			t.Fatal("the write never reached the subscriber")
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// A second reader delivers its own copy within this window.
+	time.Sleep(500 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	resyncs, upserts := 0, 0
+
+	for _, evt := range *events {
+		switch {
+		case evt.Op == store.OpResync:
+			resyncs++
+		case evt.Op == store.OpUpsert && evt.Key == "k":
+			upserts++
+		}
+	}
+
+	if resyncs != 1 {
+		t.Errorf("OpResync count = %d, want 1: a second reader announced its own open; events = %#v", resyncs, *events)
+	}
+
+	if upserts != 1 {
+		t.Errorf("upsert count for one Set = %d, want 1: two readers delivered the same event; events = %#v", upserts, *events)
+	}
+}

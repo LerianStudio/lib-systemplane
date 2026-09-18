@@ -919,3 +919,138 @@ func TestMongoSubscribe_ClosingStoreResolvesNoTenant(t *testing.T) {
 		t.Errorf("a closing store reserved %d feed slots, want 0", remaining)
 	}
 }
+
+// Two Starts landing together must open ONE changefeed between them. The
+// check-then-open used to be two steps — read "no reader yet" under f.mu,
+// release, then open outside every lock — so both callers opened a cursor, the
+// second startFeedReader overwrote the first reader's done channel, and from
+// then on two readers delivered every event and every marker twice while Close
+// waited on only one of them. Exactly one caller may own the open; the rest
+// wait for its outcome.
+func TestMongoStore_ReserveZeroFeedElectsOneOpener(t *testing.T) {
+	s := newSubscribeStore()
+
+	defer func() { _ = s.Close() }()
+
+	const callers = 16
+
+	var (
+		start   sync.WaitGroup
+		done    sync.WaitGroup
+		mu      sync.Mutex
+		openers int
+		waiters int
+	)
+
+	start.Add(1)
+	done.Add(callers)
+
+	for range callers {
+		go func() {
+			defer done.Done()
+
+			start.Wait()
+
+			f, mine, err := s.reserveZeroFeed()
+			if err != nil {
+				t.Errorf("reserveZeroFeed: %v", err)
+
+				return
+			}
+
+			if f == nil {
+				t.Error("reserveZeroFeed reported a running feed; no reader was ever launched")
+
+				return
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+
+			if mine {
+				openers++
+			} else {
+				waiters++
+			}
+		}()
+	}
+
+	start.Done()
+	done.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if openers != 1 {
+		t.Fatalf("%d of %d concurrent Starts opened the zero-scope feed, want exactly 1", openers, callers)
+	}
+
+	if waiters != callers-1 {
+		t.Fatalf("%d callers waited on the reservation, want %d", waiters, callers-1)
+	}
+}
+
+// A feed must not pin its tenant's collection for life. The tenant manager owns
+// the client behind that handle and disconnects it on LRU eviction or a
+// credentials swap, and it ranks eviction candidates by the last connection
+// checkout — which changefeed I/O never touches — so a tenant served entirely
+// from its feed is the first evicted. Every reopen therefore re-resolves.
+func TestMongoStore_RefreshFeedCollReresolvesNamedScope(t *testing.T) {
+	client := &mongo.Client{}
+	first := client.Database("tenant_before_eviction")
+	second := client.Database("tenant_after_eviction")
+
+	// The manager hands out a fresh handle after the eviction: the feed must
+	// pick it up instead of reopening on the one it was built with.
+	conn := &stubConnector{resolve: func(int) (*mongo.Database, error) { return second, nil }}
+
+	s := newSubscribeStore()
+	s.cfg.MultiTenantEnabled = true
+	s.cfg.Connector = conn
+
+	defer func() { _ = s.Close() }()
+
+	f := newFeed(store.Scope{Tenant: "t1"}, first.Collection(defaultCollection))
+
+	if err := s.refreshFeedColl(context.Background(), f); err != nil {
+		t.Fatalf("refreshFeedColl: %v", err)
+	}
+
+	if got := f.coll.Database().Name(); got != second.Name() {
+		t.Fatalf("feed collection resolved to database %q, want the freshly resolved %q", got, second.Name())
+	}
+
+	// The zero scope keeps the constructor handle: nobody else closes it.
+	zero := newFeed(store.Scope{}, first.Collection(defaultCollection))
+
+	if err := s.refreshFeedColl(context.Background(), zero); err != nil {
+		t.Fatalf("refreshFeedColl on the zero scope: %v", err)
+	}
+
+	if got := zero.coll.Database().Name(); got != first.Name() {
+		t.Fatalf("zero-scope feed re-resolved to %q; it must keep the constructor handle %q", got, first.Name())
+	}
+
+	if calls := conn.callCount(); calls != 1 {
+		t.Fatalf("connector called %d times, want 1: the zero scope must not resolve a tenant", calls)
+	}
+}
+
+// A connector reporting success with a nil database is a bug; a reopen must
+// refuse it rather than attach to something that panics on the first command.
+func TestMongoStore_RefreshFeedCollRefusesNilDatabase(t *testing.T) {
+	conn := &stubConnector{resolve: func(int) (*mongo.Database, error) { return nil, nil }}
+
+	s := newSubscribeStore()
+	s.cfg.MultiTenantEnabled = true
+	s.cfg.Connector = conn
+
+	defer func() { _ = s.Close() }()
+
+	f := newFeed(store.Scope{Tenant: "t1"}, nil)
+
+	err := s.refreshFeedColl(context.Background(), f)
+	if !errors.Is(err, store.ErrTenantConnectorMissing) {
+		t.Fatalf("refreshFeedColl error = %v, want store.ErrTenantConnectorMissing", err)
+	}
+}

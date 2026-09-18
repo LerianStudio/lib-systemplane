@@ -26,6 +26,8 @@ import (
 //     empty result) — masking permission problems and producing answers that
 //     look correct. CreateCollection is treated as idempotent:
 //     NamespaceExists (code 48 / "already exists") is success.
+//     In polling mode it also creates the two indexes in pollingIndexes, which
+//     is the same privilege class CreateCollection already assumes.
 //
 //   - The single-tenant constructor collection: we deliberately DO NOT call
 //     CreateCollection. The change stream that backs Subscribe attaches at
@@ -34,12 +36,25 @@ import (
 //     miss the first insert. Listing indexes is also all the privilege a
 //     consumer whose collection is provisioned externally may hold — it
 //     confirms the connection can reach the collection, and the change stream
-//     observes the very first write that auto-creates the namespace.
+//     observes the very first write that auto-creates the namespace. A
+//     single-tenant consumer running in POLLING mode therefore has to create
+//     the two indexes in pollingIndexes itself, in whatever provisions that
+//     collection: without them both of the poller's per-tick queries scan the
+//     whole collection on every tick, and the incremental one also sorts it
+//     in memory.
 func (s *Store) runSchema(ctx context.Context, coll *mongo.Collection, tenantScoped bool) error {
 	if s.cfg.MultiTenantEnabled || tenantScoped {
 		db := coll.Database()
 		if err := db.CreateCollection(ctx, coll.Name()); err != nil && !isNamespaceExists(err) {
 			return fmt.Errorf("systemplane/mongodb: create collection: %w", err)
+		}
+
+		if s.cfg.PollInterval <= 0 {
+			return nil
+		}
+
+		if _, err := coll.Indexes().CreateMany(ctx, pollingIndexes()); err != nil {
+			return fmt.Errorf("systemplane/mongodb: create polling indexes: %w", err)
 		}
 
 		return nil
@@ -139,6 +154,35 @@ func tombstonePipeline(actor string, now time.Time) mongo.Pipeline {
 // field at all and must stay visible, and $ne matches a missing field.
 func notDeleted() bson.E {
 	return bson.E{Key: fieldDeleted, Value: bson.D{{Key: "$ne", Value: true}}}
+}
+
+// pollingIndexes are the two indexes the polling fallback needs. Every reads
+// path outside polling goes through _id, which the server indexes on its own —
+// these exist for the two full-collection queries polling runs on EVERY tick,
+// for every scope it serves:
+//
+//   - {updated_at, namespace, key} turns the incremental $gte query into a
+//     bounded index scan AND satisfies its sort, so the round trip no longer
+//     sorts the whole collection in memory.
+//   - {deleted, namespace, key} covers snapshotKeys: the projection is
+//     (namespace, key), so the live key set is read from the index alone and
+//     the stored JSON value is never fetched or decoded.
+//
+// Both are created with the collection, so the driver's own names are used and
+// re-creating them is a no-op.
+func pollingIndexes() []mongo.IndexModel {
+	return []mongo.IndexModel{
+		{Keys: bson.D{
+			{Key: fieldUpdatedAt, Value: 1},
+			{Key: fieldNamespace, Value: 1},
+			{Key: fieldKey, Value: 1},
+		}},
+		{Keys: bson.D{
+			{Key: fieldDeleted, Value: 1},
+			{Key: fieldNamespace, Value: 1},
+			{Key: fieldKey, Value: 1},
+		}},
+	}
 }
 
 // bumpRevisionExpr is the revision bump: strictly above the revision the

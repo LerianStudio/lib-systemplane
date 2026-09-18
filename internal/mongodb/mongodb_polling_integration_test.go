@@ -523,3 +523,180 @@ func waitForKeyOp(t *testing.T, events <-chan store.Event, namespace, key, op st
 		}
 	}
 }
+
+// The polling twin of TestIntegration_MongoConcurrentStartOpensOneStream: two
+// Starts landing together must leave ONE ticker behind. Two would deliver every
+// round's events twice and announce two resyncs, and Close would wait on only
+// the second.
+func TestIntegration_MongoConcurrentStartOpensOnePoller(t *testing.T) {
+	client, cleanup := startPollingContainer(t)
+	t.Cleanup(cleanup)
+
+	dbName := fmt.Sprintf("concurrentpoll_%d", time.Now().UnixNano())
+
+	s, err := New(Config{Client: client, Database: dbName, PollInterval: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	t.Cleanup(func() {
+		_ = s.Close()
+		_ = client.Database(dbName).Drop(context.Background())
+	})
+
+	ctx := context.Background()
+
+	// Subscribed BEFORE Start: the feed has announced nothing yet, so every
+	// marker this subscriber sees comes from a poller.
+	add, snapshot := collectingSubscriber()
+
+	unsub, err := s.Subscribe(ctx, store.Scope{}, add)
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	defer unsub()
+
+	var (
+		barrier sync.WaitGroup
+		done    sync.WaitGroup
+	)
+
+	barrier.Add(1)
+	done.Add(2)
+
+	for i := range 2 {
+		go func() {
+			defer done.Done()
+
+			barrier.Wait()
+
+			if err := s.Start(context.Background()); err != nil {
+				t.Errorf("concurrent Start %d: %v", i, err)
+			}
+		}()
+	}
+
+	barrier.Done()
+	done.Wait()
+
+	if total, _ := s.FeedsSnapshot(""); total != 1 {
+		t.Fatalf("feeds after two concurrent Starts = %d, want exactly 1", total)
+	}
+
+	if _, err := s.Set(ctx, store.Scope{}, store.Entry{
+		Namespace: "ns",
+		Key:       "k",
+		Value:     []byte(`{"a":1}`),
+		UpdatedBy: "actor",
+	}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+
+	for !pollSawUpsert(snapshot()) {
+		if time.Now().After(deadline) {
+			t.Fatal("the write never reached the subscriber")
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// A second ticker delivers its own copy within this window; the boundary
+	// dedup suppresses a re-emission from the SAME ticker, so anything extra
+	// here is a second poller.
+	time.Sleep(300 * time.Millisecond)
+
+	resyncs, upserts := 0, 0
+
+	for _, evt := range snapshot() {
+		switch {
+		case evt.Op == store.OpResync:
+			resyncs++
+		case evt.Op == store.OpUpsert && evt.Key == "k":
+			upserts++
+		}
+	}
+
+	if resyncs != 1 {
+		t.Errorf("OpResync count = %d, want 1: a second poller announced its own first round trip", resyncs)
+	}
+
+	if upserts != 1 {
+		t.Errorf("upsert count for one Set = %d, want 1: two pollers delivered the same document", upserts)
+	}
+}
+
+func pollSawUpsert(events []store.Event) bool {
+	for _, evt := range events {
+		if evt.Op == store.OpUpsert && evt.Key == "k" {
+			return true
+		}
+	}
+
+	return false
+}
+
+// Polling reads the whole collection twice per tick, for every scope it serves.
+// Without these two indexes the incremental query is a collection scan with a
+// blocking in-memory sort and the live-key snapshot fetches and decodes every
+// stored value. A tenant collection is created by this library, so it creates
+// them too.
+func TestIntegration_MongoPollingIndexesCreatedForTenantCollection(t *testing.T) {
+	client, cleanup := startPollingContainer(t)
+	t.Cleanup(cleanup)
+
+	dbName := fmt.Sprintf("pollindexes_%d", time.Now().UnixNano())
+	db := client.Database(dbName)
+
+	t.Cleanup(func() { _ = db.Drop(context.Background()) })
+
+	s, err := New(Config{MultiTenantEnabled: true, PollInterval: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	coll := db.Collection(defaultCollection)
+
+	if err := s.runSchema(context.Background(), coll, true); err != nil {
+		t.Fatalf("runSchema: %v", err)
+	}
+
+	// Idempotent: a second bootstrap of the same collection must not error.
+	if err := s.runSchema(context.Background(), coll, true); err != nil {
+		t.Fatalf("runSchema (second run): %v", err)
+	}
+
+	want := map[string]bool{
+		fieldUpdatedAt + "_1_" + fieldNamespace + "_1_" + fieldKey + "_1": false,
+		fieldDeleted + "_1_" + fieldNamespace + "_1_" + fieldKey + "_1":   false,
+	}
+
+	cur, err := coll.Indexes().List(context.Background())
+	if err != nil {
+		t.Fatalf("list indexes: %v", err)
+	}
+
+	defer cur.Close(context.Background())
+
+	for cur.Next(context.Background()) {
+		var idx struct {
+			Name string `bson:"name"`
+		}
+
+		if err := cur.Decode(&idx); err != nil {
+			t.Fatalf("decode index: %v", err)
+		}
+
+		if _, ok := want[idx.Name]; ok {
+			want[idx.Name] = true
+		}
+	}
+
+	for name, found := range want {
+		if !found {
+			t.Errorf("index %q missing: the poller's per-tick queries scan the whole collection without it", name)
+		}
+	}
+}

@@ -47,3 +47,14 @@ func (s *Store) FeedsSnapshot(tenant string) (total, refs int) {
 
 	return len(s.feeds), refs
 }
+
+// zeroFeed returns the zero-scope feed, creating it when the test needs one
+// without going through Start. Test-only: production reaches the same slot
+// through reserveZeroFeed (which also elects the one caller that opens it) or
+// through acquireFeed.
+func (s *Store) zeroFeed() (*feed, error) {
+	s.feedsMu.Lock()
+	defer s.feedsMu.Unlock()
+
+	return s.zeroFeedLocked()
+}
