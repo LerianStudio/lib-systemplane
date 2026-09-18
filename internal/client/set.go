@@ -39,7 +39,7 @@ func (c *Client) Set(ctx context.Context, namespace, key string, value any, acto
 	}
 
 	if def.validator != nil {
-		if err := def.validator(value); err != nil {
+		if err := def.validator(ctx, value); err != nil {
 			return fmt.Errorf("%w: %w", ErrValidation, err)
 		}
 	}

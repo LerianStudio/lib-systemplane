@@ -59,10 +59,12 @@ type Snapshot[T any] struct {
 // see that nil. A validator for such a group must guard its argument rather
 // than dereference it.
 //
-// The validate parameter is the group's validator. A [WithValidator] passed in
-// opts is ignored: Bind's own validator is registered last and replaces it, so
-// a caller cannot disable the type check on their own group. Every other key
-// option in opts is forwarded to [Client.Register] unchanged.
+// The validate parameter is the group's validator. A [WithValidator] or a
+// [WithContextValidator] passed in opts is ignored: both set the same single
+// validator, and Bind appends its own [WithValidator] after opts, so whichever
+// of the two a caller passes is replaced and cannot disable the type check on
+// their own group. Every other key option in opts is forwarded to
+// [Client.Register] unchanged.
 //
 // Bind on a nil Client returns ErrClosed. Defaults that validate rejects
 // surface as the ErrValidation that Register returns.
@@ -118,8 +120,9 @@ func Bind[T any](c *Client, namespace, key string, defaults T, validate func(T) 
 	}
 
 	// The type check goes LAST: applyKeyOptions applies options in order and
-	// the last writer wins, so a caller's own WithValidator would otherwise
-	// silently disable it for their own group.
+	// the last writer wins, so a caller's own WithValidator — or
+	// WithContextValidator, which sets the same single validator — would
+	// otherwise silently disable it for their own group.
 	keyOpts := make([]KeyOption, 0, len(opts)+1)
 	keyOpts = append(keyOpts, opts...)
 	keyOpts = append(keyOpts, WithValidator(ingress))
