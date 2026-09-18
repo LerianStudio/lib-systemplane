@@ -47,9 +47,10 @@ func New(cfg Config) (*Store, error) {
 	}
 
 	s := &Store{
-		cfg:         cfg,
-		tracer:      tracer,
-		subscribers: make(map[uint64]func(store.Event)),
+		cfg:      cfg,
+		tracer:   tracer,
+		feeds:    make(map[string]*feed),
+		closedCh: make(chan struct{}),
 	}
 
 	if !cfg.MultiTenantEnabled {

@@ -21,8 +21,9 @@ import (
 // Subscribe path itself doesn't touch the client.
 func newSubscribeStore() *Store {
 	return &Store{
-		cfg:         Config{Collection: defaultCollection, Module: defaultModule},
-		subscribers: make(map[uint64]func(store.Event)),
+		cfg:      Config{Collection: defaultCollection, Module: defaultModule},
+		feeds:    make(map[string]*feed),
+		closedCh: make(chan struct{}),
 	}
 }
 
@@ -485,4 +486,97 @@ func TestHashValue_Stability(t *testing.T) {
 	if hashValue("") == hashValue(" ") {
 		t.Fatalf("hashValue did not distinguish empty from whitespace payload")
 	}
+}
+
+// beginDisconnect is the single atomic decision point for "does this
+// connection loss get announced". It must fire exactly once per outage and
+// never during a clean teardown. It matters more here than on Postgres: the
+// reopen loop calls the watch once per retry, so an emission tied to "the
+// reopen failed" would announce one disconnect per failed attempt and flood
+// the engine through a long outage.
+func TestMongoFeed_BeginDisconnectSuppressedWhenClosing(t *testing.T) {
+	f := newFeed(store.Scope{}, nil)
+	f.subs[1] = &subscription{fn: func(store.Event) {}}
+	f.subs[2] = &subscription{fn: func(store.Event) {}}
+
+	subs, ok := f.beginDisconnect()
+	if !ok {
+		t.Fatal("beginDisconnect on a live feed = ok false; want the connected->disconnected edge to announce")
+	}
+
+	if len(subs) != 2 {
+		t.Fatalf("beginDisconnect returned %d subscribers, want 2", len(subs))
+	}
+
+	// Edge-triggered: a second failure inside the same outage announces nothing.
+	if subs, ok := f.beginDisconnect(); ok || len(subs) != 0 {
+		t.Fatalf("second beginDisconnect in one outage = (%d subs, ok %v), want (0, false)", len(subs), ok)
+	}
+
+	// A successful reopen re-arms the edge.
+	if subs, ok := f.beginResync(); !ok || len(subs) != 2 {
+		t.Fatalf("beginResync after a disconnect = (%d subs, ok %v), want (2, true)", len(subs), ok)
+	}
+
+	if subs, ok := f.beginDisconnect(); !ok || len(subs) != 2 {
+		t.Fatalf("beginDisconnect after resync = (%d subs, ok %v), want (2, true)", len(subs), ok)
+	}
+
+	f.beginResync()
+
+	// Teardown wins: a clean shutdown must emit no OpDisconnect at all.
+	f.mu.Lock()
+	f.closing = true
+	f.mu.Unlock()
+
+	subs, ok = f.beginDisconnect()
+	if ok {
+		t.Fatal("beginDisconnect during teardown = ok true; a clean shutdown must announce no disconnect")
+	}
+
+	if len(subs) != 0 {
+		t.Fatalf("beginDisconnect during teardown returned %d subscribers, want 0", len(subs))
+	}
+}
+
+// A reopen that succeeds just as Close lands must announce nothing: the scope
+// is going away, and an OpResync there would send the engine off to reconcile
+// a feed that no longer exists.
+func TestMongoFeed_BeginResyncSuppressedWhenClosing(t *testing.T) {
+	f := newFeed(store.Scope{}, nil)
+	f.subs[1] = &subscription{fn: func(store.Event) {}}
+
+	if subs, ok := f.beginResync(); !ok || len(subs) != 1 {
+		t.Fatalf("beginResync on a live feed = (%d subs, ok %v), want (1, true)", len(subs), ok)
+	}
+
+	// Teardown wins, exactly as it does for beginDisconnect.
+	f.mu.Lock()
+	f.closing = true
+	f.mu.Unlock()
+
+	if subs, ok := f.beginResync(); ok || len(subs) != 0 {
+		t.Fatalf("beginResync during teardown = (%d subs, ok %v), want (0, false)", len(subs), ok)
+	}
+}
+
+// A subscription whose ctx outlives the store must not park its observer — and
+// the feed graph that observer closes over — forever after Close. The store-wide
+// closed channel is the third select arm that reaps it.
+func TestMongoSubscribe_CloseReapsCtxObservers(t *testing.T) {
+	s := newSubscribeStore()
+
+	// A ctx that outlives the store: nothing here ever cancels it.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if _, err := s.Subscribe(ctx, store.Scope{}, func(store.Event) {}); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	waitForObserverExit(t)
 }

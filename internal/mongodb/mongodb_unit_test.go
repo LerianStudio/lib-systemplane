@@ -282,6 +282,19 @@ func TestChangeEventAndDispatch(t *testing.T) {
 		t.Fatalf("delete event = (%#v, %v)", deleted, ok)
 	}
 
+	// A tombstone is written as an UPDATE (FC-9), so the operation type alone
+	// cannot tell a delete from a write: the after-image decides.
+	tombstoned, ok := eventFromChange(changeEvent{
+		OperationType: "update",
+		DocumentKey: struct {
+			ID compoundID `bson:"_id"`
+		}{ID: compoundID{Namespace: "ns", Key: "k"}},
+		FullDocument: &entryDoc{Namespace: "ns", Key: "k", Deleted: true},
+	})
+	if !ok || tombstoned.Op != store.OpDelete {
+		t.Fatalf("tombstone event = (%#v, %v), want OpDelete", tombstoned, ok)
+	}
+
 	for _, ce := range []changeEvent{
 		{},
 		{DocumentKey: struct {
@@ -296,14 +309,23 @@ func TestChangeEventAndDispatch(t *testing.T) {
 		}
 	}
 
+	// Fan-out runs on the feed, which is also the one place an event learns
+	// its scope: a change stream cannot name it.
 	s := newSubscribeStore()
-	var got []store.Event
-	s.subscribers[1] = func(store.Event) { panic("handler panic must be recovered") }
-	s.subscribers[2] = func(evt store.Event) { got = append(got, evt) }
+	f := newFeed(store.Scope{}, nil)
 
-	s.dispatchEvent(upsert)
-	if len(got) != 1 || got[0] != upsert {
-		t.Fatalf("dispatch events = %#v, want %#v", got, []store.Event{upsert})
+	var got []store.Event
+
+	f.subs[1] = &subscription{fn: func(store.Event) { panic("handler panic must be recovered") }}
+	f.subs[2] = &subscription{fn: func(evt store.Event) { got = append(got, evt) }}
+
+	f.dispatch(s.cfg.Logger, upsert)
+
+	want := upsert
+	want.Scope = f.scope
+
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("dispatch events = %#v, want %#v", got, []store.Event{want})
 	}
 }
 

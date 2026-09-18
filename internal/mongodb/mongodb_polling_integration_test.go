@@ -162,6 +162,13 @@ func TestIntegration_PollOnce_SameMsDifferentValue_EmitsBoth(t *testing.T) {
 
 	t.Cleanup(unsub)
 
+	// The subscriber lives on the zero-scope feed, which is also what stamps
+	// the scope on every event pollOnce dispatches.
+	f, err := s.zeroFeed()
+	if err != nil {
+		t.Fatalf("zero feed: %v", err)
+	}
+
 	coll := client.Database(dbName).Collection(defaultCollection)
 
 	// Step 1: write v1 at time T (truncated to ms boundary).
@@ -174,7 +181,7 @@ func TestIntegration_PollOnce_SameMsDifferentValue_EmitsBoth(t *testing.T) {
 	emptySeen := make(map[nsKey]seenEntry)
 	emptyKnown := make(map[nsKey]struct{})
 
-	newWM, newKnown, newSeen, err := s.pollOnce(wm0, emptySeen, emptyKnown, true)
+	newWM, newKnown, newSeen, err := s.pollOnce(f, wm0, emptySeen, emptyKnown, true)
 	if err != nil {
 		t.Fatalf("first pollOnce: %v", err)
 	}
@@ -198,7 +205,7 @@ func TestIntegration_PollOnce_SameMsDifferentValue_EmitsBoth(t *testing.T) {
 	// Step 4: second poll with the previous watermark + previous seen set.
 	// Pre-fix this would have skipped silently and emission count would
 	// stay at 1.
-	_, _, _, err = s.pollOnce(newWM, newSeen, newKnown, false)
+	_, _, _, err = s.pollOnce(f, newWM, newSeen, newKnown, false)
 	if err != nil {
 		t.Fatalf("second pollOnce: %v", err)
 	}
@@ -246,6 +253,13 @@ func TestIntegration_PollOnce_SameMsSameValue_EmitsOnce(t *testing.T) {
 
 	t.Cleanup(unsub)
 
+	// The subscriber lives on the zero-scope feed, which is also what stamps
+	// the scope on every event pollOnce dispatches.
+	f, err := s.zeroFeed()
+	if err != nil {
+		t.Fatalf("zero feed: %v", err)
+	}
+
 	coll := client.Database(dbName).Collection(defaultCollection)
 
 	t0 := time.Now().UTC().Truncate(time.Millisecond)
@@ -255,7 +269,7 @@ func TestIntegration_PollOnce_SameMsSameValue_EmitsOnce(t *testing.T) {
 	emptySeen := make(map[nsKey]seenEntry)
 	emptyKnown := make(map[nsKey]struct{})
 
-	newWM, newKnown, newSeen, err := s.pollOnce(wm0, emptySeen, emptyKnown, true)
+	newWM, newKnown, newSeen, err := s.pollOnce(f, wm0, emptySeen, emptyKnown, true)
 	if err != nil {
 		t.Fatalf("first pollOnce: %v", err)
 	}
@@ -269,7 +283,7 @@ func TestIntegration_PollOnce_SameMsSameValue_EmitsOnce(t *testing.T) {
 	// touched updated_at without changing payload.)
 	rawUpsert(t, coll, "ns", "k", `"vSame"`, t0)
 
-	_, _, _, err = s.pollOnce(newWM, newSeen, newKnown, false)
+	_, _, _, err = s.pollOnce(f, newWM, newSeen, newKnown, false)
 	if err != nil {
 		t.Fatalf("second pollOnce: %v", err)
 	}

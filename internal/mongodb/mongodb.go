@@ -129,21 +129,37 @@ type Store struct {
 	// construct a *mongo.Collection; we pass the cacheKey string instead.
 	schemaRunner func(ctx context.Context, cacheKey string) error
 
-	// subscriberMu / subscribers serve the single-tenant change-stream path.
-	subscriberMu sync.Mutex
-	subscribers  map[uint64]func(store.Event)
-	nextSubID    uint64
-	streamStop   chan struct{}
-	streamDone   chan struct{}
+	// feedsMu guards feeds, the changefeeds keyed by scope.Tenant ("" is the
+	// zero, single-tenant scope), and every feed's reference count: a feed's
+	// lifetime decision and its map slot change together, in one lock hold.
+	feedsMu sync.Mutex
+	feeds   map[string]*feed
+
+	// closing is set by Close under feedsMu, and is NOT the per-feed
+	// feed.closing (which only suppresses OpDisconnect on a clean teardown).
+	// A feed is opened outside the map lock, so Close cannot stop an in-flight
+	// creator by walking the map alone: it raises this flag instead, and the
+	// creator rechecks it before publishing anything.
+	closing bool
 
 	mu     sync.Mutex
 	closed bool
+
+	// closedCh is closed exactly once, by Close, in the same s.mu hold that
+	// sets closed — the early return above it is what makes that single. It is
+	// the store-wide shutdown signal every subscription's ctx observer selects
+	// on, so a subscriber whose ctx outlives the store does not leave a
+	// goroutine parked forever. Created by New; a Store is not usable without
+	// it.
+	closedCh chan struct{}
 
 	droppedEvents atomic.Int64
 }
 
 // Start performs single-tenant collection bootstrap and opens the change
-// stream. In multi-tenant mode it is a no-op.
+// stream, synchronously: it does not return until the stream is established or
+// has failed, so a write that lands right after it is observed rather than
+// lost. In multi-tenant mode it is a no-op.
 func (s *Store) Start(ctx context.Context) error {
 	if s == nil || s.isClosed() {
 		return store.ErrClosed
@@ -162,6 +178,13 @@ func (s *Store) Start(ctx context.Context) error {
 
 // Close releases backend resources. Idempotent. Does NOT close the externally
 // supplied mongo client.
+//
+// It signals every changefeed and then waits for their readers under ONE
+// shared closeTimeout, so shutdown costs a single bound no matter how many
+// scopes the store carries. Called from INSIDE a subscriber callback it costs
+// exactly that bound: the reader it is waiting for is the goroutine running
+// the caller, so the wait can only end at the deadline. Close still returns,
+// and the feeds are still torn down.
 func (s *Store) Close() error {
 	if s == nil {
 		return nil
@@ -176,9 +199,11 @@ func (s *Store) Close() error {
 	}
 
 	s.closed = true
+
+	close(s.closedCh)
 	s.mu.Unlock()
 
-	s.stopListener()
+	s.stopFeeds()
 
 	return nil
 }
@@ -522,4 +547,12 @@ func (s *Store) logInfo(ctx context.Context, msg string, fields ...log.Field) {
 	}
 
 	s.cfg.Logger.Log(ctx, log.LevelInfo, msg, fields)
+}
+
+func (s *Store) logDebug(ctx context.Context, msg string, fields ...log.Field) {
+	if s == nil || s.cfg.Logger == nil {
+		return
+	}
+
+	s.cfg.Logger.Log(ctx, log.LevelDebug, msg, fields)
 }

@@ -771,3 +771,88 @@ func TestIntegration_MongoRepeatDeleteWritesNothing(t *testing.T) {
 		t.Errorf("delete of a missing key created %d document(s), want 0", count)
 	}
 }
+
+// A clean Close must announce nothing. The reader's cursor dies because
+// teardown killed it, so an OpDisconnect emitted there would tell the engine to
+// mark stale a scope that is in fact gone — once per scope, on every shutdown.
+//
+// The upsert assertion in the middle is not scenery: it proves the stream was
+// attached BEFORE that write landed. A change stream carries no resume token
+// here, so a stream opened after the write never delivers it — and without that
+// assertion this test would pass vacuously on a feed that never attached.
+func TestIntegration_MongoCleanCloseEmitsNoDisconnect(t *testing.T) {
+	client, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	s, _ := freshSingleTenantStore(t, client, "cleanclose")
+	ctx := context.Background()
+
+	if err := s.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	var (
+		mu     sync.Mutex
+		events []store.Event
+	)
+
+	unsub, err := s.Subscribe(ctx, store.Scope{}, func(evt store.Event) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		events = append(events, evt)
+	})
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	defer unsub()
+
+	if _, err := s.Set(ctx, store.Scope{}, store.Entry{
+		Namespace: "ns",
+		Key:       "k",
+		Value:     []byte(`{"a":1}`),
+		UpdatedBy: "actor",
+	}); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+
+	for !sawUpsert(&mu, &events) {
+		if time.Now().After(deadline) {
+			t.Fatal("the write that landed after Subscribe never reached the subscriber: the change stream attached too late")
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Whatever the reader still had in flight lands inside this window.
+	time.Sleep(500 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	for _, evt := range events {
+		if evt.Op == store.OpDisconnect {
+			t.Fatalf("clean Close emitted OpDisconnect; events = %#v", events)
+		}
+	}
+}
+
+func sawUpsert(mu *sync.Mutex, events *[]store.Event) bool {
+	mu.Lock()
+	defer mu.Unlock()
+
+	for _, evt := range *events {
+		if evt.Op == store.OpUpsert && evt.Key == "k" {
+			return true
+		}
+	}
+
+	return false
+}

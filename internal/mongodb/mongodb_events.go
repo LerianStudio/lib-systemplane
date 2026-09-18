@@ -3,6 +3,7 @@ package mongodb
 import (
 	"hash/fnv"
 
+	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/runtime"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
@@ -67,29 +68,105 @@ func eventFromChange(ce changeEvent) (store.Event, bool) {
 		return store.Event{}, false
 	}
 
+	// A tombstone is written as an UPDATE that unsets the value and raises
+	// deleted (FC-9), so the operation type alone cannot tell a delete from a
+	// write: the after-image decides. A raw delete — a foreign writer removing
+	// the document outright — carries no after-image and is still a delete.
 	op := store.OpUpsert
-	if ce.OperationType == operationTypeDelete {
+	if ce.OperationType == operationTypeDelete || (ce.FullDocument != nil && ce.FullDocument.Deleted) {
 		op = store.OpDelete
 	}
 
 	return store.Event{Namespace: id.Namespace, Key: id.Key, Op: op}, true
 }
 
-func (s *Store) dispatchEvent(evt store.Event) {
-	s.subscriberMu.Lock()
-	subs := make([]func(store.Event), 0, len(s.subscribers))
+// snapshotLocked copies the subscriber set so it can be fanned out to after
+// f.mu is released. The caller MUST already hold f.mu.
+func (f *feed) snapshotLocked() []*subscription {
+	subs := make([]*subscription, 0, len(f.subs))
 
-	for _, fn := range s.subscribers {
-		subs = append(subs, fn)
+	for _, sub := range f.subs {
+		subs = append(subs, sub)
 	}
 
-	s.subscriberMu.Unlock()
+	return subs
+}
 
-	for _, fn := range subs {
-		func() {
-			defer runtime.RecoverAndLog(s.cfg.Logger, "systemplane.mongodb.handler")
+// deliverLocked runs fn under runtime.RecoverAndLog. The caller MUST already
+// hold sub.mu; deliver is the variant that takes it. Both routes are
+// panic-safe, and every caller unlocks through defer, so a panicking callback
+// can never leave sub.mu held.
+func (sub *subscription) deliverLocked(logger log.Logger, evt store.Event) {
+	defer runtime.RecoverAndLog(logger, "systemplane.mongodb.handler")
 
-			fn(evt)
-		}()
+	sub.fn(evt)
+}
+
+func (sub *subscription) deliver(logger log.Logger, evt store.Event) {
+	sub.mu.Lock()
+	defer sub.mu.Unlock()
+
+	sub.deliverLocked(logger, evt)
+}
+
+// dispatch fans one event out to the feed's subscribers. The snapshot is
+// taken under f.mu and the lock is RELEASED before any callback runs: a
+// callback that unsubscribes from inside itself would otherwise deadlock.
+//
+// This is the ONE place a change-stream event learns its scope: the stream
+// cannot name it (the tenant IS the database it was opened on), so the feed
+// that read it stamps it, and eventFromChange stays a pure function of the
+// raw event.
+//
+// The fan-out is also marked on the feed, because a callback can call back into
+// the store: f.dispatching tells a teardown reached from inside a callback that
+// it must not wait for the reader goroutine — it may BE that goroutine.
+func (f *feed) dispatch(logger log.Logger, evt store.Event) {
+	evt.Scope = f.scope
+
+	f.mu.Lock()
+	subs := f.snapshotLocked()
+	f.dispatching++
+	f.mu.Unlock()
+
+	defer f.endDispatch()
+
+	for _, sub := range subs {
+		sub.deliver(logger, evt)
 	}
+}
+
+// broadcast fans a synthesized marker (OpResync / OpDisconnect) out to an
+// already-taken snapshot of subscribers, outside f.mu.
+//
+// The window is marked on the feed for the same reason feed.dispatch marks a
+// key event: a marker is delivered on the reader goroutine too, and the engine
+// reacts to markers by reconciling a scope — dropping the tenant's last
+// subscription when that reconcile fails, or closing the store. Without the
+// marker that teardown would wait the full closeTimeout on the goroutine
+// running it, freezing the tenant's feed for those five seconds.
+func (s *Store) broadcast(f *feed, subs []*subscription, evt store.Event) {
+	f.beginDispatch()
+	defer f.endDispatch()
+
+	for _, sub := range subs {
+		sub.deliver(s.cfg.Logger, evt)
+	}
+}
+
+// beginDispatch and endDispatch bracket one delivery performed by the reader
+// goroutine, so signalFeed can tell a teardown reached from inside a callback
+// not to wait on that goroutine. Every reader-goroutine delivery — key events
+// through feed.dispatch and markers through Store.broadcast — goes through
+// this pair.
+func (f *feed) beginDispatch() {
+	f.mu.Lock()
+	f.dispatching++
+	f.mu.Unlock()
+}
+
+func (f *feed) endDispatch() {
+	f.mu.Lock()
+	f.dispatching--
+	f.mu.Unlock()
 }
