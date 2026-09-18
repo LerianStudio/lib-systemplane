@@ -574,3 +574,37 @@ func TestCloseDoesNotCloseTheStore(t *testing.T) {
 		t.Errorf("Engine.Close closed the store %d times, want 0: the Client owns the store's lifecycle", got)
 	}
 }
+
+// TestCloseTimeoutInsideAStoreCallSaysSo pins the diagnosis a timed-out Close
+// hands the operator. Nothing is inside a subscriber here — the engine is stuck
+// in Store.List — so blaming a callback sends whoever reads the message hunting
+// through consumer code for a bug that is in the backend or the network.
+func TestCloseTimeoutInsideAStoreCallSaysSo(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	e := storeEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0, 100*time.Millisecond)
+
+	release := heldList(fs)
+
+	e.onEvent(resyncEvent(scope))
+	waitFor(t, time.Second, "the reconcile to reach its List", func() bool { return fs.listCount() == 1 })
+
+	err := e.Close()
+	if !errors.Is(err, ErrCloseTimeout) {
+		t.Fatalf("Close() = %v, want an error wrapping ErrCloseTimeout", err)
+	}
+
+	if strings.Contains(err.Error(), "subscriber") {
+		t.Errorf("Close() error %q blames a subscriber, but the engine is stuck inside Store.List", err)
+	}
+
+	if !strings.Contains(err.Error(), "store call") {
+		t.Errorf("Close() error %q does not say the engine is stuck inside a store call", err)
+	}
+
+	// Release the held List and wait for the reconcile goroutine: a test that
+	// leaks on purpose fails the whole package under goleak.
+	release()
+	e.dispatchWG.Wait()
+}

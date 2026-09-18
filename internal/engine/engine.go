@@ -159,6 +159,11 @@ func New(cfg Config) *Engine {
 //     returned and the scope is left tracked and stale. A backend that never
 //     emits OpResync is broken, and failing loudly beats serving registered
 //     defaults forever while pretending they are current.
+//   - Close runs while Start is waiting: store.ErrClosed is returned at once.
+//     Close drops the event that would have driven the first reconcile and
+//     stops the goroutine that would have run it, so nothing will ever close
+//     the channel Start waits on — a caller that passed context.Background(),
+//     which is what a service does, would wait for the life of the process.
 //   - the first reconcile ran and failed: its error is returned wrapped and
 //     the scope is left stale, for the next OpResync to retry.
 //
@@ -196,6 +201,8 @@ func (e *Engine) Start(ctx context.Context) error {
 
 	select {
 	case <-sc.firstReconcileDone:
+	case <-e.dispatchContext().Done():
+		return store.ErrClosed
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -494,13 +501,19 @@ func (e *Engine) trackedScopes() []*scopeState {
 // waitForWorkers drains the dispatch WaitGroup in a goroutine racing a timer,
 // which is what makes the wait bounded. The drain goroutine only ever closes a
 // channel, so it cannot outlive the workers even when the timer wins.
+//
+// It is launched the way every other engine goroutine is — with the context
+// and the component — so a panic here is metered and recorded on the span
+// rather than only logged. Its context is already canceled by the time it
+// runs, which is why the function ignores it.
 func (e *Engine) waitForWorkers() error {
 	drained := make(chan struct{})
 
-	runtime.SafeGo(e.logger, "systemplane.engine.close", runtime.KeepRunning, func() {
-		e.dispatchWG.Wait()
-		close(drained)
-	})
+	runtime.SafeGoWithContextAndComponent(e.dispatchContext(), e.logger,
+		"systemplane.engine", "close", runtime.KeepRunning, func(context.Context) {
+			e.dispatchWG.Wait()
+			close(drained)
+		})
 
 	timeout := e.closeTimeout
 	if timeout <= 0 {
@@ -520,9 +533,14 @@ func (e *Engine) waitForWorkers() error {
 
 // stuckError names every worker still inside a subscriber callback. The set is
 // read from the workers themselves rather than derived from the cache, so the
-// message reports what is actually stuck. A worker caught between its wake-up
-// and the callback leaves the set empty; the error still reports the timeout
-// rather than claiming a clean shutdown.
+// message reports what is actually stuck.
+//
+// An empty set is a different diagnosis, not a missing one: no callback is
+// running, so what held shutdown is engine work inside the store — a reconcile
+// whose List has not answered, or a debounced re-read — or a worker caught
+// between its wake-up and the callback. Blaming a subscriber there sends
+// whoever reads the message hunting through consumer code for a fault that is
+// in the backend or the network.
 func (e *Engine) stuckError(timeout time.Duration) error {
 	stuck := make([]string, 0, 1)
 
@@ -543,7 +561,8 @@ func (e *Engine) stuckError(timeout time.Duration) error {
 	})
 
 	if len(stuck) == 0 {
-		stuck = append(stuck, "unknown")
+		return fmt.Errorf("%w after %s: engine still inside a store call (reconcile or re-read)",
+			ErrCloseTimeout, timeout)
 	}
 
 	sort.Strings(stuck)

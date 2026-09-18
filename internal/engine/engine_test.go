@@ -383,3 +383,77 @@ func TestWriteDuringStartSurvives(t *testing.T) {
 			got.Value, got.Revision)
 	}
 }
+
+// TestStartReturnsClosedWhenCloseRacesIt pins the release path. Start waits for
+// the first reconcile, which a Close cancels without ever completing: the event
+// that would have driven it is dropped, the reconcile worker refuses to start,
+// and the channel Start waits on is never closed. A caller that started the
+// engine with a context of its own choosing — context.Background() is what a
+// service does — was wedged for the life of the process.
+func TestStartReturnsClosedWhenCloseRacesIt(t *testing.T) {
+	fs := newFakeStore() // no resyncOnSubscribe: the first reconcile never completes
+	e := startEngine(t, map[NSKey]KeyDef{}, fs)
+
+	subscribed := make(chan struct{})
+
+	fs.onSubscribe(func(store.Scope) error {
+		fs.onSubscribe(nil)
+		close(subscribed)
+
+		return nil
+	})
+
+	started := make(chan error, 1)
+
+	go func() { started <- e.Start(context.Background()) }()
+
+	select {
+	case <-subscribed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for Start to open the changefeed")
+	}
+
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close() = %v, want nil", err)
+	}
+
+	select {
+	case err := <-started:
+		if !errors.Is(err, store.ErrClosed) {
+			t.Fatalf("Start() = %v, want an error wrapping %v", err, store.ErrClosed)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Start() never returned after Close(); a caller waiting on a first reconcile nobody will run is wedged for the life of the process")
+	}
+}
+
+// TestStartFailsWhenFirstReconcilePanics pins the other way out of that wait. A
+// panic inside the first reconcile — the registered validator is consumer code —
+// is recovered so the scope keeps its reconcile goroutine, but the recovery used
+// to swallow the completion too, leaving Start blocked until its own context
+// expired.
+func TestStartFailsWhenFirstReconcilePanics(t *testing.T) {
+	fs := newFakeStore()
+	fs.resyncOnSubscribe()
+
+	fs.onList(func(store.Scope) error {
+		fs.onList(nil)
+
+		panic("reconcile blew up")
+	})
+
+	e := startEngine(t, map[NSKey]KeyDef{}, fs)
+
+	err := e.Start(startCtx(t, 2*time.Second))
+	if !errors.Is(err, errFirstReconcilePanicked) {
+		t.Fatalf("Start() = %v, want an error wrapping %v", err, errFirstReconcilePanicked)
+	}
+
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Error("Start blocked on a panicked first reconcile until its own context expired")
+	}
+
+	if errors.Is(err, store.ErrValidation) {
+		t.Error("a panicked reconcile reports as a store validation failure; it is an internal engine failure")
+	}
+}

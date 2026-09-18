@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"reflect"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
@@ -139,14 +140,43 @@ func (e *Engine) runReconcileWorker(ctx context.Context, sc *scopeState) {
 	}
 }
 
+// errFirstReconcilePanicked is what a caller waiting on the first reconcile is
+// told when that reconcile panicked. The panic itself is reported through
+// lib-observability, which recovers it so the scope keeps its one reconcile
+// goroutine; this sentinel is how the wait ends instead of blocking until the
+// caller's own context expires.
+//
+// It deliberately wraps nothing from the store: a panic is an internal engine
+// failure, not a value the backend rejected.
+var errFirstReconcilePanicked = errors.New("systemplane: the first reconcile panicked")
+
 // runOneReconcile keeps a panicking reconcile from taking the scope's only
 // reconcile goroutine with it. The validator the ingress runs is consumer
 // code: recovering per reconcile rather than per goroutine is what makes the
 // next OpResync still reconcile after one bad row.
+//
+// A recovered panic must still complete the first reconcile. reconcileScope is
+// what hands Start that outcome, and a panic skips it: Start then waits on a
+// channel nothing will ever close, for as long as its own context allows.
+//
+// The two defers are ordered deliberately. This one is registered FIRST so it
+// runs LAST, after the recovery below has absorbed the panic and reported it,
+// and it fires only when reconcileScope did not return — a superseded
+// reconcile returns normally and completes nothing, which is correct.
 func (e *Engine) runOneReconcile(ctx context.Context, sc *scopeState, arm reconcileArming) {
+	returned := false
+
+	defer func() {
+		if !returned {
+			sc.finishFirstReconcile(errFirstReconcilePanicked)
+		}
+	}()
+
 	defer runtime.RecoverAndLogWithContext(ctx, e.logger, "systemplane.engine", "reconcile")
 
 	e.reconcileScope(sc, arm)
+
+	returned = true
 }
 
 // reconcileScope reloads scope from the store and republishes what changed.
@@ -206,10 +236,20 @@ func (e *Engine) applyScope(sc *scopeState, arm reconcileArming) (superseded boo
 
 	entries, err := e.listSnapshot(ctx, sc.scope)
 	if err != nil {
-		e.logWarn(ctx, "scope reconcile failed to list, keeping cached values",
-			log.String("tenant", sc.scope.Tenant),
-			log.Err(err),
-		)
+		const msg = "scope reconcile failed to list, keeping cached values"
+
+		fields := []log.Field{log.String("tenant", sc.scope.Tenant), log.Err(err)}
+
+		// Every ordinary Close with a reconcile in flight cancels its List, so
+		// reporting that at WARN makes a clean shutdown look like an incident
+		// and trains operators to ignore the channel a real failure uses. The
+		// reconcile timeout that ends a hung List is DeadlineExceeded, not
+		// Canceled, and stays at WARN like every other failure.
+		if errors.Is(err, context.Canceled) && ctx.Err() != nil {
+			e.logDebug(ctx, msg, fields...)
+		} else {
+			e.logWarn(ctx, msg, fields...)
+		}
 
 		// Nothing is cleared here: the deferred closeWindow releases this
 		// reconcile's own fences and stale stays true because clearStale is

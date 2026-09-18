@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/redaction"
@@ -247,4 +248,78 @@ func TestReReadCanceledByCloseIsLoggedAtDebug(t *testing.T) {
 	e.refreshKey(store.Scope{}, nk)
 
 	requireLogged(t, rec, log.LevelDebug, "changefeed re-read canceled during shutdown", nk)
+}
+
+// requireLoggedAt asserts the single entry with this message was emitted at
+// level. It is requireLogged for the lines that name a scope rather than a key:
+// a reconcile failure carries the tenant and the error, not a namespace.
+func requireLoggedAt(t *testing.T, r *recordingLogger, level int, msg string) {
+	t.Helper()
+
+	matches := make([]logRecord, 0, 1)
+
+	for _, rec := range r.snapshot() {
+		if rec.Msg == msg {
+			matches = append(matches, rec)
+		}
+	}
+
+	if len(matches) != 1 {
+		t.Fatalf("entries with message %q: got %d, want 1; all entries: %v", msg, len(matches), r.all())
+	}
+
+	if got := matches[0].Level; got != level {
+		t.Errorf("%q logged at level %s, want %s", msg, log.LevelName(got), log.LevelName(level))
+	}
+
+	requireNotRedacted(t, matches[0])
+}
+
+// TestReconcileListFailureLevelsSplitOnShutdown pins the one level that is
+// noise. Every ordinary Close with a reconcile in flight cancels that List, so
+// logging it at WARN made a clean shutdown look like an incident — and trained
+// operators to ignore the channel the real failure uses.
+func TestReconcileListFailureLevelsSplitOnShutdown(t *testing.T) {
+	const msg = "scope reconcile failed to list, keeping cached values"
+
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+
+	t.Run("canceled by Close", func(t *testing.T) {
+		fs := newFakeStore()
+		e, rec := loggingEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs)
+
+		release := heldList(fs)
+
+		e.onEvent(resyncEvent(scope))
+		waitFor(t, time.Second, "the reconcile to reach its List", func() bool { return fs.listCount() == 1 })
+
+		done := closeInBackground(e)
+
+		// The cancellation must land BEFORE the List is released, or the List
+		// succeeds and there is no failure to log at any level.
+		waitFor(t, time.Second, "Close to cancel the lifecycle context", func() bool {
+			return e.lifecycleCtx.Err() != nil
+		})
+
+		release()
+		mustCloseCleanly(t, done)
+
+		requireLoggedAt(t, rec, log.LevelDebug, msg)
+	})
+
+	t.Run("a real List failure", func(t *testing.T) {
+		fs := newFakeStore()
+		e, rec := loggingEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs)
+
+		fs.onList(func(store.Scope) error { return errList })
+
+		e.onEvent(resyncEvent(scope))
+
+		if err := waitFirstReconcile(t, e, scope); !errors.Is(err, errList) {
+			t.Fatalf("first reconcile outcome: got %v, want %v", err, errList)
+		}
+
+		requireLoggedAt(t, rec, log.LevelWarn, msg)
+	})
 }
