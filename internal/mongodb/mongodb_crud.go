@@ -17,22 +17,25 @@ import (
 //
 // Behavior differs by mode:
 //
-//   - Multi-tenant: we MUST eagerly materialize the collection via
-//     CreateCollection. MongoDB creates collections lazily on first write, so
-//     a Get/List against a fresh tenant DB before any Set would otherwise
-//     succeed (returning an empty result) — masking permission problems and
-//     producing answers that look correct. CreateCollection is treated as
-//     idempotent: NamespaceExists (code 48 / "already exists") is success.
+//   - Any tenant database, whether carried by ctx in multi-tenant mode or
+//     resolved through the tenant connector for a named scope: we MUST
+//     eagerly materialize the collection via CreateCollection. MongoDB
+//     creates collections lazily on first write, so a Get/List against a
+//     fresh tenant DB before any Set would otherwise succeed (returning an
+//     empty result) — masking permission problems and producing answers that
+//     look correct. CreateCollection is treated as idempotent:
+//     NamespaceExists (code 48 / "already exists") is success.
 //
-//   - Single-tenant: we deliberately DO NOT call CreateCollection. The
-//     change stream that backs Subscribe attaches at the current oplog
-//     position, and on freshly created replica-set members there is a brief
-//     window after CreateCollection where the watcher can miss the first
-//     insert. Listing indexes is sufficient — it confirms the connection has
-//     the required privileges, and the change stream observes the very first
-//     write that auto-creates the namespace.
-func (s *Store) runSchema(ctx context.Context, coll *mongo.Collection) error {
-	if s.cfg.MultiTenantEnabled {
+//   - The single-tenant constructor collection: we deliberately DO NOT call
+//     CreateCollection. The change stream that backs Subscribe attaches at
+//     the current oplog position, and on freshly created replica-set members
+//     there is a brief window after CreateCollection where the watcher can
+//     miss the first insert. Listing indexes is also all the privilege a
+//     consumer whose collection is provisioned externally may hold — it
+//     confirms the connection can reach the collection, and the change stream
+//     observes the very first write that auto-creates the namespace.
+func (s *Store) runSchema(ctx context.Context, coll *mongo.Collection, tenantScoped bool) error {
+	if s.cfg.MultiTenantEnabled || tenantScoped {
 		db := coll.Database()
 		if err := db.CreateCollection(ctx, coll.Name()); err != nil && !isNamespaceExists(err) {
 			return fmt.Errorf("systemplane/mongodb: create collection: %w", err)

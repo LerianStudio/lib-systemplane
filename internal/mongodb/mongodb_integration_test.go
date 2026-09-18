@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -196,4 +198,165 @@ func mustGet(t *testing.T, s store.Store, ctx context.Context, ns, key string) s
 	}
 
 	return v
+}
+
+// fakeConnector resolves tenants from a static map, standing in for a
+// tenant-manager Mongo Manager without a tenant-config gRPC client. It is
+// guarded by a mutex so a test can teach it a tenant it previously did not
+// know, and an unknown tenant fails the way the manager would.
+type fakeConnector struct {
+	mu  sync.Mutex
+	dbs map[string]*mongo.Database
+}
+
+func newFakeConnector() *fakeConnector {
+	return &fakeConnector{dbs: map[string]*mongo.Database{}}
+}
+
+func (c *fakeConnector) set(tenantID string, db *mongo.Database) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.dbs[tenantID] = db
+}
+
+func (c *fakeConnector) ResolveDatabase(_ context.Context, tenantID string) (*mongo.Database, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	db, ok := c.dbs[tenantID]
+	if !ok {
+		return nil, fmt.Errorf("fakeConnector: unknown tenant %q", tenantID)
+	}
+
+	return db, nil
+}
+
+// TestIntegration_MongoScopedCRUDIsolation pins FC-2's scoped resolution on the
+// MongoDB CRUD path: a named Scope.Tenant resolves its database through the
+// connector and nothing else. Every call travels on a plain
+// context.Background() carrying no tenant at all, so a passing test proves the
+// handle came from the connector rather than from ctx, and each tenant sees
+// only its own documents.
+func TestIntegration_MongoScopedCRUDIsolation(t *testing.T) {
+	client, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	conn := newFakeConnector()
+	stamp := time.Now().UnixNano()
+
+	for _, tenant := range []string{"t1", "t2"} {
+		db := client.Database(fmt.Sprintf("scoped_%s_%d", tenant, stamp))
+
+		t.Cleanup(func() { _ = db.Drop(context.Background()) })
+
+		conn.set(tenant, db)
+	}
+
+	// No Client, no Database: every handle must come from the connector.
+	s, err := mongodb.New(mongodb.Config{
+		MultiTenantEnabled: true,
+		Module:             "systemplane",
+		Connector:          conn,
+	})
+	if err != nil {
+		t.Fatalf("mongodb.New: %v", err)
+	}
+
+	t.Cleanup(func() { _ = s.Close() })
+
+	ctx := context.Background()
+	scope1 := store.Scope{Tenant: "t1"}
+	scope2 := store.Scope{Tenant: "t2"}
+
+	set := func(scope store.Scope, key, value string) {
+		t.Helper()
+
+		raw, err := json.Marshal(value)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+
+		if _, err := s.Set(ctx, scope, store.Entry{Namespace: "ns", Key: key, Value: raw}); err != nil {
+			t.Fatalf("set %s/%s: %v", scope.Tenant, key, err)
+		}
+	}
+
+	get := func(scope store.Scope) (string, bool) {
+		t.Helper()
+
+		entry, found, err := s.Get(ctx, scope, "ns", "k")
+		if err != nil {
+			t.Fatalf("get %s: %v", scope.Tenant, err)
+		}
+
+		if !found {
+			return "", false
+		}
+
+		var v string
+		if err := json.Unmarshal(entry.Value, &v); err != nil {
+			t.Fatalf("unmarshal %s: %v", scope.Tenant, err)
+		}
+
+		return v, true
+	}
+
+	// A read before the first write must reach a materialized collection, not
+	// an empty answer from a database that was never touched.
+	if _, found := get(scope1); found {
+		t.Fatal("t1 Get before any write found an entry")
+	}
+
+	set(scope1, "k", "value-t1")
+	set(scope2, "k", "value-t2")
+
+	if got, found := get(scope1); !found || got != "value-t1" {
+		t.Errorf("t1 Get = %q (found=%v), want value-t1", got, found)
+	}
+
+	if got, found := get(scope2); !found || got != "value-t2" {
+		t.Errorf("t2 Get = %q (found=%v), want value-t2", got, found)
+	}
+
+	// A t2-only write must stay invisible from t1's scope.
+	set(scope2, "only-t2", "x")
+
+	list1, err := s.List(ctx, scope1)
+	if err != nil {
+		t.Fatalf("list t1: %v", err)
+	}
+
+	if len(list1) != 1 || list1[0].Key != "k" {
+		t.Fatalf("t1 List = %#v, want exactly ns/k", list1)
+	}
+
+	list2, err := s.List(ctx, scope2)
+	if err != nil {
+		t.Fatalf("list t2: %v", err)
+	}
+
+	if len(list2) != 2 {
+		t.Fatalf("t2 List has %d entries, want 2", len(list2))
+	}
+
+	// Deleting in t1 must not touch t2.
+	if err := s.Delete(ctx, scope1, "ns", "k", "actor"); err != nil {
+		t.Fatalf("delete t1: %v", err)
+	}
+
+	if _, found := get(scope1); found {
+		t.Errorf("t1 Get after delete still found the entry")
+	}
+
+	if got, found := get(scope2); !found || got != "value-t2" {
+		t.Errorf("t2 Get after t1 delete = %q (found=%v), want value-t2", got, found)
+	}
+
+	// A tenant the connector does not know surfaces the resolution failure.
+	if _, err := s.List(ctx, store.Scope{Tenant: "unknown"}); err == nil {
+		t.Fatal("List for an unknown tenant succeeded, want a resolution error")
+	} else if !strings.Contains(err.Error(), "resolve tenant unknown") {
+		t.Errorf("unknown tenant error = %v, want it to name the tenant", err)
+	}
 }

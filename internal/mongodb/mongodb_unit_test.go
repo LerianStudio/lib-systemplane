@@ -5,6 +5,7 @@ package mongodb
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -219,9 +220,10 @@ func TestIsNamespaceExists(t *testing.T) {
 	}
 }
 
-// MongoDB has no tenant connector yet; the storage lane adds one per FC-3.
-// Until then a named tenant is refused.
-func TestStore_NamedTenantScopeIsRefused(t *testing.T) {
+// A named tenant on a store built without a connector is refused on every
+// CRUD method: there is no handle to resolve it with, and falling back to the
+// constructor collection would silently serve another tenant's data.
+func TestStore_NamedTenantWithoutConnector(t *testing.T) {
 	t.Parallel()
 
 	s, err := New(Config{Client: &mongo.Client{}, Database: "db"})
@@ -250,5 +252,37 @@ func TestStore_NamedTenantScopeIsRefused(t *testing.T) {
 
 	if _, err := s.Subscribe(ctx, scope, func(store.Event) {}); !errors.Is(err, store.ErrNotSupportedInMultiTenant) {
 		t.Fatalf("Subscribe error = %v, want ErrNotSupportedInMultiTenant", err)
+	}
+}
+
+// nilDBConnector stands in for a buggy connector that reports success while
+// handing back no database.
+type nilDBConnector struct{}
+
+func (nilDBConnector) ResolveDatabase(context.Context, string) (*mongo.Database, error) {
+	return nil, nil
+}
+
+// A connector that returns a nil database with a nil error is a connector bug.
+// Refuse it with the tenant named rather than hand back a handle that panics
+// on the first command.
+func TestStore_NamedTenantNilDatabaseIsRefused(t *testing.T) {
+	t.Parallel()
+
+	s, err := New(Config{MultiTenantEnabled: true, Connector: nilDBConnector{}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	scope := store.Scope{Tenant: "t1"}
+	ctx := context.Background()
+
+	_, _, err = s.Get(ctx, scope, "ns", "k")
+	if !errors.Is(err, store.ErrTenantConnectorMissing) {
+		t.Fatalf("Get error = %v, want ErrTenantConnectorMissing", err)
+	}
+
+	if !strings.Contains(err.Error(), "resolve tenant t1") {
+		t.Fatalf("Get error = %v, want it to name the tenant", err)
 	}
 }

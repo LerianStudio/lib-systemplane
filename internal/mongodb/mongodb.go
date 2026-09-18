@@ -148,7 +148,7 @@ func (s *Store) Start(ctx context.Context) error {
 		return nil
 	}
 
-	if err := s.ensureSchema(ctx, s.coll); err != nil {
+	if err := s.ensureSchema(ctx, s.coll, false); err != nil {
 		return err
 	}
 
@@ -196,11 +196,43 @@ func (s *Store) DroppedEvents() int64 {
 }
 
 // resolveCollection returns the collection handle for the current call.
+//
+// The zero scope keeps today's behavior: single-tenant mode returns the
+// constructor-supplied collection, multi-tenant mode extracts the
+// *mongo.Database stored in ctx by tenant-manager middleware. A named tenant
+// resolves through the connector regardless of MultiTenantEnabled and
+// regardless of whatever tenant ctx carries (FC-2: an explicitly named scope
+// and a request-scoped ctx tenant must never silently disagree), and is
+// refused with store.ErrTenantConnectorMissing when no connector is
+// configured.
+//
+// Every tenant database — ctx-carried or connector-resolved — goes through
+// the lazy per-database bootstrap, which materializes the collection so a
+// read before the first write cannot mistake a permissions problem for an
+// empty scope.
 func (s *Store) resolveCollection(ctx context.Context, scope store.Scope) (*mongo.Collection, error) {
-	// MongoDB has no tenant connector yet; the storage lane adds one per
-	// FC-3. Until then a named tenant is refused.
 	if scope.Tenant != "" {
-		return nil, store.ErrTenantConnectorMissing
+		if s.cfg.Connector == nil {
+			return nil, store.ErrTenantConnectorMissing
+		}
+
+		db, err := s.cfg.Connector.ResolveDatabase(ctx, scope.Tenant)
+		if err != nil {
+			return nil, fmt.Errorf("systemplane/mongodb: resolve tenant %s: %w", scope.Tenant, err)
+		}
+
+		// A nil handle with a nil error is a connector bug; refuse it here
+		// rather than hand back something that panics on the first command.
+		if db == nil {
+			return nil, fmt.Errorf("systemplane/mongodb: resolve tenant %s: %w", scope.Tenant, store.ErrTenantConnectorMissing)
+		}
+
+		coll := db.Collection(s.cfg.Collection)
+		if err := s.ensureSchema(ctx, coll, true); err != nil {
+			return nil, err
+		}
+
+		return coll, nil
 	}
 
 	if !s.cfg.MultiTenantEnabled {
@@ -213,7 +245,7 @@ func (s *Store) resolveCollection(ctx context.Context, scope store.Scope) (*mong
 	}
 
 	coll := db.Collection(s.cfg.Collection)
-	if err := s.ensureSchema(ctx, coll); err != nil {
+	if err := s.ensureSchema(ctx, coll, true); err != nil {
 		return nil, err
 	}
 
@@ -227,11 +259,14 @@ func schemaCacheKey(coll *mongo.Collection) string {
 	return coll.Database().Name() + "/" + coll.Name()
 }
 
-func (s *Store) ensureSchema(ctx context.Context, coll *mongo.Collection) error {
+// ensureSchema memoizes the per-database bootstrap. tenantScoped marks a
+// collection that belongs to a tenant database — carried by ctx or resolved
+// through the connector — and is threaded into runSchema.
+func (s *Store) ensureSchema(ctx context.Context, coll *mongo.Collection, tenantScoped bool) error {
 	cacheKey := schemaCacheKey(coll)
 
 	return s.ensureSchemaByKey(ctx, cacheKey, func(ctx context.Context) error {
-		return s.runSchema(ctx, coll)
+		return s.runSchema(ctx, coll, tenantScoped)
 	})
 }
 
