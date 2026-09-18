@@ -652,9 +652,11 @@ Add `func (e *Engine) Stale(scope store.Scope) bool` next to `Lookup` in
 `internal/engine/engine.go`. A nil engine reports false. A scope the engine does not track reports
 false, and that is the honest answer rather than a defensive true: an untracked scope is one the
 engine is not confirming at all, which in multi-tenant mode is every read — those go straight to the
-row and carry the freshness of that read. A tracked scope returns `sc.stale` read under
-`sc.mu.RLock()`, the same lock `Lookup` uses, so the flag and the entries it describes cannot be read
-from two different instants by one caller doing `Lookup` then `Stale`.
+row and carry the freshness of that read. After fix pass 2 (unit G3) `Lookup` already reports `Stale` on
+both a hit and a miss, read under the same `sc.mu.RLock()` as the entry, so ONE `Lookup` is the atomic
+read of entry and freshness. Do not add a separate `Engine.Stale` accessor: two calls would read two
+instants, and a feed can flip the flag between them. The Client stamps `Stale` from the `Entry`
+`Lookup` returns, on hits and on misses alike.
 
 Named edge cases: `Stale` must not create a scope. Use the `e.scopes` map read under `scopesMu.RLock`
 directly, as `Lookup` does at `internal/engine/engine.go:381-387`, never `scopeFor`, which creates
@@ -671,9 +673,10 @@ otherwise conjure a permanently stale, permanently unfed scope on every request.
 **Verification:** `cd /srv/worktrees/v4-engine-core && go test -tags=unit -race -count=1
 ./internal/engine/...` — existing delete coverage (`TestDeleteEventPublishesDefaultAtRevisionZero`)
 still passes under the new name, plus `TestStaleReportsTheScopeFlag` (start, settle: false; emit
-`OpDisconnect`: true), `TestStaleOnUntrackedScopeIsFalse` (and asserts the scope map did not grow —
-read it through `Lookup` reporting a miss for any key, which proves nothing was created) and
-`TestStaleOnNilEngineIsFalse`. Then `grep -rn "applyDelete" .` returns nothing.
+`OpDisconnect`: true), `TestLookupOnUntrackedScopeCreatesNoScope` (a `Lookup` for an untracked scope returns ok false and
+Stale false, and `len(e.scopes)` read under `scopesMu.RLock` from the same package is unchanged before
+and after: a miss alone proves nothing, because an empty tracked scope also misses) and
+`TestLookupOnNilEngineIsSafe`. Then `grep -rn "applyDelete" .` returns nothing.
 
 **Done when:** `PublishDelete` is exported and is the single implementation the feed and the Client
 both call; `Stale` reports a tracked scope's flag, false for an untracked scope and for a nil engine,
@@ -976,8 +979,8 @@ multi-tenant per-request read must behave exactly as it does today for a consume
 bound — resolve the tenant database from ctx and read through — which is what remains once the
 lookup and populate branches go.
 
-**Implementation vision:** Delete `internal/manager/` entirely (16 production and test files,
-including `schema.go`, `listen.go`, `metrics.go`, `warmload.go` and their integration suites),
+**Implementation vision:** Delete `internal/manager/` entirely (every file under it,
+including `schema.go`, `listen.go`, `metrics.go`, `warmload.go` and their integration suites; the Files list below is the authoritative enumeration),
 `internal/client/manager_binding.go` and `internal/client/manager_binding_test.go`.
 
 In `internal/client/get.go`, the multi-tenant branch of `getEntry` (`:76-120`) loses the
@@ -1080,7 +1083,10 @@ things change. The comments stop saying "hydration" and say "the first reconcile
 the value actually landing (subscribe with `OnChange` before `Start` and read one `Change` off a
 channel, or poll `c.Get` with a bounded deadline) because the injected upsert now travels through a
 debounced re-read; and the test additionally asserts `GetEntry` reports the injected value's
-revision, which the old cache could not carry.
+revision, which the old cache could not carry. The wait is for the injected key at the injected value
+AND revision, never for "the first callback": a subscriber registered before `Start` also receives the
+first-reconcile announcements (defaults and seeded rows), so releasing `List` on the first `Change`
+would let the test pass without the injected upsert ever reaching the touched-key fence.
 
 `TestRefreshKeepsCacheWhenReReadReportsNotFound` keeps its name and its `getHook`. Update its comment
 to name `internal/engine/feed.go`'s three-outcome rule rather than `refreshFromStore`, and add one
@@ -1222,9 +1228,12 @@ belong to this lane. The likely list, from reading the phase's own diff:
   and `GetEntry` with `Stale: true`.
 
 Do not chase coverage in `internal/engine` — Phase 1 covered it, and a test written to move a
-percentage rather than to pin a behaviour is worse than the gap. If the total still sits below the
-baseline after the items above, record the delta and its cause (deleting a heavily-tested package
-changes the denominator) in the task's completion note rather than padding.
+percentage rather than to pin a behaviour is worse than the gap. The gate is one rule: the total reported by
+`make coverage-unit` must be at or above the Phase 1 baseline. Because deleting `internal/manager`
+removes lines from the denominator, the baseline is recomputed from the saved Phase 1 profile with
+`internal/manager` filtered out (`go tool cover -func` over the profile minus that package), and THAT
+adjusted number is the bar, stated in the completion note. A total below the adjusted baseline fails
+the task; no explanatory note substitutes for it.
 
 Then run the full gate sweep this phase is responsible for, which is Phase 3's list minus the
 surface cut: `make test-unit`, `go vet -tags=unit ./...`, `go vet -tags=integration ./...`,

@@ -49,8 +49,8 @@ No Go consumer uses the MongoDB backend yet; the Console will. Nobody consumes c
 | Lane | Delivers | Depends on | Wave | Worktree / Branch | Plan | Status |
 |------|----------|-----------|------|-------------------|------|--------|
 | contracts | `/v4` module path; `Store` interface with `Scope` + `Revision` + `OpResync` and compiling shims in both backends; connector moved to `internal/postgres`; public `Change`, new `OnChange` signature, `Entry` + `GetEntry` shims; all in-repo callers and tests updated | none | 1 | `/srv/worktrees/v4-contracts` / `feat/v4-contracts` | lane-contracts.md | Merged |
-| engine-core | `internal/engine` replacing Client cache + Manager for the single-tenant scope: ingress, reconcile on `OpResync`, revision dedupe, coalescing dispatch, read-your-writes, delete→default; `internal/manager` and root Manager API deleted; options in D8 removed; Mongo MT rejected at construction | contracts | 2 | `/srv/worktrees/v4-engine-core` / `feat/v4-engine-core` | lane-engine-core.md | Phase 1 built, in final review, PR next; Phase 2 Detailed |
-| storage | Postgres: scope resolution via connector, `RETURNING revision`, per-tenant `Subscribe(scope)` LISTEN, `OpDisconnect` on loss and `OpResync` after (re)connect, revision in NOTIFY; MongoDB: `revision` `$inc`, `OpResync` after stream re-open and after every polling round-trip failure, tenant connector + per-tenant `Subscribe(scope)` change stream; DDL v4 + `migrate_v3_to_v4.sql`; `DefaultSeedSQL` removed; contract suite extended and run against both backends in both modes | contracts | 2 | `/srv/worktrees/v4-storage` / `feat/v4-storage` | lane-storage.md | Phase 1 built, in final review, PR next; Phase 2 Detailed |
+| engine-core | `internal/engine` replacing Client cache + Manager for the single-tenant scope: ingress, reconcile on `OpResync`, revision dedupe, coalescing dispatch, read-your-writes, delete→default; `internal/manager` and root Manager API deleted; options in D8 removed; Mongo MT rejected at construction | contracts | 2 | `/srv/worktrees/v4-engine-core` / `feat/v4-engine-core` | lane-engine-core.md | In review |
+| storage | Postgres: scope resolution via connector, `RETURNING revision`, per-tenant `Subscribe(scope)` LISTEN, `OpDisconnect` on loss and `OpResync` after (re)connect, revision in NOTIFY; MongoDB: `revision = max(previous + 1, $toLong($$NOW))` on every value change and tombstone deletes (FC-9, D11), `OpDisconnect` on cursor loss or a failed poll and `OpResync` after every successful (re)open or recovered poll (FC-2), tenant connector + per-tenant `Subscribe(scope)` change stream; DDL v4 + `migrate_v3_to_v4.sql`; `DefaultSeedSQL` removed; contract suite extended and run against both backends in both modes | contracts | 2 | `/srv/worktrees/v4-storage` / `feat/v4-storage` | lane-storage.md | In review |
 | groups | `Bind[T]`, `Group[T].Snapshot/Set/OnApply/Status` over the per-key facade | contracts | 2 | `/srv/worktrees/v4-groups` / `feat/v4-groups` | lane-groups.md | Merged |
 | engine-tenants | `WithPostgresTenantManager` / `WithMongoTenantManager`, lazy activation, `Client.HandleTenantLifecycle`, per-scope feeds through `Store.Subscribe(scope)` on both backends, stale marking, per-tenant metrics with aggregate threshold | engine-core, storage | 3 | `/srv/worktrees/v4-engine-tenants` / `feat/v4-engine-tenants` | lane-engine-tenants.md | Pending |
 | admin | GET responses carry `revision`, `updatedAt`, `updatedBy`, `stale`; list too; handlers read through `GetEntry` | contracts | 2 | `/srv/worktrees/v4-admin` / `feat/v4-admin` | lane-admin.md | Merged |
@@ -62,6 +62,8 @@ No Go consumer uses the MongoDB backend yet; the Console will. Nobody consumes c
 The orchestrator session owns this column. Lanes never write to this file.
 
 **Worktrees on mordor** are created with `agent new lib-systemplane v4-<slug>` (lands on `/srv/worktrees/v4-<slug>`), then `git checkout -B feat/v4-<slug> origin/develop` inside it: the `agent/` prefix the tool creates is not a valid Lerian branch name. Base branch for every PR: `develop`. PR titles use one of the repo's `pr_title_scopes` (`client`, `core`, `store`, `postgres`, `mongodb`, `admin`, `docs`, `tests`, `systemplanetest`, ...) or no scope; `engine`, `manager`, `group` are not registered scopes.
+
+**Phase progress (orchestrator's note, 2026-09-18).** `engine-core`: Phase 1 built, fix pass 2 in review, PR next; Phase 2 Detailed. `storage`: Postgres Phase 1 built, fix pass 3 in review, PR next; Phase 2 (MongoDB) Detailed and in flight on `/srv/worktrees/v4-storage-mongo` / `feat/v4-storage-mongo`. `groups`: Phase 1 Merged (PR #72); Phase 2 (`OnApply`, `Status`, FC-7) is NOT landed and is being elaborated; the acceptance suite depends on it. `integration`: the acceptance suite is being authored ahead of time on `/srv/worktrees/v4-integration` / `feat/v4-acceptance` under build tag `acceptance` (red by design until the lanes land).
 
 ## Waves
 
@@ -329,23 +331,23 @@ func (g *Group[T]) Status() []ApplyStatus
 ```sql
 DO $$
 DECLARE
-	existing_schema TEXT := (
+	foreign_schema TEXT := (
 		SELECT n.nspname
 		FROM pg_class c
 		JOIN pg_namespace n ON n.oid = c.relnamespace
 		WHERE c.relname = 'systemplane_entries'
 		  AND c.relkind IN ('r', 'p')
+		  AND n.nspname <> current_schema()
 		  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
 		  AND n.nspname NOT LIKE 'pg_toast%'
 		  AND n.nspname NOT LIKE 'pg_temp%'
-		ORDER BY (n.nspname = current_schema()) DESC
 		LIMIT 1
 	);
 BEGIN
-	IF existing_schema IS NOT NULL AND existing_schema IS DISTINCT FROM current_schema() THEN
+	IF foreign_schema IS NOT NULL THEN
 		RAISE EXCEPTION
 			'systemplane_entries already exists in schema %, but this role would provision into %; applying the full schema here would fork the install into a second, empty table and orphan the populated one',
-			existing_schema, current_schema()
+			foreign_schema, current_schema()
 			USING HINT = 'put the existing schema first in search_path, or upgrade that install with ddl/migrate_v3_to_v4.sql, which creates no table';
 	END IF;
 END
@@ -436,7 +438,42 @@ EXECUTE FUNCTION systemplane_notify_v4('systemplane_changes');
 ALTER TABLE systemplane_entries ALTER COLUMN revision DROP DEFAULT;
 ```
 
-Re-setting an identical value bumps `updated_at` but not `revision`; the NOTIFY fires with the same revision and the engine dedupes it. Every revision comes from `systemplane_revision_seq` (D11), and ONLY through `systemplane_bump_revision_v4()`: the function is SECURITY DEFINER with a pinned search_path and fires BEFORE INSERT OR UPDATE, so the runtime role needs plain DML and no grant on the sequence (a column default calling `nextval` would run as the invoking role and fail a DML-only role with 42501); the column therefore carries no default. The guard DO block that opens the file (added 2026-09-18 after the storage lane reproduced the fork; re-amended the same day to scan every schema through `pg_class`/`pg_namespace`, because `to_regclass` only sees schemas on the applier's `search_path` and would have let the most likely fork through) raises when `systemplane_entries` already exists in a schema other than `current_schema()`: `CREATE TABLE IF NOT EXISTS` looks only at the first schema of `search_path`, so applying the full file to an install living elsewhere would provision a second, empty table, exit 0 and orphan the populated one; such an install is upgraded with `MigrationV3ToV4SQL()`, which creates no table. The sequence is created and seeded inside a DO block in the schema that owns `systemplane_entries`, resolved exactly the way the trigger resolves it (`TG_TABLE_SCHEMA`), because an unqualified CREATE SEQUENCE lands in the applier's first search_path schema and a v3 table living elsewhere would then fail every write at runtime while the migration reported success. `MigrationV3ToV4SQL()` is this file minus the guard block and the `CREATE TABLE`; on a v3 table it adds the column at 1, and on EVERY application it re-sets the transitional default unconditionally (the `ADD COLUMN IF NOT EXISTS` is a no-op on a second run and would restore nothing), seeds the sequence past the highest existing revision, installs the triggers and only then drops the default, so an untransacted first or repeated application never leaves an insert without a revision. A recreated key is always above the revision it had before the delete; numbers may skip and start at 2 on a fresh database, and nothing depends on their magnitude. Both artifacts assume one database per tenant and must never be applied per schema inside a shared database: NOTIFY is database-wide, every feed listens on the same channel, and the unqualified `DROP FUNCTION IF EXISTS systemplane_notify_v3()` resolves through the whole search_path. `SchemaSQL()` returns the full file; `MigrationV3ToV4SQL()` returns the delta (the `ALTER` plus the function/trigger replacement). NOTIFY payload is `{"namespace","key","op","revision"}`; decoders treat a missing `revision` as 0.
+**Guard that opens `MigrationV3ToV4SQL()`** (the migration runs unqualified statements, so it must be told which install it is altering; it never creates a table):
+
+```sql
+DO $$
+DECLARE
+	target_schema TEXT := (
+		SELECT n.nspname
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE c.oid = to_regclass('systemplane_entries')
+	);
+	other_schema TEXT;
+BEGIN
+	IF target_schema IS NULL THEN
+		RAISE EXCEPTION 'systemplane_entries is not visible on search_path; this migration alters the table search_path resolves and creates none'
+			USING HINT = 'put the schema that holds the v3 install first in search_path, then re-run';
+	END IF;
+	SELECT n.nspname INTO other_schema
+	FROM pg_class c
+	JOIN pg_namespace n ON n.oid = c.relnamespace
+	WHERE c.relname = 'systemplane_entries'
+	  AND c.relkind IN ('r', 'p')
+	  AND n.nspname <> target_schema
+	  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+	  AND n.nspname NOT LIKE 'pg_toast%'
+	  AND n.nspname NOT LIKE 'pg_temp%'
+	LIMIT 1;
+	IF other_schema IS NOT NULL THEN
+		RAISE EXCEPTION 'systemplane_entries exists in schema % as well as in %, which search_path resolves first; refusing to guess which install to migrate', other_schema, target_schema
+			USING HINT = 'drop or rename the stray table, or narrow search_path to the schema that holds the install to migrate';
+	END IF;
+END
+$$;
+```
+
+Re-setting an identical value bumps `updated_at` but not `revision`; the NOTIFY fires with the same revision and the engine dedupes it. Every revision comes from `systemplane_revision_seq` (D11), and ONLY through `systemplane_bump_revision_v4()`: the function is SECURITY DEFINER with a pinned search_path and fires BEFORE INSERT OR UPDATE, so the runtime role needs plain DML and no grant on the sequence (a column default calling `nextval` would run as the invoking role and fail a DML-only role with 42501); the column therefore carries no default. The guard DO block that opens the file (added 2026-09-18 after the storage lane reproduced the fork; re-amended the same day to scan every schema through `pg_class`/`pg_namespace`, because `to_regclass` only sees schemas on the applier's `search_path` and would have let the most likely fork through) raises when ANY `systemplane_entries` exists in a non-system schema other than `current_schema()`, whether or not the current schema also holds one (re-amended after review: preferring the current schema would let a stray copy elsewhere pass and stay orphaned): `CREATE TABLE IF NOT EXISTS` looks only at the first schema of `search_path`, so applying the full file to an install living elsewhere would provision a second, empty table, exit 0 and orphan the populated one; such an install is upgraded with `MigrationV3ToV4SQL()`, which creates no table. The sequence is created and seeded inside a DO block in the schema that owns `systemplane_entries`, resolved exactly the way the trigger resolves it (`TG_TABLE_SCHEMA`), because an unqualified CREATE SEQUENCE lands in the applier's first search_path schema and a v3 table living elsewhere would then fail every write at runtime while the migration reported success. `MigrationV3ToV4SQL()` is its own guard block (below) followed by this file minus the schema guard and the `CREATE TABLE`, so from the `ALTER TABLE` line to the end the two artifacts are byte-identical; on a v3 table it adds the column at 1, and on EVERY application it re-sets the transitional default unconditionally (the `ADD COLUMN IF NOT EXISTS` is a no-op on a second run and would restore nothing), seeds the sequence past the highest existing revision, installs the triggers and only then drops the default, so an untransacted first or repeated application never leaves an insert without a revision. A recreated key is always above the revision it had before the delete; numbers may skip and start at 2 on a fresh database, and nothing depends on their magnitude. Both artifacts assume one database per tenant and must never be applied per schema inside a shared database: NOTIFY is database-wide, every feed listens on the same channel, and the unqualified `DROP FUNCTION IF EXISTS systemplane_notify_v3()` resolves through the whole search_path. `SchemaSQL()` returns the full file; `MigrationV3ToV4SQL()` returns the delta (the `ALTER` plus the function/trigger replacement). NOTIFY payload is `{"namespace","key","op","revision"}`; decoders treat a missing `revision` as 0.
 
 ### FC-9 MongoDB document
 
