@@ -333,7 +333,13 @@ DECLARE
 		SELECT n.nspname
 		FROM pg_class c
 		JOIN pg_namespace n ON n.oid = c.relnamespace
-		WHERE c.oid = to_regclass('systemplane_entries')
+		WHERE c.relname = 'systemplane_entries'
+		  AND c.relkind IN ('r', 'p')
+		  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+		  AND n.nspname NOT LIKE 'pg_toast%'
+		  AND n.nspname NOT LIKE 'pg_temp%'
+		ORDER BY (n.nspname = current_schema()) DESC
+		LIMIT 1
 	);
 BEGIN
 	IF existing_schema IS NOT NULL AND existing_schema IS DISTINCT FROM current_schema() THEN
@@ -355,6 +361,7 @@ CREATE TABLE IF NOT EXISTS systemplane_entries (
 );
 
 ALTER TABLE systemplane_entries ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;
+ALTER TABLE systemplane_entries ALTER COLUMN revision SET DEFAULT 1;
 
 DO $$
 DECLARE
@@ -429,7 +436,7 @@ EXECUTE FUNCTION systemplane_notify_v4('systemplane_changes');
 ALTER TABLE systemplane_entries ALTER COLUMN revision DROP DEFAULT;
 ```
 
-Re-setting an identical value bumps `updated_at` but not `revision`; the NOTIFY fires with the same revision and the engine dedupes it. Every revision comes from `systemplane_revision_seq` (D11), and ONLY through `systemplane_bump_revision_v4()`: the function is SECURITY DEFINER with a pinned search_path and fires BEFORE INSERT OR UPDATE, so the runtime role needs plain DML and no grant on the sequence (a column default calling `nextval` would run as the invoking role and fail a DML-only role with 42501); the column therefore carries no default. The guard DO block that opens the file (added 2026-09-18 after the storage lane reproduced the fork) raises when `systemplane_entries` already exists in a schema other than `current_schema()`: `CREATE TABLE IF NOT EXISTS` looks only at the first schema of `search_path`, so applying the full file to an install living elsewhere would provision a second, empty table, exit 0 and orphan the populated one; such an install is upgraded with `MigrationV3ToV4SQL()`, which creates no table. The sequence is created and seeded inside a DO block in the schema that owns `systemplane_entries`, resolved exactly the way the trigger resolves it (`TG_TABLE_SCHEMA`), because an unqualified CREATE SEQUENCE lands in the applier's first search_path schema and a v3 table living elsewhere would then fail every write at runtime while the migration reported success. `MigrationV3ToV4SQL()` is this file minus the guard block and the `CREATE TABLE`; on a v3 table it adds the column at 1, seeds the sequence past the highest existing revision, installs the triggers and only then drops the transitional default, so an untransacted migration never leaves an insert without a revision. A recreated key is always above the revision it had before the delete; numbers may skip and start at 2 on a fresh database, and nothing depends on their magnitude. Both artifacts assume one database per tenant and must never be applied per schema inside a shared database: NOTIFY is database-wide, every feed listens on the same channel, and the unqualified `DROP FUNCTION IF EXISTS systemplane_notify_v3()` resolves through the whole search_path. `SchemaSQL()` returns the full file; `MigrationV3ToV4SQL()` returns the delta (the `ALTER` plus the function/trigger replacement). NOTIFY payload is `{"namespace","key","op","revision"}`; decoders treat a missing `revision` as 0.
+Re-setting an identical value bumps `updated_at` but not `revision`; the NOTIFY fires with the same revision and the engine dedupes it. Every revision comes from `systemplane_revision_seq` (D11), and ONLY through `systemplane_bump_revision_v4()`: the function is SECURITY DEFINER with a pinned search_path and fires BEFORE INSERT OR UPDATE, so the runtime role needs plain DML and no grant on the sequence (a column default calling `nextval` would run as the invoking role and fail a DML-only role with 42501); the column therefore carries no default. The guard DO block that opens the file (added 2026-09-18 after the storage lane reproduced the fork; re-amended the same day to scan every schema through `pg_class`/`pg_namespace`, because `to_regclass` only sees schemas on the applier's `search_path` and would have let the most likely fork through) raises when `systemplane_entries` already exists in a schema other than `current_schema()`: `CREATE TABLE IF NOT EXISTS` looks only at the first schema of `search_path`, so applying the full file to an install living elsewhere would provision a second, empty table, exit 0 and orphan the populated one; such an install is upgraded with `MigrationV3ToV4SQL()`, which creates no table. The sequence is created and seeded inside a DO block in the schema that owns `systemplane_entries`, resolved exactly the way the trigger resolves it (`TG_TABLE_SCHEMA`), because an unqualified CREATE SEQUENCE lands in the applier's first search_path schema and a v3 table living elsewhere would then fail every write at runtime while the migration reported success. `MigrationV3ToV4SQL()` is this file minus the guard block and the `CREATE TABLE`; on a v3 table it adds the column at 1, and on EVERY application it re-sets the transitional default unconditionally (the `ADD COLUMN IF NOT EXISTS` is a no-op on a second run and would restore nothing), seeds the sequence past the highest existing revision, installs the triggers and only then drops the default, so an untransacted first or repeated application never leaves an insert without a revision. A recreated key is always above the revision it had before the delete; numbers may skip and start at 2 on a fresh database, and nothing depends on their magnitude. Both artifacts assume one database per tenant and must never be applied per schema inside a shared database: NOTIFY is database-wide, every feed listens on the same channel, and the unqualified `DROP FUNCTION IF EXISTS systemplane_notify_v3()` resolves through the whole search_path. `SchemaSQL()` returns the full file; `MigrationV3ToV4SQL()` returns the delta (the `ALTER` plus the function/trigger replacement). NOTIFY payload is `{"namespace","key","op","revision"}`; decoders treat a missing `revision` as 0.
 
 ### FC-9 MongoDB document
 
