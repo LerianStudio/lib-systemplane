@@ -137,9 +137,8 @@ func TestIntegration_MongoDBSingleTenant(t *testing.T) {
 	}
 
 	systemplanetest.Run(t, factory, systemplanetest.RunOptions{
-		EventWait: 5 * time.Second,
-		// Phase 2 of lane-storage turns this off.
-		SkipRevisionAndResync: true,
+		EventWait:             5 * time.Second,
+		SkipRevisionAndResync: false,
 	})
 }
 

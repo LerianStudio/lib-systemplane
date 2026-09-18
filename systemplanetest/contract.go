@@ -99,6 +99,13 @@ func Run(t *testing.T, f Factory, opts RunOptions) {
 
 			runUnsubscribeStops(t, s, opts)
 		})
+
+		// Ungated on purpose, and placed here rather than below the gated
+		// block: both backends satisfy it, and a sub-test appended after a
+		// gate is skipped by position alone.
+		t.Run("SubscribeThenImmediateWriteNeverLosesTheEvent", func(t *testing.T) {
+			runSubscribeThenImmediateWrite(t, f, opts)
+		})
 	}
 
 	// Gated as blocks rather than as early returns on purpose: a sub-test
@@ -385,6 +392,70 @@ func runUnsubscribeStops(t *testing.T, s store.Store, opts RunOptions) {
 		}
 	case <-time.After(opts.EventWait / 2):
 		// expected
+	}
+}
+
+// subscribeReadinessIterations is how many fresh stores the readiness sub-test
+// walks through. The defect it pins reproduced in 3 runs out of 5, so a couple
+// of iterations would clear nothing.
+const subscribeReadinessIterations = 20
+
+// runSubscribeThenImmediateWrite pins changefeed readiness: once Subscribe has
+// returned, a write issued with no delay whatsoever is still delivered.
+//
+// The defect it guards against is LOSS, not latency. A MongoDB change stream
+// opened with no resume token attaches at the current oplog position, so a
+// stream that finished opening after Subscribe returned never delivered the
+// write that beat it — 3 failures in 5 runs. A longer wait would not have
+// helped, which is why ONE missing event across every iteration fails here.
+//
+// Each iteration builds a FRESH store through the factory, because the race
+// lives in the feed OPEN: subscribing and unsubscribing over one already-open
+// feed exercises nothing and passes on the broken code.
+func runSubscribeThenImmediateWrite(t *testing.T, f Factory, opts RunOptions) {
+	t.Helper()
+
+	for i := range subscribeReadinessIterations {
+		// A closure per iteration so its store is torn down as the iteration
+		// ends, instead of twenty teardowns queueing up for the end of the
+		// sub-test. Deferred, not called at the tail: a lost event fails the
+		// iteration through t.Fatalf, and only a defer still runs then.
+		func() {
+			s, cleanup := f(t)
+			defer cleanup()
+
+			startStore(t, s)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			events := newEventChan()
+
+			unsub, err := s.Subscribe(ctx, opts.Scope, events.push)
+			if errors.Is(err, store.ErrNotSupportedInMultiTenant) {
+				t.Skip("subscribe not supported in this mode")
+			}
+
+			if err != nil {
+				t.Fatalf("iteration %d: subscribe: %v", i, err)
+			}
+
+			defer unsub()
+
+			// No sleep between Subscribe and Set: that gap is the whole
+			// assertion. The key carries the iteration index, so a straggler
+			// from an earlier iteration can never satisfy this one.
+			key := fmt.Sprintf("ready-%d", i)
+
+			setEntry(ctx, t, s, opts.Scope, entry("ns", key, i))
+
+			// waitFor, not waitNext: a backend that announces itself delivers
+			// its joining OpResync first, and waitNext would take that marker
+			// for the answer.
+			if got := events.waitFor(t, "ns", key, opts.EventWait); got.Op != store.OpUpsert {
+				t.Fatalf("iteration %d: event = %+v, want op %q", i, got, store.OpUpsert)
+			}
+		}()
 	}
 }
 
