@@ -29,6 +29,16 @@ type groupMemoryStore struct {
 	// every other field here.
 	getErr error
 	setErr error
+
+	// announce makes Subscribe fire an upsert for every row already stored as
+	// it registers. That is the shape the engine's first reconcile takes
+	// (FC-11) and the only way this base produces a publication DURING Start.
+	announce bool
+
+	// held queues every event instead of delivering it, standing in for a
+	// dispatch worker that has not run yet; release replays the queue.
+	held    bool
+	pending []systemplane.TestEvent
 }
 
 func newGroupMemoryStore() *groupMemoryStore {
@@ -65,12 +75,9 @@ func (s *groupMemoryStore) Set(_ context.Context, _ systemplane.TestScope, e sys
 	}
 
 	s.entries[groupMemoryKey(e.Namespace, e.Key)] = e
-	sub := s.sub
 	s.mu.Unlock()
 
-	if sub != nil {
-		sub(systemplane.TestEvent{Namespace: e.Namespace, Key: e.Key, Op: "upsert"})
-	}
+	s.fire(systemplane.TestEvent{Namespace: e.Namespace, Key: e.Key, Op: "upsert"})
 
 	return 0, nil
 }
@@ -78,12 +85,9 @@ func (s *groupMemoryStore) Set(_ context.Context, _ systemplane.TestScope, e sys
 func (s *groupMemoryStore) Delete(_ context.Context, _ systemplane.TestScope, namespace, key, _ string) error {
 	s.mu.Lock()
 	delete(s.entries, groupMemoryKey(namespace, key))
-	sub := s.sub
 	s.mu.Unlock()
 
-	if sub != nil {
-		sub(systemplane.TestEvent{Namespace: namespace, Key: key, Op: "delete"})
-	}
+	s.fire(systemplane.TestEvent{Namespace: namespace, Key: key, Op: "delete"})
 
 	return nil
 }
@@ -103,13 +107,82 @@ func (s *groupMemoryStore) List(context.Context, systemplane.TestScope) ([]syste
 func (s *groupMemoryStore) Subscribe(_ context.Context, _ systemplane.TestScope, fn func(systemplane.TestEvent)) (func(), error) {
 	s.mu.Lock()
 	s.sub = fn
+
+	var announced []systemplane.TestEvent
+	if s.announce {
+		for _, e := range s.entries {
+			announced = append(announced, systemplane.TestEvent{Namespace: e.Namespace, Key: e.Key, Op: "upsert"})
+		}
+	}
+
 	s.mu.Unlock()
+
+	// Announce outside the lock: the subscriber re-reads this store on the
+	// calling goroutine, which is exactly what makes the publication land
+	// while Start is still running.
+	for _, evt := range announced {
+		s.fire(evt)
+	}
 
 	return func() {
 		s.mu.Lock()
 		s.sub = nil
 		s.mu.Unlock()
 	}, nil
+}
+
+// fire delivers evt to the subscriber, or queues it while the store is
+// holding. It must be called with mu released: the subscriber reads this
+// store back on the calling goroutine.
+func (s *groupMemoryStore) fire(evt systemplane.TestEvent) {
+	s.mu.Lock()
+
+	if s.held {
+		s.pending = append(s.pending, evt)
+		s.mu.Unlock()
+
+		return
+	}
+
+	sub := s.sub
+	s.mu.Unlock()
+
+	if sub != nil {
+		sub(evt)
+	}
+}
+
+// announceOnSubscribe makes Subscribe fire an upsert for every seeded row as
+// it registers, so the stored document is published DURING Start (FC-11).
+func (s *groupMemoryStore) announceOnSubscribe() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.announce = true
+}
+
+// hold stops delivering events and queues them instead, standing in for a
+// publication the engine has accepted but not yet dispatched.
+func (s *groupMemoryStore) hold() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.held = true
+}
+
+// release stops holding and replays every queued event.
+func (s *groupMemoryStore) release(t *testing.T) {
+	t.Helper()
+
+	s.mu.Lock()
+	s.held = false
+	queued := s.pending
+	s.pending = nil
+	s.mu.Unlock()
+
+	for _, evt := range queued {
+		s.fire(evt)
+	}
 }
 
 // groupConfig is the typed configuration document the group tests bind.
@@ -1696,5 +1769,248 @@ func TestGroupStatusOnNilGroupReturnsNil(t *testing.T) {
 
 	if status := g.Status(); status != nil {
 		t.Errorf("Status on a nil group = %#v, want nil", status)
+	}
+}
+
+// groupBurstDocument is the i-th document of the coalescing burst. Every field
+// differs between two indexes, so a delivery can be matched to the exact write
+// that produced it.
+func groupBurstDocument(i int) groupConfig {
+	return groupConfig{
+		Name:    fmt.Sprintf("burst-%02d", i),
+		Retries: i,
+		Hosts:   []string{fmt.Sprintf("h%02d", i)},
+	}
+}
+
+// TestGroupOnApplyBeforeStartIsDeliveredDuringStart pins FC-7's "Before Start,
+// OnApply registers and the initial delivery happens during Start": the store
+// announces its seeded row as Subscribe registers, which is the shape the
+// engine's first reconcile takes (FC-11), so the stored document is published
+// while Start is still running.
+//
+// No delivery count is asserted, deliberately. On this base GetEntry reports
+// Stale false even before Start (FC-5's wave-1 shim), so OnApply's seed fires
+// at registration time with the registered DEFAULT and the stored document
+// arrives during Start — two deliveries where an engine-backed Client produces
+// one. D-G7 predicted exactly that ("the pre-Start gate cannot be exercised
+// through the facade on this lane's base"); the assertion that survives both
+// shapes is that the applier holds the current document when Start returns.
+func TestGroupOnApplyBeforeStartIsDeliveredDuringStart(t *testing.T) {
+	t.Parallel()
+
+	s := newGroupMemoryStore()
+	stored := groupConfig{Name: "stored", Retries: 9, Hosts: []string{"z"}}
+	s.seed(t, "runtime", "ingest", stored)
+	s.announceOnSubscribe()
+
+	c := newGroupHotClient(t, s)
+	g := bindGroupOn(t, c)
+
+	var rec applyRecorder
+
+	unsubscribe, err := g.OnApply(rec.apply)
+	if err != nil {
+		t.Fatalf("OnApply: %v", err)
+	}
+
+	t.Cleanup(unsubscribe)
+
+	startGroupClient(t, c)
+
+	seen := rec.all()
+	if len(seen) == 0 {
+		t.Fatal("no delivery by the time Start returned; an OnApply registered before Start must be delivered during it")
+	}
+
+	last := seen[len(seen)-1]
+	if !reflect.DeepEqual(last.Value, stored) {
+		t.Errorf("document in force when Start returned = %#v, want the stored document %#v", last.Value, stored)
+	}
+}
+
+// TestGroupOnApplyAfterStartSeedsUndeliveredPublication covers D-G7's window:
+// Start has returned but the publication for the scope has not been delivered
+// yet, standing in for a dispatch worker that has not run. FC-7 still promises
+// the current snapshot before OnApply returns, so the group reads the Client's
+// own state and seeds itself from it — which is why the applier sees the
+// STORED document and not the registered default.
+//
+// The second half is the other side of that promise: the seed and the
+// publication it anticipates are ONE observation, so releasing the held
+// publication at the same revision with the same bytes delivers nothing.
+func TestGroupOnApplyAfterStartSeedsUndeliveredPublication(t *testing.T) {
+	t.Parallel()
+
+	s := newGroupMemoryStore()
+	stored := groupConfig{Name: "held", Retries: 4, Hosts: []string{"h"}}
+	s.seed(t, "runtime", "ingest", stored)
+	s.announceOnSubscribe()
+	s.hold()
+
+	c := newGroupHotClient(t, s)
+	g := bindGroupOn(t, c)
+	startGroupClient(t, c)
+
+	var rec applyRecorder
+
+	unsubscribe, err := g.OnApply(rec.apply)
+	if err != nil {
+		t.Fatalf("OnApply: %v", err)
+	}
+
+	t.Cleanup(unsubscribe)
+
+	seen := rec.all()
+	if len(seen) != 1 {
+		t.Fatalf("deliveries by the time OnApply returned = %d, want 1", len(seen))
+	}
+
+	if !reflect.DeepEqual(seen[0].Value, stored) {
+		t.Errorf("seeded delivery = %#v, want the stored document %#v rather than the registered default", seen[0].Value, stored)
+	}
+
+	if seen[0].Previous != nil {
+		t.Errorf("Previous on the seeded delivery = %#v, want nil", seen[0].Previous)
+	}
+
+	s.release(t)
+
+	if got := rec.count(); got != 1 {
+		t.Errorf("deliveries after releasing the held publication = %d, want 1: same revision and same bytes as the seed, so it is the same observation", got)
+	}
+}
+
+// TestGroupOnApplyCoalescesABurst pins FC-7's coalescing: revisions published
+// while an applier runs collapse into the next delivery instead of queueing,
+// and the newest document is never the one dropped. The Client is built with
+// debouncing disabled so what is measured is the group's coalescing rather
+// than the facade's trailing-edge debounce window.
+func TestGroupOnApplyCoalescesABurst(t *testing.T) {
+	t.Parallel()
+
+	const burst = 50
+
+	c := newGroupHotClient(t, newGroupMemoryStore())
+	g := bindGroupOn(t, c)
+	startGroupClient(t, c)
+
+	var (
+		rec       applyRecorder
+		once      sync.Once
+		delivered = make(chan struct{})
+		release   = make(chan struct{})
+		wg        sync.WaitGroup
+	)
+
+	// Every delivery blocks until the burst is written, so all 50 writes land
+	// while a fan-out is in flight.
+	applier := func(ctx context.Context, a systemplane.Applied[groupConfig]) error {
+		err := rec.apply(ctx, a)
+
+		once.Do(func() { close(delivered) })
+		<-release
+
+		return err
+	}
+
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+		defer close(release)
+
+		<-delivered
+
+		for i := range burst {
+			if err := g.Set(context.Background(), groupBurstDocument(i), "operator"); err != nil {
+				t.Errorf("Set %d: %v", i, err)
+
+				return
+			}
+		}
+	}()
+
+	unsubscribe, err := g.OnApply(applier)
+	if err != nil {
+		t.Fatalf("OnApply: %v", err)
+	}
+
+	t.Cleanup(unsubscribe)
+	wg.Wait()
+
+	seen := rec.all()
+	if len(seen) == 0 {
+		t.Fatal("no delivery at all")
+	}
+
+	if len(seen) >= burst {
+		t.Errorf("deliveries for a burst of %d writes = %d, want fewer: writes landing while an applier runs coalesce", burst, len(seen))
+	}
+
+	final := groupBurstDocument(burst - 1)
+	if last := seen[len(seen)-1]; !reflect.DeepEqual(last.Value, final) {
+		t.Errorf("last delivery = %#v, want the final document of the burst %#v", last.Value, final)
+	}
+}
+
+// TestGroupOnApplyReceivesTheDefaultAfterADelete pins what a delete means to a
+// group: the row is gone, so the registered default is what is in force, and
+// the applier is told — a consumer that only ever saw writes would otherwise
+// keep running a configuration nothing stores any more.
+//
+// The last delivery is asserted, never a count: a delete may legitimately
+// deliver twice under the engine-backed Client, both at Revision 0, which FC-4
+// never deduplicates.
+func TestGroupOnApplyReceivesTheDefaultAfterADelete(t *testing.T) {
+	t.Parallel()
+
+	c := newGroupHotClient(t, newGroupMemoryStore())
+	g := bindGroupOn(t, c)
+	startGroupClient(t, c)
+
+	var rec applyRecorder
+
+	unsubscribe, err := g.OnApply(rec.apply)
+	if err != nil {
+		t.Fatalf("OnApply: %v", err)
+	}
+
+	t.Cleanup(unsubscribe)
+
+	rolled := groupConfig{Name: "rolled", Retries: 7, Hosts: []string{"c"}}
+	if err := g.Set(context.Background(), rolled, "operator"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	if err := c.Delete(context.Background(), "runtime", "ingest", "operator"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	seen := rec.all()
+	if len(seen) == 0 {
+		t.Fatal("no delivery at all")
+	}
+
+	last := seen[len(seen)-1]
+	if !reflect.DeepEqual(last.Value, groupDefaults()) {
+		t.Errorf("delivery after the delete = %#v, want the registered defaults %#v", last.Value, groupDefaults())
+	}
+
+	if last.Previous == nil || !reflect.DeepEqual(last.Previous.Value, rolled) {
+		t.Errorf("Previous on the delete delivery = %#v, want the deleted document %#v", last.Previous, rolled)
+	}
+
+	status := g.Status()
+	if len(status) != 1 {
+		t.Fatalf("Status entries = %d, want 1", len(status))
+	}
+
+	if status[0].Desired != 0 || status[0].Applied != 0 {
+		t.Errorf("Status after the delete = Desired %d, Applied %d, want 0 and 0: a delete publishes Revision 0 and that is convergence", status[0].Desired, status[0].Applied)
+	}
+
+	if status[0].LastErr != nil {
+		t.Errorf("LastErr after a delete every applier accepted = %v, want nil", status[0].LastErr)
 	}
 }
