@@ -1780,7 +1780,9 @@ func (p *tcpProxy) restore(t *testing.T) {
 // short server-selection bound is what makes the failure fast and the outage
 // deterministic: without it a severed feed would sit in selection for 30s and
 // the test would be timing out rather than observing anything.
-func proxiedStore(t *testing.T, proxy *tcpProxy, prefix string) (store.Store, string) {
+// A positive pollInterval selects the polling fallback instead of a change
+// stream; zero leaves the store on change streams.
+func proxiedStore(t *testing.T, proxy *tcpProxy, prefix string, pollInterval time.Duration) (store.Store, string) {
 	t.Helper()
 
 	client, err := mongo.Connect(options.Client().
@@ -1793,7 +1795,7 @@ func proxiedStore(t *testing.T, proxy *tcpProxy, prefix string) (store.Store, st
 
 	dbName := fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano())
 
-	s, err := mongodb.New(mongodb.Config{Client: client, Database: dbName})
+	s, err := mongodb.New(mongodb.Config{Client: client, Database: dbName, PollInterval: pollInterval})
 	if err != nil {
 		t.Fatalf("mongodb.New: %v", err)
 	}
@@ -1818,7 +1820,7 @@ func outageHarness(t *testing.T, prefix string) (proxied store.Store, direct sto
 
 	proxy = newTCPProxy(t, endpoint)
 
-	proxied, dbName := proxiedStore(t, proxy, prefix)
+	proxied, dbName := proxiedStore(t, proxy, prefix, 0)
 
 	direct, err := mongodb.New(mongodb.Config{Client: client, Database: dbName})
 	if err != nil {
@@ -1927,4 +1929,63 @@ func TestIntegration_MongoRepeatedReopenFailuresEmitOneDisconnect(t *testing.T) 
 	if len(narration) != 2 {
 		t.Fatalf("outage narrated %d events, want exactly the disconnect/resync pair; sequence = %#v", len(narration), narration)
 	}
+}
+
+// TestIntegration_MongoPollingDisconnectAndResyncAroundFailedRound holds the
+// polling fallback to the SAME narration contract the change stream has
+// (FC-2): a round trip that cannot reach MongoDB announces exactly one
+// OpDisconnect for the whole failure streak — not one per tick — and the first
+// round trip that succeeds afterwards announces exactly one OpResync. A
+// disconnect per failed tick would have the engine re-marking a scope it
+// already believes is stale; a resync per SUCCESSFUL tick would have it
+// reloading the scope forever.
+func TestIntegration_MongoPollingDisconnectAndResyncAroundFailedRound(t *testing.T) {
+	_, endpoint, cleanup := startContainerAt(t)
+	t.Cleanup(cleanup)
+
+	proxy := newTCPProxy(t, endpoint)
+
+	s, _ := proxiedStore(t, proxy, "pollfail", 200*time.Millisecond)
+
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	events, unsub := subscribeScope(t, s, store.Scope{})
+	t.Cleanup(unsub)
+
+	if evt := recvEvent(t, events, "the joining resync"); evt.Op != store.OpResync {
+		t.Fatalf("first event after Subscribe = %#v, want %q", evt, store.OpResync)
+	}
+
+	proxy.sever()
+
+	// Several round trips must fail inside this window: each one burns the 2s
+	// server-selection bound on top of the 200ms tick.
+	time.Sleep(6 * time.Second)
+
+	proxy.restore(t)
+
+	narration := collectUntil(t, events, "the OpResync after the failed round trips", 60*time.Second,
+		func(evt store.Event) bool { return evt.Op == store.OpResync })
+
+	if narration[0].Op != store.OpDisconnect {
+		t.Fatalf("outage began with %#v, want OpDisconnect first; sequence = %#v", narration[0], narration)
+	}
+
+	if got := countOps(narration, store.OpDisconnect); got != 1 {
+		t.Fatalf("the failure streak narrated %d disconnects, want exactly 1; sequence = %#v", got, narration)
+	}
+
+	if got := countOps(narration, store.OpResync); got != 1 {
+		t.Fatalf("the recovery narrated %d resyncs, want exactly 1; sequence = %#v", got, narration)
+	}
+
+	if len(narration) != 2 {
+		t.Fatalf("the outage narrated %d events, want exactly the disconnect/resync pair; sequence = %#v", len(narration), narration)
+	}
+
+	// A recovered feed goes quiet: the round trips that follow announce
+	// nothing, because nothing happened to the collection.
+	assertNoEvent(t, events, time.Second, "after the polling recovery")
 }

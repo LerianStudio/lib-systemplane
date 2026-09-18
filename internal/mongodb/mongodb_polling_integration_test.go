@@ -1,11 +1,16 @@
 //go:build integration
 
-// Integration tests that exercise the polling-mode boundary dedup against a
-// live MongoDB testcontainer. The unit tests in mongodb_changestream_test.go
-// pin the pure discrimination rule (boundaryDedupHit); these drive pollOnce
-// end-to-end with raw collection writes that force same-millisecond
-// updated_at — the exact race that produced the silent-skip bug when the
-// dedup set keyed only on (namespace, key) with no content discriminator.
+// Integration tests for the polling fallback against a live MongoDB
+// testcontainer: the boundary dedup, the synchronous first round trip, and the
+// tombstone-as-delete rule. The unit tests in mongodb_changestream_test.go pin
+// the pure discrimination rule (boundaryDedupHit); the two pollOnce tests here
+// drive it end-to-end with raw collection writes that force same-millisecond
+// updated_at — the exact race that produced the silent-skip bug when the dedup
+// set keyed only on (namespace, key) with no content discriminator.
+//
+// The outage narration — one OpDisconnect per failure streak, one OpResync on
+// recovery — is pinned in mongodb_integration_test.go instead, where the
+// severable TCP proxy that produces a deterministic outage already lives.
 //
 // Lives in package mongodb (not mongodb_test) so the test can invoke the
 // unexported pollOnce directly. Container startup is inlined rather than
@@ -17,6 +22,8 @@ package mongodb
 import (
 	"context"
 	"fmt"
+	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -186,23 +193,26 @@ func TestIntegration_PollOnce_SameMsDifferentValue_EmitsBoth(t *testing.T) {
 	rawUpsert(t, coll, "ns", "k", `"v1"`, t0)
 
 	// Step 2: first poll. Watermark anchored just before t0 so the $gte
-	// includes our row; firstPoll=true suppresses delete synthesis.
-	wm0 := t0.Add(-time.Millisecond)
-	emptySeen := make(map[nsKey]seenEntry)
-	emptyKnown := make(map[nsKey]struct{})
+	// includes our row; first=true suppresses delete synthesis.
+	first := pollState{
+		watermark:       t0.Add(-time.Millisecond),
+		known:           make(map[nsKey]struct{}),
+		seenAtWatermark: make(map[nsKey]seenEntry),
+		first:           true,
+	}
 
-	newWM, newKnown, newSeen, err := s.pollOnce(f, wm0, emptySeen, emptyKnown, true)
+	after, err := s.pollOnce(context.Background(), f, first)
 	if err != nil {
 		t.Fatalf("first pollOnce: %v", err)
 	}
 
-	if !newWM.Equal(t0) {
-		t.Fatalf("first poll watermark = %v, want %v", newWM, t0)
+	if !after.watermark.Equal(t0) {
+		t.Fatalf("first poll watermark = %v, want %v", after.watermark, t0)
 	}
 
 	nk := nsKey{Namespace: "ns", Key: "k"}
-	if entry, ok := newSeen[nk]; !ok || entry.valueHash != hashValue(`"v1"`) {
-		t.Fatalf("first poll newSeen[%v] = %+v, want valueHash=hash(v1)=%d", nk, entry, hashValue(`"v1"`))
+	if entry, ok := after.seenAtWatermark[nk]; !ok || entry.valueHash != hashValue(`"v1"`) {
+		t.Fatalf("first poll seenAtWatermark[%v] = %+v, want valueHash=hash(v1)=%d", nk, entry, hashValue(`"v1"`))
 	}
 
 	if got := len(snapshot()); got != 1 {
@@ -212,11 +222,10 @@ func TestIntegration_PollOnce_SameMsDifferentValue_EmitsBoth(t *testing.T) {
 	// Step 3: overwrite with v2 at the SAME t0. This is the same-ms collision.
 	rawUpsert(t, coll, "ns", "k", `"v2"`, t0)
 
-	// Step 4: second poll with the previous watermark + previous seen set.
+	// Step 4: second poll carrying the state the first one established.
 	// Pre-fix this would have skipped silently and emission count would
 	// stay at 1.
-	_, _, _, err = s.pollOnce(f, newWM, newSeen, newKnown, false)
-	if err != nil {
+	if _, err := s.pollOnce(context.Background(), f, after); err != nil {
 		t.Fatalf("second pollOnce: %v", err)
 	}
 
@@ -275,11 +284,14 @@ func TestIntegration_PollOnce_SameMsSameValue_EmitsOnce(t *testing.T) {
 	t0 := time.Now().UTC().Truncate(time.Millisecond)
 	rawUpsert(t, coll, "ns", "k", `"vSame"`, t0)
 
-	wm0 := t0.Add(-time.Millisecond)
-	emptySeen := make(map[nsKey]seenEntry)
-	emptyKnown := make(map[nsKey]struct{})
+	first := pollState{
+		watermark:       t0.Add(-time.Millisecond),
+		known:           make(map[nsKey]struct{}),
+		seenAtWatermark: make(map[nsKey]seenEntry),
+		first:           true,
+	}
 
-	newWM, newKnown, newSeen, err := s.pollOnce(f, wm0, emptySeen, emptyKnown, true)
+	after, err := s.pollOnce(context.Background(), f, first)
 	if err != nil {
 		t.Fatalf("first pollOnce: %v", err)
 	}
@@ -293,12 +305,221 @@ func TestIntegration_PollOnce_SameMsSameValue_EmitsOnce(t *testing.T) {
 	// touched updated_at without changing payload.)
 	rawUpsert(t, coll, "ns", "k", `"vSame"`, t0)
 
-	_, _, _, err = s.pollOnce(f, newWM, newSeen, newKnown, false)
-	if err != nil {
+	if _, err := s.pollOnce(context.Background(), f, after); err != nil {
 		t.Fatalf("second pollOnce: %v", err)
 	}
 
 	if got := len(snapshot()); got != 1 {
 		t.Fatalf("after second poll: emission count = %d, want 1 (idempotent rewrite must NOT re-emit)", got)
+	}
+}
+
+// deadClientConnector hands out a database on a client that can never reach a
+// server, so the feed's first poll round trip fails on the caller's goroutine.
+type deadClientConnector struct {
+	db *mongo.Database
+}
+
+func (c deadClientConnector) ResolveDatabase(context.Context, string) (*mongo.Database, error) {
+	return c.db, nil
+}
+
+// unreachableStore builds a polling store whose client points at a closed
+// local port with a short server-selection bound, so every round trip fails
+// fast and no container is needed at all. tenantScoped selects the named-tenant
+// wiring (a connector handing out a database on that same dead client).
+//
+// The collection bootstrap is stubbed through the package's schemaRunner seam:
+// it would otherwise fail first, on its own probe, and the test would never
+// reach the round trip it is about.
+func unreachableStore(t *testing.T, tenantScoped bool) *Store {
+	t.Helper()
+
+	// An ephemeral listener closed immediately hands us an address nothing is
+	// listening on, without guessing a port that might be in use.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	client, err := mongo.Connect(options.Client().
+		ApplyURI("mongodb://" + addr).
+		SetDirect(true).
+		SetServerSelectionTimeout(500 * time.Millisecond))
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+
+	t.Cleanup(func() { _ = client.Disconnect(context.Background()) })
+
+	cfg := Config{PollInterval: 50 * time.Millisecond}
+
+	if tenantScoped {
+		cfg.MultiTenantEnabled = true
+		cfg.Connector = deadClientConnector{db: client.Database("unreachable")}
+	} else {
+		cfg.Client = client
+		cfg.Database = "unreachable"
+	}
+
+	s, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	s.schemaRunner = func(context.Context, string) error { return nil }
+
+	t.Cleanup(func() { _ = s.Close() })
+
+	return s
+}
+
+// TestIntegration_MongoSubscribeReturnsErrorWhenFirstPollFails pins the
+// handshake: the first polling round trip runs on the caller's goroutine, so a
+// backend it cannot reach fails Start (zero scope) or Subscribe (named tenant)
+// instead of looping in the background behind a feed that looks alive. A
+// failure leaves nothing behind — no feed slot, no ticker — which is also what
+// keeps the package's goleak guard clean.
+func TestIntegration_MongoSubscribeReturnsErrorWhenFirstPollFails(t *testing.T) {
+	t.Run("zero scope fails Start", func(t *testing.T) {
+		s := unreachableStore(t, false)
+
+		err := s.Start(context.Background())
+		if err == nil {
+			t.Fatal("Start returned nil; want the failed first poll round trip")
+		}
+
+		if !strings.Contains(err.Error(), "poll") {
+			t.Fatalf("Start error = %v, want the poll round trip's own error", err)
+		}
+
+		if total, _ := s.FeedsSnapshot(""); total != 0 {
+			t.Fatalf("feeds after the failed Start = %d, want 0: the reserved slot must be retracted", total)
+		}
+	})
+
+	t.Run("named tenant fails Subscribe", func(t *testing.T) {
+		s := unreachableStore(t, true)
+
+		unsub, err := s.Subscribe(context.Background(), store.Scope{Tenant: "t1"}, func(store.Event) {})
+		if err == nil {
+			unsub()
+
+			t.Fatal("Subscribe returned nil; want the failed first poll round trip")
+		}
+
+		if !strings.Contains(err.Error(), "poll") {
+			t.Fatalf("Subscribe error = %v, want the poll round trip's own error", err)
+		}
+
+		if total, _ := s.FeedsSnapshot("t1"); total != 0 {
+			t.Fatalf("feeds after the failed Subscribe = %d, want 0: the reserved slot must be retracted", total)
+		}
+	})
+}
+
+// TestIntegration_MongoPollingTombstoneIsADelete pins FC-9 on the polling
+// path: Delete leaves a tombstone document rather than removing the row, and
+// the poller must announce that tombstone as ONE delete — not as an upsert of
+// a valueless document, and not twice (once from the tombstone it read, once
+// from the key vanishing out of the live key set).
+func TestIntegration_MongoPollingTombstoneIsADelete(t *testing.T) {
+	client, cleanup := startPollingContainer(t)
+	t.Cleanup(cleanup)
+
+	dbName := fmt.Sprintf("poll_tombstone_%d", time.Now().UnixNano())
+	t.Cleanup(func() { _ = client.Database(dbName).Drop(context.Background()) })
+
+	s, err := New(Config{
+		Client:       client,
+		Database:     dbName,
+		PollInterval: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	t.Cleanup(func() { _ = s.Close() })
+
+	ctx := context.Background()
+	if err := s.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	events := make(chan store.Event, 32)
+
+	unsub, err := s.Subscribe(ctx, store.Scope{}, func(evt store.Event) {
+		select {
+		case events <- evt:
+		default:
+		}
+	})
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	t.Cleanup(unsub)
+
+	if _, err := s.Set(ctx, store.Scope{}, store.Entry{
+		Namespace: "ns",
+		Key:       "k",
+		Value:     []byte(`{"a":1}`),
+		UpdatedAt: time.Now().UTC(),
+		UpdatedBy: "writer",
+	}); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+
+	waitForKeyOp(t, events, "ns", "k", store.OpUpsert)
+
+	if err := s.Delete(ctx, store.Scope{}, "ns", "k", "deleter"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	waitForKeyOp(t, events, "ns", "k", store.OpDelete)
+
+	// Several more round trips must add nothing: the tombstone stays in the
+	// collection forever, so a poller that re-announced it — or that fired a
+	// second delete from the key-set diff — would emit on every tick.
+	time.Sleep(500 * time.Millisecond)
+
+	for {
+		select {
+		case evt := <-events:
+			if evt.Namespace == "ns" && evt.Key == "k" {
+				t.Fatalf("extra event for the tombstoned key: %+v; want exactly one delete", evt)
+			}
+		default:
+			return
+		}
+	}
+}
+
+// waitForKeyOp drains events until the named key arrives with op, failing the
+// test on anything else for that key: the point of every caller here is that a
+// key's transition is announced once, with the right op.
+func waitForKeyOp(t *testing.T, events <-chan store.Event, namespace, key, op string) {
+	t.Helper()
+
+	deadline := time.After(15 * time.Second)
+
+	for {
+		select {
+		case evt := <-events:
+			if evt.Namespace != namespace || evt.Key != key {
+				continue
+			}
+
+			if evt.Op != op {
+				t.Fatalf("event for %s/%s = %+v, want op %q", namespace, key, evt, op)
+			}
+
+			return
+		case <-deadline:
+			t.Fatalf("timed out waiting for %s/%s %s", namespace, key, op)
+		}
 	}
 }

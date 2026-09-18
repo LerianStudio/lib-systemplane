@@ -65,8 +65,10 @@ type Config struct {
 	Collection string
 
 	// PollInterval enables polling mode when positive. A zero value uses
-	// change streams (which require a replica set). Polling mode is only
-	// available in single-tenant mode.
+	// change streams (which require a replica set). Polling serves every
+	// scope a change stream serves — the zero scope and a named tenant
+	// alike — with the same store.OpResync, store.OpDisconnect and revision
+	// guarantees.
 	PollInterval time.Duration
 
 	// MultiTenantEnabled selects the tmcore-driven dispatch path. When true,
@@ -159,7 +161,9 @@ type Store struct {
 // Start performs single-tenant collection bootstrap and opens the change
 // stream, synchronously: it does not return until the stream is established or
 // has failed, so a write that lands right after it is observed rather than
-// lost. In multi-tenant mode it is a no-op.
+// lost. In polling mode the same applies to the first poll round trip, which
+// anchors the watermark every later query filters on. In multi-tenant mode it
+// is a no-op.
 func (s *Store) Start(ctx context.Context) error {
 	if s == nil || s.isClosed() {
 		return store.ErrClosed

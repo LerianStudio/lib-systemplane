@@ -12,6 +12,11 @@
 // write that lands before the attach is never delivered — not late, never. The
 // gap left by a LATER outage is covered instead by store.OpResync, which every
 // (re)open announces so the engine reconciles the whole scope.
+//
+// The polling fallback runs the same handshake for the same reason: its FIRST
+// round trip runs on the caller's goroutine and anchors the watermark every
+// later query filters on, so a watermark anchored on a background goroutine
+// nobody waits for would swallow every write that landed before it.
 package mongodb
 
 import (
@@ -42,6 +47,11 @@ var (
 	watchTimeout = 10 * time.Second
 	closeTimeout = 5 * time.Second
 )
+
+// pollRoundTimeout bounds ONE poll round trip, the synchronous first one as
+// much as a tick, so an unreachable MongoDB fails Start or Subscribe instead of
+// parking it for the life of the caller's ctx.
+const pollRoundTimeout = 5 * time.Second
 
 // errFeedStopped ends a reopen loop that lost its race with teardown. It never
 // reaches a caller.
@@ -102,6 +112,13 @@ type feed struct {
 
 	stop chan struct{}
 	done chan struct{}
+
+	// pollStart is the state the feed's first poll round trip established,
+	// handed to the reader goroutine that owns it from then on. Written by the
+	// creator BEFORE the reader is launched — the goroutine start is the
+	// happens-before edge — and never written again, so it needs no lock.
+	// Unused on a change-stream feed.
+	pollStart pollState
 }
 
 // subscription serializes delivery to one callback. sub.mu is held for the
@@ -171,10 +188,32 @@ func (f *feed) beginResync() (subs []*subscription, ok bool) {
 		return nil, false
 	}
 
+	return f.markConnectedLocked(), true
+}
+
+// beginResyncAfterOutage is the polling loop's variant: it announces ONLY on
+// the disconnected→connected edge. A change stream hangs its announcement on a
+// reopen, which happens once per outage; polling has no reopen — every tick is
+// a fresh round trip — so announcing on each success would tell the engine to
+// reload the scope forever.
+func (f *feed) beginResyncAfterOutage() (subs []*subscription, ok bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.closing || !f.disconnected {
+		return nil, false
+	}
+
+	return f.markConnectedLocked(), true
+}
+
+// markConnectedLocked records the connection and clears the outage flag so the
+// next real loss can announce once more. The caller MUST hold f.mu.
+func (f *feed) markConnectedLocked() []*subscription {
 	f.connected = true
 	f.disconnected = false
 
-	return f.snapshotLocked(), true
+	return f.snapshotLocked()
 }
 
 // zeroFeed returns the zero-scope feed, creating it when Subscribe runs before
@@ -322,6 +361,17 @@ func (s *Store) createFeed(ctx context.Context, f *feed) error {
 	}
 
 	f.coll = coll
+
+	// Polling serves a named tenant exactly as it serves the zero scope: the
+	// first round trip replaces the first Watch, and its failure retracts the
+	// slot the same way.
+	if s.cfg.PollInterval > 0 {
+		if err := s.startPolling(ctx, f); err != nil {
+			return s.retractFeed(f, err)
+		}
+
+		return s.publishFeed(ctx, f, nil)
+	}
 
 	stream, err := s.openWatch(ctx, f)
 	if err != nil {
@@ -501,8 +551,10 @@ func (s *Store) Subscribe(ctx context.Context, scope store.Scope, fn func(store.
 // meanwhile must be able to throw it away instead of inheriting a live cursor
 // and a reader goroutine no later Close will ever stop.
 //
-// Polling mode has no stream to open: its reader is launched the same way with
-// a nil stream, and the poll loop attaches per tick.
+// Polling mode has no stream to open: its first round trip runs here instead,
+// on this goroutine, and its reader is launched with a nil stream. A first
+// round trip that fails returns the error and retracts the slot, so Start
+// leaves no feed and no ticker behind.
 func (s *Store) startListener(ctx context.Context) error {
 	f, err := s.zeroFeed()
 	if err != nil {
@@ -518,6 +570,10 @@ func (s *Store) startListener(ctx context.Context) error {
 	}
 
 	if s.cfg.PollInterval > 0 {
+		if err := s.startPolling(ctx, f); err != nil {
+			return s.retractFeed(f, err)
+		}
+
 		return s.publishFeed(ctx, f, nil)
 	}
 
@@ -645,7 +701,7 @@ func (s *Store) startFeedReader(f *feed, stream *mongo.ChangeStream) {
 		defer runtime.RecoverAndLog(s.cfg.Logger, "systemplane.mongodb.listener")
 
 		if stream == nil {
-			s.pollForever(f)
+			s.pollForever(f, f.pollStart)
 
 			return
 		}
@@ -913,26 +969,78 @@ type nsKey struct {
 	Key       string
 }
 
-func (s *Store) pollForever(f *feed) {
-	// Watermark anchored slightly in the past so the first tick observes any
-	// row that already exists. Deduplication is keyed on (namespace, key)
-	// pairs already emitted at the current watermark boundary.
-	watermark := time.Now().UTC().Truncate(time.Millisecond)
-	// known tracks the set of (namespace, key) tuples observed by the most
-	// recent full poll. Anything present last time but absent now is a
-	// delete that we synthesize an OpDelete event for.
-	known := make(map[nsKey]struct{})
-	// seenAtWatermark holds the ids whose updated_at equals the current
-	// watermark, paired with a content hash of the value we emitted for them.
-	// Two consecutive polls observing the same (ns, key) at the boundary skip
-	// re-emission only when the hash also matches — otherwise the second
-	// write (same key, same ms, different value) would be silently swallowed
-	// and never reach peer caches. See seenEntry / boundaryDedupHit.
-	seenAtWatermark := make(map[nsKey]seenEntry)
-	// firstPoll suppresses delete synthesis on the very first iteration
-	// (when `known` is empty by construction) and primes the watermark from
-	// the maximum updated_at observed during the snapshot scan.
-	firstPoll := true
+// pollState is everything one poll round trip carries into the next. The FIRST
+// round trip establishes it on the caller's goroutine; from the moment the feed
+// is published it belongs to the reader goroutine alone, so it needs no lock.
+type pollState struct {
+	// watermark is the updated_at floor of the incremental query. Only a round
+	// trip that COMPLETED advances it: advancing on a partial read would
+	// silently skip every row that read never saw.
+	watermark time.Time
+	// known is the live (namespace, key) set the last completed round trip
+	// saw. A key in it that is absent now is the one delete that leaves
+	// nothing to announce — a foreign deleteOne that removed the document
+	// outright instead of tombstoning it.
+	known map[nsKey]struct{}
+	// seenAtWatermark holds the keys whose updated_at equals the watermark,
+	// each with a content hash of the value emitted for it. Two consecutive
+	// round trips observing the same key at that millisecond skip re-emission
+	// only when the hash matches too — see seenEntry / boundaryDedupHit.
+	seenAtWatermark map[nsKey]seenEntry
+	// first suppresses delete synthesis on the very first round trip, whose
+	// known set is empty by construction.
+	first bool
+}
+
+// newPollState anchors the watermark at now, truncated to the BSON
+// millisecond so a row written earlier inside the same millisecond is still
+// caught by the $gte.
+func newPollState() pollState {
+	return pollState{
+		watermark:       time.Now().UTC().Truncate(time.Millisecond),
+		known:           make(map[nsKey]struct{}),
+		seenAtWatermark: make(map[nsKey]seenEntry),
+		first:           true,
+	}
+}
+
+// startPolling runs the feed's FIRST poll round trip synchronously and records
+// the state it established for the reader goroutine.
+//
+// Synchronous for the same reason openWatch is: the watermark this round trip
+// anchors is the floor of every later query, so anchoring it on a goroutine the
+// caller never waits for swallows the writes that land in between — not late,
+// never. On failure it returns the wrapped error and leaves the caller to
+// retract the slot: no ticker, no placeholder, no partial subscription.
+func (s *Store) startPolling(ctx context.Context, f *feed) error {
+	st, err := s.pollOnce(ctx, f, newPollState())
+	if err != nil {
+		return err
+	}
+
+	f.pollStart = st
+
+	return nil
+}
+
+// pollForever is THE polling loop, for every scope. st is the state the
+// synchronous first round trip established, so the loop never re-anchors the
+// watermark.
+//
+// Connectivity narration, the SAME edge-triggered pair the change stream uses:
+// the first failure of a streak announces one store.OpDisconnect and every
+// later failure announces nothing, so a long outage costs one disconnect rather
+// than one per tick; the round trip that ends the streak announces one
+// store.OpResync. A round trip's key events are dispatched by pollOnce as it
+// reads them, so they precede that resync — harmlessly, because the engine
+// answers a resync by reloading the whole scope anyway.
+func (s *Store) pollForever(f *feed, st pollState) {
+	// The first round trip already succeeded — the caller would not have
+	// published this feed otherwise — so the connection is announced here, on
+	// the reader goroutine, exactly where runFeed announces its own open.
+	if subs, ok := f.beginResync(); ok {
+		s.broadcast(f, subs, store.Event{Scope: f.scope, Op: store.OpResync})
+	}
 
 	ticker := time.NewTicker(s.cfg.PollInterval)
 	defer ticker.Stop()
@@ -942,49 +1050,59 @@ func (s *Store) pollForever(f *feed) {
 		case <-f.stop:
 			return
 		case <-ticker.C:
-			newWatermark, currentKnown, newSeen, err := s.pollOnce(f, watermark, seenAtWatermark, known, firstPoll)
+			next, err := s.pollOnce(context.Background(), f, st)
 			if err != nil {
-				s.logWarn(context.Background(), "poll query failed", log.Err(err))
+				s.logWarn(context.Background(), "poll round trip failed",
+					log.Err(err),
+					log.String("tenant", f.scope.Tenant),
+				)
 
+				if subs, ok := f.beginDisconnect(); ok {
+					s.broadcast(f, subs, store.Event{Scope: f.scope, Op: store.OpDisconnect})
+				}
+
+				// st is deliberately left untouched: the failed round trip
+				// established nothing.
 				continue
 			}
 
-			watermark = newWatermark
-			seenAtWatermark = newSeen
-			known = currentKnown
-			firstPoll = false
+			if subs, ok := f.beginResyncAfterOutage(); ok {
+				s.broadcast(f, subs, store.Event{Scope: f.scope, Op: store.OpResync})
+			}
+
+			st = next
 		}
 	}
 }
 
-// pollOnce performs one poll cycle:
-//   - Emits OpUpsert for every doc with updated_at >= watermark unless it is
-//     an idempotent rewrite at the watermark boundary (same (ns, key), same
-//     boundary millisecond, AND same value-hash as what was emitted last
-//     round). Same key at the same ms with a different value is a real new
-//     write and IS emitted — otherwise peer caches would stay stale until a
-//     later, strictly-newer write advances the watermark.
-//   - Performs a full collection scan to capture the current key set;
-//     anything present in `prevKnown` but absent now becomes a synthesized
-//     OpDelete event. Skipped on the first iteration (prevKnown empty).
+// pollOnce performs one poll round trip on the feed's own collection:
 //
-// Returns the new watermark, the new full known set, and the new
-// seenAtWatermark set (ids that touched the boundary millisecond, with their
-// value-hash content discriminator).
-func (s *Store) pollOnce(
-	f *feed,
-	watermark time.Time,
-	prevSeenAtWatermark map[nsKey]seenEntry,
-	prevKnown map[nsKey]struct{},
-	firstPoll bool,
-) (time.Time, map[nsKey]struct{}, map[nsKey]seenEntry, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+//   - Emits store.OpUpsert carrying the document's stored revision for every
+//     live document with updated_at >= the watermark, unless it is an
+//     idempotent rewrite at the boundary millisecond (same key, same
+//     millisecond, and the same value hash as the one emitted last round).
+//     Same key at the same millisecond with a DIFFERENT value is a real new
+//     write and IS emitted — otherwise peer caches stay stale until a later,
+//     strictly newer write advances the watermark.
+//   - Emits store.OpDelete at Revision 0 for every TOMBSTONE it reads: the
+//     document Delete rewrote in place (FC-9). The incremental query is
+//     deliberately NOT filtered on "deleted" — the poller has to see the
+//     tombstone in order to announce it.
+//   - Diffs the live key set against the previous round's to catch the one
+//     delete that leaves nothing behind: a foreign deleteOne. A key already
+//     announced from its tombstone this round is excluded from that diff, or
+//     the same delete would fire twice.
+//
+// It returns the state the next round trip carries. On failure it returns the
+// state it was GIVEN, unchanged, so nothing advances over rows it never read.
+func (s *Store) pollOnce(ctx context.Context, f *feed, st pollState) (pollState, error) {
+	ctx, cancel := context.WithTimeout(ctx, pollRoundTimeout)
 	defer cancel()
 
-	// Use >= so two writes that land in the same millisecond as the previous
-	// boundary aren't silently skipped; dedup via prevSeenAtWatermark with
-	// a value-hash discriminator (see seenEntry).
-	filter := bson.D{{Key: fieldUpdatedAt, Value: bson.D{{Key: "$gte", Value: watermark}}}}
+	// $gte, not $gt, so two writes landing in the previous boundary
+	// millisecond are not silently skipped; the duplicate that follows is
+	// filtered by boundaryDedupHit's content discriminator.
+	filter := bson.D{{Key: fieldUpdatedAt, Value: bson.D{{Key: "$gte", Value: st.watermark}}}}
 
 	findOpts := options.Find().SetSort(bson.D{
 		{Key: fieldUpdatedAt, Value: 1},
@@ -992,17 +1110,26 @@ func (s *Store) pollOnce(
 		{Key: fieldKey, Value: 1},
 	})
 
-	cur, err := s.coll.Find(ctx, filter, findOpts)
+	cur, err := f.coll.Find(ctx, filter, findOpts)
 	if err != nil {
-		return watermark, prevKnown, prevSeenAtWatermark, fmt.Errorf("poll find: %w", err)
+		return st, fmt.Errorf("systemplane/mongodb: poll find%s: %w", f.label(), err)
 	}
 	defer cur.Close(ctx)
 
-	newWatermark := watermark
-	newSeen := make(map[nsKey]seenEntry)
+	next := pollState{
+		watermark:       st.watermark,
+		known:           st.known,
+		seenAtWatermark: make(map[nsKey]seenEntry),
+	}
+
+	// The keys this round announced from their tombstone. They are already
+	// absent from the live key set (snapshotKeys filters tombstones out), so
+	// the diff below would fire a second delete for each of them.
+	tombstoned := make(map[nsKey]struct{})
 
 	for cur.Next(ctx) {
 		var doc entryDoc
+
 		if err := cur.Decode(&doc); err != nil {
 			s.logWarn(ctx, "poll decode error, skipping document", log.Err(err))
 
@@ -1011,72 +1138,79 @@ func (s *Store) pollOnce(
 
 		nk := nsKey{Namespace: doc.Namespace, Key: doc.Key}
 		valueHash := hashValue(doc.Value)
-		atBoundary := doc.UpdatedAt.Equal(watermark)
+		atBoundary := doc.UpdatedAt.Equal(st.watermark)
 
-		// Dedup: only skip when the same (ns, key) was emitted at this
-		// boundary millisecond AND the value digest matches. Same key, same
-		// ms, different value is a real write that MUST re-emit — otherwise
-		// peer caches stay stale until a strictly newer write advances the
-		// watermark.
-		if boundaryDedupHit(prevSeenAtWatermark, nk, atBoundary, valueHash) {
-			// Preserve the entry in newSeen so the next poll round still
-			// dedupes against it (we re-observe the same row again via $gte
-			// until the watermark advances).
-			newSeen[nk] = seenEntry{valueHash: valueHash}
+		if doc.Deleted {
+			tombstoned[nk] = struct{}{}
+		}
+
+		// A tombstone runs through the same discriminator: its value is unset
+		// and hashes differently from the value it replaced, so the delete
+		// transition always emits, while two observations of the SAME
+		// tombstone at the boundary collapse into one.
+		if boundaryDedupHit(st.seenAtWatermark, nk, atBoundary, valueHash) {
+			// Preserved so the next round still dedupes against it: the $gte
+			// re-reads this row until the watermark advances past it.
+			next.seenAtWatermark[nk] = seenEntry{valueHash: valueHash}
 
 			continue
 		}
 
-		f.dispatch(s.cfg.Logger, store.Event{
-			Namespace: doc.Namespace,
-			Key:       doc.Key,
-			Op:        store.OpUpsert,
-		})
+		evt := store.Event{Namespace: doc.Namespace, Key: doc.Key, Op: store.OpUpsert, Revision: doc.Revision}
+		if doc.Deleted {
+			evt.Op, evt.Revision = store.OpDelete, 0
+		}
+
+		f.dispatch(s.cfg.Logger, evt)
 
 		switch {
-		case doc.UpdatedAt.After(newWatermark):
-			newWatermark = doc.UpdatedAt
-			newSeen = map[nsKey]seenEntry{nk: {valueHash: valueHash}}
-		case doc.UpdatedAt.Equal(newWatermark):
-			newSeen[nk] = seenEntry{valueHash: valueHash}
+		case doc.UpdatedAt.After(next.watermark):
+			next.watermark = doc.UpdatedAt
+			next.seenAtWatermark = map[nsKey]seenEntry{nk: {valueHash: valueHash}}
+		case doc.UpdatedAt.Equal(next.watermark):
+			next.seenAtWatermark[nk] = seenEntry{valueHash: valueHash}
 		}
 	}
 
 	if err := cur.Err(); err != nil {
-		return watermark, prevKnown, prevSeenAtWatermark, fmt.Errorf("poll cursor error: %w", err)
+		return st, fmt.Errorf("systemplane/mongodb: poll cursor%s: %w", f.label(), err)
 	}
 
-	// Full-collection scan to detect deletes done by other processes. The
-	// incremental updated_at scan above cannot see deletes (the row is gone
-	// before its tombstone is observable); diffing key sets is the only way.
-	currentKnown, err := s.snapshotKeys(ctx)
+	currentKnown, err := s.snapshotKeys(ctx, f.coll)
 	if err != nil {
-		// If the snapshot fails, keep prevKnown — we'd rather miss a delete
-		// event than emit a spurious one based on a partial scan.
+		// A partial scan would synthesize deletes for rows it merely failed to
+		// read, so the previous key set is kept and the diff skipped: a late
+		// delete beats a phantom one.
 		s.logWarn(ctx, "poll snapshot failed, skipping delete diff", log.Err(err))
 
-		return newWatermark, prevKnown, newSeen, nil
+		return next, nil
 	}
 
-	if !firstPoll {
-		for nk := range prevKnown {
-			if _, stillThere := currentKnown[nk]; !stillThere {
-				f.dispatch(s.cfg.Logger, store.Event{
-					Namespace: nk.Namespace,
-					Key:       nk.Key,
-					Op:        store.OpDelete,
-				})
+	if !st.first {
+		for nk := range st.known {
+			if _, stillThere := currentKnown[nk]; stillThere {
+				continue
 			}
+
+			if _, announced := tombstoned[nk]; announced {
+				continue
+			}
+
+			f.dispatch(s.cfg.Logger, store.Event{Namespace: nk.Namespace, Key: nk.Key, Op: store.OpDelete})
 		}
 	}
 
-	return newWatermark, currentKnown, newSeen, nil
+	next.known = currentKnown
+
+	return next, nil
 }
 
-// snapshotKeys returns the set of (namespace, key) tuples currently present
-// in the collection. Used by polling mode to diff against the prior poll and
-// synthesize OpDelete events for rows that disappeared.
-func (s *Store) snapshotKeys(ctx context.Context) (map[nsKey]struct{}, error) {
+// snapshotKeys returns the LIVE (namespace, key) set of a collection —
+// tombstones excluded through the same notDeleted guard the reads use, so a key
+// this lib deleted is already gone from here and is announced from its
+// tombstone instead. What the resulting diff still covers is the delete that
+// leaves nothing to read: a foreign deleteOne.
+func (s *Store) snapshotKeys(ctx context.Context, coll *mongo.Collection) (map[nsKey]struct{}, error) {
 	projection := bson.D{
 		{Key: fieldNamespace, Value: 1},
 		{Key: fieldKey, Value: 1},
@@ -1084,7 +1218,7 @@ func (s *Store) snapshotKeys(ctx context.Context) (map[nsKey]struct{}, error) {
 	}
 	findOpts := options.Find().SetProjection(projection)
 
-	cur, err := s.coll.Find(ctx, bson.D{}, findOpts)
+	cur, err := coll.Find(ctx, bson.D{notDeleted()}, findOpts)
 	if err != nil {
 		return nil, fmt.Errorf("snapshot find: %w", err)
 	}
