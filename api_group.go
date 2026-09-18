@@ -28,15 +28,10 @@ type Group[T any] struct {
 	// caller holds.
 	coordinator *group.Coordinator[T]
 
-	// unsubscribe releases the single OnChange subscription Bind took, so the
-	// handle owns what it created. Nothing calls it today: a group has no
-	// Close, and the Client's own teardown drops its subscribers.
-	unsubscribe func()
-
 	// subscribeErr is the refusal OnChange returned at Bind, reported by
-	// OnApply. A multi-tenant Client refuses the subscription and must still
-	// get a working Snapshot and Set, so Bind records the error instead of
-	// failing.
+	// OnApply. A multi-tenant Client with no bound Manager refuses the
+	// subscription and must still get a working Snapshot and Set, so Bind
+	// records the error instead of failing.
 	subscribeErr error
 }
 
@@ -86,9 +81,14 @@ type Snapshot[T any] struct {
 // here, before c.Start and therefore before any publication can exist, which is
 // what lets [Group.OnApply] promise that no revision falls between its initial
 // delivery and its subscription. A Client that refuses the subscription — a
-// multi-tenant one today — still yields a working handle: the refusal is
-// recorded and returned by OnApply, while [Group.Snapshot] and [Group.Set] keep
-// working.
+// multi-tenant one with no bound Manager today — still yields a working handle:
+// the refusal is recorded and returned by OnApply, while [Group.Snapshot] and
+// [Group.Set] keep working.
+//
+// That subscription is never released. FC-7 gives a group no Close, so nothing
+// could ever call the unsubscribe, and the subscription therefore lives as long
+// as the Client does; [Client.Close] does not drop subscribers either, it
+// cancels the context they are delivered under.
 //
 // Bind on a nil Client returns ErrClosed. Defaults that validate rejects
 // surface as the ErrValidation that Register returns.
@@ -164,14 +164,13 @@ func Bind[T any](c *Client, namespace, key string, defaults T, validate func(T) 
 	// before any publication can exist. That is the structural half of FC-7's
 	// "no revision can fall between the initial delivery and the
 	// subscription"; the coordinator's seed watermark is the other half.
-	unsubscribe, subscribeErr := c.OnChange(namespace, key, func(ctx context.Context, ch Change) {
+	//
+	// The unsubscribe is discarded: a group has no Close, so the subscription
+	// outlives every caller of it.
+	_, subscribeErr := c.OnChange(namespace, key, func(ctx context.Context, ch Change) {
 		g.coordinator.Publish(ctx, group.Publication{Tenant: ch.Tenant, Revision: ch.Revision, Value: ch.Value})
 	})
-	if subscribeErr != nil {
-		g.subscribeErr = subscribeErr
-	} else {
-		g.unsubscribe = unsubscribe
-	}
+	g.subscribeErr = subscribeErr
 
 	return g, nil
 }
@@ -303,6 +302,13 @@ func (g *Group[T]) Set(ctx context.Context, value T, actor string) error {
 // is what Previous carries on the next delivery, so an applier must treat it
 // as read-only. A caller that wants an owned copy calls [Group.Snapshot],
 // which decodes per call.
+//
+// Value can be nil on a pointer-, map- or slice-shaped T. A JSON null is a
+// legitimate document for such a group, and decoding turns it into the zero T
+// (D-G2), so an applier for one of these types must guard Value rather than
+// dereference it: a nil dereference panics, and the panic is recovered and
+// recorded as that revision's rejection in [Group.Status]'s LastErr, which
+// leaves the group silently unconverged rather than crashing the process.
 type Applied[T any] struct {
 	Snapshot[T]
 	Previous *Snapshot[T]
@@ -343,27 +349,35 @@ type ApplyStatus struct {
 // initial delivery happens during Start.
 //
 // fn runs with no lock held and may call [Group.Snapshot], [Group.Status],
-// [Group.Set] or OnApply for its own group: the resulting delivery runs after
-// the current one returns, on the same goroutine. An applier that writes on
-// every delivery therefore loops forever.
+// [Group.Set] or OnApply for its own group. A re-entrant OnApply appends its
+// function and returns without delivering: the initial delivery is deferred to
+// the running fan-out's next iteration, and an unsubscribe called before that
+// iteration cancels it, so the function never runs at all. A re-entrant Set
+// reaches the applier on that same goroutine, after the current delivery
+// returns, only when the Client publishes the write inline from the applier's
+// own goroutine — which is what WithDebounce(0) does; under the default
+// debounce the publication comes from a timer goroutine instead. Either way an
+// applier that writes on every delivery keeps the group reloading forever.
 //
-// The initial delivery — the replay, or the seeded one — normally runs on the
-// calling goroutine, before OnApply returns. It does not when a fan-out for the
-// same scope is already running on another goroutine: OnApply then returns
-// without waiting, and that fan-out makes the delivery. Which goroutine
-// delivers never decides the context fn receives: a published snapshot always
-// carries the context the Client handed its subscribers when it published,
-// which [Client.Close] cancels, and a seeded one carries a background context.
+// The initial delivery — the replay, or the seeded one — runs on the calling
+// goroutine, before OnApply returns, whenever no fan-out for that scope is in
+// flight. When another goroutine is already fanning that scope out, OnApply
+// returns without waiting and THAT fan-out delivers to the newly registered fn
+// before it completes, because it re-reads the registered functions on every
+// iteration. Which goroutine delivers never decides the context fn receives:
+// a published snapshot always carries the context the Client handed its
+// subscribers when it published, which [Client.Close] cancels, and a seeded
+// one carries a background context.
 // OnApply after Close registers and replays the last observed snapshot, and no
 // further delivery can arrive.
 //
 // A nil fn registers nothing and returns no error, matching [Client.OnChange].
 // unsubscribe is idempotent, is safe to call from inside fn itself, and
 // releases that function's hold on the scope's applied revision. In
-// multi-tenant mode OnApply returns ErrNotSupportedInMultiTenant, while
-// [Group.Snapshot] and [Group.Set] keep working; on a nil *Group it returns
-// ErrClosed. unsubscribe is never nil, so a caller may defer it before
-// checking err.
+// multi-tenant mode with no bound Manager OnApply returns
+// ErrNotSupportedInMultiTenant, while [Group.Snapshot] and [Group.Set] keep
+// working; on a nil *Group it returns ErrClosed. unsubscribe is never nil, so
+// a caller may defer it before checking err.
 func (g *Group[T]) OnApply(fn func(ctx context.Context, a Applied[T]) error) (unsubscribe func(), err error) {
 	noop := func() {}
 

@@ -1,4 +1,17 @@
 // Publication coordinator: the per-scope delivery core behind typed groups.
+//
+// Ordering is arrival order. Every publication is stamped with a sequence
+// number as it enters Publish, and that sequence — never the revision — drives
+// dedupe, coalescing and convergence. The coordinator can therefore keep what
+// it is handed in order, but it cannot repair a caller that hands it one key's
+// callbacks out of order, which the current Client's debounce dispatch can do
+// from its timer goroutines. The engine-backed Client closes that gap by
+// serializing per scope and key in revision order before it publishes.
+//
+// Nothing is pruned. A scope entry and every registered function's bookkeeping
+// for it live as long as the coordinator, so a tenant the Client has stopped
+// serving keeps its row in Status. Releasing a scope needs a DropScope hook
+// called from the Client's tenant teardown, which the engine-tenants lane owns.
 package group
 
 import (
