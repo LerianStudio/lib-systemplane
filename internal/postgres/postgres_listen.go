@@ -276,21 +276,31 @@ func (f *feed) endDispatch() {
 	f.mu.Unlock()
 }
 
-// zeroFeed returns the zero-scope feed, creating it when Subscribe runs before
-// Start. Callers must NOT hold feedsMu.
-func (s *Store) zeroFeed() (*feed, error) {
+// zeroFeedForStart hands Start the zero-scope feed and clears the refusal a
+// PREVIOUS attempt recorded. Start retries the feed its subscribers are already
+// holding, so that record belongs to the attempt that produced it, not to the
+// feed forever. Callers must NOT hold feedsMu.
+func (s *Store) zeroFeedForStart() (*feed, error) {
 	s.feedsMu.Lock()
 	defer s.feedsMu.Unlock()
 
-	return s.zeroFeedLocked()
+	f, err := s.zeroFeedSlotLocked()
+	if err != nil {
+		return nil, err
+	}
+
+	f.err = nil
+
+	return f, nil
 }
 
-// zeroFeedLocked refuses to hand out — or resurrect — the zero-scope feed once
-// Close has begun. The caller MUST hold Store.feedsMu, which is what makes the
-// check atomic with the map walk in stopFeeds: a Start or a Subscribe that
-// already passed the s.closed check would otherwise re-insert a slot into a
-// shut-down store, and nothing would ever tear it down again.
-func (s *Store) zeroFeedLocked() (*feed, error) {
+// zeroFeedSlotLocked returns the zero-scope slot, creating it when Subscribe
+// runs before Start, and refuses to hand it out — or resurrect it — once Close
+// has begun. The caller MUST hold Store.feedsMu, which is what makes the check
+// atomic with the map walk in stopFeeds: a Start or a Subscribe that already
+// passed the s.closed check would otherwise re-insert a slot into a shut-down
+// store, and nothing would ever tear it down again.
+func (s *Store) zeroFeedSlotLocked() (*feed, error) {
 	if s.closing {
 		return nil, store.ErrClosed
 	}
@@ -301,6 +311,24 @@ func (s *Store) zeroFeedLocked() (*feed, error) {
 
 	f := newFeed(store.Scope{}, s.cfg.ListenDSN)
 	s.feeds[""] = f
+
+	return f, nil
+}
+
+// zeroFeedLocked is the SUBSCRIBE side of that slot: it reports the refusal a
+// Start recorded instead of handing back a feed nothing is bringing up. The
+// zero-scope slot is never retracted — its subscribers hold it and a retried
+// Start must reconnect the one they hold — so the recorded cause is the only
+// thing that can tell a later Subscribe the changefeed never came up.
+func (s *Store) zeroFeedLocked() (*feed, error) {
+	f, err := s.zeroFeedSlotLocked()
+	if err != nil {
+		return nil, err
+	}
+
+	if f.err != nil {
+		return nil, f.err
+	}
 
 	return f, nil
 }
@@ -511,6 +539,16 @@ func (f *feed) closeReadyLocked() {
 func (s *Store) failLocked(f *feed, err error) error {
 	if f.err == nil {
 		f.err = err
+	}
+
+	// The zero-scope slot is the exception: Start owns it, Subscribe can attach
+	// to it BEFORE Start, and a retried Start must bring up the very feed those
+	// subscribers hold. Retracting it would strand them on a feed nothing
+	// reconnects and nothing tears down, while handing the next Subscribe a
+	// fresh feed that has announced nothing and looks healthy. The recorded
+	// cause stays on the slot instead, and zeroFeedLocked reports it.
+	if f.scope.Tenant == "" {
+		return f.err
 	}
 
 	if s.feeds[f.scope.Tenant] == f {
@@ -777,7 +815,7 @@ func (s *Store) startListener(ctx context.Context) error {
 	s.startMu.Lock()
 	defer s.startMu.Unlock()
 
-	f, err := s.zeroFeed()
+	f, err := s.zeroFeedForStart()
 	if err != nil {
 		return err
 	}
@@ -919,14 +957,21 @@ func (s *Store) stopFeed(f *feed) {
 // store.Event{Scope: f.scope, Op: store.OpDisconnect}. Then it repeats
 // through the existing backoff.
 func (s *Store) runFeed(f *feed, conn *pgx.Conn) {
-	attempt := 0
+	var retry reconnectBackoff
 
 	for {
 		if subs, ok := f.beginResync(); ok {
 			s.broadcast(f, subs, store.Event{Scope: f.scope, Op: store.OpResync})
 		}
 
-		s.consumeUntilFailure(f, conn)
+		connectedAt := time.Now()
+
+		consumed := s.consumeUntilFailure(f, conn)
+
+		// Only a connection that did some work clears the backoff. A backend
+		// that accepts and drops at once would otherwise reset it every cycle
+		// and the feed would reconnect at the first delay forever.
+		retry.connectionEnded(consumed, time.Since(connectedAt))
 
 		if subs, ok := f.beginDisconnect(); ok {
 			s.broadcast(f, subs, store.Event{Scope: f.scope, Op: store.OpDisconnect})
@@ -947,14 +992,18 @@ func (s *Store) runFeed(f *feed, conn *pgx.Conn) {
 
 		var err error
 
-		conn, err = s.reconnect(f, &attempt)
+		conn, err = s.reconnect(f, &retry)
 		if err != nil {
 			return
 		}
 	}
 }
 
-func (s *Store) consumeUntilFailure(f *feed, conn *pgx.Conn) {
+// consumeUntilFailure pumps notifications from conn until it dies or teardown
+// closes f.stop. It reports whether the connection carried at least one
+// notification, which is what tells runFeed the connection was worth keeping
+// and its backoff can start over.
+func (s *Store) consumeUntilFailure(f *feed, conn *pgx.Conn) (consumed bool) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -976,8 +1025,10 @@ func (s *Store) consumeUntilFailure(f *feed, conn *pgx.Conn) {
 				)
 			}
 
-			return
+			return consumed
 		}
+
+		consumed = true
 
 		s.handleNotification(ctx, f, notification.Payload)
 	}
@@ -1003,28 +1054,74 @@ func (s *Store) handleNotification(ctx context.Context, f *feed, payload string)
 	f.dispatch(s.cfg.Logger, evt)
 }
 
-func (s *Store) reconnect(f *feed, attempt *int) (*pgx.Conn, error) {
-	if *attempt == 0 {
-		s.logWarn(context.Background(), "LISTEN connection lost, reconnecting",
-			log.Int("attempt", *attempt),
-			log.String("tenant", f.scope.Tenant),
-		)
+// errFeedStopped ends the reconnect loop when the feed is torn down. It never
+// reaches a caller of the package: runFeed is the only reader and it just
+// returns.
+var errFeedStopped = errors.New("systemplane/postgres: changefeed stopped")
+
+// reconnectBackoff sequences the delays between one feed's reconnect attempts.
+//
+// The sequence restarts only after a connection that was USEFUL — one that
+// carried at least one notification, or that outlived the backoff cap. A
+// backend that accepts a connection and drops it immediately (a pgbouncer in
+// transaction pooling, an idle_session_timeout shorter than the quiet period
+// between notifications, a primary mid-failover) otherwise resets the delay on
+// every cycle, so the feed reconnects at the first delay for as long as the
+// condition lasts instead of escalating to the cap.
+type reconnectBackoff struct {
+	attempt int
+}
+
+// ceiling bounds the next delay. The delay is drawn uniformly from
+// [0, ceiling), so feeds recovering from one outage spread out instead of
+// dialing together.
+func (b *reconnectBackoff) ceiling() time.Duration {
+	return min(backoff.Exponential(backoffBase, b.attempt), backoffCap)
+}
+
+// next draws the delay before the next attempt and advances the sequence.
+func (b *reconnectBackoff) next() time.Duration {
+	delay := backoff.FullJitter(b.ceiling())
+	b.attempt++
+
+	return delay
+}
+
+// connectionEnded records the outcome of the connection that just died.
+func (b *reconnectBackoff) connectionEnded(consumed bool, lifetime time.Duration) {
+	if consumed || lifetime >= backoffCap {
+		b.attempt = 0
 	}
+}
+
+func (s *Store) reconnect(f *feed, retry *reconnectBackoff) (*pgx.Conn, error) {
+	// One warning per connection loss: reconnect is entered once per loss and
+	// retries internally. attempt is how many attempts this backoff sequence
+	// has already spent, so a flapping backend reports a rising number instead
+	// of a flat zero.
+	s.logWarn(context.Background(), "LISTEN connection lost, reconnecting",
+		log.Int("attempt", retry.attempt),
+		log.String("tenant", f.scope.Tenant),
+	)
 
 	for {
 		select {
 		case <-f.stop:
-			return nil, errors.New("stopped")
+			return nil, errFeedStopped
 		default:
 		}
 
-		delay := min(backoff.ExponentialWithJitter(backoffBase, *attempt), backoffCap)
-		*attempt++
-
 		select {
 		case <-f.stop:
-			return nil, errors.New("stopped")
-		case <-time.After(delay):
+			return nil, errFeedStopped
+		case <-time.After(retry.next()):
+		}
+
+		// The fence openListen applies before its own socket. A store torn
+		// down between the shutdown flag and this feed's stop signal must not
+		// open one more connection to a database it will never read again.
+		if s.isClosing() {
+			return nil, store.ErrClosed
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
@@ -1057,8 +1154,6 @@ func (s *Store) reconnect(f *feed, attempt *int) (*pgx.Conn, error) {
 
 			continue
 		}
-
-		*attempt = 0
 
 		return conn, nil
 	}

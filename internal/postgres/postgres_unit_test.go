@@ -244,9 +244,9 @@ func TestNotifyPayloadParsingAndDispatch(t *testing.T) {
 	}
 
 	s := newSubscribeStore()
-	f, err := s.zeroFeed()
+	f, err := s.zeroFeedForStart()
 	if err != nil {
-		t.Fatalf("zeroFeed: %v", err)
+		t.Fatalf("zeroFeedForStart: %v", err)
 	}
 
 	var got []store.Event

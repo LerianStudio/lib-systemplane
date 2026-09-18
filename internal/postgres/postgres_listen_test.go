@@ -245,9 +245,9 @@ func TestPostgresFeed_CloseRacingConnectionLoss_EmitsNoDisconnect(t *testing.T) 
 // still completes.
 func TestPostgresSubscribe_PanickingCallbackDoesNotEscapeOrHoldLock(t *testing.T) {
 	s := newSubscribeStore()
-	f, err := s.zeroFeed()
+	f, err := s.zeroFeedForStart()
 	if err != nil {
-		t.Fatalf("zeroFeed: %v", err)
+		t.Fatalf("zeroFeedForStart: %v", err)
 	}
 
 	f.beginResync() // mark the feed connected, as a successful LISTEN does
@@ -485,8 +485,13 @@ func TestPostgresFeed_BroadcastMarksTheDispatchWindow(t *testing.T) {
 }
 
 // shrinkTimeouts makes the connect and shutdown bounds small enough to assert
-// on inside a unit test, and restores them afterwards. The unit tests in this
-// package never run in parallel with one another, so a package var is enough.
+// on inside a unit test, and restores them afterwards.
+//
+// Writing package vars is safe here because every caller is a SEQUENTIAL test:
+// Go resumes a parallel test only once the sequential tests have all finished,
+// and a test finishes only after its t.Cleanup has run, so no parallel test can
+// observe a shrunk bound. A caller that adds t.Parallel() breaks that and has
+// to take a different route.
 func shrinkTimeouts(t *testing.T, d time.Duration) {
 	t.Helper()
 
@@ -723,9 +728,9 @@ func TestPostgresSubscribe_JoinerIsToldTheFeedState(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			s := newSubscribeStore()
 
-			f, err := s.zeroFeed()
+			f, err := s.zeroFeedForStart()
 			if err != nil {
-				t.Fatalf("zeroFeed: %v", err)
+				t.Fatalf("zeroFeedForStart: %v", err)
 			}
 
 			tc.arm(f)
@@ -789,9 +794,11 @@ func TestPostgresClose_WaitsForAFeedMidDispatch(t *testing.T) {
 // branch of feed acquisition reserved its slot and dialed the tenant without
 // ever looking at the shutdown flag the zero scope already fenced on.
 func TestPostgresSubscribe_ClosingStoreDialsNoTenant(t *testing.T) {
+	conn := &stubConnector{resolve: func(int) (string, error) { return unreachableDSN, nil }}
+
 	s := newSubscribeStore()
 	s.cfg.MultiTenantEnabled = true
-	s.cfg.Connector = &stubConnector{resolve: func(int) (string, error) { return unreachableDSN, nil }}
+	s.cfg.Connector = conn
 
 	s.feedsMu.Lock()
 	s.closing = true
@@ -807,7 +814,7 @@ func TestPostgresSubscribe_ClosingStoreDialsNoTenant(t *testing.T) {
 		t.Fatalf("Subscribe error = %v, want store.ErrClosed", err)
 	}
 
-	if calls := s.cfg.Connector.(*stubConnector).callCount(); calls != 0 {
+	if calls := conn.callCount(); calls != 0 {
 		t.Errorf("a closing store resolved %d tenant DSNs; want 0 — it must not dial", calls)
 	}
 
@@ -1266,4 +1273,298 @@ func TestStore_NotifyDecodeWarningNamesItsTenant(t *testing.T) {
 	if len(delivered) != 1 || delivered[0].Key != "k" || delivered[0].Revision != 7 || delivered[0].Scope != f.scope {
 		t.Errorf("delivered = %+v, want one ns/k upsert at revision 7 stamped with the feed's scope", delivered)
 	}
+}
+
+// A refusal at publish time — a tenant feed already listening on the database
+// ListenDSN names, or a Close landing mid-connect — must NOT drop the
+// zero-scope slot. Subscribe can run before Start, so subscribers already hold
+// that feed: retracting it strands them on a feed nothing reconnects and nothing
+// tears down, while the next zero-scope Subscribe silently gets a fresh feed
+// that has announced nothing and looks healthy.
+func TestPostgresZeroFeed_RefusalKeepsTheSlotAndIsReported(t *testing.T) {
+	s := newSubscribeStore()
+
+	s.feedsMu.Lock()
+	f := s.feeds[""]
+	s.feedsMu.Unlock()
+
+	events := make(chan store.Event, 4)
+
+	unsub, err := s.Subscribe(context.Background(), store.Scope{}, func(evt store.Event) {
+		events <- evt
+	})
+	if err != nil {
+		t.Fatalf("subscribe before Start: %v", err)
+	}
+
+	t.Cleanup(unsub)
+
+	// Start reaches publishFeed and is refused.
+	s.feedsMu.Lock()
+	cause := s.failLocked(f, ErrSharedDatabaseUnsupported)
+	s.feedsMu.Unlock()
+
+	if !errors.Is(cause, ErrSharedDatabaseUnsupported) {
+		t.Fatalf("recorded cause = %v, want ErrSharedDatabaseUnsupported", cause)
+	}
+
+	s.feedsMu.Lock()
+	kept := s.feeds[""]
+	s.feedsMu.Unlock()
+
+	if kept != f {
+		t.Fatalf("the zero-scope slot holds %p after a refused publish, want the feed its subscribers hold (%p)", kept, f)
+	}
+
+	// A later zero-scope Subscribe must fail loudly rather than attach to a
+	// feed nothing is bringing up.
+	unsub2, err := s.Subscribe(context.Background(), store.Scope{}, func(store.Event) {})
+	if err == nil {
+		unsub2()
+		t.Fatal("Subscribe after a refused Start returned nil; want the recorded refusal")
+	}
+
+	if !errors.Is(err, ErrSharedDatabaseUnsupported) {
+		t.Fatalf("Subscribe error = %v, want the recorded ErrSharedDatabaseUnsupported", err)
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	waitForObserverExit(t)
+}
+
+// The zero scope is the exception, not the rule: a NAMED tenant's creation
+// failure still retracts its slot, so the next Subscribe for that tenant builds
+// a fresh placeholder instead of finding a corpse.
+func TestPostgresFeed_NamedFailureStillRetractsItsSlot(t *testing.T) {
+	s := newSubscribeStore()
+
+	f := newFeed(store.Scope{Tenant: "t1"}, "")
+	f.ready = make(chan struct{})
+
+	s.feedsMu.Lock()
+	s.feeds["t1"] = f
+	_ = s.failLocked(f, ErrSharedDatabaseUnsupported)
+	_, still := s.feeds["t1"]
+	s.feedsMu.Unlock()
+
+	if still {
+		t.Fatal("a failed tenant feed kept its slot; the next Subscribe for that tenant would wait on a corpse")
+	}
+}
+
+// A closing store must not dial, and the reconnect loop is the path that did:
+// openListen fences on the shutdown flag before opening its socket, reconnect
+// went straight to pgx.Connect. Without the fence a store torn down between
+// the flag and the feed's stop signal keeps reconnecting to a database it will
+// never read from again.
+func TestPostgresReconnect_ClosingStoreDialsNothing(t *testing.T) {
+	shrinkTimeouts(t, 250*time.Millisecond)
+
+	s := newSubscribeStore()
+
+	s.feedsMu.Lock()
+	s.closing = true
+	s.feedsMu.Unlock()
+
+	f := newFeed(store.Scope{Tenant: "t1"}, unreachableDSN)
+
+	done := make(chan error, 1)
+
+	var retry reconnectBackoff
+
+	go func() {
+		_, err := s.reconnect(f, &retry)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, store.ErrClosed) {
+			t.Fatalf("reconnect on a closing store = %v, want store.ErrClosed", err)
+		}
+	case <-time.After(3 * time.Second):
+		close(f.stop)
+		<-done
+		t.Fatal("reconnect on a closing store never returned; it keeps dialing a store that is shutting down")
+	}
+}
+
+// Start RETRIES: it brings up the same feed its subscribers already hold, and
+// the refusal a previous attempt recorded belongs to that attempt, not to the
+// feed forever.
+func TestPostgresZeroFeed_StartRetriesTheSameFeed(t *testing.T) {
+	s := newSubscribeStore()
+
+	s.feedsMu.Lock()
+	f := s.feeds[""]
+	s.feedsMu.Unlock()
+
+	events := make(chan store.Event, 4)
+
+	unsub, err := s.Subscribe(context.Background(), store.Scope{}, func(evt store.Event) {
+		events <- evt
+	})
+	if err != nil {
+		t.Fatalf("subscribe before Start: %v", err)
+	}
+
+	t.Cleanup(unsub)
+
+	s.feedsMu.Lock()
+	_ = s.failLocked(f, ErrSharedDatabaseUnsupported)
+	s.feedsMu.Unlock()
+
+	retried, err := s.zeroFeedForStart()
+	if err != nil {
+		t.Fatalf("a retried Start was refused by the previous attempt's failure: %v", err)
+	}
+
+	if retried != f {
+		t.Fatalf("a retried Start took feed %p, want the one the subscribers hold (%p)", retried, f)
+	}
+
+	// The reader of that retried connection announces its resync, and the
+	// subscriber that attached before the refusal is the one that receives it.
+	subs, ok := f.beginResync()
+	if !ok {
+		t.Fatal("beginResync refused on a retried feed")
+	}
+
+	s.broadcast(f, subs, store.Event{Scope: f.scope, Op: store.OpResync})
+
+	select {
+	case evt := <-events:
+		if evt.Op != store.OpResync {
+			t.Fatalf("subscriber received %+v, want OpResync", evt)
+		}
+	default:
+		t.Fatal("the subscriber that attached before the refused Start received nothing from the retried feed")
+	}
+
+	// With the feed live again, a new zero-scope Subscribe is served.
+	unsub2, err := s.Subscribe(context.Background(), store.Scope{}, func(store.Event) {})
+	if err != nil {
+		t.Fatalf("Subscribe after a successful retry: %v", err)
+	}
+
+	unsub2()
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	waitForObserverExit(t)
+}
+
+// A backend that accepts a connection and drops it at once — a pgbouncer in
+// transaction pooling, an idle_session_timeout shorter than the quiet period
+// between notifications, a primary mid-failover — used to hold the feed at the
+// FIRST delay forever, because every successful connect reset the sequence
+// before the drop was accounted for. Each iteration below is one such cycle:
+// the connect succeeds, nothing is consumed, the connection dies immediately.
+func TestPostgresReconnect_BackoffEscalatesOnAcceptThenDropCycles(t *testing.T) {
+	t.Parallel()
+
+	var retry reconnectBackoff
+
+	prev := time.Duration(0)
+
+	for cycle := range 6 {
+		ceiling := retry.ceiling()
+		if ceiling <= prev {
+			t.Fatalf("cycle %d: delay ceiling %v did not grow past %v; an accept-then-drop backend is being hammered at one delay", cycle, ceiling, prev)
+		}
+
+		prev = ceiling
+
+		if delay := retry.next(); delay < 0 || delay > ceiling {
+			t.Fatalf("cycle %d: delay %v outside [0, %v]", cycle, delay, ceiling)
+		}
+
+		// The connection came up and died without carrying anything.
+		retry.connectionEnded(false, time.Millisecond)
+	}
+
+	if retry.ceiling() > backoffCap {
+		t.Fatalf("delay ceiling %v exceeded the cap %v", retry.ceiling(), backoffCap)
+	}
+
+	// A connection that carried a notification earned a fresh sequence.
+	retry.connectionEnded(true, time.Millisecond)
+
+	if got := retry.ceiling(); got != backoffBase {
+		t.Fatalf("ceiling after a useful connection = %v, want the base %v", got, backoffBase)
+	}
+
+	// So did one that simply lasted: a feed quiet for longer than the cap is
+	// healthy, not flapping.
+	_ = retry.next()
+	retry.connectionEnded(false, backoffCap)
+
+	if got := retry.ceiling(); got != backoffBase {
+		t.Fatalf("ceiling after a long-lived connection = %v, want the base %v", got, backoffBase)
+	}
+}
+
+// The zero scope is held to the one-database rule in BOTH directions: a
+// single-tenant ListenDSN pointed at a database a tenant feed already listens
+// on is refused, and so is a tenant whose DSN lands on the ListenDSN's
+// database. NOTIFY is database-wide, so either pairing would deliver one
+// install's notifications to the other stamped with the wrong scope.
+func TestPostgresFeed_SharedDatabaseIsRefusedAcrossTheZeroScope(t *testing.T) {
+	t.Parallel()
+
+	const dbKey = "db.example:5432/shared"
+
+	t.Run("tenant joining the single-tenant database", func(t *testing.T) {
+		t.Parallel()
+
+		live := newFeed(store.Scope{}, "")
+		live.dbKey = dbKey
+
+		s := &Store{feeds: map[string]*feed{"": live}}
+
+		err := s.refuseSharedDatabaseLocked(newFeed(store.Scope{Tenant: "t1"}, ""), dbKey)
+		if !errors.Is(err, ErrSharedDatabaseUnsupported) {
+			t.Fatalf("a tenant on the ListenDSN's database = %v, want ErrSharedDatabaseUnsupported", err)
+		}
+
+		if !strings.Contains(err.Error(), `"t1"`) {
+			t.Errorf("error %q must name the refused tenant", err)
+		}
+	})
+
+	t.Run("single-tenant feed joining a tenant database", func(t *testing.T) {
+		t.Parallel()
+
+		live := newFeed(store.Scope{Tenant: "t1"}, "")
+		live.dbKey = dbKey
+
+		s := &Store{feeds: map[string]*feed{"t1": live}}
+
+		err := s.refuseSharedDatabaseLocked(newFeed(store.Scope{}, ""), dbKey)
+		if !errors.Is(err, ErrSharedDatabaseUnsupported) {
+			t.Fatalf("a ListenDSN on t1's database = %v, want ErrSharedDatabaseUnsupported", err)
+		}
+
+		if !strings.Contains(err.Error(), `"t1"`) {
+			t.Errorf("error %q must name the tenant already listening there", err)
+		}
+	})
+
+	t.Run("its own database is admitted", func(t *testing.T) {
+		t.Parallel()
+
+		live := newFeed(store.Scope{}, "")
+		live.dbKey = dbKey
+
+		s := &Store{feeds: map[string]*feed{"": live}}
+
+		if err := s.refuseSharedDatabaseLocked(newFeed(store.Scope{Tenant: "t1"}, ""), "db.example:5432/t1"); err != nil {
+			t.Errorf("a tenant with its own database was refused: %v", err)
+		}
+	})
 }

@@ -1876,6 +1876,10 @@ func TestIntegration_PostgresResyncAfterListenGap(t *testing.T) {
 		return false
 	})[mark:]
 
+	if len(seq) < 2 {
+		t.Fatalf("sequence after the kill = %+v; want at least the OpDisconnect/OpResync pair", seq)
+	}
+
 	if seq[0].Op != store.OpDisconnect {
 		t.Fatalf("sequence after the kill = %+v; first event must be OpDisconnect", seq)
 	}
@@ -2240,8 +2244,8 @@ func TestIntegration_PostgresTwoTenantsOnOneDatabase(t *testing.T) {
 		t.Fatalf("subscribe t2 error = %v, want postgres.ErrSharedDatabaseUnsupported", err)
 	}
 
-	// The refused feed leaves nothing behind: t1 keeps its one backend.
-	if n := listenBackends(t, admin, dbName); n != 1 {
-		t.Fatalf("%s carries %d LISTEN connections, want 1 (t1's only)", dbName, n)
-	}
+	// The refused feed leaves nothing behind: t1 keeps its one backend. The
+	// refused connection is closed by the creator and reaped by Postgres
+	// asynchronously, so this waits for the count instead of sampling it once.
+	waitForListenBackends(t, admin, dbName, 1, "after the shared-database refusal")
 }
