@@ -109,7 +109,7 @@ func TestCoordinatorApplierErrorRecordsARejection(t *testing.T) {
 	c := newCoordinator(t)
 	ctx := context.Background()
 
-	unsubscribe := c.Register(func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
+	unsubscribe := mustRegister(t, c, func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
 		return errRejected
 	})
 	defer unsubscribe()
@@ -135,7 +135,7 @@ func TestCoordinatorApplierPanicIsRecordedLikeAnError(t *testing.T) {
 	c := NewCoordinator[coordDoc](logger, Decode[coordDoc], nil)
 	ctx := context.Background()
 
-	unsubscribe := c.Register(func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
+	unsubscribe := mustRegister(t, c, func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
 		panic("boom")
 	})
 	defer unsubscribe()
@@ -151,8 +151,12 @@ func TestCoordinatorApplierPanicIsRecordedLikeAnError(t *testing.T) {
 		t.Errorf("LastErr = %v, want an error naming the panic", got.LastErr)
 	}
 
-	if !strings.Contains(got.LastErr.Error(), "boom") {
-		t.Errorf("LastErr = %v, want the recovered value in the message", got.LastErr)
+	// The recovered value is whatever the hook was holding — routinely the
+	// decoded document, with whatever endpoints and credentials it carries —
+	// and LastErr is read, logged and surfaced by operators. It stays in the
+	// panic log line, which redacts it in production; it never goes in here.
+	if strings.Contains(got.LastErr.Error(), "boom") {
+		t.Errorf("LastErr = %v, want no recovered value in the message: that undoes the redaction the panic log applies", got.LastErr)
 	}
 
 	line := logger.lineContaining(t, "panic recovered")
@@ -175,8 +179,11 @@ func TestCoordinatorApplierPanicIsRecordedLikeAnError(t *testing.T) {
 
 // TestCoordinatorApplierPanicIsRedactedInProductionMode pins the other half of
 // the panic path: in production mode the recovered value and the stack stay out
-// of the log line, while Status still carries the value to the consumer that
-// asked for it.
+// of the log line, and out of Status with them. Status is the surface operators
+// read and log, so republishing the value there would hand back in the clear
+// exactly what the log line just redacted — and a panic value is whatever the
+// hook was holding, routinely the decoded document with its endpoints and its
+// credentials. Status still reports the rejection; only the payload is gone.
 func TestCoordinatorApplierPanicIsRedactedInProductionMode(t *testing.T) {
 	runtime.SetProductionMode(true)
 
@@ -185,7 +192,7 @@ func TestCoordinatorApplierPanicIsRedactedInProductionMode(t *testing.T) {
 	logger := newRecordingLogger()
 	c := NewCoordinator[coordDoc](logger, Decode[coordDoc], nil)
 
-	unsubscribe := c.Register(func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
+	unsubscribe := mustRegister(t, c, func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
 		panic("boom")
 	})
 	defer unsubscribe()
@@ -201,8 +208,13 @@ func TestCoordinatorApplierPanicIsRedactedInProductionMode(t *testing.T) {
 		t.Error("stack_trace was logged in production mode, want it withheld")
 	}
 
-	if got := statusOf(t, c, "t1"); got.LastErr == nil || !strings.Contains(got.LastErr.Error(), "boom") {
-		t.Errorf("LastErr = %v, want the recovered value on the status surface even in production mode", got.LastErr)
+	got := statusOf(t, c, "t1")
+	if got.LastErr == nil || !strings.Contains(got.LastErr.Error(), "panicked") {
+		t.Errorf("LastErr = %v, want the rejection recorded", got.LastErr)
+	}
+
+	if strings.Contains(got.LastErr.Error(), "boom") {
+		t.Errorf("LastErr = %v, want no recovered value: Status would republish in the clear what the log line redacts", got.LastErr)
 	}
 }
 
@@ -214,7 +226,7 @@ func TestCoordinatorApplierErrorIsLogged(t *testing.T) {
 	logger := newRecordingLogger()
 	c := NewCoordinator[coordDoc](logger, Decode[coordDoc], nil)
 
-	unsubscribe := c.Register(func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
+	unsubscribe := mustRegister(t, c, func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
 		return errRejected
 	})
 	defer unsubscribe()
@@ -245,7 +257,7 @@ func TestCoordinatorRejectionLeavesPreviousUntouched(t *testing.T) {
 
 	var rec recorder
 
-	unsubscribe := c.Register(func(fnCtx context.Context, current Decoded[coordDoc], previous *Decoded[coordDoc]) error {
+	unsubscribe := mustRegister(t, c, func(fnCtx context.Context, current Decoded[coordDoc], previous *Decoded[coordDoc]) error {
 		if current.Revision == 2 {
 			return errRejected
 		}
@@ -282,7 +294,7 @@ func TestCoordinatorRejectionIsNeverRetried(t *testing.T) {
 		calls int
 	)
 
-	unsubscribe := c.Register(func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
+	unsubscribe := mustRegister(t, c, func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
 		mu.Lock()
 		defer mu.Unlock()
 
@@ -309,7 +321,7 @@ func TestCoordinatorDecodeFailureIsRecordedAndNeverDelivered(t *testing.T) {
 
 	var rec recorder
 
-	unsubscribe := c.Register(rec.apply)
+	unsubscribe := mustRegister(t, c, rec.apply)
 	defer unsubscribe()
 
 	c.Publish(ctx, publication("t1", 1, "good"))
@@ -335,7 +347,7 @@ func TestCoordinatorDecodeFailureIsRecordedAndNeverDelivered(t *testing.T) {
 	// The last good publication must stay replayable for a later Register.
 	var late recorder
 
-	unsubscribeLate := c.Register(late.apply)
+	unsubscribeLate := mustRegister(t, c, late.apply)
 	defer unsubscribeLate()
 
 	if names := late.names(); len(names) != 1 || names[0] != "good" {
@@ -356,10 +368,10 @@ func TestCoordinatorAppliedIsTheMinimumAcrossAppliers(t *testing.T) {
 		return nil
 	}
 
-	unsubscribeA := c.Register(accepting)
+	unsubscribeA := mustRegister(t, c, accepting)
 	defer unsubscribeA()
 
-	unsubscribeB := c.Register(picky)
+	unsubscribeB := mustRegister(t, c, picky)
 	defer unsubscribeB()
 
 	c.Publish(ctx, publication("t1", 1, "one"))
@@ -403,7 +415,7 @@ func TestCoordinatorLastErrClearsWhenAppliedCatchesUp(t *testing.T) {
 	c := newCoordinator(t)
 	ctx := context.Background()
 
-	unsubscribe := c.Register(func(_ context.Context, current Decoded[coordDoc], _ *Decoded[coordDoc]) error {
+	unsubscribe := mustRegister(t, c, func(_ context.Context, current Decoded[coordDoc], _ *Decoded[coordDoc]) error {
 		if current.Revision == 5 {
 			return errRejected
 		}
@@ -439,10 +451,10 @@ func TestCoordinatorUnsubscribeStopsDeliveryAndReleasesStatus(t *testing.T) {
 		leaver recorder
 	)
 
-	unsubscribeKeeper := c.Register(rec.apply)
+	unsubscribeKeeper := mustRegister(t, c, rec.apply)
 	defer unsubscribeKeeper()
 
-	unsubscribeLeaver := c.Register(func(fnCtx context.Context, current Decoded[coordDoc], previous *Decoded[coordDoc]) error {
+	unsubscribeLeaver := mustRegister(t, c, func(fnCtx context.Context, current Decoded[coordDoc], previous *Decoded[coordDoc]) error {
 		_ = leaver.apply(fnCtx, current, previous)
 
 		return errRejected
@@ -486,7 +498,7 @@ func TestCoordinatorUnsubscribeFromInsideAnApplierDoesNotDeadlock(t *testing.T) 
 		once        sync.Once
 	)
 
-	unsubscribe = c.Register(func(fnCtx context.Context, current Decoded[coordDoc], previous *Decoded[coordDoc]) error {
+	unsubscribe = mustRegister(t, c, func(fnCtx context.Context, current Decoded[coordDoc], previous *Decoded[coordDoc]) error {
 		once.Do(unsubscribe)
 
 		return rec.apply(fnCtx, current, previous)
@@ -544,7 +556,7 @@ func TestCoordinatorRejectionAtRevisionZeroStaysVisible(t *testing.T) {
 	invocations := 0
 	reject := true
 
-	unsubscribe := c.Register(func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
+	unsubscribe := mustRegister(t, c, func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
 		invocations++
 
 		if reject {
@@ -598,10 +610,10 @@ func TestCoordinatorAppliedIsTheOldestObservationNotTheLowestRevision(t *testing
 		return nil
 	}
 
-	unsubscribeA := c.Register(accepting)
+	unsubscribeA := mustRegister(t, c, accepting)
 	defer unsubscribeA()
 
-	unsubscribeB := c.Register(refusesTheDelete)
+	unsubscribeB := mustRegister(t, c, refusesTheDelete)
 	defer unsubscribeB()
 
 	c.Publish(ctx, publication("t1", 7, "seven"))

@@ -88,7 +88,7 @@ func TestCoordinatorRegisterReplaysEveryObservedScope(t *testing.T) {
 
 	var rec recorder
 
-	unsubscribe := c.Register(rec.apply)
+	unsubscribe := mustRegister(t, c, rec.apply)
 	defer unsubscribe()
 
 	got := rec.all()
@@ -121,7 +121,7 @@ func TestCoordinatorDeliversTheNewestObservationOnly(t *testing.T) {
 
 	var rec recorder
 
-	unsubscribe := c.Register(rec.apply)
+	unsubscribe := mustRegister(t, c, rec.apply)
 	defer unsubscribe()
 
 	got := rec.all()
@@ -158,7 +158,7 @@ func TestCoordinatorCoalescesWhileAnApplierIsBusy(t *testing.T) {
 		}
 	)
 
-	unsubscribe := c.Register(blocking)
+	unsubscribe := mustRegister(t, c, blocking)
 	defer unsubscribe()
 
 	var wg sync.WaitGroup
@@ -230,7 +230,7 @@ func TestCoordinatorSerializesDeliveriesPerScope(t *testing.T) {
 	}
 
 	for which := range 2 {
-		unsubscribe := c.Register(serialized(which))
+		unsubscribe := mustRegister(t, c, serialized(which))
 		defer unsubscribe()
 	}
 
@@ -288,7 +288,7 @@ func TestCoordinatorDeliversScopesIndependently(t *testing.T) {
 		return nil
 	}
 
-	unsubscribe := c.Register(applier)
+	unsubscribe := mustRegister(t, c, applier)
 	defer unsubscribe()
 
 	var wg sync.WaitGroup
@@ -337,7 +337,7 @@ func TestCoordinatorNeverDeliversTheSameObservationTwice(t *testing.T) {
 		c.Publish(ctx, publication("t1", 2, "two"))
 	}()
 
-	unsubscribe := c.Register(rec.apply)
+	unsubscribe := mustRegister(t, c, rec.apply)
 
 	wg.Wait()
 	unsubscribe()
@@ -372,7 +372,7 @@ func TestCoordinatorDeliversTheSameRevisionAgainWhenTheValueChanged(t *testing.T
 
 	var rec recorder
 
-	unsubscribe := c.Register(rec.apply)
+	unsubscribe := mustRegister(t, c, rec.apply)
 	defer unsubscribe()
 
 	c.Publish(ctx, publication("t1", 7, "first"))
@@ -390,7 +390,7 @@ func TestCoordinatorRevisionZeroIsAlwaysDelivered(t *testing.T) {
 
 	var rec recorder
 
-	unsubscribe := c.Register(rec.apply)
+	unsubscribe := mustRegister(t, c, rec.apply)
 	defer unsubscribe()
 
 	for range 3 {
@@ -408,7 +408,7 @@ func TestCoordinatorPreviousIsTheLastAcceptedValue(t *testing.T) {
 
 	var rec recorder
 
-	unsubscribe := c.Register(rec.apply)
+	unsubscribe := mustRegister(t, c, rec.apply)
 	defer unsubscribe()
 
 	c.Publish(ctx, publication("t1", 1, "one"))
@@ -453,7 +453,7 @@ func TestCoordinatorPublishFromInsideAnApplierIsDeliveredAfterIt(t *testing.T) {
 		return nil
 	}
 
-	unsubscribe := c.Register(applier)
+	unsubscribe := mustRegister(t, c, applier)
 	defer unsubscribe()
 
 	done := make(chan struct{})
@@ -511,7 +511,7 @@ func TestCoordinatorRegisterFromInsideAnApplierIsDeliveredAfterIt(t *testing.T) 
 			return nil
 		}
 
-		unsubscribe := c.Register(first)
+		unsubscribe := mustRegister(t, c, first)
 		defer unsubscribe()
 
 		done := make(chan struct{})
@@ -546,7 +546,9 @@ func TestCoordinatorRegisterFromInsideAnApplierIsDeliveredAfterIt(t *testing.T) 
 			events = append(events, "enter:"+current.Value.Name)
 
 			once.Do(func() {
-				drop := c.Register(second)
+				// Not mustRegister: this runs on the publishing goroutine,
+				// where t.Fatalf is not allowed.
+				drop, _ := c.Register(second)
 				drop()
 			})
 
@@ -555,7 +557,7 @@ func TestCoordinatorRegisterFromInsideAnApplierIsDeliveredAfterIt(t *testing.T) 
 			return nil
 		}
 
-		unsubscribe := c.Register(first)
+		unsubscribe := mustRegister(t, c, first)
 		defer unsubscribe()
 
 		done := make(chan struct{})
@@ -592,7 +594,7 @@ func TestCoordinatorRegisterRefusesANilApplyFunc(t *testing.T) {
 	c := newCoordinator(t)
 	ctx := context.Background()
 
-	unsubscribe := c.Register(nil)
+	unsubscribe := mustRegister(t, c, nil)
 	if unsubscribe == nil {
 		t.Fatal("Register(nil) returned a nil unsubscribe")
 	}
@@ -606,7 +608,7 @@ func TestCoordinatorNilReceiverIsSafe(t *testing.T) {
 
 	c.Publish(context.Background(), publication("t1", 1, "one"))
 
-	unsubscribe := c.Register(func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error { return nil })
+	unsubscribe := mustRegister(t, c, func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error { return nil })
 	if unsubscribe == nil {
 		t.Fatal("Register on a nil coordinator returned a nil unsubscribe")
 	}
@@ -630,8 +632,22 @@ func constantDecode(any) (coordDoc, error) { return coordDoc{Name: "decoded"}, n
 
 func noopApply(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error { return nil }
 
-func seedOf(pub Publication) func() (Publication, bool) {
-	return func() (Publication, bool) { return pub, true }
+func seedOf(pub Publication) func() (Publication, bool, error) {
+	return func() (Publication, bool, error) { return pub, true, nil }
+}
+
+// mustRegister registers fn and fails the test when the seed read behind the
+// registration failed, which is the uninteresting case in every test that is
+// not about seed errors.
+func mustRegister(t *testing.T, c *Coordinator[coordDoc], fn ApplyFunc[coordDoc]) func() {
+	t.Helper()
+
+	unsubscribe, err := c.Register(fn)
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	return unsubscribe
 }
 
 func mustPanic(t *testing.T, what string, fn func()) {
@@ -674,7 +690,7 @@ func TestCoordinatorPanicUnderTheStateMutexDoesNotWedgeTheGroup(t *testing.T) {
 	t.Run("publish", func(t *testing.T) {
 		c := NewCoordinator[coordDoc](nil, constantDecode, seedOf(publication("", 1, "seeded")))
 
-		unsubscribe := c.Register(noopApply)
+		unsubscribe := mustRegister(t, c, noopApply)
 		defer unsubscribe()
 
 		// Registering took the seed, which armed the watermark, so this
@@ -687,7 +703,7 @@ func TestCoordinatorPanicUnderTheStateMutexDoesNotWedgeTheGroup(t *testing.T) {
 	})
 
 	t.Run("register", func(t *testing.T) {
-		c := NewCoordinator[coordDoc](nil, constantDecode, func() (Publication, bool) {
+		c := NewCoordinator[coordDoc](nil, constantDecode, func() (Publication, bool, error) {
 			panic("the seed read exploded")
 		})
 
@@ -746,7 +762,7 @@ func TestCoordinatorAPanickingLoggerDoesNotWedgeTheScope(t *testing.T) {
 		return nil
 	}
 
-	unsubscribe := c.Register(applier)
+	unsubscribe := mustRegister(t, c, applier)
 	defer unsubscribe()
 
 	publishWithoutPanicking(t, c, publication("t1", 1, "one"))
@@ -796,7 +812,13 @@ func TestCoordinatorDeliversUnderThePublishersContext(t *testing.T) {
 	go func() {
 		defer close(registered)
 
-		unsubscribe = c.Register(applier)
+		// Not mustRegister: t.Fatalf is not allowed off the test goroutine.
+		var err error
+
+		unsubscribe, err = c.Register(applier)
+		if err != nil {
+			t.Errorf("Register: %v", err)
+		}
 	}()
 
 	waitFor(t, entered, "the registration replay to reach the applier")
@@ -848,7 +870,7 @@ func TestCoordinatorDiscardsAPublicationThatDecodedAfterANewerOne(t *testing.T) 
 
 	var rec recorder
 
-	unsubscribe := c.Register(rec.apply)
+	unsubscribe := mustRegister(t, c, rec.apply)
 	defer unsubscribe()
 
 	done := make(chan struct{})
@@ -899,7 +921,7 @@ func TestCoordinatorAnAbandonedApplierReleasesTheScope(t *testing.T) {
 		return rec.apply(ctx, current, previous)
 	}
 
-	unsubscribe := c.Register(abandoning)
+	unsubscribe := mustRegister(t, c, abandoning)
 	defer unsubscribe()
 
 	done := make(chan struct{})
@@ -916,5 +938,44 @@ func TestCoordinatorAnAbandonedApplierReleasesTheScope(t *testing.T) {
 
 	if names := rec.names(); len(names) != 1 || names[0] != "two" {
 		t.Fatalf("deliveries after the abandoned one = %v, want [two]: the scope stayed marked as delivering", names)
+	}
+}
+
+// TestCoordinatorReplayDoesNotRunUnderADeadPublisherContext pins the one case
+// where the observation's own context must be refused. A registration replays
+// the last observation, which keeps the context of whoever published it — and
+// through the Client that is the dispatch context Close cancels. Nothing is
+// ever retried, so a hook that honours cancellation would reject the replay and
+// leave the scope permanently unconverged, on a key nobody may write again.
+func TestCoordinatorReplayDoesNotRunUnderADeadPublisherContext(t *testing.T) {
+	c := newCoordinator(t)
+
+	publisherCtx, cancel := context.WithCancel(context.Background())
+	c.Publish(publisherCtx, publication("t1", 1, "one"))
+	cancel()
+
+	var (
+		seen    int
+		lastErr error
+	)
+
+	unsubscribe := mustRegister(t, c, func(ctx context.Context, _ Decoded[coordDoc], _ *Decoded[coordDoc]) error {
+		seen++
+		lastErr = ctx.Err()
+
+		return ctx.Err()
+	})
+	defer unsubscribe()
+
+	if seen != 1 {
+		t.Fatalf("deliveries = %d, want the replay", seen)
+	}
+
+	if lastErr != nil {
+		t.Fatalf("the replay ran under a context reporting %v, want a live one: the publisher is gone and the delivery is not retried", lastErr)
+	}
+
+	if got := statusOf(t, c, "t1"); got.LastErr != nil {
+		t.Errorf("LastErr = %v, want nil: the replay was applied", got.LastErr)
 	}
 }

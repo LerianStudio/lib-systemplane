@@ -4,6 +4,7 @@ package group
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -18,13 +19,14 @@ import (
 type seeder struct {
 	pub   Publication
 	ok    bool
+	err   error
 	calls int
 }
 
-func (s *seeder) read() (Publication, bool) {
+func (s *seeder) read() (Publication, bool, error) {
 	s.calls++
 
-	return s.pub, s.ok
+	return s.pub, s.ok, s.err
 }
 
 func newSeedingCoordinator(t *testing.T, seed *seeder) *Coordinator[coordDoc] {
@@ -39,7 +41,7 @@ func TestCoordinatorSeedsWhenNothingWasObserved(t *testing.T) {
 
 	var rec recorder
 
-	unsubscribe := c.Register(rec.apply)
+	unsubscribe := mustRegister(t, c, rec.apply)
 	defer unsubscribe()
 
 	got := rec.all()
@@ -71,7 +73,7 @@ func TestCoordinatorDoesNotSeedWhenTheClientDoesNotTrackTheScope(t *testing.T) {
 
 	var rec recorder
 
-	unsubscribe := c.Register(rec.apply)
+	unsubscribe := mustRegister(t, c, rec.apply)
 	defer unsubscribe()
 
 	if names := rec.names(); len(names) != 0 {
@@ -87,7 +89,7 @@ func TestCoordinatorDoesNotSeedWhenTheClientDoesNotTrackTheScope(t *testing.T) {
 
 	var second recorder
 
-	unsubscribeSecond := c.Register(second.apply)
+	unsubscribeSecond := mustRegister(t, c, second.apply)
 	defer unsubscribeSecond()
 
 	if seed.calls != 2 {
@@ -105,7 +107,7 @@ func TestCoordinatorDropsTheDuplicatePublicationAfterASeed(t *testing.T) {
 
 	var rec recorder
 
-	unsubscribe := c.Register(rec.apply)
+	unsubscribe := mustRegister(t, c, rec.apply)
 	defer unsubscribe()
 
 	c.Publish(context.Background(), publication("t1", 7, "seeded"))
@@ -126,7 +128,7 @@ func TestCoordinatorKeepsAHigherRevisionAfterASeed(t *testing.T) {
 
 	var rec recorder
 
-	unsubscribe := c.Register(rec.apply)
+	unsubscribe := mustRegister(t, c, rec.apply)
 	defer unsubscribe()
 
 	c.Publish(context.Background(), publication("t1", 8, "newer"))
@@ -151,7 +153,7 @@ func TestCoordinatorKeepsADifferentValueAtTheSameRevisionAfterASeed(t *testing.T
 
 	var rec recorder
 
-	unsubscribe := c.Register(rec.apply)
+	unsubscribe := mustRegister(t, c, rec.apply)
 	defer unsubscribe()
 
 	c.Publish(context.Background(), publication("t1", 7, "changed"))
@@ -167,7 +169,7 @@ func TestCoordinatorDeliversARevisionZeroDeleteAfterADroppedPublication(t *testi
 
 	var rec recorder
 
-	unsubscribe := c.Register(rec.apply)
+	unsubscribe := mustRegister(t, c, rec.apply)
 	defer unsubscribe()
 
 	ctx := context.Background()
@@ -198,7 +200,7 @@ func TestCoordinatorNeverSeedsAScopeItAlreadyObserved(t *testing.T) {
 
 	var rec recorder
 
-	unsubscribe := c.Register(rec.apply)
+	unsubscribe := mustRegister(t, c, rec.apply)
 	defer unsubscribe()
 
 	if seed.calls != 0 {
@@ -217,7 +219,7 @@ func TestCoordinatorSeedThatFailsToDecodeIsRecorded(t *testing.T) {
 
 	var rec recorder
 
-	unsubscribe := c.Register(rec.apply)
+	unsubscribe := mustRegister(t, c, rec.apply)
 	defer unsubscribe()
 
 	if names := rec.names(); len(names) != 0 {
@@ -237,10 +239,61 @@ func TestCoordinatorSeedThatFailsToDecodeIsRecorded(t *testing.T) {
 	// The scope counts as observed for seeding purposes: the seed is not retried.
 	var second recorder
 
-	unsubscribeSecond := c.Register(second.apply)
+	unsubscribeSecond := mustRegister(t, c, second.apply)
 	defer unsubscribeSecond()
 
 	if seed.calls != 1 {
 		t.Fatalf("seed consulted %d times, want 1: a failed decode is not retried", seed.calls)
+	}
+}
+
+// TestCoordinatorSeedReadErrorReachesTheRegistrant separates "nothing to seed"
+// from "could not look". A read that FAILS leaves the registration with no
+// initial delivery and — on a key nobody writes again, which is the ordinary
+// case for a runtime knob — no delivery at all, so the error goes back to the
+// registrant instead of into silence. Nothing is observed, no seed is spent,
+// and the next registration reads again.
+func TestCoordinatorSeedReadErrorReachesTheRegistrant(t *testing.T) {
+	failed := errors.New("the client is closed")
+	seed := &seeder{err: failed}
+	c := newSeedingCoordinator(t, seed)
+
+	var first recorder
+
+	unsubscribe, err := c.Register(first.apply)
+	if !errors.Is(err, failed) {
+		t.Fatalf("Register = %v, want the seed read's own error", err)
+	}
+
+	if unsubscribe == nil {
+		t.Fatal("unsubscribe is nil on the error return, so a caller cannot defer it before checking err")
+	}
+
+	defer unsubscribe()
+
+	if got := first.all(); len(got) != 0 {
+		t.Fatalf("deliveries = %v, want none: the read failed", first.names())
+	}
+
+	if status := c.Status(); len(status) != 0 {
+		t.Fatalf("Status = %+v, want empty: a failed read observes no scope", status)
+	}
+
+	seed.err = nil
+	seed.pub = publication("t1", 4, "seeded")
+	seed.ok = true
+
+	var second recorder
+
+	unsubscribeSecond := mustRegister(t, c, second.apply)
+	defer unsubscribeSecond()
+
+	if seed.calls != 2 {
+		t.Fatalf("seed consulted %d times, want 2: a failed read spends nothing", seed.calls)
+	}
+
+	got := second.all()
+	if len(got) != 1 || got[0].current.Revision != 4 {
+		t.Fatalf("deliveries to the second registration = %v, want the seeded revision 4", second.names())
 	}
 }

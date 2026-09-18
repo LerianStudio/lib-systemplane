@@ -18,7 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"math"
 	"slices"
 	"strings"
@@ -157,7 +157,7 @@ type delivery[T any] struct {
 type Coordinator[T any] struct {
 	logger log.Logger
 	decode func(any) (T, error)
-	seed   func() (Publication, bool)
+	seed   func() (Publication, bool, error)
 
 	mu        sync.Mutex
 	seq       uint64
@@ -170,12 +170,14 @@ type Coordinator[T any] struct {
 // NewCoordinator builds a coordinator. logger (may be nil) receives decode
 // failures and applier panics; decode converts a published document into T;
 // seed reads the group's current entry through the Client and reports ok=false
-// when the Client does not yet track the scope. seed is consulted only by a
-// Register that finds no observed publication at all.
+// when the Client does not yet track the scope. A seed that cannot read at all
+// returns its error instead, and Register hands that error to the registrant.
+// seed is consulted only by a Register that finds no observed publication at
+// all.
 func NewCoordinator[T any](
 	logger log.Logger,
 	decode func(any) (T, error),
-	seed func() (Publication, bool),
+	seed func() (Publication, bool, error),
 ) *Coordinator[T] {
 	return &Coordinator[T]{
 		logger: logger,
@@ -342,19 +344,28 @@ func dropsAfterSeedLocked[T any](sc *scope[T], pub Publication) bool {
 // Register adds fn and synchronously delivers the cached publication of every
 // scope already observed. When nothing has been observed at all it takes one
 // seed and delivers that instead, which is what covers a publication still in
-// flight on its way out of the engine. Returns a function that removes fn;
-// calling it more than once, or from inside fn itself, is safe.
-func (c *Coordinator[T]) Register(fn ApplyFunc[T]) func() {
+// flight on its way out of the engine. The returned function removes fn, is
+// never nil, and is safe to call more than once or from inside fn itself.
+//
+// The error is the seed READ's own. A registration whose initial read failed is
+// registered and told so, rather than left running the consumer's compiled-in
+// defaults believing hot reload is live while no delivery ever arrives. A seed
+// that reports no entry is not an error — nothing is tracked yet — and a seed
+// that fails to DECODE is recorded on its scope like any other document that
+// cannot be applied, where Status reports it.
+func (c *Coordinator[T]) Register(fn ApplyFunc[T]) (func(), error) {
 	if c == nil || fn == nil {
-		return func() {}
+		return func() {}, nil
 	}
 
 	ctx := context.Background()
 
-	id, observed, seeded, seedErr := c.add(fn)
-	if seedErr != nil {
+	id, observed, seeded := c.add(fn)
+	if seeded.decodeErr != nil {
 		c.logError(ctx, "systemplane.group: seeded document failed to decode",
-			log.Err(seedErr), log.String(constants.AttrKeyTenantID, seeded.Tenant), log.Any("revision", seeded.Revision))
+			log.Err(seeded.decodeErr),
+			log.String(constants.AttrKeyTenantID, seeded.pub.Tenant),
+			log.Any("revision", seeded.pub.Revision))
 	}
 
 	// The replay is the same code path as a publication, which is why a
@@ -369,7 +380,7 @@ func (c *Coordinator[T]) Register(fn ApplyFunc[T]) func() {
 		once.Do(func() {
 			c.remove(id)
 		})
-	}
+	}, seeded.readErr
 }
 
 // add appends fn, takes the seed when no publication has been observed yet, and
@@ -379,7 +390,7 @@ func (c *Coordinator[T]) Register(fn ApplyFunc[T]) func() {
 // must not leave the group's mutex held: every later Publish and every Status
 // would then block forever, silently, with hot reload stopped and no signal
 // anywhere.
-func (c *Coordinator[T]) add(fn ApplyFunc[T]) (uint64, []*scope[T], Publication, error) {
+func (c *Coordinator[T]) add(fn ApplyFunc[T]) (uint64, []*scope[T], seedOutcome) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -387,7 +398,7 @@ func (c *Coordinator[T]) add(fn ApplyFunc[T]) (uint64, []*scope[T], Publication,
 	id := c.nextID
 	c.appliers = append(c.appliers, &applier[T]{id: id, fn: fn, state: map[string]*applierScope[T]{}})
 
-	seeded, seedErr := c.seedLocked()
+	seeded := c.seedLocked()
 
 	observed := make([]*scope[T], 0, len(c.scopes))
 
@@ -397,7 +408,7 @@ func (c *Coordinator[T]) add(fn ApplyFunc[T]) (uint64, []*scope[T], Publication,
 		}
 	}
 
-	return id, observed, seeded, seedErr
+	return id, observed, seeded
 }
 
 // Status reports desired and applied revisions per scope the coordinator has
@@ -472,18 +483,23 @@ func (c *Coordinator[T]) remove(id uint64) {
 // the seeded one, and it arms the watermark that spends the publication it
 // anticipates.
 //
-// It returns the publication it took and the decode error, for the caller to
-// log outside the mutex: a seed that fails to decode is recorded exactly like a
-// published document that does, reaches no applier, and is never retried. The
-// caller holds the state mutex.
-func (c *Coordinator[T]) seedLocked() (Publication, error) {
+// It returns what the attempt produced, for the caller to act on outside the
+// mutex: a read that failed goes back to the registrant, while a seed that
+// fails to decode is recorded exactly like a published document that does,
+// reaches no applier, and is never retried. A failed read takes no seed, so the
+// next registration reads again. The caller holds the state mutex.
+func (c *Coordinator[T]) seedLocked() seedOutcome {
 	if c.seed == nil || c.seedTaken || c.decode == nil || c.anyObservedLocked() {
-		return Publication{}, nil
+		return seedOutcome{}
 	}
 
-	pub, ok := c.seed()
+	pub, ok, readErr := c.seed()
+	if readErr != nil {
+		return seedOutcome{readErr: readErr}
+	}
+
 	if !ok {
-		return Publication{}, nil
+		return seedOutcome{}
 	}
 
 	c.seedTaken = true
@@ -493,12 +509,12 @@ func (c *Coordinator[T]) seedLocked() (Publication, error) {
 
 	seq := c.nextSeqLocked()
 
-	value, err := c.decode(pub.Value)
-	if err != nil {
+	value, decodeErr := c.decode(pub.Value)
+	if decodeErr != nil {
 		sc.latestSeq = seq
-		sc.lastErr = err
+		sc.lastErr = decodeErr
 
-		return pub, err
+		return seedOutcome{pub: pub, decodeErr: decodeErr}
 	}
 
 	// A seed has no publisher of its own: it is read and delivered by the
@@ -514,7 +530,18 @@ func (c *Coordinator[T]) seedLocked() (Publication, error) {
 		sc.seedBytes = data
 	}
 
-	return pub, nil
+	return seedOutcome{pub: pub}
+}
+
+// seedOutcome is what one seed attempt produced: the publication it read, the
+// error the READ itself returned, and the error decoding what it read. The two
+// errors are mutually exclusive — a read that failed produced nothing to
+// decode — and they are handled differently: the read error goes back to the
+// registrant, the decode error is recorded on the scope and logged.
+type seedOutcome struct {
+	pub       Publication
+	readErr   error
+	decodeErr error
 }
 
 // anyObservedLocked reports whether any scope has a publication behind it. The
@@ -585,9 +612,16 @@ func (c *Coordinator[T]) drain(ctx context.Context, sc *scope[T]) {
 
 // deliveryCtx is the context an observation is delivered under: the one its
 // publisher supplied, or the draining goroutine's own when the observation has
-// no publisher (a seed) or no observation has landed yet.
+// no publisher (a seed), when no observation has landed yet, or when the
+// publisher's context is already cancelled.
+//
+// That last case is what keeps a replay usable. A registration replays an
+// observation whose publisher is long gone — the Client hands its subscribers a
+// context that Close cancels — and no delivery is ever retried, so handing a
+// ctx-aware applier a dead context would reject the document permanently and
+// leave the scope unconverged for good.
 func deliveryCtx[T any](fallback context.Context, observed observation[T]) context.Context {
-	if observed.ctx != nil {
+	if observed.ctx != nil && observed.ctx.Err() == nil {
 		return observed.ctx
 	}
 
@@ -630,7 +664,10 @@ func (c *Coordinator[T]) pendingLocked(sc *scope[T], observed observation[T]) []
 // invoke runs one applier and turns every failure mode into an error: a
 // returned error passes through, and a panic is recovered into one. The recover
 // is the coordinator's own because the RecoverAndLog family swallows the
-// recovered value and FC-7 needs it as the scope's LastErr; the value is then
+// recovered value and FC-7 needs a rejection in the scope's LastErr; the value
+// itself never goes into that error — a panic value is whatever the panicking
+// hook was holding, routinely the decoded document with its endpoints and
+// credentials, and LastErr is a field operators read and log. The value is
 // handed to runtime.HandlePanicValue, which is built for a panic recovered
 // elsewhere and does not recover itself. That is what keeps a panicking
 // hot-reload hook on the fleet's panic counter, on the publication's span and
@@ -648,7 +685,7 @@ func (c *Coordinator[T]) invoke(
 ) (err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			err = fmt.Errorf("systemplane/group: apply function panicked: %v", recovered)
+			err = errors.New("systemplane/group: apply function panicked; the value and stack are in the log line under group.apply")
 
 			c.reportPanic(ctx, recovered)
 		}

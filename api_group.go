@@ -196,15 +196,24 @@ func (g *Group[T]) decodePublished(value any) (T, error) {
 // entry means the scope has not reconciled, which is the pre-Start case, and
 // nothing is seeded.
 //
+// A read that FAILS is not "nothing to seed": it is a registration that will
+// receive no initial delivery and no later one either, on a key nobody may
+// write again, so the error travels back to the registrant instead of being
+// collapsed into silence.
+//
 // The read uses context.Background() because OnApply takes no context, so a
 // seeded snapshot carries the single-tenant scope.
-func (g *Group[T]) seedCurrentEntry() (group.Publication, bool) {
+func (g *Group[T]) seedCurrentEntry() (group.Publication, bool, error) {
 	entry, ok, err := g.client.GetEntry(context.Background(), g.namespace, g.key)
-	if err != nil || !ok || entry.Stale {
-		return group.Publication{}, false
+	if err != nil {
+		return group.Publication{}, false, err
 	}
 
-	return group.Publication{Revision: entry.Revision, Value: entry.Value}, true
+	if !ok || entry.Stale {
+		return group.Publication{}, false, nil
+	}
+
+	return group.Publication{Revision: entry.Revision, Value: entry.Value}, true, nil
 }
 
 // Snapshot returns the group's document in the caller's scope, decoded into T,
@@ -364,12 +373,22 @@ type ApplyStatus struct {
 // flight. When another goroutine is already fanning that scope out, OnApply
 // returns without waiting and THAT fan-out delivers to the newly registered fn
 // before it completes, because it re-reads the registered functions on every
-// iteration. Which goroutine delivers never decides the context fn receives:
-// a published snapshot always carries the context the Client handed its
-// subscribers when it published, which [Client.Close] cancels, and a seeded
-// one carries a background context.
+// iteration. Which goroutine delivers never decides the context fn receives: a
+// published snapshot carries the context the Client handed its subscribers when
+// it published, unless that context is already cancelled — a replay long after
+// its publisher moved on, [Client.Close] being the usual cause — in which case
+// it carries the delivering goroutine's own, because a delivery is never
+// retried and a hook that honours cancellation would otherwise reject the
+// document for good. A seeded snapshot carries a background context.
 // OnApply after Close registers and replays the last observed snapshot, and no
 // further delivery can arrive.
+//
+// When nothing has been published for any scope yet, OnApply reads the document
+// in force to deliver it, and a read that fails is returned: fn is registered,
+// nothing is delivered, and the caller learns that hot reload is not live
+// instead of running its compiled-in defaults until a write that may never come.
+// Reading after [Client.Close] fails this way. A key with nothing stored is not
+// a failure — the registered defaults are delivered once the Client tracks it.
 //
 // A nil fn registers nothing and returns no error, matching [Client.OnChange].
 // unsubscribe is idempotent, is safe to call from inside fn itself, and
@@ -393,6 +412,8 @@ func (g *Group[T]) OnApply(fn func(ctx context.Context, a Applied[T]) error) (un
 		return noop, nil
 	}
 
+	// Register's unsubscribe is never nil, including on the error return, which
+	// is what lets a caller defer it before checking err.
 	return g.coordinator.Register(func(ctx context.Context, current group.Decoded[T], previous *group.Decoded[T]) error {
 		a := Applied[T]{Snapshot: appliedSnapshot(current)}
 
@@ -402,7 +423,7 @@ func (g *Group[T]) OnApply(fn func(ctx context.Context, a Applied[T]) error) (un
 		}
 
 		return fn(ctx, a)
-	}), nil
+	})
 }
 
 // Status reports the desired and applied revisions of every scope the group

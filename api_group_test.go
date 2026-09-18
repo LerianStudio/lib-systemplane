@@ -2163,19 +2163,18 @@ func TestGroupOnApplySetFromInsideAnApplierIsDeliveredAfterIt(t *testing.T) {
 	}
 }
 
-// TestGroupOnApplyAfterCloseRegistersAndReplays covers the registration-time
-// seed gate, which refuses a seed on any of three conditions — the read failed,
-// the key is unknown, or the scope has not reconciled — and says so to nobody.
-// Close is the one condition reachable through this facade: GetEntry then
-// returns ErrClosed.
+// TestGroupOnApplyAfterCloseRegistersAndReplays splits the registration-time
+// seed gate in two. Finding nothing to seed — the key is unknown, or the scope
+// has not reconciled — is not an error: the Client simply does not track the
+// scope yet. Failing to READ is: that registration gets no initial delivery
+// and, on a key nobody writes again, no delivery ever, so the failure travels
+// back to the caller rather than leaving a hook on its compiled-in defaults
+// believing hot reload is live. Close is the condition reachable through this
+// facade — GetEntry then returns ErrClosed.
 //
-// The two halves pin one behaviour between them: registering after Close
-// registers and returns no error, it replays whatever was already observed, and
-// when nothing was ever observed it delivers nothing and still returns no
-// error. That is the OnApply godoc's promise and the lane's B7 resolution.
-// A9 would have the unreadable-seed case surface its error from OnApply; the
-// coordinator's seed closure returns no error at all, so this file pins the
-// silent refusal rather than inventing a second contract for it.
+// Registering after Close still registers and still replays whatever was
+// already observed, because a scope with a publication behind it never
+// consults the seed at all.
 func TestGroupOnApplyAfterCloseRegistersAndReplays(t *testing.T) {
 	t.Parallel()
 
@@ -2230,7 +2229,7 @@ func TestGroupOnApplyAfterCloseRegistersAndReplays(t *testing.T) {
 		}
 	})
 
-	t.Run("refuses a seed it cannot read", func(t *testing.T) {
+	t.Run("returns the error of a seed it cannot read", func(t *testing.T) {
 		t.Parallel()
 
 		s := newGroupMemoryStore()
@@ -2247,8 +2246,12 @@ func TestGroupOnApplyAfterCloseRegistersAndReplays(t *testing.T) {
 		var rec applyRecorder
 
 		unsubscribe, err := g.OnApply(rec.apply)
-		if err != nil {
-			t.Fatalf("OnApply after Close with nothing observed = %v, want no error", err)
+		if !errors.Is(err, systemplane.ErrClosed) {
+			t.Fatalf("OnApply after Close with nothing observed = %v, want ErrClosed: the read the initial delivery needs failed", err)
+		}
+
+		if unsubscribe == nil {
+			t.Fatal("unsubscribe is nil on the error return, so a caller cannot defer it before checking err")
 		}
 
 		t.Cleanup(unsubscribe)
@@ -2258,7 +2261,7 @@ func TestGroupOnApplyAfterCloseRegistersAndReplays(t *testing.T) {
 		}
 
 		if status := g.Status(); len(status) != 0 {
-			t.Errorf("Status = %#v, want empty: a refused seed observes no scope", status)
+			t.Errorf("Status = %#v, want empty: a failed seed read observes no scope", status)
 		}
 	})
 }
