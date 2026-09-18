@@ -412,6 +412,14 @@ func (e *Engine) Publish(scope store.Scope, se store.Entry) {
 // default. Value is a deep copy the caller owns, and Stale reports whether the
 // scope's changefeed is disconnected or has not been reconciled yet. A nil
 // Engine reports a miss instead of panicking.
+//
+// A miss inside a tracked scope still carries that scope's Stale flag, and
+// only the scope the engine does not track at all reports the zero Entry.
+// Discarding staleness on the miss path was a silent lie: after a first
+// reconcile that published nothing — a transient List failure at Start — every
+// registered key is a miss, so every read is answered by the caller's
+// registered default, and dropping Stale reported each of those defaults as a
+// value the store had confirmed (FC-5).
 func (e *Engine) Lookup(scope store.Scope, nk NSKey) (Entry, bool) {
 	if e == nil {
 		return Entry{}, false
@@ -428,7 +436,7 @@ func (e *Engine) Lookup(scope store.Scope, nk NSKey) (Entry, bool) {
 	sc.mu.RUnlock()
 
 	if !ok {
-		return Entry{}, false
+		return Entry{Stale: stale}, false
 	}
 
 	// Clone runs OUTSIDE the lock. A read lock excludes every writer, so

@@ -343,16 +343,21 @@ func (e *Engine) applySnapshotRow(ctx context.Context, sc *scopeState, arm recon
 	}
 
 	// The ingress refused the row — undecodable, or refused by the registered
-	// validator — and has already said so at WARN. FC-11 as amended: on the
-	// FIRST reconcile, with nothing cached, the key is announced with its
-	// registered default at Revision 0 exactly like an absent row. That is the
-	// same resolution keepsCachedValue gives an absent-and-unusable key with an
-	// empty cache, and it is what makes a read serve the default rather than
-	// report a miss for a key the consumer registered.
+	// validator — and has already said so at WARN. FC-11 as amended: the first
+	// reconcile that SEES the row, with nothing cached for the key, announces
+	// it with its registered default at Revision 0 exactly like an absent row.
+	// That is the same resolution keepsCachedValue gives an absent-and-unusable
+	// key with an empty cache, and it is what makes a read serve the default
+	// rather than report a miss for a key the consumer registered.
 	//
-	// Later reconciles never repeat it: the default is cached by then, so a row
-	// that stays rejected leaves the value in force in force (D-G4).
-	if _, isCached := sc.cached(nk); !isCached && sc.firstReconcilePending() {
+	// The empty cache is the whole condition, and "once" needs nothing else:
+	// this announcement caches the default, so a later reconcile over a row
+	// that stays rejected finds the key cached and leaves the value in force
+	// (D-G4). Asking instead whether the scope's FIRST reconcile was still
+	// pending silenced the announcement for good whenever that reconcile
+	// failed to list — it completed, with an error, and the row it never saw
+	// was never announced by any reconcile after it.
+	if _, isCached := sc.cached(nk); !isCached {
 		e.ingestDefault(ctx, sc.scope, nk)
 	}
 

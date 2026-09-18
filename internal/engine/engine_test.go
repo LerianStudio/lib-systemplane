@@ -271,11 +271,12 @@ func TestStartReturnsCtxErrorWhenNoResyncArrives(t *testing.T) {
 
 func TestStartReturnsWrappedFirstReconcileError(t *testing.T) {
 	scope := store.Scope{}
+	nk := NSKey{Namespace: "billing", Key: "limits"}
 	fs := newFakeStore()
 	fs.resyncOnSubscribe()
 	fs.onList(func(store.Scope) error { return errList })
 
-	e := startEngine(t, nil, fs)
+	e := startEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs)
 
 	err := e.Start(startCtx(t, 2*time.Second))
 	if !errors.Is(err, errList) {
@@ -290,8 +291,17 @@ func TestStartReturnsWrappedFirstReconcileError(t *testing.T) {
 		t.Fatal("a failed first reconcile dropped the scope; the next resync must be able to retry it")
 	}
 
-	if !scopeStale(t, e, scope) {
-		t.Error("the scope looks fresh after a first reconcile that published nothing")
+	// A first reconcile that published nothing leaves every registered key a
+	// miss, and the Client answers a miss with the registered default. The
+	// miss has to carry Stale, or that default is reported to the caller as a
+	// value the store confirmed (FC-5).
+	got, ok := e.Lookup(scope, nk)
+	if ok {
+		t.Fatalf("Lookup: got the cached entry %+v, want a miss after a reconcile that published nothing", got)
+	}
+
+	if !got.Stale {
+		t.Error("the miss reports Stale false: the registered default behind it would read as confirmed")
 	}
 }
 

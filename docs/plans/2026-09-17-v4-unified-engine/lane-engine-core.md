@@ -195,7 +195,7 @@ type scopeState struct {
 }
 ```
 
-Amended in the fix pass (2026-09-17): scopeState also carries runMu and reconcileGen; holding reconcileMu across List would block the changefeed goroutine inside recordFeedOutcome
+Amended in the fix pass (2026-09-17): `reconciling`, `touched` and `unusable` became `windows`, one `reconcileWindow` per reconcile in flight keyed by `reconcileGen`, so two overlapping reconciles never inherit each other's fences; `scopeState` also carries the reconcile mailbox (`resyncMu`, `resyncPending`, `resyncSignal`, `reconcileStop`, `stopOnce`, `workerStarted`) that gives each scope one reconcile goroutine instead of one per OpResync
 
 `Engine` itself gets its struct here too: a `store.Store`, a `Registry`, a logger, a `store.Telemetry`, `scopesMu sync.RWMutex` + `scopes map[store.Scope]*scopeState`, and the lifecycle context pair. Dispatch and debounce fields are added by Epic 1.3; leave them out rather than stubbing them.
 

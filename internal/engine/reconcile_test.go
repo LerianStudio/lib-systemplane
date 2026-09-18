@@ -857,6 +857,91 @@ func TestFirstReconcileRejectsInvalidSnapshotRow(t *testing.T) {
 	})
 }
 
+// TestRejectedRowIsAnnouncedAfterATransientListFailure pins FC-11 against the
+// first reconcile that actually SEES the row, not against the first one that
+// ran.
+//
+// A backend can be up long enough to connect and gone before the snapshot, and
+// that failed reconcile is still the one Start waited on: it completes, with
+// an error. Gating the announcement on "no reconcile has completed yet" then
+// silenced it for the life of the process — the key stayed uncached, every
+// read reported a miss, and no subscriber ever heard the default that is in
+// force for it.
+func TestRejectedRowIsAnnouncedAfterATransientListFailure(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	e := feedEngine(t, map[NSKey]KeyDef{nk: {
+		Default: "fallback",
+		Validate: func(v any) error {
+			if _, ok := v.(string); !ok {
+				return errors.New("want a string")
+			}
+
+			return nil
+		},
+	}}, fs, 0)
+
+	var rec recorder
+
+	unsub := e.OnChange(nk, rec.record)
+	defer unsub()
+
+	// The key's only row is one an operator hand-edited to the wrong type.
+	fs.seed(scope, jsonRow(nk, 7, `{"limit":10}`, "operator"))
+
+	// The reconcile Start waits on never gets its photograph.
+	fs.onList(func(store.Scope) error { return errList })
+	bringUp(t, e, scope)
+	e.onEvent(resyncEvent(scope))
+
+	if err := waitFirstReconcile(t, e, scope); !errors.Is(err, errList) {
+		t.Fatalf("first reconcile: got %v, want one wrapping %v", err, errList)
+	}
+
+	// The feed reconnects, and this reconcile does see the row.
+	fs.onList(nil)
+	e.onEvent(resyncEvent(scope))
+	waitReconcileIdle(t, e, scope)
+
+	waitFor(t, time.Second, "the rejected row's announcement", func() bool {
+		return rec.len() == 1
+	})
+
+	got, ok := e.Lookup(scope, nk)
+	if !ok {
+		t.Fatal("Lookup reports a miss: the rejected row was never announced")
+	}
+
+	if got.Value != "fallback" || got.Revision != 0 {
+		t.Errorf("announced: got (%v, rev %d), want (\"fallback\", rev 0)", got.Value, got.Revision)
+	}
+
+	// The row stays rejected, so the announcement does not repeat: the default
+	// is cached by now, and the value in force stays in force (D-G4).
+	e.onEvent(resyncEvent(scope))
+	waitReconcileIdle(t, e, scope)
+	quiesce(t, e)
+
+	if n := rec.len(); n != 1 {
+		t.Errorf("deliveries over the same rejected row: got %d (%v), want 1", n, rec.revisions())
+	}
+
+	// A row the validator accepts publishes over the announced default.
+	fs.seed(scope, jsonRow(nk, 9, `"live"`, "ops"))
+	e.onEvent(resyncEvent(scope))
+	waitReconcileIdle(t, e, scope)
+
+	waitFor(t, time.Second, "the repaired row's delivery", func() bool {
+		return rec.len() == 2
+	})
+
+	if repaired, _ := e.Lookup(scope, nk); repaired.Value != "live" || repaired.Revision != 9 {
+		t.Errorf("after the repair: got (%v, rev %d), want (\"live\", rev 9)",
+			repaired.Value, repaired.Revision)
+	}
+}
+
 func TestReconcileSkipsUndecodableSnapshotRow(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 	scope := store.Scope{}

@@ -70,9 +70,12 @@ func TestLookupOnUnknownScopeOrKeyReportsMiss(t *testing.T) {
 		t.Errorf("Lookup on an untracked scope: got (%+v, %t), want (Entry{}, false)", got, ok)
 	}
 
+	// A miss inside a tracked scope still reports that scope's staleness: the
+	// caller answers it with the registered default, and a default served out
+	// of an unreconciled scope is not a confirmed value (FC-5).
 	unknown := NSKey{Namespace: "billing", Key: "unregistered"}
-	if got, ok := e.Lookup(store.Scope{}, unknown); ok || got != (Entry{}) {
-		t.Errorf("Lookup on an uncached key: got (%+v, %t), want (Entry{}, false)", got, ok)
+	if got, ok := e.Lookup(store.Scope{}, unknown); ok || got != (Entry{Stale: true}) {
+		t.Errorf("Lookup on an uncached key: got (%+v, %t), want (Entry{Stale: true}, false)", got, ok)
 	}
 }
 
