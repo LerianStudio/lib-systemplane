@@ -197,8 +197,10 @@ func WithValidator(fn func(any) error) KeyOption {
 // client holds its start lock. For the registered default the function MUST
 // NOT perform I/O or block: a validator that blocks there blocks registration,
 // [Client.Start] and [Client.Close] with it. Recognise the default (or empty)
-// value and return before any external call. A validator that needs request
-// scope MUST accept that context for the default rather than reject it.
+// value and return before any external call. Whether an empty context is
+// acceptable for the default is the validator's own policy: a refusal makes
+// [Client.Register] fail with the wrapped validation error, so the key is not
+// registered.
 //
 // A nil fn is ignored. [WithValidator] and WithContextValidator set the same
 // single validator, so when both are applied to one key the last NON-NIL one
