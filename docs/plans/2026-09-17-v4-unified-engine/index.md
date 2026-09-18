@@ -327,7 +327,7 @@ type ApplyStatus struct {
 	Tenant   string
 	Desired  int64 // latest published revision
 	Applied  int64 // latest revision fn accepted
-	LastErr  error // nil when Desired == Applied
+	LastErr  error // nil once every registered fn has accepted the newest published revision (amended 2026-09-18: a rejection stays visible until the next acceptance; Revision 0 equality never clears it)
 }
 
 func (g *Group[T]) Status() []ApplyStatus
