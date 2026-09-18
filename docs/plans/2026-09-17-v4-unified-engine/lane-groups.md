@@ -73,7 +73,7 @@ The seed reads with `context.Background()`, so a seeded snapshot carries `Tenant
 Multi-tenant on the contracts base: `OnChange` returns `ErrNotSupportedInMultiTenant`. `Bind` records that error instead of failing (so `Snapshot` and `Set` still work for a multi-tenant consumer) and `OnApply` returns it.
 Wave-1 caveat: the shim reports `Stale false` always (D-G5), so the pre-`Start` gate cannot be exercised through the facade on this lane's base. The coordinator takes the seed as an injected function and its tests drive both outcomes directly (D-G9's pattern); end to end it is deferred to the integration lane. **Amended 2026-09-18 (A3):** the watermark drop requires equal revision AND equal marshalled bytes, the same rule FC-7 applies everywhere else.
 
-**D-G8 — Serialization and coalescing use two locks and no goroutines.**
+**D-G8 — Serialization and coalescing use one mutex, a per-scope `delivering` flag and no goroutines (heading amended 2026-09-18; the original text said two locks).**
 Per scope: a delivery mutex held while applier functions run, plus a state mutex guarding `latest`, a monotonically increasing publication sequence number, and the per-applier bookkeeping. A publication records itself under the state mutex, then takes the delivery mutex and drains: if the sequence number has not advanced since the last fan-out it exits, which is precisely the trailing-edge coalescing FC-7 asks for. The sequence number, not the revision, drives the drain, because Revision 0 repeats legitimately and would otherwise look like "nothing new".
 The fan-out runs on the publishing goroutine. FC-4 already licenses that: a subscriber of one key may occupy that key's dispatch worker, and different keys deliver independently. Applier functions run WITHOUT the state mutex held, so calling `Status()` or `Snapshot()` from inside an applier works.
 Documented constraint: an applier function must not call `OnApply` or `Set` for its own group synchronously — deliveries are serialized per scope and re-entering blocks. `internal/group` carries a `goleak.VerifyTestMain`, which is what proves the no-goroutines claim rather than asserting it in prose. **Amended 2026-09-18 (C1):** the two locks become one mutex plus a per-scope `delivering` flag, and the publishing goroutine never blocks behind a running fan-out. The re-entrancy hazards this decision could only document away stop being deadlocks: an applier that calls `Set` for its own group (against a store whose echo is synchronous) or calls `OnApply` has that observation delivered on the drain's next iteration, on the same goroutine, after the current delivery returns. The remaining consumer bug is unbounded rather than frozen: an applier that writes on EVERY delivery loops forever; the godoc says so.
@@ -269,6 +269,15 @@ Also add the "a broken document never becomes a partial `T`" case at this level:
 
 At the end of Phase 2 a consumer registers an apply function once and receives every published revision of its group, serialized per tenant, coalesced while it is busy, never twice for the same non-zero revision, with `Status` reporting what is desired and what is actually applied.
 
+**Amendments after the PR #77 review (2026-09-18).** Where a task body below conflicts with these six rules, the amendment wins; implementers build to it and reviewers hold the code to it.
+
+- **A5, ordering at ingress.** `Publish` assigns the scope's observation sequence under the mutex at INGRESS, before decoding, and decodes outside the lock. On commit, a publication whose sequence is below the scope's last committed sequence is discarded as an intermediate revision (coalescing permits skipping it), so `Desired` never moves backward and observations commit in sequence order even when an older publication decodes slower than a newer one.
+- **A6, a rejected publication is observed.** The decode-failure branch marks the scope observed (so `Status()` lists it and a later `Register` never seeds), records `Desired` and `LastErr`, and leaves `current` unchanged.
+- **A7, re-entrant `Register`.** A `Register` that runs while the scope is delivering (an applier of this group calling `OnApply`) appends the applier and returns; its replay happens on the drain's next iteration, on the delivering goroutine; an unsubscribe before that iteration cancels the replay. `OnApply`'s "delivers the current snapshot before returning" therefore holds for every non-re-entrant call, and the godoc says a re-entrant registration is deferred and cancellable.
+- **A8, convergence by observation.** The coordinator decides convergence per applier by observation sequence (accepted sequence vs scope sequence), never by revision equality. `Status()` still reports FC-7's revisions: `Desired` is the revision of the latest observation, `Applied` is the revision of the oldest observation accepted across the registered appliers (the applier furthest behind, by sequence). `LastErr` clears when every applier has accepted the latest observation. Because FC-7 defines Revision 0 as unknown, `Desired == Applied == 0` does not by itself mean converged; the godoc says so, and the coordinator tests drive a repeated Revision 0 and a delete to Revision 0 with two appliers.
+- **A9, seed errors.** The seed closure returns `(Publication, ok bool, err error)`. A `GetEntry` error (`ErrClosed` after `Start`, a store or decode error on the multi-tenant path) is returned by `Register`, whose signature is `Register(fn ApplyFunc[T]) (func(), error)`, and `OnApply` returns it (after `subscribeErr`); `ok=false` is reserved for a confirmed `!ok` or `Entry.Stale`. The contract blocks in Epic 2.1 and Task 2.1.1 carry the amended signatures.
+- **A10, re-entrancy and the debounce window.** With the default positive debounce the Client publishes a synchronous store echo from a timer goroutine, not from the applier's goroutine; the same-goroutine deferred-delivery statement holds only when the upstream callback invokes `Publish` inline during the delivery (`WithDebounce(0)` in the tests, and the engine-backed Client). The godoc states the `Set` case that way and documents `OnApply` re-entry separately, as a direct coordinator path.
+
 ### Epic 2.1: The publication coordinator in `internal/group`
 
 **Goal:** The non-generic semantics of FC-7 exist and are tested with explicit revisions: per-scope publication cache, the seed that covers a publication still in flight, per-applier revision dedupe, trailing-edge coalescing, `Previous` tracking, rejection recording, and status aggregation.
@@ -314,7 +323,7 @@ type Coordinator[T any] struct { /* unexported */ }
 func NewCoordinator[T any](
 	logger log.Logger,
 	decode func(any) (T, error),
-	seed func() (Publication, bool),
+	seed func() (Publication, bool, error),
 ) *Coordinator[T]
 
 // Publish records pub as the newest state of its scope and delivers it to
@@ -326,7 +335,7 @@ func (c *Coordinator[T]) Publish(ctx context.Context, pub Publication)
 // Register adds fn and synchronously delivers the cached publication of every
 // scope already observed. When no scope has been observed it takes one seed
 // and delivers that instead. Returns a function that removes fn.
-func (c *Coordinator[T]) Register(fn ApplyFunc[T]) func()
+func (c *Coordinator[T]) Register(fn ApplyFunc[T]) (func(), error)
 
 // Status reports desired and applied revisions per scope, sorted by tenant.
 func (c *Coordinator[T]) Status() []Status
@@ -394,11 +403,11 @@ type Coordinator[T any] struct { /* unexported */ }
 func NewCoordinator[T any](
 	logger log.Logger,                       // lib-observability/v4/log; may be nil
 	decode func(any) (T, error),
-	seed func() (Publication, bool),
+	seed func() (Publication, bool, error),
 ) *Coordinator[T]
 
 func (c *Coordinator[T]) Publish(ctx context.Context, pub Publication)
-func (c *Coordinator[T]) Register(fn ApplyFunc[T]) func()
+func (c *Coordinator[T]) Register(fn ApplyFunc[T]) (func(), error)
 func (c *Coordinator[T]) Status() []Status
 ```
 
