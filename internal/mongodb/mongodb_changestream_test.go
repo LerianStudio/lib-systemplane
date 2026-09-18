@@ -8,11 +8,14 @@ package mongodb
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.uber.org/goleak"
 )
 
@@ -725,5 +728,194 @@ func TestMongoSubscribe_PanickingCallbackDoesNotEscapeOrHoldLock(t *testing.T) {
 
 	if n != 2 {
 		t.Fatalf("callback saw %d events, want 2 (joining resync, then the upsert)", n)
+	}
+}
+
+// errResolveTenantDB is the cause every caller parked on a failed feed creation
+// must see.
+var errResolveTenantDB = errors.New("tenant database unavailable")
+
+// stubConnector drives feed creation from the test: resolve decides what the
+// nth ResolveDatabase call returns, so the first call can park inside the
+// connector while the other callers pile up on the reserved slot.
+type stubConnector struct {
+	mu      sync.Mutex
+	calls   int
+	resolve func(call int) (*mongo.Database, error)
+}
+
+func (c *stubConnector) ResolveDatabase(context.Context, string) (*mongo.Database, error) {
+	c.mu.Lock()
+	c.calls++
+	call := c.calls
+	c.mu.Unlock()
+
+	return c.resolve(call)
+}
+
+func (c *stubConnector) callCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.calls
+}
+
+// waitForFeedRefs blocks until the tenant's reserved slot has taken want
+// references — one per caller that reached it. It is what makes the test below
+// deterministic instead of timing-based: once every caller holds a reference,
+// none of them can become a second creator, so releasing the first one exercises
+// the waiter path for all the others.
+func waitForFeedRefs(t *testing.T, s *Store, tenant string, want int) {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+
+	for {
+		s.feedsMu.Lock()
+		refs := 0
+
+		if f, ok := s.feeds[tenant]; ok {
+			refs = f.refs
+		}
+
+		s.feedsMu.Unlock()
+
+		if refs >= want {
+			return
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("reserved slot for tenant %q holds %d references, want %d callers parked on it", tenant, refs, want)
+		}
+
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// A feed whose creation fails must fail EVERY caller waiting on it with the
+// same cause. A waiter that instead blocked until its own ctx died would strand
+// the engine's tenant activation, and a dead slot left in the map would poison
+// the tenant forever: the next Subscribe has to resolve the database again from
+// scratch.
+func TestMongoSubscribe_FailedFeedCreationFailsEveryWaiter(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+
+	conn := &stubConnector{
+		resolve: func(call int) (*mongo.Database, error) {
+			// The first caller is the creator: park it inside the connector so
+			// every later caller provably finds the reserved slot.
+			if call == 1 {
+				close(entered)
+				<-release
+			}
+
+			return nil, errResolveTenantDB
+		},
+	}
+
+	s := newSubscribeStore()
+	s.cfg.MultiTenantEnabled = true
+	s.cfg.Connector = conn
+
+	defer func() { _ = s.Close() }()
+
+	const waiters = 8
+
+	scope := store.Scope{Tenant: "t1"}
+	results := make(chan error, waiters)
+
+	subscribe := func() {
+		_, err := s.Subscribe(context.Background(), scope, func(store.Event) {})
+		results <- err
+	}
+
+	go subscribe()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Subscribe never reached the connector: a named tenant must open its own feed, not be refused outright")
+	}
+
+	for i := 1; i < waiters; i++ {
+		go subscribe()
+	}
+
+	waitForFeedRefs(t, s, scope.Tenant, waiters)
+	close(release)
+
+	for i := range waiters {
+		select {
+		case err := <-results:
+			if !errors.Is(err, errResolveTenantDB) {
+				t.Fatalf("Subscribe %d error = %v, want it to carry %v", i, err, errResolveTenantDB)
+			}
+
+			if !strings.Contains(err.Error(), scope.Tenant) {
+				t.Errorf("Subscribe %d error %q must name the tenant", i, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("Subscribe %d blocked instead of receiving the creator's failure", i)
+		}
+	}
+
+	if got := conn.callCount(); got != 1 {
+		t.Errorf("ResolveDatabase calls = %d, want 1: the waiters must share the creator's attempt", got)
+	}
+
+	s.feedsMu.Lock()
+	remaining := len(s.feeds)
+	s.feedsMu.Unlock()
+
+	if remaining != 0 {
+		t.Fatalf("feeds map holds %d entries after a failed creation, want 0", remaining)
+	}
+
+	// The tenant is not poisoned: the next Subscribe builds a fresh placeholder
+	// and resolves the database again rather than replaying the dead one.
+	if _, err := s.Subscribe(context.Background(), scope, func(store.Event) {}); !errors.Is(err, errResolveTenantDB) {
+		t.Fatalf("Subscribe after a failed creation = %v, want a fresh attempt carrying %v", err, errResolveTenantDB)
+	}
+
+	if got := conn.callCount(); got != 2 {
+		t.Errorf("ResolveDatabase calls = %d after the retry, want 2: the retracted slot must be rebuilt", got)
+	}
+}
+
+// A closing store must never resolve a tenant. The named-tenant branch of feed
+// acquisition would otherwise reserve its slot and call the connector without
+// ever looking at the shutdown flag the zero scope already fences on.
+func TestMongoSubscribe_ClosingStoreResolvesNoTenant(t *testing.T) {
+	conn := &stubConnector{resolve: func(int) (*mongo.Database, error) { return nil, errResolveTenantDB }}
+
+	s := newSubscribeStore()
+	s.cfg.MultiTenantEnabled = true
+	s.cfg.Connector = conn
+
+	s.feedsMu.Lock()
+	s.closing = true
+	s.feedsMu.Unlock()
+
+	unsub, err := s.Subscribe(context.Background(), store.Scope{Tenant: "t1"}, func(store.Event) {})
+	if err == nil {
+		unsub()
+		t.Fatal("Subscribe on a closing store returned nil; want store.ErrClosed")
+	}
+
+	if !errors.Is(err, store.ErrClosed) {
+		t.Fatalf("Subscribe error = %v, want store.ErrClosed", err)
+	}
+
+	if calls := conn.callCount(); calls != 0 {
+		t.Errorf("a closing store resolved %d tenant databases; want 0 — it must not dial", calls)
+	}
+
+	s.feedsMu.Lock()
+	remaining := len(s.feeds)
+	s.feedsMu.Unlock()
+
+	if remaining != 0 {
+		t.Errorf("a closing store reserved %d feed slots, want 0", remaining)
 	}
 }

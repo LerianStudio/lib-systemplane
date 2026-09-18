@@ -65,6 +65,16 @@ func startPollingContainer(t *testing.T) (*mongo.Client, func()) {
 	return client, cleanup
 }
 
+// StartStandaloneContainer exposes the standalone container to the external
+// mongodb_test package. A change stream requires a replica set, so a standalone
+// MongoDB is the only deterministic way to make coll.Watch fail without a
+// production test seam.
+func StartStandaloneContainer(t *testing.T) (*mongo.Client, func()) {
+	t.Helper()
+
+	return startPollingContainer(t)
+}
+
 // rawUpsert writes (or rewrites) an entry directly via the collection,
 // bypassing Store.Set, so the test can pin updated_at to a chosen instant
 // (including a previously-used millisecond). This is the only way to force

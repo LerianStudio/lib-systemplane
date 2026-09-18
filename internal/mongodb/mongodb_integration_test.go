@@ -5,6 +5,7 @@ package mongodb_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -240,10 +241,13 @@ func mustGet(t *testing.T, s store.Store, ctx context.Context, ns, key string) s
 // fakeConnector resolves tenants from a static map, standing in for a
 // tenant-manager Mongo Manager without a tenant-config gRPC client. It is
 // guarded by a mutex so a test can teach it a tenant it previously did not
-// know, and an unknown tenant fails the way the manager would.
+// know, and an unknown tenant fails the way the manager would. It counts
+// resolutions so a test can prove that a re-subscribed tenant resolves again —
+// which is how a credentials rotation is picked up.
 type fakeConnector struct {
-	mu  sync.Mutex
-	dbs map[string]*mongo.Database
+	mu    sync.Mutex
+	dbs   map[string]*mongo.Database
+	calls int
 }
 
 func newFakeConnector() *fakeConnector {
@@ -257,9 +261,18 @@ func (c *fakeConnector) set(tenantID string, db *mongo.Database) {
 	c.dbs[tenantID] = db
 }
 
+func (c *fakeConnector) resolveCalls() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.calls
+}
+
 func (c *fakeConnector) ResolveDatabase(_ context.Context, tenantID string) (*mongo.Database, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	c.calls++
 
 	db, ok := c.dbs[tenantID]
 	if !ok {
@@ -898,4 +911,499 @@ func TestIntegration_MongoSubscribeAfterStartGetsResyncFirst(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("a subscriber joining a connected feed never received its own OpResync")
 	}
+}
+
+// tenantDB hands the connector a fresh database for tenant and drops it when
+// the test ends. Nothing writes it up front: a tenant database that has never
+// been touched is exactly the case a change stream must still be able to
+// attach to.
+func tenantDB(t *testing.T, client *mongo.Client, conn *fakeConnector, tenant, prefix string) *mongo.Database {
+	t.Helper()
+
+	db := client.Database(fmt.Sprintf("%s_%s_%d", prefix, tenant, time.Now().UnixNano()))
+
+	t.Cleanup(func() { _ = db.Drop(context.Background()) })
+
+	conn.set(tenant, db)
+
+	return db
+}
+
+// tenantStore builds a Store with no database of its own: every scope resolves
+// through the connector, which is the shape the engine uses for tenant scopes.
+func tenantStore(t *testing.T, conn mongodb.Connector) *mongodb.Store {
+	t.Helper()
+
+	s, err := mongodb.New(mongodb.Config{MultiTenantEnabled: true, Connector: conn})
+	if err != nil {
+		t.Fatalf("mongodb.New: %v", err)
+	}
+
+	t.Cleanup(func() { _ = s.Close() })
+
+	return s
+}
+
+// subscribeScope subscribes to scope and returns the delivered events. The
+// channel is buffered because a joining subscriber's OpResync is delivered
+// synchronously inside Subscribe.
+func subscribeScope(t *testing.T, s *mongodb.Store, scope store.Scope) (<-chan store.Event, func()) {
+	t.Helper()
+
+	events := make(chan store.Event, 32)
+
+	unsub, err := s.Subscribe(context.Background(), scope, func(evt store.Event) {
+		select {
+		case events <- evt:
+		default:
+		}
+	})
+	if err != nil {
+		t.Fatalf("subscribe tenant %q: %v", scope.Tenant, err)
+	}
+
+	return events, unsub
+}
+
+// recvEvent waits for one changefeed event or fails the test.
+func recvEvent(t *testing.T, events <-chan store.Event, what string) store.Event {
+	t.Helper()
+
+	select {
+	case evt := <-events:
+		return evt
+	case <-time.After(15 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+
+		return store.Event{}
+	}
+}
+
+// assertNoEvent fails when anything is delivered within wait.
+func assertNoEvent(t *testing.T, events <-chan store.Event, wait time.Duration, what string) {
+	t.Helper()
+
+	select {
+	case evt := <-events:
+		t.Fatalf("%s: unexpected event %+v", what, evt)
+	case <-time.After(wait):
+	}
+}
+
+// waitForFeedRefs blocks until tenant's reserved slot has taken want
+// references — one per caller parked on it.
+func waitForFeedRefs(t *testing.T, s *mongodb.Store, tenant string, want int) {
+	t.Helper()
+
+	deadline := time.Now().Add(30 * time.Second)
+
+	for {
+		if _, refs := s.FeedsSnapshot(tenant); refs >= want {
+			return
+		}
+
+		if time.Now().After(deadline) {
+			_, refs := s.FeedsSnapshot(tenant)
+			t.Fatalf("reserved slot for tenant %q holds %d references, want %d callers parked on it", tenant, refs, want)
+		}
+
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestIntegration_MongoTwoTenantFeedsAreIsolated pins the per-tenant change
+// stream: each tenant's subscriber is told OpResync for ITS OWN scope, and a
+// write in one tenant's database never reaches the other tenant's subscriber.
+func TestIntegration_MongoTwoTenantFeedsAreIsolated(t *testing.T) {
+	client, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	conn := newFakeConnector()
+
+	for _, tenant := range []string{"t1", "t2"} {
+		tenantDB(t, client, conn, tenant, "feed")
+	}
+
+	s := tenantStore(t, conn)
+
+	scope1 := store.Scope{Tenant: "t1"}
+	scope2 := store.Scope{Tenant: "t2"}
+
+	events1, unsub1 := subscribeScope(t, s, scope1)
+	defer unsub1()
+
+	events2, unsub2 := subscribeScope(t, s, scope2)
+	defer unsub2()
+
+	if first := recvEvent(t, events1, "t1 resync"); first.Op != store.OpResync || first.Scope != scope1 {
+		t.Fatalf("t1 first event = %+v, want {Scope:%+v Op:%q}", first, scope1, store.OpResync)
+	}
+
+	if first := recvEvent(t, events2, "t2 resync"); first.Op != store.OpResync || first.Scope != scope2 {
+		t.Fatalf("t2 first event = %+v, want {Scope:%+v Op:%q}", first, scope2, store.OpResync)
+	}
+
+	// A plain background ctx carries no tenant at all: a passing test proves
+	// every handle came from the connector rather than from ctx.
+	ctx := context.Background()
+
+	if _, err := s.Set(ctx, scope1, store.Entry{Namespace: "ns", Key: "only-t1", Value: []byte(`"v1"`)}); err != nil {
+		t.Fatalf("set t1: %v", err)
+	}
+
+	if got := recvEvent(t, events1, "t1 upsert"); got.Op != store.OpUpsert || got.Namespace != "ns" || got.Key != "only-t1" {
+		t.Fatalf("t1 event = %+v, want an upsert of ns/only-t1", got)
+	}
+
+	assertNoEvent(t, events2, 2*time.Second, "t2 must never see t1's write")
+
+	if _, err := s.Set(ctx, scope2, store.Entry{Namespace: "ns", Key: "only-t2", Value: []byte(`"v2"`)}); err != nil {
+		t.Fatalf("set t2: %v", err)
+	}
+
+	if got := recvEvent(t, events2, "t2 upsert"); got.Op != store.OpUpsert || got.Namespace != "ns" || got.Key != "only-t2" {
+		t.Fatalf("t2 event = %+v, want an upsert of ns/only-t2", got)
+	}
+
+	assertNoEvent(t, events1, 2*time.Second, "t1 must never see t2's write")
+}
+
+// TestIntegration_MongoTenantFeedTornDownOnLastUnsubscribe pins the shared,
+// reference-counted lifetime of a tenant feed: two subscribers ride ONE change
+// stream, dropping the first keeps it alive for the second, the last one to
+// leave closes it, and a later Subscribe resolves the tenant's database again —
+// which is how a credentials rotation is picked up.
+func TestIntegration_MongoTenantFeedTornDownOnLastUnsubscribe(t *testing.T) {
+	client, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	conn := newFakeConnector()
+	tenantDB(t, client, conn, "t1", "teardown")
+
+	s := tenantStore(t, conn)
+	scope := store.Scope{Tenant: "t1"}
+	ctx := context.Background()
+
+	eventsA, unsubA := subscribeScope(t, s, scope)
+	eventsB, unsubB := subscribeScope(t, s, scope)
+
+	if first := recvEvent(t, eventsA, "A resync"); first.Op != store.OpResync || first.Scope != scope {
+		t.Fatalf("A first event = %+v, want {Scope:%+v Op:%q}", first, scope, store.OpResync)
+	}
+
+	if first := recvEvent(t, eventsB, "B resync"); first.Op != store.OpResync || first.Scope != scope {
+		t.Fatalf("B first event = %+v, want {Scope:%+v Op:%q}", first, scope, store.OpResync)
+	}
+
+	if total, refs := s.FeedsSnapshot(scope.Tenant); total != 1 || refs != 2 {
+		t.Fatalf("feeds = %d slots / %d refs, want one shared feed held by both subscribers", total, refs)
+	}
+
+	if calls := conn.resolveCalls(); calls != 1 {
+		t.Errorf("ResolveDatabase calls = %d, want 1: the second subscriber must join the existing feed", calls)
+	}
+
+	// Dropping one subscriber keeps the stream alive for the other.
+	unsubA()
+
+	if _, err := s.Set(ctx, scope, store.Entry{Namespace: "ns", Key: "k", Value: []byte(`"v1"`)}); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+
+	if got := recvEvent(t, eventsB, "upsert after A left"); got.Op != store.OpUpsert || got.Key != "k" {
+		t.Fatalf("B event = %+v, want an upsert of ns/k", got)
+	}
+
+	assertNoEvent(t, eventsA, time.Second, "A unsubscribed and must receive nothing")
+
+	if total, refs := s.FeedsSnapshot(scope.Tenant); total != 1 || refs != 1 {
+		t.Fatalf("feeds = %d slots / %d refs while one subscriber remains, want 1/1", total, refs)
+	}
+
+	// The last subscriber closes the tenant's stream.
+	unsubB()
+
+	if total, _ := s.FeedsSnapshot(scope.Tenant); total != 0 {
+		t.Fatalf("feeds map holds %d entries after the last unsubscribe, want 0", total)
+	}
+
+	// Measured as a delta, not a total: MongoDB has ONE connector method, so
+	// the Set above resolved the tenant too. What must be true is that the
+	// rebuilt feed consults the connector once more of its own.
+	before := conn.resolveCalls()
+
+	// A later Subscribe rebuilds the feed from a freshly resolved database.
+	eventsC, unsubC := subscribeScope(t, s, scope)
+	defer unsubC()
+
+	if first := recvEvent(t, eventsC, "resync after re-subscribe"); first.Op != store.OpResync || first.Scope != scope {
+		t.Fatalf("re-subscribe first event = %+v, want {Scope:%+v Op:%q}", first, scope, store.OpResync)
+	}
+
+	if calls := conn.resolveCalls(); calls != before+1 {
+		t.Errorf("ResolveDatabase calls = %d, want %d: a re-subscribed tenant must resolve its database again", calls, before+1)
+	}
+}
+
+// subscribeBurst runs callers concurrent Subscribe calls on scope and returns
+// what each one got back. It fails the test if any of them blocks, which is the
+// half of the creation handshake a reserved slot could break.
+func subscribeBurst(t *testing.T, s *mongodb.Store, scope store.Scope, callers int) []subscribeResult {
+	t.Helper()
+
+	results := make(chan subscribeResult, callers)
+
+	var wg sync.WaitGroup
+
+	for range callers {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			unsub, err := s.Subscribe(context.Background(), scope, func(store.Event) {})
+			results <- subscribeResult{unsub: unsub, err: err}
+		}()
+	}
+
+	done := make(chan struct{})
+
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(60 * time.Second):
+		t.Fatal("concurrent Subscribe calls blocked instead of returning")
+	}
+
+	close(results)
+
+	out := make([]subscribeResult, 0, callers)
+	for r := range results {
+		out = append(out, r)
+	}
+
+	return out
+}
+
+type subscribeResult struct {
+	unsub func()
+	err   error
+}
+
+// TestIntegration_MongoConcurrentFirstSubscribeOpensOneFeed covers both halves
+// of the creation handshake. A tenant the connector cannot resolve fails every
+// concurrent caller — none of them blocks, and nothing is left running — and
+// once the connector knows the tenant, the same burst of callers shares exactly
+// ONE change stream, which is what "one live subscription per activated tenant"
+// rests on.
+func TestIntegration_MongoConcurrentFirstSubscribeOpensOneFeed(t *testing.T) {
+	client, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	conn := newFakeConnector()
+	s := tenantStore(t, conn)
+	scope := store.Scope{Tenant: "t1"}
+
+	const callers = 8
+
+	for i, r := range subscribeBurst(t, s, scope, callers) {
+		if r.err == nil {
+			r.unsub()
+			t.Fatalf("Subscribe %d succeeded for a tenant the connector cannot resolve", i)
+		}
+
+		if !strings.Contains(r.err.Error(), "unknown tenant") {
+			t.Errorf("Subscribe %d error = %v, want the connector's resolution failure", i, r.err)
+		}
+	}
+
+	if total, _ := s.FeedsSnapshot(scope.Tenant); total != 0 {
+		t.Fatalf("a failed feed creation left %d feeds behind, want 0", total)
+	}
+
+	// The connector learns the tenant: every caller now succeeds on one feed.
+	tenantDB(t, client, conn, "t1", "concurrent")
+
+	unsubs := make([]func(), 0, callers)
+
+	for i, r := range subscribeBurst(t, s, scope, callers) {
+		if r.err != nil {
+			t.Fatalf("Subscribe %d after the connector learned the tenant: %v", i, r.err)
+		}
+
+		unsubs = append(unsubs, r.unsub)
+	}
+
+	if total, refs := s.FeedsSnapshot(scope.Tenant); total != 1 || refs != callers {
+		t.Fatalf("feeds = %d slots / %d refs, want one feed shared by all %d callers", total, refs, callers)
+	}
+
+	for _, unsub := range unsubs {
+		unsub()
+	}
+
+	if total, _ := s.FeedsSnapshot(scope.Tenant); total != 0 {
+		t.Fatalf("feeds map holds %d entries after the last unsubscribe, want 0", total)
+	}
+}
+
+// blockingConnector parks the FIRST ResolveDatabase call inside the connector
+// until the test releases it. That is the window Close has to survive: a
+// creator still resolving, a reserved slot in the feeds map that carries no
+// stop channel, and a second caller already waiting on it.
+type blockingConnector struct {
+	db *mongo.Database
+
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *blockingConnector) ResolveDatabase(ctx context.Context, _ string) (*mongo.Database, error) {
+	c.once.Do(func() { close(c.entered) })
+
+	select {
+	case <-c.release:
+		return c.db, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// Close must not be able to leave a live feed, a live goroutine or an open
+// change stream behind when it lands while a tenant feed is still being
+// created. Walking the feeds map is not enough on its own: the entry Close
+// finds there is a reserved slot with nothing to stop yet, so the creator
+// itself has to notice the shutdown after it opens the stream and throw it
+// away.
+func TestIntegration_MongoCloseDuringFeedCreationLeavesNothingRunning(t *testing.T) {
+	client, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	db := client.Database(fmt.Sprintf("close_race_%d", time.Now().UnixNano()))
+	t.Cleanup(func() { _ = db.Drop(context.Background()) })
+
+	conn := &blockingConnector{
+		db:      db,
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+
+	s := tenantStore(t, conn)
+	scope := store.Scope{Tenant: "t1"}
+
+	const callers = 2
+
+	results := make(chan error, callers)
+
+	var wg sync.WaitGroup
+
+	subscribe := func() {
+		defer wg.Done()
+
+		unsub, err := s.Subscribe(context.Background(), scope, func(store.Event) {})
+		if err == nil {
+			unsub()
+		}
+
+		results <- err
+	}
+
+	wg.Add(1)
+
+	go subscribe()
+
+	select {
+	case <-conn.entered:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Subscribe never reached the connector")
+	}
+
+	// The second caller parks on the creator's reserved slot. Waiting for the
+	// reference count keeps the race deterministic: once it is there, Close
+	// provably runs against a slot that already has a waiter on it.
+	wg.Add(1)
+
+	go subscribe()
+
+	waitForFeedRefs(t, s, scope.Tenant, callers)
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	close(conn.release)
+
+	// Join before asserting: Close does not wait for an in-flight creator, and
+	// the package goleak guard is only meaningful once the creator has returned.
+	wg.Wait()
+	close(results)
+
+	for err := range results {
+		if !errors.Is(err, store.ErrClosed) {
+			t.Fatalf("Subscribe racing Close = %v, want store.ErrClosed", err)
+		}
+	}
+
+	if total, _ := s.FeedsSnapshot(scope.Tenant); total != 0 {
+		t.Fatalf("feeds map holds %d entries after Close, want 0", total)
+	}
+}
+
+// A change stream needs a replica set, so a standalone MongoDB fails every
+// Watch deterministically — no proxy, no mock, no production seam. The failure
+// must reach the caller that asked for the feed and leave nothing behind: for a
+// named tenant that caller is Subscribe, for the zero scope it is Start, which
+// is where the single-tenant stream is opened.
+func TestIntegration_MongoSubscribeReturnsErrorWhenWatchFails(t *testing.T) {
+	client, cleanup := mongodb.StartStandaloneContainer(t)
+	t.Cleanup(cleanup)
+
+	t.Run("named tenant fails every concurrent caller", func(t *testing.T) {
+		conn := newFakeConnector()
+		tenantDB(t, client, conn, "t1", "watchfail")
+
+		s := tenantStore(t, conn)
+		scope := store.Scope{Tenant: "t1"}
+
+		for i, r := range subscribeBurst(t, s, scope, 8) {
+			if r.err == nil {
+				r.unsub()
+				t.Fatalf("Subscribe %d opened a change stream on a standalone MongoDB", i)
+			}
+
+			if !strings.Contains(r.err.Error(), "watch tenant t1") {
+				t.Errorf("Subscribe %d error = %v, want the tenant's Watch failure", i, r.err)
+			}
+		}
+
+		if total, _ := s.FeedsSnapshot(scope.Tenant); total != 0 {
+			t.Fatalf("a failed Watch left %d feeds behind, want 0", total)
+		}
+	})
+
+	t.Run("zero scope fails Start", func(t *testing.T) {
+		dbName := fmt.Sprintf("watchfail_zero_%d", time.Now().UnixNano())
+		t.Cleanup(func() { _ = client.Database(dbName).Drop(context.Background()) })
+
+		s, err := mongodb.New(mongodb.Config{Client: client, Database: dbName})
+		if err != nil {
+			t.Fatalf("mongodb.New: %v", err)
+		}
+
+		t.Cleanup(func() { _ = s.Close() })
+
+		err = s.Start(context.Background())
+		if err == nil {
+			t.Fatal("Start opened a change stream on a standalone MongoDB")
+		}
+
+		if !strings.Contains(err.Error(), "watch") {
+			t.Fatalf("Start error = %v, want the Watch failure", err)
+		}
+	})
 }

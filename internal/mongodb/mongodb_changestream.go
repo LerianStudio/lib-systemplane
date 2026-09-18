@@ -1,9 +1,10 @@
 // Change-stream and polling changefeeds for the MongoDB backend.
 //
 // One feed per scope: the zero-scope feed is opened by Start and lives until
-// Close. Multi-tenant deployments resolve a fresh database on every call, so
-// the zero scope has no durable collection to watch there and Subscribe
-// returns store.ErrNotSupportedInMultiTenant.
+// Close, and a named tenant's feed is opened by its first Subscribe and closed
+// by its last unsubscribe. Multi-tenant deployments resolve a fresh database on
+// every call, so the zero scope has no durable collection to watch there and
+// Subscribe returns store.ErrNotSupportedInMultiTenant.
 //
 // Start opens the change stream SYNCHRONOUSLY, on the caller's goroutine,
 // before it returns. That handshake is not a style choice: a change stream
@@ -205,21 +206,142 @@ func (s *Store) zeroFeedLocked() (*feed, error) {
 	return f, nil
 }
 
-// acquireFeed returns the zero-scope feed and takes one reference on it,
-// released by releaseFeed. Feeds are SHARED: a scope has exactly one change
-// stream no matter how many subscribers it has.
-func (s *Store) acquireFeed() (*feed, error) {
-	s.feedsMu.Lock()
-	defer s.feedsMu.Unlock()
+// acquireFeed returns the live feed for scope — creating it when this caller is
+// the first to ask for that tenant — and takes one reference on it, released by
+// releaseFeed. Feeds are SHARED: a scope has exactly one change stream no
+// matter how many subscribers it has.
+//
+// The feeds-map lock is never held across the connector call or coll.Watch, or
+// one unreachable tenant would freeze every other tenant's Subscribe. The
+// creator instead reserves the map slot with an unconnected placeholder
+// carrying a ready channel, resolves and opens outside the lock, and then
+// publishes or retracts it.
+func (s *Store) acquireFeed(ctx context.Context, scope store.Scope) (*feed, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
-	f, err := s.zeroFeedLocked()
-	if err != nil {
+	s.feedsMu.Lock()
+
+	// One shutdown fence for both branches, hoisted above them: a closing store
+	// must not reserve a slot and resolve a tenant, which is exactly what the
+	// named branch would do if only the zero scope were fenced.
+	if s.closing {
+		s.feedsMu.Unlock()
+
+		return nil, store.ErrClosed
+	}
+
+	if scope.Tenant == "" {
+		f, err := s.zeroFeedLocked()
+		if err != nil {
+			s.feedsMu.Unlock()
+
+			return nil, err
+		}
+
+		f.refs++
+		s.feedsMu.Unlock()
+
+		return f, nil
+	}
+
+	if f, ok := s.feeds[scope.Tenant]; ok {
+		f.refs++
+		s.feedsMu.Unlock()
+
+		return s.awaitFeed(ctx, f)
+	}
+
+	f := newFeed(scope, nil)
+	f.ready = make(chan struct{})
+	f.refs = 1
+	s.feeds[scope.Tenant] = f
+	s.feedsMu.Unlock()
+
+	if err := s.createFeed(ctx, f); err != nil {
 		return nil, err
 	}
 
-	f.refs++
-
 	return f, nil
+}
+
+// awaitFeed blocks until the creator publishes or retracts the feed.
+//
+// A creation failure reaches EVERY waiter carrying the creator's own cause: a
+// waiter that blocked until its own ctx died instead would strand the caller.
+// It is never retried here — the slot is already gone, so the next Subscribe
+// for that tenant builds a fresh placeholder. On ctx cancellation the waiter
+// leaves the creator alone; the creator finishes or retracts on its own.
+func (s *Store) awaitFeed(ctx context.Context, f *feed) (*feed, error) {
+	select {
+	case <-f.ready:
+		if f.err != nil {
+			s.releaseFeed(f)
+
+			return nil, f.err
+		}
+
+		return f, nil
+	case <-ctx.Done():
+		s.releaseFeed(f)
+
+		return nil, ctx.Err()
+	}
+}
+
+// createFeed resolves the tenant's collection through the connector and opens
+// its first change stream synchronously, so an unreachable tenant fails the
+// Subscribe call instead of looping in the background, then publishes the feed
+// to every waiter.
+//
+// The connector is consulted ONCE per feed lifetime, not once per reopen: a
+// credentials rotation is picked up when the last subscriber leaves and a later
+// Subscribe builds a fresh feed, which is exactly what releaseFeed removing the
+// named slot buys.
+func (s *Store) createFeed(ctx context.Context, f *feed) error {
+	tenant := f.scope.Tenant
+
+	db, err := s.cfg.Connector.ResolveDatabase(ctx, tenant)
+	if err != nil {
+		return s.retractFeed(f, fmt.Errorf("systemplane/mongodb: resolve tenant %s: %w", tenant, err))
+	}
+
+	// A nil handle reported with a nil error is a connector bug; refuse it here
+	// rather than attach a stream to something that panics on the first command.
+	if db == nil {
+		return s.retractFeed(f, fmt.Errorf("systemplane/mongodb: resolve tenant %s: %w", tenant, store.ErrTenantConnectorMissing))
+	}
+
+	coll := db.Collection(s.cfg.Collection)
+
+	// A change stream attaches to a collection, so a tenant database that has
+	// never been written to needs its collection materialized first.
+	if err := s.ensureSchema(ctx, coll, true); err != nil {
+		return s.retractFeed(f, err)
+	}
+
+	f.coll = coll
+
+	stream, err := s.openWatch(ctx, f)
+	if err != nil {
+		return s.retractFeed(f, err)
+	}
+
+	return s.publishFeed(ctx, f, stream)
+}
+
+// retractFeed publishes a creation failure to every waiter and removes the dead
+// slot.
+func (s *Store) retractFeed(f *feed, err error) error {
+	s.feedsMu.Lock()
+	defer s.feedsMu.Unlock()
+
+	cause := s.failLocked(f, err)
+
+	f.closeReadyLocked()
+
+	return cause
 }
 
 // releaseFeed drops one reference. When the last one goes, a NAMED feed leaves
@@ -245,7 +367,8 @@ func (s *Store) releaseFeed(f *feed) {
 }
 
 // Subscribe registers fn to be invoked for every change event in scope. The
-// returned unsubscribe func removes fn from the dispatch list.
+// returned unsubscribe func removes fn from the dispatch list, and the last
+// subscriber to leave a tenant scope closes that tenant's change stream.
 //
 // A subscriber joining a feed that has already announced its state is told that
 // state before anything else: store.OpResync on a connected feed,
@@ -261,7 +384,9 @@ func (s *Store) releaseFeed(f *feed) {
 // The zero scope in multi-tenant mode returns
 // store.ErrNotSupportedInMultiTenant: every method there resolves a per-call
 // tenant database, so there is no shared process-wide changefeed to attach to.
-// A named tenant scope is refused the same way for now.
+// A named tenant scope is served regardless of MultiTenantEnabled — it resolves
+// its own database through the connector — and is refused with
+// store.ErrTenantConnectorMissing when none is configured.
 //
 // The subscription lives for the lifetime of ctx: when ctx is cancelled the
 // callback is removed and the feed released, exactly as if unsubscribe had been
@@ -271,8 +396,12 @@ func (s *Store) Subscribe(ctx context.Context, scope store.Scope, fn func(store.
 		return nil, store.ErrClosed
 	}
 
-	if s.cfg.MultiTenantEnabled || scope.Tenant != "" {
-		return nil, store.ErrNotSupportedInMultiTenant
+	if scope.Tenant == "" {
+		if s.cfg.MultiTenantEnabled {
+			return nil, store.ErrNotSupportedInMultiTenant
+		}
+	} else if s.cfg.Connector == nil {
+		return nil, store.ErrTenantConnectorMissing
 	}
 
 	// Checked before any feed work: a nil callback must never open a stream.
@@ -280,7 +409,7 @@ func (s *Store) Subscribe(ctx context.Context, scope store.Scope, fn func(store.
 		return func() {}, nil
 	}
 
-	f, err := s.acquireFeed()
+	f, err := s.acquireFeed(ctx, scope)
 	if err != nil {
 		return nil, err
 	}

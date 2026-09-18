@@ -358,8 +358,9 @@ func TestIsNamespaceExists(t *testing.T) {
 }
 
 // A named tenant on a store built without a connector is refused on every
-// CRUD method: there is no handle to resolve it with, and falling back to the
-// constructor collection would silently serve another tenant's data.
+// method — CRUD and Subscribe alike: there is no handle to resolve it with, and
+// falling back to the constructor collection would silently serve, or watch,
+// another tenant's data.
 func TestStore_NamedTenantWithoutConnector(t *testing.T) {
 	t.Parallel()
 
@@ -387,8 +388,8 @@ func TestStore_NamedTenantWithoutConnector(t *testing.T) {
 		t.Fatalf("List error = %v, want ErrTenantConnectorMissing", err)
 	}
 
-	if _, err := s.Subscribe(ctx, scope, func(store.Event) {}); !errors.Is(err, store.ErrNotSupportedInMultiTenant) {
-		t.Fatalf("Subscribe error = %v, want ErrNotSupportedInMultiTenant", err)
+	if _, err := s.Subscribe(ctx, scope, func(store.Event) {}); !errors.Is(err, store.ErrTenantConnectorMissing) {
+		t.Fatalf("Subscribe error = %v, want ErrTenantConnectorMissing", err)
 	}
 }
 
