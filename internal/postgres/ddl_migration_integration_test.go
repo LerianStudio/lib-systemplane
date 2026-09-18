@@ -412,6 +412,11 @@ func assertNextWriteClearsMigratedRevision(t *testing.T, db *sql.DB, dsn string)
 // migration still exits 0, and then every write dies because the bump trigger
 // resolves app.systemplane_revision_seq. Resolving the table's own schema and
 // creating the sequence there is what keeps the upgrade writable.
+//
+// It doubles as the accept case for the migration's own guard: a SINGLE install
+// resolved past the first schema of search_path is exactly what the migration
+// is for, so the guard has to admit it. Only an invisible or an ambiguous one is
+// refused — the two cases the sibling tests below cover.
 func TestIntegration_DDLMigrationCreatesTheSequenceBesideTheTable(t *testing.T) {
 	assertUpgradeOutsideTheDefaultSchema(t, "seqmig", "public, app",
 		systemplane.MigrationV3ToV4SQL(),
@@ -861,5 +866,163 @@ func assertReapplyDoesNotRewindTheSequence(t *testing.T, db *sql.DB, dsn, artifa
 
 	if next := set("write after the re-apply", "after", `"after"`); next <= highest {
 		t.Fatalf("the first write after the re-apply returned revision %d, want strictly greater than the %d already handed out; re-seeding the sequence from MAX(revision) alone re-issues revisions subscribers have already seen", next, highest)
+	}
+}
+
+// TestIntegration_DDLSchemaRefusesForkWhenAStrayTableSitsInTheDefaultSchema is
+// the fork the guard's second version still let through, and the reason it no
+// longer prefers the current schema.
+//
+// The layout is the one a half-finished deploy leaves behind: the populated v3
+// install under `app`, a SECOND and EMPTY systemplane_entries already sitting
+// in `public`, and search_path = public, app. A guard that resolves "the
+// existing install" by preferring current_schema() finds the empty `public`
+// copy and decides there is nothing to protect, so the artifact runs on: it
+// upgrades the empty table and leaves the populated install in `app`
+// untouched, whereupon the runtime reads the empty one and every registered
+// key falls back to its default. Where it stops depends only on what the
+// orphaned install still carries — here its v3 triggers still depend on
+// systemplane_notify_v3(), so the unqualified DROP FUNCTION dies half way
+// through a file with no transaction wrapper; against an `app` install already
+// on v4 the same run exits 0 and reports success. Refusing whenever ANY other
+// user schema holds the table is what closes both.
+func TestIntegration_DDLSchemaRefusesForkWhenAStrayTableSitsInTheDefaultSchema(t *testing.T) {
+	db := seedStrayTableBesideTheAppInstall(t, "strayschema")
+
+	_, err := db.Exec(systemplane.SchemaSQL())
+	if err == nil {
+		t.Fatal("SchemaSQL() applied under search_path \"public, app\" with the install in app and a stray empty table in public: want a loud failure, got success")
+	}
+
+	if !strings.Contains(err.Error(), "systemplane_entries already exists in schema app") {
+		t.Fatalf("SchemaSQL() failed, but not with the fork guard: %v", err)
+	}
+
+	assertNeitherInstallMoved(t, db)
+}
+
+// TestIntegration_DDLMigrationRefusesAnAmbiguousInstall is the same layout seen
+// from the migration route.
+//
+// The migration creates no table, so the fork SchemaSQL() refuses cannot
+// happen here — but every statement in it names systemplane_entries
+// unqualified, so with two candidates it would upgrade whichever one
+// search_path resolves first (the empty `public` copy) and silently leave the
+// populated `app` install on v3: a v4 runtime then reads v3 NOTIFY payloads
+// with no revision at all. It has no way to tell which install the operator
+// meant, so it names both and refuses.
+func TestIntegration_DDLMigrationRefusesAnAmbiguousInstall(t *testing.T) {
+	db := seedStrayTableBesideTheAppInstall(t, "straymig")
+
+	_, err := db.Exec(systemplane.MigrationV3ToV4SQL())
+	if err == nil {
+		t.Fatal("MigrationV3ToV4SQL() applied with systemplane_entries in both app and public: want a loud failure, got success")
+	}
+
+	// Both schemas by name, or the operator cannot tell which table the
+	// migration was about to touch and which one it would have left behind.
+	for _, want := range []string{"systemplane_entries exists in schema app", "as well as in public"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("MigrationV3ToV4SQL() failed without naming both installs: want %q in: %v", want, err)
+		}
+	}
+
+	assertNeitherInstallMoved(t, db)
+}
+
+// TestIntegration_DDLMigrationRefusesAnInvisibleInstall pins the other half of
+// that guard: no systemplane_entries on search_path at all.
+//
+// The file is not wrapped in a transaction — the consumer's migration tool owns
+// transaction boundaries — so without the guard the operator's first signal is
+// whatever error the first unqualified ALTER TABLE raises, mid-file, with no
+// hint that the install is simply somewhere search_path cannot reach. Failing
+// first, with the fix in the message, is the difference.
+func TestIntegration_DDLMigrationRefusesAnInvisibleInstall(t *testing.T) {
+	db, _ := seedV3InsideAppSchema(t, "invisiblemig", "public")
+
+	_, err := db.Exec(systemplane.MigrationV3ToV4SQL())
+	if err == nil {
+		t.Fatal("MigrationV3ToV4SQL() applied under search_path \"public\" with the install in app: want a loud failure, got success")
+	}
+
+	if !strings.Contains(err.Error(), "systemplane_entries is not visible on search_path") {
+		t.Fatalf("MigrationV3ToV4SQL() failed, but not with the visibility guard: %v", err)
+	}
+
+	assertRelationSchemas(t, db, "systemplane_entries", []string{"app"})
+	assertRelationSchemas(t, db, "systemplane_revision_seq", nil)
+	assertNoRevisionColumn(t, db, "app")
+}
+
+// seedStrayTableBesideTheAppInstall builds the populated v3 install under `app`,
+// adds a SECOND and empty v3-shaped systemplane_entries in `public`, and leaves
+// search_path = public, app so the stray copy is the one search_path resolves.
+func seedStrayTableBesideTheAppInstall(t *testing.T, label string) *sql.DB {
+	t.Helper()
+
+	db, _ := seedV3InsideAppSchema(t, label, "public, app")
+
+	if _, err := db.Exec(`CREATE TABLE public.systemplane_entries (
+		namespace   TEXT NOT NULL,
+		"key"       TEXT NOT NULL,
+		value       JSONB NOT NULL,
+		updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+		updated_by  TEXT NOT NULL DEFAULT '',
+		PRIMARY KEY (namespace, "key")
+	)`); err != nil {
+		t.Fatalf("create the stray public.systemplane_entries: %v", err)
+	}
+
+	assertRelationSchemas(t, db, "systemplane_entries", []string{"app", "public"})
+
+	return db
+}
+
+// assertNeitherInstallMoved pins that a refused artifact was a no-op on BOTH
+// tables. A refusal that had already added the revision column to the stray
+// copy, or seeded a sequence, would have half-forked the install anyway.
+func assertNeitherInstallMoved(t *testing.T, db *sql.DB) {
+	t.Helper()
+
+	assertRelationSchemas(t, db, "systemplane_entries", []string{"app", "public"})
+	assertRelationSchemas(t, db, "systemplane_revision_seq", nil)
+
+	assertNoRevisionColumn(t, db, "app")
+	assertNoRevisionColumn(t, db, "public")
+
+	assertRowCount(t, db, "app", 1)
+	assertRowCount(t, db, "public", 0)
+}
+
+// assertNoRevisionColumn pins that the table in schema is still the v3 shape.
+func assertNoRevisionColumn(t *testing.T, db *sql.DB, schema string) {
+	t.Helper()
+
+	var found int
+
+	if err := db.QueryRow(`SELECT count(*) FROM information_schema.columns
+		WHERE table_schema = $1 AND table_name = 'systemplane_entries' AND column_name = 'revision'`, schema).Scan(&found); err != nil {
+		t.Fatalf("look up revision column in %s: %v", schema, err)
+	}
+
+	if found != 0 {
+		t.Errorf("%s.systemplane_entries carries a revision column; the refused artifact must have altered nothing", schema)
+	}
+}
+
+// assertRowCount pins that the refusal touched no data either way: the
+// populated install still holds its row and the stray copy is still empty.
+func assertRowCount(t *testing.T, db *sql.DB, schema string, want int) {
+	t.Helper()
+
+	var got int
+
+	if err := db.QueryRow(fmt.Sprintf(`SELECT count(*) FROM %s.systemplane_entries`, schema)).Scan(&got); err != nil {
+		t.Fatalf("count rows in %s.systemplane_entries: %v", schema, err)
+	}
+
+	if got != want {
+		t.Errorf("%s.systemplane_entries holds %d rows, want %d", schema, got, want)
 	}
 }

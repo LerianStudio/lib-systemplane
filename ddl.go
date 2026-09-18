@@ -14,8 +14,8 @@ import _ "embed"
 var schemaSQL string
 
 // migrationV3ToV4SQL is the v3 -> v4 delta, embedded byte-faithfully from
-// ddl/migrate_v3_to_v4.sql. It is schemaSQL minus the guard block and the
-// CREATE TABLE.
+// ddl/migrate_v3_to_v4.sql. It is schemaSQL minus the fork guard and the
+// CREATE TABLE, preceded by a guard of its own.
 //
 //go:embed ddl/migrate_v3_to_v4.sql
 var migrationV3ToV4SQL string
@@ -66,8 +66,11 @@ var defaultSeedSQL string
 // a second, empty table there and orphan the populated one — a migration that
 // exits 0 and leaves every registered key reading its default. The DDL refuses
 // that case loudly instead, scanning the catalog for systemplane_entries in
-// every user schema rather than resolving it through search_path, so the
-// install it protects is found even when the applier cannot see it. An install
+// every user schema but the one it would provision into, rather than resolving
+// it through search_path, so the install it protects is found even when the
+// applier cannot see it — and found whether or not a table of its own already
+// sits in that first schema, since a stray empty copy there is precisely what
+// makes the populated one easy to orphan. An install
 // that cannot be put first in search_path
 // is upgraded with MigrationV3ToV4SQL(), which creates no table and therefore
 // follows the search_path to wherever the table actually is.
@@ -119,10 +122,15 @@ func SchemaSQL() string {
 // Revisions may skip numbers from then on, and a key deleted and recreated
 // always comes back above every revision it previously had.
 //
-// It is idempotent and it is SchemaSQL() minus the guard block and the CREATE
-// TABLE: it creates no systemplane_entries and therefore upgrades the install
-// wherever search_path finds it, which is what makes it the way out of the
-// fork SchemaSQL() refuses. A consumer starting
+// It is idempotent and, from its first ALTER TABLE onwards, byte-identical to
+// SchemaSQL(): it is that artifact minus the fork guard and the CREATE TABLE,
+// so it creates no systemplane_entries and upgrades the install wherever
+// search_path finds it, which is what makes it the way out of the fork
+// SchemaSQL() refuses. It opens with a guard of its own instead, because every
+// statement in it names systemplane_entries unqualified: it refuses when
+// search_path reaches no systemplane_entries at all, and when a second one
+// exists in another user schema, where it would otherwise upgrade whichever
+// install search_path resolves first and leave the other on v3. A consumer starting
 // from an empty database applies SchemaSQL() instead, where the first write
 // lands at revision 2 rather than 1. lib-systemplane does not execute it for
 // the caller.

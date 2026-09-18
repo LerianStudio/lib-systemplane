@@ -1,10 +1,20 @@
 -- systemplane v3 -> v4 migration — canonical, static artifact published by lib-systemplane.
 --
 -- lib-systemplane never executes this file: consumers fold it into their own
--- migration pipeline. It is ddl/schema.sql minus the guard block and the table
--- creation, so it assumes systemplane_entries already exists and upgrades it
--- wherever search_path finds it; a consumer starting from an empty database
--- applies ddl/schema.sql instead.
+-- migration pipeline. From its first ALTER TABLE to the end it is byte-identical
+-- to ddl/schema.sql: it is that file minus the schema fork guard and the table
+-- creation, preceded by a guard of its own, so it assumes systemplane_entries
+-- already exists and upgrades it wherever search_path finds it; a consumer
+-- starting from an empty database applies ddl/schema.sql instead.
+--
+-- IT ALTERS THE TABLE SEARCH_PATH RESOLVES, AND CREATES NONE. Every statement
+-- here names systemplane_entries unqualified, so search_path alone decides which
+-- install is upgraded. The guard DO block below refuses the two layouts that
+-- make that unsafe: no systemplane_entries visible on search_path at all, where
+-- the first ALTER would fail halfway through an untransacted file; and a SECOND
+-- systemplane_entries in another user schema, where the file would upgrade
+-- whichever one search_path happens to resolve first and leave the other on v3,
+-- reading v3 payloads through a v4 runtime.
 --
 -- ONE DATABASE PER TENANT. This file assumes systemplane_entries is alone in
 -- its database, and must never be applied once per schema inside a shared
@@ -48,6 +58,37 @@
 -- violation. The SET is unconditional because that is what makes a SECOND
 -- application safe: once the column exists, ADD COLUMN IF NOT EXISTS is a
 -- no-op and restores nothing.
+
+DO $$
+DECLARE
+	target_schema TEXT := (
+		SELECT n.nspname
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE c.oid = to_regclass('systemplane_entries')
+	);
+	other_schema TEXT;
+BEGIN
+	IF target_schema IS NULL THEN
+		RAISE EXCEPTION 'systemplane_entries is not visible on search_path; this migration alters the table search_path resolves and creates none'
+			USING HINT = 'put the schema that holds the v3 install first in search_path, then re-run';
+	END IF;
+	SELECT n.nspname INTO other_schema
+	FROM pg_class c
+	JOIN pg_namespace n ON n.oid = c.relnamespace
+	WHERE c.relname = 'systemplane_entries'
+	  AND c.relkind IN ('r', 'p')
+	  AND n.nspname <> target_schema
+	  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+	  AND n.nspname NOT LIKE 'pg_toast%'
+	  AND n.nspname NOT LIKE 'pg_temp%'
+	LIMIT 1;
+	IF other_schema IS NOT NULL THEN
+		RAISE EXCEPTION 'systemplane_entries exists in schema % as well as in %, which search_path resolves first; refusing to guess which install to migrate', other_schema, target_schema
+			USING HINT = 'drop or rename the stray table, or narrow search_path to the schema that holds the install to migrate';
+	END IF;
+END
+$$;
 
 ALTER TABLE systemplane_entries ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;
 ALTER TABLE systemplane_entries ALTER COLUMN revision SET DEFAULT 1;

@@ -30,9 +30,12 @@
 -- populated one orphaned and invisible to the runtime: every registered key
 -- would silently fall back to its default after a `successful` migration. The
 -- guard DO block below refuses that outright rather than forking the install.
--- It scans the catalog for systemplane_entries in EVERY user schema instead of
--- resolving it through search_path, because the install most likely to be
--- forked is precisely the one the applier's search_path cannot reach.
+-- It scans the catalog for systemplane_entries in every user schema OTHER than
+-- current_schema() instead of resolving it through search_path, because the
+-- install most likely to be forked is precisely the one the applier's
+-- search_path cannot reach; and it refuses whether or not current_schema()
+-- already holds a table of its own, because a stray copy elsewhere that slipped
+-- past the guard would simply stay orphaned.
 -- An install that cannot be put first in search_path is upgraded with
 -- ddl/migrate_v3_to_v4.sql instead, which creates no table and so follows the
 -- search_path to wherever the table actually is.
@@ -74,28 +77,27 @@
 
 DO $$
 DECLARE
-	existing_schema TEXT := (
+	foreign_schema TEXT := (
 		SELECT n.nspname
 		FROM pg_class c
 		JOIN pg_namespace n ON n.oid = c.relnamespace
 		WHERE c.relname = 'systemplane_entries'
 		  AND c.relkind IN ('r', 'p')
+		  AND n.nspname <> current_schema()
 		  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
 		  AND n.nspname NOT LIKE 'pg_toast%'
 		  AND n.nspname NOT LIKE 'pg_temp%'
-		ORDER BY (n.nspname = current_schema()) DESC
 		LIMIT 1
 	);
 BEGIN
-	IF existing_schema IS NOT NULL AND existing_schema IS DISTINCT FROM current_schema() THEN
+	IF foreign_schema IS NOT NULL THEN
 		RAISE EXCEPTION
 			'systemplane_entries already exists in schema %, but this role would provision into %; applying the full schema here would fork the install into a second, empty table and orphan the populated one',
-			existing_schema, current_schema()
+			foreign_schema, current_schema()
 			USING HINT = 'put the existing schema first in search_path, or upgrade that install with ddl/migrate_v3_to_v4.sql, which creates no table';
 	END IF;
 END
 $$;
-
 CREATE TABLE IF NOT EXISTS systemplane_entries (
 	namespace   TEXT NOT NULL,
 	"key"       TEXT NOT NULL,

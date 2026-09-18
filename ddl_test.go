@@ -29,7 +29,15 @@ func TestSchemaSQL_ContainsCanonicalStatements(t *testing.T) {
 		"WHERE c.relname = 'systemplane_entries'",
 		"AND c.relkind IN ('r', 'p')",
 		"AND n.nspname NOT IN ('pg_catalog', 'information_schema')",
-		"ORDER BY (n.nspname = current_schema()) DESC",
+		// The guard looks for the table in every user schema EXCEPT the one it
+		// would provision into, so a stray copy elsewhere is a refusal even
+		// when current_schema() already holds a table of its own. Preferring
+		// the current schema instead let exactly the reported fork through:
+		// populated install in `app`, stray empty table in `public`,
+		// search_path = public, app — guard silent, `public` upgraded, `app`
+		// orphaned.
+		"AND n.nspname <> current_schema()",
+		"IF foreign_schema IS NOT NULL THEN",
 		"CREATE TABLE IF NOT EXISTS systemplane_entries (",
 		"namespace   TEXT NOT NULL,",
 		`"key"       TEXT NOT NULL,`,
@@ -293,15 +301,59 @@ func TestMigrationV3ToV4SQL_IsTheDeltaOnly(t *testing.T) {
 		t.Error("MigrationV3ToV4SQL() must not contain a table creation statement")
 	}
 
-	// The fork guard belongs to the artifact that creates the table. The
-	// migration creates none, so it follows search_path to wherever the table
-	// actually lives — which is the escape hatch the guard points at.
+	// The SCHEMA artifact's fork guard belongs to the artifact that creates
+	// the table. The migration creates none, so it follows search_path to
+	// wherever the table actually lives — which is the escape hatch that guard
+	// points at — and must not inherit the refusal.
 	if strings.Contains(sql, "would fork the install") {
-		t.Error("MigrationV3ToV4SQL() carries the fork guard; it creates no table and must upgrade an install wherever search_path finds it")
+		t.Error("MigrationV3ToV4SQL() carries the schema artifact's fork guard; it creates no table and must upgrade an install wherever search_path finds it")
+	}
+
+	// It carries a guard of its OWN, and that one is built on to_regclass on
+	// purpose: the install it is about to ALTER is by definition the one
+	// search_path resolves, so the guard has to resolve the target the same way
+	// the unqualified ALTERs will.
+	if !strings.Contains(sql, "to_regclass('systemplane_entries')") {
+		t.Error("MigrationV3ToV4SQL() has no guard resolving the target install with to_regclass('systemplane_entries'); every statement in it is unqualified, so it must refuse an invisible or ambiguous install instead of altering whichever table search_path happens to hit")
 	}
 
 	assertSequenceLivesInTheTableSchema(t, "MigrationV3ToV4SQL()", sql)
 	assertDropsTriggersBeforeFunction(t, "MigrationV3ToV4SQL()", sql)
 	assertNoV3FunctionDefinition(t, "MigrationV3ToV4SQL()", sql)
 	assertDropDefaultComesLast(t, "MigrationV3ToV4SQL()", sql)
+}
+
+// TestMigrationV3ToV4SQL_SharesEverythingFromTheFirstAlter pins the relationship
+// the two published artifacts are defined by: they differ only in their heads — the
+// schema file creates the table and refuses a fork, the migration refuses an
+// invisible or ambiguous target and creates nothing — and from the first
+// ALTER TABLE onwards they are the SAME bytes.
+//
+// Fragment assertions cannot pin that. They passed the whole time the two
+// files were drifting statement by statement, which is how a consumer on the
+// migration route ends up with a sequence, a trigger or a statement order the
+// schema route never had.
+func TestMigrationV3ToV4SQL_SharesEverythingFromTheFirstAlter(t *testing.T) {
+	t.Parallel()
+
+	const firstAlter = "ALTER TABLE systemplane_entries ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;"
+
+	schema := systemplane.SchemaSQL()
+	migration := systemplane.MigrationV3ToV4SQL()
+
+	schemaAt := strings.Index(schema, firstAlter)
+	migrationAt := strings.Index(migration, firstAlter)
+
+	if schemaAt < 0 {
+		t.Fatalf("SchemaSQL() missing %q", firstAlter)
+	}
+
+	if migrationAt < 0 {
+		t.Fatalf("MigrationV3ToV4SQL() missing %q", firstAlter)
+	}
+
+	if schemaTail, migrationTail := schema[schemaAt:], migration[migrationAt:]; schemaTail != migrationTail {
+		t.Errorf("the two artifacts diverge from the first ALTER TABLE onwards; they must be byte-identical there so both upgrade routes leave the same database\nSchemaSQL() tail (%d bytes):\n%s\nMigrationV3ToV4SQL() tail (%d bytes):\n%s",
+			len(schemaTail), schemaTail, len(migrationTail), migrationTail)
+	}
 }
