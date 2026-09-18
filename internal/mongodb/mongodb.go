@@ -78,6 +78,8 @@ type Config struct {
 	// dispatch. Default: "systemplane".
 	Module string
 
+	Connector Connector // nil in single-tenant mode
+
 	Logger    log.Logger
 	Telemetry store.Telemetry
 }
