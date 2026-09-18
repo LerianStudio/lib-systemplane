@@ -28,10 +28,12 @@ type Connector interface {
 	// their own scope, and the revision fence would act on them. Values never
 	// cross; notifications and revisions would.
 	//
-	// That constraint is enforced, not merely documented: a DSN that pins a
-	// schema is REFUSED with ErrSchemaIsolationUnsupported before anything is
-	// dialed, so the tenant loses its changefeed instead of the deployment
-	// losing revision integrity.
+	// That constraint is refused wherever the DSN reveals it: a DSN that pins
+	// a schema is rejected with ErrSchemaIsolationUnsupported before anything
+	// is dialed, so the tenant loses its changefeed instead of the deployment
+	// losing revision integrity. A role- or database-level default search_path
+	// cannot be detected — it is applied by the server, after connecting, and
+	// appears nowhere in the DSN — and remains the operator's responsibility.
 	ResolveDSN(ctx context.Context, tenantID string) (string, error)
 }
 
@@ -40,15 +42,29 @@ type Connector interface {
 // constructed the connector with a nil manager.
 var ErrPgMgrUnavailable = errors.New("systemplane/postgres: tenant-manager postgres manager is not configured")
 
-// ErrSchemaIsolationUnsupported is returned when a tenant DSN pins a schema,
-// the signature of schema-per-tenant isolation. See refuseSchemaIsolatedDSN.
-var ErrSchemaIsolationUnsupported = errors.New("systemplane/postgres: tenant DSN sets search_path (schema-per-tenant isolation); systemplane needs one database per tenant because NOTIFY is database-wide")
+// ErrSchemaIsolationUnsupported is returned when a DSN pins a schema, the
+// signature of schema-per-tenant isolation. It covers a tenant's DSN and the
+// single-tenant ListenDSN alike. See refuseSchemaIsolatedDSN.
+var ErrSchemaIsolationUnsupported = errors.New("systemplane/postgres: DSN sets search_path (schema-per-tenant isolation); systemplane needs one database per tenant because NOTIFY is database-wide")
 
-// refuseSchemaIsolatedDSN fails closed on a tenant DSN that pins a schema,
-// either as a bare search_path runtime parameter or inside libpq's options
-// string (the shape lib-commons builds: "options=-csearch_path=<schema>").
-// Both survive pgconn.ParseConfig as runtime parameters, which is what makes
-// the intent detectable before any connection is opened.
+// refuseSchemaIsolatedDSN fails closed on a DSN that pins a schema, either as
+// a bare search_path runtime parameter or inside libpq's options string (the
+// shape lib-commons builds: "options=-csearch_path=<schema>"). Both survive
+// pgconn.ParseConfig as runtime parameters, which is what makes the intent
+// detectable before any connection is opened. It guards every DSN this package
+// dials: a tenant's, resolved through the connector, and the single-tenant
+// ListenDSN alike.
+//
+// The comparison is case-INSENSITIVE on both the parameter name and the
+// options string, because pgconn keeps the connection string verbatim while
+// Postgres resolves GUC names case-insensitively: "SEARCH_PATH=tenant_a" and
+// "options=-cSEARCH_PATH=tenant_a" pin exactly the same schema as their
+// lowercase spellings.
+//
+// It sees only what the DSN carries. A search_path installed as a role or
+// database default is applied by the server after the connection is made and
+// is invisible here; keeping one database per install remains the operator's
+// responsibility.
 //
 // A pinned schema means several tenants share ONE database. NOTIFY is
 // database-wide, so each tenant's feed would receive every other tenant's
@@ -58,11 +74,16 @@ var ErrSchemaIsolationUnsupported = errors.New("systemplane/postgres: tenant DSN
 func refuseSchemaIsolatedDSN(dsn string) error {
 	cfg, err := pgconn.ParseConfig(dsn)
 	if err != nil {
-		return fmt.Errorf("systemplane/postgres: parse tenant DSN: %w", err)
+		return fmt.Errorf("systemplane/postgres: parse DSN: %w", err)
 	}
 
-	if cfg.RuntimeParams["search_path"] != "" || strings.Contains(cfg.RuntimeParams["options"], "search_path") {
-		return ErrSchemaIsolationUnsupported
+	for name, value := range cfg.RuntimeParams {
+		switch {
+		case strings.EqualFold(name, "search_path") && value != "":
+			return ErrSchemaIsolationUnsupported
+		case strings.EqualFold(name, "options") && strings.Contains(strings.ToLower(value), "search_path"):
+			return ErrSchemaIsolationUnsupported
+		}
 	}
 
 	return nil

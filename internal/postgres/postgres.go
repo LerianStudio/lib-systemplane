@@ -160,6 +160,12 @@ type Store struct {
 	// and the creator rechecks it before publishing anything.
 	closing bool
 
+	// startMu serializes Start. The zero-scope feed is shared, so the check
+	// for an existing reader and the launch of a new one must be one decision:
+	// without it two concurrent Starts each open a LISTEN backend on the same
+	// feed and every notification is delivered twice.
+	startMu sync.Mutex
+
 	mu     sync.Mutex
 	closed bool
 
@@ -224,6 +230,17 @@ func (s *Store) isClosed() bool {
 	defer s.mu.Unlock()
 
 	return s.closed
+}
+
+// isClosing reports the shutdown flag Close raises under feedsMu — the one a
+// feed creator rechecks before it publishes anything. It is deliberately the
+// same flag, not the s.mu one: a creator that dialed on one flag and published
+// on the other could still hand a live connection to a shut-down store.
+func (s *Store) isClosing() bool {
+	s.feedsMu.Lock()
+	defer s.feedsMu.Unlock()
+
+	return s.closing
 }
 
 // resolveDB returns the database handle for the current call.

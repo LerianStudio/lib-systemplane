@@ -1949,3 +1949,125 @@ func TestIntegration_PostgresEventCarriesRevision(t *testing.T) {
 		t.Fatalf("recreate event revision = %d, want %d (what Set reported)", back.Revision, recreated)
 	}
 }
+
+// The zero-scope feed is shared, so Start must open exactly one LISTEN
+// connection no matter how many callers race into it. Two readers on one feed
+// deliver every NOTIFY twice — the engine would then apply, and fence, each
+// change against itself.
+func TestIntegration_PostgresConcurrentStartOpensOneListener(t *testing.T) {
+	base, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	admin := adminDSN(t, base)
+
+	defer func() { _ = admin.Close() }()
+
+	dbName, tenantDSN, db := provisionTenantDB(t, admin, base, "concurrentstart")
+
+	s, err := postgres.New(postgres.Config{DB: db, ListenDSN: tenantDSN})
+	if err != nil {
+		t.Fatalf("postgres.New: %v", err)
+	}
+
+	t.Cleanup(func() { _ = s.Close() })
+
+	ctx := context.Background()
+
+	const callers = 8
+
+	errs := make(chan error, callers)
+
+	var wg sync.WaitGroup
+
+	for range callers {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			errs <- s.Start(ctx)
+		}()
+	}
+
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent Start: %v", err)
+		}
+	}
+
+	waitForListenBackends(t, admin, dbName, 1, "concurrent Start calls share one LISTEN connection")
+
+	events := make(chan store.Event, 16)
+
+	unsub, err := s.Subscribe(ctx, store.Scope{}, func(evt store.Event) {
+		select {
+		case events <- evt:
+		default:
+		}
+	})
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	defer unsub()
+
+	if first := recvEvent(t, events, "joining resync"); first.Op != store.OpResync {
+		t.Fatalf("first event = %+v, want %q", first, store.OpResync)
+	}
+
+	if _, err := s.Set(ctx, store.Scope{}, store.Entry{
+		Namespace: "ns",
+		Key:       "k",
+		Value:     jsonBytes(t, "v1"),
+	}); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+
+	evt := recvEvent(t, events, "upsert of ns/k")
+	if evt.Op != store.OpUpsert || evt.Namespace != "ns" || evt.Key != "k" {
+		t.Fatalf("event = %+v, want an upsert of ns/k", evt)
+	}
+
+	select {
+	case dup := <-events:
+		t.Fatalf("one write produced a second event %+v: more than one reader is attached to the zero-scope feed", dup)
+	case <-time.After(3 * time.Second):
+	}
+}
+
+// Against a real server: a ListenDSN that pins a schema is refused before
+// anything is dialed, so the database ends up with no LISTEN backend at all.
+// The unit test pins the sentinel; this one pins that nothing was opened.
+func TestIntegration_PostgresStartRefusesSchemaIsolatedListenDSN(t *testing.T) {
+	base, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	admin := adminDSN(t, base)
+
+	defer func() { _ = admin.Close() }()
+
+	dbName, tenantDSN, db := provisionTenantDB(t, admin, base, "pinned_schema")
+
+	s, err := postgres.New(postgres.Config{DB: db, ListenDSN: tenantDSN + "&options=-csearch_path%3Dapp"})
+	if err != nil {
+		t.Fatalf("postgres.New: %v", err)
+	}
+
+	t.Cleanup(func() { _ = s.Close() })
+
+	err = s.Start(context.Background())
+	if err == nil {
+		t.Fatal("Start with a schema-isolated ListenDSN returned nil; want the schema-isolation refusal")
+	}
+
+	if !errors.Is(err, postgres.ErrSchemaIsolationUnsupported) {
+		t.Fatalf("Start error = %v, want postgres.ErrSchemaIsolationUnsupported", err)
+	}
+
+	if n := listenBackends(t, admin, dbName); n != 0 {
+		t.Fatalf("a refused ListenDSN left %d LISTEN connections on %s, want 0", n, dbName)
+	}
+}

@@ -832,6 +832,14 @@ func TestPostgresSubscribe_SchemaIsolatedDSNIsRefused(t *testing.T) {
 	}{
 		{name: "search_path parameter", dsn: unreachableDSN + "&search_path=tenant_a"},
 		{name: "options -c search_path", dsn: unreachableDSN + "&options=-csearch_path%3Dtenant_a"},
+		// Postgres resolves GUC names case-insensitively while pgconn keeps the
+		// connection string verbatim, so an upper- or mixed-case spelling pins
+		// exactly the same schema through a check that only knew the lowercase
+		// one.
+		{name: "SEARCH_PATH parameter", dsn: unreachableDSN + "&SEARCH_PATH=tenant_a"},
+		{name: "Search_Path parameter", dsn: unreachableDSN + "&Search_Path=tenant_a"},
+		{name: "options -c SEARCH_PATH", dsn: unreachableDSN + "&options=-cSEARCH_PATH%3Dtenant_a"},
+		{name: "options -c Search_Path", dsn: unreachableDSN + "&options=-cSearch_Path%3Dtenant_a"},
 	}
 
 	for _, tc := range cases {
@@ -931,6 +939,139 @@ func TestPostgresSubscribe_NilContext(t *testing.T) {
 
 	if n := subscriberCount(s); n != 0 {
 		t.Errorf("subscriber map size = %d, want 0 after unsubscribe", n)
+	}
+
+	waitForObserverExit(t)
+}
+
+// The one-database-per-tenant rule is not a tenant-only rule. Two installations
+// that share one database through per-schema search_paths cross-contaminate
+// through the single-tenant ListenDSN exactly as two tenants would: NOTIFY is
+// database-wide and both feeds listen on the same channel. Start must refuse
+// the DSN before it opens anything.
+func TestPostgresStart_SchemaIsolatedListenDSNIsRefused(t *testing.T) {
+	cases := []struct {
+		name string
+		dsn  string
+	}{
+		{name: "search_path parameter", dsn: unreachableDSN + "&search_path=app"},
+		{name: "SEARCH_PATH parameter", dsn: unreachableDSN + "&SEARCH_PATH=app"},
+		{name: "options -c search_path", dsn: unreachableDSN + "&options=-csearch_path%3Dapp"},
+		{name: "options -c SEARCH_PATH", dsn: unreachableDSN + "&options=-cSEARCH_PATH%3Dapp"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &Store{
+				cfg:      Config{Channel: defaultChannel, Table: defaultTable, Module: defaultModule, ListenDSN: tc.dsn},
+				feeds:    map[string]*feed{},
+				closedCh: make(chan struct{}),
+			}
+
+			err := s.Start(context.Background())
+			if err == nil {
+				t.Fatal("Start with a schema-isolated ListenDSN returned nil; want ErrSchemaIsolationUnsupported")
+			}
+
+			if !errors.Is(err, ErrSchemaIsolationUnsupported) {
+				t.Fatalf("Start error = %v, want ErrSchemaIsolationUnsupported", err)
+			}
+
+			if !strings.Contains(err.Error(), "listen dsn") {
+				t.Errorf("Start error %q must name the listen DSN", err)
+			}
+
+			if n := feedCount(s); n != 0 {
+				t.Errorf("feeds map holds %d entries after a refused ListenDSN, want 0", n)
+			}
+
+			if err := s.Close(); err != nil {
+				t.Fatalf("close: %v", err)
+			}
+		})
+	}
+}
+
+// A ListenDSN without a search_path still reaches the dialer, which is what
+// makes the refusal above meaningful rather than a blanket Start failure.
+func TestPostgresStart_PlainListenDSNStillDials(t *testing.T) {
+	s := &Store{
+		cfg:      Config{Channel: defaultChannel, Table: defaultTable, Module: defaultModule, ListenDSN: unreachableDSN},
+		feeds:    map[string]*feed{},
+		closedCh: make(chan struct{}),
+	}
+
+	err := s.Start(context.Background())
+	if err == nil {
+		t.Fatal("Start against a closed port returned nil; want the dial to fail")
+	}
+
+	if errors.Is(err, ErrSchemaIsolationUnsupported) {
+		t.Fatalf("Start error = %v; a DSN without a search_path must not be refused as schema-isolated", err)
+	}
+
+	if !strings.Contains(err.Error(), "listen connect") {
+		t.Errorf("Start error %q must come from the dialer", err)
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
+
+// startListener must not open a second connection for a feed whose reader is
+// already running: the zero-scope feed is shared, and two readers on it deliver
+// every NOTIFY twice. The DSN here is unreachable, so a second dial surfaces as
+// an error instead of passing silently.
+func TestPostgresStartListener_SkipsWhenReaderAlreadyRunning(t *testing.T) {
+	s := newSubscribeStore()
+	s.cfg.ListenDSN = unreachableDSN
+
+	s.feedsMu.Lock()
+	f := s.feeds[""]
+	s.feedsMu.Unlock()
+
+	f.mu.Lock()
+	f.done = make(chan struct{})
+	f.mu.Unlock()
+
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("Start on a feed whose reader is already running: %v", err)
+	}
+}
+
+// Close landing while a creator is still resolving the tenant's DSN must stop
+// the dial, not merely throw the connection away after it succeeded. The
+// connector closes the store from inside ResolveDSN, which is the window
+// acquireFeed's shutdown fence cannot cover; unreachableDSN is the
+// discriminator, because a dial that happens at all fails with a connect error
+// instead of store.ErrClosed.
+func TestPostgresSubscribe_CloseDuringResolutionSkipsTheDial(t *testing.T) {
+	s := newSubscribeStore()
+	s.cfg.MultiTenantEnabled = true
+
+	conn := &stubConnector{}
+	conn.resolve = func(int) (string, error) {
+		s.feedsMu.Lock()
+		s.closing = true
+		s.feedsMu.Unlock()
+
+		return unreachableDSN, nil
+	}
+	s.cfg.Connector = conn
+
+	unsub, err := s.Subscribe(context.Background(), store.Scope{Tenant: "t1"}, func(store.Event) {})
+	if err == nil {
+		unsub()
+		t.Fatal("Subscribe on a store closed mid-resolution returned nil; want store.ErrClosed")
+	}
+
+	if !errors.Is(err, store.ErrClosed) {
+		t.Fatalf("Subscribe error = %v, want store.ErrClosed", err)
+	}
+
+	if n := feedCount(s); n != 1 {
+		t.Errorf("feeds map holds %d entries, want only the zero-scope feed", n)
 	}
 
 	waitForObserverExit(t)

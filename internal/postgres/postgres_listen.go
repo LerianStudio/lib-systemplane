@@ -15,7 +15,14 @@
 // stamped with their OWN scope, and the engine's revision fence would treat
 // the other tenant's revision as authoritative. Values never cross — every
 // read re-resolves through the tenant's own handle — but notifications and
-// revisions would.
+// revisions would. The single-tenant ListenDSN is held to the same rule: two
+// installations pinned to different schemas of one database cross-contaminate
+// the same way.
+//
+// That rule is refused wherever the DSN reveals it — every DSN this package
+// dials is checked before it is opened — but a search_path installed as a role
+// or database default appears nowhere in the DSN and cannot be detected, so
+// one database per install remains the operator's responsibility.
 package postgres
 
 import (
@@ -643,6 +650,16 @@ func (s *Store) Subscribe(ctx context.Context, scope store.Scope, fn func(store.
 // with it the reserved feed slot every later Subscribe for that tenant waits
 // on. The teardown interlock in publishFeed is only as tight as this bound.
 func (s *Store) openListen(ctx context.Context, f *feed) (*pgx.Conn, error) {
+	// Last look before the socket. The shutdown fence in acquireFeed is taken
+	// before the DSN is resolved, and resolving it is a round trip through the
+	// tenant manager: a Close landing in between would otherwise open a
+	// connection for a store that is already tearing down, and publishFeed
+	// would immediately throw it away. Refusing here keeps a closing store from
+	// dialing at all.
+	if s.isClosing() {
+		return nil, store.ErrClosed
+	}
+
 	connectCtx, cancelConnect := context.WithTimeout(ctx, connectTimeout)
 	defer cancelConnect()
 
@@ -700,6 +717,23 @@ func (s *Store) startFeedReader(f *feed, conn *pgx.Conn) {
 // meanwhile must be able to throw it away instead of inheriting a live LISTEN
 // connection and a reader goroutine no later Close will ever stop.
 func (s *Store) startListener(ctx context.Context) error {
+	// Two installations sharing one database through per-schema search_paths
+	// cross-contaminate exactly as two tenants would — NOTIFY is database-wide
+	// and both feeds listen on the same channel name — so the single-tenant
+	// DSN is held to the same one-database rule as a tenant's.
+	if err := refuseSchemaIsolatedDSN(s.cfg.ListenDSN); err != nil {
+		return fmt.Errorf("systemplane/postgres: listen dsn: %w", err)
+	}
+
+	// One Start at a time. The zero-scope feed is SHARED, so the "already
+	// running" check below and the reader launch inside publishFeed have to be
+	// one decision: two concurrent Starts that both saw no reader would each
+	// open a LISTEN backend on the same feed, and every NOTIFY would then be
+	// delivered to every subscriber twice. The connect itself is bounded by
+	// connectTimeout, so a second caller waits at most that long.
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
+
 	f, err := s.zeroFeed()
 	if err != nil {
 		return err

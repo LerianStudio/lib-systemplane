@@ -45,6 +45,18 @@ func parseNotifyPayload(data string) (store.Event, bool) {
 		return store.Event{}, false
 	}
 
+	// The op whitelist, and ONLY the op. OpResync and OpDisconnect are
+	// synthesized by the feed from what it observed on the wire, so a payload
+	// must never be able to name one: any writer with NOTIFY rights on the
+	// channel could otherwise force a pointless full reconcile, or mark a
+	// healthy scope stale.
+	//
+	// This is not payload validation. The revision field is NOT checked — any
+	// int64 a payload carries is passed through — so a forged NOTIFY can name
+	// any revision it likes. Nothing downstream may trust it as the authority
+	// on what is stored: the engine records the revision of the row it
+	// re-reads, never the payload's, and that re-read is what fences a stale
+	// value.
 	op := p.Op
 	if op != store.OpUpsert && op != store.OpDelete {
 		return store.Event{}, false
