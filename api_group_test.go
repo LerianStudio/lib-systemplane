@@ -2014,3 +2014,49 @@ func TestGroupOnApplyReceivesTheDefaultAfterADelete(t *testing.T) {
 		t.Errorf("LastErr after a delete every applier accepted = %v, want nil", status[0].LastErr)
 	}
 }
+
+// TestGroupOnApplyRefusesAPublishedNullDocument pins the only thing standing
+// between a stored JSON null and a hot-reload applier: without it the applier
+// is handed a wholly blank document — empty name, zero retries, no hosts — and
+// applies it as if an operator had written it, while Status reports the scope
+// converged and error-free. The seed path reaches the guard, so this is live
+// behaviour rather than defensive dead code.
+func TestGroupOnApplyRefusesAPublishedNullDocument(t *testing.T) {
+	t.Parallel()
+
+	s := newGroupMemoryStore()
+	s.seed(t, "runtime", "ingest", nil)
+
+	c := newGroupHotClient(t, s)
+	g := bindGroupOn(t, c)
+	startGroupClient(t, c)
+
+	var rec applyRecorder
+
+	unsubscribe, err := g.OnApply(rec.apply)
+	if err != nil {
+		t.Fatalf("OnApply: %v", err)
+	}
+
+	t.Cleanup(unsubscribe)
+
+	var blank groupConfig
+
+	for i, a := range rec.all() {
+		if reflect.DeepEqual(a.Value, blank) {
+			t.Fatalf("delivery %d handed the applier the blank document %#v: a stored null must never reach an applier", i, a.Value)
+		}
+	}
+
+	// The rejection is recorded on the scope but erased on the way out: every
+	// revision the wave-1 facade publishes is 0, and an applier that accepted
+	// nothing reports Applied 0 too, so FC-7's "LastErr is nil when Desired ==
+	// Applied" clears it. Pinned here for the same reason as
+	// TestCoordinatorRejectionAtRevisionZeroReadsAsConverged in internal/group:
+	// it is a contract amendment away, not a code fix.
+	for _, st := range g.Status() {
+		if st.Desired != st.Applied || st.LastErr != nil {
+			t.Errorf("Status entry = %#v, want a converged scope with a nil LastErr on the wave-1 facade", st)
+		}
+	}
+}

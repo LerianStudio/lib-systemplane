@@ -208,29 +208,47 @@ func TestCoordinatorSerializesDeliveriesPerScope(t *testing.T) {
 
 	// inFlight is deliberately unguarded: two deliveries running concurrently
 	// have no happens-before edge between them, so -race reports the overlap.
+	// delivered is unguarded for the same reason, and it is what stops this test
+	// passing on a coordinator that never invokes an applier at all: overlapped
+	// starts false and is only ever written from inside a delivery.
 	inFlight := false
 	overlapped := false
+	delivered := [2]int{}
 
-	serialized := func(_ context.Context, _ Decoded[coordDoc], _ *Decoded[coordDoc]) error {
-		if inFlight {
-			overlapped = true
+	serialized := func(which int) ApplyFunc[coordDoc] {
+		return func(_ context.Context, _ Decoded[coordDoc], _ *Decoded[coordDoc]) error {
+			if inFlight {
+				overlapped = true
+			}
+
+			inFlight = true
+			delivered[which]++
+			time.Sleep(time.Microsecond)
+			inFlight = false
+
+			return nil
 		}
-
-		inFlight = true
-		time.Sleep(time.Microsecond)
-		inFlight = false
-
-		return nil
 	}
 
-	for range 2 {
-		unsubscribe := c.Register(serialized)
+	for which := range 2 {
+		unsubscribe := c.Register(serialized(which))
 		defer unsubscribe()
+	}
+
+	// One publication on this goroutine, before any concurrency: its fan-out
+	// runs to completion here, so both counters are readable without a race and
+	// a coordinator that delivers nothing fails on the spot.
+	c.Publish(ctx, publication("t1", 1, "warm"))
+
+	for which, count := range delivered {
+		if count == 0 {
+			t.Fatalf("applier %d received no delivery at all, so the serialization this test guards was never exercised", which)
+		}
 	}
 
 	var wg sync.WaitGroup
 
-	for revision := int64(1); revision <= 20; revision++ {
+	for revision := int64(2); revision <= 21; revision++ {
 		wg.Add(1)
 
 		go func() {
@@ -325,9 +343,21 @@ func TestCoordinatorNeverDeliversTheSameObservationTwice(t *testing.T) {
 	wg.Wait()
 	unsubscribe()
 
+	got := rec.all()
+	if len(got) == 0 {
+		t.Fatal("the registration delivered nothing at all, so the dedupe this test guards was never exercised")
+	}
+
+	// Deterministic on every interleaving: whoever drains reads the scope's
+	// newest observation, and only one goroutine drains a scope at a time, so
+	// revision 2 is always the last thing to land.
+	if last := got[len(got)-1].current.Revision; last != 2 {
+		t.Errorf("final delivery carried revision %d, want 2: the newest observation must always be the one left in force", last)
+	}
+
 	var previous int64
 
-	for i, d := range rec.all() {
+	for i, d := range got {
 		if i > 0 && d.current.Revision <= previous {
 			t.Errorf("delivery %d carried revision %d after %d: an observation was repeated or inverted",
 				i, d.current.Revision, previous)
@@ -477,4 +507,83 @@ func TestCoordinatorNilReceiverIsSafe(t *testing.T) {
 	if got := c.Status(); got != nil {
 		t.Errorf("Status() on a nil coordinator = %#v, want nil", got)
 	}
+}
+
+// blowUpOnMarshal is a document whose MarshalJSON panics. A group carries the
+// consumer's own type — Group.Set persists the caller's struct verbatim and the
+// client's value clone preserves its concrete type — so it is the consumer's
+// MarshalJSON that runs inside the coordinator, and inside its state mutex.
+type blowUpOnMarshal struct{}
+
+func (blowUpOnMarshal) MarshalJSON() ([]byte, error) { panic("MarshalJSON exploded") }
+
+func constantDecode(any) (coordDoc, error) { return coordDoc{Name: "decoded"}, nil }
+
+func noopApply(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error { return nil }
+
+func seedOf(pub Publication) func() (Publication, bool) {
+	return func() (Publication, bool) { return pub, true }
+}
+
+func mustPanic(t *testing.T, what string, fn func()) {
+	t.Helper()
+
+	defer func() {
+		if recover() == nil {
+			t.Fatalf("%s did not panic, so this test proves nothing", what)
+		}
+	}()
+
+	fn()
+}
+
+// stillResponsive is the whole assertion: a coordinator whose mutex was
+// released can still be read and published to.
+func stillResponsive(t *testing.T, c *Coordinator[coordDoc]) {
+	t.Helper()
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		c.Status()
+		c.Publish(context.Background(), publication("", 9, "after"))
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the state mutex is still held after a panic under it: every later publication and every Status blocks forever, hot reload stops, and a health check calling Status leaks a goroutine per call")
+	}
+}
+
+// TestCoordinatorPanicUnderTheStateMutexDoesNotWedgeTheGroup covers both
+// critical sections that run consumer-controlled code: the marshal the seed
+// watermark does on a publication, and the seed read itself.
+func TestCoordinatorPanicUnderTheStateMutexDoesNotWedgeTheGroup(t *testing.T) {
+	t.Run("publish", func(t *testing.T) {
+		c := NewCoordinator[coordDoc](nil, constantDecode, seedOf(publication("", 1, "seeded")))
+
+		unsubscribe := c.Register(noopApply)
+		defer unsubscribe()
+
+		// Registering took the seed, which armed the watermark, so this
+		// publication is marshalled under the state mutex.
+		mustPanic(t, "Publish of a document whose MarshalJSON panics", func() {
+			c.Publish(context.Background(), Publication{Revision: 1, Value: blowUpOnMarshal{}})
+		})
+
+		stillResponsive(t, c)
+	})
+
+	t.Run("register", func(t *testing.T) {
+		c := NewCoordinator[coordDoc](nil, constantDecode, func() (Publication, bool) {
+			panic("the seed read exploded")
+		})
+
+		mustPanic(t, "Register whose seed read panics", func() { c.Register(noopApply) })
+
+		stillResponsive(t, c)
+	})
 }

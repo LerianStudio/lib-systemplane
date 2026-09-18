@@ -7,12 +7,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
+	"github.com/LerianStudio/lib-observability/v4/runtime"
 )
 
 // Publication is one published revision of a group's document in one scope.
@@ -162,37 +162,54 @@ func (c *Coordinator[T]) Publish(ctx context.Context, pub Publication) {
 
 	value, err := c.decode(pub.Value)
 
-	c.mu.Lock()
-
-	sc := c.scopeLocked(pub.Tenant)
-
-	// The one publication a seed anticipates is the same observation as the
-	// seed, so it is spent here rather than delivered a second time.
-	if dropsAfterSeedLocked(sc, pub) {
-		c.mu.Unlock()
-
+	sc, spent := c.record(pub, value, err)
+	if spent {
 		return
 	}
 
-	// Assignment, not max: a delete publishes Revision 0 and that IS the newest
-	// state of the scope, so max would report a converged group as lagging.
-	sc.desired = pub.Revision
-
 	if err != nil {
-		sc.lastErr = err
-		c.mu.Unlock()
-
 		c.logError(ctx, "systemplane.group: published document failed to decode",
 			log.Err(err), log.String("tenant", pub.Tenant), log.Any("revision", pub.Revision))
 
 		return
 	}
 
+	c.drain(ctx, sc)
+}
+
+// record stores pub as the scope's newest state and reports whether the seed
+// watermark spent it. The unlock is deferred rather than manual because this
+// critical section runs code the consumer owns — json.Marshal on its own
+// document, reached through the watermark — and a panic in it must not leave
+// the group's mutex held: every later Publish and every Status would then block
+// forever, silently, with hot reload stopped and no signal anywhere. The decode
+// failure is logged by the caller, outside the lock, for the same reason: the
+// logger is the consumer's too.
+func (c *Coordinator[T]) record(pub Publication, value T, decodeErr error) (*scope[T], bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	sc := c.scopeLocked(pub.Tenant)
+
+	// The one publication a seed anticipates is the same observation as the
+	// seed, so it is spent here rather than delivered a second time.
+	if dropsAfterSeedLocked(sc, pub) {
+		return nil, true
+	}
+
+	// Assignment, not max: a delete publishes Revision 0 and that IS the newest
+	// state of the scope, so max would report a converged group as lagging.
+	sc.desired = pub.Revision
+
+	if decodeErr != nil {
+		sc.lastErr = decodeErr
+
+		return sc, false
+	}
+
 	c.observeLocked(sc, pub, value)
 
-	c.mu.Unlock()
-
-	c.drain(ctx, sc)
+	return sc, false
 }
 
 // observeLocked records value as the scope's newest observation. The sequence
@@ -245,24 +262,7 @@ func (c *Coordinator[T]) Register(fn ApplyFunc[T]) func() {
 
 	ctx := context.Background()
 
-	c.mu.Lock()
-
-	c.nextID++
-	id := c.nextID
-	c.appliers = append(c.appliers, &applier[T]{id: id, fn: fn, state: map[string]*applierScope[T]{}})
-
-	seeded, seedErr := c.seedLocked()
-
-	observed := make([]*scope[T], 0, len(c.scopes))
-
-	for _, sc := range c.scopes {
-		if sc.observed {
-			observed = append(observed, sc)
-		}
-	}
-
-	c.mu.Unlock()
-
+	id, observed, seeded, seedErr := c.add(fn)
 	if seedErr != nil {
 		c.logError(ctx, "systemplane.group: seeded document failed to decode",
 			log.Err(seedErr), log.String("tenant", seeded.Tenant), log.Any("revision", seeded.Revision))
@@ -281,6 +281,34 @@ func (c *Coordinator[T]) Register(fn ApplyFunc[T]) func() {
 			c.remove(id)
 		})
 	}
+}
+
+// add appends fn, takes the seed when no publication has been observed yet, and
+// reports the scopes worth replaying. The unlock is deferred rather than manual
+// because this critical section runs code the consumer owns — the seed read,
+// the group's decoder and json.Marshal on its own document — and a panic in it
+// must not leave the group's mutex held: every later Publish and every Status
+// would then block forever, silently, with hot reload stopped and no signal
+// anywhere.
+func (c *Coordinator[T]) add(fn ApplyFunc[T]) (uint64, []*scope[T], Publication, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.nextID++
+	id := c.nextID
+	c.appliers = append(c.appliers, &applier[T]{id: id, fn: fn, state: map[string]*applierScope[T]{}})
+
+	seeded, seedErr := c.seedLocked()
+
+	observed := make([]*scope[T], 0, len(c.scopes))
+
+	for _, sc := range c.scopes {
+		if sc.observed {
+			observed = append(observed, sc)
+		}
+	}
+
+	return id, observed, seeded, seedErr
 }
 
 // Status reports desired and applied revisions per scope the coordinator has
@@ -464,8 +492,13 @@ func (c *Coordinator[T]) pendingLocked(sc *scope[T], observed observation[T]) []
 
 // invoke runs one applier and turns every failure mode into an error: a
 // returned error passes through, and a panic is recovered into one. The recover
-// is the coordinator's own rather than a lib-observability helper because those
-// swallow the recovered value, and FC-7 needs it as the scope's LastErr.
+// is the coordinator's own because the RecoverAndLog family swallows the
+// recovered value and FC-7 needs it as the scope's LastErr; the value is then
+// handed to runtime.HandlePanicValue, which is built for a panic recovered
+// elsewhere and does not recover itself. That is what keeps a panicking
+// hot-reload hook on the fleet's panic counter, on the publication's span and
+// at the error reporter, and what redacts the value and the stack in
+// production mode.
 func (c *Coordinator[T]) invoke(
 	ctx context.Context,
 	fn ApplyFunc[T],
@@ -476,8 +509,7 @@ func (c *Coordinator[T]) invoke(
 		if recovered := recover(); recovered != nil {
 			err = fmt.Errorf("systemplane/group: apply function panicked: %v", recovered)
 
-			c.logError(ctx, "systemplane.group: apply function panicked",
-				log.Any("panic", recovered), log.String("stack", string(debug.Stack())))
+			runtime.HandlePanicValue(ctx, c.logger, recovered, "systemplane", "group.apply")
 		}
 	}()
 

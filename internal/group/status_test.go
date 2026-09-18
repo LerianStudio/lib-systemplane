@@ -422,3 +422,45 @@ func TestCoordinatorStatusIsSortedByTenant(t *testing.T) {
 		}
 	}
 }
+
+// TestCoordinatorRejectionAtRevisionZeroReadsAsConverged pins a hole this lane
+// cannot close on its own. FC-7 freezes ApplyStatus.LastErr as "nil when
+// Desired == Applied", and an applier that has accepted nothing reports Applied
+// 0 — the very value a publication at Revision 0 desires. A rejected Revision-0
+// document therefore reads back as a converged, error-free scope, and through
+// the wave-1 facade EVERY publication is Revision 0, so an applier refusing a
+// configuration is invisible on the only error surface FC-7 gives a consumer.
+//
+// Closing it means either letting LastErr outlive Desired == Applied, or giving
+// Applied a "nothing accepted yet" value that is not a revision. Both change
+// what FC-7 promises, so it is the orchestrator's call, not this lane's. The
+// behaviour is pinned here instead of fixed: this test flips the day FC-7 is
+// amended, which is exactly when it should.
+func TestCoordinatorRejectionAtRevisionZeroReadsAsConverged(t *testing.T) {
+	c := newCoordinator(t)
+	ctx := context.Background()
+
+	invocations := 0
+
+	unsubscribe := c.Register(func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
+		invocations++
+
+		return errRejected
+	})
+	defer unsubscribe()
+
+	c.Publish(ctx, publication("t1", 0, "zero"))
+
+	if invocations != 1 {
+		t.Fatalf("the applier ran %d times, want 1: without a real rejection this test proves nothing", invocations)
+	}
+
+	got := statusOf(t, c, "t1")
+	if got.Desired != 0 || got.Applied != 0 {
+		t.Fatalf("Status = %#v, want Desired 0 and Applied 0", got)
+	}
+
+	if got.LastErr != nil {
+		t.Fatalf("Status.LastErr = %v, but FC-7 requires nil when Desired == Applied; changing this is a contract amendment, not a test fix", got.LastErr)
+	}
+}
