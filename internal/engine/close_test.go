@@ -34,6 +34,13 @@ func closeEngine(t *testing.T, timeout time.Duration) *Engine {
 	return e
 }
 
+// hangGuard is the bound every wait in these tests that is ONLY a hang guard
+// uses. It is deliberately far longer than anything being waited for: the wait
+// ends on the event, not on the clock, so the only thing a tighter bound buys
+// is a red test on a loaded runner. Bounds that are themselves under test —
+// the close timeout a stuck callback must trip — stay short and explicit.
+const hangGuard = 30 * time.Second
+
 // mustReceive waits for ch to fire, failing the test rather than hanging the
 // package when a delivery never happens.
 func mustReceive(t *testing.T, ch <-chan struct{}, what string) {
@@ -41,7 +48,7 @@ func mustReceive(t *testing.T, ch <-chan struct{}, what string) {
 
 	select {
 	case <-ch:
-	case <-time.After(5 * time.Second):
+	case <-time.After(hangGuard):
 		t.Fatalf("timed out waiting for %s", what)
 	}
 }
@@ -311,7 +318,7 @@ func mustCloseCleanly(t *testing.T, done <-chan error) {
 		if err != nil {
 			t.Fatalf("Close() = %v, want nil", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(hangGuard):
 		t.Fatal("Close() never returned")
 	}
 }
@@ -358,14 +365,14 @@ func TestCloseWaitsForADebouncedReReadInFlight(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 	scope := store.Scope{}
 	fs := newFakeStore()
-	e := storeEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, time.Millisecond, 2*time.Second)
+	e := storeEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, time.Millisecond, hangGuard)
 
 	fs.seed(scope, jsonRow(nk, 1, `"live"`, "ops"))
 
 	release := heldGet(fs)
 
 	e.onEvent(upsertEvent(scope, nk, 1))
-	waitFor(t, time.Second, "the debounced re-read to reach its Get", func() bool { return fs.getCount() == 1 })
+	waitFor(t, hangGuard, "the debounced re-read to reach its Get", func() bool { return fs.getCount() == 1 })
 
 	done := closeInBackground(e)
 	mustStillBeWaiting(t, done, "a debounced re-read was still inside Store.Get")
@@ -500,7 +507,7 @@ func TestDropScopeStopsThatScopesWorkers(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 	tenant := store.Scope{Tenant: "acme"}
 	fs := newFakeStore()
-	e := storeEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0, 2*time.Second)
+	e := storeEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0, hangGuard)
 
 	var rec recorder
 
@@ -511,7 +518,7 @@ func TestDropScopeStopsThatScopesWorkers(t *testing.T) {
 	// tenant scope and nothing else.
 	bringUp(t, e, tenant)
 	e.onEvent(resyncEvent(tenant))
-	waitFor(t, 2*time.Second, "the tenant's first reconcile to announce its keys",
+	waitFor(t, hangGuard, "the tenant's first reconcile to announce its keys",
 		func() bool { return rec.len() == 1 })
 
 	e.dropScope(tenant)

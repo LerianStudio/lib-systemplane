@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/LerianStudio/lib-systemplane/v4/internal/debounce"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -27,24 +26,22 @@ func feedEngine(t *testing.T, defs map[NSKey]KeyDef, fs *fakeStore, window time.
 // test can hand the engine a registry that fires a hook at the exact moment a
 // reconcile decides a key — which is how a feed event is landed inside the gap
 // a fence is supposed to close, without guessing at it with a sleep.
+//
+// It goes through New rather than building the struct: New derives fields from
+// Config that a literal silently leaves zero. debounceAsync is the one that
+// mattered — a hand-built engine with a non-zero window ran every debounced
+// re-read inline on the caller's goroutine, so every feed and reconcile test
+// with a real quiet window exercised a path production never takes.
 func registryEngine(t *testing.T, reg Registry, fs *fakeStore, window time.Duration) *Engine {
 	t.Helper()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	e := &Engine{
-		store:           fs,
-		registry:        reg,
-		scopes:          map[store.Scope]*scopeState{},
-		debouncer:       debounce.New[scopeNSKey](window),
-		lifecycleCtx:    ctx,
-		lifecycleCancel: cancel,
-	}
+	e := New(Config{Store: fs, Registry: reg, Debounce: window})
 
 	track(t, e, store.Scope{})
 
 	t.Cleanup(func() {
 		e.debouncer.Close()
-		cancel()
+		e.lifecycleCancel()
 		// The same door Close uses, for the same reason: a straggler re-read
 		// or reconcile that reached the WaitGroup while this Wait ran would
 		// kill the test binary rather than fail a test.
@@ -304,6 +301,50 @@ func TestFeedRecordsTouchedOnlyWhileReconciling(t *testing.T) {
 
 	if len(unusable) != 1 || unusable[0] != other {
 		t.Errorf("unusable: got %v, want [%v]", unusable, other)
+	}
+}
+
+// TestReReadRejectedByRevisionFenceLandsInTouchedNotUnusable pins the one
+// outcome the two fences would otherwise disagree about. A re-read that decoded
+// and passed the registered validator DID teach the engine the key's value; the
+// fence then found it no newer than what is cached and published nothing.
+//
+// That is "the cache is already current", not "the engine learned nothing", and
+// only the first keeps an older photograph off the key: a reconcile deciding a
+// row its own List DID carry consults touched alone, so a key filed as unusable
+// takes the snapshot row — which is exactly the row the fence just refused.
+func TestReReadRejectedByRevisionFenceLandsInTouchedNotUnusable(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0)
+
+	fs.seed(scope, jsonRow(nk, 5, `"five"`, "ops"))
+	e.onEvent(upsertEvent(scope, nk, 5))
+
+	arm := armReconcile(e, scope)
+	defer e.scopeFor(scope).closeWindow(arm)
+
+	// A row the fence refuses: it decodes and it validates, it is simply older
+	// than what the cache already holds.
+	fs.seed(scope, jsonRow(nk, 3, `"three"`, "ops"))
+	e.onEvent(upsertEvent(scope, nk, 3))
+
+	touched, unusable := recordedSets(e, scope)
+	if len(touched) != 1 || touched[0] != nk {
+		t.Errorf("touched: got %v, want [%v]: a value the fence merely deduplicated is still a value the feed read",
+			touched, nk)
+	}
+
+	if len(unusable) != 0 {
+		t.Errorf("unusable: got %v, want empty: filing it there tells a reconcile the feed learned nothing "+
+			"about the key, and its older snapshot row then lands on top of the newer cached value", unusable)
+	}
+
+	got, ok := e.Lookup(scope, nk)
+	if !ok || got.Revision != 5 || got.Value != "five" {
+		t.Errorf("cached after the rejected re-read: got (%v, rev %d, found %t), want (\"five\", rev 5, true)",
+			got.Value, got.Revision, ok)
 	}
 }
 

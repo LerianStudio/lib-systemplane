@@ -5,6 +5,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -514,10 +515,23 @@ func quiesce(t *testing.T, e *Engine) {
 		e.debouncer.Submit(scopeNSKey{Namespace: quiesceKey.Namespace, Key: quiesceKey.Key}, fire)
 	}
 
-	waitFor(t, 10*time.Second, "the quiesce sentinel to be delivered", func() bool {
+	waitFor(t, hangGuard, "the quiesce sentinel to be delivered", func() bool {
 		return rec.len() > 0
 	})
-	waitFor(t, 10*time.Second, "every dispatch worker to go idle", func() bool {
+
+	// Idleness is sampled TWICE, with a yield between. workersIdle reads the
+	// busy marker and then the mailboxes, so one sample taken while a worker
+	// sits between waking and marking itself busy reports idle for a delivery
+	// about to start. The second sample's marker read happens after the first
+	// sample's mailbox read, hence after the worker took the Change and set
+	// the marker, so a worker mid-delivery can no longer read as idle twice.
+	waitFor(t, hangGuard, "every dispatch worker to go idle", func() bool {
+		if !workersIdle(e) {
+			return false
+		}
+
+		runtime.Gosched()
+
 		return workersIdle(e)
 	})
 }
@@ -584,6 +598,80 @@ func TestQuiesceOutlastsASlowDelivery(t *testing.T) {
 
 	if got := rec.len(); got != 1 {
 		t.Fatalf("deliveries after quiesce: got %d, want 1 — quiesce returned before a slow delivery landed", got)
+	}
+}
+
+// TestQuiesceNeverReturnsBeforeAPendingDelivery pins the ordering inside a
+// dispatch worker that every "and nothing more arrived" assertion in this
+// package rests on.
+//
+// quiesce reads exactly two things: the mailbox, and the marker saying a worker
+// is inside a subscriber. A worker that empties its mailbox BEFORE setting that
+// marker leaves a gap where the Change is in neither, so quiesce reports an
+// idle engine for a delivery that is about to start and the assertion after it
+// passes before the delivery lands.
+//
+// Holding the worker's own mutex freezes it in that gap deterministically —
+// no sleep, no load: the mailbox is full, the worker has woken, and the only
+// question left is whether it marked itself busy before reaching for the slot.
+func TestQuiesceNeverReturnsBeforeAPendingDelivery(t *testing.T) {
+	e := dispatchEngine(t)
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+
+	var rec recorder
+
+	unsub := e.OnChange(nk, rec.record)
+	defer unsub()
+
+	// One delivery first, so the worker exists and is parked on its select
+	// rather than being started by the submit below.
+	e.publishInto(pub(nk, 1, "v1"))
+	waitFor(t, hangGuard, "the worker's first delivery", func() bool { return rec.len() == 1 })
+	quiesce(t, e)
+
+	wk := workerKey{NSKey: nk}
+
+	e.workersMu.Lock()
+	w := e.workers[wk]
+	e.workersMu.Unlock()
+
+	if w == nil {
+		t.Fatal("no dispatch worker for the key a delivery just went to")
+	}
+
+	w.submit(Change{Namespace: nk.Namespace, Key: nk.Key, Revision: 2, Value: "v2"})
+
+	// The worker wakes on that signal and blocks inside take() until this is
+	// released, which is the gap under test.
+	w.mu.Lock()
+
+	// Polled inline rather than through waitFor: waitFor fails with Fatalf,
+	// and failing while this mutex is held would park the worker in take()
+	// for good and hang the cleanup that waits for it instead of reporting
+	// the defect.
+	marked := false
+
+	for deadline := time.Now().Add(hangGuard); time.Now().Before(deadline); {
+		if _, busy := e.running.Load(wk); busy {
+			marked = true
+
+			break
+		}
+
+		time.Sleep(time.Millisecond)
+	}
+
+	w.mu.Unlock()
+
+	if !marked {
+		t.Fatal("the worker emptied its mailbox before marking itself busy: quiesce can " +
+			"observe an idle engine while a delivery is about to start")
+	}
+
+	quiesce(t, e)
+
+	if got := rec.len(); got != 2 {
+		t.Fatalf("deliveries after quiesce: got %d, want 2 — quiesce returned before a pending delivery landed", got)
 	}
 }
 

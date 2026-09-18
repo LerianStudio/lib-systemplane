@@ -51,7 +51,7 @@ func waitFirstReconcile(t *testing.T, e *Engine, scope store.Scope) error {
 
 	select {
 	case <-sc.firstReconcileDone:
-	case <-time.After(2 * time.Second):
+	case <-time.After(hangGuard):
 		t.Fatal("timed out waiting for the first reconcile to complete")
 	}
 
@@ -69,7 +69,7 @@ func waitReconcileIdle(t *testing.T, e *Engine, scope store.Scope) {
 
 	sc := e.scopeFor(scope)
 
-	waitFor(t, 2*time.Second, "the reconcile to finish", func() bool {
+	waitFor(t, hangGuard, "the reconcile to finish", func() bool {
 		sc.reconcileMu.Lock()
 		defer sc.reconcileMu.Unlock()
 
@@ -1240,6 +1240,84 @@ func TestPublishRecordsItsKeyAgainstAConcurrentReconcile(t *testing.T) {
 		if ch.Revision == 0 {
 			t.Fatalf("a Revision 0 default was delivered over the write: deliveries = %v", rec.revisions())
 		}
+	}
+}
+
+// TestFeedDeleteDuringReconcileIsNotResurrected is the unconditional half of
+// the delete fence: no registry hook and no decision-point gate, just an
+// operator's delete landing while a reconcile's List is held open. The
+// photograph still carries the row, and the only thing standing between it and
+// the cache is the feed recording the delete against every open window — the
+// snapshot row is NEWER than the revision-0 default a delete publishes, so the
+// revision fence alone lets it back in.
+func TestFeedDeleteDuringReconcileIsNotResurrected(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0)
+
+	fs.seed(scope, jsonRow(nk, 5, `"five"`, "ops"))
+	settled(t, e, scope)
+
+	release := heldList(fs)
+	defer release()
+
+	// The photograph carries the row; the live store is about to stop doing so.
+	fs.freezeNextList([]store.Entry{jsonRow(nk, 5, `"five"`, "ops")})
+
+	e.onEvent(disconnectEvent(scope))
+	e.onEvent(resyncEvent(scope))
+
+	waitFor(t, hangGuard, "the reconcile to reach its List", func() bool { return fs.listCount() >= 2 })
+
+	fs.remove(scope, nk)
+	e.onEvent(deleteEvent(scope, nk))
+
+	release()
+	waitReconcileIdle(t, e, scope)
+	quiesce(t, e)
+
+	got, ok := e.Lookup(scope, nk)
+	if !ok {
+		t.Fatal("Lookup reports a miss after a delete that spanned a reconcile")
+	}
+
+	if got.Value != "fallback" || got.Revision != 0 {
+		t.Errorf("after the delete: got (%v, rev %d), want the registered default at rev 0: "+
+			"the reconcile's snapshot resurrected the key an operator deleted", got.Value, got.Revision)
+	}
+}
+
+// TestSupersededReconcileClosesItsWindow pins which exit releases a reconcile's
+// fences. A reconcile that finds itself superseded publishes nothing, and the
+// temptation is to let it return before the cleanup — it changed nothing, after
+// all. But the window it armed is still registered on the scope, and the feed
+// goes on writing every event into it for the life of the scope: a leak that
+// grows with every reconnect and silently teaches later reconciles to skip keys
+// no live reconcile ever asked about.
+func TestSupersededReconcileClosesItsWindow(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, newFakeStore(), 0)
+
+	sc := e.scopeFor(scope)
+
+	stale := sc.beginReconcile()
+	newer := sc.beginReconcile()
+
+	// The newer reconcile finishes first, so the only window left is the one
+	// the superseded reconcile has to release itself.
+	sc.closeWindow(newer)
+
+	if got := openWindows(e, scope); got != 1 {
+		t.Fatalf("windows open before the superseded reconcile ran: got %d, want 1", got)
+	}
+
+	e.reconcileScope(sc, stale)
+
+	if got := openWindows(e, scope); got != 0 {
+		t.Errorf("windows open after a superseded reconcile returned: got %d, want 0: "+
+			"its fences keep collecting every feed event for the life of the scope", got)
 	}
 }
 

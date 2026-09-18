@@ -233,13 +233,22 @@ func (e *Engine) runWorker(ctx context.Context, wk workerKey, w *dispatchWorker)
 		case <-w.done:
 			return
 		case <-w.signal:
+			// Marked BEFORE the mailbox is emptied, and for the whole
+			// delivery. It is what a Close that times out uses to name this
+			// (scope, key) as one it is stuck on, and what tells an observer
+			// that a delivery is under way. Marking it after take() left a
+			// window where the Change was in neither the mailbox nor the
+			// marker: an observer sampling both saw an idle worker for a
+			// delivery that was about to start. A wake with an empty slot
+			// therefore marks the worker busy for the length of one
+			// mutex-guarded slot read, which no observer can be stuck behind.
+			e.running.Store(wk, struct{}{})
+
 			if ch, ok := w.take(); ok {
-				// Marked for the whole delivery so a Close that times out can
-				// name this (scope, key) as one it is stuck on.
-				e.running.Store(wk, struct{}{})
 				e.deliver(ctx, wk.NSKey, ch)
-				e.running.Delete(wk)
 			}
+
+			e.running.Delete(wk)
 		}
 	}
 }

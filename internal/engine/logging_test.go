@@ -251,6 +251,33 @@ func TestReReadCanceledByCloseIsLoggedAtDebug(t *testing.T) {
 	requireLogged(t, rec, log.LevelDebug, "changefeed re-read canceled during shutdown", nk)
 }
 
+// TestLogLevelReReadWithNoRowIsDebug pins the re-read that finds nothing. The
+// write may simply not be visible to this reader yet, and a real removal
+// arrives as its own delete event, so this is ordinary rather than wrong: at
+// WARN every routine race between a notification and its row becoming readable
+// would reach an operator as a fault.
+func TestLogLevelReReadWithNoRowIsDebug(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	e, rec := loggingEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, newFakeStore())
+
+	e.refreshKey(store.Scope{}, nk)
+
+	requireLogged(t, rec, log.LevelDebug, "changefeed re-read found no row, keeping current value", nk)
+}
+
+// TestLogLevelNoRowEventForUnregisteredKeyIsDebug pins the delete of a key this
+// process never registered. A store legitimately holds another service's keys
+// in the same table, so those deletes are ordinary traffic on the feed — at
+// WARN they would bury the rejections that matter.
+func TestLogLevelNoRowEventForUnregisteredKeyIsDebug(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "unknown"}
+	e, rec := loggingEngine(t, map[NSKey]KeyDef{}, newFakeStore())
+
+	e.onEvent(deleteEvent(store.Scope{}, nk))
+
+	requireLogged(t, rec, log.LevelDebug, "no-row event for unregistered key, skipping", nk)
+}
+
 // requireLoggedAt asserts the single entry with this message was emitted at
 // level. It is requireLogged for the lines that name a scope rather than a key:
 // a reconcile failure carries the tenant and the error, not a namespace.
