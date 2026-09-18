@@ -15,6 +15,10 @@ const (
 	fieldRevision  = "revision"
 	fieldUpdatedAt = "updated_at"
 	fieldUpdatedBy = "updated_by"
+	// fieldDeleted marks a tombstone. It is present and true only on a
+	// document Delete rewrote; every other document omits it entirely, which
+	// is why the reads guard with $ne rather than $exists (FC-9).
+	fieldDeleted = "deleted"
 
 	opSet = "$set"
 	// opLiteral wraps every caller-supplied STRING written by an
@@ -22,4 +26,5 @@ const (
 	// with "$" is an expression, not a value.
 	opLiteral = "$literal"
 	opIfNull  = "$ifNull"
+	opUnset   = "$unset"
 )

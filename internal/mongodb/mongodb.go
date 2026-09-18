@@ -101,6 +101,10 @@ type entryDoc struct {
 	Revision  int64      `bson:"revision"`
 	UpdatedAt time.Time  `bson:"updated_at"`
 	UpdatedBy string     `bson:"updated_by"`
+	// Deleted is present and true only on a tombstone: a document Delete
+	// rewrote in place so the revision the key reached survives (FC-9, D11).
+	// Get and List filter these out, so the store surface never shows one.
+	Deleted bool `bson:"deleted"`
 }
 
 // Store implements [store.Store] over MongoDB.
@@ -351,7 +355,7 @@ func (s *Store) List(ctx context.Context, scope store.Scope) ([]store.Entry, err
 		{Key: fieldKey, Value: 1},
 	})
 
-	cursor, err := coll.Find(ctx, bson.D{}, findOpts)
+	cursor, err := coll.Find(ctx, bson.D{notDeleted()}, findOpts)
 	if err != nil {
 		tracing.HandleSpanError(span, "list find failed", err)
 
@@ -395,7 +399,7 @@ func (s *Store) Get(ctx context.Context, scope store.Scope, namespace, key strin
 		attribute.String("key", key),
 	)
 
-	filter := bson.D{{Key: fieldID, Value: compoundID{Namespace: namespace, Key: key}}}
+	filter := bson.D{{Key: fieldID, Value: compoundID{Namespace: namespace, Key: key}}, notDeleted()}
 
 	var doc entryDoc
 	if err := coll.FindOne(ctx, filter).Decode(&doc); err != nil {
@@ -455,7 +459,14 @@ func (s *Store) Set(ctx context.Context, scope store.Scope, e store.Entry) (int6
 	return revision, nil
 }
 
-// Delete removes a single (namespace, key) row. Idempotent.
+// Delete rewrites a single (namespace, key) row as a tombstone: the document
+// stays, carrying deleted: true, no value and a bumped revision, so a key that
+// is deleted and recreated always comes back above every revision it ever had
+// (FC-9, D11). Get and List treat a tombstone as absent.
+//
+// Idempotent: the filter excludes tombstones, so deleting an already-deleted
+// or never-written key matches nothing, writes nothing, emits no change-stream
+// event, and still returns nil.
 func (s *Store) Delete(ctx context.Context, scope store.Scope, namespace, key, actor string) error {
 	if s == nil || s.isClosed() {
 		return store.ErrClosed
@@ -474,18 +485,22 @@ func (s *Store) Delete(ctx context.Context, scope store.Scope, namespace, key, a
 	defer span.End()
 
 	// actor is intentionally NOT a span attribute: it is unbounded caller
-	// identity and would create a high-cardinality / potentially PII tag.
-	// Audit trails capture it via the UpdatedBy column on writes.
-	_ = actor
-
+	// identity and would create a high-cardinality / potentially PII tag. It
+	// is recorded where audit trails read it: the tombstone's updated_by.
 	span.SetAttributes(
 		attribute.String("namespace", namespace),
 		attribute.String("key", key),
 	)
 
-	filter := bson.D{{Key: fieldID, Value: compoundID{Namespace: namespace, Key: key}}}
-	if _, err := coll.DeleteOne(ctx, filter); err != nil {
-		tracing.HandleSpanError(span, "delete failed", err)
+	filter := bson.D{{Key: fieldID, Value: compoundID{Namespace: namespace, Key: key}}, notDeleted()}
+
+	// No upsert, and MatchedCount is deliberately not inspected: a missing key
+	// and an existing tombstone both match nothing, and Delete reports that as
+	// success exactly as Postgres does. Rewriting a tombstone would reach the
+	// change stream as a second delete at revision 0, which nothing
+	// deduplicates, so every subscriber would see a duplicate (FC-9).
+	if _, err := coll.UpdateOne(ctx, filter, tombstonePipeline(actor, time.Now().UTC())); err != nil {
+		tracing.HandleSpanError(span, "delete tombstone failed", err)
 
 		return fmt.Errorf("systemplane/mongodb: delete: %w", err)
 	}

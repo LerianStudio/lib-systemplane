@@ -4,6 +4,7 @@ package mongodb
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -102,7 +103,42 @@ func upsertPipeline(e store.Entry) mongo.Pipeline {
 			{Key: fieldUpdatedAt, Value: e.UpdatedAt},
 			{Key: fieldUpdatedBy, Value: bson.D{{Key: opLiteral, Value: e.UpdatedBy}}},
 		}}},
+		// Stage 3 — a Set on a tombstone brings the key back to life, so the
+		// marker goes (FC-9). No stage reads "deleted", so this one is last by
+		// choice rather than by necessity. The revision bumped in stage 1 for
+		// free: a tombstone carries no "value", so the $eq there compared BSON
+		// null against a JSON payload, which is always a string.
+		bson.D{{Key: opUnset, Value: fieldDeleted}},
 	}
+}
+
+// tombstonePipeline builds the aggregation-pipeline update that backs Delete.
+// It is only ever run under notDeleted(), so there is no tombstone left to
+// condition on and stage 1 always bumps.
+func tombstonePipeline(actor string, now time.Time) mongo.Pipeline {
+	return mongo.Pipeline{
+		// Stage 1 — the revision the deleted key reached must keep climbing, so
+		// a later recreate lands above every revision the key ever had (D11).
+		bson.D{{Key: opSet, Value: bson.D{{Key: fieldRevision, Value: bumpRevisionExpr()}}}},
+		// Stage 2 — the marker and the provenance of the delete. actor is
+		// caller-supplied, so it is wrapped; updated_at is a BSON date and is
+		// left bare, exactly as in upsertPipeline.
+		bson.D{{Key: opSet, Value: bson.D{
+			{Key: fieldDeleted, Value: true},
+			{Key: fieldUpdatedAt, Value: now},
+			{Key: fieldUpdatedBy, Value: bson.D{{Key: opLiteral, Value: actor}}},
+		}}},
+		// Stage 3 — the value is gone; only the revision and the provenance
+		// survive.
+		bson.D{{Key: opUnset, Value: fieldValue}},
+	}
+}
+
+// notDeleted is the tombstone guard shared by Get, List and Delete. $ne rather
+// than $exists on purpose: a document written before v4 carries no "deleted"
+// field at all and must stay visible, and $ne matches a missing field.
+func notDeleted() bson.E {
+	return bson.E{Key: fieldDeleted, Value: bson.D{{Key: "$ne", Value: true}}}
 }
 
 // bumpRevisionExpr is the revision bump: strictly above the revision the

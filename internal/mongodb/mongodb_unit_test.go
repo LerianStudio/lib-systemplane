@@ -5,6 +5,7 @@ package mongodb
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -26,6 +27,7 @@ func TestEntryDocToEntry(t *testing.T) {
 		Revision:  42,
 		UpdatedAt: now,
 		UpdatedBy: "actor",
+		Deleted:   true,
 	}
 
 	entry := doc.toEntry()
@@ -55,8 +57,14 @@ func TestUpsertPipeline_WrapsEveryCallerString(t *testing.T) {
 		UpdatedBy: "$value",
 	})
 
-	if len(pipeline) != 2 {
-		t.Fatalf("pipeline has %d stages, want 2", len(pipeline))
+	if len(pipeline) != 3 {
+		t.Fatalf("pipeline has %d stages, want 3", len(pipeline))
+	}
+
+	// Stage 3 clears the tombstone marker, which is what lets a Set bring a
+	// deleted key back to life (FC-9).
+	if unset := pipeline[2]; len(unset) != 1 || unset[0].Key != opUnset || unset[0].Value != fieldDeleted {
+		t.Errorf("stage 3 = %#v, want %s of %q", pipeline[2], opUnset, fieldDeleted)
 	}
 
 	set, ok := stageSet(t, pipeline[1])
@@ -391,5 +399,75 @@ func TestStore_NamedTenantNilDatabaseIsRefused(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "resolve tenant t1") {
 		t.Fatalf("Get error = %v, want it to name the tenant", err)
+	}
+}
+
+// TestTombstonePipeline_ShapeAndWrapping is the server-free half of FC-9's
+// delete: the revision always bumps (the filter, not a $cond, is what excludes
+// tombstones), the marker and provenance are written with the actor wrapped
+// against the $-prefix hazard, and the value is unset.
+func TestTombstonePipeline_ShapeAndWrapping(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+
+	pipeline := tombstonePipeline("$value", now)
+	if len(pipeline) != 3 {
+		t.Fatalf("pipeline has %d stages, want 3", len(pipeline))
+	}
+
+	revisionSet, ok := stageSet(t, pipeline[0])
+	if !ok {
+		t.Fatalf("stage 1 is not a $set: %#v", pipeline[0])
+	}
+
+	if len(revisionSet) != 1 {
+		t.Errorf("stage 1 writes %d fields, want only %s", len(revisionSet), fieldRevision)
+	}
+
+	// Always bump: no $cond, because the filter already excluded every
+	// tombstone. Shared with the Set pipeline's changed-value branch so the
+	// two writers cannot drift.
+	if got := revisionSet[fieldRevision]; !reflect.DeepEqual(got, bumpRevisionExpr()) {
+		t.Errorf("stage 1 revision = %#v, want the shared bump expression", got)
+	}
+
+	markerSet, ok := stageSet(t, pipeline[1])
+	if !ok {
+		t.Fatalf("stage 2 is not a $set: %#v", pipeline[1])
+	}
+
+	if deleted, found := markerSet[fieldDeleted]; !found || deleted != true {
+		t.Errorf("stage 2 %s = %#v, want true", fieldDeleted, deleted)
+	}
+
+	if stamp, _ := markerSet[fieldUpdatedAt].(time.Time); !stamp.Equal(now) {
+		t.Errorf("stage 2 %s = %#v, want the bare BSON date %v", fieldUpdatedAt, markerSet[fieldUpdatedAt], now)
+	}
+
+	actor, isDoc := markerSet[fieldUpdatedBy].(bson.D)
+	if !isDoc || len(actor) != 1 || actor[0].Key != opLiteral || actor[0].Value != "$value" {
+		t.Errorf("stage 2 %s = %#v, want a %s wrapper around %q", fieldUpdatedBy, markerSet[fieldUpdatedBy], opLiteral, "$value")
+	}
+
+	if unset := pipeline[2]; len(unset) != 1 || unset[0].Key != opUnset || unset[0].Value != fieldValue {
+		t.Errorf("stage 3 = %#v, want %s of %q", pipeline[2], opUnset, fieldValue)
+	}
+}
+
+// TestNotDeleted_MatchesMissingField pins the choice of $ne over
+// $exists: a document written before v4 carries no "deleted" field at all and
+// must stay visible to Get and List.
+func TestNotDeleted_MatchesMissingField(t *testing.T) {
+	t.Parallel()
+
+	guard := notDeleted()
+	if guard.Key != fieldDeleted {
+		t.Fatalf("guard key = %q, want %q", guard.Key, fieldDeleted)
+	}
+
+	cond, ok := guard.Value.(bson.D)
+	if !ok || len(cond) != 1 || cond[0].Key != "$ne" || cond[0].Value != true {
+		t.Fatalf("guard = %#v, want {$ne: true}", guard.Value)
 	}
 }

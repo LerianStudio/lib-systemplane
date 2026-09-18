@@ -400,8 +400,11 @@ func TestIntegration_MongoScopedCRUDIsolation(t *testing.T) {
 
 // freshSingleTenantStore builds a single-tenant store over its own database on
 // the shared container. CRUD needs no Start — Start only opens the change
-// stream — so these revision tests leave no feed goroutine behind.
-func freshSingleTenantStore(t *testing.T, client *mongo.Client, prefix string) store.Store {
+// stream — so these revision tests leave no feed goroutine behind. The raw
+// collection handle is returned alongside it so a test can inspect the stored
+// document behind the store surface, which is the only way to observe a
+// tombstone: Get and List filter them out by contract.
+func freshSingleTenantStore(t *testing.T, client *mongo.Client, prefix string) (store.Store, *mongo.Collection) {
 	t.Helper()
 
 	dbName := fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano())
@@ -416,7 +419,37 @@ func freshSingleTenantStore(t *testing.T, client *mongo.Client, prefix string) s
 		_ = client.Database(dbName).Drop(context.Background())
 	})
 
-	return s
+	return s, client.Database(dbName).Collection("systemplane_entries")
+}
+
+// rawID mirrors the compound _id so a test can address a document directly.
+type rawID struct {
+	Namespace string `bson:"namespace"`
+	Key       string `bson:"key"`
+}
+
+// rawDoc is the stored document as a test reads it, bypassing the store. Value
+// is a pointer so an unset field (what a tombstone carries) is distinguishable
+// from an empty string.
+type rawDoc struct {
+	Revision  int64     `bson:"revision"`
+	Deleted   bool      `bson:"deleted"`
+	UpdatedAt time.Time `bson:"updated_at"`
+	UpdatedBy string    `bson:"updated_by"`
+	Value     *string   `bson:"value"`
+}
+
+func readRaw(t *testing.T, coll *mongo.Collection, namespace, key string) rawDoc {
+	t.Helper()
+
+	var doc rawDoc
+	if err := coll.FindOne(context.Background(), bson.D{
+		{Key: "_id", Value: rawID{Namespace: namespace, Key: key}},
+	}).Decode(&doc); err != nil {
+		t.Fatalf("raw find %s/%s: %v", namespace, key, err)
+	}
+
+	return doc
 }
 
 // TestIntegration_MongoIdenticalWriteKeepsRevision pins FC-2/FC-9 on the
@@ -427,7 +460,7 @@ func TestIntegration_MongoIdenticalWriteKeepsRevision(t *testing.T) {
 	client, cleanup := startContainer(t)
 	t.Cleanup(cleanup)
 
-	s := freshSingleTenantStore(t, client, "rev")
+	s, _ := freshSingleTenantStore(t, client, "rev")
 	ctx := context.Background()
 
 	set := func(value string) int64 {
@@ -508,7 +541,7 @@ func TestIntegration_MongoDollarPrefixedStringsStoredVerbatim(t *testing.T) {
 	client, cleanup := startContainer(t)
 	t.Cleanup(cleanup)
 
-	s := freshSingleTenantStore(t, client, "dollar")
+	s, _ := freshSingleTenantStore(t, client, "dollar")
 	ctx := context.Background()
 
 	const (
@@ -565,5 +598,176 @@ func TestIntegration_MongoDollarPrefixedStringsStoredVerbatim(t *testing.T) {
 	// field wrapped, so the revision must not move.
 	if r2 := write(); r2 != r1 {
 		t.Errorf("identical rewrite revision = %d, want %d unchanged", r2, r1)
+	}
+}
+
+// setForDelete writes one entry through the store and returns its revision.
+func setForDelete(t *testing.T, s store.Store, namespace, key, value string) int64 {
+	t.Helper()
+
+	rev, err := s.Set(context.Background(), store.Scope{}, store.Entry{
+		Namespace: namespace,
+		Key:       key,
+		Value:     []byte(value),
+		UpdatedBy: "writer",
+	})
+	if err != nil {
+		t.Fatalf("set %s/%s: %v", namespace, key, err)
+	}
+
+	return rev
+}
+
+// TestIntegration_MongoDeleteLeavesTombstone pins FC-9/D11: Delete never
+// removes the document. It rewrites it as a tombstone that the store surface
+// treats as absent, so the revision the key reached survives the delete and a
+// later recreate can be placed above it.
+func TestIntegration_MongoDeleteLeavesTombstone(t *testing.T) {
+	client, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	s, coll := freshSingleTenantStore(t, client, "tombstone")
+	ctx := context.Background()
+
+	r1 := setForDelete(t, s, "ns", "k", `{"a":1}`)
+
+	if err := s.Delete(ctx, store.Scope{}, "ns", "k", "deleter"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	if _, found, err := s.Get(ctx, store.Scope{}, "ns", "k"); err != nil {
+		t.Fatalf("get after delete: %v", err)
+	} else if found {
+		t.Error("get after delete: tombstone is visible through the store surface")
+	}
+
+	entries, err := s.List(ctx, store.Scope{})
+	if err != nil {
+		t.Fatalf("list after delete: %v", err)
+	}
+
+	for _, e := range entries {
+		if e.Namespace == "ns" && e.Key == "k" {
+			t.Error("list after delete: tombstone is listed")
+		}
+	}
+
+	doc := readRaw(t, coll, "ns", "k")
+
+	if !doc.Deleted {
+		t.Error("tombstone: deleted = false, want true")
+	}
+
+	if doc.Value != nil {
+		t.Errorf("tombstone: value = %q, want the field unset", *doc.Value)
+	}
+
+	if doc.Revision <= r1 {
+		t.Errorf("tombstone revision = %d, want > %d", doc.Revision, r1)
+	}
+
+	if doc.UpdatedBy != "deleter" {
+		t.Errorf("tombstone updated_by = %q, want %q", doc.UpdatedBy, "deleter")
+	}
+}
+
+// TestIntegration_MongoRecreateAfterDeleteExceedsTombstone is the reason the
+// tombstone exists (D11): with the document gone, a recreate would fall back to
+// the server-clock floor and could land at or below the pre-delete revision,
+// and the engine's fence would then reject the recreated value indefinitely.
+func TestIntegration_MongoRecreateAfterDeleteExceedsTombstone(t *testing.T) {
+	client, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	s, coll := freshSingleTenantStore(t, client, "recreate")
+	ctx := context.Background()
+
+	r1 := setForDelete(t, s, "ns", "k", `{"a":1}`)
+
+	if err := s.Delete(ctx, store.Scope{}, "ns", "k", "deleter"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	tombstone := readRaw(t, coll, "ns", "k").Revision
+	if tombstone <= r1 {
+		t.Fatalf("tombstone revision = %d, want > %d", tombstone, r1)
+	}
+
+	r2 := setForDelete(t, s, "ns", "k", `{"a":2}`)
+	if r2 <= tombstone {
+		t.Fatalf("recreated revision = %d, want strictly greater than the tombstone's %d", r2, tombstone)
+	}
+
+	entry, found, err := s.Get(ctx, store.Scope{}, "ns", "k")
+	if err != nil {
+		t.Fatalf("get after recreate: %v", err)
+	}
+
+	if !found {
+		t.Fatal("get after recreate: not found")
+	}
+
+	if entry.Revision != r2 {
+		t.Errorf("get revision after recreate = %d, want %d", entry.Revision, r2)
+	}
+
+	if string(entry.Value) != `{"a":2}` {
+		t.Errorf("value after recreate = %q, want %q", string(entry.Value), `{"a":2}`)
+	}
+}
+
+// TestIntegration_MongoRepeatDeleteWritesNothing pins the half of FC-9 that the
+// filter — rather than a conditional pipeline — buys: a delete of an existing
+// tombstone, or of a key that was never written, matches nothing and writes
+// nothing at all. A write of any kind would move updated_at, and on a tombstone
+// it would reach the change stream as a second OpDelete at revision 0, which
+// nothing deduplicates.
+func TestIntegration_MongoRepeatDeleteWritesNothing(t *testing.T) {
+	client, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	s, coll := freshSingleTenantStore(t, client, "repeatdelete")
+	ctx := context.Background()
+
+	setForDelete(t, s, "ns", "k", `{"a":1}`)
+
+	if err := s.Delete(ctx, store.Scope{}, "ns", "k", "deleter"); err != nil {
+		t.Fatalf("first delete: %v", err)
+	}
+
+	before := readRaw(t, coll, "ns", "k")
+
+	if err := s.Delete(ctx, store.Scope{}, "ns", "k", "second-deleter"); err != nil {
+		t.Fatalf("second delete: %v", err)
+	}
+
+	after := readRaw(t, coll, "ns", "k")
+
+	if after.Revision != before.Revision {
+		t.Errorf("revision moved on repeat delete: %d → %d", before.Revision, after.Revision)
+	}
+
+	if !after.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Errorf("updated_at moved on repeat delete: %v → %v", before.UpdatedAt, after.UpdatedAt)
+	}
+
+	if after.UpdatedBy != before.UpdatedBy {
+		t.Errorf("updated_by moved on repeat delete: %q → %q", before.UpdatedBy, after.UpdatedBy)
+	}
+
+	// A delete of a key that was never written creates nothing: no upsert.
+	if err := s.Delete(ctx, store.Scope{}, "ns", "never-written", "deleter"); err != nil {
+		t.Fatalf("delete of a missing key: %v", err)
+	}
+
+	count, err := coll.CountDocuments(ctx, bson.D{
+		{Key: "_id", Value: rawID{Namespace: "ns", Key: "never-written"}},
+	})
+	if err != nil {
+		t.Fatalf("count after deleting a missing key: %v", err)
+	}
+
+	if count != 0 {
+		t.Errorf("delete of a missing key created %d document(s), want 0", count)
 	}
 }
