@@ -256,7 +256,7 @@ func (s *Store) isClosing() bool {
 // does not create it.
 //
 // Whatever route produced the handle, a resolver that carries read replicas is
-// narrowed to its primary here — see pinPrimary.
+// narrowed to its primaries here — see pinPrimary.
 func (s *Store) resolveDB(ctx context.Context, scope store.Scope) (dbExecutor, error) {
 	if scope.Tenant != "" {
 		if s.cfg.Connector == nil {
@@ -305,14 +305,15 @@ func (s *Store) resolveDB(ctx context.Context, scope store.Scope) (dbExecutor, e
 // already resolves everything to a primary, and keeping the wrapper preserves
 // its failover behavior.
 //
-// Narrowing keeps EVERY primary, and hands back a resolver rather than one
-// *sql.DB, for the same reason: a tenant whose config declares several
-// writable connection strings would otherwise be pinned to whichever one came
-// first for the life of the process, so losing that node would take the
-// tenant's configuration down while its other primaries were healthy. The
-// narrowed resolver keeps dbresolver's rotation across primaries and its retry
-// on another primary when a read fails with a connection error; only the
-// standbys are excluded.
+// Narrowing excludes the standbys and NOTHING else — no failover claim rides
+// on it. lib-commons builds every tenant resolver from exactly one primary and
+// one replica (commons/postgres createResolverFn), so the common case is the
+// single primary handed back directly, which also spares every read the cost
+// of building a resolver. A connector of a consumer's own making may return
+// several primaries; those keep a resolver so the standbys stay excluded, and
+// dbresolver picks one of them per call. It does not fail over: its retry
+// fires only on a net.Error, and a dead pool reports "sql: database is closed",
+// which is not one.
 func pinPrimary(db dbresolver.DB) dbExecutor {
 	if len(db.ReplicaDBs()) == 0 {
 		return db
@@ -322,11 +323,14 @@ func pinPrimary(db dbresolver.DB) dbExecutor {
 	// nothing better to fall back to than the resolver itself. It also keeps
 	// the narrowing below out of dbresolver.New's no-primary panic.
 	primaries := db.PrimaryDBs()
-	if len(primaries) == 0 {
+	switch len(primaries) {
+	case 0:
 		return db
+	case 1:
+		return primaries[0]
+	default:
+		return dbresolver.New(dbresolver.WithPrimaryDBs(primaries...))
 	}
-
-	return dbresolver.New(dbresolver.WithPrimaryDBs(primaries...))
 }
 
 // List returns every entry in the resolved database, ordered by (namespace, key).

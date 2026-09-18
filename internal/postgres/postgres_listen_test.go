@@ -816,31 +816,24 @@ func TestPostgresSubscribe_ClosingStoreDialsNoTenant(t *testing.T) {
 	}
 }
 
-// FAIL CLOSED on schema-per-tenant isolation. A tenant DSN that pins a
-// search_path means several tenants share ONE database, and NOTIFY is
-// database-wide: every tenant's feed would then receive every other tenant's
-// events stamped with its own scope, and the engine's revision fence would act
-// on them. Refusing costs a tenant its changefeed; accepting corrupts every
-// tenant in that database.
+// A tenant DSN that pins a schema is NOT refused on that basis: lib-commons
+// writes "options=-csearch_path=<schema>" for any tenant whose config declares
+// a schema, whatever its isolation mode, so a tenant with its own database
+// that merely names a schema must still get its changefeed. What is refused is
+// two scopes resolving to the same DATABASE, which needs two live feeds and is
+// pinned by TestPostgresFeed_SharedDatabaseIsRefused and, end to end, by
+// TestIntegration_PostgresTwoTenantsOnOneDatabase.
 //
-// unreachableDSN is the discriminator for "nothing was dialed": without the
-// refusal the call reaches pgx.Connect and fails with a connect error instead
-// of the sentinel.
-func TestPostgresSubscribe_SchemaIsolatedDSNIsRefused(t *testing.T) {
+// unreachableDSN is the discriminator for "it was dialed": reaching the dialer
+// is what proves nothing refused the DSN up front.
+func TestPostgresSubscribe_SchemaPinnedDSNStillDials(t *testing.T) {
 	cases := []struct {
 		name string
 		dsn  string
 	}{
 		{name: "search_path parameter", dsn: unreachableDSN + "&search_path=tenant_a"},
 		{name: "options -c search_path", dsn: unreachableDSN + "&options=-csearch_path%3Dtenant_a"},
-		// Postgres resolves GUC names case-insensitively while pgconn keeps the
-		// connection string verbatim, so an upper- or mixed-case spelling pins
-		// exactly the same schema through a check that only knew the lowercase
-		// one.
-		{name: "SEARCH_PATH parameter", dsn: unreachableDSN + "&SEARCH_PATH=tenant_a"},
-		{name: "Search_Path parameter", dsn: unreachableDSN + "&Search_Path=tenant_a"},
-		{name: "options -c SEARCH_PATH", dsn: unreachableDSN + "&options=-cSEARCH_PATH%3Dtenant_a"},
-		{name: "options -c Search_Path", dsn: unreachableDSN + "&options=-cSearch_Path%3Dtenant_a"},
+		{name: "plain", dsn: unreachableDSN},
 	}
 
 	for _, tc := range cases {
@@ -855,19 +848,19 @@ func TestPostgresSubscribe_SchemaIsolatedDSNIsRefused(t *testing.T) {
 			unsub, subErr := s.Subscribe(context.Background(), store.Scope{Tenant: "t1"}, func(store.Event) {})
 			if subErr == nil {
 				unsub()
-				t.Fatal("Subscribe with a schema-isolated tenant DSN returned nil; want ErrSchemaIsolationUnsupported")
+				t.Fatal("Subscribe to a closed port returned nil; want the dial to fail")
 			}
 
-			if !errors.Is(subErr, ErrSchemaIsolationUnsupported) {
-				t.Fatalf("Subscribe error = %v, want ErrSchemaIsolationUnsupported", subErr)
+			if errors.Is(subErr, ErrSharedDatabaseUnsupported) {
+				t.Fatalf("Subscribe error = %v; the only tenant on this store shares no database with anything", subErr)
 			}
 
-			if !strings.Contains(subErr.Error(), "tenant t1") {
-				t.Errorf("Subscribe error %q must name the tenant", subErr)
+			if !strings.Contains(subErr.Error(), "listen connect") {
+				t.Errorf("Subscribe error %q must come from the dialer", subErr)
 			}
 
 			if n := feedCount(s); n != 0 {
-				t.Errorf("feeds map holds %d entries after a refused DSN, want 0", n)
+				t.Errorf("feeds map holds %d entries after a failed dial, want 0", n)
 			}
 
 			if err := s.Close(); err != nil {
@@ -879,35 +872,51 @@ func TestPostgresSubscribe_SchemaIsolatedDSNIsRefused(t *testing.T) {
 	}
 }
 
-// The refusal is narrow: a tenant DSN without a search_path still reaches the
-// dialer, which is what makes the sentinel above meaningful.
-func TestPostgresSubscribe_PlainTenantDSNStillDials(t *testing.T) {
-	conn := &stubConnector{resolve: func(int) (string, error) { return unreachableDSN, nil }}
+// refuseSharedDatabaseLocked is the whole one-database-per-scope decision, and
+// it needs two LIVE feeds — which a unit test cannot dial — so it is driven
+// directly here. A reserved slot still connecting carries no dbKey and must be
+// invisible to it: it is not listening yet, so it cannot receive anything.
+func TestPostgresFeed_SharedDatabaseIsRefused(t *testing.T) {
+	t.Parallel()
 
-	s, err := New(Config{MultiTenantEnabled: true, Connector: conn})
-	if err != nil {
-		t.Fatalf("New: %v", err)
+	live := newFeed(store.Scope{Tenant: "t1"}, "")
+	live.dbKey = "db.example:5432/shared"
+
+	connecting := newFeed(store.Scope{Tenant: "t3"}, "")
+
+	s := &Store{feeds: map[string]*feed{"t1": live, "t3": connecting}}
+
+	joiner := newFeed(store.Scope{Tenant: "t2"}, "")
+
+	err := s.refuseSharedDatabaseLocked(joiner, "db.example:5432/shared")
+	if err == nil {
+		t.Fatal("a second scope on t1's database was admitted; want ErrSharedDatabaseUnsupported")
 	}
 
-	unsub, subErr := s.Subscribe(context.Background(), store.Scope{Tenant: "t1"}, func(store.Event) {})
-	if subErr == nil {
-		unsub()
-		t.Fatal("Subscribe to a closed port returned nil; want the dial to fail")
+	if !errors.Is(err, ErrSharedDatabaseUnsupported) {
+		t.Fatalf("error = %v, want ErrSharedDatabaseUnsupported", err)
 	}
 
-	if errors.Is(subErr, ErrSchemaIsolationUnsupported) {
-		t.Fatalf("Subscribe error = %v; a DSN without a search_path must not be refused as schema-isolated", subErr)
+	for _, want := range []string{`"t1"`, `"t2"`, "db.example:5432/shared"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q must name %s", err, want)
+		}
 	}
 
-	if !strings.Contains(subErr.Error(), "listen connect") {
-		t.Errorf("Subscribe error %q must come from the dialer", subErr)
+	if err := s.refuseSharedDatabaseLocked(joiner, "db.example:5432/its_own"); err != nil {
+		t.Errorf("a scope with its own database was refused: %v", err)
 	}
 
-	if err := s.Close(); err != nil {
-		t.Fatalf("close: %v", err)
+	// The connecting placeholder holds no database yet, so joining on the key
+	// it will eventually take is admitted here and refused at publish time.
+	if err := s.refuseSharedDatabaseLocked(joiner, ""); err != nil {
+		t.Errorf("an unpublished slot collided on the empty key: %v", err)
 	}
 
-	waitForObserverExit(t)
+	// Republishing the same feed must not collide with itself.
+	if err := s.refuseSharedDatabaseLocked(live, "db.example:5432/shared"); err != nil {
+		t.Errorf("a feed collided with itself: %v", err)
+	}
 }
 
 // A nil ctx is a caller bug the store absorbs rather than panics on: the
@@ -945,24 +954,33 @@ func TestPostgresSubscribe_NilContext(t *testing.T) {
 	waitForObserverExit(t)
 }
 
-// The one-database-per-tenant rule is not a tenant-only rule. Two installations
-// that share one database through per-schema search_paths cross-contaminate
-// through the single-tenant ListenDSN exactly as two tenants would: NOTIFY is
-// database-wide and both feeds listen on the same channel. Start must refuse
-// the DSN before it opens anything.
-func TestPostgresStart_SchemaIsolatedListenDSNIsRefused(t *testing.T) {
+// A ListenDSN that pins a schema reaches the dialer like any other: the
+// discriminator for the one-database rule is the DATABASE, not the schema, and
+// a single-tenant install may legitimately name one.
+//
+// The PGOPTIONS case is the environment, not the DSN: pgconn.ParseConfig merges
+// PGOPTIONS into the parsed runtime parameters before it reads the connection
+// string, so a guard that judged a parsed search_path would refuse a
+// completely clean DSN on any host that exports one, and the process could not
+// boot.
+func TestPostgresStart_SchemaPinnedListenDSNStillDials(t *testing.T) {
 	cases := []struct {
-		name string
-		dsn  string
+		name    string
+		dsn     string
+		options string
 	}{
 		{name: "search_path parameter", dsn: unreachableDSN + "&search_path=app"},
-		{name: "SEARCH_PATH parameter", dsn: unreachableDSN + "&SEARCH_PATH=app"},
 		{name: "options -c search_path", dsn: unreachableDSN + "&options=-csearch_path%3Dapp"},
-		{name: "options -c SEARCH_PATH", dsn: unreachableDSN + "&options=-cSEARCH_PATH%3Dapp"},
+		{name: "clean DSN under PGOPTIONS", dsn: unreachableDSN, options: "-csearch_path=app"},
+		{name: "plain", dsn: unreachableDSN},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.options != "" {
+				t.Setenv("PGOPTIONS", tc.options)
+			}
+
 			s := &Store{
 				cfg:      Config{Channel: defaultChannel, Table: defaultTable, Module: defaultModule, ListenDSN: tc.dsn},
 				feeds:    map[string]*feed{},
@@ -971,19 +989,15 @@ func TestPostgresStart_SchemaIsolatedListenDSNIsRefused(t *testing.T) {
 
 			err := s.Start(context.Background())
 			if err == nil {
-				t.Fatal("Start with a schema-isolated ListenDSN returned nil; want ErrSchemaIsolationUnsupported")
+				t.Fatal("Start against a closed port returned nil; want the dial to fail")
 			}
 
-			if !errors.Is(err, ErrSchemaIsolationUnsupported) {
-				t.Fatalf("Start error = %v, want ErrSchemaIsolationUnsupported", err)
+			if errors.Is(err, ErrSharedDatabaseUnsupported) {
+				t.Fatalf("Start error = %v; this store has exactly one feed and shares no database", err)
 			}
 
-			if !strings.Contains(err.Error(), "listen dsn") {
-				t.Errorf("Start error %q must name the listen DSN", err)
-			}
-
-			if n := feedCount(s); n != 0 {
-				t.Errorf("feeds map holds %d entries after a refused ListenDSN, want 0", n)
+			if !strings.Contains(err.Error(), "listen connect") {
+				t.Errorf("Start error %q must come from the dialer", err)
 			}
 
 			if err := s.Close(); err != nil {
@@ -993,26 +1007,26 @@ func TestPostgresStart_SchemaIsolatedListenDSNIsRefused(t *testing.T) {
 	}
 }
 
-// A ListenDSN without a search_path still reaches the dialer, which is what
-// makes the refusal above meaningful rather than a blanket Start failure.
-func TestPostgresStart_PlainListenDSNStillDials(t *testing.T) {
+// A malformed ListenDSN is still refused before anything is dialed: the same
+// parse that yields the database key is the one that rejects it.
+func TestPostgresStart_UnparseableListenDSNIsRefused(t *testing.T) {
 	s := &Store{
-		cfg:      Config{Channel: defaultChannel, Table: defaultTable, Module: defaultModule, ListenDSN: unreachableDSN},
+		cfg:      Config{Channel: defaultChannel, Table: defaultTable, Module: defaultModule, ListenDSN: "postgres://%zz"},
 		feeds:    map[string]*feed{},
 		closedCh: make(chan struct{}),
 	}
 
 	err := s.Start(context.Background())
 	if err == nil {
-		t.Fatal("Start against a closed port returned nil; want the dial to fail")
+		t.Fatal("Start with an unparseable ListenDSN returned nil; want a parse error")
 	}
 
-	if errors.Is(err, ErrSchemaIsolationUnsupported) {
-		t.Fatalf("Start error = %v; a DSN without a search_path must not be refused as schema-isolated", err)
+	if !strings.Contains(err.Error(), "listen dsn") {
+		t.Errorf("Start error %q must name the listen DSN", err)
 	}
 
-	if !strings.Contains(err.Error(), "listen connect") {
-		t.Errorf("Start error %q must come from the dialer", err)
+	if n := feedCount(s); n != 0 {
+		t.Errorf("feeds map holds %d entries after a refused ListenDSN, want 0", n)
 	}
 
 	if err := s.Close(); err != nil {

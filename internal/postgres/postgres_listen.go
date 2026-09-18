@@ -19,10 +19,12 @@
 // installations pinned to different schemas of one database cross-contaminate
 // the same way.
 //
-// That rule is refused wherever the DSN reveals it — every DSN this package
-// dials is checked before it is opened — but a search_path installed as a role
-// or database default appears nowhere in the DSN and cannot be detected, so
-// one database per install remains the operator's responsibility.
+// That rule is enforced where it is decidable: a feed whose DSN names a
+// database another live feed already listens on is refused with
+// ErrSharedDatabaseUnsupported, which is what schema-per-tenant produces
+// inside one process. Two processes sharing one database cannot see each
+// other, so one database per install remains the operator's responsibility
+// beyond this one.
 package postgres
 
 import (
@@ -73,6 +75,12 @@ type notifyPayload struct {
 type feed struct {
 	scope store.Scope
 	dsn   string
+
+	// dbKey names the physical database this feed listens on, written once by
+	// publishFeed and guarded by Store.feedsMu — the lock that also decides
+	// which feeds are live. Empty until the feed is published, so a reserved
+	// slot still connecting never collides with anything.
+	dbKey string
 
 	// ready is closed exactly once, by the creator, when creation finishes:
 	// with err nil the feed is live, with err non-nil creation failed and the
@@ -397,7 +405,8 @@ func (s *Store) createFeed(ctx context.Context, f *feed) error {
 		return s.retractFeed(f, fmt.Errorf("systemplane/postgres: resolve tenant %s DSN: %w", tenant, store.ErrTenantConnectorMissing))
 	}
 
-	if err := refuseSchemaIsolatedDSN(dsn); err != nil {
+	dbKey, err := dsnDatabaseKey(dsn)
+	if err != nil {
 		return s.retractFeed(f, fmt.Errorf("systemplane/postgres: tenant %s: %w", tenant, err))
 	}
 
@@ -408,7 +417,7 @@ func (s *Store) createFeed(ctx context.Context, f *feed) error {
 		return s.retractFeed(f, err)
 	}
 
-	return s.publishFeed(ctx, f, conn)
+	return s.publishFeed(ctx, f, conn, dbKey)
 }
 
 // publishFeed hands the connected feed to its waiters — or throws it away when
@@ -420,11 +429,20 @@ func (s *Store) createFeed(ctx context.Context, f *feed) error {
 // Close decides what to tear down by walking that map, so a feed must never be
 // visible there without its goroutine already running, or Close would wait the
 // full closeTimeout on a done channel nothing will ever close.
-func (s *Store) publishFeed(ctx context.Context, f *feed, conn *pgx.Conn) error {
+func (s *Store) publishFeed(ctx context.Context, f *feed, conn *pgx.Conn, dbKey string) error {
 	s.feedsMu.Lock()
 
-	if s.closing {
-		cause := s.failLocked(f, store.ErrClosed)
+	var refusal error
+
+	switch {
+	case s.closing:
+		refusal = store.ErrClosed
+	default:
+		refusal = s.refuseSharedDatabaseLocked(f, dbKey)
+	}
+
+	if refusal != nil {
+		cause := s.failLocked(f, refusal)
 
 		f.closeReadyLocked()
 		s.feedsMu.Unlock()
@@ -437,9 +455,34 @@ func (s *Store) publishFeed(ctx context.Context, f *feed, conn *pgx.Conn) error 
 		return cause
 	}
 
+	f.dbKey = dbKey
+
 	s.startFeedReader(f, conn)
 	f.closeReadyLocked()
 	s.feedsMu.Unlock()
+
+	return nil
+}
+
+// refuseSharedDatabaseLocked rejects a feed that is about to listen on a
+// database a live feed already listens on. The caller MUST hold Store.feedsMu,
+// which is what makes the decision race-free: dbKey is written in the same hold
+// that starts the reader, so two creators racing to publish serialize and the
+// second one always sees the first.
+//
+// A reserved slot that is still connecting carries no dbKey and is skipped —
+// it is not listening yet, so it cannot receive anything.
+func (s *Store) refuseSharedDatabaseLocked(f *feed, dbKey string) error {
+	for _, other := range s.feeds {
+		if other == f || other.dbKey == "" || other.dbKey != dbKey {
+			continue
+		}
+
+		return fmt.Errorf(
+			"systemplane/postgres: scope %q and scope %q both resolve to %s: %w",
+			f.scope.Tenant, other.scope.Tenant, dbKey, ErrSharedDatabaseUnsupported,
+		)
+	}
 
 	return nil
 }
@@ -717,11 +760,11 @@ func (s *Store) startFeedReader(f *feed, conn *pgx.Conn) {
 // meanwhile must be able to throw it away instead of inheriting a live LISTEN
 // connection and a reader goroutine no later Close will ever stop.
 func (s *Store) startListener(ctx context.Context) error {
-	// Two installations sharing one database through per-schema search_paths
-	// cross-contaminate exactly as two tenants would — NOTIFY is database-wide
-	// and both feeds listen on the same channel name — so the single-tenant
-	// DSN is held to the same one-database rule as a tenant's.
-	if err := refuseSchemaIsolatedDSN(s.cfg.ListenDSN); err != nil {
+	// The zero scope is held to the same one-database rule as a tenant's: a
+	// Store that also serves named tenants must not listen on a database one
+	// of them listens on, or every NOTIFY would reach both feeds.
+	dbKey, err := dsnDatabaseKey(s.cfg.ListenDSN)
+	if err != nil {
 		return fmt.Errorf("systemplane/postgres: listen dsn: %w", err)
 	}
 
@@ -752,7 +795,7 @@ func (s *Store) startListener(ctx context.Context) error {
 		return err
 	}
 
-	return s.publishFeed(ctx, f, conn)
+	return s.publishFeed(ctx, f, conn, dbKey)
 }
 
 // stopFeeds tears down every feed the store owns. Idempotent.

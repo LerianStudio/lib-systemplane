@@ -792,37 +792,44 @@ func TestIntegration_PostgresScopedReadsStayOnThePrimary(t *testing.T) {
 	}
 }
 
-// TestIntegration_PostgresPrimaryFailover pins that a tenant declaring several
-// primaries keeps all of them.
+// TestIntegration_PostgresSeveralPrimariesStillAvoidTheStandby pins that
+// narrowing a resolver keeps EVERY primary rather than collapsing to one, so a
+// tenant declaring several writable connection strings still reads from a
+// writable node.
 //
-// Narrowing a resolver to its primaries is what keeps reads off a standby (see
-// TestIntegration_PostgresScopedReadsStayOnThePrimary); narrowing it to ONE
-// primary would trade a stale read for an outage, because that tenant would
-// then be pinned to a single node for the life of the process and lose the
-// resolver's own primary rotation and its fallback on a connection error.
+// It deliberately makes no failover claim. dbresolver picks one primary per
+// call and its retry fires only on a net.Error, while a dead pool reports
+// "sql: database is closed" — so killing a node here would prove nothing about
+// recovery, only about which index the load balancer happens to pick.
 //
-// The two primaries here are separate databases carrying the same row rather
-// than a real multi-master pair, and the replica is an empty decoy: a read
-// served by the replica comes back missing, and a read served by a closed
-// handle comes back as an error, so both failures are loud and deterministic.
-func TestIntegration_PostgresPrimaryFailover(t *testing.T) {
+// The two primaries are separate databases holding DIFFERENT values, and the
+// replica is an empty decoy. A read served by the replica comes back missing;
+// a read served by either primary comes back as that primary's value. Dropping
+// the narrowing therefore fails this test deterministically, without pinning
+// dbresolver's choice between the two primaries.
+func TestIntegration_PostgresSeveralPrimariesStillAvoidTheStandby(t *testing.T) {
 	base, cleanup := startContainer(t)
 	t.Cleanup(cleanup)
 
 	admin := adminDSN(t, base)
 	t.Cleanup(func() { _ = admin.Close() })
 
-	_, primaryDSN, primary1 := provisionTenantDB(t, admin, base, "failover_primary1")
-	_, _, primary2 := provisionTenantDB(t, admin, base, "failover_primary2")
-	_, _, standby := provisionTenantDB(t, admin, base, "failover_standby")
+	_, primaryDSN, primary1 := provisionTenantDB(t, admin, base, "multiprimary_one")
+	_, _, primary2 := provisionTenantDB(t, admin, base, "multiprimary_two")
+	_, _, standby := provisionTenantDB(t, admin, base, "multiprimary_standby")
 
-	// Both primaries hold the row; the decoy replica stays empty.
-	for _, db := range []*sql.DB{primary1, primary2} {
+	seeded := map[string]bool{}
+
+	for i, db := range []*sql.DB{primary1, primary2} {
+		value := fmt.Sprintf("primary-%d", i+1)
+		seeded[value] = true
+
 		if _, err := db.Exec(
 			`INSERT INTO systemplane_entries (namespace, key, value, updated_at, updated_by)
-			 VALUES ('ns', 'k', '"seeded"'::jsonb, now(), 'seed')`,
+			 VALUES ('ns', 'k', $1::jsonb, now(), 'seed')`,
+			fmt.Sprintf("%q", value),
 		); err != nil {
-			t.Fatalf("seed primary: %v", err)
+			t.Fatalf("seed primary %d: %v", i+1, err)
 		}
 	}
 
@@ -836,32 +843,30 @@ func TestIntegration_PostgresPrimaryFailover(t *testing.T) {
 	ctx := context.Background()
 	scope := store.Scope{Tenant: "t1"}
 
-	entry, found, err := s.Get(ctx, scope, "ns", "k")
-	if err != nil {
-		t.Fatalf("get before the outage: %v", err)
-	}
+	// Several reads, because the choice between the primaries is dbresolver's
+	// and every one of them must still land on a writable node.
+	for i := range 4 {
+		entry, found, err := s.Get(ctx, scope, "ns", "k")
+		if err != nil {
+			t.Fatalf("get #%d: %v", i+1, err)
+		}
 
-	if !found {
-		t.Fatal("Get missed the seeded row: the read was served by the empty replica")
-	}
+		if !found {
+			t.Fatalf("get #%d missed the seeded row: the read was served by the empty replica", i+1)
+		}
 
-	if entry.Revision == 0 {
-		t.Errorf("revision = 0, want the revision the insert trigger assigned")
-	}
+		var got string
+		if err := json.Unmarshal(entry.Value, &got); err != nil {
+			t.Fatalf("get #%d: decode value: %v", i+1, err)
+		}
 
-	// One primary goes away. The tenant still has another, so the read must
-	// still be served — a resolver narrowed to primaries[0] would report
-	// "sql: database is closed" here for the rest of the process's life.
-	if err := primary1.Close(); err != nil {
-		t.Fatalf("close the first primary: %v", err)
-	}
+		if !seeded[got] {
+			t.Fatalf("get #%d returned %q, want a value seeded on one of the primaries", i+1, got)
+		}
 
-	if _, found, err = s.Get(ctx, scope, "ns", "k"); err != nil {
-		t.Fatalf("get after the first primary was closed: %v", err)
-	}
-
-	if !found {
-		t.Fatal("Get after the outage missed the seeded row")
+		if entry.Revision == 0 {
+			t.Errorf("get #%d revision = 0, want the revision the insert trigger assigned", i+1)
+		}
 	}
 
 	var onStandby int
@@ -2154,10 +2159,13 @@ func TestIntegration_PostgresConcurrentStartOpensOneListener(t *testing.T) {
 	}
 }
 
-// Against a real server: a ListenDSN that pins a schema is refused before
-// anything is dialed, so the database ends up with no LISTEN backend at all.
-// The unit test pins the sentinel; this one pins that nothing was opened.
-func TestIntegration_PostgresStartRefusesSchemaIsolatedListenDSN(t *testing.T) {
+// Against a real server: a ListenDSN that pins a schema is DIALED, not refused.
+// lib-commons writes "options=-csearch_path=<schema>" for any tenant whose
+// config declares a schema, whatever its isolation mode, so refusing on that
+// signal alone would take the changefeed away from every install that merely
+// names one — permanently, since a failed activation is retried from scratch
+// on every later read.
+func TestIntegration_PostgresStartAcceptsSchemaPinnedListenDSN(t *testing.T) {
 	base, cleanup := startContainer(t)
 	t.Cleanup(cleanup)
 
@@ -2167,23 +2175,73 @@ func TestIntegration_PostgresStartRefusesSchemaIsolatedListenDSN(t *testing.T) {
 
 	dbName, tenantDSN, db := provisionTenantDB(t, admin, base, "pinned_schema")
 
-	s, err := postgres.New(postgres.Config{DB: db, ListenDSN: tenantDSN + "&options=-csearch_path%3Dapp"})
+	if _, err := db.Exec(`CREATE SCHEMA IF NOT EXISTS app`); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+
+	s, err := postgres.New(postgres.Config{DB: db, ListenDSN: tenantDSN + "&options=-csearch_path%3Dapp,public"})
 	if err != nil {
 		t.Fatalf("postgres.New: %v", err)
 	}
 
 	t.Cleanup(func() { _ = s.Close() })
 
-	err = s.Start(context.Background())
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("Start with a schema-pinned ListenDSN: %v", err)
+	}
+
+	if n := listenBackends(t, admin, dbName); n != 1 {
+		t.Fatalf("a schema-pinned ListenDSN opened %d LISTEN connections on %s, want 1", n, dbName)
+	}
+}
+
+// What IS refused is two scopes resolving to the same DATABASE — the shape
+// schema-per-tenant actually produces. NOTIFY is database-wide and every feed
+// listens on the same channel, so the second tenant's feed would receive the
+// first tenant's notifications stamped with its own scope and the engine's
+// revision fence would act on them.
+func TestIntegration_PostgresTwoTenantsOnOneDatabase(t *testing.T) {
+	base, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	admin := adminDSN(t, base)
+
+	defer func() { _ = admin.Close() }()
+
+	dbName, tenantDSN, db := provisionTenantDB(t, admin, base, "shared_db")
+
+	if _, err := db.Exec(`CREATE SCHEMA IF NOT EXISTS tenant_b`); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+
+	conn := newFakeConnector()
+	conn.set("t1", db, tenantDSN)
+	// The classic schema-per-tenant DSN pair: one database, two search_paths.
+	conn.set("t2", db, tenantDSN+"&options=-csearch_path%3Dtenant_b,public")
+
+	s := tenantStore(t, conn)
+
+	ctx := context.Background()
+
+	unsub, err := s.Subscribe(ctx, store.Scope{Tenant: "t1"}, func(store.Event) {})
+	if err != nil {
+		t.Fatalf("subscribe t1: %v", err)
+	}
+
+	t.Cleanup(unsub)
+
+	unsub2, err := s.Subscribe(ctx, store.Scope{Tenant: "t2"}, func(store.Event) {})
 	if err == nil {
-		t.Fatal("Start with a schema-isolated ListenDSN returned nil; want the schema-isolation refusal")
+		unsub2()
+		t.Fatal("a second tenant on t1's database was admitted; want ErrSharedDatabaseUnsupported")
 	}
 
-	if !errors.Is(err, postgres.ErrSchemaIsolationUnsupported) {
-		t.Fatalf("Start error = %v, want postgres.ErrSchemaIsolationUnsupported", err)
+	if !errors.Is(err, postgres.ErrSharedDatabaseUnsupported) {
+		t.Fatalf("subscribe t2 error = %v, want postgres.ErrSharedDatabaseUnsupported", err)
 	}
 
-	if n := listenBackends(t, admin, dbName); n != 0 {
-		t.Fatalf("a refused ListenDSN left %d LISTEN connections on %s, want 0", n, dbName)
+	// The refused feed leaves nothing behind: t1 keeps its one backend.
+	if n := listenBackends(t, admin, dbName); n != 1 {
+		t.Fatalf("%s carries %d LISTEN connections, want 1 (t1's only)", dbName, n)
 	}
 }
