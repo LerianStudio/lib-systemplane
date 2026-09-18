@@ -30,6 +30,9 @@
 -- populated one orphaned and invisible to the runtime: every registered key
 -- would silently fall back to its default after a `successful` migration. The
 -- guard DO block below refuses that outright rather than forking the install.
+-- It scans the catalog for systemplane_entries in EVERY user schema instead of
+-- resolving it through search_path, because the install most likely to be
+-- forked is precisely the one the applier's search_path cannot reach.
 -- An install that cannot be put first in search_path is upgraded with
 -- ddl/migrate_v3_to_v4.sql instead, which creates no table and so follows the
 -- search_path to wherever the table actually is.
@@ -60,11 +63,14 @@
 -- payload is {"namespace","key","op","revision"}, with revision 0 on delete,
 -- meaning "no row".
 --
--- Statement order is load-bearing: the DROP DEFAULT comes LAST, after every
--- CREATE TRIGGER. `revision` is NOT NULL, so between dropping the default and
--- installing the bump trigger nothing would assign it and a concurrent insert
--- would fail — this file is not wrapped in a transaction, because the
--- consumer's migration tool owns transaction boundaries.
+-- Statement order is load-bearing: the default is SET unconditionally right
+-- after the ADD COLUMN, and the DROP DEFAULT comes LAST, after every CREATE
+-- TRIGGER. `revision` is NOT NULL, so between dropping the bump trigger and
+-- creating it again nothing assigns it except that default and a concurrent
+-- insert would fail — this file is not wrapped in a transaction, because the
+-- consumer's migration tool owns transaction boundaries. The SET is
+-- unconditional because that is what makes a SECOND application safe: once the
+-- column exists, ADD COLUMN IF NOT EXISTS is a no-op and restores nothing.
 
 DO $$
 DECLARE
@@ -72,7 +78,13 @@ DECLARE
 		SELECT n.nspname
 		FROM pg_class c
 		JOIN pg_namespace n ON n.oid = c.relnamespace
-		WHERE c.oid = to_regclass('systemplane_entries')
+		WHERE c.relname = 'systemplane_entries'
+		  AND c.relkind IN ('r', 'p')
+		  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+		  AND n.nspname NOT LIKE 'pg_toast%'
+		  AND n.nspname NOT LIKE 'pg_temp%'
+		ORDER BY (n.nspname = current_schema()) DESC
+		LIMIT 1
 	);
 BEGIN
 	IF existing_schema IS NOT NULL AND existing_schema IS DISTINCT FROM current_schema() THEN
@@ -95,6 +107,7 @@ CREATE TABLE IF NOT EXISTS systemplane_entries (
 );
 
 ALTER TABLE systemplane_entries ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;
+ALTER TABLE systemplane_entries ALTER COLUMN revision SET DEFAULT 1;
 
 DO $$
 DECLARE

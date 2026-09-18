@@ -14,7 +14,8 @@ import _ "embed"
 var schemaSQL string
 
 // migrationV3ToV4SQL is the v3 -> v4 delta, embedded byte-faithfully from
-// ddl/migrate_v3_to_v4.sql. It is schemaSQL without the table creation.
+// ddl/migrate_v3_to_v4.sql. It is schemaSQL minus the guard block and the
+// CREATE TABLE.
 //
 //go:embed ddl/migrate_v3_to_v4.sql
 var migrationV3ToV4SQL string
@@ -64,17 +65,22 @@ var defaultSeedSQL string
 // so applying this to an install that sits further down the path would create
 // a second, empty table there and orphan the populated one — a migration that
 // exits 0 and leaves every registered key reading its default. The DDL refuses
-// that case loudly instead. An install that cannot be put first in search_path
+// that case loudly instead, scanning the catalog for systemplane_entries in
+// every user schema rather than resolving it through search_path, so the
+// install it protects is found even when the applier cannot see it. An install
+// that cannot be put first in search_path
 // is upgraded with MigrationV3ToV4SQL(), which creates no table and therefore
 // follows the search_path to wherever the table actually is.
 //
 // It is idempotent and upgrades a v3 database in place: the ALTER adds the
 // column at revision 1 for the rows already there and the setval lifts the
 // sequence past the highest revision present, so the first write after the
-// upgrade lands at 2 or higher. The statement dropping the column default
-// comes last, after the triggers are installed, so an untransacted
-// application never leaves a window in which a concurrent insert has neither
-// a default nor a trigger to fill the NOT NULL revision. It is safe to fold
+// upgrade lands at 2 or higher. Every application re-sets the transitional
+// column default unconditionally and drops it again last, after the triggers
+// are installed, so neither a first nor a repeated untransacted application
+// ever leaves a window in which a concurrent insert has neither a default nor
+// a trigger to fill the NOT NULL revision — on a re-application the ADD COLUMN
+// is a no-op and would restore nothing. It is safe to fold
 // into a consumer's own migration pipeline; lib-systemplane does not execute
 // it for the caller.
 func SchemaSQL() string {
@@ -90,7 +96,9 @@ func SchemaSQL() string {
 // triggers, drops the v3 notify function, and only then drops the column
 // default — last, after the triggers exist, so an untransacted application
 // never leaves a window in which a concurrent insert has neither a default nor
-// a trigger to fill the NOT NULL revision.
+// a trigger to fill the NOT NULL revision. The default is re-set
+// unconditionally on every application, because once the column exists the ADD
+// COLUMN is a no-op and would restore nothing for a second run to lean on.
 //
 // The table and the sequence always live in the SAME schema: the bump trigger
 // resolves the sequence as TG_TABLE_SCHEMA.systemplane_revision_seq, so the
@@ -111,8 +119,10 @@ func SchemaSQL() string {
 // Revisions may skip numbers from then on, and a key deleted and recreated
 // always comes back above every revision it previously had.
 //
-// It is idempotent and it does NOT create the systemplane_entries table: it
-// upgrades a database that already carries the v3 schema. A consumer starting
+// It is idempotent and it is SchemaSQL() minus the guard block and the CREATE
+// TABLE: it creates no systemplane_entries and therefore upgrades the install
+// wherever search_path finds it, which is what makes it the way out of the
+// fork SchemaSQL() refuses. A consumer starting
 // from an empty database applies SchemaSQL() instead, where the first write
 // lands at revision 2 rather than 1. lib-systemplane does not execute it for
 // the caller.

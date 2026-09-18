@@ -630,3 +630,236 @@ func assertRelationSchemas(t *testing.T, db *sql.DB, relName string, want []stri
 		t.Fatalf("%s exists in schemas %v, want exactly %v", relName, got, want)
 	}
 }
+
+// TestIntegration_DDLSchemaRefusesForkWhenInstallIsOffSearchPath is the shape
+// the fork guard exists for and the one its first version could not see.
+//
+// Resolving the existing install with to_regclass() only ever finds a table
+// the applier's own search_path can reach. The install most likely to be
+// forked is precisely the one that is NOT on that path: a role deploying with
+// search_path = public against systemplane living in `app` saw to_regclass()
+// return NULL, passed the guard, created a second and EMPTY
+// systemplane_entries in public, exited 0 and orphaned the populated one.
+// Scanning pg_class/pg_namespace for the table in ANY user schema is what
+// closes that. With the install put back on the path the very same file
+// applies cleanly, so the guard refuses a fork rather than the upgrade.
+func TestIntegration_DDLSchemaRefusesForkWhenInstallIsOffSearchPath(t *testing.T) {
+	db, _ := seedV3InsideAppSchema(t, "offpath", "public")
+
+	_, err := db.Exec(systemplane.SchemaSQL())
+	if err == nil {
+		t.Fatal(`SchemaSQL() applied under search_path "public" to an install living in app: want a loud failure, got success`)
+	}
+
+	if !strings.Contains(err.Error(), "systemplane_entries already exists in schema app") {
+		t.Fatalf("SchemaSQL() failed, but not with the fork guard: %v", err)
+	}
+
+	// The refusal left the install alone: no second table, no stray sequence.
+	assertRelationSchemas(t, db, "systemplane_entries", []string{"app"})
+	assertRelationSchemas(t, db, "systemplane_revision_seq", nil)
+
+	// Put the install first in search_path and the same artifact upgrades it.
+	ctx := context.Background()
+
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("take a dedicated connection: %v", err)
+	}
+
+	defer func() { _ = conn.Close() }()
+
+	if _, err := conn.ExecContext(ctx, `SET search_path = app, public`); err != nil {
+		t.Fatalf("point the session search_path at app: %v", err)
+	}
+
+	if _, err := conn.ExecContext(ctx, systemplane.SchemaSQL()); err != nil {
+		t.Fatalf("SchemaSQL() with the install first in search_path: %v", err)
+	}
+
+	assertRelationSchemas(t, db, "systemplane_entries", []string{"app"})
+	assertRelationSchemas(t, db, "systemplane_revision_seq", []string{"app"})
+}
+
+// TestIntegration_DDLReapplyKeepsInsertsWorkingInsideTheTriggerWindow pins the
+// one window a re-applied artifact opens on a live database.
+//
+// Neither artifact is wrapped in a transaction — the consumer's migration tool
+// owns transaction boundaries — so between dropping the bump trigger and
+// creating it again nothing assigns the NOT NULL revision except the column
+// default. On a FIRST application ADD COLUMN ... DEFAULT 1 installs that
+// default; on a second one the column already exists, ADD COLUMN IF NOT EXISTS
+// is a no-op, and the default the first run dropped at the end is never
+// restored. A write arriving in that window then failed with a not-null
+// violation on a database the operator was merely re-running a migration
+// against. Re-setting the default unconditionally is what keeps the table
+// writable throughout.
+func TestIntegration_DDLReapplyKeepsInsertsWorkingInsideTheTriggerWindow(t *testing.T) {
+	base, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	t.Run("schema", func(t *testing.T) {
+		dsn, db := freshV4Database(t, base, "window_schema")
+		assertReapplyKeepsInsertsWorking(t, db, dsn, systemplane.SchemaSQL())
+	})
+
+	t.Run("migration", func(t *testing.T) {
+		dsn, db := populatedV3Database(t, base, "window_migration")
+
+		if _, err := db.Exec(systemplane.MigrationV3ToV4SQL()); err != nil {
+			t.Fatalf("apply the migration once: %v", err)
+		}
+
+		assertReapplyKeepsInsertsWorking(t, db, dsn, systemplane.MigrationV3ToV4SQL())
+	})
+}
+
+// assertReapplyKeepsInsertsWorking re-applies artifact to an already-upgraded
+// database, stops inside the trigger window, and writes there.
+func assertReapplyKeepsInsertsWorking(t *testing.T, db *sql.DB, dsn, artifact string) {
+	t.Helper()
+
+	s := storeOn(t, db, dsn)
+	ctx := context.Background()
+
+	before, err := s.Set(ctx, store.Scope{}, store.Entry{
+		Namespace: "runtime_config",
+		Key:       "log_level",
+		Value:     []byte(`"info"`),
+	})
+	if err != nil {
+		t.Fatalf("write through the store before the re-apply: %v", err)
+	}
+
+	prefix, remainder := splitAtTheTriggerWindow(t, artifact)
+
+	if _, err := db.Exec(prefix); err != nil {
+		t.Fatalf("re-apply the artifact up to the DROP TRIGGER: %v", err)
+	}
+
+	// The window is open here: the bump trigger is gone and the artifact is
+	// untransacted, so a concurrent write must land on the column default the
+	// re-application just re-set.
+	if _, err := db.Exec(`INSERT INTO systemplane_entries (namespace, "key", value, updated_by)
+		VALUES ('runtime_config', 'window_probe', '"probe"'::jsonb, 'operator')`); err != nil {
+		t.Fatalf("insert while the bump trigger is dropped: %v", err)
+	}
+
+	if _, err := db.Exec(remainder); err != nil {
+		t.Fatalf("apply the remainder of the artifact: %v", err)
+	}
+
+	var columnDefault sql.NullString
+
+	if err := db.QueryRow(`SELECT column_default FROM information_schema.columns
+		WHERE table_name = 'systemplane_entries' AND column_name = 'revision'`).
+		Scan(&columnDefault); err != nil {
+		t.Fatalf("read the revision column default after the re-apply: %v", err)
+	}
+
+	if columnDefault.Valid {
+		t.Fatalf("revision column default = %q after the re-apply, want none: the transitional default must be dropped again once the bump trigger is back", columnDefault.String)
+	}
+
+	after, err := s.Set(ctx, store.Scope{}, store.Entry{
+		Namespace: "runtime_config",
+		Key:       "log_level",
+		Value:     []byte(`"warn"`),
+	})
+	if err != nil {
+		t.Fatalf("write through the store after the re-apply: %v", err)
+	}
+
+	if after <= before {
+		t.Fatalf("the first write after the re-apply returned revision %d, want greater than the %d it carried before; the restored trigger must keep assigning from the sequence", after, before)
+	}
+}
+
+// splitAtTheTriggerWindow cuts artifact immediately after it drops the bump
+// trigger — the first instant at which the NOT NULL revision has no trigger to
+// fill it.
+func splitAtTheTriggerWindow(t *testing.T, artifact string) (string, string) {
+	t.Helper()
+
+	const dropBump = "DROP TRIGGER IF EXISTS systemplane_bump_revision_trigger ON systemplane_entries;"
+
+	at := strings.Index(artifact, dropBump)
+	if at < 0 {
+		t.Fatal("artifact never drops systemplane_bump_revision_trigger; the window this test probes does not exist")
+	}
+
+	cut := at + len(dropBump)
+
+	return artifact[:cut], artifact[cut:]
+}
+
+// TestIntegration_DDLReapplyAfterStoreWritesDoesNotRewindTheSequence pins the
+// GREATEST arm of the setval both artifacts run.
+//
+// Seeding the sequence from MAX(revision) alone is correct only on a database
+// that has never served a delete. Once the row carrying the highest revision is
+// gone, MAX(revision) sits BELOW the sequence, so a re-applied artifact would
+// wind the counter back and hand out revisions subscribers have already seen —
+// a subscriber holding the older, higher number then fences out the newer
+// value forever. Taking the greater of MAX(revision) and the sequence's own
+// last_value is what makes re-application safe on a live database.
+func TestIntegration_DDLReapplyAfterStoreWritesDoesNotRewindTheSequence(t *testing.T) {
+	base, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	t.Run("schema", func(t *testing.T) {
+		dsn, db := freshV4Database(t, base, "rewind_schema")
+		assertReapplyDoesNotRewindTheSequence(t, db, dsn, systemplane.SchemaSQL())
+	})
+
+	t.Run("migration", func(t *testing.T) {
+		dsn, db := populatedV3Database(t, base, "rewind_migration")
+
+		if _, err := db.Exec(systemplane.MigrationV3ToV4SQL()); err != nil {
+			t.Fatalf("apply the migration once: %v", err)
+		}
+
+		assertReapplyDoesNotRewindTheSequence(t, db, dsn, systemplane.MigrationV3ToV4SQL())
+	})
+}
+
+// assertReapplyDoesNotRewindTheSequence drives the sequence past every stored
+// revision, deletes the row that carried the highest one, re-applies artifact
+// and demands the next write still come out above everything already issued.
+func assertReapplyDoesNotRewindTheSequence(t *testing.T, db *sql.DB, dsn, artifact string) {
+	t.Helper()
+
+	s := storeOn(t, db, dsn)
+	ctx := context.Background()
+
+	set := func(what, key, value string) int64 {
+		t.Helper()
+
+		rev, err := s.Set(ctx, store.Scope{}, store.Entry{
+			Namespace: "runtime_config",
+			Key:       key,
+			Value:     []byte(value),
+		})
+		if err != nil {
+			t.Fatalf("%s: %v", what, err)
+		}
+
+		return rev
+	}
+
+	set("write the key that stays", "kept", `"kept"`)
+	highest := set("write the key that is deleted next", "removed", `"removed"`)
+
+	if err := s.Delete(ctx, store.Scope{}, "runtime_config", "removed", "tester"); err != nil {
+		t.Fatalf("delete the highest-revision row: %v", err)
+	}
+
+	// MAX(revision) now trails the sequence: seeding from it alone rewinds.
+	if _, err := db.Exec(artifact); err != nil {
+		t.Fatalf("re-apply the artifact: %v", err)
+	}
+
+	if next := set("write after the re-apply", "after", `"after"`); next <= highest {
+		t.Fatalf("the first write after the re-apply returned revision %d, want strictly greater than the %d already handed out; re-seeding the sequence from MAX(revision) alone re-issues revisions subscribers have already seen", next, highest)
+	}
+}

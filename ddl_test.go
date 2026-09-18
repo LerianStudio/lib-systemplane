@@ -26,6 +26,10 @@ func TestSchemaSQL_ContainsCanonicalStatements(t *testing.T) {
 	// nothing else fails when it drifts. These fragments are the drift guard:
 	// a change to the table/function/trigger shape has to be made here too.
 	wantFragments := []string{
+		"WHERE c.relname = 'systemplane_entries'",
+		"AND c.relkind IN ('r', 'p')",
+		"AND n.nspname NOT IN ('pg_catalog', 'information_schema')",
+		"ORDER BY (n.nspname = current_schema()) DESC",
 		"CREATE TABLE IF NOT EXISTS systemplane_entries (",
 		"namespace   TEXT NOT NULL,",
 		`"key"       TEXT NOT NULL,`,
@@ -35,6 +39,7 @@ func TestSchemaSQL_ContainsCanonicalStatements(t *testing.T) {
 		"updated_by  TEXT NOT NULL DEFAULT '',",
 		`PRIMARY KEY (namespace, "key")`,
 		"ALTER TABLE systemplane_entries ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;",
+		"ALTER TABLE systemplane_entries ALTER COLUMN revision SET DEFAULT 1;",
 		"ALTER TABLE systemplane_entries ALTER COLUMN revision DROP DEFAULT;",
 		"CREATE OR REPLACE FUNCTION systemplane_bump_revision_v4() RETURNS TRIGGER AS $$",
 		"IF TG_OP = 'INSERT' OR OLD.value IS DISTINCT FROM NEW.value THEN",
@@ -65,6 +70,13 @@ func TestSchemaSQL_ContainsCanonicalStatements(t *testing.T) {
 		if !strings.Contains(sql, frag) {
 			t.Errorf("SchemaSQL() missing canonical fragment:\n%q", frag)
 		}
+	}
+
+	// to_regclass() resolves only through the applier's own search_path, so a
+	// guard built on it is blind to exactly the install most likely to be
+	// forked: the one that is not on that path.
+	if strings.Contains(sql, "to_regclass") {
+		t.Error("SchemaSQL() resolves the existing install with to_regclass(); it must scan pg_class/pg_namespace so an install off the applier's search_path is still found")
 	}
 
 	assertSequenceLivesInTheTableSchema(t, "SchemaSQL()", sql)
@@ -150,14 +162,32 @@ func assertNoV3FunctionDefinition(t *testing.T, artifact, sql string) {
 
 // assertDropDefaultComesLast pins the ordering that keeps an untransacted
 // migration writable throughout: revision is NOT NULL, so between dropping the
-// column default and installing the bump trigger nothing would assign it and a
-// concurrent insert would fail with a not-null violation. The DROP DEFAULT
-// therefore has to be the last statement, after every CREATE TRIGGER.
+// bump trigger and creating it again nothing assigns it except the column
+// default, and a concurrent insert without one fails with a not-null
+// violation. Two statements bracket that window. The unconditional SET DEFAULT
+// has to come before the first DROP TRIGGER — ADD COLUMN IF NOT EXISTS is a
+// no-op on a re-application and restores nothing, so it cannot be relied on to
+// put the default back — and the DROP DEFAULT has to be the last statement of
+// all, after every CREATE TRIGGER.
 func assertDropDefaultComesLast(t *testing.T, artifact, sql string) {
 	t.Helper()
 
+	setDefault := strings.Index(sql, "ALTER TABLE systemplane_entries ALTER COLUMN revision SET DEFAULT 1;")
+	firstDropTrigger := strings.Index(sql, "DROP TRIGGER IF EXISTS")
 	dropDefault := strings.LastIndex(sql, "ALTER TABLE systemplane_entries ALTER COLUMN revision DROP DEFAULT;")
 	lastCreateTrigger := strings.LastIndex(sql, "CREATE TRIGGER")
+
+	if setDefault < 0 {
+		t.Fatalf("%s never re-sets the revision default (ALTER TABLE systemplane_entries ALTER COLUMN revision SET DEFAULT 1); a re-application would drop the bump trigger with no default behind it", artifact)
+	}
+
+	if firstDropTrigger < 0 {
+		t.Fatalf("%s missing DROP TRIGGER statements", artifact)
+	}
+
+	if setDefault > firstDropTrigger {
+		t.Errorf("%s re-sets the revision default at index %d, after its first DROP TRIGGER at index %d; the default must already be back before the trigger window opens", artifact, setDefault, firstDropTrigger)
+	}
 
 	if dropDefault < 0 {
 		t.Fatalf("%s missing ALTER TABLE systemplane_entries ALTER COLUMN revision DROP DEFAULT;", artifact)
@@ -244,6 +274,7 @@ func TestMigrationV3ToV4SQL_IsTheDeltaOnly(t *testing.T) {
 	// existing revision so the first post-migration write lands above them.
 	wantFragments := []string{
 		"ALTER TABLE systemplane_entries ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;",
+		"ALTER TABLE systemplane_entries ALTER COLUMN revision SET DEFAULT 1;",
 		"ALTER TABLE systemplane_entries ALTER COLUMN revision DROP DEFAULT;",
 		"NEW.revision := nextval(format('%I.systemplane_revision_seq', TG_TABLE_SCHEMA)::regclass);",
 		"$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp;",
@@ -260,6 +291,13 @@ func TestMigrationV3ToV4SQL_IsTheDeltaOnly(t *testing.T) {
 	// fresh one is SchemaSQL()'s job.
 	if strings.Contains(sql, "CREATE TABLE") {
 		t.Error("MigrationV3ToV4SQL() must not contain a table creation statement")
+	}
+
+	// The fork guard belongs to the artifact that creates the table. The
+	// migration creates none, so it follows search_path to wherever the table
+	// actually lives — which is the escape hatch the guard points at.
+	if strings.Contains(sql, "would fork the install") {
+		t.Error("MigrationV3ToV4SQL() carries the fork guard; it creates no table and must upgrade an install wherever search_path finds it")
 	}
 
 	assertSequenceLivesInTheTableSchema(t, "MigrationV3ToV4SQL()", sql)

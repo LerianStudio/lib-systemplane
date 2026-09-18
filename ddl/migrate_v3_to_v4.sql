@@ -1,9 +1,10 @@
 -- systemplane v3 -> v4 migration — canonical, static artifact published by lib-systemplane.
 --
 -- lib-systemplane never executes this file: consumers fold it into their own
--- migration pipeline. It is ddl/schema.sql minus the table creation, so it
--- assumes systemplane_entries already exists; a consumer starting from an
--- empty database applies ddl/schema.sql instead.
+-- migration pipeline. It is ddl/schema.sql minus the guard block and the table
+-- creation, so it assumes systemplane_entries already exists and upgrades it
+-- wherever search_path finds it; a consumer starting from an empty database
+-- applies ddl/schema.sql instead.
 --
 -- ONE DATABASE PER TENANT. This file assumes systemplane_entries is alone in
 -- its database, and must never be applied once per schema inside a shared
@@ -39,12 +40,17 @@
 -- systemplane_revision_seq. Revisions may skip numbers from then on, and a key
 -- deleted and recreated always exceeds every revision it previously had.
 --
--- Statement order is load-bearing: the DROP DEFAULT comes LAST, after every
--- CREATE TRIGGER, because `revision` is NOT NULL and between dropping the
--- default and installing the bump trigger nothing would assign it — a
--- concurrent insert in that window would fail with a not-null violation.
+-- Statement order is load-bearing: the default is SET unconditionally right
+-- after the ADD COLUMN and the DROP DEFAULT comes LAST, after every CREATE
+-- TRIGGER, because `revision` is NOT NULL and between dropping the bump
+-- trigger and creating it again nothing assigns it except that default — a
+-- concurrent insert in that window would otherwise fail with a not-null
+-- violation. The SET is unconditional because that is what makes a SECOND
+-- application safe: once the column exists, ADD COLUMN IF NOT EXISTS is a
+-- no-op and restores nothing.
 
 ALTER TABLE systemplane_entries ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;
+ALTER TABLE systemplane_entries ALTER COLUMN revision SET DEFAULT 1;
 
 DO $$
 DECLARE
