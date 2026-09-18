@@ -53,8 +53,10 @@ type Snapshot[T any] struct {
 // client runs it on the default at Bind, on every Set, and on every other
 // ingress the client validates. A row already in the store is decoded on read
 // and never re-validated by the group, so a row that entered the store without
-// passing the registered validator surfaces from [Group.Snapshot] as a decode
-// error at worst, not as a validated document. Must be called before c.Start.
+// passing the registered validator surfaces as a decode error at worst — from
+// [Group.Snapshot] on a read, and as a rejection recorded in [Group.Status] on
+// a publication — never as a validated document. Must be called before
+// c.Start.
 //
 // The value registered is not defaults itself but its canonical JSON document:
 // defaults marshaled and unmarshaled back into an any. A stored row, a Set
@@ -79,6 +81,14 @@ type Snapshot[T any] struct {
 // opts is ignored: Bind's own validator is registered last and replaces it, so
 // a caller cannot disable the type check on their own group. Every other key
 // option in opts is forwarded to [Client.Register] unchanged.
+//
+// Bind also takes the group's one subscription to (namespace, key). It is taken
+// here, before c.Start and therefore before any publication can exist, which is
+// what lets [Group.OnApply] promise that no revision falls between its initial
+// delivery and its subscription. A Client that refuses the subscription — a
+// multi-tenant one today — still yields a working handle: the refusal is
+// recorded and returned by OnApply, while [Group.Snapshot] and [Group.Set] keep
+// working.
 //
 // Bind on a nil Client returns ErrClosed. Defaults that validate rejects
 // surface as the ErrValidation that Register returns.
@@ -330,12 +340,14 @@ type ApplyStatus struct {
 // the current one returns, on the same goroutine. An applier that writes on
 // every delivery therefore loops forever.
 //
-// OnApply blocks while a delivery for the same scope is in flight. The replay
-// and the seeded delivery run on the calling goroutine with a background
-// context; a delivery driven by a publication carries the context the Client
-// hands its subscribers, which [Client.Close] cancels. OnApply after Close
-// registers and replays the last observed snapshot, and no further delivery
-// can arrive.
+// The initial delivery — the replay, or the seeded one — normally runs on the
+// calling goroutine under a background context, before OnApply returns. It does
+// not when a fan-out for the same scope is already running on another
+// goroutine: OnApply then returns without waiting, and that fan-out makes the
+// delivery under its own context. Every later delivery is driven by a
+// publication and carries the context the Client hands its subscribers, which
+// [Client.Close] cancels. OnApply after Close registers and replays the last
+// observed snapshot, and no further delivery can arrive.
 //
 // A nil fn registers nothing and returns no error, matching [Client.OnChange].
 // unsubscribe is idempotent, is safe to call from inside fn itself, and
