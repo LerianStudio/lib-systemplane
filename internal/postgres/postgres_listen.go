@@ -433,14 +433,9 @@ func (s *Store) createFeed(ctx context.Context, f *feed) error {
 		return s.retractFeed(f, fmt.Errorf("systemplane/postgres: resolve tenant %s DSN: %w", tenant, store.ErrTenantConnectorMissing))
 	}
 
-	dbKey, err := dsnDatabaseKey(dsn)
-	if err != nil {
-		return s.retractFeed(f, fmt.Errorf("systemplane/postgres: tenant %s: %w", tenant, err))
-	}
-
 	f.dsn = dsn
 
-	conn, err := s.openListen(ctx, f)
+	conn, dbKey, err := s.openListen(ctx, f)
 	if err != nil {
 		return s.retractFeed(f, err)
 	}
@@ -721,16 +716,18 @@ func (s *Store) Subscribe(ctx context.Context, scope store.Scope, fn func(store.
 	return teardown, nil
 }
 
-// openListen opens a dedicated pgx connection for the feed's DSN and installs
-// LISTEN on it synchronously, so a bad DSN or a missing privilege surfaces to
-// the caller instead of looping in the background.
+// openListen opens a dedicated pgx connection for the feed's DSN, reads back
+// which database it reached and installs LISTEN on it, all synchronously, so a
+// bad DSN or a missing privilege surfaces to the caller instead of looping in
+// the background. The returned key is what publishFeed compares against the
+// live feeds to refuse two scopes sharing one database.
 //
-// Both steps carry the same bounds a reconnect uses. Inheriting the caller's
+// Every step carries the same bounds a reconnect uses. Inheriting the caller's
 // ctx unbounded is what would let a tenant whose host swallows packets — no
 // refusal, no reset — park the Subscribe call for the life of that ctx, and
 // with it the reserved feed slot every later Subscribe for that tenant waits
 // on. The teardown interlock in publishFeed is only as tight as this bound.
-func (s *Store) openListen(ctx context.Context, f *feed) (*pgx.Conn, error) {
+func (s *Store) openListen(ctx context.Context, f *feed) (*pgx.Conn, string, error) {
 	// Last look before the socket. The shutdown fence in acquireFeed is taken
 	// before the DSN is resolved, and resolving it is a round trip through the
 	// tenant manager: a Close landing in between would otherwise open a
@@ -738,7 +735,7 @@ func (s *Store) openListen(ctx context.Context, f *feed) (*pgx.Conn, error) {
 	// would immediately throw it away. Refusing here keeps a closing store from
 	// dialing at all.
 	if s.isClosing() {
-		return nil, store.ErrClosed
+		return nil, "", store.ErrClosed
 	}
 
 	connectCtx, cancelConnect := context.WithTimeout(ctx, connectTimeout)
@@ -746,29 +743,48 @@ func (s *Store) openListen(ctx context.Context, f *feed) (*pgx.Conn, error) {
 
 	conn, err := pgx.Connect(connectCtx, f.dsn)
 	if err != nil {
-		return nil, fmt.Errorf("systemplane/postgres: listen connect%s: %w", f.label(), err)
+		return nil, "", fmt.Errorf("systemplane/postgres: listen connect%s: %w", f.label(), err)
+	}
+
+	// Any failure past this point closes the connection on a ctx of its own:
+	// the one that just expired would abandon the socket instead of closing it.
+	abort := func(err error) (*pgx.Conn, string, error) {
+		closeCtx, cancelClose := context.WithTimeout(context.WithoutCancel(ctx), closeTimeout)
+		defer cancelClose()
+
+		_ = conn.Close(closeCtx)
+
+		return nil, "", err
+	}
+
+	// Which database this connection actually reached is a question only the
+	// server can answer, and publishFeed cannot admit the feed without it, so
+	// a failure here is a connect failure like any other. It runs BEFORE the
+	// LISTEN so a refused feed never installs one, and so LISTEN stays the last
+	// statement this connection ever ran — which is how a backend is told from
+	// any other in pg_stat_activity.
+	keyCtx, cancelKey := context.WithTimeout(ctx, listenTimeout)
+	defer cancelKey()
+
+	dbKey, err := serverDatabaseKey(keyCtx, conn, f.dsn)
+	if err != nil {
+		return abort(fmt.Errorf("systemplane/postgres: database identity%s: %w", f.label(), err))
 	}
 
 	listenCtx, cancelListen := context.WithTimeout(ctx, listenTimeout)
 	defer cancelListen()
 
 	if _, err := conn.Exec(listenCtx, "LISTEN "+quoteIdentifier(s.cfg.Channel)); err != nil {
-		// The connection is closed on a ctx of its own: the one that just
-		// expired would abandon the socket instead of closing it.
-		closeCtx, cancelClose := context.WithTimeout(context.WithoutCancel(ctx), closeTimeout)
-		defer cancelClose()
-
-		_ = conn.Close(closeCtx)
-
-		return nil, fmt.Errorf("systemplane/postgres: listen%s: %w", f.label(), err)
+		return abort(fmt.Errorf("systemplane/postgres: listen%s: %w", f.label(), err))
 	}
 
 	s.logInfo(ctx, "LISTEN connection established",
 		log.String("channel", s.cfg.Channel),
 		log.String("tenant", f.scope.Tenant),
+		log.String("database", dbKey),
 	)
 
-	return conn, nil
+	return conn, dbKey, nil
 }
 
 // startFeedReader records the reader's done channel and launches it. done is
@@ -798,14 +814,6 @@ func (s *Store) startFeedReader(f *feed, conn *pgx.Conn) {
 // meanwhile must be able to throw it away instead of inheriting a live LISTEN
 // connection and a reader goroutine no later Close will ever stop.
 func (s *Store) startListener(ctx context.Context) error {
-	// The zero scope is held to the same one-database rule as a tenant's: a
-	// Store that also serves named tenants must not listen on a database one
-	// of them listens on, or every NOTIFY would reach both feeds.
-	dbKey, err := dsnDatabaseKey(s.cfg.ListenDSN)
-	if err != nil {
-		return fmt.Errorf("systemplane/postgres: listen dsn: %w", err)
-	}
-
 	// One Start at a time. The zero-scope feed is SHARED, so the "already
 	// running" check below and the reader launch inside publishFeed have to be
 	// one decision: two concurrent Starts that both saw no reader would each
@@ -828,7 +836,11 @@ func (s *Store) startListener(ctx context.Context) error {
 		return nil
 	}
 
-	conn, err := s.openListen(ctx, f)
+	// The zero scope is held to the same one-database rule as a tenant's: a
+	// Store that also serves named tenants must not listen on a database one
+	// of them listens on, or every NOTIFY would reach both feeds. openListen
+	// reads that identity off the connection it just opened.
+	conn, dbKey, err := s.openListen(ctx, f)
 	if err != nil {
 		return err
 	}

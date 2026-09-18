@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -792,22 +794,20 @@ func TestIntegration_PostgresScopedReadsStayOnThePrimary(t *testing.T) {
 	}
 }
 
-// TestIntegration_PostgresSeveralPrimariesStillAvoidTheStandby pins that
-// narrowing a resolver keeps EVERY primary rather than collapsing to one, so a
-// tenant declaring several writable connection strings still reads from a
-// writable node.
+// TestIntegration_PostgresPrimaryPinIsDeterministic pins that a tenant whose
+// connector reports several writable nodes sends every read AND every write to
+// the SAME one, so a value Set returns is the value the next Get reads (D4).
 //
-// It deliberately makes no failover claim. dbresolver picks one primary per
-// call and its retry fires only on a net.Error, while a dead pool reports
-// "sql: database is closed" — so killing a node here would prove nothing about
-// recovery, only about which index the load balancer happens to pick.
+// It deliberately makes no failover claim. Spreading the calls over the
+// primaries instead would buy none: dbresolver retries only on a net.Error and
+// a dead pool reports "sql: database is closed", which is not one. All it
+// would buy is a read that misses what the last write stored.
 //
-// The two primaries are separate databases holding DIFFERENT values, and the
-// replica is an empty decoy. A read served by the replica comes back missing;
-// a read served by either primary comes back as that primary's value. Dropping
-// the narrowing therefore fails this test deterministically, without pinning
-// dbresolver's choice between the two primaries.
-func TestIntegration_PostgresSeveralPrimariesStillAvoidTheStandby(t *testing.T) {
+// The two primaries are separate databases holding DIFFERENT values and the
+// replica is an empty decoy, so each possible destination answers distinctly:
+// the standby comes back missing, the second primary comes back with its own
+// value, and only the first primary comes back with the one asserted here.
+func TestIntegration_PostgresPrimaryPinIsDeterministic(t *testing.T) {
 	base, cleanup := startContainer(t)
 	t.Cleanup(cleanup)
 
@@ -818,11 +818,8 @@ func TestIntegration_PostgresSeveralPrimariesStillAvoidTheStandby(t *testing.T) 
 	_, _, primary2 := provisionTenantDB(t, admin, base, "multiprimary_two")
 	_, _, standby := provisionTenantDB(t, admin, base, "multiprimary_standby")
 
-	seeded := map[string]bool{}
-
 	for i, db := range []*sql.DB{primary1, primary2} {
 		value := fmt.Sprintf("primary-%d", i+1)
-		seeded[value] = true
 
 		if _, err := db.Exec(
 			`INSERT INTO systemplane_entries (namespace, key, value, updated_at, updated_by)
@@ -843,8 +840,8 @@ func TestIntegration_PostgresSeveralPrimariesStillAvoidTheStandby(t *testing.T) 
 	ctx := context.Background()
 	scope := store.Scope{Tenant: "t1"}
 
-	// Several reads, because the choice between the primaries is dbresolver's
-	// and every one of them must still land on a writable node.
+	// Several reads, because a pin that drifts between calls is the failure
+	// this guards: every one must answer from the first primary.
 	for i := range 4 {
 		entry, found, err := s.Get(ctx, scope, "ns", "k")
 		if err != nil {
@@ -860,13 +857,43 @@ func TestIntegration_PostgresSeveralPrimariesStillAvoidTheStandby(t *testing.T) 
 			t.Fatalf("get #%d: decode value: %v", i+1, err)
 		}
 
-		if !seeded[got] {
-			t.Fatalf("get #%d returned %q, want a value seeded on one of the primaries", i+1, got)
+		if got != "primary-1" {
+			t.Fatalf("get #%d returned %q, want %q: reads must pin to the first primary", i+1, got, "primary-1")
 		}
 
 		if entry.Revision == 0 {
 			t.Errorf("get #%d revision = 0, want the revision the insert trigger assigned", i+1)
 		}
+	}
+
+	// Read-your-write across several primaries: the write must land where the
+	// reads look, or the value a caller just stored comes back missing.
+	written, err := s.Set(ctx, scope, store.Entry{Namespace: "ns", Key: "fresh", Value: jsonBytes(t, "written")})
+	if err != nil {
+		t.Fatalf("set: %v", err)
+	}
+
+	entry, found, err := s.Get(ctx, scope, "ns", "fresh")
+	if err != nil {
+		t.Fatalf("get after set: %v", err)
+	}
+
+	if !found {
+		t.Fatal("Get missed the value Set just stored: the write and the read chose different primaries")
+	}
+
+	if entry.Revision != written {
+		t.Errorf("Get revision = %d, want the %d Set returned", entry.Revision, written)
+	}
+
+	var onSecondPrimary int
+
+	if err := primary2.QueryRow(`SELECT count(*) FROM systemplane_entries WHERE key = 'fresh'`).Scan(&onSecondPrimary); err != nil {
+		t.Fatalf("count rows on the second primary: %v", err)
+	}
+
+	if onSecondPrimary != 0 {
+		t.Errorf("the second primary holds the written row, want 0: writes must pin to the first primary")
 	}
 
 	var onStandby int
@@ -1172,6 +1199,8 @@ func assertNoEvent(t *testing.T, events <-chan store.Event, wait time.Duration, 
 // listenBackends counts the dedicated LISTEN connections open on dbName. A feed
 // parks its connection in `LISTEN "..."` for its whole life, so that query text
 // isolates it from the test's own pooled handles.
+// A feed's backend is recognised by its last statement, so LISTEN must remain
+// the last thing openListen runs on the connection.
 func listenBackends(t *testing.T, admin *sql.DB, dbName string) int {
 	t.Helper()
 
@@ -2244,8 +2273,77 @@ func TestIntegration_PostgresTwoTenantsOnOneDatabase(t *testing.T) {
 		t.Fatalf("subscribe t2 error = %v, want postgres.ErrSharedDatabaseUnsupported", err)
 	}
 
-	// The refused feed leaves nothing behind: t1 keeps its one backend. The
+	// A third tenant on the same database, reached by a different SPELLING of
+	// the same host. Nothing forces two operators to type one connection
+	// string, and a key read off the DSN text calls "localhost" and
+	// "127.0.0.1" two databases and lets this feed through. The server reports
+	// one identity for both.
+	altDSN, ok := respellHost(tenantDSN)
+	if !ok {
+		t.Logf("container host in %q has no second spelling here; skipping the respelling case", tenantDSN)
+	} else {
+		requireDialable(t, altDSN)
+
+		conn.set("t3", db, altDSN)
+
+		unsub3, err := s.Subscribe(ctx, store.Scope{Tenant: "t3"}, func(store.Event) {})
+		if err == nil {
+			unsub3()
+			t.Fatal("a tenant spelling t1's host differently was admitted; want ErrSharedDatabaseUnsupported")
+		}
+
+		if !errors.Is(err, postgres.ErrSharedDatabaseUnsupported) {
+			t.Fatalf("subscribe t3 error = %v, want postgres.ErrSharedDatabaseUnsupported", err)
+		}
+	}
+
+	// The refused feeds leave nothing behind: t1 keeps its one backend. A
 	// refused connection is closed by the creator and reaped by Postgres
 	// asynchronously, so this waits for the count instead of sampling it once.
 	waitForListenBackends(t, admin, dbName, 1, "after the shared-database refusal")
+}
+
+// respellHost returns dsn with its host swapped for another spelling of the
+// same address, and false when the environment offers none.
+func respellHost(dsn string) (string, bool) {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return "", false
+	}
+
+	var alt string
+
+	switch u.Hostname() {
+	case "localhost":
+		alt = "127.0.0.1"
+	case "127.0.0.1":
+		alt = "localhost"
+	default:
+		return "", false
+	}
+
+	u.Host = net.JoinHostPort(alt, u.Port())
+
+	return u.String(), true
+}
+
+// requireDialable skips the caller when the alternate spelling cannot reach the
+// container at all — an environment fact (no IPv4 loopback publish, a resolver
+// that sends localhost to ::1), not something the store decides.
+func requireDialable(t *testing.T, dsn string) {
+	t.Helper()
+
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Skipf("open %s: %v", dsn, err)
+	}
+
+	defer func() { _ = db.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := db.PingContext(ctx); err != nil {
+		t.Skipf("the alternate host spelling is not reachable here: %v", err)
+	}
 }

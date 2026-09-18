@@ -300,37 +300,34 @@ func (s *Store) resolveDB(ctx context.Context, scope store.Scope) (dbExecutor, e
 // revision older than the one Set just returned, and older than the NOTIFY the
 // changefeed is reconciling against, since the feed LISTENs on the primary
 // DSN. Read-your-write and revision coherence are worth more than offloading a
-// five-column configuration table, so a resolver carrying replicas is narrowed
-// to its primaries. A resolver with no replicas is handed back untouched: it
-// already resolves everything to a primary, and keeping the wrapper preserves
-// its failover behavior.
+// five-column configuration table, so a resolver carrying replicas is pinned
+// to ONE primary. A resolver with no replicas is handed back untouched: it
+// already resolves everything to a primary, and keeping the wrapper costs
+// nothing.
 //
-// Narrowing excludes the standbys and NOTHING else — no failover claim rides
-// on it. lib-commons builds every tenant resolver from exactly one primary and
-// one replica (commons/postgres createResolverFn), so the common case is the
-// single primary handed back directly, which also spares every read the cost
-// of building a resolver. A connector of a consumer's own making may return
-// several primaries; those keep a resolver so the standbys stay excluded, and
-// dbresolver picks one of them per call. It does not fail over: its retry
-// fires only on a net.Error, and a dead pool reports "sql: database is closed",
-// which is not one.
+// The pin is the FIRST primary, always, and that is the whole claim: one
+// deterministic node, every standby excluded, no failover. lib-commons builds
+// every tenant resolver from exactly one primary and one replica
+// (commons/postgres createResolverFn), so the common case has only one primary
+// to pick. A connector of a consumer's own making may report several; picking
+// deterministically among them is what keeps a value Set returned readable by
+// the next Get, and it costs no allocation on a path every query crosses.
+// Handing those back inside a fresh resolver instead would buy nothing:
+// dbresolver retries only on a net.Error, and a dead pool reports
+// "sql: database is closed", which is not one.
 func pinPrimary(db dbresolver.DB) dbExecutor {
 	if len(db.ReplicaDBs()) == 0 {
 		return db
 	}
 
 	// A resolver with replicas but no primary is a connector bug; there is
-	// nothing better to fall back to than the resolver itself. It also keeps
-	// the narrowing below out of dbresolver.New's no-primary panic.
+	// nothing better to fall back to than the resolver itself.
 	primaries := db.PrimaryDBs()
-	switch len(primaries) {
-	case 0:
+	if len(primaries) == 0 {
 		return db
-	case 1:
-		return primaries[0]
-	default:
-		return dbresolver.New(dbresolver.WithPrimaryDBs(primaries...))
 	}
+
+	return primaries[0]
 }
 
 // List returns every entry in the resolved database, ordered by (namespace, key).

@@ -1014,8 +1014,10 @@ func TestPostgresStart_SchemaPinnedListenDSNStillDials(t *testing.T) {
 	}
 }
 
-// A malformed ListenDSN is still refused before anything is dialed: the same
-// parse that yields the database key is the one that rejects it.
+// A malformed ListenDSN is still refused before anything reaches the network,
+// and Start surfaces it instead of looping in the background. The refusal is
+// now the dialer's: the database key is read off the connection the server
+// answers on, not parsed out of the DSN text, so pgx is the only parser left.
 func TestPostgresStart_UnparseableListenDSNIsRefused(t *testing.T) {
 	s := &Store{
 		cfg:      Config{Channel: defaultChannel, Table: defaultTable, Module: defaultModule, ListenDSN: "postgres://%zz"},
@@ -1028,12 +1030,25 @@ func TestPostgresStart_UnparseableListenDSNIsRefused(t *testing.T) {
 		t.Fatal("Start with an unparseable ListenDSN returned nil; want a parse error")
 	}
 
-	if !strings.Contains(err.Error(), "listen dsn") {
-		t.Errorf("Start error %q must name the listen DSN", err)
+	if !strings.Contains(err.Error(), "listen connect") {
+		t.Errorf("Start error %q must come from the dialer", err)
 	}
 
-	if n := feedCount(s); n != 0 {
-		t.Errorf("feeds map holds %d entries after a refused ListenDSN, want 0", n)
+	// The reserved zero-scope slot may survive a failed Start — Start is
+	// retryable and reuses it — but it must carry no reader, or Close would
+	// wait out the full timeout on a goroutine that never ran.
+	s.feedsMu.Lock()
+	f := s.feeds[""]
+	s.feedsMu.Unlock()
+
+	if f != nil {
+		f.mu.Lock()
+		running := f.done != nil
+		f.mu.Unlock()
+
+		if running {
+			t.Error("a refused ListenDSN left a LISTEN reader running")
+		}
 	}
 
 	if err := s.Close(); err != nil {

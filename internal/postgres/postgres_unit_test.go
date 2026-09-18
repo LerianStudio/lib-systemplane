@@ -13,6 +13,7 @@ import (
 
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 	"github.com/bxcodec/dbresolver/v2"
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 func TestNew_ConfigValidationAndDefaults(t *testing.T) {
@@ -501,5 +502,45 @@ func TestPostgresSubscribe_FailedFeedCreationFailsEveryWaiter(t *testing.T) {
 
 	if got := conn.callCount(); got != 2 {
 		t.Errorf("ResolveDSN calls = %d after the retry, want 2: the retracted slot must be rebuilt", got)
+	}
+}
+
+// pinPrimary sits on the hot path of every Get, Set, Delete and List, so it
+// must pick ONE deterministic primary and allocate nothing doing it.
+//
+// The determinism is what a caller can reason about: reads and writes of a
+// tenant whose connector reports several writable nodes all land on the same
+// one, so a value Set returns is the value the next Get reads. Building a
+// fresh resolver per call gave neither — six allocations a query, and a fresh
+// round-robin counter that made every call pick the same index anyway.
+// Not parallel: testing.AllocsPerRun panics in a parallel test.
+func TestPinPrimary_PinsTheFirstPrimaryWithoutAllocating(t *testing.T) {
+	open := func() *sql.DB {
+		t.Helper()
+
+		db, err := sql.Open("pgx", "postgres://u:p@127.0.0.1:5432/db?sslmode=disable")
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+
+		t.Cleanup(func() { _ = db.Close() })
+
+		return db
+	}
+
+	primaries := []*sql.DB{open(), open(), open()}
+	resolver := dbresolver.New(
+		dbresolver.WithPrimaryDBs(primaries...),
+		dbresolver.WithReplicaDBs(open()),
+	)
+
+	for i := range 8 {
+		if got := pinPrimary(resolver); got != dbExecutor(primaries[0]) {
+			t.Fatalf("call #%d resolved to a handle other than the first primary", i+1)
+		}
+	}
+
+	if allocs := testing.AllocsPerRun(100, func() { _ = pinPrimary(resolver) }); allocs != 0 {
+		t.Errorf("pinPrimary allocated %v objects per call, want 0 on the hot path", allocs)
 	}
 }
