@@ -22,39 +22,15 @@ import (
 	"github.com/LerianStudio/lib-systemplane/v4/systemplanetest"
 	"github.com/bxcodec/dbresolver/v2"
 	_ "github.com/jackc/pgx/v5/stdlib"
-	"github.com/testcontainers/testcontainers-go"
-	pgcontainer "github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 
-// startContainer launches a single Postgres testcontainer reused across the
-// integration tests in this file.
-func startContainer(t *testing.T) (string, func()) {
+// startContainer returns the admin DSN of the package-wide Postgres server
+// (see shared_container_integration_test.go). Tests isolate themselves with a
+// uniquely-named database on that server, so none of them needs its own.
+func startContainer(t *testing.T) string {
 	t.Helper()
 
-	ctx := context.Background()
-
-	container, err := pgcontainer.Run(ctx, "postgres:16-alpine",
-		pgcontainer.WithDatabase("postgres"),
-		pgcontainer.WithUsername("postgres"),
-		pgcontainer.WithPassword("postgres"),
-		pgcontainer.BasicWaitStrategies(),
-	)
-	if err != nil {
-		t.Fatalf("start container: %v", err)
-	}
-
-	dsn, err := container.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		_ = testcontainers.TerminateContainer(container)
-
-		t.Fatalf("connection string: %v", err)
-	}
-
-	cleanup := func() {
-		_ = testcontainers.TerminateContainer(container)
-	}
-
-	return dsn, cleanup
+	return postgres.SharedContainerDSN(t)
 }
 
 // adminDSN returns a connection string for the postgres admin database used
@@ -118,8 +94,7 @@ func dsnFor(base, dbName string) string {
 }
 
 func TestIntegration_PostgresSingleTenant(t *testing.T) {
-	dsn, cleanup := startContainer(t)
-	t.Cleanup(cleanup)
+	dsn := startContainer(t)
 
 	factory := func(t *testing.T) (store.Store, func()) {
 		t.Helper()
@@ -163,8 +138,7 @@ func TestIntegration_PostgresSingleTenant(t *testing.T) {
 // using schema that the consumer provisioned externally (the Store performs no
 // runtime DDL).
 func TestIntegration_PostgresMultiTenantIsolation(t *testing.T) {
-	dsn, cleanup := startContainer(t)
-	t.Cleanup(cleanup)
+	dsn := startContainer(t)
 
 	admin := adminDSN(t, dsn)
 	defer admin.Close()
@@ -274,8 +248,7 @@ func TestIntegration_PostgresMultiTenantIsolation(t *testing.T) {
 }
 
 func TestIntegration_PostgresMultiTenantMissingCtx(t *testing.T) {
-	dsn, cleanup := startContainer(t)
-	t.Cleanup(cleanup)
+	dsn := startContainer(t)
 	_ = dsn
 
 	s, err := postgres.New(postgres.Config{
@@ -304,8 +277,7 @@ func TestIntegration_PostgresMultiTenantMissingCtx(t *testing.T) {
 // schema — Get/Set/Delete still succeed. If the Store attempted any runtime
 // DDL it would fail with "permission denied for schema" (42501).
 func TestIntegration_PostgresLeastPrivilegeRole_NoRuntimeDDL(t *testing.T) {
-	dsn, cleanup := startContainer(t)
-	t.Cleanup(cleanup)
+	dsn := startContainer(t)
 
 	admin := adminDSN(t, dsn)
 	defer admin.Close()
@@ -446,8 +418,7 @@ func jsonBytes(t *testing.T, v any) []byte {
 func freshStore(t *testing.T, prefix string) *postgres.Store {
 	t.Helper()
 
-	dsn, cleanup := startContainer(t)
-	t.Cleanup(cleanup)
+	dsn := startContainer(t)
 
 	admin := adminDSN(t, dsn)
 	dbName := fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano())
@@ -707,8 +678,7 @@ func (c *fakeConnector) ResolveDSN(_ context.Context, tenantID string) (string, 
 // replication lag from the test entirely — any read routed to it comes back
 // missing, which is a harder signal than a stale one and fails deterministically.
 func TestIntegration_PostgresScopedReadsStayOnThePrimary(t *testing.T) {
-	base, cleanup := startContainer(t)
-	t.Cleanup(cleanup)
+	base := startContainer(t)
 
 	admin := adminDSN(t, base)
 	t.Cleanup(func() { _ = admin.Close() })
@@ -808,8 +778,7 @@ func TestIntegration_PostgresScopedReadsStayOnThePrimary(t *testing.T) {
 // the standby comes back missing, the second primary comes back with its own
 // value, and only the first primary comes back with the one asserted here.
 func TestIntegration_PostgresPrimaryPinIsDeterministic(t *testing.T) {
-	base, cleanup := startContainer(t)
-	t.Cleanup(cleanup)
+	base := startContainer(t)
 
 	admin := adminDSN(t, base)
 	t.Cleanup(func() { _ = admin.Close() })
@@ -914,8 +883,7 @@ func TestIntegration_PostgresPrimaryPinIsDeterministic(t *testing.T) {
 // handle came from the connector rather than from ctx, and each tenant sees
 // only its own rows.
 func TestIntegration_PostgresScopedCRUDIsolation(t *testing.T) {
-	dsn, cleanup := startContainer(t)
-	t.Cleanup(cleanup)
+	dsn := startContainer(t)
 
 	admin := adminDSN(t, dsn)
 	defer admin.Close()
@@ -1242,8 +1210,7 @@ func waitForListenBackends(t *testing.T, admin *sql.DB, dbName string, want int,
 // each tenant's subscriber is told OpResync for ITS OWN scope, and a write in
 // one tenant's database never reaches the other tenant's subscriber.
 func TestIntegration_PostgresTwoTenantFeedsAreIsolated(t *testing.T) {
-	base, cleanup := startContainer(t)
-	t.Cleanup(cleanup)
+	base := startContainer(t)
 
 	admin := adminDSN(t, base)
 	defer admin.Close()
@@ -1303,8 +1270,7 @@ func TestIntegration_PostgresTwoTenantFeedsAreIsolated(t *testing.T) {
 // leave closes it, and a later Subscribe resolves the tenant's DSN again — which
 // is how a credentials rotation is picked up.
 func TestIntegration_PostgresTenantFeedTornDownOnLastUnsubscribe(t *testing.T) {
-	base, cleanup := startContainer(t)
-	t.Cleanup(cleanup)
+	base := startContainer(t)
 
 	admin := adminDSN(t, base)
 	defer admin.Close()
@@ -1378,8 +1344,7 @@ func TestIntegration_PostgresTenantFeedTornDownOnLastUnsubscribe(t *testing.T) {
 // doing the waiting, so it can only ever end at the closeTimeout, and the
 // tenant's dispatch is frozen for those five seconds.
 func TestIntegration_PostgresSelfUnsubscribeInCallbackDoesNotStall(t *testing.T) {
-	base, cleanup := startContainer(t)
-	t.Cleanup(cleanup)
+	base := startContainer(t)
 
 	admin := adminDSN(t, base)
 	defer admin.Close()
@@ -1455,8 +1420,7 @@ func TestIntegration_PostgresSelfUnsubscribeInCallbackDoesNotStall(t *testing.T)
 // exactly ONE LISTEN connection, which is what "one live subscription per
 // activated tenant" rests on.
 func TestIntegration_PostgresConcurrentFirstSubscribeOpensOneConnection(t *testing.T) {
-	base, cleanup := startContainer(t)
-	t.Cleanup(cleanup)
+	base := startContainer(t)
 
 	admin := adminDSN(t, base)
 	defer admin.Close()
@@ -1586,8 +1550,7 @@ func (c *blockingConnector) ResolveDSN(ctx context.Context, _ string) (string, e
 // is a reserved slot with nothing to stop yet, so the creator itself has to
 // notice the shutdown after it connects and throw the connection away.
 func TestIntegration_PostgresCloseDuringFeedCreationLeavesNothingRunning(t *testing.T) {
-	base, cleanup := startContainer(t)
-	t.Cleanup(cleanup)
+	base := startContainer(t)
 
 	admin := adminDSN(t, base)
 	defer admin.Close()
@@ -1775,8 +1738,7 @@ func listenBackendPID(t *testing.T, admin *sql.DB, dbName string) int {
 // not, and that is precisely why the resync exists. What IS asserted is that
 // the value is recoverable afterwards, at a higher revision.
 func TestIntegration_PostgresResyncAfterListenGap(t *testing.T) {
-	base, cleanup := startContainer(t)
-	t.Cleanup(cleanup)
+	base := startContainer(t)
 
 	admin := adminDSN(t, base)
 	defer admin.Close()
@@ -2109,8 +2071,7 @@ func TestIntegration_PostgresEventCarriesRevision(t *testing.T) {
 // deliver every NOTIFY twice — the engine would then apply, and fence, each
 // change against itself.
 func TestIntegration_PostgresConcurrentStartOpensOneListener(t *testing.T) {
-	base, cleanup := startContainer(t)
-	t.Cleanup(cleanup)
+	base := startContainer(t)
 
 	admin := adminDSN(t, base)
 
@@ -2199,8 +2160,7 @@ func TestIntegration_PostgresConcurrentStartOpensOneListener(t *testing.T) {
 // names one — permanently, since a failed activation is retried from scratch
 // on every later read.
 func TestIntegration_PostgresStartAcceptsSchemaPinnedListenDSN(t *testing.T) {
-	base, cleanup := startContainer(t)
-	t.Cleanup(cleanup)
+	base := startContainer(t)
 
 	admin := adminDSN(t, base)
 
@@ -2234,8 +2194,7 @@ func TestIntegration_PostgresStartAcceptsSchemaPinnedListenDSN(t *testing.T) {
 // first tenant's notifications stamped with its own scope and the engine's
 // revision fence would act on them.
 func TestIntegration_PostgresTwoTenantsOnOneDatabase(t *testing.T) {
-	base, cleanup := startContainer(t)
-	t.Cleanup(cleanup)
+	base := startContainer(t)
 
 	admin := adminDSN(t, base)
 

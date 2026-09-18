@@ -96,8 +96,7 @@ func TestIntegration_DDLSchemaUpgradesAV3DatabaseInPlace(t *testing.T) {
 func assertUpgradeRoute(t *testing.T, label string, steps ...string) {
 	t.Helper()
 
-	base, cleanup := startContainer(t)
-	t.Cleanup(cleanup)
+	base := startContainer(t)
 
 	dsn, db := populatedV3Database(t, base, label)
 
@@ -118,8 +117,7 @@ func assertUpgradeRoute(t *testing.T, label string, steps ...string) {
 // that missed both events still accepts the recreated value instead of fencing
 // it out as stale.
 func TestIntegration_DDLRecreatedKeyExceedsDeletedRevision(t *testing.T) {
-	base, cleanup := startContainer(t)
-	t.Cleanup(cleanup)
+	base := startContainer(t)
 
 	dsn, db := freshV4Database(t, base, "recreate")
 	s := storeOn(t, db, dsn)
@@ -529,8 +527,7 @@ func assertUpgradeOutsideTheDefaultSchema(t *testing.T, label, searchPath string
 func seedV3InsideAppSchema(t *testing.T, label, searchPath string) (*sql.DB, string) {
 	t.Helper()
 
-	base, cleanup := startContainer(t)
-	t.Cleanup(cleanup)
+	base := startContainer(t)
 
 	admin := adminDSN(t, base)
 	t.Cleanup(func() { _ = admin.Close() })
@@ -700,8 +697,7 @@ func TestIntegration_DDLSchemaRefusesForkWhenInstallIsOffSearchPath(t *testing.T
 // against. Re-setting the default unconditionally is what keeps the table
 // writable throughout.
 func TestIntegration_DDLReapplyKeepsInsertsWorkingInsideTheTriggerWindow(t *testing.T) {
-	base, cleanup := startContainer(t)
-	t.Cleanup(cleanup)
+	base := startContainer(t)
 
 	t.Run("schema", func(t *testing.T) {
 		dsn, db := freshV4Database(t, base, "window_schema")
@@ -809,8 +805,7 @@ func splitAtTheTriggerWindow(t *testing.T, artifact string) (string, string) {
 // value forever. Taking the greater of MAX(revision) and the sequence's own
 // last_value is what makes re-application safe on a live database.
 func TestIntegration_DDLReapplyAfterStoreWritesDoesNotRewindTheSequence(t *testing.T) {
-	base, cleanup := startContainer(t)
-	t.Cleanup(cleanup)
+	base := startContainer(t)
 
 	t.Run("schema", func(t *testing.T) {
 		dsn, db := freshV4Database(t, base, "rewind_schema")
