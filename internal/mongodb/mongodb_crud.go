@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -36,12 +37,12 @@ import (
 //     miss the first insert. Listing indexes is also all the privilege a
 //     consumer whose collection is provisioned externally may hold — it
 //     confirms the connection can reach the collection, and the change stream
-//     observes the very first write that auto-creates the namespace. A
-//     single-tenant consumer running in POLLING mode therefore has to create
-//     the two indexes in pollingIndexes itself, in whatever provisions that
-//     collection: without them both of the poller's per-tick queries scan the
-//     whole collection on every tick, and the incremental one also sorts it
-//     in memory.
+//     observes the very first write that auto-creates the namespace. In
+//     POLLING mode it also creates the two indexes in pollingIndexes: there is
+//     no change stream to race there, and without them both of the poller's
+//     per-tick queries scan the whole collection on every tick while the
+//     incremental one also sorts it in memory. A role that may not create an
+//     index keeps working — slower — so a refusal is logged, not returned.
 func (s *Store) runSchema(ctx context.Context, coll *mongo.Collection, tenantScoped bool) error {
 	if s.cfg.MultiTenantEnabled || tenantScoped {
 		db := coll.Database()
@@ -70,6 +71,16 @@ func (s *Store) runSchema(ctx context.Context, coll *mongo.Collection, tenantSco
 
 	if err := cur.Close(ctx); err != nil {
 		return fmt.Errorf("systemplane/mongodb: close index cursor: %w", err)
+	}
+
+	if s.cfg.PollInterval <= 0 {
+		return nil
+	}
+
+	if _, err := coll.Indexes().CreateMany(ctx, pollingIndexes()); err != nil {
+		s.logWarn(ctx, "could not create the polling indexes; every poll round trip will scan the whole collection",
+			log.Err(err),
+		)
 	}
 
 	return nil

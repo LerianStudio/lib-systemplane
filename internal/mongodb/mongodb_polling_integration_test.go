@@ -201,7 +201,7 @@ func TestIntegration_PollOnce_SameMsDifferentValue_EmitsBoth(t *testing.T) {
 		first:           true,
 	}
 
-	after, err := s.pollOnce(context.Background(), f, first)
+	after, err := s.pollOnce(context.Background(), f, first, s.pollEmitter(f))
 	if err != nil {
 		t.Fatalf("first pollOnce: %v", err)
 	}
@@ -225,7 +225,7 @@ func TestIntegration_PollOnce_SameMsDifferentValue_EmitsBoth(t *testing.T) {
 	// Step 4: second poll carrying the state the first one established.
 	// Pre-fix this would have skipped silently and emission count would
 	// stay at 1.
-	if _, err := s.pollOnce(context.Background(), f, after); err != nil {
+	if _, err := s.pollOnce(context.Background(), f, after, s.pollEmitter(f)); err != nil {
 		t.Fatalf("second pollOnce: %v", err)
 	}
 
@@ -291,7 +291,7 @@ func TestIntegration_PollOnce_SameMsSameValue_EmitsOnce(t *testing.T) {
 		first:           true,
 	}
 
-	after, err := s.pollOnce(context.Background(), f, first)
+	after, err := s.pollOnce(context.Background(), f, first, s.pollEmitter(f))
 	if err != nil {
 		t.Fatalf("first pollOnce: %v", err)
 	}
@@ -305,7 +305,7 @@ func TestIntegration_PollOnce_SameMsSameValue_EmitsOnce(t *testing.T) {
 	// touched updated_at without changing payload.)
 	rawUpsert(t, coll, "ns", "k", `"vSame"`, t0)
 
-	if _, err := s.pollOnce(context.Background(), f, after); err != nil {
+	if _, err := s.pollOnce(context.Background(), f, after, s.pollEmitter(f)); err != nil {
 		t.Fatalf("second pollOnce: %v", err)
 	}
 
@@ -668,6 +668,48 @@ func TestIntegration_MongoPollingIndexesCreatedForTenantCollection(t *testing.T)
 		t.Fatalf("runSchema (second run): %v", err)
 	}
 
+	assertPollingIndexes(t, coll)
+}
+
+// The single-tenant collection is the one runSchema deliberately does NOT
+// create, to keep a fresh change stream from missing the write that
+// materializes it. Polling has no cursor to race, and its two per-tick
+// full-collection queries need the indexes exactly as much as a tenant
+// collection's do — so in polling mode the single-tenant branch creates them
+// too.
+func TestIntegration_MongoPollingIndexesCreatedForSingleTenantCollection(t *testing.T) {
+	client, cleanup := startPollingContainer(t)
+	t.Cleanup(cleanup)
+
+	dbName := fmt.Sprintf("pollindexes_st_%d", time.Now().UnixNano())
+	db := client.Database(dbName)
+
+	t.Cleanup(func() { _ = db.Drop(context.Background()) })
+
+	s, err := New(Config{Client: client, Database: dbName, PollInterval: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	coll := db.Collection(defaultCollection)
+
+	if err := s.runSchema(context.Background(), coll, false); err != nil {
+		t.Fatalf("runSchema: %v", err)
+	}
+
+	// Idempotent: a second bootstrap of the same collection must not error.
+	if err := s.runSchema(context.Background(), coll, false); err != nil {
+		t.Fatalf("runSchema (second run): %v", err)
+	}
+
+	assertPollingIndexes(t, coll)
+}
+
+// assertPollingIndexes fails the test unless both indexes the poller relies on
+// are present on coll.
+func assertPollingIndexes(t *testing.T, coll *mongo.Collection) {
+	t.Helper()
+
 	want := map[string]bool{
 		fieldUpdatedAt + "_1_" + fieldNamespace + "_1_" + fieldKey + "_1": false,
 		fieldDeleted + "_1_" + fieldNamespace + "_1_" + fieldKey + "_1":   false,
@@ -698,5 +740,66 @@ func TestIntegration_MongoPollingIndexesCreatedForTenantCollection(t *testing.T)
 		if !found {
 			t.Errorf("index %q missing: the poller's per-tick queries scan the whole collection without it", name)
 		}
+	}
+}
+
+// TestIntegration_MongoPollingFirstRoundAnnouncesBeforeKeyEvents pins FC-2's
+// order on the feed's FIRST round trip. A subscriber can be registered before
+// Start — the engine does exactly that — and at that moment the feed has
+// announced nothing to it. A first round trip that dispatched the documents it
+// read would hand that subscriber key events ahead of its first OpResync, the
+// one marker that tells it to load the scope at all. So the first round is
+// silent: it only anchors the watermark, and the OpResync that follows it makes
+// the engine read the whole scope anyway.
+func TestIntegration_MongoPollingFirstRoundAnnouncesBeforeKeyEvents(t *testing.T) {
+	client, cleanup := startPollingContainer(t)
+	t.Cleanup(cleanup)
+
+	dbName := fmt.Sprintf("poll_firstround_%d", time.Now().UnixNano())
+	db := client.Database(dbName)
+
+	t.Cleanup(func() { _ = db.Drop(context.Background()) })
+
+	// Stamped ahead of the watermark the first round anchors at time.Now(), so
+	// the round is guaranteed to READ this row rather than race the clock for
+	// it.
+	rawUpsert(t, db.Collection(defaultCollection), "ns", "k", `{"a":1}`, time.Now().Add(time.Minute))
+
+	s, err := New(Config{Client: client, Database: dbName, PollInterval: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	t.Cleanup(func() { _ = s.Close() })
+
+	ctx := context.Background()
+	events := make(chan store.Event, 32)
+
+	// Subscribed BEFORE Start: the feed exists but has announced nothing, so
+	// every event this subscriber sees comes from the first round trip and the
+	// marker that follows it.
+	unsub, err := s.Subscribe(ctx, store.Scope{}, func(evt store.Event) {
+		select {
+		case events <- evt:
+		default:
+		}
+	})
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	t.Cleanup(unsub)
+
+	if err := s.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	select {
+	case evt := <-events:
+		if evt.Op != store.OpResync {
+			t.Fatalf("first event a pre-Start subscriber received = %+v, want %q: the feed announced a key event before it announced itself", evt, store.OpResync)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("timed out waiting for the feed's first marker")
 	}
 }

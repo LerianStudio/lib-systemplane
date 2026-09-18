@@ -1939,12 +1939,21 @@ func TestIntegration_MongoRepeatedReopenFailuresEmitOneDisconnect(t *testing.T) 
 // already believes is stale; a resync per SUCCESSFUL tick would have it
 // reloading the scope forever.
 func TestIntegration_MongoPollingDisconnectAndResyncAroundFailedRound(t *testing.T) {
-	_, endpoint, cleanup := startContainerAt(t)
+	client, endpoint, cleanup := startContainerAt(t)
 	t.Cleanup(cleanup)
 
 	proxy := newTCPProxy(t, endpoint)
 
-	s, _ := proxiedStore(t, proxy, "pollfail", 200*time.Millisecond)
+	s, dbName := proxiedStore(t, proxy, "pollfail", 200*time.Millisecond)
+
+	// Wired straight to the container, so the write below lands in the
+	// collection the polling feed cannot reach while the proxy is severed.
+	direct, err := mongodb.New(mongodb.Config{Client: client, Database: dbName})
+	if err != nil {
+		t.Fatalf("mongodb.New direct: %v", err)
+	}
+
+	t.Cleanup(func() { _ = direct.Close() })
 
 	if err := s.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
@@ -1963,13 +1972,25 @@ func TestIntegration_MongoPollingDisconnectAndResyncAroundFailedRound(t *testing
 	// server-selection bound on top of the 200ms tick.
 	time.Sleep(6 * time.Second)
 
+	// The write the feed is blind to. The round trip that finds it is the one
+	// that ends the failure streak, which is what makes the order below a real
+	// assertion rather than a vacuous one.
+	setEntry(t, direct, "ns", "k", `{"a":1}`)
+
 	proxy.restore(t)
 
-	narration := collectUntil(t, events, "the OpResync after the failed round trips", 60*time.Second,
-		func(evt store.Event) bool { return evt.Op == store.OpResync })
+	narration := collectUntil(t, events, "the upsert the recovering round trip found", 60*time.Second,
+		func(evt store.Event) bool { return evt.Op == store.OpUpsert })
 
 	if narration[0].Op != store.OpDisconnect {
 		t.Fatalf("outage began with %#v, want OpDisconnect first; sequence = %#v", narration[0], narration)
+	}
+
+	// FC-2: the marker that says the feed is back precedes every key event the
+	// recovering round trip read. A subscriber told about the key first would
+	// apply it while it still believes the scope is stale.
+	if narration[1].Op != store.OpResync {
+		t.Fatalf("recovery announced %#v before the OpResync, want the resync first; sequence = %#v", narration[1], narration)
 	}
 
 	if got := countOps(narration, store.OpDisconnect); got != 1 {
@@ -1980,8 +2001,8 @@ func TestIntegration_MongoPollingDisconnectAndResyncAroundFailedRound(t *testing
 		t.Fatalf("the recovery narrated %d resyncs, want exactly 1; sequence = %#v", got, narration)
 	}
 
-	if len(narration) != 2 {
-		t.Fatalf("the outage narrated %d events, want exactly the disconnect/resync pair; sequence = %#v", len(narration), narration)
+	if len(narration) != 3 {
+		t.Fatalf("the outage narrated %d events, want exactly disconnect, resync, upsert; sequence = %#v", len(narration), narration)
 	}
 
 	// A recovered feed goes quiet: the round trips that follow announce

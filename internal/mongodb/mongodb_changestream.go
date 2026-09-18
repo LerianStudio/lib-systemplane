@@ -836,6 +836,14 @@ func (s *Store) consumeUntilFailure(f *feed, stream *mongo.ChangeStream) {
 	}
 }
 
+// reconnectDelay is how long a feed waits after its attempt-th consecutive
+// failure: full jitter over an exponential base, capped. Both loops use it —
+// the change stream between reopen attempts and the poller between failed round
+// trips — so an outage costs the same on either path.
+func reconnectDelay(attempt int) time.Duration {
+	return min(backoff.ExponentialWithJitter(reconnectBaseDelay, attempt), reconnectMaxDelay)
+}
+
 // reopenWatch retries the open until it succeeds or teardown stops the feed.
 // attempt is reset by a successful reopen, so a feed that flaps does not
 // inherit the previous outage's backoff.
@@ -854,7 +862,7 @@ func (s *Store) reopenWatch(f *feed, attempt *int) (*mongo.ChangeStream, error) 
 		default:
 		}
 
-		delay := min(backoff.ExponentialWithJitter(reconnectBaseDelay, *attempt), reconnectMaxDelay)
+		delay := reconnectDelay(*attempt)
 		*attempt++
 
 		select {
@@ -1104,8 +1112,15 @@ func newPollState() pollState {
 // caller never waits for swallows the writes that land in between — not late,
 // never. On failure it returns the wrapped error and leaves the caller to
 // retract the slot: no ticker, no placeholder, no partial subscription.
+//
+// It dispatches nothing (nil emit): the feed has announced nothing yet, and a
+// subscriber registered before Start — which is what the engine does — would
+// otherwise receive key events ahead of its first OpResync, breaking FC-2's
+// order. Nothing is lost by the silence: the OpResync pollForever broadcasts
+// immediately after has the engine reload the whole scope, and this round trip
+// still anchors the watermark so the next one is incremental.
 func (s *Store) startPolling(ctx context.Context, f *feed) error {
-	st, err := s.pollOnce(ctx, f, newPollState())
+	st, err := s.pollOnce(ctx, f, newPollState(), nil)
 	if err != nil {
 		return err
 	}
@@ -1123,9 +1138,13 @@ func (s *Store) startPolling(ctx context.Context, f *feed) error {
 // the first failure of a streak announces one store.OpDisconnect and every
 // later failure announces nothing, so a long outage costs one disconnect rather
 // than one per tick; the round trip that ends the streak announces one
-// store.OpResync. A round trip's key events are dispatched by pollOnce as it
-// reads them, so they precede that resync — harmlessly, because the engine
-// answers a resync by reloading the whole scope anyway.
+// store.OpResync BEFORE the first key event it read (pollEmitter), or right
+// after it returns when it read none.
+//
+// A failure streak backs off exactly as the change stream's reopen loop does,
+// so a MongoDB that is down costs one round trip per backoff step instead of
+// one per tick — and, for a named tenant, one tenant-manager resolution per
+// tick on top of it. The counter resets on the first success.
 func (s *Store) pollForever(f *feed, st pollState) {
 	// The first round trip already succeeded — the caller would not have
 	// published this feed otherwise — so the connection is announced here, on
@@ -1137,12 +1156,14 @@ func (s *Store) pollForever(f *feed, st pollState) {
 	ticker := time.NewTicker(s.cfg.PollInterval)
 	defer ticker.Stop()
 
+	attempt := 0
+
 	for {
 		select {
 		case <-f.stop:
 			return
 		case <-ticker.C:
-			next, err := s.pollOnce(context.Background(), f, st)
+			next, err := s.pollOnce(context.Background(), f, st, s.pollEmitter(f))
 			if err != nil {
 				s.logWarn(context.Background(), "poll round trip failed",
 					log.Err(err),
@@ -1151,6 +1172,10 @@ func (s *Store) pollForever(f *feed, st pollState) {
 
 				if subs, ok := f.beginDisconnect(); ok {
 					s.broadcast(f, subs, store.Event{Scope: f.scope, Op: store.OpDisconnect})
+				}
+
+				if !s.pollBackoff(f, &attempt) {
+					return
 				}
 
 				// The tenant manager may have Disconnect()ed the client behind
@@ -1168,12 +1193,64 @@ func (s *Store) pollForever(f *feed, st pollState) {
 				continue
 			}
 
-			if subs, ok := f.beginResyncAfterOutage(); ok {
-				s.broadcast(f, subs, store.Event{Scope: f.scope, Op: store.OpResync})
-			}
+			attempt = 0
+
+			// The recovery announcement for a round trip that read no key
+			// event: pollEmitter never ran, so there was nothing to precede.
+			// Announcing twice is free — beginResyncAfterOutage is
+			// edge-triggered and the emitter already cleared the edge.
+			s.announceRecovery(f)
 
 			st = next
 		}
+	}
+}
+
+// pollEmitter returns the dispatch callback for ONE poll round trip. It hangs
+// the recovery OpResync on the round's FIRST key event, so a subscriber is
+// never told about a key by a feed that has not yet told it the feed is back:
+// the engine answers OpResync by reloading the scope, and a key event applied
+// before that marker is applied into a scope the engine still believes stale
+// (FC-2).
+func (s *Store) pollEmitter(f *feed) func(store.Event) {
+	announced := false
+
+	return func(evt store.Event) {
+		if !announced {
+			announced = true
+
+			s.announceRecovery(f)
+		}
+
+		f.dispatch(s.cfg.Logger, evt)
+	}
+}
+
+// announceRecovery broadcasts the one OpResync that ends a failure streak.
+// Edge-triggered through beginResyncAfterOutage: outside a streak, and on every
+// call after the first of one round trip, it announces nothing.
+func (s *Store) announceRecovery(f *feed) {
+	if subs, ok := f.beginResyncAfterOutage(); ok {
+		s.broadcast(f, subs, store.Event{Scope: f.scope, Op: store.OpResync})
+	}
+}
+
+// pollBackoff waits out one failed round trip and advances the streak counter.
+// It reports false when teardown stopped the feed meanwhile, so a Close never
+// waits out a backoff that can reach reconnectMaxDelay.
+//
+// The ticker keeps running underneath: its channel buffers one tick, so the
+// round trip that follows fires immediately after the wait rather than a whole
+// interval later.
+func (s *Store) pollBackoff(f *feed, attempt *int) bool {
+	delay := reconnectDelay(*attempt)
+	*attempt++
+
+	select {
+	case <-f.stop:
+		return false
+	case <-time.After(delay):
+		return true
 	}
 }
 
@@ -1195,9 +1272,19 @@ func (s *Store) pollForever(f *feed, st pollState) {
 //     announced from its tombstone this round is excluded from that diff, or
 //     the same delete would fire twice.
 //
+// Every one of those events goes to emit, never to f.dispatch directly, which
+// is what lets the caller decide what precedes them: pollForever hands in an
+// emitter that announces the recovery OpResync before the first of them, and
+// the synchronous first round trip hands in nil and dispatches nothing at all.
+// A nil emit still reads every document and advances the state normally.
+//
 // It returns the state the next round trip carries. On failure it returns the
 // state it was GIVEN, unchanged, so nothing advances over rows it never read.
-func (s *Store) pollOnce(ctx context.Context, f *feed, st pollState) (pollState, error) {
+func (s *Store) pollOnce(ctx context.Context, f *feed, st pollState, emit func(store.Event)) (pollState, error) {
+	if emit == nil {
+		emit = func(store.Event) {}
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, pollRoundTimeout)
 	defer cancel()
 
@@ -1263,7 +1350,7 @@ func (s *Store) pollOnce(ctx context.Context, f *feed, st pollState) (pollState,
 			evt.Op, evt.Revision = store.OpDelete, 0
 		}
 
-		f.dispatch(s.cfg.Logger, evt)
+		emit(evt)
 
 		switch {
 		case doc.UpdatedAt.After(next.watermark):
@@ -1298,7 +1385,7 @@ func (s *Store) pollOnce(ctx context.Context, f *feed, st pollState) (pollState,
 				continue
 			}
 
-			f.dispatch(s.cfg.Logger, store.Event{Namespace: nk.Namespace, Key: nk.Key, Op: store.OpDelete})
+			emit(store.Event{Namespace: nk.Namespace, Key: nk.Key, Op: store.OpDelete})
 		}
 	}
 

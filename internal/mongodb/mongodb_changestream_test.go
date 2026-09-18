@@ -1054,3 +1054,102 @@ func TestMongoStore_RefreshFeedCollRefusesNilDatabase(t *testing.T) {
 		t.Fatalf("refreshFeedColl error = %v, want store.ErrTenantConnectorMissing", err)
 	}
 }
+
+// TestPollEmitterAnnouncesResyncBeforeFirstEvent pins FC-2's order on the
+// polling path: the round trip that ends a failure streak must say the feed is
+// back BEFORE it hands over the first key it read. Announcing afterwards has a
+// subscriber apply a value into a scope it still believes stale, and the
+// engine's only route out of stale is that marker.
+func TestPollEmitterAnnouncesResyncBeforeFirstEvent(t *testing.T) {
+	s := newSubscribeStore()
+	f := newFeed(store.Scope{}, nil)
+
+	var got []store.Event
+
+	f.subs[1] = &subscription{fn: func(evt store.Event) { got = append(got, evt) }}
+
+	// An announced outage: the next successful round trip is a recovery.
+	f.disconnected = true
+
+	emit := s.pollEmitter(f)
+	emit(store.Event{Namespace: "ns", Key: "a", Op: store.OpUpsert, Revision: 7})
+	emit(store.Event{Namespace: "ns", Key: "b", Op: store.OpDelete})
+
+	assertOpSequence(t, got, "the recovering round trip",
+		store.OpResync, store.OpUpsert, store.OpDelete)
+
+	// A feed that never lost its connection announces nothing: one resync per
+	// successful round trip would have the engine reloading the scope forever.
+	got = nil
+
+	quiet := s.pollEmitter(f)
+	quiet(store.Event{Namespace: "ns", Key: "a", Op: store.OpUpsert, Revision: 8})
+
+	assertOpSequence(t, got, "a round trip outside an outage", store.OpUpsert)
+}
+
+func assertOpSequence(t *testing.T, got []store.Event, what string, want ...string) {
+	t.Helper()
+
+	if len(got) != len(want) {
+		t.Fatalf("%s delivered %d events, want %d; sequence = %#v", what, len(got), len(want), got)
+	}
+
+	for i, op := range want {
+		if got[i].Op != op {
+			t.Fatalf("%s delivered %q at position %d, want %q; sequence = %#v", what, got[i].Op, i, op, got)
+		}
+	}
+}
+
+// reconnectDelay is what keeps a backend that is down from costing one round
+// trip per tick — and, for a named tenant, one tenant-manager resolution on top
+// of each.
+func TestReconnectDelayIsJitteredAndCapped(t *testing.T) {
+	for attempt := range 41 {
+		if d := reconnectDelay(attempt); d < 0 || d > reconnectMaxDelay {
+			t.Fatalf("reconnectDelay(%d) = %s, want a non-negative delay no larger than %s", attempt, d, reconnectMaxDelay)
+		}
+	}
+
+	// Full jitter: strictly under the exponential bound, which is what makes a
+	// streak's waits grow with it.
+	for attempt := range 6 {
+		bound := reconnectBaseDelay << attempt
+		if d := reconnectDelay(attempt); d >= bound {
+			t.Fatalf("reconnectDelay(%d) = %s, want strictly under the exponential bound %s", attempt, d, bound)
+		}
+	}
+}
+
+// TestPollBackoffAdvancesTheStreakAndStopsWithTheFeed pins both halves of the
+// poll loop's backoff: the streak counter grows, so consecutive failures wait
+// longer instead of hammering a dead backend every tick, and a teardown is
+// never made to sit out a wait that can reach half a minute.
+func TestPollBackoffAdvancesTheStreakAndStopsWithTheFeed(t *testing.T) {
+	s := newSubscribeStore()
+	f := newFeed(store.Scope{}, nil)
+
+	attempt := 0
+
+	if !s.pollBackoff(f, &attempt) {
+		t.Fatal("pollBackoff on a live feed reported the feed stopped")
+	}
+
+	if attempt != 1 {
+		t.Fatalf("streak counter after one failed round trip = %d, want 1: a counter that never grows makes every wait the first one", attempt)
+	}
+
+	close(f.stop)
+
+	attempt = 20 // a wait pinned at the cap, which teardown must not sit out
+	start := time.Now()
+
+	if s.pollBackoff(f, &attempt) {
+		t.Fatal("pollBackoff on a stopped feed reported it could continue")
+	}
+
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("a stopped feed waited %s for its backoff, want the wait abandoned at once", elapsed)
+	}
+}
