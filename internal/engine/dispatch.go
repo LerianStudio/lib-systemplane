@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"slices"
 	"sync"
 
 	"github.com/LerianStudio/lib-observability/v4/runtime"
@@ -120,7 +121,12 @@ func (e *Engine) OnChange(nk NSKey, fn func(ctx context.Context, ch Change)) (un
 			subs := e.subscribers[nk]
 			for i, sub := range subs {
 				if sub.id == id {
-					e.subscribers[nk] = append(subs[:i], subs[i+1:]...)
+					// slices.Delete, not a re-slicing append: append leaves the
+					// removed subscription in the backing array's tail slot, so
+					// the callback and everything the consumer captured in it
+					// stay reachable for the life of the Engine. Delete zeroes
+					// the vacated slots.
+					e.subscribers[nk] = slices.Delete(subs, i, i+1)
 
 					return
 				}

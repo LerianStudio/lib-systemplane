@@ -63,7 +63,7 @@ func TestCloseWaitsForCtxHonoringCallbacks(t *testing.T) {
 		close(returned)
 	})
 
-	e.publish(pub(nk, 1, "v1"))
+	e.publishInto(pub(nk, 1, "v1"))
 	mustReceive(t, entered, "the subscriber to start running")
 
 	if err := e.Close(); err != nil {
@@ -93,7 +93,7 @@ func TestCloseReportsTimeoutNamingStuckKey(t *testing.T) {
 		close(returned)
 	})
 
-	e.publish(pub(nk, 1, "v1"))
+	e.publishInto(pub(nk, 1, "v1"))
 	mustReceive(t, entered, "the subscriber to start running")
 
 	err := e.Close()
@@ -108,7 +108,7 @@ func TestCloseReportsTimeoutNamingStuckKey(t *testing.T) {
 	}
 
 	// A timeout still leaves the engine fully closed.
-	if e.publish(pub(nk, 2, "v2")) {
+	if e.publishInto(pub(nk, 2, "v2")) {
 		t.Error("publish after a timed-out Close was accepted, want dropped")
 	}
 
@@ -157,7 +157,7 @@ func TestPublishAfterCloseIsDropped(t *testing.T) {
 		t.Fatalf("Close() = %v, want nil", err)
 	}
 
-	if e.publish(pub(nk, 1, "v1")) {
+	if e.publishInto(pub(nk, 1, "v1")) {
 		t.Error("publish after Close was accepted, want dropped")
 	}
 
@@ -190,7 +190,7 @@ func TestPublishRacingCloseStartsNoWorker(t *testing.T) {
 			defer wg.Done()
 
 			<-start
-			e.publish(pub(NSKey{Namespace: "ns", Key: fmt.Sprintf("key-%d", i)}, 1, "v1"))
+			e.publishInto(pub(NSKey{Namespace: "ns", Key: fmt.Sprintf("key-%d", i)}, 1, "v1"))
 		}()
 	}
 
@@ -544,14 +544,14 @@ func TestDropScopeLeavesOtherScopesWorkersRunning(t *testing.T) {
 	bringUp(t, e, tenant)
 	bringUp(t, e, store.Scope{})
 
-	e.publish(publication{Scope: tenant, NSKey: nk, Revision: 1, Value: "tenant"})
-	e.publish(publication{NSKey: nk, Revision: 1, Value: "single"})
+	e.publishInto(publication{Scope: tenant, NSKey: nk, Revision: 1, Value: "tenant"})
+	e.publishInto(publication{NSKey: nk, Revision: 1, Value: "single"})
 	waitFor(t, time.Second, "both scopes to deliver", func() bool { return rec.len() == 2 })
 
 	e.dropScope(tenant)
 
 	// The surviving scope's worker must still deliver.
-	e.publish(publication{NSKey: nk, Revision: 2, Value: "single-again"})
+	e.publishInto(publication{NSKey: nk, Revision: 2, Value: "single-again"})
 	waitFor(t, time.Second, "the surviving scope to keep delivering", func() bool { return rec.len() == 3 })
 
 	if err := e.Close(); err != nil {

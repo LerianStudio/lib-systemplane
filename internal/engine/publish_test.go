@@ -43,16 +43,29 @@ func emptyEngine() *Engine {
 	return e
 }
 
+// publishInto resolves the publication's scope and publishes into it, which is
+// what every production caller of publish does: resolve the scope once, then
+// hand the state down. Tests address a publication by its scope alone, so the
+// resolve lives here rather than in every case.
+func (e *Engine) publishInto(pub publication) (notify bool) {
+	sc := e.trackedScope(pub.Scope)
+	if sc == nil {
+		return false
+	}
+
+	return e.publish(sc, pub)
+}
+
 func TestPublishAcceptsHigherRevision(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 	e := emptyEngine()
 
-	if notify := e.publish(publication{NSKey: nk, Revision: 1, Value: "a", UpdatedBy: "ops"}); !notify {
+	if notify := e.publishInto(publication{NSKey: nk, Revision: 1, Value: "a", UpdatedBy: "ops"}); !notify {
 		t.Error("first publication of a key: notify is false, want true")
 	}
 
 	at := time.Date(2026, time.September, 17, 12, 0, 0, 0, time.UTC)
-	if notify := e.publish(publication{NSKey: nk, Revision: 2, Value: "b", UpdatedAt: at, UpdatedBy: "console"}); !notify {
+	if notify := e.publishInto(publication{NSKey: nk, Revision: 2, Value: "b", UpdatedAt: at, UpdatedBy: "console"}); !notify {
 		t.Error("higher revision: notify is false, want true")
 	}
 
@@ -71,10 +84,10 @@ func TestPublishRejectsLowerRevision(t *testing.T) {
 	at := time.Date(2026, time.September, 17, 12, 0, 0, 0, time.UTC)
 
 	e := emptyEngine()
-	e.publish(publication{NSKey: nk, Revision: 5, Value: "current", UpdatedAt: at, UpdatedBy: "ops"})
+	e.publishInto(publication{NSKey: nk, Revision: 5, Value: "current", UpdatedAt: at, UpdatedBy: "ops"})
 
 	stale := time.Date(2026, time.September, 17, 11, 0, 0, 0, time.UTC)
-	if notify := e.publish(publication{NSKey: nk, Revision: 4, Value: "old", UpdatedAt: stale, UpdatedBy: "snapshot"}); notify {
+	if notify := e.publishInto(publication{NSKey: nk, Revision: 4, Value: "old", UpdatedAt: stale, UpdatedBy: "snapshot"}); notify {
 		t.Error("lower revision: notify is true, want false")
 	}
 
@@ -93,7 +106,7 @@ func TestPublishRefreshesProvenanceWithoutNotify(t *testing.T) {
 	first := time.Date(2026, time.September, 17, 12, 0, 0, 0, time.UTC)
 
 	e := emptyEngine()
-	e.publish(publication{
+	e.publishInto(publication{
 		NSKey:     nk,
 		Revision:  3,
 		Value:     map[string]any{"limit": float64(10)},
@@ -105,7 +118,7 @@ func TestPublishRefreshesProvenanceWithoutNotify(t *testing.T) {
 	// object but deeply equal, which is exactly what a re-read of unchanged
 	// JSON produces.
 	second := time.Date(2026, time.September, 17, 13, 0, 0, 0, time.UTC)
-	if notify := e.publish(publication{
+	if notify := e.publishInto(publication{
 		NSKey:     nk,
 		Revision:  3,
 		Value:     map[string]any{"limit": float64(10)},
@@ -138,10 +151,10 @@ func TestPublishAcceptsSameRevisionWithChangedValue(t *testing.T) {
 	first := time.Date(2026, time.September, 17, 12, 0, 0, 0, time.UTC)
 
 	e := emptyEngine()
-	e.publish(publication{NSKey: nk, Revision: 3, Value: "a", UpdatedAt: first, UpdatedBy: "ops"})
+	e.publishInto(publication{NSKey: nk, Revision: 3, Value: "a", UpdatedAt: first, UpdatedBy: "ops"})
 
 	second := time.Date(2026, time.September, 17, 13, 0, 0, 0, time.UTC)
-	if notify := e.publish(publication{NSKey: nk, Revision: 3, Value: "b", UpdatedAt: second, UpdatedBy: "console"}); !notify {
+	if notify := e.publishInto(publication{NSKey: nk, Revision: 3, Value: "b", UpdatedAt: second, UpdatedBy: "console"}); !notify {
 		t.Error("equal revision with a changed value: notify is false, want true")
 	}
 
@@ -159,7 +172,7 @@ func TestPublishRevisionZeroAlwaysWinsAndResetsRevision(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 
 	e := emptyEngine()
-	e.publish(publication{
+	e.publishInto(publication{
 		NSKey:     nk,
 		Revision:  9,
 		Value:     "persisted",
@@ -167,7 +180,7 @@ func TestPublishRevisionZeroAlwaysWinsAndResetsRevision(t *testing.T) {
 		UpdatedBy: "ops",
 	})
 
-	if notify := e.publish(publication{NSKey: nk, Revision: 0, Value: "default"}); !notify {
+	if notify := e.publishInto(publication{NSKey: nk, Revision: 0, Value: "default"}); !notify {
 		t.Error("revision 0 over a cached revision 9: notify is false, want true")
 	}
 
@@ -181,13 +194,13 @@ func TestPublishRevisionZeroAlwaysWinsAndResetsRevision(t *testing.T) {
 	}
 
 	// Revision 0 is never deduplicated: a second delete still notifies.
-	if notify := e.publish(publication{NSKey: nk, Revision: 0, Value: "default"}); !notify {
+	if notify := e.publishInto(publication{NSKey: nk, Revision: 0, Value: "default"}); !notify {
 		t.Error("a repeated revision 0 with an equal value: notify is false, want true")
 	}
 
 	// A recreate arrives with a fresh non-zero revision and is accepted over
 	// the reset counter, which is why resetting it cannot swallow one.
-	if notify := e.publish(publication{NSKey: nk, Revision: 1, Value: "recreated"}); !notify {
+	if notify := e.publishInto(publication{NSKey: nk, Revision: 1, Value: "recreated"}); !notify {
 		t.Error("recreate at revision 1 after a delete: notify is false, want true")
 	}
 
@@ -206,7 +219,7 @@ func TestPublishRefusesAnUntrackedScope(t *testing.T) {
 	scope := store.Scope{Tenant: "t1"}
 
 	e := emptyEngine()
-	if notify := e.publish(publication{Scope: scope, NSKey: nk, Revision: 1, Value: "a"}); notify {
+	if notify := e.publishInto(publication{Scope: scope, NSKey: nk, Revision: 1, Value: "a"}); notify {
 		t.Error("publish into an untracked scope: notify is true, want false")
 	}
 
@@ -243,7 +256,7 @@ func TestPublishIsSerializedUnderRace(t *testing.T) {
 			var highest int64
 
 			for rev := int64(1); rev <= revisions; rev++ {
-				e.publish(publication{
+				e.publishInto(publication{
 					NSKey:     nk,
 					Revision:  rev,
 					Value:     fmt.Sprintf("writer%d-rev%d", writer, rev),

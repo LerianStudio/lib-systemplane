@@ -53,7 +53,7 @@ func (e *Engine) ingest(ctx context.Context, sc *scopeState, se store.Entry) {
 	defer sc.reconcileMu.Unlock()
 
 	if usable {
-		e.publish(pub)
+		e.publish(sc, pub)
 	}
 
 	sc.record(NSKey{Namespace: se.Namespace, Key: se.Key}, usable)
@@ -137,7 +137,9 @@ func (e *Engine) logValidatorRejection(ctx context.Context, nk NSKey, redacted b
 // The default is cloned before publication so the registry's own copy can
 // never be reached — let alone mutated — through the cache or through a
 // subscriber's callback.
-func (e *Engine) ingestDefault(ctx context.Context, scope store.Scope, nk NSKey) (notify bool) {
+//
+// sc is the caller's own scope state, for the reason publish takes one.
+func (e *Engine) ingestDefault(ctx context.Context, sc *scopeState, nk NSKey) (notify bool) {
 	def, registered := e.lookup(nk.Namespace, nk.Key)
 	if !registered {
 		e.logDebug(ctx, "no-row event for unregistered key, skipping",
@@ -148,8 +150,8 @@ func (e *Engine) ingestDefault(ctx context.Context, scope store.Scope, nk NSKey)
 		return false
 	}
 
-	return e.publish(publication{
-		Scope:    scope,
+	return e.publish(sc, publication{
+		Scope:    sc.scope,
 		NSKey:    nk,
 		Revision: 0,
 		Value:    Clone(def.Default),

@@ -36,10 +36,18 @@ type publication struct {
 // never interleave with another publication's store; splitting it into a
 // check-then-refresh pair reopens the race it exists to close.
 //
+// sc is the caller's own scope state and is never nil: every path here — the
+// ingress, the no-row ingress, a reconcile row — resolved it already, and
+// logged the drop when the scope was gone. Re-resolving it through the tracked
+// map would cost an RLock and a lookup per publication to answer a question
+// the caller has answered, and would answer it DIFFERENTLY when the scope was
+// dropped and brought back up in between: the value would land in the new
+// state while the reconcile fences the caller recorded live on the old one.
+//
 // It does not clone. The caller owns producing a value the engine may keep —
 // the ingress already decoded fresh JSON, and cloning again per publication
 // would cost a reflective walk on the hot path for nothing.
-func (e *Engine) publish(pub publication) (notify bool) {
+func (e *Engine) publish(sc *scopeState, pub publication) (notify bool) {
 	// A closed engine takes no publication: its workers are gone or going, so
 	// caching a value nobody can be told about only resurrects a scope during
 	// shutdown.
@@ -47,13 +55,15 @@ func (e *Engine) publish(pub publication) (notify bool) {
 		return false
 	}
 
-	// Lookup-only: a publication never creates a scope. The paths that reach
-	// here have already resolved the scope and logged the drop if it was gone,
-	// and re-creating one at the last step would rebuild the cache of a tenant
-	// nothing feeds.
-	sc := e.trackedScope(pub.Scope)
-	if sc == nil {
+	// The caller's state, refused once its scope has been dropped. publish no
+	// longer re-resolves the scope, so this is what keeps a publication that
+	// was already past its caller's resolve — a slow validator, a contended
+	// reconcile mutex — from caching into a torn-down scope and starting a
+	// delivery worker nothing will ever stop before Close.
+	select {
+	case <-sc.reconcileStop:
 		return false
+	default:
 	}
 
 	sc.mu.Lock()

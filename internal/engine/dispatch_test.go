@@ -120,10 +120,10 @@ func TestDispatchIsolatesKeys(t *testing.T) {
 	unsubB := e.OnChange(keyB, recB.record)
 	defer unsubB()
 
-	e.publish(pub(keyA, 1, "a1"))
+	e.publishInto(pub(keyA, 1, "a1"))
 	<-blocked
 
-	e.publish(pub(keyB, 1, "b1"))
+	e.publishInto(pub(keyB, 1, "b1"))
 	waitFor(t, 500*time.Millisecond, "key b delivered while key a is blocked", func() bool {
 		return recB.len() == 1
 	})
@@ -150,7 +150,7 @@ func TestSubscriberMutationDoesNotAffectCache(t *testing.T) {
 	})
 	defer unsub()
 
-	e.publish(pub(nk, 1, map[string]any{"max": float64(10)}))
+	e.publishInto(pub(nk, 1, map[string]any{"max": float64(10)}))
 	<-delivered
 
 	got, ok := e.Lookup(store.Scope{}, nk)
@@ -194,7 +194,7 @@ func TestTwoSubscribersGetIndependentCopies(t *testing.T) {
 	unsubSecond := e.OnChange(nk, marker("second"))
 	defer unsubSecond()
 
-	e.publish(pub(nk, 1, map[string]any{"max": float64(10)}))
+	e.publishInto(pub(nk, 1, map[string]any{"max": float64(10)}))
 
 	for i := 0; i < 2; i++ {
 		got := <-delivered
@@ -238,11 +238,11 @@ func TestDispatchCoalescesToLatestRevision(t *testing.T) {
 	})
 	defer unsub()
 
-	e.publish(pub(nk, 1, "v1"))
+	e.publishInto(pub(nk, 1, "v1"))
 	<-started
 
 	for rev := int64(2); rev <= 10; rev++ {
-		e.publish(pub(nk, rev, fmt.Sprintf("v%d", rev)))
+		e.publishInto(pub(nk, rev, fmt.Sprintf("v%d", rev)))
 	}
 
 	close(release)
@@ -267,7 +267,7 @@ func TestDispatchDeliversInRevisionOrder(t *testing.T) {
 
 	const last = 100
 	for rev := int64(1); rev <= last; rev++ {
-		e.publish(pub(nk, rev, rev))
+		e.publishInto(pub(nk, rev, rev))
 	}
 
 	waitFor(t, 2*time.Second, "the newest revision to be delivered", func() bool {
@@ -299,10 +299,10 @@ func TestPanickingSubscriberDoesNotStopLaterDeliveries(t *testing.T) {
 	})
 	defer unsub()
 
-	e.publish(pub(nk, 1, "v1"))
+	e.publishInto(pub(nk, 1, "v1"))
 	waitFor(t, time.Second, "the delivery that panics", func() bool { return rec.len() == 1 })
 
-	e.publish(pub(nk, 2, "v2"))
+	e.publishInto(pub(nk, 2, "v2"))
 	waitFor(t, time.Second, "the delivery after the panic", func() bool { return rec.len() == 2 })
 
 	if got := rec.revisions(); got[1] != 2 {
@@ -318,7 +318,7 @@ func TestUnsubscribeIsIdempotentAndStopsDelivery(t *testing.T) {
 
 	unsub := e.OnChange(nk, first.record)
 
-	e.publish(pub(nk, 1, "v1"))
+	e.publishInto(pub(nk, 1, "v1"))
 	waitFor(t, time.Second, "the first delivery", func() bool { return first.len() == 1 })
 
 	unsub()
@@ -329,7 +329,7 @@ func TestUnsubscribeIsIdempotentAndStopsDelivery(t *testing.T) {
 	unsubSecond := e.OnChange(nk, second.record)
 	defer unsubSecond()
 
-	e.publish(pub(nk, 2, "v2"))
+	e.publishInto(pub(nk, 2, "v2"))
 	waitFor(t, time.Second, "the delivery to the surviving subscriber", func() bool {
 		return second.len() == 1
 	})
@@ -348,10 +348,10 @@ func TestSameRevisionPublishedTwiceDeliversOnce(t *testing.T) {
 	unsub := e.OnChange(nk, rec.record)
 	defer unsub()
 
-	e.publish(pub(nk, 7, "same"))
+	e.publishInto(pub(nk, 7, "same"))
 	waitFor(t, time.Second, "the first delivery", func() bool { return rec.len() == 1 })
 
-	e.publish(pub(nk, 7, "same"))
+	e.publishInto(pub(nk, 7, "same"))
 	quiesce(t, e)
 
 	if got := rec.revisions(); len(got) != 1 || got[0] != 7 {
@@ -381,7 +381,7 @@ func TestUnsubscribeRemovesOnlyItsOwnSubscription(t *testing.T) {
 	unsubDropped := e.OnChange(nk, dropped.record)
 	unsubDropped()
 
-	e.publish(pub(nk, 1, "v1"))
+	e.publishInto(pub(nk, 1, "v1"))
 	waitFor(t, time.Second, "the surviving subscriber's first delivery", func() bool {
 		return kept.len() == 1
 	})
@@ -397,7 +397,7 @@ func TestUnsubscribeRemovesOnlyItsOwnSubscription(t *testing.T) {
 
 	unsubDropped()
 
-	e.publish(pub(nk, 2, "v2"))
+	e.publishInto(pub(nk, 2, "v2"))
 	waitFor(t, time.Second, "the surviving subscriber's second delivery", func() bool {
 		return kept.len() == 2
 	})
@@ -444,10 +444,10 @@ func TestDispatchIsolatesScopesAndNamesTheTenant(t *testing.T) {
 
 	track(t, e, tenant)
 
-	e.publish(publication{Scope: store.Scope{}, NSKey: nk, Revision: 1, Value: "single"})
+	e.publishInto(publication{Scope: store.Scope{}, NSKey: nk, Revision: 1, Value: "single"})
 	<-blocked
 
-	e.publish(publication{Scope: tenant, NSKey: nk, Revision: 1, Value: "t1"})
+	e.publishInto(publication{Scope: tenant, NSKey: nk, Revision: 1, Value: "t1"})
 
 	waitFor(t, 500*time.Millisecond, "the tenant delivery while the single-tenant one is blocked", func() bool {
 		return tenantRec.len() == 1
@@ -501,7 +501,7 @@ func quiesce(t *testing.T, e *Engine) {
 	defer unsub()
 
 	fire := func() {
-		e.publish(publication{
+		e.publishInto(publication{
 			NSKey:    quiesceKey,
 			Revision: quiesceRev.Add(1),
 			Value:    "sentinel",
@@ -578,11 +578,45 @@ func TestQuiesceOutlastsASlowDelivery(t *testing.T) {
 	})
 	defer unsub()
 
-	e.publish(pub(nk, 1, "v1"))
+	e.publishInto(pub(nk, 1, "v1"))
 
 	quiesce(t, e)
 
 	if got := rec.len(); got != 1 {
 		t.Fatalf("deliveries after quiesce: got %d, want 1 — quiesce returned before a slow delivery landed", got)
+	}
+}
+
+// TestUnsubscribeReleasesTheCallback pins that a removal drops the closure as
+// well as the subscription. Re-slicing with append copies the survivors down
+// and leaves the removed entry sitting in the backing array's tail slot, so
+// the callback — and everything a consumer captured in it, usually a whole
+// service struct — stays reachable for the life of the Engine although nothing
+// can ever invoke it again.
+func TestUnsubscribeReleasesTheCallback(t *testing.T) {
+	e := dispatchEngine(t)
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+
+	var kept, dropped recorder
+
+	unsubKept := e.OnChange(nk, kept.record)
+	defer unsubKept()
+
+	unsubDropped := e.OnChange(nk, dropped.record)
+	unsubDropped()
+
+	e.subsMu.RLock()
+	defer e.subsMu.RUnlock()
+
+	subs := e.subscribers[nk]
+	for i, slot := range subs[:cap(subs)] {
+		if i < len(subs) {
+			continue
+		}
+
+		if slot.fn != nil || slot.id != 0 {
+			t.Errorf("backing slot %d past the %d live subscriptions still holds subscription %d: "+
+				"the unsubscribed callback is still reachable", i, len(subs), slot.id)
+		}
 	}
 }

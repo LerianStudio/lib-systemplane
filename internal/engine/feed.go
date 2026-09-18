@@ -76,14 +76,11 @@ func (e *Engine) onEvent(evt store.Event) {
 		return
 	}
 
-	key := scopeNSKey{Tenant: evt.Scope.Tenant, Namespace: nk.Namespace, Key: nk.Key}
-	refresh := func() { e.refreshKey(evt.Scope, nk) }
-
 	// A nil debouncer refreshes inline rather than dropping the event:
 	// swallowing a changefeed notification would leave the cache silently
 	// behind the store until the next reconcile.
 	if e.debouncer == nil {
-		refresh()
+		e.refreshKey(evt.Scope, nk)
 
 		return
 	}
@@ -95,11 +92,19 @@ func (e *Engine) onEvent(evt store.Event) {
 	// changefeed goroutine, whose lifetime the store owns — registering THAT
 	// in the WaitGroup would make Close wait on the goroutine it is
 	// unsubscribing.
+	//
+	// Exactly one closure is built, in the branch that wants it. Building the
+	// inline one up front and overwriting it here cost one discarded heap
+	// allocation on every upsert event the feed delivers.
+	var refresh func()
+
 	if e.debounceAsync {
 		refresh = func() { e.trackedRefresh(evt.Scope, nk) }
+	} else {
+		refresh = func() { e.refreshKey(evt.Scope, nk) }
 	}
 
-	e.debouncer.Submit(key, refresh)
+	e.debouncer.Submit(scopeNSKey{Tenant: evt.Scope.Tenant, Namespace: nk.Namespace, Key: nk.Key}, refresh)
 }
 
 // trackedRefresh runs a debounced re-read as engine work Close waits for.
@@ -182,7 +187,7 @@ func (e *Engine) applyDelete(scope store.Scope, nk NSKey) {
 	sc.reconcileMu.Lock()
 	defer sc.reconcileMu.Unlock()
 
-	if e.ingestDefault(e.dispatchContext(), scope, nk) {
+	if e.ingestDefault(e.dispatchContext(), sc, nk) {
 		sc.record(nk, true)
 	}
 }

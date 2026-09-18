@@ -137,3 +137,46 @@ func TestPublishAfterDropIsRefused(t *testing.T) {
 		t.Fatalf("Close() = %v, want nil", err)
 	}
 }
+
+// TestPublishIntoAlreadyDroppedStateIsRefused covers the window publish no
+// longer closes by re-resolving the scope. A caller resolves the scope, then
+// spends time outside every lock — decoding the row, running the consumer's
+// validator, waiting on the reconcile mutex — and the tenant is suspended in
+// the meantime. Its publication must not cache into the torn-down state, and
+// above all must not start a delivery worker for a scope nothing will stop
+// again before Close.
+func TestPublishIntoAlreadyDroppedStateIsRefused(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	fs := newFakeStore()
+	e := storeEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0, 2*time.Second)
+
+	bringUp(t, e, dropTenant)
+
+	sc := e.trackedScope(dropTenant)
+	if sc == nil {
+		t.Fatal("the tenant scope was not brought up")
+	}
+
+	e.OnChange(nk, func(context.Context, Change) {})
+	e.dropScope(dropTenant)
+
+	if notify := e.publish(sc, publication{Scope: dropTenant, NSKey: nk, Revision: 9, Value: "late"}); notify {
+		t.Error("publish into a dropped scope state: notify is true, want false")
+	}
+
+	if _, ok := e.Lookup(dropTenant, nk); ok {
+		t.Error("a publication into a dropped scope state became readable")
+	}
+
+	e.workersMu.Lock()
+	workers := len(e.workers)
+	e.workersMu.Unlock()
+
+	if workers != 0 {
+		t.Errorf("publish started %d delivery worker(s) for a dropped scope, want 0", workers)
+	}
+
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close() = %v, want nil", err)
+	}
+}
