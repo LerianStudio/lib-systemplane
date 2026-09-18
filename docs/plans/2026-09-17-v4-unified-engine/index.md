@@ -56,6 +56,7 @@ No Go consumer uses the MongoDB backend yet; the Console will. Nobody consumes c
 | admin | GET responses carry `revision`, `updatedAt`, `updatedBy`, `stale`; list too; handlers read through `GetEntry` | contracts | 2 | `/srv/worktrees/v4-admin` / `feat/v4-admin` | lane-admin.md | Merged |
 | docs | README, CLAUDE.md, `MIGRATION-v4.md`, `.env.reference` deleted, `docs/PROJECT_RULES.md` corrected, three compiled examples (single-tenant, multi-tenant, groups) built in CI, godoc truth sweep | engine-core, storage, groups | 3 | `/srv/worktrees/v4-docs` / `feat/v4-docs` | lane-docs.md | Pending |
 | matcher-pilot | matcher on v4 groups: glue deleted, migrated env vars removed from charts, before/after line count reported | engine-core, storage, groups | 3 | repo `matcher`: `/srv/worktrees/matcher-v4-pilot` / `feat/systemplane-v4` | (lives in matcher: `docs/plans/`) | Pending |
+| groups-redaction | field-level redaction for group documents (FC-13): `Bind` derives per-field policies from `systemplane:"redact=full|mask"` struct tags, `WithFieldRedaction` / `KeyFieldRedaction`, admin renders GET and list per field | engine-core (Phase 2, `internal/client`), groups (Phase 2) | 3 | `/srv/worktrees/v4-groups-redaction` / `feat/v4-groups-redaction` | lane-groups.md (Phase 3) | Pending |
 | integration | audit §10 acceptance suite end to end (feed loss → write → reconnect → converge without a second write, in ST Postgres, MT Postgres, ST Mongo, MT Mongo; two tenants get distinct identity on both backends; invalid external row keeps last valid; activation gap; slow callback does not stall the pump; `-race` + goleak), repo-wide absence checks, manual `v4.0.0` cut | every other lane | 4 | `/srv/worktrees/v4-integration` / `feat/v4-integration` | lane-integration.md | Pending |
 
 `Status` lifecycle: Pending → In flight → In review → Merged | Failed.
@@ -326,7 +327,7 @@ type ApplyStatus struct {
 	Tenant   string
 	Desired  int64 // latest published revision
 	Applied  int64 // latest revision fn accepted
-	LastErr  error // nil when Desired == Applied
+	LastErr  error // nil once every registered fn has accepted the newest published revision (amended 2026-09-18: a rejection stays visible until the next acceptance; Revision 0 equality never clears it)
 }
 
 func (g *Group[T]) Status() []ApplyStatus
@@ -499,6 +500,34 @@ Removed in v4: `Manager`, `ManagerOption`, `NewManager`, `WithManagerLogger`, `W
 
 Meter `systemplane.engine`. Instruments: `systemplane.scopes_active` (gauge: tracked scopes), `systemplane.cache_entries` (gauge, per scope), `systemplane.changefeed_events_total` (counter, per scope), `systemplane.changefeed_disconnects_total` (counter, per scope), `systemplane.activation_latency_seconds` (histogram, tenant scopes only: from the first read that activates a tenant until its scope reports `Stale=false`), `systemplane.cache_reads_total` (counter, per scope, attribute `result` = `hit` | `miss`). Per-scope instruments carry `tenant_id` while at most `WithAggregateTenantThreshold` tenant scopes are active and the literal `aggregate` above that (FC-10); the single-tenant scope carries no `tenant_id`. Any further attribute is the lane's call and must be low-cardinality (no key names, no values). The v3 names under meter `systemplane.manager` (`tenants_active`, `cache_entries`, `notify_received_total`, `listen_disconnects_total`, `warmload_latency_seconds`, `get_cache_hits_total`) are gone: the manager no longer exists and two of them name Postgres mechanics MongoDB does not have. `MIGRATION-v4.md` lists each old name beside its replacement so dashboards and alerts can be rewritten.
 
+### FC-13 Field-level redaction for group documents (frozen 2026-09-18, Fred's decision on the matcher pilot)
+
+```go
+package systemplane
+
+// A group document is redacted on the admin surface per FIELD. Bind[T] walks T
+// at registration (nested structs included; json tag names give the field path)
+// and derives one policy per tagged field from the `systemplane` struct tag:
+// `systemplane:"redact=full"` renders the field as the full-redaction
+// placeholder, `systemplane:"redact=mask"` as the masked form (non-string values
+// under mask render as the full placeholder), untagged fields render in clear. A
+// tagged struct-typed field redacts its whole sub-document; a tagged slice or map
+// applies the policy to every element. The key's own policy stays RedactNone
+// unless the caller passes WithRedaction to Bind, which redacts the whole
+// document as before and wins over every tag. Stored values are never altered:
+// redaction is a rendering rule of the admin surface, as today.
+//
+// WithFieldRedaction sets per-field policies explicitly on a per-key
+// registration (the non-generic path); Bind derives them from tags.
+// KeyFieldRedaction reports them, keyed by dotted JSON path; nil when the key
+// carries none. admin applies them on GET (single and list) whenever the key's
+// policy is RedactNone and a field map exists.
+func WithFieldRedaction(policies map[string]RedactPolicy) KeyOption
+func (c *Client) KeyFieldRedaction(namespace, key string) map[string]RedactPolicy
+```
+
+Reason: a group is one row and the v3 per-key redaction is per row, so a group holding one secret would mask every neighbouring field for the operator (matcher: object-storage endpoint, bucket and region beside two credentials). Alternatives considered and rejected by Fred on 2026-09-18: moving the secrets out of systemplane (loses runtime rotation), accepting whole-document masking. Owned by the `groups-redaction` lane (wave 3): root `api_group.go` (tag walk at `Bind`), root key options and `KeyFieldRedaction`, `internal/client` registry (stores the map), `admin/` rendering. Not a behaviour change for existing consumers: opt-in through tags or the option.
+
 ## Lane blocks (not yet in flight)
 
 ### Lane: engine-core
@@ -550,6 +579,13 @@ Meter `systemplane.engine`. Instruments: `systemplane.scopes_active` (gauge: tra
 **Depends on:** engine-core, storage, groups.
 **Done when:** matcher registers its runtime knobs as typed groups; `systemplane_keys_defs.go`, `systemplane_keys_validators.go`, `systemplane_keys.go`, `runtime_settings.go` are deleted or reduced to the `Bind` calls; every env var that duplicated a migrated knob is removed from code, chart and docs; `make test` and the matcher integration suite pass; the lane's PR description states the line count before and after.
 
+### Lane: groups-redaction
+
+**Goal:** An operator reading a group document on the admin surface sees every field in clear except the ones the consumer tagged as secret.
+**Scope:** root `api_group.go` (struct-tag walk at `Bind`, FC-13), root key options file (`WithFieldRedaction`) and `api_client.go` (`KeyFieldRedaction`), `internal/client` registry (per-key field policy map, `KeyFieldRedaction`), `admin/admin.go` and `admin/admin_responses.go` (apply the map on single GET and list when the key policy is `RedactNone`), tests for each.
+**Depends on:** engine-core Phase 2 (owns `internal/client` until it merges), groups Phase 2.
+**Done when:** a `Bind[T]` whose `T` tags two fields `redact=full` and one `redact=mask` registers a key whose `KeyFieldRedaction` names exactly those three paths with those policies (nested path included); admin GET of that key renders the tagged fields redacted and every other field in clear, list too; `WithRedaction` on the same `Bind` masks the whole document and `KeyFieldRedaction` still reports the map; a per-key `Register` with `WithFieldRedaction` behaves identically; stored values are unchanged (a direct read of the row shows clear text); `release_policy_test.go` and the admin suite stay green; the matcher pilot's three secret-carrying groups render with only their credentials masked against a beta carrying this lane.
+
 ### Lane: integration
 
 **Goal:** The audit's acceptance criteria hold end to end, and v4.0.0 ships.
@@ -564,7 +600,7 @@ Required: `engine-core`, `engine-tenants`, `storage` and `groups` all touch the 
 1. **Feed loss, ST Postgres.** Start Client, kill the LISTEN backend with `pg_terminate_backend`, write a new value via a separate connection, let the listener reconnect: `GetEntry` returns the new value and revision, `OnChange` fired exactly once, `Stale` was true during the gap (from `OpDisconnect`) and false after the reconcile. Variant: a second write lands between the reconcile's `List` and its application; the cache ends at the second write's revision and `OnChange` never observes the first.
 2. **Feed loss, MT Postgres.** Same for tenant `t1` with `WithTenantManager`; `t2` unaffected.
 3. **Feed loss, Mongo.** Same with the change stream cursor killed, in ST and for tenant `t1` with `WithMongoTenantManager` (`t2` unaffected).
-4. **Two tenants, one subscription.** Write different values for `t1` and `t2`; the single `OnChange` receives two `Change`s with distinct `Tenant`, and `Group.OnApply` `Status()` shows both tenants applied.
+4. **Two tenants, one subscription.** Write different values for `t1` and `t2`; the single `OnChange` receives two `Change`s with distinct `Tenant`, and `Group.OnApply` `Status()` shows both tenants applied. The group assertion is on state (the applier holds the current document for each tenant and `Status()` reports both applied), never on a delivery count: a pre-`Start` `OnApply` may legitimately receive the registered default before `Start` and the stored document during it (groups Phase 2 elaboration, C3).
 5. **Invalid external row.** Insert JSON of the wrong type directly in SQL; `GetEntry` keeps the previous value, `Stale` false, a rejection is logged, no callback fires.
 6. **Activation gap.** Write for `t1` concurrently with the first read that activates it; the value is visible after activation without a second write.
 7. **Slow subscriber.** A subscriber for key A blocks 5s; changes for key B are delivered within 500ms; the LISTEN connection keeps draining.
