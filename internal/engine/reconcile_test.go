@@ -3,6 +3,7 @@
 package engine
 
 import (
+	"context"
 	"errors"
 	"strconv"
 	"sync"
@@ -1217,7 +1218,7 @@ func TestPublishRecordsItsKeyAgainstAConcurrentReconcile(t *testing.T) {
 	// What Client.Set does: persist, then publish to the caller's own scope.
 	row := jsonRow(nk, 5, `"written"`, "ops")
 	fs.seed(scope, row)
-	e.Publish(scope, row)
+	e.Publish(context.Background(), scope, row)
 
 	release()
 
@@ -1609,7 +1610,7 @@ func TestPublishRecordsARejectedWriteAgainstAConcurrentReconcile(t *testing.T) {
 	// in the store, and the engine learned nothing usable from it.
 	row := jsonRow(nk, 4, `42`, "ops")
 	fs.seed(scope, row)
-	e.Publish(scope, row)
+	e.Publish(context.Background(), scope, row)
 
 	release()
 

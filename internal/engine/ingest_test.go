@@ -43,6 +43,17 @@ func engineWithRegistry(reg Registry) *Engine {
 	return e
 }
 
+// ingestRow puts se through the ingress of the single-tenant scope, the way
+// the changefeed re-read and a write both do: decode and validate first, then
+// publish and record under the scope's reconcile mutex.
+//
+// The ingress reports nothing — every caller publishes and moves on — so what
+// it made of the row is asserted where it is visible: the cache it did or did
+// not change, and the line it logged.
+func ingestRow(e *Engine, se store.Entry) {
+	e.ingest(context.Background(), e.scopeFor(store.Scope{}), se)
+}
+
 func TestIngestRejectsInvalidValueKeepingPrevious(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 	e := engineWithRegistry(fakeRegistry{defs: map[NSKey]KeyDef{
@@ -59,14 +70,10 @@ func TestIngestRejectsInvalidValueKeepingPrevious(t *testing.T) {
 	}})
 
 	valid := store.Entry{Namespace: nk.Namespace, Key: nk.Key, Value: []byte(`"a"`), Revision: 1, UpdatedBy: "ops"}
-	if !e.ingest(context.Background(), store.Scope{}, valid) {
-		t.Fatal("first valid row: usable is false, want true")
-	}
+	ingestRow(e, valid)
 
 	rejected := store.Entry{Namespace: nk.Namespace, Key: nk.Key, Value: []byte(`42`), Revision: 2, UpdatedBy: "typo"}
-	if e.ingest(context.Background(), store.Scope{}, rejected) {
-		t.Error("validator-rejected row: usable is true, want false")
-	}
+	ingestRow(e, rejected)
 
 	got := cachedEntry(t, e, store.Scope{}, nk)
 	if got.Value != "a" || got.Revision != 1 {
@@ -82,9 +89,7 @@ func TestIngestSkipsUnregisteredKey(t *testing.T) {
 	e := engineWithRegistry(fakeRegistry{})
 
 	unregistered := store.Entry{Namespace: "billing", Key: "unknown", Value: []byte(`"a"`), Revision: 1}
-	if e.ingest(context.Background(), store.Scope{}, unregistered) {
-		t.Error("unregistered key: usable is true, want false")
-	}
+	ingestRow(e, unregistered)
 
 	sc := e.trackedScope(store.Scope{})
 
@@ -102,14 +107,10 @@ func TestIngestSkipsUndecodableJSONKeepingPrevious(t *testing.T) {
 	e := engineWithRegistry(fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: "default"}}})
 
 	valid := store.Entry{Namespace: nk.Namespace, Key: nk.Key, Value: []byte(`"a"`), Revision: 1, UpdatedBy: "ops"}
-	if !e.ingest(context.Background(), store.Scope{}, valid) {
-		t.Fatal("first valid row: usable is false, want true")
-	}
+	ingestRow(e, valid)
 
 	corrupt := store.Entry{Namespace: nk.Namespace, Key: nk.Key, Value: []byte(`{not json`), Revision: 2, UpdatedBy: "corrupt"}
-	if e.ingest(context.Background(), store.Scope{}, corrupt) {
-		t.Error("undecodable JSON: usable is true, want false")
-	}
+	ingestRow(e, corrupt)
 
 	got := cachedEntry(t, e, store.Scope{}, nk)
 	if got.Value != "a" || got.Revision != 1 || got.UpdatedBy != "ops" {
@@ -123,9 +124,7 @@ func TestIngestDefaultPublishesAtRevisionZero(t *testing.T) {
 	e := engineWithRegistry(fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: "fallback"}}})
 
 	seeded := store.Entry{Namespace: nk.Namespace, Key: nk.Key, Value: []byte(`"a"`), Revision: 7, UpdatedBy: "ops"}
-	if !e.ingest(context.Background(), store.Scope{}, seeded) {
-		t.Fatal("seeding row: usable is false, want true")
-	}
+	ingestRow(e, seeded)
 
 	if notify := e.ingestDefault(context.Background(), store.Scope{}, nk); !notify {
 		t.Error("no-row publication: notify is false, want true")
@@ -195,14 +194,10 @@ func TestIngestRejectsPanickingValidatorWithoutLeakingPanicValue(t *testing.T) {
 	e.logger = logger
 
 	valid := store.Entry{Namespace: nk.Namespace, Key: nk.Key, Value: []byte(`"a"`), Revision: 1, UpdatedBy: "ops"}
-	if !e.ingest(context.Background(), store.Scope{}, valid) {
-		t.Fatal("first valid row: usable is false, want true")
-	}
+	ingestRow(e, valid)
 
 	panicking := store.Entry{Namespace: nk.Namespace, Key: nk.Key, Value: []byte(`42`), Revision: 2, UpdatedBy: "typo"}
-	if e.ingest(context.Background(), store.Scope{}, panicking) {
-		t.Error("row whose validator panicked: usable is true, want false")
-	}
+	ingestRow(e, panicking)
 
 	if got := cachedEntry(t, e, store.Scope{}, nk); got.Value != "a" || got.Revision != 1 {
 		t.Errorf("cached after a panicking validator: got (%v, rev %d), want (\"a\", rev 1)",

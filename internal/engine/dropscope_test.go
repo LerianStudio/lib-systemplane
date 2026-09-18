@@ -3,6 +3,7 @@
 package engine
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -122,7 +123,7 @@ func TestPublishAfterDropIsRefused(t *testing.T) {
 	bringUp(t, e, dropTenant)
 	e.dropScope(dropTenant)
 
-	e.Publish(dropTenant, jsonRow(nk, 5, `"written"`, "ops"))
+	e.Publish(context.Background(), dropTenant, jsonRow(nk, 5, `"written"`, "ops"))
 
 	if tracked(e, dropTenant) {
 		t.Error("Publish re-created a dropped scope")

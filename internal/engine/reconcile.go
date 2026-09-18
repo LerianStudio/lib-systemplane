@@ -321,9 +321,22 @@ func (e *Engine) listSnapshot(ctx context.Context, scope store.Scope) ([]store.E
 //
 // A row the ingress refuses is the one case where "the snapshot carried this
 // key" is not the same as "the engine learned its value"; see the FC-11 note
-// below the ingest call.
+// below the publish call.
+//
+// Decoding the row and running the registered validator happen BEFORE the
+// lock, for the reason the ingress splits at all: the validator is consumer
+// code, and running it under a mutex that serializes the whole scope holds
+// every changefeed event for every other key of that scope behind it. The
+// consequence is that a row this reconcile then skips was decoded and
+// validated for nothing: the one row it reads before noticing a newer
+// OpResync has taken the scope (the loop stops on the first), and each key the
+// feed already published during this window. Both are bounded and both are
+// pure predicate calls; the alternative is a changefeed goroutine parked
+// behind consumer code.
 func (e *Engine) applySnapshotRow(ctx context.Context, sc *scopeState, arm reconcileArming, se store.Entry) (superseded bool) {
 	nk := NSKey{Namespace: se.Namespace, Key: se.Key}
+
+	pub, usable := e.prepare(ctx, sc.scope, se)
 
 	sc.reconcileMu.Lock()
 	defer sc.reconcileMu.Unlock()
@@ -338,7 +351,9 @@ func (e *Engine) applySnapshotRow(ctx context.Context, sc *scopeState, arm recon
 		return false
 	}
 
-	if e.ingest(ctx, sc.scope, se) {
+	if usable {
+		e.publish(pub)
+
 		return false
 	}
 

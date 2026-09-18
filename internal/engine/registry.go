@@ -18,6 +18,12 @@ type KeyDef struct {
 	Default any
 	// Validate rejects a decoded value at ingress. nil accepts anything.
 	Validate func(any) error
+	// Redacted reports that the key was registered with a redaction policy
+	// other than "none": its value is sensitive and must never reach a log
+	// line. The engine needs the fact, not the policy — masking and hiding
+	// are the same decision to a log stream, and rendering a value for an
+	// admin response belongs to the Client, which owns the policy itself.
+	Redacted bool
 }
 
 // NSKey identifies one registered key inside a scope.

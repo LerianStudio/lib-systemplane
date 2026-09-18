@@ -37,7 +37,33 @@ import (
 //     reverting a key because an operator typo'd a row is a worse failure than
 //     keeping the last value that passed.
 //  4. Fence rejection — publish already decided; the value was still usable.
-func (e *Engine) ingest(ctx context.Context, scope store.Scope, se store.Entry) (usable bool) {
+//
+// The ingress runs in two halves and the split is load-bearing. prepare —
+// decode, and the CONSUMER's registered validator — runs OUTSIDE the scope's
+// reconcile mutex, because that mutex serializes the whole scope: a validator
+// that blocks on a file, a remote call or a lock of its own would otherwise
+// hold every other key's delete, every debounced re-read and every reconcile
+// of that scope behind consumer code the engine does not control. The mutex
+// covers only the pair that must be indivisible to a reconcile in flight: the
+// publication, and the outcome recorded in that reconcile's fences.
+func (e *Engine) ingest(ctx context.Context, sc *scopeState, se store.Entry) {
+	pub, usable := e.prepare(ctx, sc.scope, se)
+
+	sc.reconcileMu.Lock()
+	defer sc.reconcileMu.Unlock()
+
+	if usable {
+		e.publish(pub)
+	}
+
+	sc.record(NSKey{Namespace: se.Namespace, Key: se.Key}, usable)
+}
+
+// prepare is the ingress's consumer-facing half: it decodes the row and runs
+// the registered validator against it, reporting the publication the second
+// half will apply. It touches no cache, no fence and no lock, so a validator
+// that takes a second costs that second to this goroutine alone.
+func (e *Engine) prepare(ctx context.Context, scope store.Scope, se store.Entry) (pub publication, usable bool) {
 	def, registered := e.lookup(se.Namespace, se.Key)
 	if !registered {
 		e.logDebug(ctx, "value for unregistered key, skipping",
@@ -45,7 +71,7 @@ func (e *Engine) ingest(ctx context.Context, scope store.Scope, se store.Entry) 
 			log.String("keyname", se.Key),
 		)
 
-		return false
+		return publication{}, false
 	}
 
 	var decoded any
@@ -56,29 +82,51 @@ func (e *Engine) ingest(ctx context.Context, scope store.Scope, se store.Entry) 
 			log.Err(err),
 		)
 
-		return false
+		return publication{}, false
 	}
+
+	nk := NSKey{Namespace: se.Namespace, Key: se.Key}
 
 	if err := e.runValidator(ctx, def.Validate, decoded); err != nil {
-		e.logWarn(ctx, "stored value rejected by validator, keeping cached value",
-			log.String("namespace", se.Namespace),
-			log.String("keyname", se.Key),
-			log.Err(err),
-		)
+		e.logValidatorRejection(ctx, nk, def.Redacted, err)
 
-		return false
+		return publication{}, false
 	}
 
-	e.publish(publication{
+	return publication{
 		Scope:     scope,
-		NSKey:     NSKey{Namespace: se.Namespace, Key: se.Key},
+		NSKey:     nk,
 		Revision:  se.Revision,
 		Value:     decoded,
 		UpdatedAt: se.UpdatedAt,
 		UpdatedBy: se.UpdatedBy,
-	})
+	}, true
+}
 
-	return true
+// logValidatorRejection reports a row the registered validator refused, with
+// the key's registered redaction policy applied to the ERROR TEXT.
+//
+// The validator is consumer code and its message is a consumer-built string,
+// so it is the one place a configuration value reaches the log stream having
+// passed no redaction at all: a validator that names what it refused —
+// "token %q is too short" — publishes that token at WARN, into whatever ships
+// the logs. For a key registered as redacted the line therefore carries only
+// the error's dynamic type, which is enough to tell two rejections apart and
+// never enough to carry a value.
+//
+// The error returned to the caller of Set is unchanged in both cases. This is
+// the log stream, not the API.
+func (e *Engine) logValidatorRejection(ctx context.Context, nk NSKey, redacted bool, err error) {
+	detail := log.Err(err)
+	if redacted {
+		detail = log.String("error", fmt.Sprintf("validation failed (%T)", err))
+	}
+
+	e.logWarn(ctx, "stored value rejected by validator, keeping cached value",
+		log.String("namespace", nk.Namespace),
+		log.String("keyname", nk.Key),
+		detail,
+	)
 }
 
 // ingestDefault is the ingress for the no-row case: a feed delete, or a

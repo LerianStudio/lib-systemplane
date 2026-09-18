@@ -37,7 +37,7 @@ func TestNilEngineIsInert(t *testing.T) {
 			call: func(t *testing.T) {
 				var e *Engine
 
-				e.Publish(store.Scope{}, store.Entry{Namespace: nk.Namespace, Key: nk.Key})
+				e.Publish(context.Background(), store.Scope{}, store.Entry{Namespace: nk.Namespace, Key: nk.Key})
 			},
 		},
 		{
@@ -132,7 +132,7 @@ func TestPublishWithoutRegistryIsDropped(t *testing.T) {
 	// rather than the scope resolution in front of it.
 	track(t, e, store.Scope{})
 
-	e.Publish(store.Scope{}, store.Entry{
+	e.Publish(context.Background(), store.Scope{}, store.Entry{
 		Namespace: nk.Namespace,
 		Key:       nk.Key,
 		Value:     []byte(`"a"`),

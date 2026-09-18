@@ -146,7 +146,7 @@ func TestPublishMakesSetVisibleBeforeFeedEcho(t *testing.T) {
 
 	// The Client has persisted the row and hands the engine what it wrote.
 	// No Start has run: the scope is created lazily by the write itself.
-	e.Publish(scope, jsonRow(nk, 7, `"written"`, "ops"))
+	e.Publish(context.Background(), scope, jsonRow(nk, 7, `"written"`, "ops"))
 
 	got, ok := e.Lookup(scope, nk)
 	if !ok {

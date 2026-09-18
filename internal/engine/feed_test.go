@@ -533,3 +533,85 @@ func TestDeleteEventNeverBlocksOnASubscriber(t *testing.T) {
 		t.Errorf("delete delivery for key b: got (%v, rev %d), want (\"db\", rev 0)", got.Value, got.Revision)
 	}
 }
+
+// TestSlowValidatorDoesNotBlockTheChangefeedGoroutine pins the consumer's
+// validator OUT of the scope's reconcile mutex.
+//
+// The validator is consumer code: it may read a file, call a remote service,
+// or simply be slow. Running it while the scope's reconcile mutex is held puts
+// every other event for that scope behind it — a delete of an unrelated key
+// waits on a validator that has nothing to do with it, and so does every
+// reconcile of the scope. Decode and validate therefore run before the mutex
+// is taken, and the mutex covers only the publish-and-record pair the fence
+// needs to be atomic.
+func TestSlowValidatorDoesNotBlockTheChangefeedGoroutine(t *testing.T) {
+	scope := store.Scope{}
+	slow := NSKey{Namespace: "billing", Key: "slow"}
+	other := NSKey{Namespace: "billing", Key: "other"}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+
+	var once sync.Once
+
+	fs := newFakeStore()
+	fs.seed(scope, jsonRow(slow, 1, `"v"`, "ops"))
+
+	e := feedEngine(t, map[NSKey]KeyDef{
+		slow: {Default: "fallback", Validate: func(any) error {
+			once.Do(func() { close(entered) })
+			<-release
+
+			return nil
+		}},
+		other: {Default: "fallback"},
+	}, fs, 0)
+
+	delivered := make(chan Change, 1)
+	unsubscribe := e.OnChange(other, func(_ context.Context, ch Change) { delivered <- ch })
+
+	defer unsubscribe()
+
+	reread := make(chan struct{})
+
+	go func() {
+		defer close(reread)
+
+		e.onEvent(upsertEvent(scope, slow, 1))
+	}()
+
+	<-entered
+
+	applied := make(chan struct{})
+
+	go func() {
+		defer close(applied)
+
+		e.onEvent(deleteEvent(scope, other))
+	}()
+
+	timeout := time.After(200 * time.Millisecond)
+
+	select {
+	case <-applied:
+	case <-timeout:
+		close(release)
+		<-reread
+		<-applied
+		t.Fatal("the delete of a second key waited on a validator holding the scope's reconcile mutex")
+	}
+
+	select {
+	case ch := <-delivered:
+		if ch.Revision != 0 || ch.Value != "fallback" {
+			t.Errorf("delete delivered (rev %d, %v), want the registered default at revision 0", ch.Revision, ch.Value)
+		}
+	case <-timeout:
+		close(release)
+		<-reread
+		t.Fatal("the delete of a second key was never delivered while a validator held the scope's reconcile mutex")
+	}
+
+	close(release)
+	<-reread
+}

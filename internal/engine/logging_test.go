@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -23,6 +24,10 @@ type logRecord struct {
 	Level int
 	Msg   string
 	Args  []any
+	// Ctx is the context the engine logged under. It is captured because a
+	// line severed from the caller's trace is indistinguishable from one
+	// attached to it by message and fields alone.
+	Ctx context.Context
 }
 
 func (r logRecord) fields() []log.Field {
@@ -66,11 +71,11 @@ type recordingLogger struct {
 	records []logRecord
 }
 
-func (r *recordingLogger) Log(_ context.Context, level int, msg string, fields ...any) {
+func (r *recordingLogger) Log(ctx context.Context, level int, msg string, fields ...any) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.records = append(r.records, logRecord{Level: level, Msg: msg, Args: fields})
+	r.records = append(r.records, logRecord{Level: level, Msg: msg, Args: fields, Ctx: ctx})
 }
 
 func (r *recordingLogger) snapshot() []logRecord {
@@ -178,9 +183,7 @@ func TestUnregisteredKeyIsLoggedAtDebug(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "unknown"}
 	e, rec := loggingEngine(t, map[NSKey]KeyDef{}, newFakeStore())
 
-	if e.ingest(context.Background(), store.Scope{}, jsonRow(nk, 1, `"v"`, "ops")) {
-		t.Error("an unregistered row reported usable, want false")
-	}
+	ingestRow(e, jsonRow(nk, 1, `"v"`, "ops"))
 
 	requireLogged(t, rec, log.LevelDebug, "value for unregistered key, skipping", nk)
 }
@@ -192,9 +195,7 @@ func TestUndecodableValueIsLoggedAtWarn(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 	e, rec := loggingEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, newFakeStore())
 
-	if e.ingest(context.Background(), store.Scope{}, jsonRow(nk, 1, `{not json`, "ops")) {
-		t.Error("an undecodable row reported usable, want false")
-	}
+	ingestRow(e, jsonRow(nk, 1, `{not json`, "ops"))
 
 	requireLogged(t, rec, log.LevelWarn, "failed to unmarshal stored value, keeping cached value", nk)
 }
@@ -210,9 +211,7 @@ func TestValidatorRejectionIsLoggedAtWarn(t *testing.T) {
 		Validate: func(any) error { return errors.New("want a string") },
 	}}, newFakeStore())
 
-	if e.ingest(context.Background(), store.Scope{}, jsonRow(nk, 1, `42`, "ops")) {
-		t.Error("a rejected row reported usable, want false")
-	}
+	ingestRow(e, jsonRow(nk, 1, `42`, "ops"))
 
 	requireLogged(t, rec, log.LevelWarn, "stored value rejected by validator, keeping cached value", nk)
 }
@@ -323,5 +322,111 @@ func TestReconcileListFailureLevelsSplitOnShutdown(t *testing.T) {
 		}
 
 		requireLoggedAt(t, rec, log.LevelWarn, msg)
+	})
+}
+
+// requireOneRecord returns the single entry whose message is msg, failing when
+// the engine emitted none or several: every assertion below is about WHAT one
+// line carries, which is meaningless if the line is ambiguous.
+func requireOneRecord(t *testing.T, r *recordingLogger, msg string) logRecord {
+	t.Helper()
+
+	matches := make([]logRecord, 0, 1)
+
+	for _, rec := range r.snapshot() {
+		if rec.Msg == msg {
+			matches = append(matches, rec)
+		}
+	}
+
+	if len(matches) != 1 {
+		t.Fatalf("entries with message %q: got %d, want 1; all entries: %v", msg, len(matches), r.all())
+	}
+
+	return matches[0]
+}
+
+// TestPublishLogsUnderTheCallerContext pins the write path to the caller's
+// context. A Set arrives on the consumer's own goroutine, inside the consumer's
+// own span; logging its ingress under the engine's background context detaches
+// every rejection an operator would use to explain why a write did not take
+// effect from the request that caused it.
+func TestPublishLogsUnderTheCallerContext(t *testing.T) {
+	type ctxKey struct{}
+
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	e, rec := loggingEngine(t, map[NSKey]KeyDef{nk: {
+		Default:  "fallback",
+		Validate: func(any) error { return errors.New("want a string") },
+	}}, newFakeStore())
+
+	ctx := context.WithValue(context.Background(), ctxKey{}, "caller-span")
+
+	e.Publish(ctx, store.Scope{}, jsonRow(nk, 1, `42`, "ops"))
+
+	got := requireOneRecord(t, rec, "stored value rejected by validator, keeping cached value")
+	if got.Ctx == nil || got.Ctx.Value(ctxKey{}) != "caller-span" {
+		t.Errorf("the write path logged under a context that is not the caller's: %s", got)
+	}
+}
+
+// validatorError is the shape a real validator returns: a consumer-defined
+// error whose message names what it refused — which is how the refused value
+// itself ends up in the message.
+type validatorError struct{ msg string }
+
+func (e validatorError) Error() string { return e.msg }
+
+// TestValidatorErrorIsRedactedByKeyPolicy pins the one place a consumer-built
+// string reaches the log stream carrying a configuration value: the message of
+// an error the registered validator returned. A validator that interpolates
+// the value it refused ("password %q is too short") publishes that value at
+// WARN, past every redaction the key was registered with.
+//
+// The error returned to the caller of Set is unchanged in both cases; only the
+// log line is redacted.
+func TestValidatorErrorIsRedactedByKeyPolicy(t *testing.T) {
+	const (
+		sentinel = "s3cr3t-value"
+		msg      = "stored value rejected by validator, keeping cached value"
+	)
+
+	rejecting := func(any) error { return validatorError{"rejected " + sentinel} }
+
+	visible := NSKey{Namespace: "billing", Key: "limits"}
+	secret := NSKey{Namespace: "billing", Key: "apitoken"}
+
+	t.Run("RedactNone keeps the validator's own message", func(t *testing.T) {
+		e, rec := loggingEngine(t, map[NSKey]KeyDef{
+			visible: {Default: "fallback", Validate: rejecting},
+		}, newFakeStore())
+
+		ingestRow(e, jsonRow(visible, 1, `42`, "ops"))
+
+		got := requireOneRecord(t, rec, msg)
+		requireNotRedacted(t, got)
+
+		if !strings.Contains(got.String(), sentinel) {
+			t.Errorf("a key registered without redaction lost its validator's message: %s", got)
+		}
+	})
+
+	t.Run("RedactFull withholds it", func(t *testing.T) {
+		e, rec := loggingEngine(t, map[NSKey]KeyDef{
+			secret: {Default: "fallback", Validate: rejecting, Redacted: true},
+		}, newFakeStore())
+
+		ingestRow(e, jsonRow(secret, 1, `42`, "ops"))
+
+		got := requireOneRecord(t, rec, msg)
+		requireNotRedacted(t, got)
+
+		if strings.Contains(got.String(), sentinel) {
+			t.Errorf("a redacted key published its value through the validator's error message: %s", got)
+		}
+
+		if !strings.Contains(got.String(), "engine.validatorError") {
+			t.Errorf("the redacted line names no error type, so an operator cannot tell the rejections apart: %s", got)
+		}
 	})
 }

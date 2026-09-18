@@ -243,11 +243,12 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
 		return
 	}
 
-	// The ingest and the fence it writes are one atomic step, for the same
-	// reason as in applyDelete: a reconcile deciding this key must see either
-	// both or neither, never an empty fence followed by this publication.
-	// The store read above deliberately stays outside the lock — holding it
-	// across a network round trip would stall every reconcile of the scope.
+	// The publication and the fence it writes are one atomic step, for the
+	// same reason as in applyDelete: a reconcile deciding this key must see
+	// either both or neither, never an empty fence followed by this
+	// publication. The store read above deliberately stays outside the lock —
+	// holding it across a network round trip would stall every reconcile of
+	// the scope, and so does the validator ingest runs before taking it.
 	// The scope is resolved again because it can be dropped during that round
 	// trip, and this publication must not bring it back.
 	sc := e.scopeForEvent(scope, nk)
@@ -255,10 +256,7 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
 		return
 	}
 
-	sc.reconcileMu.Lock()
-	defer sc.reconcileMu.Unlock()
-
-	sc.record(nk, e.ingest(ctx, scope, se))
+	e.ingest(ctx, sc, se)
 }
 
 // recordFeedOutcome tells every reconcile in flight what the feed learned

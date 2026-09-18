@@ -383,14 +383,23 @@ func scopeLabel(scope store.Scope) string {
 // rejects still means the engine learned nothing usable about that key, and a
 // concurrent reconcile that sees neither fence treats the key as absent and
 // publishes the registered default over the cached value.
-func (e *Engine) Publish(scope store.Scope, se store.Entry) {
+//
+// ctx is the WRITER's context — the one the Client received from the caller of
+// Set — and it is used for everything this path emits: the rejection lines an
+// operator reads to explain why a write did not take effect, and the panic
+// record of a validator that dies on the value. This is the one ingress that
+// runs on the consumer's own goroutine, inside the consumer's own span; the
+// engine's background context belongs to the goroutines the engine owns (the
+// workers, the reconcile, the debounced re-read), and using it here detached
+// every one of those records from the request that caused it.
+func (e *Engine) Publish(ctx context.Context, scope store.Scope, se store.Entry) {
 	if e == nil || e.closed.Load() {
 		return
 	}
 
 	sc := e.trackedScope(scope)
 	if sc == nil {
-		e.logDebug(e.dispatchContext(), "write for an untracked scope, dropping",
+		e.logDebug(ctx, "write for an untracked scope, dropping",
 			log.String("tenant", scope.Tenant),
 			log.String("namespace", se.Namespace),
 			log.String("keyname", se.Key),
@@ -399,10 +408,7 @@ func (e *Engine) Publish(scope store.Scope, se store.Entry) {
 		return
 	}
 
-	sc.reconcileMu.Lock()
-	defer sc.reconcileMu.Unlock()
-
-	sc.record(NSKey{Namespace: se.Namespace, Key: se.Key}, e.ingest(e.dispatchContext(), scope, se))
+	e.ingest(ctx, sc, se)
 }
 
 // Lookup returns the published state of nk in scope.
