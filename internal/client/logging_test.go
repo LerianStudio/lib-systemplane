@@ -152,4 +152,28 @@ func TestRefreshPanicNamesTheKey(t *testing.T) {
 	if !namespaced || !named {
 		t.Errorf("the line does not name the key the re-read panicked on: %v", lines[0])
 	}
+
+	// The identity line says which key; this one says the panic was COUNTED.
+	// runtime.HandlePanicValue is what records panic_recovered_total and the
+	// span event, and it is also what logs this line, so the line is the only
+	// in-process evidence the counter moved: a recoverRefresh that re-panicked
+	// into the debouncer's RecoverAndLog instead would leave the identity line
+	// standing above and the counter at zero, and nothing else here would
+	// notice.
+	accounted := logger.errs("panic recovered")
+	if len(accounted) != 1 {
+		t.Fatalf("got %d ERROR lines accounting for the panic, want exactly 1: %s", len(accounted), logger.rendered())
+	}
+
+	var source any
+
+	for _, f := range accounted[0].structured() {
+		if f.Key == "source" {
+			source = f.Value
+		}
+	}
+
+	if source != "refresh" {
+		t.Errorf("the accounting line carries source = %v, want \"refresh\": the panic was counted under another site, or reported without being counted", source)
+	}
 }

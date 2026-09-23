@@ -22,19 +22,24 @@ import (
 	"github.com/LerianStudio/lib-observability/v4/redaction"
 )
 
+// obsLogPath is the package whose Field constructors this scan reads. The
+// local name is resolved per file from the import block rather than assumed,
+// because an alias is the same call under another identifier: a scan keyed on
+// the literal "log" misses obslog.String("key", …) and reads any OTHER package
+// imported as log — the standard library's included — as if it were this one.
+const obsLogPath = "github.com/LerianStudio/lib-observability/v4/log"
+
 // fieldConstructors are the log.Field constructors whose first argument is the
 // field NAME — the string an operator greps by and the string lib-observability
-// matches its sensitive list against. log.Err is absent because it names no
-// field.
+// matches its sensitive list against. Those four are every name-carrying
+// constructor the package exports: log.Err names no field, and log.Fields, in
+// alternating key/value form, would need its own reader and no production file
+// here builds one.
 var fieldConstructors = map[string]bool{
-	"String":   true,
-	"Any":      true,
-	"Int":      true,
-	"Int64":    true,
-	"Bool":     true,
-	"Duration": true,
-	"Float64":  true,
-	"Strings":  true,
+	"String": true,
+	"Any":    true,
+	"Int":    true,
+	"Bool":   true,
 }
 
 // AssertNoneRedacted parses every non-test Go file in dir — "." is the package
@@ -47,7 +52,8 @@ var fieldConstructors = map[string]bool{
 //
 // A name built from a constant or a variable is skipped: it is not a literal
 // this scan can read, and constants.AttrKeyTenantID is the library's own and
-// already checked there.
+// already checked there. A dot-imported log package is skipped too — no file
+// here imports one, and a scan that claimed to read it would be guessing.
 func AssertNoneRedacted(tb testing.TB, dir string) {
 	tb.Helper()
 
@@ -69,8 +75,13 @@ func AssertNoneRedacted(tb testing.TB, dir string) {
 			tb.Fatalf("parse %s: %v", source, err)
 		}
 
+		pkg, ok := logPkgName(file)
+		if !ok {
+			continue
+		}
+
 		ast.Inspect(file, func(n ast.Node) bool {
-			if name, lit, ok := fieldName(n); ok {
+			if name, lit, ok := fieldName(n, pkg); ok {
 				names[name] = fset.Position(lit.Pos())
 			}
 
@@ -90,9 +101,29 @@ func AssertNoneRedacted(tb testing.TB, dir string) {
 	}
 }
 
-// fieldName reports the literal field name of a log.<Constructor>("name", …)
-// call, and false for every other node.
-func fieldName(n ast.Node) (string, *ast.BasicLit, bool) {
+// logPkgName reports the local name lib-observability's log package is bound
+// to in file, and false when the file does not import it.
+func logPkgName(file *ast.File) (string, bool) {
+	for _, imported := range file.Imports {
+		path, err := strconv.Unquote(imported.Path.Value)
+		if err != nil || path != obsLogPath {
+			continue
+		}
+
+		if imported.Name != nil {
+			return imported.Name.Name, true
+		}
+
+		return "log", true
+	}
+
+	return "", false
+}
+
+// fieldName reports the literal field name of a <pkg>.<Constructor>("name", …)
+// call, where pkg is the local name of the log package in the file being
+// scanned, and false for every other node.
+func fieldName(n ast.Node, pkg string) (string, *ast.BasicLit, bool) {
 	call, ok := n.(*ast.CallExpr)
 	if !ok || len(call.Args) == 0 {
 		return "", nil, false
@@ -103,7 +134,7 @@ func fieldName(n ast.Node) (string, *ast.BasicLit, bool) {
 		return "", nil, false
 	}
 
-	if pkg, ok := sel.X.(*ast.Ident); !ok || pkg.Name != "log" {
+	if ident, ok := sel.X.(*ast.Ident); !ok || ident.Name != pkg {
 		return "", nil, false
 	}
 

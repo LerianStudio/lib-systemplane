@@ -91,7 +91,7 @@ func (m *Manager) warmLoad(ctx context.Context, db dbresolver.DB, ts *tenantStat
 		if _, ok := registry[nk]; !ok {
 			m.logDebug(ctx, "manager warm-load: unregistered key, skipping",
 				log.String("namespace", ns),
-				log.String("key", key),
+				log.String("keyname", key),
 			)
 
 			continue
@@ -101,7 +101,7 @@ func (m *Manager) warmLoad(ctx context.Context, db dbresolver.DB, ts *tenantStat
 		if err := json.Unmarshal(raw, &decoded); err != nil {
 			m.logWarn(ctx, "manager warm-load: decode failed, skipping",
 				log.String("namespace", ns),
-				log.String("key", key),
+				log.String("keyname", key),
 				log.Err(err),
 			)
 

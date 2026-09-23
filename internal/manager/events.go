@@ -48,7 +48,7 @@ func (m *Manager) applyEvent(ctx context.Context, tenantID string, ts *tenantSta
 			m.logWarn(readCtx, "manager LISTEN: refresh read failed",
 				log.String("tenant_id", tenantID),
 				log.String("namespace", evt.Namespace),
-				log.String("key", evt.Key),
+				log.String("keyname", evt.Key),
 				log.Err(err),
 			)
 
