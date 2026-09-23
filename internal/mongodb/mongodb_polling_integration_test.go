@@ -381,8 +381,14 @@ func unreachableStore(t *testing.T, tenantScoped bool) *Store {
 // handshake: the first polling round trip runs on the caller's goroutine, so a
 // backend it cannot reach fails Start (zero scope) or Subscribe (named tenant)
 // instead of looping in the background behind a feed that looks alive. A
-// failure leaves nothing behind — no feed slot, no ticker — which is also what
-// keeps the package's goleak guard clean.
+// failure leaves no ticker and no reader behind, which is what keeps the
+// package's goleak guard clean.
+//
+// The two scopes differ in what happens to the SLOT. A named tenant's is
+// retracted, so the next Subscribe for it builds a fresh placeholder. The zero
+// scope's is KEPT: subscribers may have attached before Start and a retried
+// Start must bring up the very feed they hold, so the cause is recorded on the
+// slot and reported to every later zero-scope Subscribe instead.
 func TestIntegration_MongoSubscribeReturnsErrorWhenFirstPollFails(t *testing.T) {
 	t.Run("zero scope fails Start", func(t *testing.T) {
 		s := unreachableStore(t, false)
@@ -396,8 +402,21 @@ func TestIntegration_MongoSubscribeReturnsErrorWhenFirstPollFails(t *testing.T) 
 			t.Fatalf("Start error = %v, want the poll round trip's own error", err)
 		}
 
-		if total, _ := s.FeedsSnapshot(""); total != 0 {
-			t.Fatalf("feeds after the failed Start = %d, want 0: the reserved slot must be retracted", total)
+		if total, _ := s.FeedsSnapshot(""); total != 1 {
+			t.Fatalf("feeds after the failed Start = %d, want the zero-scope slot kept for the retry", total)
+		}
+
+		// The recorded cause is what a later zero-scope Subscribe gets: never a
+		// feed that has announced nothing and looks healthy.
+		unsub, subErr := s.Subscribe(context.Background(), store.Scope{}, func(store.Event) {})
+		if subErr == nil {
+			unsub()
+
+			t.Fatal("Subscribe after the failed Start returned nil; want the recorded cause")
+		}
+
+		if !strings.Contains(subErr.Error(), "poll") {
+			t.Fatalf("Subscribe error = %v, want the failed Start's own cause", subErr)
 		}
 	})
 

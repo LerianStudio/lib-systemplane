@@ -28,13 +28,17 @@ type Connector interface {
 	// their own scope, and the revision fence would act on them. Values never
 	// cross; notifications and revisions would.
 	//
-	// That constraint is enforced where it is decidable: a feed that REACHES a
-	// database another live feed is already listening on is refused with
-	// ErrSharedDatabaseUnsupported, whatever the two connection strings say —
-	// the database is identified by the server, not by the DSN text. Two
-	// processes sharing one database cannot see each other, and neither can a
-	// search_path installed as a role or database default, so one database per
-	// scope remains the operator's responsibility beyond this one process.
+	// That constraint is enforced where it is decidable: the database is
+	// identified by what the SERVER reports on the open connection — its
+	// address, port and current_database() — not by the DSN text, so two
+	// spellings that reach one server over one route are refused with
+	// ErrSharedDatabaseUnsupported however differently they are written.
+	// Routes the server describes differently are NOT caught, and
+	// serverDatabaseKey names them: a Unix-socket route against a TCP one, and
+	// two distinct interface addresses of one host. Two processes sharing one
+	// database cannot see each other either, and neither can a search_path
+	// installed as a role or database default, so one database per scope
+	// remains the operator's responsibility beyond this one process.
 	ResolveDSN(ctx context.Context, tenantID string) (string, error)
 }
 
@@ -46,8 +50,8 @@ var ErrPgMgrUnavailable = errors.New("systemplane/postgres: tenant-manager postg
 // ErrSharedDatabaseUnsupported is returned when a feed would listen on a
 // database another live feed of the same Store already listens on — the
 // signature of schema-per-tenant isolation, and of a connector that hands two
-// tenants one database, whether or not it spells it the same way. See
-// serverDatabaseKey.
+// tenants one database. What counts as "the same database", and which routes
+// to one database this cannot tell apart, is serverDatabaseKey's definition.
 //
 // NOTIFY is database-wide and every feed listens on the same channel, so both
 // scopes would receive every notification stamped with their OWN scope and the
@@ -65,15 +69,27 @@ var ErrSharedDatabaseUnsupported = errors.New("systemplane/postgres: two scopes 
 // actually reached, so two scopes pointing at the same one can be told apart
 // from two scopes pointing at different ones.
 //
-// The identity comes from the server, not from the connection string. DSN text
-// is a description of how to get there and two descriptions of one database
-// need not match: "localhost" and "127.0.0.1", a CNAME and its target, a
-// pgbouncer address and the backend behind it, a Unix socket and a TCP port on
-// the same host. Every one of those spellings lands on one NOTIFY namespace,
-// and a key built from the text would call them different databases and admit
-// the second feed. current_database() with inet_server_addr()/inet_server_port()
-// are unprivileged and are evaluated inside the server, so every route to it
-// reports the same triple.
+// The identity comes from the server, not from the connection string: the
+// triple (inet_server_addr(), inet_server_port(), current_database()), all
+// unprivileged and all evaluated inside the server. DSN text is a description
+// of how to get there and two descriptions that land on one NOTIFY namespace
+// need not match — a host name and the literal address it resolves to, a CNAME
+// and its target, a pgbouncer address and the backend behind it — and a key
+// built from the text would call those different databases and admit the
+// second feed.
+//
+// What this key CANNOT tell apart, by construction, is two routes the server
+// itself describes differently:
+//
+//   - A Unix-domain socket against a TCP port on the same host. The socket
+//     route reports no address at all (see below) and is therefore keyed in a
+//     different format, so the pair is admitted as two databases.
+//   - Two distinct interface addresses of one host — a literal 127.0.0.1
+//     against a name that resolves to ::1, or two NICs.
+//
+// Both pairs reach one NOTIFY namespace and neither is refused. One database
+// per scope stays the operator's responsibility; this key catches the spelling
+// mistakes, not every route.
 //
 // The database — not the schema — is the discriminator, because NOTIFY is
 // database-wide. A DSN that pins a schema is NOT refused on that basis: a

@@ -717,6 +717,77 @@ func TestIntegration_MongoPreV4DocumentReadsAtRevisionZero(t *testing.T) {
 	}
 }
 
+// One foreign-written document with a badly typed field must cost ONE key and
+// not the whole scope. Bulk-decoding the List cursor turned a single such
+// document into an error for every key in the collection, so the engine's
+// reconcile after each OpResync could never converge again and every key stayed
+// on whatever the cache last held. The undecodable key itself reads as ABSENT,
+// which is what puts its registered default in force (FC-11), and every other
+// key still reads and still lists. The bad document is named so it sorts FIRST
+// under the (namespace, key) order List asks for, which is what makes a scan
+// that aborts on it visible here as the missing good keys behind it.
+func TestIntegration_MongoBadlyTypedDocumentCostsOneKey(t *testing.T) {
+	client, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	s, coll := freshSingleTenantStore(t, client, "badtype")
+	ctx := context.Background()
+
+	setEntry(t, s, "ns", "good-a", `{"enabled":true}`)
+	setEntry(t, s, "ns", "good-b", `{"enabled":false}`)
+
+	// value stored as a sub-document instead of the JSON string this store writes.
+	if _, err := coll.InsertOne(ctx, bson.D{
+		{Key: "_id", Value: rawID{Namespace: "ns", Key: "bad-value"}},
+		{Key: "namespace", Value: "ns"},
+		{Key: "key", Value: "bad-value"},
+		{Key: "value", Value: bson.D{{Key: "enabled", Value: true}}},
+		{Key: "updated_at", Value: time.Now().UTC()},
+		{Key: "updated_by", Value: "foreign-writer"},
+	}); err != nil {
+		t.Fatalf("insert badly typed value: %v", err)
+	}
+
+	entries, err := s.List(ctx, store.Scope{})
+	if err != nil {
+		t.Fatalf("list with one undecodable document in the collection: %v", err)
+	}
+
+	listed := make(map[string]string, len(entries))
+	for _, e := range entries {
+		listed[e.Key] = string(e.Value)
+	}
+
+	if listed["good-a"] != `{"enabled":true}` || listed["good-b"] != `{"enabled":false}` {
+		t.Fatalf("list = %v, want both well-formed keys with their stored values", listed)
+	}
+
+	if _, there := listed["bad-value"]; there {
+		t.Error(`list returned "bad-value"; an undecodable document must be skipped, not surfaced`)
+	}
+
+	entry, found, err := s.Get(ctx, store.Scope{}, "ns", "bad-value")
+	if err != nil {
+		t.Fatalf("get bad-value: %v; an undecodable document must read as absent, not fail the read", err)
+	}
+
+	if found {
+		t.Errorf("get bad-value returned %#v, want absent so the registered default stays in force", entry)
+	}
+
+	// The scope still converges: a write lands and the next List sees it.
+	setEntry(t, s, "ns", "good-c", `{"enabled":true}`)
+
+	entries, err = s.List(ctx, store.Scope{})
+	if err != nil {
+		t.Fatalf("list after a write alongside the bad document: %v", err)
+	}
+
+	if len(entries) != 3 {
+		t.Fatalf("list returned %d entries, want the 3 decodable ones", len(entries))
+	}
+}
+
 // TestIntegration_MongoConcurrentSetsLoseNoBump pins the write rule under
 // contention: concurrent writers of the same NEW key race on the insert, and
 // the loser is retried onto the update path rather than failing. Every write

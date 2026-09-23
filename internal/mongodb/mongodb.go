@@ -417,16 +417,37 @@ func (s *Store) List(ctx context.Context, scope store.Scope) ([]store.Entry, err
 	}
 	defer cursor.Close(ctx)
 
-	var docs []entryDoc
-	if err := cursor.All(ctx, &docs); err != nil {
-		tracing.HandleSpanError(span, "list decode failed", err)
+	// Decoded one document at a time, never in bulk. A single foreign-written
+	// document with a badly typed field — a value stored as a sub-document
+	// rather than as the JSON string this store writes — fails its own decode,
+	// and cursor.All would turn that into an error for the WHOLE scope, so the
+	// engine's reconcile after every OpResync could never converge again. One
+	// bad document costs one key instead: it is skipped with a warning naming
+	// it, and that key falls back to its registered default (FC-11).
+	var entries []store.Entry
 
-		return nil, fmt.Errorf("systemplane/mongodb: list decode: %w", err)
+	for cursor.Next(ctx) {
+		var doc entryDoc
+
+		if err := cursor.Decode(&doc); err != nil {
+			namespace, key := docIdentity(cursor.Current)
+
+			s.logWarn(ctx, "list decode error, skipping document",
+				log.Err(err),
+				log.String("namespace", namespace),
+				log.String("key", key),
+			)
+
+			continue
+		}
+
+		entries = append(entries, doc.toEntry())
 	}
 
-	entries := make([]store.Entry, len(docs))
-	for i := range docs {
-		entries[i] = docs[i].toEntry()
+	if err := cursor.Err(); err != nil {
+		tracing.HandleSpanError(span, "list cursor failed", err)
+
+		return nil, fmt.Errorf("systemplane/mongodb: list cursor: %w", err)
 	}
 
 	span.SetAttributes(attribute.Int("entries.count", len(entries)))
@@ -455,8 +476,10 @@ func (s *Store) Get(ctx context.Context, scope store.Scope, namespace, key strin
 
 	filter := bson.D{{Key: fieldID, Value: compoundID{Namespace: namespace, Key: key}}, notDeleted()}
 
-	var doc entryDoc
-	if err := coll.FindOne(ctx, filter).Decode(&doc); err != nil {
+	// Raw() rather than Decode(): it separates the QUERY outcome, which is the
+	// caller's problem, from the DECODE outcome, which is one document's.
+	raw, err := coll.FindOne(ctx, filter).Raw()
+	if err != nil {
 		if errors.Is(err, mongo.ErrNoDocuments) {
 			return store.Entry{}, false, nil
 		}
@@ -464,6 +487,22 @@ func (s *Store) Get(ctx context.Context, scope store.Scope, namespace, key strin
 		tracing.HandleSpanError(span, "get find failed", err)
 
 		return store.Entry{}, false, fmt.Errorf("systemplane/mongodb: get: %w", err)
+	}
+
+	var doc entryDoc
+
+	if err := bson.Unmarshal(raw, &doc); err != nil {
+		// A document this backend cannot decode reads as ABSENT rather than as
+		// an error: the registered default is then what serves the key, which
+		// is what FC-11 prescribes for a stored row the ingress rejects. An
+		// error here would instead fail every read of that key.
+		s.logWarn(ctx, "get decode error, serving the key as absent",
+			log.Err(err),
+			log.String("namespace", namespace),
+			log.String("key", key),
+		)
+
+		return store.Entry{}, false, nil
 	}
 
 	return doc.toEntry(), true, nil

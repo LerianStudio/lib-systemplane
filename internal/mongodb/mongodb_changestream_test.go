@@ -952,7 +952,7 @@ func TestMongoStore_ReserveZeroFeedElectsOneOpener(t *testing.T) {
 
 			start.Wait()
 
-			f, mine, err := s.reserveZeroFeed()
+			f, ready, err := s.reserveZeroFeed()
 			if err != nil {
 				t.Errorf("reserveZeroFeed: %v", err)
 
@@ -968,7 +968,7 @@ func TestMongoStore_ReserveZeroFeedElectsOneOpener(t *testing.T) {
 			mu.Lock()
 			defer mu.Unlock()
 
-			if mine {
+			if ready == nil {
 				openers++
 			} else {
 				waiters++
@@ -1310,4 +1310,198 @@ func changeEventFor(t *testing.T, operationType string, full bson.D) changeEvent
 	}
 
 	return ce
+}
+
+// errRefused stands in for whatever refuses a zero-scope open — a Close landing
+// mid-connect, an unreachable replica set. The identity is what matters here,
+// not the cause.
+var errRefused = errors.New("mongodb test: zero-scope open refused")
+
+// A refusal at publish time must NOT drop the zero-scope slot. Subscribe can run
+// before Start, so subscribers already hold that feed: retracting it strands
+// them on a feed nothing reopens and nothing tears down, while the next
+// zero-scope Subscribe silently gets a fresh feed that has announced nothing and
+// looks healthy.
+func TestMongoZeroFeed_RefusalKeepsTheSlotAndIsReported(t *testing.T) {
+	s := newSubscribeStore()
+
+	f, err := s.zeroFeed()
+	if err != nil {
+		t.Fatalf("zeroFeed: %v", err)
+	}
+
+	events := make(chan store.Event, 4)
+
+	unsub, err := s.Subscribe(context.Background(), store.Scope{}, func(evt store.Event) {
+		events <- evt
+	})
+	if err != nil {
+		t.Fatalf("subscribe before Start: %v", err)
+	}
+
+	t.Cleanup(unsub)
+
+	// Start reaches publishFeed and is refused.
+	s.feedsMu.Lock()
+	cause := s.failLocked(f, errRefused)
+	s.feedsMu.Unlock()
+
+	if !errors.Is(cause, errRefused) {
+		t.Fatalf("recorded cause = %v, want the refusal", cause)
+	}
+
+	s.feedsMu.Lock()
+	kept := s.feeds[""]
+	s.feedsMu.Unlock()
+
+	if kept != f {
+		t.Fatalf("the zero-scope slot holds %p after a refused publish, want the feed its subscribers hold (%p)", kept, f)
+	}
+
+	// A later zero-scope Subscribe must fail loudly rather than attach to a feed
+	// nothing is bringing up.
+	unsub2, err := s.Subscribe(context.Background(), store.Scope{}, func(store.Event) {})
+	if err == nil {
+		unsub2()
+		t.Fatal("Subscribe after a refused Start returned nil; want the recorded refusal")
+	}
+
+	if !errors.Is(err, errRefused) {
+		t.Fatalf("Subscribe error = %v, want the recorded refusal", err)
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	waitForObserverExit(t)
+}
+
+// The zero scope is the exception, not the rule: a NAMED tenant's creation
+// failure still retracts its slot, so the next Subscribe for that tenant builds
+// a fresh placeholder instead of finding a corpse.
+func TestMongoFeed_NamedFailureStillRetractsItsSlot(t *testing.T) {
+	s := newSubscribeStore()
+
+	f := newFeed(store.Scope{Tenant: "t1"}, nil)
+	f.ready = make(chan struct{})
+
+	s.feedsMu.Lock()
+	s.feeds["t1"] = f
+	_ = s.failLocked(f, errRefused)
+	_, still := s.feeds["t1"]
+	s.feedsMu.Unlock()
+
+	if still {
+		t.Fatal("a failed tenant feed kept its slot; the next Subscribe for that tenant would wait on a corpse")
+	}
+}
+
+// Start RETRIES: it brings up the same feed its subscribers already hold, and
+// the refusal a previous attempt recorded belongs to that attempt, not to the
+// feed forever.
+func TestMongoZeroFeed_StartRetriesTheSameFeed(t *testing.T) {
+	s := newSubscribeStore()
+
+	f, err := s.zeroFeed()
+	if err != nil {
+		t.Fatalf("zeroFeed: %v", err)
+	}
+
+	events := make(chan store.Event, 4)
+
+	unsub, err := s.Subscribe(context.Background(), store.Scope{}, func(evt store.Event) {
+		events <- evt
+	})
+	if err != nil {
+		t.Fatalf("subscribe before Start: %v", err)
+	}
+
+	t.Cleanup(unsub)
+
+	// A first Start reserves the slot and is refused.
+	first, ready, err := s.reserveZeroFeed()
+	if err != nil {
+		t.Fatalf("first reserveZeroFeed: %v", err)
+	}
+
+	if first != f || ready != nil {
+		t.Fatalf("the first Start did not own the open of the subscribers' feed (%p, ready=%v)", first, ready != nil)
+	}
+
+	if cause := s.retractFeed(f, errRefused); !errors.Is(cause, errRefused) {
+		t.Fatalf("retractFeed reported %v, want the refusal", cause)
+	}
+
+	// The retry owns the open again, on the very feed the subscriber holds.
+	retried, ready, err := s.reserveZeroFeed()
+	if err != nil {
+		t.Fatalf("a retried Start was refused by the previous attempt's failure: %v", err)
+	}
+
+	if ready != nil {
+		t.Fatal("a retried Start was told to wait on the failed attempt's reservation")
+	}
+
+	if retried != f {
+		t.Fatalf("a retried Start took feed %p, want the one the subscribers hold (%p)", retried, f)
+	}
+
+	// The reader of that retried stream announces its resync, and the subscriber
+	// that attached before the refusal is the one that receives it.
+	subs, ok := f.beginResync()
+	if !ok {
+		t.Fatal("beginResync refused on a retried feed")
+	}
+
+	s.broadcast(f, subs, store.Event{Scope: f.scope, Op: store.OpResync})
+
+	select {
+	case evt := <-events:
+		if evt.Op != store.OpResync {
+			t.Fatalf("subscriber received %+v, want OpResync", evt)
+		}
+	default:
+		t.Fatal("the subscriber that attached before the refused Start received nothing from the retried feed")
+	}
+
+	// With the refusal cleared, a new zero-scope Subscribe is served again.
+	unsub2, err := s.Subscribe(context.Background(), store.Scope{}, func(store.Event) {})
+	if err != nil {
+		t.Fatalf("Subscribe after a successful retry: %v", err)
+	}
+
+	unsub2()
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	waitForObserverExit(t)
+}
+
+// A MongoDB that accepts a change stream and drops it at once — a replica-set
+// election, a proxy killing idle cursors, a mongos mid-failover — used to hold
+// the feed at the FIRST delay forever, because every successful OPEN reset the
+// sequence. Only a cursor that did work, or one that outlived the cap, may.
+func TestStreamWasUseful_OnlyAWorkingCursorClearsTheBackoff(t *testing.T) {
+	cases := []struct {
+		name     string
+		consumed bool
+		lifetime time.Duration
+		want     bool
+	}{
+		{"accepted and dropped at once", false, time.Millisecond, false},
+		{"delivered an event", true, time.Millisecond, true},
+		{"stayed open past the cap", false, reconnectMaxDelay, true},
+		{"died just under the cap", false, reconnectMaxDelay - time.Nanosecond, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := streamWasUseful(tc.consumed, tc.lifetime); got != tc.want {
+				t.Fatalf("streamWasUseful(%v, %v) = %v, want %v", tc.consumed, tc.lifetime, got, tc.want)
+			}
+		})
+	}
 }

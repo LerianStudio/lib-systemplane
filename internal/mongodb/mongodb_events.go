@@ -118,6 +118,42 @@ func afterImage(raw bson.Raw) (revision int64, deleted bool) {
 	return revision, deleted
 }
 
+// docIdentity reads (namespace, key) out of a raw document, one lookup each, so
+// a document this backend failed to decode is still NAMED in the warning it
+// costs — without it an operator sees "one document was skipped" and has no way
+// to find which key stopped converging.
+//
+// The compound _id carries the pair on every document this library writes; the
+// top-level mirrors are the fallback for a foreign writer that stored its own
+// _id. Either lookup yielding nothing leaves the field empty rather than
+// failing: this runs on a path that is already handling a malformed document.
+func docIdentity(raw bson.Raw) (namespace, key string) {
+	namespace = lookupString(raw, fieldID, fieldNamespace)
+	if namespace == "" {
+		namespace = lookupString(raw, fieldNamespace)
+	}
+
+	key = lookupString(raw, fieldID, fieldKey)
+	if key == "" {
+		key = lookupString(raw, fieldKey)
+	}
+
+	return namespace, key
+}
+
+// lookupString returns the string at path, or "" when it is absent or is not a
+// string.
+func lookupString(raw bson.Raw, path ...string) string {
+	v, err := raw.LookupErr(path...)
+	if err != nil {
+		return ""
+	}
+
+	s, _ := v.StringValueOK()
+
+	return s
+}
+
 // snapshotLocked copies the subscriber set so it can be fanned out to after
 // f.mu is released. The caller MUST already hold f.mu.
 func (f *feed) snapshotLocked() []*subscription {

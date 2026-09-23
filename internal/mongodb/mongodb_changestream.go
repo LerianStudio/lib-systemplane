@@ -225,12 +225,13 @@ func (f *feed) markConnectedLocked() []*subscription {
 	return f.snapshotLocked()
 }
 
-// zeroFeedLocked refuses to hand out — or resurrect — the zero-scope feed once
-// Close has begun. The caller MUST hold Store.feedsMu, which is what makes the
-// check atomic with the map walk in stopFeeds: a Start or a Subscribe that
-// already passed the s.closed check would otherwise re-insert a slot into a
-// shut-down store, and nothing would ever tear it down again.
-func (s *Store) zeroFeedLocked() (*feed, error) {
+// zeroFeedSlotLocked returns the zero-scope slot, creating it when Subscribe
+// runs before Start, and refuses to hand it out — or resurrect it — once Close
+// has begun. The caller MUST hold Store.feedsMu, which is what makes the check
+// atomic with the map walk in stopFeeds: a Start or a Subscribe that already
+// passed the s.closed check would otherwise re-insert a slot into a shut-down
+// store, and nothing would ever tear it down again.
+func (s *Store) zeroFeedSlotLocked() (*feed, error) {
 	if s.closing {
 		return nil, store.ErrClosed
 	}
@@ -241,6 +242,24 @@ func (s *Store) zeroFeedLocked() (*feed, error) {
 
 	f := newFeed(store.Scope{}, s.coll)
 	s.feeds[""] = f
+
+	return f, nil
+}
+
+// zeroFeedLocked is the SUBSCRIBE side of that slot: it reports the refusal a
+// Start recorded instead of handing back a feed nothing is bringing up. The
+// zero-scope slot is never retracted — its subscribers hold it and a retried
+// Start must reopen the one they hold — so the recorded cause is the only thing
+// that can tell a later Subscribe the changefeed never came up.
+func (s *Store) zeroFeedLocked() (*feed, error) {
+	f, err := s.zeroFeedSlotLocked()
+	if err != nil {
+		return nil, err
+	}
+
+	if f.err != nil {
+		return nil, f.err
+	}
 
 	return f, nil
 }
@@ -559,7 +578,7 @@ func (s *Store) Subscribe(ctx context.Context, scope store.Scope, fn func(store.
 // Two concurrent Starts open ONE stream between them: reserveZeroFeed picks the
 // opener under the feeds-map lock and the loser waits for its outcome here.
 func (s *Store) startListener(ctx context.Context) error {
-	f, mine, err := s.reserveZeroFeed()
+	f, ready, err := s.reserveZeroFeed()
 	if err != nil {
 		return err
 	}
@@ -572,10 +591,10 @@ func (s *Store) startListener(ctx context.Context) error {
 	// Another Start reserved this feed and is opening it. Wait for its outcome
 	// rather than open a second stream; the opener is bounded by watchTimeout
 	// (or pollRoundTimeout), so this wait is bounded with it.
-	if !mine {
-		<-f.ready
+	if ready != nil {
+		<-ready
 
-		return f.err
+		return s.feedErr(f)
 	}
 
 	if s.cfg.PollInterval > 0 {
@@ -604,18 +623,22 @@ func (s *Store) startListener(ctx context.Context) error {
 // then on every document event and every marker would be delivered twice by two
 // readers while Close waited on only one of them.
 //
-// Returns (nil, false, nil) when the feed already has a reader — Start is
-// idempotent. Returns (f, false, nil) when another Start reserved it: the
-// caller waits on f.ready and returns that attempt's outcome. Returns
-// (f, true, nil) to the one caller that owns the open; it publishes or retracts,
+// Returns (nil, nil, nil) when the feed already has a reader — Start is
+// idempotent. Returns (f, ready, nil) when another Start reserved it: the caller
+// waits on THAT channel and returns the reserving attempt's outcome. Returns
+// (f, nil, nil) to the one caller that owns the open; it publishes or retracts,
 // and either way closes ready.
-func (s *Store) reserveZeroFeed() (*feed, bool, error) {
+//
+// The channel is returned rather than re-read off the feed because a LATER
+// Start replaces it: a waiter reading f.ready after the reservation it waits on
+// has already failed would race that replacement.
+func (s *Store) reserveZeroFeed() (*feed, <-chan struct{}, error) {
 	s.feedsMu.Lock()
 	defer s.feedsMu.Unlock()
 
-	f, err := s.zeroFeedLocked()
+	f, err := s.zeroFeedSlotLocked()
 	if err != nil {
-		return nil, false, err
+		return nil, nil, err
 	}
 
 	f.mu.Lock()
@@ -623,16 +646,33 @@ func (s *Store) reserveZeroFeed() (*feed, bool, error) {
 	f.mu.Unlock()
 
 	if running {
-		return nil, false, nil
+		return nil, nil, nil
 	}
 
-	if f.ready != nil {
-		return f, false, nil
+	// A reservation still in flight: wait for its outcome rather than open a
+	// second stream.
+	if f.ready != nil && !f.readyClosed {
+		return f, f.ready, nil
 	}
 
+	// This caller owns the open. Start RETRIES the feed its subscribers already
+	// hold, so a previous attempt's refusal — and the ready channel it closed —
+	// belong to that attempt and not to the feed forever.
+	f.err = nil
 	f.ready = make(chan struct{})
+	f.readyClosed = false
 
-	return f, true, nil
+	return f, nil, nil
+}
+
+// feedErr reads a feed's recorded cause under the lock that writes it. The
+// zero-scope slot outlives the attempt that failed it and a later Start clears
+// the record, so an unsynchronized read is a race there.
+func (s *Store) feedErr(f *feed) error {
+	s.feedsMu.Lock()
+	defer s.feedsMu.Unlock()
+
+	return f.err
 }
 
 // openWatch opens one change stream on the feed's collection, bounded by
@@ -729,6 +769,16 @@ func (s *Store) failLocked(f *feed, err error) error {
 		f.err = err
 	}
 
+	// The zero-scope slot is the exception: Start owns it, Subscribe can attach
+	// to it BEFORE Start, and a retried Start must bring up the very feed those
+	// subscribers hold. Retracting it would strand them on a feed nothing
+	// reopens and nothing tears down, while handing the next Subscribe a fresh
+	// feed that has announced nothing and looks healthy. The recorded cause
+	// stays on the slot instead, and zeroFeedLocked reports it.
+	if f.scope.Tenant == "" {
+		return f.err
+	}
+
 	if s.feeds[f.scope.Tenant] == f {
 		delete(s.feeds, f.scope.Tenant)
 	}
@@ -774,7 +824,17 @@ func (s *Store) runFeed(f *feed, stream *mongo.ChangeStream) {
 			s.broadcast(f, subs, store.Event{Scope: f.scope, Op: store.OpResync})
 		}
 
-		s.consumeUntilFailure(f, stream)
+		openedAt := time.Now()
+
+		consumed := s.consumeUntilFailure(f, stream)
+
+		// Only a cursor that did some work clears the backoff. A replica set
+		// that accepts a change stream and drops it at once would otherwise
+		// reset the sequence on every cycle and the feed would reopen at the
+		// first delay forever.
+		if streamWasUseful(consumed, time.Since(openedAt)) {
+			attempt = 0
+		}
 
 		if subs, ok := f.beginDisconnect(); ok {
 			s.broadcast(f, subs, store.Event{Scope: f.scope, Op: store.OpDisconnect})
@@ -798,10 +858,14 @@ func (s *Store) runFeed(f *feed, stream *mongo.ChangeStream) {
 }
 
 // consumeUntilFailure drains one cursor until it dies or teardown closes
-// f.stop. It never reports the difference: the f.closing check inside
-// beginDisconnect is what keeps a clean shutdown from announcing an outage, and
-// the ctx below is what keeps the shutdown from being logged as a failure.
-func (s *Store) consumeUntilFailure(f *feed, stream *mongo.ChangeStream) {
+// f.stop. It never reports the difference between the two: the f.closing check
+// inside beginDisconnect is what keeps a clean shutdown from announcing an
+// outage, and the ctx below is what keeps the shutdown from being logged as a
+// failure.
+//
+// It DOES report whether the cursor carried at least one event, which is what
+// tells runFeed the stream was worth keeping and its backoff can start over.
+func (s *Store) consumeUntilFailure(f *feed, stream *mongo.ChangeStream) (consumed bool) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -814,6 +878,10 @@ func (s *Store) consumeUntilFailure(f *feed, stream *mongo.ChangeStream) {
 	}()
 
 	for stream.Next(ctx) {
+		// Counted before classification: a cursor that delivered an event this
+		// process could not use still proves the connection carried traffic.
+		consumed = true
+
 		var event changeEvent
 		if err := stream.Decode(&event); err != nil {
 			s.logWarn(ctx, "change stream decode error, skipping event", log.Err(err))
@@ -841,6 +909,21 @@ func (s *Store) consumeUntilFailure(f *feed, stream *mongo.ChangeStream) {
 			log.String("tenant", f.scope.Tenant),
 		)
 	}
+
+	return consumed
+}
+
+// streamWasUseful reports whether the cursor that just ended earns a fresh
+// backoff sequence. A cursor that carried at least one event did work; so did
+// one that merely stayed open past the cap, since a feed that survives that
+// long is not the flapping case the escalation exists for. Everything else
+// keeps the sequence climbing, so a MongoDB that accepts a change stream and
+// drops it immediately — a replica-set election, a proxy killing idle cursors,
+// a mongos mid-failover — escalates to the cap instead of reopening four times
+// a second, each cycle costing a tenant re-resolve, a watch aggregate and an
+// OpResync that makes the engine reload the whole scope.
+func streamWasUseful(consumed bool, lifetime time.Duration) bool {
+	return consumed || lifetime >= reconnectMaxDelay
 }
 
 // reconnectDelay is how long a feed waits after its attempt-th consecutive
@@ -852,15 +935,19 @@ func reconnectDelay(attempt int) time.Duration {
 }
 
 // reopenWatch retries the open until it succeeds or teardown stops the feed.
-// attempt is reset by a successful reopen, so a feed that flaps does not
-// inherit the previous outage's backoff.
+// It never clears attempt: an open that succeeds proves nothing about the
+// connection behind it, and runFeed resets the sequence once the cursor it
+// returns has actually done some work (see streamWasUseful).
 func (s *Store) reopenWatch(f *feed, attempt *int) (*mongo.ChangeStream, error) {
-	if *attempt == 0 {
-		s.logWarn(context.Background(), "change stream disconnected, reconnecting",
-			log.Int("attempt", *attempt),
-			log.String("tenant", f.scope.Tenant),
-		)
-	}
+	// One warning per loss: reopenWatch is entered once per loss and retries
+	// internally. attempt is how many attempts this backoff sequence has
+	// already spent, so a flapping backend reports a RISING number instead of
+	// going silent after the first cycle — which is what gating this on
+	// attempt == 0 would now do, since a bare reopen no longer clears it.
+	s.logWarn(context.Background(), "change stream disconnected, reconnecting",
+		log.Int("attempt", *attempt),
+		log.String("tenant", f.scope.Tenant),
+	)
 
 	for {
 		select {
@@ -896,8 +983,6 @@ func (s *Store) reopenWatch(f *feed, attempt *int) (*mongo.ChangeStream, error) 
 
 			continue
 		}
-
-		*attempt = 0
 
 		return stream, nil
 	}
