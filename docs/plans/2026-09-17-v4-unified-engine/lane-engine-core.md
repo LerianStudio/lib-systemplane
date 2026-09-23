@@ -24,7 +24,7 @@
 
 | Phase | Milestone | Epics | Status |
 |-------|-----------|-------|--------|
-| 1 | `internal/engine` exists and is fully unit-tested standalone against a fake store: scope state, ingress, publish fence, reconcile, coalescing dispatch, bounded `Close`. `internal/client` still runs its own cache; nothing user-visible changed, everything is green. | 1.1, 1.2, 1.3, 1.4 | Detailed |
+| 1 | `internal/engine` exists and is fully unit-tested standalone against a fake store: scope state, ingress, publish fence, reconcile, coalescing dispatch, bounded `Close`. `internal/client` still runs its own cache; the only user-visible changes are two corrections carried onto the shipping v3 path (the `key` log field renamed to `keyname`, and a named identity line for a panicking changefeed re-read), everything is green. | 1.1, 1.2, 1.3, 1.4 | Detailed |
 | 2 | The single-tenant `Client` reads, writes and dispatches through the engine; `internal/manager`, the root `Manager` API and `examples/manager/` are gone; `WithCloseTimeout` / `ErrCloseTimeout` are public. | 2.1, 2.2, 2.3 | Detailed |
 | 3 | The v4 breaking surface is cut: `WithTable`, `WithListenChannel`, `WithCollection` removed; canonical names only; boundary, vet, perf and coverage gates green on the reduced surface. | 3.1, 3.2 | Epic-level |
 
@@ -348,7 +348,9 @@ A second, smaller entry point in the same file handles the "no row" case — del
 
 **Implementation vision:** `internal/engine/feed.go` holds the `func(store.Event)` the engine hands to `Store.Subscribe`, plus the re-read it schedules.
 
-`internal/debounce` is reused unchanged — it is already generic over any comparable key. Re-key it from the Client's `nskey` to a struct carrying the scope, so the wave-3 lane gets per-tenant coalescing for free: `debounce.Debouncer[scopeNSKey]` where `scopeNSKey{Tenant, Namespace, Key}`. No file in `internal/debounce` changes.
+`internal/debounce` is reused — it is already generic over any comparable key. Re-key it from the Client's `nskey` to a struct carrying the scope, so the wave-3 lane gets per-tenant coalescing for free: `debounce.Debouncer[scopeNSKey]` where `scopeNSKey{Tenant, Namespace, Key}`.
+
+Amended 2026-09-23 (Phase 1 fix pass): this sentence ended "No file in `internal/debounce` changes", and two did. `Debouncer.invokeWithRecover` built its recovery component name as `fmt.Sprintf("debounce:%v", key)`, and because the arguments of a deferred call are evaluated when the `defer` runs, that reflective format ran on every debounced invocation whether or not anything panicked — a per-re-read cost paid to label a line that redacts the recovered value and the stack in production anyway, so an operator never learned more from it than "something under the debouncer blew up". The component name is now the package constant `recoveryComponent = "debounce"`, `fmt` leaves the package, and identity moves to the caller: `(*Engine).recoverRefresh` (`internal/engine/feed.go`) and `(*Client).recoverRefresh` (`internal/client/client.go`) recover first, log the namespace and key, and leave the debouncer as the outer net. `debounce_test.go` follows the signature change and pins the constant.
 
 Amended 2026-09-23 (Phase 1 fix pass, the G1 finding): **an event for a key this process never
 registered is dropped at the feed callback, before the debouncer ever sees it** — the registry
@@ -390,6 +392,8 @@ Named edge cases: a re-read that reports **not found** keeps the current value a
 - Create: `internal/engine/feed.go`
 - Create: `internal/engine/feed_test.go`
 - Modify: `internal/engine/engine.go` (debouncer field and its construction)
+- Modify: `internal/debounce/debounce.go` (`invokeWithRecover`, the `recoveryComponent` constant) — see the amendment above
+- Modify: `internal/debounce/debounce_test.go` (the `invokeWithRecover` call sites and the recovery-name assertion)
 
 **Verification:** `go test -tags=unit -race ./internal/engine/...` — `TestDeleteEventPublishesDefaultAtRevisionZero` (cache holds the default, `Lookup` reports revision 0, one notification), `TestUpsertEventReReadsAndIngests`, `TestUpsertReReadNotFoundKeepsCurrentValue`, `TestFeedBurstForOneKeyCausesOneStoreRead` (five events inside the debounce window, the fake store counts one `Get`), `TestFeedRecordsTouchedOnlyWhileReconciling`, `TestDisconnectMarksScopeStaleWithoutPublishing` (emit `OpDisconnect`, then assert `Lookup` reports `Stale` true, the cached value and revision are untouched, and no subscriber fired), `TestRepeatedDisconnectIsIdempotent`.
 
@@ -613,15 +617,16 @@ channel is a reconcile, and the only thing that starts one is a `store.OpResync`
 `internal/engine/reconcile.go`). Every fake store in this
 repository's unit suite returns from `Subscribe` without emitting anything, so the moment Task 2.1.3
 routes `Client.Start` through the engine, every single-tenant `Start(context.Background())` in the
-suite blocks forever. Seven fakes: `memStore` (`internal/client/client_test.go:123`),
-`facadeTestStore` (`internal/client/testing_facade_test.go:51`), `catalogSpyStore`
-(`internal/client/catalog_test.go:50`), `apiMemoryStore` (`api_client_test.go:64`),
-`apiCatalogStore` (`api_catalog_test.go:22`), `groupMemoryStore` (`api_group_test.go:103`),
-`fakeStore` (`admin/admin_test.go:174`).
+suite blocks forever. Seven fakes, each named here by the method to edit: `memStore.Subscribe`
+(`internal/client/client_test.go`), `facadeTestStore.Subscribe`
+(`internal/client/testing_facade_test.go`), `catalogSpyStore.Subscribe`
+(`internal/client/catalog_test.go`), `apiMemoryStore.Subscribe` (`api_client_test.go`),
+`apiCatalogStore.Subscribe` (`api_catalog_test.go`), `groupMemoryStore.Subscribe`
+(`api_group_test.go`), `fakeStore.Subscribe` (`admin/admin_test.go`).
 
-Two further gaps in the same fakes. First, `memStore.Set` (`internal/client/client_test.go:83`),
-`apiMemoryStore.Set` (`api_client_test.go:37`) and `facadeTestStore.Set`
-(`internal/client/testing_facade_test.go:35`) all return revision `0` and store whatever `Revision`
+Two further gaps in the same fakes. First, `memStore.Set` (`internal/client/client_test.go`),
+`apiMemoryStore.Set` (`api_client_test.go`) and `facadeTestStore.Set`
+(`internal/client/testing_facade_test.go`) all return revision `0` and store whatever `Revision`
 the caller passed, which is always `0`. FC-2 says `Set` returns the revision now stored; with `0`
 the write and its changefeed echo both arrive at revision 0, which the fence never deduplicates
 (`(*Engine).publish`, `internal/engine/publish.go`), so every `Set` would fire two callbacks. Second, the engine reads
@@ -658,22 +663,22 @@ lands green on the current (still v3) Client — `(*Client).onEvent`
 
 Named edge cases. `catalogSpyStore` counts `List` calls, and the resync now makes the engine call
 `List` once during `Start`; `TestCatalogDoesNotTouchStoreAfterStart`
-(`internal/client/catalog_test.go:182`) resets its counters *after* `Start`, so it still asserts
-zero. `TestNewForTestingAdapterAndOptions` (`internal/client/testing_facade_test.go:57`) subscribes a
+(`internal/client/catalog_test.go`) resets its counters *after* `Start`, so it still asserts
+zero. `TestNewForTestingAdapterAndOptions` (`internal/client/testing_facade_test.go`) subscribes a
 second time through `c.store.Subscribe` and asserts `subscribeFn` goes nil on unsubscribe; the extra
 resync fired by that second subscription lands in the test's own callback, which asserts on
 `evt.Namespace`/`evt.Key`/`evt.Op` — widen that callback to ignore a resync event rather than fail on
-it. `memStore.fire` (`internal/client/client_test.go:141`) is a no-op in multi-tenant mode and stays
+it. `memStore.fire` (`internal/client/client_test.go`) is a no-op in multi-tenant mode and stays
 that way: no multi-tenant test may receive a resync, because the Client opens no engine scope there.
 
 **Files:**
-- Modify: `internal/client/client_test.go` (lines 83-97 `Set`, 123-139 `Subscribe`, struct at 23-41)
-- Modify: `internal/client/testing_facade_test.go` (lines 14-54, and the callback at 107-110)
-- Modify: `internal/client/catalog_test.go` (lines 50-52)
-- Modify: `api_client_test.go` (lines 11-67)
-- Modify: `api_catalog_test.go` (lines 22-24)
-- Modify: `api_group_test.go` (lines 103-114) — **see DEVIATIONS, file owned by the `groups` lane**
-- Modify: `admin/admin_test.go` (lines 174-176) — **see DEVIATIONS, file owned by the `admin` lane**
+- Modify: `internal/client/client_test.go` — the `memStore` struct (add the `revision` field), `memStore.Set`, `memStore.Subscribe`
+- Modify: `internal/client/testing_facade_test.go` — the `facadeTestStore` struct (add the mutex and the `revision` field), `facadeTestStore.Set`, `facadeTestStore.Subscribe`, and the subscriber callback inside `TestNewForTestingAdapterAndOptions`
+- Modify: `internal/client/catalog_test.go` — `catalogSpyStore.Subscribe`
+- Modify: `api_client_test.go` — the `apiMemoryStore` struct (add the mutex and the `revision` field), `apiMemoryStore.Set`, `apiMemoryStore.Subscribe`
+- Modify: `api_catalog_test.go` — `apiCatalogStore.Subscribe`
+- Modify: `api_group_test.go` — the `groupMemoryStore` struct (add the `revision` field), `groupMemoryStore.Set`, `groupMemoryStore.Subscribe` — **see DEVIATIONS, file owned by the `groups` lane**
+- Modify: `admin/admin_test.go` — `fakeStore.Subscribe` — **see DEVIATIONS, file owned by the `admin` lane**
 
 **Verification:** `cd /srv/worktrees/v4-engine-core && go build ./... && go test -tags=unit -race
 -count=1 ./...` — the whole suite is green and unchanged in behaviour, because nothing consumes the
@@ -915,9 +920,9 @@ root tests call `Start` without `Close` and would now leak the scope's reconcile
 `defer c.Close()` to `TestNewForTestingAdapterAndOptions`
 (`internal/client/testing_facade_test.go`, which `goleak.VerifyTestMain` in
 `internal/client/main_test.go` will otherwise fail) and to the `NewForTesting` client in
-`TestPublicConstructorsAndOptions` (`api_client_test.go:169`). One root test reads a callback's
+`TestPublicConstructorsAndOptions` (`api_client_test.go`). One root test reads a callback's
 result without synchronisation: `TestPublicClientFacadeRuntimeMethods`
-(`api_client_test.go:146-158`) assigns `changed = ch.Value` from the subscriber and reads it on the
+(`api_client_test.go`) assigns `changed = ch.Value` from the subscriber and reads it on the
 test goroutine — under the engine that callback runs on a dispatch worker, which is a data race under
 `-race` and a flaky assertion; replace the variable with a buffered channel and a
 `select`/`time.After(time.Second)`.
@@ -1150,7 +1155,7 @@ Also sweep the three stale comments that name deleted files inside this lane's o
 mentions `internal/manager/handle_lifecycle_test.go` (the latter file is deleted in Task 2.2.1),
 and the doc comment of `TestTenantIsLoggedUnderTheCanonicalKey` in
 `internal/engine/logging_test.go` contrasts this package's tenant label with `internal/manager`'s.
-`ddl.go:9` and `ddl_test.go:26` also name `internal/manager/schema.go` in comments — those two files
+The doc comments in `ddl.go` and `ddl_test.go` also name `internal/manager/schema.go` — those two files
 belong to the `storage` lane and are already recorded as that lane's sweep in
 `lane-engine-core.md` § Self-review; leave them alone.
 
@@ -1512,7 +1517,7 @@ Verified by import graph rather than by grep: `internal/manager` is imported onl
 
 ### Contract amendments consumed, and open deviations
 
-This lane raised four deviations while authoring. All four are closed; none remains open against the orchestrator, and this plan is written against the amended contracts rather than around them.
+This lane raised four deviations while authoring. All four are closed against the orchestrator and this plan is written against the amended contracts rather than around them; the two deviations open today were raised later, in the Phase 1 fix pass, and neither is against the orchestrator — see § Open deviations below.
 
 **Closed by an `index.md` amendment the plan now consumes:**
 
@@ -1521,8 +1526,8 @@ This lane raised four deviations while authoring. All four are closed; none rema
 
 **Closed in `index.md` by the orchestrator, no action left for this lane:** the stale engine-core Done-when clause requiring `NewMongoDB(..., WithMultiTenantEnabled())` to error (superseded by the D6 rewrite), FC-2's "(MongoDB with a non-empty tenant)" parenthetical on `Store.Subscribe`, and `ddl.go`'s doc comment naming `internal/manager/schema.go` which Epic 2.2 deletes. The last one is a one-line fix in a file the `storage` lane owns.
 
-**Handoffs to other lanes (recorded 2026-09-23, Phase 1 fix pass).** Three, all work another lane
-owns; none blocks this one.
+**Handoffs to other lanes (recorded 2026-09-23, Phase 1 fix pass).** Four bullets, counted: three
+to `engine-tenants` and one to `storage`. All are work another lane owns; none blocks this one.
 
 - **`engine-tenants` — bring-up is serialized engine-wide.** `bringUpScope`
   (`internal/engine/engine.go`) holds the engine-global `startMu` across the whole `Store.Subscribe`
@@ -1572,13 +1577,27 @@ owns; none blocks this one.
   its snapshot. It must coalesce instead: record that another notification arrived, and re-run the
   read exactly once after the in-flight one returns.
 
-**Declined, and staying declined:** the reviewer's suggestion that `applySnapshotRow`
-(`internal/engine/reconcile.go`) skip `prepare` for a snapshot row whose revision and bytes already
-match the cache. It buys microseconds per key on the reconcile path and costs a second
-deduplication predicate beside the one in `publish`, which is the library's single dedup site by
-design; it would also decide FC-11's announcement and the validator's per-ingestion-attempt
-semantics from a place that never decodes the row. One dedup site is worth more than the
-microseconds.
+  Same lane, same class, deferred with it (recorded 2026-09-23, Phase 1 fix pass):
+  `applySnapshotRow` (`internal/engine/reconcile.go`) calls `prepare` — a JSON decode plus the
+  registered validator — for EVERY row of the snapshot on EVERY reconcile, including the rows whose
+  revision and bytes already equal what the cache holds, which after the first reconcile is nearly
+  all of them. With one scope that is a cost nobody can measure; with N tenants reconnecting
+  together it becomes registry size times tenant count of pure decode work, on the reconnect path,
+  which is exactly the re-read amplification the bullet above is about. The guard for whoever takes
+  it, from the reviewer who raised it: the revision-and-bytes comparison must be read under
+  `sc.reconcileMu` and AFTER the touched check, never outside the lock — read outside it, the
+  comparison races the feed publication that the touched check exists to defer to, and the reconcile
+  can skip a row on the strength of a cache entry that changed underneath it.
+
+**Declined in Phase 1, reopened as the wave-3 handoff above (amended 2026-09-23):** the reviewer's
+suggestion that `applySnapshotRow` (`internal/engine/reconcile.go`) skip `prepare` for a snapshot
+row whose revision and bytes already match the cache. The Phase 1 decline stands for Phase 1 and its
+reasoning is unchanged: it buys microseconds per key on the reconcile path, costs a second
+deduplication predicate beside the one in `publish` — the library's single dedup site by design —
+and would decide FC-11's announcement and the validator's per-ingestion-attempt semantics from a
+place that never decodes the row. What reopens it is not a new argument about dedup sites but wave
+3's multiplier: one scope makes the saving noise, thousands of activated tenants reconnecting
+together do not. Recorded as deferred, not as done.
 
 **Declined, and staying declined (recorded 2026-09-23, Phase 1 fix pass):** the reviewer's request
 that `prepare` (`internal/engine/ingest.go`) widen its `(publication, bool)` return into a tri-state
@@ -1593,26 +1612,67 @@ The cost is a wider ingress contract — three states every future caller must h
 read. Declined on the same principle as the note above: the ingress reports usable or not, and a
 caller that needs a finer answer asks the registry, which is cheap and honest.
 
-**Open deviations: none.** Corrected 2026-09-23, twice. The sentence here first said "neither note
-above", counting two, then "five". There are now six notes above — four handoffs (three to
-`engine-tenants`, one to `storage`) and two declined reviewer requests — and none of them is a
-deviation against the orchestrator. Corrected across three passes, each of which
-over-claimed the one before: `b455a78` and `05d4d4e` called the Phase 2 line-anchor sweep finished
-while the `**Files:**` lists and a dozen parentheticals still carried line numbers, several pointing
-at the wrong construct; `d0a34d9` called it finished while one `**Files:**` list still carried a
-range, and a reviewer proved that range wrong against the tree. Only two claims are made here now,
-both mechanically checkable. First: from Task 2.1.2 onward no `**Files:**` list carries a line
-number, so an executor following one is always told which construct to edit by name. Second: the
-line numbers that survive in that range are six prose parentheticals —
-`internal/engine/registry.go:18-21`, `api_types.go:16`, `api_client_test.go:169` and `:146-158`,
-`manager.go:1-11`, and the `ddl.go:9` / `ddl_test.go:26` pair the `storage` lane owns — every one
-re-verified against the tree in this pass. They stay because each names its construct beside the
-number and none of them directs an edit, which is also why Task 2.1.1's `**Files:**` ranges into the
-unit fakes stay.
+**Corrective behaviour changes carried onto the shipping v3 path (recorded 2026-09-23, Phase 1 fix
+pass).** Phase 1's milestone said "nothing user-visible changed". Two things did, both in
+`internal/client`, which is the code consumers run today, and both corrections rather than features
+— so the milestone now names them instead of claiming a clean zero.
+
+- **The log field `key` is now `keyname`.** Eight sites across `internal/client/client.go` and
+  `internal/client/get.go`. `key` is the field name a redacting logger and every downstream log
+  pipeline reads as a secret's label, so a line carrying a configuration key's NAME could be
+  scrubbed to `[REDACTED]` and the operator lose the one identifier that made the line useful.
+  `keyname` is the canonical spelling the engine uses, and a source scan in
+  `internal/testsupport/logguard` now fails the build for either package if the banned spelling
+  comes back. Anyone grepping their logs for `"key":` on a systemplane line changes the grep.
+- **A panicking changefeed re-read now names the key it blew up on.** `(*Client).recoverRefresh`
+  (`internal/client/client.go`) recovers before the debouncer's outer net does, logs the namespace
+  and the key at ERROR, and hands the value to `runtime.HandlePanicValue` so the panic is counted
+  once rather than not at all. Before, a store driver panicking under the re-read produced
+  `RecoverAndLog`'s anonymous line with the value and stack redacted in production: an operator
+  learned something under the debouncer failed and never which configuration key. No behaviour
+  changes for a store that does not panic.
+
+**Open deviations: two, both recorded 2026-09-23 in the Phase 1 fix pass.** Neither blocks this lane
+and neither bends a frozen contract.
+
+- **`lib-observability` — `universalShim.Enabled` answers for the shim, not for the logger it
+  wraps.** `(*Engine).debugEnabled` (`internal/engine/feed.go`) asks `Logger.Enabled(log.LevelDebug)`
+  before building the fields of a hot-path DEBUG line — the foreign-key drop on the feed callback and
+  the ingress's unregistered-key line — so those lines cost nothing when DEBUG is off. `log.Adapt`
+  wraps a logger that does not implement the full interface in `universalShim`, whose `Enabled`
+  returns `LevelValid(level)`: true for every defined level, whatever the wrapped logger would
+  actually emit. So the guard bites only for a logger that implements `Enabled(int) bool` itself;
+  behind the shim every guarded DEBUG line still pays for its fields and is dropped downstream. The
+  fix is upstream and small — delegate to the wrapped logger's own `Enabled(int) bool` when it has
+  one, keep `LevelValid` as the fallback — and the engine changes either way: the guard is right, the
+  answer it gets is optimistic.
+- **`applySnapshotRow` re-decodes and re-validates unchanged snapshot rows.** The work and its
+  concurrency guard are recorded in the `engine-tenants` single-flight handoff above; it is listed
+  here because it reverses a decision this section previously recorded as closed, and a reversal
+  should be findable from the deviations list rather than only from the handoff it moved into.
+
+**The anchor sweep, and the passes that called it finished early.** Four passes now. `b455a78` and
+`05d4d4e` called the Phase 2 line-anchor sweep finished while the `**Files:**` lists and a dozen
+parentheticals still carried line numbers, several pointing at the wrong construct. `d0a34d9` called
+it finished while Task 2.1.1's `**Files:**` list still carried ranges, and argued they were safe
+because they name their construct beside the number; a reviewer then proved two of them wrong
+against the tree — `api_group_test.go` line 103 is the closing brace of `groupMemoryStore.List`, not
+its `Subscribe`, which is five lines further down, and `internal/client/client_test.go` "lines 83-97
+`Set`" spans `memStore.Set` AND `memStore.Delete`, a method this task does not touch. This pass
+removes them rather than re-verifying them, on the reasoning the wrong anchors themselves supply: a
+number is re-verified once and then rots at the next commit, while a type or method name does not.
+One claim is made here, and the lane's verification command checks it mechanically — everything
+after the Phase 2 heading, `**Files:**` lists and prose alike, names the type, method or callback to
+edit and carries no line number, so the grep for the four anchor shapes prints nothing.
+
+The counts in this section were wrong the same way, and for the same reason: asserted rather than
+counted. "Neither note above" when there were two; then "five"; then "three handoffs" above four
+bullets. Every count here is now counted.
 
 The four handoffs are work another lane owns, each stating the failure mode if it is
-never done; both declines are closed decisions with their reasons written down. Nothing in this lane
-is blocked on an answer, and no frozen contract is bent: the `storage` handoff asks for a godoc
+never done; the tri-state decline is a closed decision with its reasons written down, and the
+`applySnapshotRow` decline is closed for Phase 1 and reopened for wave 3, recorded as such in both
+places. Nothing in this lane is blocked on an answer, and no frozen contract is bent: the `storage` handoff asks for a godoc
 sentence and a contract test around `store.Entry.Value`, not a change to its shape, so FC-2 stands
 as frozen.
 
