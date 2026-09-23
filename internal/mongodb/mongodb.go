@@ -394,7 +394,7 @@ func (s *Store) ensureSchema(ctx context.Context, tenant string, coll *mongo.Col
 			return s.schemaRunner(ctx, cacheKey)
 		}
 
-		return s.runSchema(ctx, coll, tenantScoped)
+		return s.runSchema(ctx, coll, tenant, tenantScoped)
 	}
 
 	if tenantScoped && tenant == "" {

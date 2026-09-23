@@ -6,12 +6,17 @@ import (
 	"fmt"
 	"time"
 
+	obsconstants "github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
+
+// warnPollingIndexes is logged when the polling indexes cannot be created. The
+// store keeps serving: the indexes only make polling cheaper.
+const warnPollingIndexes = "could not create the polling indexes; every poll round trip will scan the whole collection"
 
 // runSchema makes the collection ready for use. With a compound _id there is
 // no separate unique index to create — the server enforces uniqueness on _id
@@ -28,7 +33,8 @@ import (
 //     look correct. CreateCollection is treated as idempotent:
 //     NamespaceExists (code 48 / "already exists") is success.
 //     In polling mode it also creates the two indexes in pollingIndexes, which
-//     is the same privilege class CreateCollection already assumes.
+//     is the same privilege class CreateCollection already assumes; a refusal
+//     is logged, not returned, exactly as in the single-tenant branch.
 //
 //   - The single-tenant constructor collection: we deliberately DO NOT call
 //     CreateCollection. The change stream that backs Subscribe attaches at
@@ -43,34 +49,24 @@ import (
 //     per-tick queries scan the whole collection on every tick while the
 //     incremental one also sorts it in memory. A role that may not create an
 //     index keeps working — slower — so a refusal is logged, not returned.
-func (s *Store) runSchema(ctx context.Context, coll *mongo.Collection, tenantScoped bool) error {
+func (s *Store) runSchema(ctx context.Context, coll *mongo.Collection, tenant string, tenantScoped bool) error {
 	if s.cfg.MultiTenantEnabled || tenantScoped {
 		db := coll.Database()
 		if err := db.CreateCollection(ctx, coll.Name()); err != nil && !isNamespaceExists(err) {
 			return fmt.Errorf("systemplane/mongodb: create collection: %w", err)
 		}
-
-		if s.cfg.PollInterval <= 0 {
-			return nil
+	} else {
+		// Single-tenant: just touch the collection's index catalog. This both
+		// confirms the connection has the required privileges and avoids the
+		// change-stream attach race that affects single-tenant Subscribe.
+		cur, err := coll.Indexes().List(ctx)
+		if err != nil {
+			return fmt.Errorf("systemplane/mongodb: list indexes: %w", err)
 		}
 
-		if _, err := coll.Indexes().CreateMany(ctx, pollingIndexes()); err != nil {
-			return fmt.Errorf("systemplane/mongodb: create polling indexes: %w", err)
+		if err := cur.Close(ctx); err != nil {
+			return fmt.Errorf("systemplane/mongodb: close index cursor: %w", err)
 		}
-
-		return nil
-	}
-
-	// Single-tenant: just touch the collection's index catalog. This both
-	// confirms the connection has the required privileges and avoids the
-	// change-stream attach race that affects single-tenant Subscribe.
-	cur, err := coll.Indexes().List(ctx)
-	if err != nil {
-		return fmt.Errorf("systemplane/mongodb: list indexes: %w", err)
-	}
-
-	if err := cur.Close(ctx); err != nil {
-		return fmt.Errorf("systemplane/mongodb: close index cursor: %w", err)
 	}
 
 	if s.cfg.PollInterval <= 0 {
@@ -78,8 +74,9 @@ func (s *Store) runSchema(ctx context.Context, coll *mongo.Collection, tenantSco
 	}
 
 	if _, err := coll.Indexes().CreateMany(ctx, pollingIndexes()); err != nil {
-		s.logWarn(ctx, "could not create the polling indexes; every poll round trip will scan the whole collection",
+		s.logWarn(ctx, warnPollingIndexes,
 			log.Err(err),
+			log.String(obsconstants.AttrKeyTenantID, tenant),
 		)
 	}
 

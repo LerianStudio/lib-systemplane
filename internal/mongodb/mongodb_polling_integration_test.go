@@ -28,6 +28,7 @@ import (
 	"testing"
 	"time"
 
+	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 	"github.com/testcontainers/testcontainers-go"
 	mongocontainer "github.com/testcontainers/testcontainers-go/modules/mongodb"
@@ -690,12 +691,12 @@ func TestIntegration_MongoPollingIndexesCreatedForTenantCollection(t *testing.T)
 
 	coll := db.Collection(defaultCollection)
 
-	if err := s.runSchema(context.Background(), coll, true); err != nil {
+	if err := s.runSchema(context.Background(), coll, "", true); err != nil {
 		t.Fatalf("runSchema: %v", err)
 	}
 
 	// Idempotent: a second bootstrap of the same collection must not error.
-	if err := s.runSchema(context.Background(), coll, true); err != nil {
+	if err := s.runSchema(context.Background(), coll, "", true); err != nil {
 		t.Fatalf("runSchema (second run): %v", err)
 	}
 
@@ -724,12 +725,12 @@ func TestIntegration_MongoPollingIndexesCreatedForSingleTenantCollection(t *test
 
 	coll := db.Collection(defaultCollection)
 
-	if err := s.runSchema(context.Background(), coll, false); err != nil {
+	if err := s.runSchema(context.Background(), coll, "", false); err != nil {
 		t.Fatalf("runSchema: %v", err)
 	}
 
 	// Idempotent: a second bootstrap of the same collection must not error.
-	if err := s.runSchema(context.Background(), coll, false); err != nil {
+	if err := s.runSchema(context.Background(), coll, "", false); err != nil {
 		t.Fatalf("runSchema (second run): %v", err)
 	}
 
@@ -1016,5 +1017,60 @@ func assertNoPollingIndexes(t *testing.T, coll *mongo.Collection) {
 		if unwanted[idx.Name] {
 			t.Errorf("index %q exists: the role was allowed to create it, so this test never exercised the denial", idx.Name)
 		}
+	}
+}
+
+// A tenant database whose operator already created an index on the poller's
+// keys under another name makes CreateMany fail with IndexOptionsConflict (85).
+// The indexes only speed polling up, so that tenant must stay readable and
+// writable, exactly like the single-tenant collection does, with the refusal
+// logged once rather than returned from every call.
+func TestIntegration_MongoTenantPollingIndexConflictStillServes(t *testing.T) {
+	client, cleanup := startPollingContainer(t)
+	t.Cleanup(cleanup)
+
+	ctx := context.Background()
+
+	dbName := fmt.Sprintf("pollindexes_conflict_%d", time.Now().UnixNano())
+	db := client.Database(dbName)
+
+	t.Cleanup(func() { _ = db.Drop(context.Background()) })
+
+	if _, err := db.Collection(defaultCollection).Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    pollingIndexes()[0].Keys,
+		Options: options.Index().SetName("operator_owned"),
+	}); err != nil {
+		t.Fatalf("pre-create the conflicting index: %v", err)
+	}
+
+	logger := &captureLogger{}
+
+	s, err := New(Config{MultiTenantEnabled: true, PollInterval: 50 * time.Millisecond, Logger: logger})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	t.Cleanup(func() { _ = s.Close() })
+
+	tctx := tmcore.ContextWithTenantID(tmcore.ContextWithMB(ctx, db, defaultModule), "tenant-a")
+
+	if _, err := s.Set(tctx, store.Scope{}, store.Entry{
+		Namespace: "ns",
+		Key:       "k",
+		Value:     []byte(`true`),
+		UpdatedBy: "test",
+		UpdatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("Set on a tenant whose polling indexes conflict: %v", err)
+	}
+
+	for range 2 {
+		if _, ok, err := s.Get(tctx, store.Scope{}, "ns", "k"); err != nil || !ok {
+			t.Fatalf("Get on a tenant whose polling indexes conflict: ok=%v err=%v", ok, err)
+		}
+	}
+
+	if n := logger.warnCount(warnPollingIndexes); n != 1 {
+		t.Fatalf("polling-index WARNs = %d, want exactly 1", n)
 	}
 }
