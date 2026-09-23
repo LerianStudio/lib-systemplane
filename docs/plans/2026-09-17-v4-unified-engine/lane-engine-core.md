@@ -361,16 +361,15 @@ placement change and not a behavior change: `prepare` rejects the same rows on t
 it still rejects everything. This is v3 parity — `(*Client).refreshFromStore`
 (`internal/client/client.go`) already refused an unregistered key before its store read; v4 moves the
 same refusal one step earlier, ahead of the debounce, and drops it to DEBUG because foreign traffic
-on a shared table is ordinary, not an incident. The registry is final before the feed opens, and
-the LOCK is what makes it so — not the `started` flag, which is set after the changefeed is already
-live: `(*Client).Start` holds `startMu` across `Subscribe` and `Register` takes that same lock, so a
-`Register` racing `Start` blocks until `Start` returns and is then refused with
-`ErrRegisterAfterStart`. One window survives, and it is the retry path rather than a race: a `Start`
-whose first reconcile fails returns the error with the subscription deliberately kept open
-(`bringUpScope`) and `started` never set, so a `Register` after that failed `Start` succeeds while
-the feed is live. Its residual is bounded — the notifications dropped here leave that key on its
-registered default until the next reconcile reads its row, which is what the retained subscription
-exists to deliver.
+on a shared table is ordinary, not an incident. What makes the drop safe is the SETUP ORDER the
+facade documents, not a lock: registration and `Start` are sequential setup calls — `Register`, then
+`Start`, and a `Register` after `Start` is refused with `ErrRegisterAfterStart` — so within supported
+usage every key the process will ever register is in the registry before `bringUpScope` opens the
+feed. Nothing in `internal/engine` synchronizes against a registry write: the engine takes no lock
+the registry writer takes, and the feed reads through `Registry.Lookup` like any other caller. A
+`Register` that does land after the feed opened is therefore unsupported rather than handled, and
+its residual is bounded — the notifications dropped here leave that key on its registered default
+until the next reconcile reads its row, which is the whole-scope repair every `OpResync` drives.
 
 Dispatch on `Event.Op`:
 
@@ -931,8 +930,8 @@ test goroutine — under the engine that callback runs on a dispatch worker, whi
   `storeUnsubscribe` and `hydratingMu`/`hydrating`/`hydrationTouched` fields of `Client`; rewrite
   `newClient`, `(*Client).Start` and `(*Client).Close`; delete `(*Client).hydrate`,
   `(*Client).onEvent`, `(*Client).refreshFromStore`, `(*Client).fireSubscribers` and the
-  `validateStored` helper the first two were the only callers of — whose `errValidatorPanicked`
-  sentinel in `internal/client/errors.go` goes with it
+  `validateStored` helper that `(*Client).hydrate` and `(*Client).refreshFromStore` are the only
+  callers of — whose `errValidatorPanicked` sentinel in `internal/client/errors.go` goes with it
 - Modify: `internal/client/get.go` (the single-tenant branch of `(*Client).getEntry`; the
   `listFromCache` call at the tail of `(*Client).List`; `(*Client).listFromCache` itself)
 - Modify: `internal/client/set.go` (the write-through tail of `(*Client).Set`, and the single-tenant
@@ -1078,8 +1077,9 @@ WithAggregateTenantThreshold. MIGRATION-v4.md names the replacement per
 consumer.
 ```
 
-Named edge cases. `boundary_test.go:24-31` carries a comment justifying why `lib-commons` is not in
-`coupledModules`, and the justification is `NewManager` taking a `*tmpostgres.Manager`. The reason
+Named edge cases. The comment above `coupledModules` in `boundary_test.go` justifies why
+`lib-commons` is not in that list, and the justification is `NewManager` taking a
+`*tmpostgres.Manager`. The reason
 survives this task — the wave-3 `WithPostgresTenantManager` takes the same concrete handle — so
 update the comment to name the option instead of `NewManager` rather than changing the list. Do not
 add `lib-commons` to `coupledModules`: that would fail a gate on a shape nobody intends to change.
@@ -1090,7 +1090,7 @@ add `lib-commons` to `coupledModules`: that would fail a gate on a shape nobody 
 **Files:**
 - Delete: `manager.go`, `manager_methods.go`, `manager_methods_test.go`, `examples/manager/main.go`
   (and the now-empty `examples/manager/` directory)
-- Modify: `boundary_test.go` (the `coupledModules` comment, lines 24-31)
+- Modify: `boundary_test.go` (the comment above `coupledModules`)
 
 **Verification:** `cd /srv/worktrees/v4-engine-core && go build ./... && go test -tags=unit -race
 -count=1 ./... && go test -tags=unit -run TestExportedBoundary ./...`; then
@@ -1145,9 +1145,11 @@ lifecycle context and cancels it in `Engine.Close`, which `Client.Close` already
 Touch nothing else in that file: the `storage` lane may need its own backend lines and the
 orchestrator resolves any merge as a two-line diff.
 
-Also sweep the two stale comments that name deleted files inside this lane's own tree:
-`internal/client/client_test.go` imports `internal/manager` and `manager_methods_test.go`
-mentions `internal/manager/handle_lifecycle_test.go` (the latter file is deleted in Task 2.2.1).
+Also sweep the three stale comments that name deleted files inside this lane's own tree:
+`internal/client/client_test.go` imports `internal/manager`, `manager_methods_test.go`
+mentions `internal/manager/handle_lifecycle_test.go` (the latter file is deleted in Task 2.2.1),
+and the doc comment of `TestTenantIsLoggedUnderTheCanonicalKey` in
+`internal/engine/logging_test.go` contrasts this package's tenant label with `internal/manager`'s.
 `ddl.go:9` and `ddl_test.go:26` also name `internal/manager/schema.go` in comments — those two files
 belong to the `storage` lane and are already recorded as that lane's sweep in
 `lane-engine-core.md` § Self-review; leave them alone.
@@ -1156,26 +1158,39 @@ Named edge cases. `internal/client/client_test.go` imports `internal/manager` an
 `dbresolver` for `warmLoadFailsConnector` and the `"bound-Manager cache hit"` case of
 `TestGetEntryPopulatesPublishedState`; that case and its helper go with the package —
 Task 2.3.1 owns rewriting that test, so here just delete the case, the helper and the two imports so
-the package compiles. `internal/postgres` gained the tenant connector in the `contracts` lane
+the package compiles. Deleting that helper is what pulls in the second file: the whole of
+`internal/client/set_writethrough_test.go` is Manager-bound — `activatedManagerFor` constructs a
+`manager.Manager`, binds it and hands it `warmLoadFailsConnector{}` — and the invariant it pins is a
+per-tenant write-through cache that does not exist between this task and `engine-tenants`, so the
+file goes with the package rather than being rewritten here; Epic 2.3's Client-level
+`TestSetThenGetReturnsNewValue` is where the surviving single-tenant half of that invariant lands.
+The third reference is production, not test: `(*Client).Set` and `(*Client).Delete` each end their
+multi-tenant branch in `c.boundManager()` plus `manager.TenantIDFromContext(ctx)`, and `boundManager`
+is defined in the `manager_binding.go` this task deletes, so `internal/client` does not compile until
+those two branches go too. `internal/postgres` gained the tenant connector in the `contracts` lane
 (FC-3), so nothing the deleted package held is still needed by a backend.
 
 **Files:**
 - Delete: `internal/manager/**` (all 26 files), `internal/client/manager_binding.go`,
-  `internal/client/manager_binding_test.go`
+  `internal/client/manager_binding_test.go`, `internal/client/set_writethrough_test.go`
 - Modify: `internal/client/client.go` (imports; delete the `lifecycleCtx` / `lifecycleCancel` and
   `managerMu` / `manager` fields, the `context.WithCancel` call and its two assignments in
   `newClient`, and the `lifecycleCancel()` call in `Close`)
 - Modify: `internal/client/get.go` (imports; the multi-tenant branch of `(*Client).getEntry`)
+- Modify: `internal/client/set.go` (imports; the multi-tenant `boundManager` tail of `(*Client).Set`
+  and of `(*Client).Delete`)
 - Modify: `internal/client/onchange.go` (imports; the doc comment and multi-tenant branch of
   `(*Client).OnChange`, and delete `(*Client).managerCallback`)
 - Modify: `internal/client/client_test.go` (the `internal/manager` and `dbresolver` imports; delete
   the `"bound-Manager cache hit"` case and `warmLoadFailsConnector`)
+- Modify: `internal/engine/logging_test.go` (the doc comment of
+  `TestTenantIsLoggedUnderTheCanonicalKey`)
 - Modify: `.ignorecoverunit` (delete the two `internal/manager/*` entries and their comment)
 
 **Verification:** `cd /srv/worktrees/v4-engine-core && go build ./... && go list -tags=unit -deps
 ./... | grep -c internal/manager` returns 0, and `go test -tags=unit -race -count=1 ./... &&
 go vet -tags=integration ./...` are green. `grep -rn "internal/manager" --include='*.go' .` returns
-only `ddl.go:9` and `ddl_test.go:26`, both comments owned by the `storage` lane.
+only the two `storage`-lane comments in `ddl.go` and `ddl_test.go`, which this lane leaves alone.
 
 **Done when:** `internal/manager` does not exist; nothing in the module imports it; multi-tenant
 reads resolve the tenant database from ctx exactly as they do today on both backends; multi-tenant
@@ -1581,17 +1596,19 @@ caller that needs a finer answer asks the registry, which is cheap and honest.
 **Open deviations: none.** Corrected 2026-09-23, twice. The sentence here first said "neither note
 above", counting two, then "five". There are now six notes above — four handoffs (three to
 `engine-tenants`, one to `storage`) and two declined reviewer requests — and none of them is a
-deviation against the orchestrator. Corrected in the same pass: two earlier commits
-(`b455a78`, `05d4d4e`) each claimed the Phase 2 line-anchor sweep was finished while the `**Files:**`
-lists and a dozen parentheticals still carried line numbers, several of them pointing at the wrong
-construct. The sweep finished with this commit: from Task 2.1.2 onward, every `internal/client`
-construct a task tells an executor to create, rewrite or delete is named by symbol, and no
-`**Files:**` list carries a line range at all. What survives, deliberately, is Task 2.1.1's
-references into the unit fakes and their tests — a different class, since each names the fake or
-the test beside the number, and every one was re-verified against the tree in this pass. The gate
-that keeps the rest finished is mechanical: a grep for a `.go` file followed by a line number, or
-for a `(delete N` / `(lines N` / `(:N` parenthetical, must return nothing from Task 2.1.2 to the end
-of the document.
+deviation against the orchestrator. Corrected across three passes, each of which
+over-claimed the one before: `b455a78` and `05d4d4e` called the Phase 2 line-anchor sweep finished
+while the `**Files:**` lists and a dozen parentheticals still carried line numbers, several pointing
+at the wrong construct; `d0a34d9` called it finished while one `**Files:**` list still carried a
+range, and a reviewer proved that range wrong against the tree. Only two claims are made here now,
+both mechanically checkable. First: from Task 2.1.2 onward no `**Files:**` list carries a line
+number, so an executor following one is always told which construct to edit by name. Second: the
+line numbers that survive in that range are six prose parentheticals —
+`internal/engine/registry.go:18-21`, `api_types.go:16`, `api_client_test.go:169` and `:146-158`,
+`manager.go:1-11`, and the `ddl.go:9` / `ddl_test.go:26` pair the `storage` lane owns — every one
+re-verified against the tree in this pass. They stay because each names its construct beside the
+number and none of them directs an edit, which is also why Task 2.1.1's `**Files:**` ranges into the
+unit fakes stay.
 
 The four handoffs are work another lane owns, each stating the failure mode if it is
 never done; both declines are closed decisions with their reasons written down. Nothing in this lane

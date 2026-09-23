@@ -83,20 +83,20 @@ func (e *Engine) onEvent(evt store.Event) {
 	// one line per window and now reports one per write — which is why the
 	// fields below are built only when DEBUG is actually enabled.
 	//
-	// The registry is final before the feed opens, and the LOCK is what makes
-	// it so — not the started flag, which is set after the changefeed is
-	// already live. (*Client).Start holds startMu across Subscribe and
-	// Register takes that same lock, so a Register racing Start blocks until
-	// Start returns and is then refused with ErrRegisterAfterStart.
+	// What makes that drop safe is the SETUP ORDER the facade documents, not a
+	// lock: registration and Start are sequential setup calls — Register, then
+	// Start, and a Register after Start is refused with ErrRegisterAfterStart
+	// — so within supported usage every key this process will ever register is
+	// in the registry before bringUpScope opens the feed. Nothing here
+	// synchronizes against a registry write: the engine takes no lock the
+	// registry writer takes, and the feed reads through Registry.Lookup like
+	// any other caller.
 	//
-	// One window survives, and it is the retry path rather than a race: a
-	// Start whose first reconcile fails returns the error with the
-	// subscription deliberately kept open (bringUpScope) and started never
-	// set, so a Register after that failed Start succeeds while the feed is
-	// live. Its residual is bounded — notifications for that key that arrived
-	// before the Register landed were dropped here, so the key holds its
-	// registered default until the next reconcile reads its row, which is what
-	// the retained subscription exists to deliver.
+	// A Register that does land after this feed opened is therefore
+	// unsupported rather than handled, and its residual is bounded: the
+	// notifications for that key that arrived before it landed were dropped
+	// here, so the key holds its registered default until the next reconcile
+	// reads its row — the whole-scope repair every OpResync drives.
 	//
 	// Outcomes are unchanged — prepare rejects the same rows on the upsert
 	// path, ingestDefault the same keys on the delete path, and a nil registry
