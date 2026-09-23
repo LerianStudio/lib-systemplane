@@ -411,7 +411,7 @@ func TestCloseWaitsForAReconcileInsideList(t *testing.T) {
 	release := heldList(fs)
 
 	e.onEvent(resyncEvent(scope))
-	waitFor(t, time.Second, "the reconcile to reach its List", func() bool { return fs.listCount() == 1 })
+	waitFor(t, hangGuard, "the reconcile to reach its List", func() bool { return fs.listCount() == 1 })
 
 	done := closeInBackground(e)
 	mustStillBeWaiting(t, done, "a reconcile was still inside Store.List")
@@ -549,7 +549,7 @@ func TestResyncBurstCoalescesAndCloseWaitsForIt(t *testing.T) {
 	release := heldList(fs)
 
 	e.onEvent(resyncEvent(scope))
-	waitFor(t, time.Second, "the reconcile to reach its List", func() bool { return fs.listCount() == 1 })
+	waitFor(t, hangGuard, "the reconcile to reach its List", func() bool { return fs.listCount() == 1 })
 
 	// Five more reconnects while the first snapshot is still being taken.
 	for range 5 {
@@ -661,13 +661,13 @@ func TestDropScopeLeavesOtherScopesWorkersRunning(t *testing.T) {
 
 	e.publishInto(publication{Scope: tenant, NSKey: nk, Revision: 1, Value: "tenant"})
 	e.publishInto(publication{NSKey: nk, Revision: 1, Value: "single"})
-	waitFor(t, time.Second, "both scopes to deliver", func() bool { return rec.len() == 2 })
+	waitFor(t, hangGuard, "both scopes to deliver", func() bool { return rec.len() == 2 })
 
 	e.dropScope(tenant)
 
 	// The surviving scope's worker must still deliver.
 	e.publishInto(publication{NSKey: nk, Revision: 2, Value: "single-again"})
-	waitFor(t, time.Second, "the surviving scope to keep delivering", func() bool { return rec.len() == 3 })
+	waitFor(t, hangGuard, "the surviving scope to keep delivering", func() bool { return rec.len() == 3 })
 
 	if err := e.Close(); err != nil {
 		t.Fatalf("Close() = %v, want nil", err)
@@ -713,7 +713,7 @@ func TestCloseTimeoutInsideAStoreCallSaysSo(t *testing.T) {
 	release := heldList(fs)
 
 	e.onEvent(resyncEvent(scope))
-	waitFor(t, time.Second, "the reconcile to reach its List", func() bool { return fs.listCount() == 1 })
+	waitFor(t, hangGuard, "the reconcile to reach its List", func() bool { return fs.listCount() == 1 })
 
 	err := e.Close()
 	if !errors.Is(err, ErrCloseTimeout) {

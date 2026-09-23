@@ -127,7 +127,7 @@ func TestDispatchIsolatesKeys(t *testing.T) {
 	<-blocked
 
 	e.publishInto(pub(keyB, 1, "b1"))
-	waitFor(t, 500*time.Millisecond, "key b delivered while key a is blocked", func() bool {
+	waitFor(t, hangGuard, "key b delivered while key a is blocked", func() bool {
 		return recB.len() == 1
 	})
 
@@ -250,7 +250,7 @@ func TestDispatchCoalescesToLatestRevision(t *testing.T) {
 
 	close(release)
 
-	waitFor(t, time.Second, "the coalesced delivery", func() bool { return rec.len() >= 2 })
+	waitFor(t, hangGuard, "the coalesced delivery", func() bool { return rec.len() >= 2 })
 	quiesce(t, e)
 
 	got := rec.revisions()
@@ -273,7 +273,7 @@ func TestDispatchDeliversInRevisionOrder(t *testing.T) {
 		e.publishInto(pub(nk, rev, rev))
 	}
 
-	waitFor(t, 2*time.Second, "the newest revision to be delivered", func() bool {
+	waitFor(t, hangGuard, "the newest revision to be delivered", func() bool {
 		revs := rec.revisions()
 
 		return len(revs) > 0 && revs[len(revs)-1] == last
@@ -370,10 +370,10 @@ func TestPanickingSubscriberDoesNotStopLaterDeliveries(t *testing.T) {
 	defer unsub()
 
 	e.publishInto(pub(nk, 1, "v1"))
-	waitFor(t, time.Second, "the delivery that panics", func() bool { return rec.len() == 1 })
+	waitFor(t, hangGuard, "the delivery that panics", func() bool { return rec.len() == 1 })
 
 	e.publishInto(pub(nk, 2, "v2"))
-	waitFor(t, time.Second, "the delivery after the panic", func() bool { return rec.len() == 2 })
+	waitFor(t, hangGuard, "the delivery after the panic", func() bool { return rec.len() == 2 })
 
 	if got := rec.revisions(); got[1] != 2 {
 		t.Errorf("delivered revisions after the panic: got %v, want the second to be 2", got)
@@ -389,7 +389,7 @@ func TestUnsubscribeIsIdempotentAndStopsDelivery(t *testing.T) {
 	unsub := e.OnChange(nk, first.record)
 
 	e.publishInto(pub(nk, 1, "v1"))
-	waitFor(t, time.Second, "the first delivery", func() bool { return first.len() == 1 })
+	waitFor(t, hangGuard, "the first delivery", func() bool { return first.len() == 1 })
 
 	unsub()
 	unsub()
@@ -400,7 +400,7 @@ func TestUnsubscribeIsIdempotentAndStopsDelivery(t *testing.T) {
 	defer unsubSecond()
 
 	e.publishInto(pub(nk, 2, "v2"))
-	waitFor(t, time.Second, "the delivery to the surviving subscriber", func() bool {
+	waitFor(t, hangGuard, "the delivery to the surviving subscriber", func() bool {
 		return second.len() == 1
 	})
 
@@ -419,7 +419,7 @@ func TestSameRevisionPublishedTwiceDeliversOnce(t *testing.T) {
 	defer unsub()
 
 	e.publishInto(pub(nk, 7, "same"))
-	waitFor(t, time.Second, "the first delivery", func() bool { return rec.len() == 1 })
+	waitFor(t, hangGuard, "the first delivery", func() bool { return rec.len() == 1 })
 
 	e.publishInto(pub(nk, 7, "same"))
 	quiesce(t, e)
@@ -452,7 +452,7 @@ func TestUnsubscribeRemovesOnlyItsOwnSubscription(t *testing.T) {
 	unsubDropped()
 
 	e.publishInto(pub(nk, 1, "v1"))
-	waitFor(t, time.Second, "the surviving subscriber's first delivery", func() bool {
+	waitFor(t, hangGuard, "the surviving subscriber's first delivery", func() bool {
 		return kept.len() == 1
 	})
 
@@ -468,7 +468,7 @@ func TestUnsubscribeRemovesOnlyItsOwnSubscription(t *testing.T) {
 	unsubDropped()
 
 	e.publishInto(pub(nk, 2, "v2"))
-	waitFor(t, time.Second, "the surviving subscriber's second delivery", func() bool {
+	waitFor(t, hangGuard, "the surviving subscriber's second delivery", func() bool {
 		return kept.len() == 2
 	})
 
@@ -519,7 +519,7 @@ func TestDispatchIsolatesScopesAndNamesTheTenant(t *testing.T) {
 
 	e.publishInto(publication{Scope: tenant, NSKey: nk, Revision: 1, Value: "t1"})
 
-	waitFor(t, 500*time.Millisecond, "the tenant delivery while the single-tenant one is blocked", func() bool {
+	waitFor(t, hangGuard, "the tenant delivery while the single-tenant one is blocked", func() bool {
 		return tenantRec.len() == 1
 	})
 
