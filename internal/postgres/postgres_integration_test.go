@@ -2277,10 +2277,12 @@ func TestIntegration_PostgresTwoTenantsOnOneDatabase(t *testing.T) {
 }
 
 // Two SERVERS that both carry a database of the same name are two databases,
-// even when they describe themselves alike: containers on separate hosts each
-// report the default bridge address, tenant clusters all name their database
-// "systemplane". The shared-database guard keys on the server's own identity
-// as well, so the second tenant's feed is admitted instead of refused forever.
+// so the second tenant's feed is admitted. This proves admission across two
+// servers only: both containers run on one Docker host with different bridge
+// addresses, so it does NOT reproduce the same-address collision (containers
+// on separate hosts each reporting the default bridge address) and would pass
+// without the server-identity component of the key. TestFormatServerDatabaseKey
+// covers the same-address case.
 func TestIntegration_PostgresTwoDatabasesOnTwoServersAreAdmitted(t *testing.T) {
 	ctx := context.Background()
 
@@ -2303,6 +2305,7 @@ func TestIntegration_PostgresTwoDatabasesOnTwoServersAreAdmitted(t *testing.T) {
 
 	dbName := fmt.Sprintf("same_name_%d", time.Now().UnixNano())
 	conn := newFakeConnector()
+	addrs := map[string]string{}
 
 	for tenant, base := range map[string]string{"t1": startContainer(t), "t2": secondBase} {
 		admin := adminDSN(t, base)
@@ -2321,6 +2324,19 @@ func TestIntegration_PostgresTwoDatabasesOnTwoServersAreAdmitted(t *testing.T) {
 
 		provisionSchema(t, db)
 		conn.set(tenant, db, tenantDSN)
+
+		var addr string
+		if err := db.QueryRowContext(ctx, `SELECT COALESCE(host(inet_server_addr()), '')`).Scan(&addr); err != nil {
+			t.Fatalf("server address of %s: %v", tenant, err)
+		}
+
+		addrs[tenant] = addr
+	}
+
+	t.Logf("server addresses: t1=%q t2=%q", addrs["t1"], addrs["t2"])
+
+	if addrs["t1"] != addrs["t2"] {
+		t.Logf("the servers report different addresses: this environment does not reproduce the same-address collision (TestFormatServerDatabaseKey covers it)")
 	}
 
 	s := tenantStore(t, conn)
