@@ -1119,6 +1119,29 @@ func TestReconnectDelayIsJitteredAndCapped(t *testing.T) {
 			t.Fatalf("reconnectDelay(%d) = %s, want strictly under the exponential bound %s", attempt, d, bound)
 		}
 	}
+
+	// The loop above only reaches attempts where the exponential is still below
+	// the cap, so it passes for a composition that jitters BEFORE capping —
+	// which collapses onto the cap exactly once the outage is long enough to
+	// matter, and then every feed in the process reopens on the same tick, each
+	// cycle costing a tenant re-resolve, a watch aggregate and an OpResync. The
+	// delay must stay DRAWN at a capped attempt too.
+	const capped = 20
+
+	draws := make(map[time.Duration]struct{})
+
+	for range 20 {
+		d := reconnectDelay(capped)
+		if d < 0 || d >= reconnectMaxDelay {
+			t.Fatalf("reconnectDelay(%d) = %s, want a delay drawn from [0, %s)", capped, d, reconnectMaxDelay)
+		}
+
+		draws[d] = struct{}{}
+	}
+
+	if len(draws) == 1 {
+		t.Fatalf("20 draws of reconnectDelay(%d) all returned %v; past the cap the jitter is gone and every feed of one outage reopens in lockstep", capped, reconnectMaxDelay)
+	}
 }
 
 // TestPollBackoffAdvancesTheStreakAndStopsWithTheFeed pins both halves of the

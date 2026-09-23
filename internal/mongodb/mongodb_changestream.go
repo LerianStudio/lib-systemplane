@@ -1070,11 +1070,18 @@ func streamWasUseful(consumed bool, lifetime time.Duration) bool {
 }
 
 // reconnectDelay is how long a feed waits after its attempt-th consecutive
-// failure: full jitter over an exponential base, capped. Both loops use it —
-// the change stream between reopen attempts and the poller between failed round
-// trips — so an outage costs the same on either path.
+// failure: the exponential is capped FIRST and the result jittered, so the
+// delay is always drawn from [0, ceiling). Both loops use it — the change
+// stream between reopen attempts and the poller between failed round trips —
+// so an outage costs the same on either path.
+//
+// Jittering before the cap would collapse the draw onto the cap exactly once
+// the outage is long enough to matter: past the cap almost every draw from the
+// (much wider) exponential window clips to the same value, so every feed in the
+// process reopens on the same tick, each cycle costing a tenant re-resolve, a
+// watch aggregate and an OpResync that makes the engine reload the whole scope.
 func reconnectDelay(attempt int) time.Duration {
-	return min(backoff.ExponentialWithJitter(reconnectBaseDelay, attempt), reconnectMaxDelay)
+	return backoff.FullJitter(min(backoff.Exponential(reconnectBaseDelay, attempt), reconnectMaxDelay))
 }
 
 // reopenWatch retries the open until it succeeds or teardown stops the feed.
