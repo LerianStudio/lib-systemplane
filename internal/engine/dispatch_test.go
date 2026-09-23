@@ -636,7 +636,7 @@ func workersIdle(e *Engine) bool {
 
 	for _, w := range ws {
 		w.mu.Lock()
-		pending := w.pending != nil
+		pending := w.hasPending
 		w.mu.Unlock()
 
 		if pending {
@@ -719,7 +719,8 @@ func TestQuiesceNeverReturnsBeforeAPendingDelivery(t *testing.T) {
 	// and signalling under the lock parks the worker inside take() on every
 	// run, which is the gap under test.
 	w.mu.Lock()
-	w.pending = &Change{Namespace: nk.Namespace, Key: nk.Key, Revision: 2, Value: "v2"}
+	w.pending = Change{Namespace: nk.Namespace, Key: nk.Key, Revision: 2, Value: "v2"}
+	w.hasPending = true
 
 	select {
 	case w.signal <- struct{}{}:

@@ -98,6 +98,7 @@ func (e *Engine) prepare(ctx context.Context, scope store.Scope, se store.Entry)
 		NSKey:     nk,
 		Revision:  se.Revision,
 		Value:     decoded,
+		Raw:       se.Value,
 		UpdatedAt: se.UpdatedAt,
 		UpdatedBy: se.UpdatedBy,
 	}, true

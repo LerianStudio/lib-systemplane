@@ -33,13 +33,19 @@ type workerKey struct {
 // subscriber may skip intermediate revisions but always ends on the newest and
 // never sees two revisions out of order.
 //
+// The slot is a value, not a pointer: taking the address of the submitted
+// Change would escape it to the heap on every delivered publication, and the
+// mailbox holds at most one of them at a time. hasPending is what distinguishes
+// an empty slot from a zero Change.
+//
 // done is closed when this one worker is stopped ahead of the engine — a
 // dropped scope. Stopping per worker is what keeps a suspended or deleted
 // tenant from leaving one parked goroutine per key behind until Close.
 type dispatchWorker struct {
-	mu      sync.Mutex
-	pending *Change
-	signal  chan struct{}
+	mu         sync.Mutex
+	pending    Change
+	hasPending bool
+	signal     chan struct{}
 
 	done     chan struct{}
 	stopOnce sync.Once
@@ -57,7 +63,8 @@ func (w *dispatchWorker) stop() {
 // the exact coupling this queue exists to break.
 func (w *dispatchWorker) submit(ch Change) {
 	w.mu.Lock()
-	w.pending = &ch
+	w.pending = ch
+	w.hasPending = true
 	w.mu.Unlock()
 
 	select {
@@ -72,12 +79,17 @@ func (w *dispatchWorker) take() (Change, bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if w.pending == nil {
+	if !w.hasPending {
 		return Change{}, false
 	}
 
-	ch := *w.pending
-	w.pending = nil
+	// Cleared as well as flagged: the slot holds the delivered value, and
+	// leaving it there keeps that object graph reachable until the next
+	// publication for this key — which for a knob nobody touches again is
+	// forever.
+	ch := w.pending
+	w.pending = Change{}
+	w.hasPending = false
 
 	return ch, true
 }

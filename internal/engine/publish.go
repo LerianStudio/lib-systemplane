@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"reflect"
 	"time"
 
@@ -11,8 +12,12 @@ import (
 type publication struct {
 	Scope store.Scope
 	NSKey
-	Revision  int64 // 0 = no row: the registered default is in force
-	Value     any   // decoded and validated; the engine owns this copy
+	Revision int64 // 0 = no row: the registered default is in force
+	Value    any   // decoded and validated; the engine owns this copy
+	// Raw is the row's JSON as the store returned it, or nil when no row
+	// backs the publication. publish compares it against the cached bytes
+	// before it compares decoded values; see the fence below.
+	Raw       []byte
 	UpdatedAt time.Time
 	UpdatedBy string
 }
@@ -78,11 +83,28 @@ func (e *Engine) publish(sc *scopeState, pub publication) (notify bool) {
 		// newer row. All three fall through to the store below.
 	case pub.Revision < cached.Revision:
 		return false
+	case len(pub.Raw) > 0 && bytes.Equal(pub.Raw, cached.Raw):
+		// The common case by far: the echo of a write this process just made.
+		// Set publishes with the revision the store returned (D4) and the
+		// changefeed then re-reads the same row, so an equal revision carrying
+		// identical bytes is what every write produces. Bytes are compared
+		// FIRST because they answer it in one memcmp, while reflect.DeepEqual
+		// walks the whole decoded document under this scope's write lock —
+		// with every Lookup of the scope waiting behind it, and with equal
+		// values as its worst case, since nothing short-circuits. Refresh
+		// provenance and stop.
+		cached.UpdatedAt = pub.UpdatedAt
+		cached.UpdatedBy = pub.UpdatedBy
+		sc.entries[pub.NSKey] = cached
+
+		return false
 	case reflect.DeepEqual(pub.Value, cached.Value):
-		// Equal non-zero revision carrying the same value: the row was
-		// re-read, not rewritten. Equality is on the decoded value, never on
-		// raw bytes, so a writer reformatting JSON or reordering object keys
-		// does not fire a callback. Refresh provenance and stop.
+		// Equal non-zero revision, different bytes, same meaning: a writer
+		// reformatted the JSON or reordered object keys. Equality is on the
+		// decoded value, never on raw bytes alone, so that no-op does not fire
+		// a callback. This walk only runs when the bytes already differ — a
+		// reformatted row, or D3's foreign writer — both rare. Refresh
+		// provenance and stop.
 		cached.UpdatedAt = pub.UpdatedAt
 		cached.UpdatedBy = pub.UpdatedBy
 		sc.entries[pub.NSKey] = cached
@@ -95,6 +117,7 @@ func (e *Engine) publish(sc *scopeState, pub publication) (notify bool) {
 
 	sc.entries[pub.NSKey] = entry{
 		Value:     pub.Value,
+		Raw:       pub.Raw,
 		Revision:  pub.Revision,
 		UpdatedAt: pub.UpdatedAt,
 		UpdatedBy: pub.UpdatedBy,

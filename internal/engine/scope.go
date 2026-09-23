@@ -11,7 +11,13 @@ import (
 // provenance of the row backing it. Revision 0 means no row — the registered
 // default is in force.
 type entry struct {
-	Value     any
+	Value any
+	// Raw is the row's JSON exactly as the store handed it over, kept beside
+	// the decoded value so the fence can recognise the echo of a write by
+	// comparing bytes instead of walking the decoded document. It is nil for a
+	// publication that has no row behind it — a delete, or a reconcile-absent
+	// publishing the registered default.
+	Raw       []byte
 	Revision  int64
 	UpdatedAt time.Time
 	UpdatedBy string

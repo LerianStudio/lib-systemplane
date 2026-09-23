@@ -126,6 +126,46 @@ func TestPublishFence(t *testing.T) {
 			wantProvenance: provenance{UpdatedAt: second, UpdatedBy: "console"},
 		},
 		{
+			// The echo of a write: the same row read back byte for byte, which
+			// is what every Set produces once the changefeed re-reads the row
+			// it just published with the store's revision. The fence must
+			// recognise it without walking the decoded document.
+			name: "an equal revision carrying identical bytes refreshes provenance only",
+			seed: []publication{{
+				NSKey: nk, Revision: 3, Value: map[string]any{"limit": float64(10), "burst": float64(2)},
+				Raw:       []byte(`{"limit":10,"burst":2}`),
+				UpdatedAt: first, UpdatedBy: "ops",
+			}},
+			candidate: publication{
+				NSKey: nk, Revision: 3, Value: map[string]any{"limit": float64(10), "burst": float64(2)},
+				Raw:       []byte(`{"limit":10,"burst":2}`),
+				UpdatedAt: second, UpdatedBy: "console",
+			},
+			wantValue:      map[string]any{"limit": float64(10), "burst": float64(2)},
+			wantRevision:   3,
+			wantProvenance: provenance{UpdatedAt: second, UpdatedBy: "console"},
+		},
+		{
+			// The reason the byte comparison can never be the only one: a
+			// writer that reordered the object's keys changed every byte and
+			// nothing else. It falls through to the decoded comparison and is
+			// still the no-op it is.
+			name: "an equal revision whose bytes were reordered still fires nothing",
+			seed: []publication{{
+				NSKey: nk, Revision: 3, Value: map[string]any{"limit": float64(10), "burst": float64(2)},
+				Raw:       []byte(`{"limit":10,"burst":2}`),
+				UpdatedAt: first, UpdatedBy: "ops",
+			}},
+			candidate: publication{
+				NSKey: nk, Revision: 3, Value: map[string]any{"limit": float64(10), "burst": float64(2)},
+				Raw:       []byte(`{"burst":2,"limit":10}`),
+				UpdatedAt: second, UpdatedBy: "console",
+			},
+			wantValue:      map[string]any{"limit": float64(10), "burst": float64(2)},
+			wantRevision:   3,
+			wantProvenance: provenance{UpdatedAt: second, UpdatedBy: "console"},
+		},
+		{
 			// D3's foreign-writer rule: MongoDB has no triggers, so a Console
 			// process writing the collection directly can change value and
 			// leave revision alone. Deduplicating on revision alone would make
