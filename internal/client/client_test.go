@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -36,6 +37,10 @@ type memStore struct {
 
 	multiTenant bool
 
+	// closeErr is what Close() reports, so a test can prove the Client
+	// surfaces a backend close failure instead of swallowing it.
+	closeErr error
+
 	// listHook is invoked at the top of List(), allowing tests to block
 	// hydration to inject race conditions deterministically. nil disables it.
 	listHook func()
@@ -64,7 +69,7 @@ func newMemStoreWithListHook(multiTenant bool) *memStore {
 func memKey(ns, key string) string { return ns + "\x00" + key }
 
 func (m *memStore) Start(_ context.Context) error { return nil }
-func (m *memStore) Close() error                  { return nil }
+func (m *memStore) Close() error                  { return m.closeErr }
 
 func (m *memStore) Get(_ context.Context, _ store.Scope, ns, key string) (store.Entry, bool, error) {
 	// Capture the hook outside the lock so it may touch m.* without deadlock.
@@ -1289,4 +1294,37 @@ type queryFailsDB struct{ dbresolver.DB }
 
 func (queryFailsDB) QueryContext(_ context.Context, _ string, _ ...any) (*sql.Rows, error) {
 	return nil, errors.New("warm-load query unavailable")
+}
+
+func TestCloseReturnsTheStoreErrorWrapped(t *testing.T) {
+	backendErr := errors.New("backend refused to close")
+	s := newMemStore(false)
+	s.closeErr = backendErr
+
+	c := newSingleTenantClient(t, s)
+
+	err := c.Close()
+	if !errors.Is(err, backendErr) {
+		t.Fatalf("close: got %v, want it to wrap %v", err, backendErr)
+	}
+
+	if !strings.HasPrefix(err.Error(), "systemplane: close store:") {
+		t.Errorf("close message: got %q, want it to start with %q", err.Error(), "systemplane: close store:")
+	}
+}
+
+func TestCloseOnAnUnstartedClientClosesTheEngine(t *testing.T) {
+	c := newSingleTenantClient(t, newMemStore(false))
+
+	if c.engine == nil {
+		t.Fatal("newClient left the Client without an engine")
+	}
+
+	if err := c.Close(); err != nil {
+		t.Fatalf("first close: %v", err)
+	}
+
+	if err := c.Close(); err != nil {
+		t.Fatalf("second close: %v", err)
+	}
 }

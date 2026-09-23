@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -40,6 +41,7 @@ type subscription struct {
 // returning zero values when the Client is nil or not yet started.
 type Client struct {
 	store     store.Store
+	engine    *engine.Engine
 	debouncer *debounce.Debouncer[nskey]
 	logger    log.Logger
 	telemetry store.Telemetry
@@ -171,6 +173,17 @@ func newClient(s store.Store, cfg clientConfig) *Client {
 		lifecycleCtx:    ctx,
 		lifecycleCancel: cancel,
 	}
+
+	// Built in both modes so Close stays uniform: engine.New opens no
+	// connection and starts no goroutine, and only Start creates a scope.
+	// Registry is the Client itself, which is why this cannot be a field of
+	// the literal above.
+	c.engine = engine.New(engine.Config{
+		Store:    s,
+		Registry: c,
+		Logger:   logger,
+		Debounce: cfg.debounce,
+	})
 
 	if !cfg.multiTenantEnabled {
 		c.debouncer = debounce.New[nskey](cfg.debounce, debounce.WithLogger[nskey](logger))
@@ -429,11 +442,23 @@ func (c *Client) Close() error {
 			c.debouncer.Close()
 		}
 
+		// Engine first, store second, and the order is load-bearing: the
+		// engine cancels its lifecycle, unsubscribes every scope, drops
+		// pending re-reads and drains its dispatch workers before returning,
+		// so the store is closed with nothing still reading through it.
+		engineErr := c.engine.Close()
+
+		var storeErr error
+
 		if c.store != nil {
 			if err := c.store.Close(); err != nil {
-				closeErr = fmt.Errorf("systemplane: close store: %w", err)
+				storeErr = fmt.Errorf("systemplane: close store: %w", err)
 			}
 		}
+
+		// errors.Join(nil, nil) is nil, so the clean path is unchanged, and a
+		// subscriber that refused to stop does not swallow a store failure.
+		closeErr = errors.Join(engineErr, storeErr)
 	})
 
 	return closeErr
