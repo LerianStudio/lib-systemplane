@@ -15,8 +15,11 @@ import (
 )
 
 // warnPollingIndexes is logged when the polling indexes cannot be created. The
-// store keeps serving: the indexes only make polling cheaper.
-const warnPollingIndexes = "could not create the polling indexes; every poll round trip will scan the whole collection"
+// store keeps serving: the indexes only make polling cheaper, and polling MAY
+// be slower without them. It is not necessarily a full scan: the creation also
+// fails when an equivalent index already exists under another name, and that
+// index still serves the poll queries.
+const warnPollingIndexes = "could not create the polling indexes; polling may be slower without them"
 
 // runSchema makes the collection ready for use. With a compound _id there is
 // no separate unique index to create — the server enforces uniqueness on _id
@@ -45,10 +48,12 @@ const warnPollingIndexes = "could not create the polling indexes; every poll rou
 //     confirms the connection can reach the collection, and the change stream
 //     observes the very first write that auto-creates the namespace. In
 //     POLLING mode it also creates the two indexes in pollingIndexes: there is
-//     no change stream to race there, and without them both of the poller's
-//     per-tick queries scan the whole collection on every tick while the
-//     incremental one also sorts it in memory. A role that may not create an
-//     index keeps working — slower — so a refusal is logged, not returned.
+//     no change stream to race there, and with no index covering them both of
+//     the poller's per-tick queries scan the whole collection on every tick
+//     while the incremental one also sorts it in memory. A failed creation is
+//     logged, not returned: a role that may not create an index keeps working,
+//     possibly slower, and an equivalent index under another name (which makes
+//     the creation fail) still serves the poll queries.
 func (s *Store) runSchema(ctx context.Context, coll *mongo.Collection, tenant string, tenantScoped bool) error {
 	if s.cfg.MultiTenantEnabled || tenantScoped {
 		db := coll.Database()
