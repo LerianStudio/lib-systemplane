@@ -1093,8 +1093,8 @@ func TestMongoStore_RefreshFeedCollKeepsHandleWhenProbeFails(t *testing.T) {
 	s.feeds["t1"] = f
 
 	err := s.refreshFeedColl(context.Background(), f)
-	if err == nil {
-		t.Fatal("refreshFeedColl accepted a collection no server confirmed")
+	if !errors.Is(err, errIdentityProbeFailed) {
+		t.Fatalf("refreshFeedColl error = %v, want errIdentityProbeFailed", err)
 	}
 
 	if !strings.Contains(err.Error(), "t1") {
@@ -2128,16 +2128,24 @@ func TestEnsureSchema_CtxTenantWithoutIDWarnsOnce(t *testing.T) {
 	s.cfg.Logger = logger
 	s.schemaRunner = func(context.Context, string) error { return nil }
 
+	// A second store on the same logger: the bound is per Store, so it warns
+	// once more. A process-wide sync.Once would leave the count at 1.
+	other := newSubscribeStore()
+	other.cfg.Logger = logger
+	other.schemaRunner = s.schemaRunner
+
 	coll := offlineCollection(t, "systemplane")
 
-	for range 2 {
-		if err := s.ensureSchema(context.Background(), "", coll, true); err != nil {
-			t.Fatalf("ensureSchema: %v", err)
+	for _, st := range []*Store{s, other} {
+		for range 2 {
+			if err := st.ensureSchema(context.Background(), "", coll, true); err != nil {
+				t.Fatalf("ensureSchema: %v", err)
+			}
 		}
 	}
 
-	if warns := logger.warnCount(warnSchemaWithoutTenantID); warns != 1 {
-		t.Fatalf("logged the no-tenant-id warning %d times, want exactly 1 per store", warns)
+	if warns := logger.warnCount(warnSchemaWithoutTenantID); warns != 2 {
+		t.Fatalf("two stores logged the no-tenant-id warning %d times, want exactly 1 per store (2)", warns)
 	}
 }
 

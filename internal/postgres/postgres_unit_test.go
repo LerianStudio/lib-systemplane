@@ -930,7 +930,9 @@ func TestStore_StartWithNilContextReturnsErrorNotPanic(t *testing.T) {
 	// The zero value a caller forwards without noticing.
 	var nilCtx context.Context
 
-	if err := s.Start(nilCtx); err == nil {
-		t.Fatal("Start(nil) = nil, want the connection error from an unreachable DSN")
+	// The connect wrapper proves Start reached the dial with the normalized
+	// ctx; a nil-ctx short-circuit returns some other error and fails here.
+	if err := s.Start(nilCtx); err == nil || !strings.Contains(err.Error(), "systemplane/postgres: listen connect") {
+		t.Fatalf("Start(nil) = %v, want the listen connect error from an unreachable DSN", err)
 	}
 }

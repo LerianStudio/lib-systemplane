@@ -761,7 +761,9 @@ func TestStore_StartWithNilContextReturnsErrorNotPanic(t *testing.T) {
 	// The zero value a caller forwards without noticing.
 	var nilCtx context.Context
 
-	if err := s.Start(nilCtx); err == nil {
-		t.Fatal("Start(nil) = nil, want the connection error from an unreachable server")
+	// The watch wrapper proves Start reached the changefeed open with the
+	// normalized ctx; a nil-ctx short-circuit returns some other error.
+	if err := s.Start(nilCtx); err == nil || !strings.Contains(err.Error(), "systemplane/mongodb: watch") {
+		t.Fatalf("Start(nil) = %v, want the changefeed watch error from an unreachable server", err)
 	}
 }

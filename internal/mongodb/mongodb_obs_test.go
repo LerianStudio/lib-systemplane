@@ -39,6 +39,9 @@ func TestMongoLogFieldNames_SurviveRedaction(t *testing.T) {
 		fieldNamespace,
 		logFieldKeyName,
 		obsconstants.AttrKeyTenantID,
+		// log.Err hard-codes this key (lib-observability log.errorFieldKey);
+		// the source walk sees log.Err(err), never the string.
+		"error",
 	}
 
 	literals := logFieldNameLiterals(t)

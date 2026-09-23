@@ -38,6 +38,9 @@ func TestPostgresLogFieldNames_SurviveRedaction(t *testing.T) {
 	// identifier, not the string it resolves to, so these stay listed by hand.
 	emitted := []string{
 		obsconstants.AttrKeyTenantID,
+		// log.Err hard-codes this key (lib-observability log.errorFieldKey);
+		// the source walk sees log.Err(err), never the string.
+		"error",
 	}
 
 	literals := logFieldNameLiterals(t)
