@@ -4,6 +4,7 @@ package systemplane
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 )
@@ -50,7 +51,7 @@ func (r *publishRecorder) all() []Applied[groupPublishDoc] {
 func TestGroupPublishCarriesEachTenantToItsOwnScope(t *testing.T) {
 	t.Parallel()
 
-	c, err := NewForTesting(newAPIMemoryStore(), WithMultiTenantEnabled())
+	c, err := NewForTesting(newGroupPublishMemoryStore(), WithMultiTenantEnabled())
 	if err != nil {
 		t.Fatalf("NewForTesting: %v", err)
 	}
@@ -119,4 +120,67 @@ func TestGroupPublishCarriesEachTenantToItsOwnScope(t *testing.T) {
 			t.Errorf("Status[%d] = %+v, want %+v", i, status[i], w)
 		}
 	}
+
+	// A published null is not a document for a T whose zero value is not nil:
+	// the coordinator records it as a rejection instead of blanking t1's
+	// document through the applier. Revision 8 is NEWER than the delivered 7,
+	// so the publication cannot be dropped as stale before the decode runs.
+	g.publish(ctx, Change{Namespace: "billing", Key: "limits", Tenant: "t1", Revision: 8, Value: nil})
+
+	after := rec.all()
+	if len(after) != len(want) {
+		t.Fatalf("deliveries after the published null = %d, want %d: a null document must never reach an applier: %#v", len(after), len(want), after)
+	}
+
+	if after[0].Value != (groupPublishDoc{Workers: 4}) {
+		t.Errorf("t1 last document = %+v, want %+v: a rejected null leaves the applied document in force", after[0].Value, groupPublishDoc{Workers: 4})
+	}
+
+	status = g.Status()
+	if len(status) != len(wantStatus) {
+		t.Fatalf("Status after the published null = %#v, want one row per tenant", status)
+	}
+
+	if status[0].Tenant != "t1" || status[0].Desired != 8 || status[0].Applied != 7 {
+		t.Errorf("t1 status = %+v, want Tenant t1 Desired 8 Applied 7: the null is the newest publication and nothing accepted it", status[0])
+	}
+
+	if !errors.Is(status[0].LastErr, ErrValidation) {
+		t.Errorf("t1 LastErr = %v, want an error matching ErrValidation", status[0].LastErr)
+	}
+
+	if status[1] != (ApplyStatus{Tenant: "t2", Desired: 9, Applied: 9}) {
+		t.Errorf("t2 status = %+v, want t2 untouched by t1's rejected null", status[1])
+	}
+}
+
+// groupPublishMemoryStore is this file's own store, lane-owned so the groups
+// tests never bind to the engine-core helpers in api_client_test.go: the test
+// drives publish directly and reads nothing back, so it stays this small.
+type groupPublishMemoryStore struct{}
+
+func newGroupPublishMemoryStore() *groupPublishMemoryStore { return &groupPublishMemoryStore{} }
+
+func (*groupPublishMemoryStore) Start(context.Context) error { return nil }
+
+func (*groupPublishMemoryStore) Close() error { return nil }
+
+func (*groupPublishMemoryStore) Get(context.Context, TestScope, string, string) (TestEntry, bool, error) {
+	return TestEntry{}, false, nil
+}
+
+func (*groupPublishMemoryStore) Set(context.Context, TestScope, TestEntry) (int64, error) {
+	return 0, nil
+}
+
+func (*groupPublishMemoryStore) Delete(context.Context, TestScope, string, string, string) error {
+	return nil
+}
+
+func (*groupPublishMemoryStore) List(context.Context, TestScope) ([]TestEntry, error) {
+	return []TestEntry{}, nil
+}
+
+func (*groupPublishMemoryStore) Subscribe(context.Context, TestScope, func(TestEvent)) (func(), error) {
+	return func() {}, nil
 }
