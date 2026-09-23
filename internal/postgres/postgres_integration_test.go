@@ -174,7 +174,22 @@ func TestIntegration_PostgresNamedTenant(t *testing.T) {
 
 		s := tenantStore(t, conn)
 
-		return s, func() { _ = s.Close() }
+		// Closing the pool and dropping the database here rather than leaning
+		// on the t.Cleanup provisionTenantDB and tenantStore register: the
+		// suite calls one Factory per iteration inside
+		// SubscribeThenImmediateWriteNeverLosesTheEvent, and twenty live pools
+		// and databases queueing up for the end of that sub-test crowd the
+		// container's max_connections. Both closes are idempotent, so the
+		// t.Cleanup closes that run later are no-ops; FORCE ends any backend
+		// the closed store left behind.
+		return s, func() {
+			_ = s.Close()
+			_ = db.Close()
+
+			if _, err := admin.Exec(fmt.Sprintf(`DROP DATABASE IF EXISTS %s WITH (FORCE)`, dbName)); err != nil {
+				t.Errorf("drop database %s: %v", dbName, err)
+			}
+		}
 	}
 
 	systemplanetest.Run(t, factory, systemplanetest.RunOptions{
