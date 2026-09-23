@@ -15,6 +15,7 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 func TestEntryDocToEntry(t *testing.T) {
@@ -596,5 +597,68 @@ func TestScopeAttrs_NamesTheTenant(t *testing.T) {
 
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("nil-collection attributes = %#v, want %#v", got, want)
+	}
+}
+
+// typedNilConnector dereferences its own receiver, so a typed nil of this type
+// panics on first use — the shape a consumer's own connector takes when its
+// concrete type is stored in Config.Connector without a nil check.
+type typedNilConnector struct{ db *mongo.Database }
+
+func (c *typedNilConnector) ResolveDatabase(context.Context, string) (*mongo.Database, error) {
+	return c.db, nil
+}
+
+// A Connector field holding a typed nil is != nil, so every `Connector == nil`
+// check downstream would pass and the first call would panic. Construction
+// normalizes it to an untyped nil, so a named tenant is refused on both the
+// resolution and the subscribe route.
+func TestNew_TypedNilConnectorIsTreatedAsAbsent(t *testing.T) {
+	t.Parallel()
+
+	s, err := New(Config{MultiTenantEnabled: true, Connector: (*typedNilConnector)(nil)})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx := context.Background()
+	scope := store.Scope{Tenant: "t1"}
+
+	if _, err := s.resolveCollection(ctx, scope); !errors.Is(err, store.ErrTenantConnectorMissing) {
+		t.Fatalf("resolveCollection error = %v, want ErrTenantConnectorMissing", err)
+	}
+
+	if _, err := s.Subscribe(ctx, scope, func(store.Event) {}); !errors.Is(err, store.ErrTenantConnectorMissing) {
+		t.Fatalf("Subscribe error = %v, want ErrTenantConnectorMissing", err)
+	}
+
+	if s.cfg.Connector != nil {
+		t.Fatalf("cfg.Connector = %v, want an untyped nil after normalization", s.cfg.Connector)
+	}
+}
+
+// nilTracerTelemetry answers with (nil, nil): no tracer, no error. A provider
+// that was never wired takes exactly this shape.
+type nilTracerTelemetry struct{ store.Telemetry }
+
+func (nilTracerTelemetry) Tracer(string) (trace.Tracer, error) { return nil, nil }
+
+// A Telemetry that hands back a nil tracer without an error must leave the
+// noop tracer in place: storing the nil makes s.tracer a nil interface and
+// every CRUD call dies at tracer.Start.
+func TestNew_NilTracerKeepsTheNoopTracer(t *testing.T) {
+	t.Parallel()
+
+	s, err := New(Config{Client: &mongo.Client{}, Database: "db", Telemetry: nilTracerTelemetry{}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if _, _, err := s.Get(context.Background(), store.Scope{}, "ns", "k"); err == nil {
+		t.Fatal("Get error = nil, want the driver's unconfigured-deployment error")
+	}
+
+	if _, span := s.tracer.Start(context.Background(), "probe"); span.IsRecording() {
+		t.Fatal("tracer records spans; want the noop tracer left in place")
 	}
 }

@@ -3,6 +3,7 @@ package mongodb
 import (
 	"fmt"
 
+	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 	"go.opentelemetry.io/otel/trace/noop"
 )
@@ -21,6 +22,15 @@ func (d entryDoc) toEntry() store.Entry {
 // New creates a MongoDB-backed Store. Validates the config; schema bootstrap
 // is lazy (first access per resolved collection).
 func New(cfg Config) (*Store, error) {
+	// A Connector holding a nil POINTER is not == nil, so every `Connector ==
+	// nil` guard downstream would pass it through and the first
+	// ResolveDatabase would panic. Normalized once here, so those guards are
+	// truthful and a named tenant is refused with
+	// store.ErrTenantConnectorMissing instead.
+	if log.IsNil(cfg.Connector) {
+		cfg.Connector = nil
+	}
+
 	if cfg.Collection == "" {
 		cfg.Collection = defaultCollection
 	}
@@ -41,7 +51,10 @@ func New(cfg Config) (*Store, error) {
 
 	tracer := noop.NewTracerProvider().Tracer(tracerName)
 	if cfg.Telemetry != nil {
-		if t, err := cfg.Telemetry.Tracer(tracerName); err == nil {
+		// t != nil as well as err == nil: a provider that answers with no
+		// tracer and no error would otherwise store a nil interface, and
+		// every CRUD call dies at tracer.Start.
+		if t, err := cfg.Telemetry.Tracer(tracerName); err == nil && t != nil {
 			tracer = t
 		}
 	}

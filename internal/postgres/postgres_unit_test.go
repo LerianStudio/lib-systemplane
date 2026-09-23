@@ -805,3 +805,44 @@ func TestPostgresCRUDSpans_NameTheTenant(t *testing.T) {
 		}
 	})
 }
+
+// typedNilConnector dereferences its own receiver, so a typed nil of this type
+// panics on first use — the shape a consumer's own connector takes when its
+// concrete type is stored in Config.Connector without a nil check.
+type typedNilConnector struct{ db dbresolver.DB }
+
+func (c *typedNilConnector) ResolveDB(context.Context, string) (dbresolver.DB, error) {
+	return c.db, nil
+}
+
+func (c *typedNilConnector) ResolveDSN(context.Context, string) (string, error) {
+	return "", nil
+}
+
+// A Connector field holding a typed nil is != nil, so every `Connector == nil`
+// check downstream would pass and the first call would panic. Construction
+// normalizes it to an untyped nil, so a named tenant is refused on both the
+// resolution and the subscribe route.
+func TestNew_TypedNilConnectorIsTreatedAsAbsent(t *testing.T) {
+	t.Parallel()
+
+	s, err := New(Config{MultiTenantEnabled: true, Connector: (*typedNilConnector)(nil)})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ctx := context.Background()
+	scope := store.Scope{Tenant: "t1"}
+
+	if _, err := s.resolveDB(ctx, scope); !errors.Is(err, store.ErrTenantConnectorMissing) {
+		t.Fatalf("resolveDB error = %v, want ErrTenantConnectorMissing", err)
+	}
+
+	if _, err := s.Subscribe(ctx, scope, func(store.Event) {}); !errors.Is(err, store.ErrTenantConnectorMissing) {
+		t.Fatalf("Subscribe error = %v, want ErrTenantConnectorMissing", err)
+	}
+
+	if s.cfg.Connector != nil {
+		t.Fatalf("cfg.Connector = %v, want an untyped nil after normalization", s.cfg.Connector)
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -20,6 +21,14 @@ func New(cfg Config) (*Store, error) {
 }
 
 func normalizeConfig(cfg *Config) error {
+	// A Connector holding a nil POINTER is not == nil, so every `Connector ==
+	// nil` guard downstream would pass it through and the first ResolveDB
+	// would panic. Normalized once here, so those guards are truthful and a
+	// named tenant is refused with store.ErrTenantConnectorMissing instead.
+	if log.IsNil(cfg.Connector) {
+		cfg.Connector = nil
+	}
+
 	if cfg.Channel == "" {
 		cfg.Channel = defaultChannel
 	}
