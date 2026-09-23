@@ -319,13 +319,16 @@ func (s *Store) resolveDB(ctx context.Context, scope store.Scope) (dbExecutor, e
 // readable by the next Get. It costs no allocation on a path every query
 // crosses: PrimaryDBs returns the resolver's own slice field.
 //
-// What the pin gives up, stated rather than glossed: a primary that cannot be
-// reached fails the dial with a net.Error, and a net.Error is exactly what
-// dbresolver retries onto the next primary, so pinning forfeits that failover.
-// The trade is deliberate — deterministic read-your-writes (D4) is worth more
-// than failover across several primaries — and it costs nothing on any
-// connector that ships, because lib-commons builds every resolver with exactly
-// one primary, leaving no second node to fail over to.
+// What the pin gives up, stated rather than glossed: nothing. dbresolver has
+// no failover for a write — ExecContext, and every statement its checker reads
+// as a write, goes to ReadWrite() once and is never retried (dbresolver/v2
+// db.go), so an unreachable primary fails a Set or a Delete with or without
+// the pin. Its ONE retry is a READ: a read whose error is a net.Error falls
+// back from ReadOnly() to ReadWrite(), gated on !writeFlag (db.go,
+// QueryContext and QueryRowContext). The pin therefore forfeits only that
+// standby-to-primary read retry, and makes it moot in the same stroke —
+// pinning every call to one primary means no read ever reaches a standby to
+// need rescuing off one. Deterministic read-your-writes (D4) at no cost.
 func pinPrimary(db dbresolver.DB) dbExecutor {
 	if primaries := db.PrimaryDBs(); len(primaries) > 0 {
 		return primaries[0]

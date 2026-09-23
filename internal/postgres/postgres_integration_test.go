@@ -769,9 +769,11 @@ func TestIntegration_PostgresScopedReadsStayOnThePrimary(t *testing.T) {
 // the SAME one, so a value Set returns is the value the next Get reads (D4).
 //
 // It deliberately makes no failover claim. Spreading the calls over the
-// primaries instead would buy none: dbresolver retries only on a net.Error and
-// a dead pool reports "sql: database is closed", which is not one. All it
-// would buy is a read that misses what the last write stored.
+// primaries instead would buy none: dbresolver never retries a write, so an
+// unreachable primary fails a write either way. Its only retry is a read
+// falling back from ReadOnly() to ReadWrite() (dbresolver/v2 db.go,
+// QueryContext and QueryRowContext), which a pin to one primary makes moot.
+// All it would buy is a read that misses what the last write stored.
 //
 // The two primaries are separate databases holding DIFFERENT values and the
 // replica is an empty decoy, so each possible destination answers distinctly:
