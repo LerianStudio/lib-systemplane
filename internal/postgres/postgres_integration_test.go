@@ -22,6 +22,8 @@ import (
 	"github.com/LerianStudio/lib-systemplane/v4/systemplanetest"
 	"github.com/bxcodec/dbresolver/v2"
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/testcontainers/testcontainers-go"
+	pgcontainer "github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 
 // startContainer returns the admin DSN of the package-wide Postgres server
@@ -2272,6 +2274,65 @@ func TestIntegration_PostgresTwoTenantsOnOneDatabase(t *testing.T) {
 			t.Fatalf("subscribe t3 error = %v, want postgres.ErrSharedDatabaseUnsupported", err)
 		}
 	})
+}
+
+// Two SERVERS that both carry a database of the same name are two databases,
+// even when they describe themselves alike: containers on separate hosts each
+// report the default bridge address, tenant clusters all name their database
+// "systemplane". The shared-database guard keys on the server's own identity
+// as well, so the second tenant's feed is admitted instead of refused forever.
+func TestIntegration_PostgresTwoDatabasesOnTwoServersAreAdmitted(t *testing.T) {
+	ctx := context.Background()
+
+	second, err := pgcontainer.Run(ctx, "postgres:16-alpine",
+		pgcontainer.WithDatabase("postgres"),
+		pgcontainer.WithUsername("postgres"),
+		pgcontainer.WithPassword("postgres"),
+		pgcontainer.BasicWaitStrategies(),
+	)
+	testcontainers.CleanupContainer(t, second)
+
+	if err != nil {
+		t.Fatalf("start the second server: %v", err)
+	}
+
+	secondBase, err := second.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		t.Fatalf("second server connection string: %v", err)
+	}
+
+	dbName := fmt.Sprintf("same_name_%d", time.Now().UnixNano())
+	conn := newFakeConnector()
+
+	for tenant, base := range map[string]string{"t1": startContainer(t), "t2": secondBase} {
+		admin := adminDSN(t, base)
+		t.Cleanup(func() { _ = admin.Close() })
+
+		freshDB(t, admin, dbName)
+
+		tenantDSN := dsnFor(base, dbName)
+
+		db, err := sql.Open("pgx", tenantDSN)
+		if err != nil {
+			t.Fatalf("open %s for %s: %v", dbName, tenant, err)
+		}
+
+		t.Cleanup(func() { _ = db.Close() })
+
+		provisionSchema(t, db)
+		conn.set(tenant, db, tenantDSN)
+	}
+
+	s := tenantStore(t, conn)
+
+	for _, tenant := range []string{"t1", "t2"} {
+		unsub, err := s.Subscribe(ctx, store.Scope{Tenant: tenant}, func(store.Event) {})
+		if err != nil {
+			t.Fatalf("subscribe %s on its own server: %v", tenant, err)
+		}
+
+		t.Cleanup(unsub)
+	}
 }
 
 // respellHost returns dsn with its host swapped for another spelling of the

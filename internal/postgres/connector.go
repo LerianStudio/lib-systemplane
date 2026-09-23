@@ -40,8 +40,8 @@ type Connector interface {
 	// stream is opened.
 	//
 	// The database is identified by what the SERVER reports on the open
-	// connection — its address, port and current_database() — not by the DSN
-	// text, so two spellings that reach one server over one route are refused
+	// connection — its cluster identity, address, port and current_database()
+	// — not by the DSN text, so two spellings that reach one server over one route are refused
 	// however differently they are written. Routes the server describes
 	// differently are NOT caught, and serverDatabaseKey names them: a
 	// Unix-socket route against a TCP one, and two distinct interface
@@ -88,8 +88,18 @@ var ErrSharedDatabaseUnsupported = errors.New("systemplane/postgres: two scopes 
 // from two scopes pointing at different ones.
 //
 // The identity comes from the server, not from the connection string: the
-// triple (inet_server_addr(), inet_server_port(), current_database()), all
-// unprivileged and all evaluated inside the server. DSN text is a description
+// server's own identity plus (inet_server_addr(), inet_server_port(),
+// current_database()), all evaluated inside the server. The address is only
+// how the SERVER sees itself, and two distinct servers can report the same one
+// — containers on separate hosts each on 172.17.0.2:5432, overlapping private
+// ranges, every tenant cluster naming its database alike — so the address
+// alone would refuse a valid tenant forever. The server identity is the
+// system_identifier from pg_control_system(), stable across restarts and
+// shared by the replicas of one cluster, which is the right notion of "same
+// database". A role that may not execute that function (it is granted to
+// PUBLIC by default) keys on pg_postmaster_start_time() instead, so a restart
+// changes the key: that only admits a pair it should have refused, the
+// failure this key already accepts, never the reverse. DSN text is a description
 // of how to get there and two descriptions that land on one NOTIFY namespace
 // need not match — a host name and the literal address it resolves to, a CNAME
 // and its target, a pgbouncer address and the backend behind it — and a key
@@ -122,30 +132,46 @@ var ErrSharedDatabaseUnsupported = errors.New("systemplane/postgres: two scopes 
 // reach one postmaster.
 func serverDatabaseKey(ctx context.Context, conn *pgx.Conn, dsn string) (string, error) {
 	var (
-		database string
-		addr     string
-		port     int32
+		database  string
+		addr      string
+		port      int32
+		canSysID  bool
+		startedAt string
 	)
 
-	const q = `SELECT current_database(), COALESCE(host(inet_server_addr()), ''), COALESCE(inet_server_port(), 0)`
+	const q = `SELECT current_database(), COALESCE(host(inet_server_addr()), ''), COALESCE(inet_server_port(), 0),
+		has_function_privilege('pg_control_system()', 'EXECUTE'), extract(epoch FROM pg_postmaster_start_time())::text`
 
-	if err := conn.QueryRow(ctx, q).Scan(&database, &addr, &port); err != nil {
+	if err := conn.QueryRow(ctx, q).Scan(&database, &addr, &port, &canSysID, &startedAt); err != nil {
 		return "", fmt.Errorf("server identity query: %w", err)
 	}
 
-	return formatServerDatabaseKey(database, addr, port, dsn)
+	server := "started:" + startedAt
+
+	// A separate round trip: Postgres checks EXECUTE when it initializes the
+	// expression, so no CASE inside the first query can skip a revoked call.
+	if canSysID {
+		var sysID string
+		if err := conn.QueryRow(ctx, `SELECT system_identifier::text FROM pg_control_system()`).Scan(&sysID); err != nil {
+			return "", fmt.Errorf("server system identifier query: %w", err)
+		}
+
+		server = "sysid:" + sysID
+	}
+
+	return formatServerDatabaseKey(database, addr, port, server, dsn)
 }
 
 // formatServerDatabaseKey turns what the server answered into the key
 // serverDatabaseKey compares, and holds every decision that comparison rests
 // on — see that function's comment for what the key does and does not tell
-// apart. Split out so those decisions are testable without a server: an
-// address the server reported keys as TCP; no address means a Unix socket, and
-// the socket directory the DSN names stands in for the address it cannot
-// report.
-func formatServerDatabaseKey(database, addr string, port int32, dsn string) (string, error) {
+// apart. Split out so those decisions are testable without a server: server
+// names the server process and prefixes every key; an address the server
+// reported keys as TCP; no address means a Unix socket, and the socket
+// directory the DSN names stands in for the address it cannot report.
+func formatServerDatabaseKey(database, addr string, port int32, server, dsn string) (string, error) {
 	if addr != "" {
-		return fmt.Sprintf("tcp:%s:%d/%s", addr, port, database), nil
+		return fmt.Sprintf("%s/tcp:%s:%d/%s", server, addr, port, database), nil
 	}
 
 	cfg, err := pgconn.ParseConfig(dsn)
@@ -153,7 +179,7 @@ func formatServerDatabaseKey(database, addr string, port int32, dsn string) (str
 		return "", fmt.Errorf("parse DSN for socket identity: %w", err)
 	}
 
-	return fmt.Sprintf("unix:%s/%s", cfg.Host, database), nil
+	return fmt.Sprintf("%s/unix:%s/%s", server, cfg.Host, database), nil
 }
 
 // NewTenantManagerConnector wraps a lib-commons tenant-manager Postgres Manager.
