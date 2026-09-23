@@ -97,7 +97,7 @@ type Entry struct {
 	// view into a driver buffer the driver reuses on its next read — pgx
 	// RawValues and sql.RawBytes on Postgres, bson.Raw and bson.RawValue
 	// views on MongoDB all alias such buffers. A backend that cannot return
-	// memory of its own copies at the boundary (bytes.Clone). The contract
+	// memory of its own must copy at the boundary (bytes.Clone). The contract
 	// suite pins this for every backend as ValueBytesBelongToTheCaller.
 	Value []byte
 

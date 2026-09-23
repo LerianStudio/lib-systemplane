@@ -313,7 +313,7 @@ func (s *Store) resolveDB(ctx context.Context, scope store.Scope) (dbExecutor, e
 // DSN.
 //
 // The pin is the FIRST primary, always, and that is the whole claim: one
-// deterministic node, every standby excluded, no failover. Having no replica
+// deterministic node, every standby excluded. Having no replica
 // is NOT a reason to hand the resolver back: dbresolver resolves ReadWrite()
 // AND, with no replica registered, ReadOnly() through its load balancer over
 // the primaries, which is round-robin by default (dbresolver/v2 db.go), so a
