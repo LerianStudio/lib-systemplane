@@ -192,7 +192,7 @@ func TestNewForTestingRejectsNilStores(t *testing.T) {
 	}
 }
 
-func TestRedactionAndClientHookHelpers(t *testing.T) {
+func TestRedactionHelpers(t *testing.T) {
 	t.Parallel()
 
 	if got := ApplyRedaction("visible", RedactNone); got != "visible" {
@@ -204,33 +204,4 @@ func TestRedactionAndClientHookHelpers(t *testing.T) {
 	if got := RedactPolicy(99).String(); got != "none" {
 		t.Fatalf("unknown RedactPolicy string = %q", got)
 	}
-
-	var nilHook *clientHook
-	if got := nilHook.RegisteredKeys(); got != nil {
-		t.Fatalf("nil hook RegisteredKeys = %#v, want nil", got)
-	}
-	if got := nilHook.LifecycleContext(); got == nil {
-		t.Fatal("nil hook LifecycleContext returned nil")
-	}
-
-	c := newSingleTenantClient(t, newMemStore(false))
-	if err := c.Register("ns", "slice", []string{"a"}); err != nil {
-		t.Fatalf("Register: %v", err)
-	}
-	hook := newClientHook(c)
-	keys := hook.RegisteredKeys()
-	if len(keys) != 1 || keys[0].Namespace != "ns" || keys[0].Key != "slice" {
-		t.Fatalf("RegisteredKeys = %#v", keys)
-	}
-	keys[0].DefaultValue.([]string)[0] = "mutated"
-	if got := hook.RegisteredKeys()[0].DefaultValue.([]string)[0]; got != "a" {
-		t.Fatalf("RegisteredKeys did not clone default: got %q", got)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	c.lifecycleCtx = ctx
-	if got := hook.LifecycleContext(); got != ctx {
-		t.Fatal("LifecycleContext did not return client lifecycle context")
-	}
-	cancel()
 }

@@ -150,13 +150,11 @@ func (c *Client) CatalogService() string {
 // the delivery made during Start return ErrNotStarted, because Start has not
 // returned yet.
 //
-// In this wave-1 shim the Manager path reports Change.Revision == 0 on every
-// delivery, upsert or delete, because the NOTIFY payload carries no revision
-// until the storage lane lands.
-//
-// OnChange returns ErrUnknownKey for a key that was not registered. In
-// multi-tenant mode without a bound Manager, OnChange returns
-// ErrNotSupportedInMultiTenant; on a closed Client it returns ErrClosed.
+// OnChange returns ErrUnknownKey for a key that was not registered, in both
+// modes. In multi-tenant mode it then returns ErrNotSupportedInMultiTenant for
+// every registered key: no scope is tracked and no changefeed runs, so no
+// callback could ever fire. The wave-3 engine-tenants lane makes multi-tenant
+// OnChange work on both backends. On a closed Client it returns ErrClosed.
 func (c *Client) OnChange(namespace, key string, fn func(ctx context.Context, ch Change)) (unsubscribe func(), err error) {
 	return asInternalClient(c).OnChange(namespace, key, fn)
 }

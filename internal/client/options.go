@@ -231,11 +231,10 @@ func WithValidator(fn func(any) error) KeyOption {
 // valid was ever accepted) or the value already in force, and logs a WARN
 // carrying the error and never the value.
 //
-// Multi-tenant reads are ungraded on every path: the direct tenant-store read
-// in [Client.Get] and [Client.List], and, when a Manager is bound, the
-// Manager's per-tenant warm-load and NOTIFY cache update that Get serves hits
-// from. None of them runs this function, so a multi-tenant consumer that must
-// not act on a value the write path would refuse checks what it reads.
+// Multi-tenant reads are ungraded: [Client.Get] and [Client.List] read the
+// tenant row through and do not run this function, so a multi-tenant consumer
+// that must not act on a value the write path would refuse checks what it
+// reads.
 //
 // Every read-back call gets a context derived from the client's own lifecycle,
 // never the one passed to [Client.Start] and never a caller's: it carries no

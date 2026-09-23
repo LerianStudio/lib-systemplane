@@ -13,7 +13,6 @@ import (
 
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/engine"
-	"github.com/LerianStudio/lib-systemplane/v4/internal/manager"
 	mongoDB "github.com/LerianStudio/lib-systemplane/v4/internal/mongodb"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/postgres"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
@@ -39,22 +38,10 @@ type Client struct {
 	registryMu sync.RWMutex
 	registry   map[nskey]keyDef
 
-	// lifecycleCtx is the Client's process-wide context. It is derived in
-	// newClient() and canceled by Close(). Dispatch paths (changefeed
-	// callbacks, OnChange subscribers) thread this through so subscribers see
-	// cancellation when the Client shuts down.
-	lifecycleCtx    context.Context
-	lifecycleCancel context.CancelFunc
-
 	startMu   sync.Mutex
 	started   atomic.Bool
 	closeOnce sync.Once
 	closed    atomic.Bool
-
-	// managerMu guards manager. The Manager is opt-in (BindManager) and
-	// nil for every caller that does not migrate to v1.5.0 explicitly.
-	managerMu sync.RWMutex
-	manager   *manager.Manager
 }
 
 // NewPostgres creates a Client backed by Postgres.
@@ -122,22 +109,13 @@ func newClient(s store.Store, cfg clientConfig) *Client {
 		logger = log.NewNop()
 	}
 
-	// cancel is intentionally stored on the Client (lifecycleCancel) and
-	// invoked from Close() to terminate dispatch goroutines and subscribers.
-	// gosec G118 flags WithCancel calls whose cancel is not invoked via defer;
-	// that heuristic is wrong for a long-lived lifecycle context that Close()
-	// drives explicitly. Keep the directive — without it lint fails.
-	ctx, cancel := context.WithCancel(context.Background())
-
 	c := &Client{
-		store:           s,
-		logger:          logger,
-		telemetry:       cfg.telemetry,
-		multiTenant:     cfg.multiTenantEnabled,
-		catalogService:  cfg.catalogService,
-		registry:        make(map[nskey]keyDef),
-		lifecycleCtx:    ctx,
-		lifecycleCancel: cancel,
+		store:          s,
+		logger:         logger,
+		telemetry:      cfg.telemetry,
+		multiTenant:    cfg.multiTenantEnabled,
+		catalogService: cfg.catalogService,
+		registry:       make(map[nskey]keyDef),
 	}
 
 	// Built in both modes so Close stays uniform: engine.New opens no
@@ -230,10 +208,6 @@ func (c *Client) Close() error {
 		defer c.startMu.Unlock()
 
 		c.closed.Store(true)
-
-		if c.lifecycleCancel != nil {
-			c.lifecycleCancel()
-		}
 
 		// Engine first, store second, and the order is load-bearing: the
 		// engine cancels its lifecycle, unsubscribes every scope, drops

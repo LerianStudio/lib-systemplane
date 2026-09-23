@@ -4,7 +4,6 @@ package client
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -13,9 +12,7 @@ import (
 	"time"
 
 	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
-	"github.com/LerianStudio/lib-systemplane/v4/internal/manager"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
-	"github.com/bxcodec/dbresolver/v2"
 )
 
 // memStore is a minimal in-memory store.Store implementation used to exercise
@@ -430,13 +427,10 @@ func TestOnChangeRefusesUnregisteredKey(t *testing.T) {
 
 			return newSingleTenantClient(t, newMemStore(false))
 		},
-		"multi-tenant with a bound Manager": func(t *testing.T) *Client {
+		"multi-tenant": func(t *testing.T) *Client {
 			t.Helper()
 
-			c := newMultiTenantClient(t, newMemStore(true))
-			c.BindManager(manager.New(nil))
-
-			return c
+			return newMultiTenantClient(t, newMemStore(true))
 		},
 	}
 
@@ -485,6 +479,52 @@ func TestGetInMultiTenantReadsThrough(t *testing.T) {
 	v, ok, err = c.Get(context.Background(), "ns", "k")
 	if err != nil || !ok || v.(string) != "set-by-test" {
 		t.Errorf("set then get: got (%v, %v, %v)", v, ok, err)
+	}
+}
+
+// TestMultiTenantSetThenGetReadsThrough pins read-your-writes for a caller that
+// carries a tenant, which is the case the deleted per-tenant cache used to
+// serve. Multi-tenant holds no in-process copy of a value: every read resolves
+// the tenant database from ctx and goes to the row, so a reader can never be
+// handed a stale value — or the registered default — for a key it just wrote.
+// Restoring a cached tenant scope is the engine-tenants lane's job (D4); until
+// then this holds trivially, and this test is what notices if a cache comes
+// back without read-your-writes.
+func TestMultiTenantSetThenGetReadsThrough(t *testing.T) {
+	c := newMultiTenantClient(t, newMemStore(true))
+
+	if err := c.Register("ns", "k", "default"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	defer c.Close()
+
+	ctx := tmcore.ContextWithTenantID(context.Background(), "t1")
+
+	if err := c.Set(ctx, "ns", "k", "written-by-t1", "actor"); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+
+	v, ok, err := c.Get(ctx, "ns", "k")
+	if err != nil || !ok {
+		t.Fatalf("get after set: got (%v, %v, %v)", v, ok, err)
+	}
+
+	if v != "written-by-t1" {
+		t.Errorf("get after set = %v, want the value just written: a tenant read must never lag its own write", v)
+	}
+
+	entry, ok, err := c.GetEntry(ctx, "ns", "k")
+	if err != nil || !ok {
+		t.Fatalf("GetEntry after set: got (%+v, %v, %v)", entry, ok, err)
+	}
+
+	if entry.Revision == 0 {
+		t.Error("Revision = 0 after a write: the read served something other than the row it just wrote")
 	}
 }
 
@@ -1167,7 +1207,6 @@ func TestGetEntryPopulatesPublishedState(t *testing.T) {
 	tests := []struct {
 		name   string
 		setup  func(t *testing.T) *Client
-		tenant string // non-empty puts a tenant in ctx, as middleware would
 		key    string
 		want   Entry
 		wantOK bool
@@ -1240,33 +1279,6 @@ func TestGetEntryPopulatesPublishedState(t *testing.T) {
 			wantOK: true,
 		},
 		{
-			name: "bound-Manager cache hit reports the cached value without provenance",
-			setup: func(t *testing.T) *Client {
-				t.Helper()
-
-				c := startedClient(t, newMultiTenantClient(t, newMemStore(true)))
-
-				mgr := manager.New(nil)
-				c.BindManager(mgr)
-				mgr.SetConnector(warmLoadFailsConnector{})
-
-				// Activation fails at warm-load, but only after the per-tenant
-				// state exists and is non-stale — which is all the cache needs.
-				// Failing before LISTEN also keeps this test goroutine-free.
-				if err := mgr.OnTenantActivated(context.Background(), "t1"); err == nil {
-					t.Fatal("expected activation to fail at warm-load")
-				}
-
-				mgr.Populate(context.Background(), "t1", "ns", "k", "from-manager-cache")
-
-				return c
-			},
-			tenant: "t1",
-			key:    "k",
-			want:   Entry{Value: "from-manager-cache"},
-			wantOK: true,
-		},
-		{
 			name: "unregistered key reports not ok",
 			setup: func(t *testing.T) *Client {
 				t.Helper()
@@ -1284,9 +1296,6 @@ func TestGetEntryPopulatesPublishedState(t *testing.T) {
 			c := tt.setup(t)
 
 			ctx := context.Background()
-			if tt.tenant != "" {
-				ctx = tmcore.ContextWithTenantID(ctx, tt.tenant)
-			}
 
 			got, ok, err := c.GetEntry(ctx, "ns", tt.key)
 			if err != nil {
@@ -1335,28 +1344,6 @@ func startedClient(t *testing.T, c *Client) *Client {
 	t.Cleanup(func() { _ = c.Close() })
 
 	return c
-}
-
-// warmLoadFailsConnector activates a tenant far enough to give the Manager a
-// per-tenant cache, then stops: warm-load fails, so no LISTEN connection is
-// ever opened and the test stays goroutine-free.
-type warmLoadFailsConnector struct{}
-
-func (warmLoadFailsConnector) ResolveDB(_ context.Context, _ string) (dbresolver.DB, error) {
-	return queryFailsDB{}, nil
-}
-
-func (warmLoadFailsConnector) ResolveDSN(_ context.Context, _ string) (string, error) {
-	return "", errors.New("no LISTEN connection in this test")
-}
-
-// queryFailsDB answers the warm-load query with an error. Every other method
-// is nil by embedding: calling one is a bug this test should crash on rather
-// than silently tolerate.
-type queryFailsDB struct{ dbresolver.DB }
-
-func (queryFailsDB) QueryContext(_ context.Context, _ string, _ ...any) (*sql.Rows, error) {
-	return nil, errors.New("warm-load query unavailable")
 }
 
 func TestCloseReturnsTheStoreErrorWrapped(t *testing.T) {

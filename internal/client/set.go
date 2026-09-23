@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/LerianStudio/lib-systemplane/v4/internal/engine"
-	"github.com/LerianStudio/lib-systemplane/v4/internal/manager"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -84,19 +83,10 @@ func (c *Client) Set(ctx context.Context, namespace, key string, value any, acto
 		entry.Revision = revision
 
 		c.engine.Publish(ctx, store.Scope{}, entry)
-
-		return nil
 	}
 
-	var canonical any
-	if err := json.Unmarshal(jsonBytes, &canonical); err != nil {
-		canonical = value
-	}
-
-	if mgr, tenantID := c.boundManager(), manager.TenantIDFromContext(ctx); mgr != nil && tenantID != "" {
-		mgr.Populate(ctx, tenantID, namespace, key, canonical)
-	}
-
+	// Multi-tenant holds no in-process cache: the row itself is the only copy,
+	// so the caller's next read through the same tenant sees this write.
 	return nil
 }
 
@@ -132,12 +122,6 @@ func (c *Client) Delete(ctx context.Context, namespace, key, actor string) error
 		// The registered default at revision 0, under the engine's delete
 		// fence, so a re-read already in flight cannot resurrect the row.
 		c.engine.PublishDelete(store.Scope{}, engine.NSKey{Namespace: namespace, Key: key})
-
-		return nil
-	}
-
-	if mgr, tenantID := c.boundManager(), manager.TenantIDFromContext(ctx); mgr != nil && tenantID != "" {
-		mgr.Invalidate(ctx, tenantID, namespace, key)
 	}
 
 	return nil

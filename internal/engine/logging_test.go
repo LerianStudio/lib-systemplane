@@ -522,7 +522,7 @@ func TestPublishLogsUnderTheCallerContext(t *testing.T) {
 
 // TestTenantIsLoggedUnderTheCanonicalKey pins the field key every tenant-scoped
 // line in this package uses. Three spellings were live in one repository at
-// once — a bare "tenant" here, "tenant_id" in internal/manager, and
+// once — a bare "tenant" here, "tenant_id" in the v3 multi-tenant Manager, and
 // lib-observability's own constants.AttrKeyTenantID — so an operator filtering
 // a log stream by tenant matched two of the three and silently lost the rest.
 // The engine follows the library constant; this assertion is what stops the

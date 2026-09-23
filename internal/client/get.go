@@ -10,7 +10,6 @@ import (
 
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/engine"
-	"github.com/LerianStudio/lib-systemplane/v4/internal/manager"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -87,18 +86,9 @@ func (c *Client) getEntry(ctx context.Context, namespace, key string) (Entry, bo
 		return c.singleTenantEntry(namespace, key, def), true, nil
 	}
 
-	// Multi-tenant: try the bound Manager's per-tenant cache first; fall
-	// through to a tenant-DB read on miss. Without a bound Manager this
-	// preserves v1.4.0 behaviour (DB roundtrip on every Get).
-	tenantID := manager.TenantIDFromContext(ctx)
-
-	mgr := c.boundManager()
-	if mgr != nil && tenantID != "" {
-		if v, hit, lookupErr := mgr.Lookup(ctx, tenantID, namespace, key); lookupErr == nil && hit {
-			return Entry{Value: engine.Clone(v)}, true, nil
-		}
-	}
-
+	// Multi-tenant: resolve the tenant database from ctx and read through.
+	// There is no in-process cache on this path, so a read always reflects
+	// what the tenant row holds right now, including this caller's own write.
 	entry, found, err := c.store.Get(ctx, store.Scope{}, namespace, key)
 	if err != nil {
 		return Entry{}, false, fmt.Errorf("systemplane: Get: %w", err)
@@ -117,13 +107,6 @@ func (c *Client) getEntry(ctx context.Context, namespace, key string) (Entry, bo
 		)
 
 		return Entry{}, false, fmt.Errorf("systemplane: decode value for %s/%s: %w", namespace, key, err)
-	}
-
-	// Populate the per-tenant cache so subsequent reads bypass the DB.
-	// Populate is a no-op for tenants that have never been activated, so it
-	// will never seed state behind the lifecycle handlers' back.
-	if mgr != nil && tenantID != "" {
-		mgr.Populate(ctx, tenantID, namespace, key, decoded)
 	}
 
 	return Entry{
