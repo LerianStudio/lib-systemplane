@@ -24,7 +24,7 @@
 
 | Phase | Milestone | Epics | Status |
 |-------|-----------|-------|--------|
-| 1 | `internal/engine` exists and is fully unit-tested standalone against a fake store: scope state, ingress, publish fence, reconcile, coalescing dispatch, bounded `Close`. `internal/client` still runs its own cache; the only user-visible changes are two corrections carried onto the shipping v3 path (the `key` log field renamed to `keyname`, and a named identity line for a panicking changefeed re-read), everything is green. | 1.1, 1.2, 1.3, 1.4 | Detailed |
+| 1 | `internal/engine` exists and is fully unit-tested standalone against a fake store: scope state, ingress, publish fence, reconcile, coalescing dispatch, bounded `Close`. `internal/client` still runs its own cache; the only user-visible changes are two corrections carried onto the shipping v3 path (the `key` log field renamed to `keyname`, and a named identity line for a panicking changefeed re-read), everything is green. | 1.1, 1.2, 1.3, 1.4 | Complete (PR #87 merged 2026-09-23) |
 | 2 | The single-tenant `Client` reads, writes and dispatches through the engine; `internal/manager`, the root `Manager` API and `examples/manager/` are gone; `WithCloseTimeout` / `ErrCloseTimeout` are public. | 2.1, 2.2, 2.3 | Detailed |
 | 3 | The v4 breaking surface is cut: `WithTable`, `WithListenChannel`, `WithCollection` removed; canonical names only; boundary, vet, perf and coverage gates green on the reduced surface. | 3.1, 3.2 | Epic-level |
 
@@ -610,6 +610,24 @@ Named edge cases: a `Publish` whose revision the store reported as 0 (a backend 
 ## Phase 2 — the Client on the engine, and the second engine deleted
 
 Phase 2 makes the engine the only cache in the library for the single-tenant scope, deletes `internal/manager` and the public `Manager` surface, and adapts every existing test to the new behavior. Tasks are elaborated when execution reaches this phase, against the engine as Phase 1 actually landed it.
+
+### Phase 2 deviations (elaboration 2026-09-23, orchestrator; re-checked against the merged tree)
+
+Recorded before dispatch so the tasks below are read against the tree as it exists, not as Phase 1 assumed. Full anchor report: the orchestrator's `elab/engine-core-phase2-recheck.md` (outside the repo); every anchor was verified on `git merge-tree origin/develop origin/feat/v4-engine-core` and again after PR #87 merged (develop `56f37b8`).
+
+- Phase 1 is merged: PR #87 (`feat/v4-engine-core`, ten fix passes plus one CodeRabbit round). Phase 2 runs on its own branch (`feat/v4-engine-client`, cut from `develop` `56f37b8`) and its own PR, so the breaking Manager-removal commit is reviewed on a diff that contains nothing else.
+- `Engine.Publish` carries the writer's `ctx` (`Publish(ctx, scope, entry)`) and ingests with an unarmed delete fence; there is no `Engine.Stale` accessor, `Lookup` reports staleness on the miss `Entry`. `applyDelete` bumps the per-key delete counter (fix passes 9-10), so `PublishDelete` gains a nil/closed guard and a Client `Delete` also refuses a re-read in flight. `PublishDelete` takes no `ctx` (the delete runs on the dispatch context, as the feed delete does).
+- `engine.KeyDef.Redacted` exists and the plan's registry adapter omitted it: the Client sets it from the key's redaction policy, or a redacted key's validator error text reaches WARN verbatim.
+- The validator ctx widening, the relaxed `Registry.Lookup` contract and the `Clone` fast path landed in Phase 1 fix pass 3; Phase 2 keeps only the Client adapter.
+- `develop` PR #78 (per-tenant write-through on `Set`/`Delete`, `internal/client/set.go` importing `internal/manager`) and PR #84 (graded hydrate and refresh, `hydrate_validator_test.go`) plus fix pass 10 (`(*Client).recoverRefresh`, `logging_test.go`, the `keyname` field) shaped `internal/client` after this plan was written; Task 2.1.x ports their tests onto the engine-backed Client (P2-04, P2-08) instead of deleting them, and P2-07 deletes the write-through with the Manager.
+- Groups hot-reload (PR #86) landed on `develop`: `api_group.go` subscribes `OnChange` at `Bind`, and three groups tests are Phase 2-sensitive. DECISIONS (orchestrator 2026-09-23): `TestGroupOnApplyBeforeStartHoldsDefaultsUntilTheEnginePublishesAtStart` is inverted and renamed by P2-04 (assert the stored document at its real revision with a converged status, delivery count not pinned), as its own godoc demands; the bound-Manager group test is deleted and `TestGroupPublishCarriesEachTenantToItsOwnScope` drops `NewManager`, asserts `OnApply` refuses in multi-tenant mode and keeps the tenant-hop assertions (P2-06); `api_group.go` stays untouched. These two test files are in the Phase 2 lane scope for those edits only.
+- A failed single-tenant `Start` is retriable INSIDE the engine (`Engine.Start` drops the scope whose first reconcile failed and brings it up again on the next call); the first elaboration's "discard and rebuild the engine" would have lost every `OnChange` registered before `Start`, because subscriptions live on the engine. One engine per Client.
+- `Set` validates the canonical JSON-decoded value on every ingress (Fred, 2026-09-23); the earlier "P2-04 keeps v3 `Set` semantics" text is superseded.
+- Single-tenant reads before `Start`: the engine reports an untracked scope as not stale; the Client reports `Stale` until `Start` succeeded.
+- A registered key whose only stored row the ingress rejects is announced with the registered default at revision 0 when nothing is cached (FC-11 as amended, `applySnapshotRow`); the coordinator's earlier "subscriber not called" reading is wrong.
+- The nine residuals of Phase 1 fix pass 10 land as two Phase 2 units: P2-13 (engine fixes: the failed re-read path records its outcome by scope identity, godoc counts, a test message, the unreaped dead worker) and P2-14 (the log-field guard also reads `log.Fields(...)` and `log.Field{Key: ...}` literals); `internal/testsupport/**` is in this lane's scope (§ What this lane owns) and in the Phase 2 harness scope.
+- `go.mod` pins `lib-commons/v7` while `CLAUDE.md` still says v6; P2-11 corrects only the CLAUDE.md lines this phase and that pin made false.
+- The plan cites a "§ Coverage baseline" that does not exist; the orchestrator captures the baseline from merged `develop` before dispatch, with `internal/manager` lines removed.
 
 ### Epic 2.1: Route the single-tenant Client through the engine
 
@@ -1566,8 +1584,8 @@ This lane raised four deviations while authoring. All four are closed against th
 
 **Closed in `index.md` by the orchestrator, no action left for this lane:** the stale engine-core Done-when clause requiring `NewMongoDB(..., WithMultiTenantEnabled())` to error (superseded by the D6 rewrite), FC-2's "(MongoDB with a non-empty tenant)" parenthetical on `Store.Subscribe`, and `ddl.go`'s doc comment naming `internal/manager/schema.go` which Epic 2.2 deletes. The last one is a one-line fix in a file the `storage` lane owns.
 
-**Handoffs to other lanes (recorded 2026-09-23, Phase 1 fix pass).** Four bullets, counted: three
-to `engine-tenants` and one to `storage`. All are work another lane owns; none blocks this one.
+**Handoffs to other lanes (recorded 2026-09-23, Phase 1 fix pass; two added at the Phase 2 elaboration).** Six bullets, counted: three
+to `engine-tenants`, one to `storage`, one to `docs` and one to `groups`. All are work another lane owns; none blocks this one.
 
 - **`engine-tenants` — bring-up is serialized engine-wide.** `bringUpScope`
   (`internal/engine/engine.go`) holds the engine-global `startMu` across the whole `Store.Subscribe`
@@ -1628,6 +1646,17 @@ to `engine-tenants` and one to `storage`. All are work another lane owns; none b
   `sc.reconcileMu` and AFTER the touched check, never outside the lock — read outside it, the
   comparison races the feed publication that the touched check exists to defer to, and the reconcile
   can skip a row on the strength of a cache entry that changed underneath it.
+- **`docs` — `MIGRATION-v4.md` must tell consumers to call `runtime.SetProductionMode(true)` and
+  `runtime.InitPanicMetrics(factory)` at startup.** v4 runs consumer validators over stored rows on
+  engine goroutines; without those two calls lib-observability logs a panicking validator's value in
+  the clear and `panic_recovered_total` never moves. The library must not flip a process global on
+  its host, so this is a documented consumer obligation (fix pass 10 obs-reviewer residual).
+- **`groups` — comments that describe Client internals Phase 2 deletes.** After engine-core Phase 2,
+  `internal/group/coordinator.go` (the `seedLocked` godoc naming `refreshFromStore`, `registryMu`,
+  `cacheMu`, `fireSubscribers`) and `api_group.go` (godoc saying the Client hydrates at `Start` without
+  announcing, and naming a bound Manager) describe code that no longer exists; the invariants they
+  rely on hold on the engine (no lock across a callback, re-entrant `Get`/`GetEntry`, FC-11
+  announcement at `Start`, multi-tenant `OnChange` refused until engine-tenants).
 
 **Declined in Phase 1, reopened as the wave-3 handoff above (amended 2026-09-23):** the reviewer's
 suggestion that `applySnapshotRow` (`internal/engine/reconcile.go`) skip `prepare` for a snapshot
@@ -1706,7 +1735,7 @@ Known v3-only residual, recorded here and deliberately NOT corrected in Phase 1:
   the error's dynamic type". That is the pattern already in the tree; nothing new has to be
   designed for it.
 
-**Open deviations: two, both recorded 2026-09-23 in the Phase 1 fix pass.** Neither blocks this lane
+**Open deviations: three, all recorded 2026-09-23 (two in the Phase 1 fix pass, one at the Phase 2 elaboration).** Neither blocks this lane
 and neither bends a frozen contract.
 
 - **`lib-observability` — `universalShim.Enabled` answers for the shim, not for the logger it
@@ -1724,6 +1753,11 @@ and neither bends a frozen contract.
   concurrency guard are recorded in the `engine-tenants` single-flight handoff above; it is listed
   here because it reverses a decision this section previously recorded as closed, and a reversal
   should be findable from the deviations list rather than only from the handoff it moved into.
+- **Fix pass 10 acceptance criterion `source == "systemplane.client"` was unsatisfiable, and is not
+  re-issued.** `runtime.HandlePanicValue(ctx, logger, v, component, name)` writes `name` to the line's
+  `source` field and the component nowhere on the line, so `TestRefreshPanicNamesTheKey` correctly
+  asserts `source == "refresh"`; pinning the component that labels `panic_recovered_total` needs a
+  telemetry recorder, not the recording logger.
 
 **The anchor sweep, and the passes that called it finished early.** Five passes now, four of which
 called it done. `b455a78` and
