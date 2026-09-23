@@ -487,6 +487,12 @@ func TestReconcileKeepsCachedValueWhenRereadWasUnusable(t *testing.T) {
 				fs.onGet(func(store.Scope, NSKey) error { return errors.New("read failed") })
 			},
 		},
+		"the reread panics": {
+			def: KeyDef{Default: "fallback"},
+			arrange: func(fs *fakeStore) {
+				fs.onGet(func(store.Scope, NSKey) error { panic("the store driver exploded") })
+			},
+		},
 		"the reread is rejected by the validator": {
 			def: KeyDef{
 				Default: "fallback",

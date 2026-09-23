@@ -778,6 +778,12 @@ func TestScopeDropDiagnosticsAreDebug(t *testing.T) {
 	}
 }
 
+// rereadPanicMsg is the one line a panic under a changefeed re-read produces,
+// whichever of the three re-read paths raised it. It says "changefeed" rather
+// than "debounced" because two of those paths are not debounced at all: a
+// consumer on WithDebounce(0), and an engine built with no debouncer.
+const rereadPanicMsg = "systemplane.engine: changefeed re-read panicked"
+
 // TestDebouncedReReadPanicNamesTheKey pins the identity on the one panic the
 // debouncer alone would report anonymously.
 //
@@ -788,7 +794,7 @@ func TestScopeDropDiagnosticsAreDebug(t *testing.T) {
 // an actionable line, and the engine stays usable afterwards: the re-read is
 // dropped, not the process.
 func TestDebouncedReReadPanicNamesTheKey(t *testing.T) {
-	const msg = "systemplane.engine: debounced re-read panicked"
+	const msg = rereadPanicMsg
 
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 	scope := store.Scope{Tenant: "acme"}
@@ -829,6 +835,112 @@ func TestDebouncedReReadPanicNamesTheKey(t *testing.T) {
 		t.Fatalf("Close after a panicking re-read: %v, want nil: one exploding store call must not "+
 			"strand shutdown", err)
 	}
+}
+
+// TestInlineReReadPanicNamesTheKey is the twin of the test above for the path
+// a consumer on WithDebounce(0) takes — a documented production mode, not only
+// a test convenience — and for an engine built with no debouncer at all.
+//
+// Both refresh inline instead of on a timer goroutine, so neither ever entered
+// the recovery that named the key: the panic was reported by the debouncer's
+// anonymous guard, which in production mode redacts the value and the stack
+// and leaves an operator with "something under the debouncer blew up".
+func TestInlineReReadPanicNamesTheKey(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{Tenant: "acme"}
+	fs := newFakeStore()
+	rec := &recordingLogger{Logger: log.NewNop()}
+
+	// No Debounce: Submit runs the re-read inline, on this goroutine.
+	e := New(Config{
+		Store:    fs,
+		Registry: fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: "fallback"}}},
+		Logger:   rec,
+	})
+	track(t, e, scope)
+
+	fs.onGet(func(store.Scope, NSKey) error { panic("the store driver exploded") })
+
+	e.onEvent(upsertEvent(scope, nk, 1))
+
+	requireLogged(t, rec, log.LevelError, rereadPanicMsg, nk)
+
+	tenant, ok := findLogged(rec, rereadPanicMsg).field(constants.AttrKeyTenantID)
+	if !ok || tenant.Value != scope.Tenant {
+		t.Errorf("%q tenant field: got %v (present=%t), want %q: a panic naming no tenant sends an "+
+			"operator through every tenant's logs", rereadPanicMsg, tenant.Value, ok, scope.Tenant)
+	}
+
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close after a panicking inline re-read: %v, want nil", err)
+	}
+}
+
+// slowLogger delays recording one message, so a test can tell "the line was
+// written before Close returned" from "Close returned and the line landed a
+// moment later" without racing on nanoseconds. A logger that takes a moment to
+// reach its sink is what a production one does anyway.
+type slowLogger struct {
+	*recordingLogger
+
+	msg   string
+	delay time.Duration
+}
+
+func (s *slowLogger) Log(ctx context.Context, level int, msg string, fields ...any) {
+	if msg == s.msg {
+		time.Sleep(s.delay)
+	}
+
+	s.recordingLogger.Log(ctx, level, msg, fields...)
+}
+
+// TestPanicIdentityIsRecordedBeforeCloseReturns pins the ORDER, which is the
+// half of the identity line that decides whether an operator ever sees it.
+//
+// The re-read's WaitGroup release and its panic recovery are both deferred on
+// the tracked path, so their order is the registration order: a recovery
+// registered outside the release lets Close return — and the process exit, or
+// the test binary's logger teardown — while the line naming the tenant, the
+// namespace and the key is still being written. Close waiting for the re-read
+// has to mean waiting for its report too.
+func TestPanicIdentityIsRecordedBeforeCloseReturns(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{Tenant: "acme"}
+	fs := newFakeStore()
+	rec := &recordingLogger{Logger: log.NewNop()}
+
+	e := New(Config{
+		Store:        fs,
+		Registry:     fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: "fallback"}}},
+		Logger:       &slowLogger{recordingLogger: rec, msg: rereadPanicMsg, delay: 50 * time.Millisecond},
+		Debounce:     time.Millisecond,
+		CloseTimeout: 2 * time.Second,
+	})
+	track(t, e, scope)
+
+	t.Cleanup(func() { _ = e.Close() })
+
+	inGet := make(chan struct{})
+
+	fs.onGet(func(store.Scope, NSKey) error {
+		close(inGet)
+
+		panic("the store driver exploded")
+	})
+
+	e.onEvent(upsertEvent(scope, nk, 1))
+
+	// Close only once the timer has fired and the re-read is inside the store
+	// call: a Close that ran first would discard the pending timer, and there
+	// would be no panic to report at all.
+	<-inGet
+
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close after a panicking re-read: %v, want nil", err)
+	}
+
+	requireLogged(t, rec, log.LevelError, rereadPanicMsg, nk)
 }
 
 // findLogged returns the single entry carrying msg. requireLogged has already

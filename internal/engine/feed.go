@@ -147,8 +147,6 @@ func (e *Engine) onEvent(evt store.Event) {
 // read that product — registered keys times tracked scopes — as the engine's
 // worst-case simultaneous demand on the store.
 func (e *Engine) trackedRefresh(scope store.Scope, nk NSKey) {
-	defer e.recoverRefresh(scope, nk)
-
 	if !e.beginWork() {
 		return
 	}
@@ -158,16 +156,33 @@ func (e *Engine) trackedRefresh(scope store.Scope, nk NSKey) {
 	e.refreshKey(scope, nk)
 }
 
-// recoverRefresh reports a panic raised under a debounced re-read, naming the
-// key it happened on.
+// recoverRefresh reports a panic raised under a changefeed re-read, naming the
+// key it happened on, and records that key as unusable.
 //
-// The debouncer's own guard would catch it, and that is what this replaces at
-// the top of the stack rather than duplicates: runtime.RecoverAndLog logs
-// source="debounce" and nothing else, and in production mode the value and the
-// stack are redacted out of that line, so an operator learns something under
-// the debouncer blew up and never which tenant, namespace or key. The
-// debouncer's guard stays the outer net — including for a consumer logger that
-// panics on the line below.
+// It is deferred by refreshKey rather than by the one caller that wraps it, so
+// all three re-read paths carry the identity: the tracked one, the inline one
+// a consumer on WithDebounce(0) takes, and the one an engine with no debouncer
+// takes. The debouncer's own guard would catch a panic on two of them, and
+// that is what this replaces at the top of the stack rather than duplicates:
+// runtime.RecoverAndLog logs source="debounce" and nothing else, and in
+// production mode the value and the stack are redacted out of that line, so an
+// operator learns something under the debouncer blew up and never which
+// tenant, namespace or key. The debouncer's guard stays the outer net —
+// including for a consumer logger that panics on the line below.
+//
+// Sitting inside refreshKey is also what orders it against Close. On the
+// tracked path trackedRefresh releases the WaitGroup with a defer of its own,
+// and an unwind runs this frame's defers first, so the report and the panic
+// metric are complete before Close can return; deferred alongside that
+// release, the recovery ran after it and Close returned mid-line.
+//
+// The key is recorded as unusable for the same reason a re-read that errored
+// is: a panic teaches the engine nothing about the key, and a reconcile in
+// flight that sees an empty fence treats the key absent from its snapshot as
+// deleted and publishes the registered default at revision 0 — turning one
+// exploding store call into a silent config reset. The deferred unlocks of
+// every frame between here and the panic have already run by the time this
+// one does, so the scope's reconcile mutex is free to take.
 //
 // HandlePanicValue rather than a re-panic into that net because only it
 // records panic_recovered_total and the span event: RecoverAndLog takes no
@@ -182,11 +197,13 @@ func (e *Engine) recoverRefresh(scope store.Scope, nk NSKey) {
 
 	ctx := e.dispatchContext()
 
-	e.logError(ctx, "systemplane.engine: debounced re-read panicked",
+	e.logError(ctx, "systemplane.engine: changefeed re-read panicked",
 		log.String(constants.AttrKeyTenantID, scope.Tenant),
 		log.String("namespace", nk.Namespace),
 		log.String("keyname", nk.Key),
 	)
+
+	e.recordFeedOutcome(scope, nk, false)
 
 	runtime.HandlePanicValue(ctx, e.logger, recovered, "systemplane.engine", "refresh")
 }
@@ -275,7 +292,15 @@ func (e *Engine) applyDelete(scope store.Scope, nk NSKey) {
 //   - a row the ingress rejects (undecodable or refused by the validator) is
 //     recorded as unusable, so a concurrent reconcile keeps the cached value
 //     instead of concluding the key is absent.
+//
+// A panic under any of it is the fourth, and recoverRefresh decides it: the
+// deferred recovery lives here, on the one function every re-read path runs
+// through, so an exploding store call names its key whether the re-read was
+// tracked, inline or debouncer-less. A validator that panics never reaches it
+// — runValidator turns that into an ordinary rejection.
 func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
+	defer e.recoverRefresh(scope, nk)
+
 	// Checked before the store call, not only after it: a re-read for a
 	// dropped tenant would otherwise open a connection to a database that
 	// tenant no longer has, to publish into a scope nothing tracks.
