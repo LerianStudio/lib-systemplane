@@ -754,7 +754,9 @@ Verification for this paragraph: `TestIngestValidatorSeesTheWriterContextOnPubli
 by the ctx handed to `Publish` is visible inside the validator) and
 `TestIngestValidatorGetsNoTenantOnFeedAndReconcile` (a validator that refuses without a tenant leaves
 the previous value in force after a feed re-read and after a reconcile, and the rejection is logged
-once), both under `-race`.
+once; the same test stamps a request marker on the ctx handed to `Start` and to `Store.Subscribe` and
+asserts the validator cannot observe it on either read-back path, since the engine dispatch context
+carries no request values), both under `-race`.
 
 **`Start`** (`internal/client/client.go:189-277`) keeps its guards and its `c.store.Start(ctx)` call,
 and then, in single-tenant mode, is exactly `if err := c.engine.Start(ctx); err != nil { return err }`.

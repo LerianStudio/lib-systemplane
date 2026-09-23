@@ -492,7 +492,7 @@ When a scope completes its first reconcile (single-tenant at `Start`, a tenant a
 
 ### FC-10 Facade surface kept unchanged (admin and consumers rely on it)
 
-`NewPostgres(db *sql.DB, listenDSN string, opts ...Option)`, `NewMongoDB(client *mongo.Client, database string, opts ...Option)`, `NewForTesting`, `Register`, `Start`, `Close`, `Get`, `GetString`, `GetInt`, `GetBool`, `GetFloat64`, `GetDuration`, `Set`, `Delete`, `List`, `Catalog`, `CatalogKey`, `CatalogService`, `KeyDescription`, `KeyRedaction`, `IsRegistered`, `Logger`, key options `WithDescription`, `WithValidator`, `WithContextValidator` (landed on `develop` 2026-09-22 in PR #79: the validator receives the `Set` context; in v4 every other ingress passes a context with no tenant, see lane-engine-core Task 2.1.3), `WithRedaction`, `WithCatalogMetadata`, client options `WithLogger`, `WithTelemetry`, `WithDebounce`, `WithPollInterval`, `WithMultiTenantEnabled`, `WithModule`, `WithCatalogService`. `admin.Mount` / `admin.MountCatalog` and their options unchanged.
+`NewPostgres(db *sql.DB, listenDSN string, opts ...Option)`, `NewMongoDB(client *mongo.Client, database string, opts ...Option)`, `NewForTesting`, `Register`, `Start`, `Close`, `Get`, `GetString`, `GetInt`, `GetBool`, `GetFloat64`, `GetDuration`, `Set`, `Delete`, `List`, `Catalog`, `CatalogKey`, `CatalogService`, `KeyDescription`, `KeyRedaction`, `IsRegistered`, `Logger`, key options `WithDescription`, `WithValidator`, `WithContextValidator` (landed on `develop` 2026-09-22 in PR #79: the validator receives the `Set` context; in v4 every other ingress passes a context with no tenant for the zero scope; whether a tenant scope's read-back context carries the tenant id is decided at engine-tenants elaboration, see lane-engine-core Task 2.1.3), `WithRedaction`, `WithCatalogMetadata`, client options `WithLogger`, `WithTelemetry`, `WithDebounce`, `WithPollInterval`, `WithMultiTenantEnabled`, `WithModule`, `WithCatalogService`. `admin.Mount` / `admin.MountCatalog` and their options unchanged.
 
 Removed in v4: `Manager`, `ManagerOption`, `NewManager`, `WithManagerLogger`, `WithManagerTelemetry`, `WithManagerAggregateTenantThreshold`, `(*Manager).*`, `WithTable`, `WithListenChannel`, `WithCollection`, `DefaultSeedSQL`. Replacement for the aggregate threshold: `WithAggregateTenantThreshold(n int) Option` on the Client (engine-tenants lane); frozen 2026-09-18: the default is the exported `DefaultAggregateTenantThreshold = 1000`, per-tenant metric attributes collapse to the literal `aggregate` once more than `n` tenant scopes are active, and a non-positive `n` disables the collapse (per-tenant attributes whatever the cardinality). Added: `WithCloseTimeout(d time.Duration) Option` and sentinel `ErrCloseTimeout` (engine-core lane, D10).
 
@@ -615,11 +615,13 @@ Absence checks deferred from lanes under rule 4 live here (see the lane's Done-w
 
 - A single-tenant consumer whose store holds a row its own registered validator rejects no longer sees that row on read. The last valid value, or the registered default, stays in force and the rejection is logged (D1, FC-11). In v3 the raw row reached `Get`/`Group.Snapshot`. Found at engine-core Phase 2 elaboration: three groups tests asserted the v3 behaviour.
 - A key validator runs on every ingress in v4, with the caller's context on `Set` and with an engine
-  context that carries no tenant on changefeed and reconcile read-back, for the zero scope and for
-  tenant scopes alike. v3 `develop` grades single-tenant read-back only (PR #84) and leaves multi-tenant
-  reads ungraded; v4 grades both. A validator registered with `WithContextValidator` that refuses without
-  a tenant pins the last valid value (or the default) for every stored row. Found at the 2026-09-23
-  merge check of engine-core against `develop`.
+  context that carries no tenant on changefeed and reconcile read-back. That is settled for the zero
+  scope. For tenant scopes it is PROVISIONAL: whether the read-back context carries the tenant id (not
+  its connection) is decided at engine-tenants elaboration (lane-engine-core Task 2.1.3); until then a
+  tenant scope behaves like the zero scope. v3 `develop` grades single-tenant read-back only (PR #84)
+  and leaves multi-tenant reads ungraded; v4 grades both. A validator registered with
+  `WithContextValidator` that refuses without a tenant pins the last valid value (or the default) for
+  every stored row on read-back. Found at the 2026-09-23 merge check of engine-core against `develop`.
 - MongoDB `Delete` leaves a tombstone document (`deleted: true`) instead of removing the row (D11, FC-9). Anyone reading `systemplane_entries` directly must filter `deleted: {$ne: true}`.
 - A connector-resolved MongoDB tenant database requires `createCollection` on first use, exactly as a ctx-resolved multi-tenant database does today; the single-tenant lazy bootstrap keeps skipping `CreateCollection` (storage Phase 2 elaboration, deviation 1).
 - Postgres `SchemaSQL()` refuses to run when a `systemplane_entries` exists in any non-system schema other than the applying role's `current_schema()` (FC-8 guard); such installs use `MigrationV3ToV4SQL()`, which itself refuses to run when the table does not resolve on `search_path` or exists in two schemas.

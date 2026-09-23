@@ -1020,7 +1020,9 @@ through `WithContextValidator` instead of `WithValidator`), its tests, the `Bind
 caller's `WithContextValidator` in opts is ignored.
 **Dependencies:** Phase 2 merged; engine-core Task 2.1.3 (defines which context each ingress passes; on
 changefeed and reconcile read-back the context carries no tenant, so a group validator that refuses
-without one pins the last accepted document).
+without one pins the last accepted document); the engine-tenants decision on whether a tenant scope's
+read-back context carries the tenant id (provisional until that lane elaborates: tenant scopes behave
+like the zero scope).
 **Done when:** a group validator receives the `Set` caller's context on the write path and a tenant-less
 context on read-back, pinned by tests; the godoc states both.
 **Status:** Pending
