@@ -178,7 +178,7 @@ func TestIngestRejectsPanickingValidatorWithoutLeakingPanicValue(t *testing.T) {
 	runtime.SetProductionMode(true)
 	t.Cleanup(func() { runtime.SetProductionMode(false) })
 
-	const secret = "sk_live_7Rq2pAnIcKeDtOkEn"
+	const secret = "validator-panic-sentinel-Zq7Xk"
 
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 	logger := &recordingLogger{Logger: log.NewNop()}
