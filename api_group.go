@@ -210,7 +210,21 @@ func (g *Group[T]) decodePublished(value any) (T, error) {
 //
 // The read uses context.Background() because OnApply takes no context, so a
 // seeded snapshot carries the single-tenant scope.
+//
+// A tenant-scoped key is the one case with nothing to seed by construction:
+// its document belongs to a tenant, and every tenant's own arrives as a
+// publication of its scope, so there is no single document in force for a
+// context carrying no tenant to read. Reading anyway would either refuse for
+// want of a tenant database or, worse, deliver the zero scope's document as
+// though it were every tenant's. The registration takes the live deliveries
+// only. CatalogKey is how the facade asks; on a closed Client it reports no
+// key at all, and the read below is then the right answer either way, because
+// it fails with ErrClosed and that travels back to the registrant.
 func (g *Group[T]) seedCurrentEntry() (group.Publication, bool, error) {
+	if detail, known := g.client.CatalogKey(g.namespace, g.key); known && detail.TenantScoped {
+		return group.Publication{}, false, nil
+	}
+
 	entry, ok, err := g.client.GetEntry(context.Background(), g.namespace, g.key)
 	if err != nil {
 		return group.Publication{}, false, err
@@ -400,14 +414,19 @@ type ApplyStatus struct {
 // instead of running its compiled-in defaults until a write that may never come.
 // Reading after [Client.Close] fails this way. A key with nothing stored is not
 // a failure — the registered defaults are delivered once the Client tracks it.
+// Multi-tenant mode takes no such read, for the reason the next paragraph
+// gives.
 //
 // A nil fn registers nothing and returns no error, matching [Client.OnChange].
 // unsubscribe is idempotent, is safe to call from inside fn itself, and
 // releases that function's hold on the scope's applied revision. In
 // multi-tenant mode with no bound Manager OnApply returns
 // ErrNotSupportedInMultiTenant, while [Group.Snapshot] and [Group.Set] keep
-// working; on a nil *Group it returns ErrClosed. unsubscribe is never nil, so
-// a caller may defer it before checking err.
+// working. With a bound Manager it registers and returns no error, and there is
+// no initial delivery: every document belongs to a tenant, so none is in force
+// until that tenant publishes one. Each tenant's later publications then reach
+// fn with that tenant in Applied.Tenant. On a nil *Group it returns ErrClosed.
+// unsubscribe is never nil, so a caller may defer it before checking err.
 func (g *Group[T]) OnApply(fn func(ctx context.Context, a Applied[T]) error) (unsubscribe func(), err error) {
 	noop := func() {}
 
