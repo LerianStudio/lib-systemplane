@@ -44,10 +44,23 @@ type RunOptions struct {
 	// runs in. The zero value is the single-tenant scope.
 	Scope store.Scope
 
-	// SkipRevisionAndResync is a temporary gate for a backend that has not
-	// landed revisions, store.OpDisconnect and store.OpResync yet; it is
-	// deleted in Phase 3, once both backends satisfy FC-2.
-	SkipRevisionAndResync bool
+	// Reconnect forces the changefeed under test to lose its connection, so
+	// the suite can assert the narration that follows. The backend supplies
+	// it because only the backend knows how to kill its own feed:
+	// pg_terminate_backend on the LISTEN backend for Postgres, killCursors on
+	// the change stream for MongoDB.
+	//
+	// It is called exactly once, from inside ResyncAfterForcedReconnect,
+	// after that sub-test's single Factory call and after the feed has
+	// delivered its joining OpResync and one key event — so the store whose
+	// connection it must kill is the one that Factory call returned, which
+	// backends capture in the factory closure (sub-tests run sequentially).
+	// It returns once the kill is issued, without waiting for recovery; the
+	// suite owns the wait.
+	//
+	// Nil means this configuration cannot force a reconnect, and the sub-test
+	// skips.
+	Reconnect func(t *testing.T)
 }
 
 // Run executes the full contract suite against every Store produced by factory.
@@ -93,6 +106,13 @@ func Run(t *testing.T, f Factory, opts RunOptions) {
 		runStartIdempotent(t, s)
 	})
 
+	t.Run("RevisionMonotonic", func(t *testing.T) {
+		s, cleanup := f(t)
+		t.Cleanup(cleanup)
+
+		runRevisionMonotonic(t, s, opts)
+	})
+
 	if !opts.SkipSubscribe {
 		t.Run("SubscribeReceivesUpsert", func(t *testing.T) {
 			s, cleanup := f(t)
@@ -115,47 +135,34 @@ func Run(t *testing.T, f Factory, opts RunOptions) {
 			runUnsubscribeStops(t, s, opts)
 		})
 
-		// Ungated on purpose, and placed here rather than below the gated
-		// block: both backends satisfy it, and a sub-test appended after a
-		// gate is skipped by position alone.
-		t.Run("SubscribeThenImmediateWriteNeverLosesTheEvent", func(t *testing.T) {
-			runSubscribeThenImmediateWrite(t, f, opts)
-		})
-	}
-
-	// Gated as blocks rather than as early returns on purpose: a sub-test
-	// appended below would otherwise be skipped by position alone, silently,
-	// for every backend that sets one of these options.
-	if !opts.SkipRevisionAndResync {
-		t.Run("RevisionMonotonic", func(t *testing.T) {
+		t.Run("SubscribeEmitsResyncFirst", func(t *testing.T) {
 			s, cleanup := f(t)
 			t.Cleanup(cleanup)
 
-			runRevisionMonotonic(t, s, opts)
+			runSubscribeEmitsResyncFirst(t, s, opts)
 		})
 
-		if !opts.SkipSubscribe {
-			t.Run("SubscribeEmitsResyncFirst", func(t *testing.T) {
-				s, cleanup := f(t)
-				t.Cleanup(cleanup)
+		t.Run("EventCarriesScopeAndRevision", func(t *testing.T) {
+			s, cleanup := f(t)
+			t.Cleanup(cleanup)
 
-				runSubscribeEmitsResyncFirst(t, s, opts)
-			})
+			runEventCarriesScopeAndRevision(t, s, opts)
+		})
 
-			t.Run("EventCarriesScopeAndRevision", func(t *testing.T) {
-				s, cleanup := f(t)
-				t.Cleanup(cleanup)
+		t.Run("DeleteEventRevisionZero", func(t *testing.T) {
+			s, cleanup := f(t)
+			t.Cleanup(cleanup)
 
-				runEventCarriesScopeAndRevision(t, s, opts)
-			})
+			runDeleteEventRevisionZero(t, s, opts)
+		})
 
-			t.Run("DeleteEventRevisionZero", func(t *testing.T) {
-				s, cleanup := f(t)
-				t.Cleanup(cleanup)
+		t.Run("SubscribeThenImmediateWriteNeverLosesTheEvent", func(t *testing.T) {
+			runSubscribeThenImmediateWrite(t, f, opts)
+		})
 
-				runDeleteEventRevisionZero(t, s, opts)
-			})
-		}
+		t.Run("ResyncAfterForcedReconnect", func(t *testing.T) {
+			runResyncAfterForcedReconnect(t, f, opts)
+		})
 	}
 }
 
@@ -841,6 +848,197 @@ func runDeleteEventRevisionZero(t *testing.T, s store.Store, opts RunOptions) {
 
 	if del.Revision != 0 {
 		t.Errorf("delete revision = %d, want 0", del.Revision)
+	}
+}
+
+// reconnectRecoveryWait bounds the wait for a feed to come back after
+// RunOptions.Reconnect killed its connection. Deliberately NOT opts.EventWait:
+// recovery runs through the backend's reconnect backoff, which is a different
+// order of magnitude from how fast a healthy feed echoes a write.
+const reconnectRecoveryWait = 60 * time.Second
+
+// runResyncAfterForcedReconnect pins the whole connectivity narration FC-2
+// promises: when a feed loses its connection its subscribers hear exactly one
+// OpDisconnect, then exactly one OpResync once it is back, and only then key
+// events again. The engine marks a scope Stale on the disconnect and has no
+// route out of Stale other than reconciling the resync that follows, so a
+// missing marker strands the scope and a duplicated one floods the engine.
+func runResyncAfterForcedReconnect(t *testing.T, f Factory, opts RunOptions) {
+	t.Helper()
+
+	if opts.Reconnect == nil {
+		t.Skip("RunOptions.Reconnect is nil: this configuration supplies no way to kill its own changefeed")
+	}
+
+	s, cleanup := f(t)
+	t.Cleanup(cleanup)
+
+	startStore(t, s)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rec := &eventRecorder{}
+
+	unsub, err := s.Subscribe(ctx, opts.Scope, rec.record)
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	defer unsub()
+
+	rec.waitUntil(t, "the joining resync", opts.EventWait, func(seq []store.Event) bool {
+		return len(seq) > 0 && seq[0].Op == store.OpResync
+	})
+
+	setEntry(ctx, t, s, opts.Scope, entry("ns", "before", 1))
+
+	rec.waitUntil(t, "the upsert for ns/before", opts.EventWait, func(seq []store.Event) bool {
+		return hasUpsert(seq, "ns", "before")
+	})
+
+	// Everything the feed said while it was healthy is behind mark; the
+	// outage narration is exactly what lands after it.
+	mark := len(rec.snapshot())
+
+	opts.Reconnect(t)
+
+	rec.waitUntil(t, "an OpResync after the forced reconnect", reconnectRecoveryWait, func(seq []store.Event) bool {
+		for _, e := range seq[mark:] {
+			if e.Op == store.OpResync {
+				return true
+			}
+		}
+
+		return false
+	})
+
+	setEntry(ctx, t, s, opts.Scope, entry("ns", "after", 1))
+
+	full := rec.waitUntil(t, "the upsert for ns/after", opts.EventWait, func(seq []store.Event) bool {
+		return hasUpsert(seq[mark:], "ns", "after")
+	})
+
+	assertReconnectNarration(t, full[mark:], opts)
+}
+
+// assertReconnectNarration checks seq — everything the feed delivered from the
+// forced connection loss onwards — against FC-2: one OpDisconnect, then one
+// OpResync, both scoped and carrying no key, then key events and no further
+// marker.
+func assertReconnectNarration(t *testing.T, seq []store.Event, opts RunOptions) {
+	t.Helper()
+
+	if len(seq) < 2 {
+		t.Fatalf("only %d events after the forced reconnect, want the disconnect and resync markers; sequence: %+v", len(seq), seq)
+	}
+
+	if seq[0].Op != store.OpDisconnect {
+		t.Fatalf("first event after the forced reconnect = %+v, want op %q; sequence: %+v", seq[0], store.OpDisconnect, seq)
+	}
+
+	if seq[1].Op != store.OpResync {
+		t.Fatalf("second event after the forced reconnect = %+v, want op %q; sequence: %+v", seq[1], store.OpResync, seq)
+	}
+
+	assertMarkersAreScopedAndKeyless(t, seq, opts)
+
+	rest := seq[2:]
+
+	for _, e := range rest {
+		if e.Op == store.OpDisconnect || e.Op == store.OpResync {
+			t.Fatalf("extra %q marker after the reconnect narration; sequence: %+v", e.Op, seq)
+		}
+	}
+
+	if !hasUpsert(rest, "ns", "after") {
+		t.Fatalf("the upsert for ns/after did not land after the reconnect narration; sequence: %+v", seq)
+	}
+
+	for _, e := range rest {
+		if e.Namespace == "ns" && e.Key == "after" && e.Scope != opts.Scope {
+			t.Errorf("ns/after event scope = %+v, want %+v; sequence: %+v", e.Scope, opts.Scope, seq)
+		}
+	}
+}
+
+// assertMarkersAreScopedAndKeyless pins what the two connectivity markers must
+// carry: the subscriber's own scope, so an engine holding several scopes knows
+// which one went stale, and nothing else.
+func assertMarkersAreScopedAndKeyless(t *testing.T, seq []store.Event, opts RunOptions) {
+	t.Helper()
+
+	for i, marker := range seq[:2] {
+		if marker.Scope != opts.Scope {
+			t.Errorf("marker %d scope = %+v, want %+v; sequence: %+v", i, marker.Scope, opts.Scope, seq)
+		}
+
+		if marker.Namespace != "" || marker.Key != "" {
+			t.Errorf("marker %d names %q/%q, want empty namespace and key; sequence: %+v", i, marker.Namespace, marker.Key, seq)
+		}
+
+		if marker.Revision != 0 {
+			t.Errorf("marker %d revision = %d, want 0; sequence: %+v", i, marker.Revision, seq)
+		}
+	}
+}
+
+// hasUpsert reports whether seq carries an upsert for ns/key.
+func hasUpsert(seq []store.Event, ns, key string) bool {
+	for _, e := range seq {
+		if e.Op == store.OpUpsert && e.Namespace == ns && e.Key == key {
+			return true
+		}
+	}
+
+	return false
+}
+
+// eventRecorder records every delivered event in arrival order and never drops
+// one, which is what lets a test assert on the SEQUENCE as a whole — "exactly
+// one disconnect, then one resync, then key events" is a claim about order and
+// about what is NOT there. eventChan cannot carry such a claim: it drops on a
+// full buffer and its waitFor skips every event that does not match.
+type eventRecorder struct {
+	mu     sync.Mutex
+	events []store.Event
+}
+
+func (r *eventRecorder) record(evt store.Event) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.events = append(r.events, evt)
+}
+
+func (r *eventRecorder) snapshot() []store.Event {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return append([]store.Event(nil), r.events...)
+}
+
+// waitUntil polls the recorded sequence until pred accepts it and returns that
+// snapshot. Polling rather than a channel, because a predicate reads the whole
+// sequence, not the next event.
+func (r *eventRecorder) waitUntil(t *testing.T, what string, bound time.Duration, pred func([]store.Event) bool) []store.Event {
+	t.Helper()
+
+	deadline := time.Now().Add(bound)
+
+	for {
+		got := r.snapshot()
+		if pred(got) {
+			return got
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s; recorded %+v", what, got)
+
+			return nil
+		}
+
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
