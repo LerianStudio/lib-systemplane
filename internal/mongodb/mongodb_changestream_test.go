@@ -1904,3 +1904,79 @@ func TestMongoReopenWatch_FirstFailureWarnsThenGoesQuiet(t *testing.T) {
 		t.Errorf("first failure logged %q; the WARN must keep the wrapped cause", cause)
 	}
 }
+
+// offlineCollection builds a *mongo.Collection handle without reaching a
+// server. mongo.Connect does not dial, and Database/Collection/Name are local,
+// so a test can exercise everything that reasons about a collection's identity
+// without a container.
+func offlineCollection(t *testing.T, database string) *mongo.Collection {
+	t.Helper()
+
+	cl, err := mongo.Connect(options.Client().ApplyURI("mongodb://127.0.0.1:1/"))
+	if err != nil {
+		t.Fatalf("mongo.Connect: %v", err)
+	}
+
+	t.Cleanup(func() { _ = cl.Disconnect(context.Background()) })
+
+	return cl.Database(database).Collection(defaultCollection)
+}
+
+// A tenant database that arrives through ctx without a tenant id has no stable
+// identity: tmcore.GetMBContext and tmcore.GetTenantIDContext read independent
+// context keys, so a caller can carry the database and omit the id. The memo
+// key is then names only, and two tenants on two clusters whose databases share
+// a name collide on one entry — the second tenant reported as already
+// bootstrapped and its collection never materialized. ensureSchema must re-run
+// the bootstrap instead.
+func TestEnsureSchema_CtxTenantWithoutIDSkipsMemo(t *testing.T) {
+	s := newSubscribeStore()
+
+	var calls int
+
+	s.schemaRunner = func(context.Context, string) error {
+		calls++
+
+		return nil
+	}
+
+	// Same database name, two different clusters — exactly the collision.
+	for _, coll := range []*mongo.Collection{
+		offlineCollection(t, "systemplane"),
+		offlineCollection(t, "systemplane"),
+	} {
+		if err := s.ensureSchema(context.Background(), "", coll, true); err != nil {
+			t.Fatalf("ensureSchema: %v", err)
+		}
+	}
+
+	if calls != 2 {
+		t.Fatalf("bootstrap ran %d times, want 2 (once per tenant database)", calls)
+	}
+}
+
+// The converse: a tenant the caller DID name keys the memo unambiguously, so
+// the bootstrap still runs exactly once per (tenant, database, collection).
+func TestEnsureSchema_NamedTenantKeepsMemo(t *testing.T) {
+	s := newSubscribeStore()
+
+	var calls int
+
+	s.schemaRunner = func(context.Context, string) error {
+		calls++
+
+		return nil
+	}
+
+	coll := offlineCollection(t, "systemplane")
+
+	for range 2 {
+		if err := s.ensureSchema(context.Background(), "t1", coll, true); err != nil {
+			t.Fatalf("ensureSchema: %v", err)
+		}
+	}
+
+	if calls != 1 {
+		t.Fatalf("bootstrap ran %d times, want 1 (the memo must still hold)", calls)
+	}
+}

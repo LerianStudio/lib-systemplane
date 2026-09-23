@@ -297,8 +297,10 @@ func (s *Store) resolveCollection(ctx context.Context, scope store.Scope) (*mong
 
 	// The tenant the middleware resolved this database for names the memo, so
 	// two tenants on two clusters that both call their database "systemplane"
-	// each get their own bootstrap. An unset id leaves the names to identify
-	// it, as they do for the store's own database.
+	// each get their own bootstrap. A ctx that carries the database but no id
+	// is possible — the two are independent context keys — and ensureSchema
+	// answers it by skipping the memo rather than sharing one entry between
+	// those two tenants.
 	coll := db.Collection(s.cfg.Collection)
 	if err := s.ensureSchema(ctx, tmcore.GetTenantIDContext(ctx), coll, true); err != nil {
 		return nil, err
@@ -330,12 +332,36 @@ func schemaCacheKey(tenant string, coll *mongo.Collection) string {
 // collection was resolved for and is empty for the store's own database.
 // tenantScoped marks a collection that belongs to a tenant database — carried
 // by ctx or resolved through the connector — and is threaded into runSchema.
+//
+// A tenant-scoped collection with NO tenant id is the one case that cannot be
+// memoized, and it is reachable: tmcore.GetMBContext and
+// tmcore.GetTenantIDContext read independent context keys, so a caller may
+// carry the tenant database and omit the id. The key would then be names only,
+// and two tenants on two clusters whose databases share a name would collide
+// on one entry — the second tenant reported as already bootstrapped and its
+// collection never materialized, which is the failure the tenant in the key
+// exists to prevent. Such a call re-runs the bootstrap instead. runSchema is
+// idempotent (CreateCollection treats NamespaceExists as success, CreateMany
+// is a no-op on existing indexes), so the cost is one extra round trip per
+// call on a path no shipped connector takes — the tenant-manager middleware
+// sets both keys.
 func (s *Store) ensureSchema(ctx context.Context, tenant string, coll *mongo.Collection, tenantScoped bool) error {
 	cacheKey := schemaCacheKey(tenant, coll)
 
-	return s.ensureSchemaByKey(ctx, cacheKey, func(ctx context.Context) error {
+	run := func(ctx context.Context) error {
+		if s.schemaRunner != nil {
+			// Test seam — see the schemaRunner field.
+			return s.schemaRunner(ctx, cacheKey)
+		}
+
 		return s.runSchema(ctx, coll, tenantScoped)
-	})
+	}
+
+	if tenantScoped && tenant == "" {
+		return run(ctx)
+	}
+
+	return s.ensureSchemaByKey(ctx, cacheKey, run)
 }
 
 // ensureSchemaByKey is the testable core of ensureSchema. It accepts a stable
