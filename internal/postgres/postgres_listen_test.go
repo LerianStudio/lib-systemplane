@@ -1116,9 +1116,10 @@ func TestPostgresSubscribe_CloseDuringResolutionSkipsTheDial(t *testing.T) {
 
 // captureLogger records what the store logs so a test can pin an operator-
 // facing message. Log is the only method with behavior; the rest satisfy the
-// interface. Entries are appended from the calling goroutine only — every test
-// below drives the logging path synchronously.
+// interface. Entries are guarded because some of the paths pinned below log
+// from a background goroutine (the reconnect loop), which waitFor then polls.
 type captureLogger struct {
+	mu      sync.Mutex
 	entries []captureEntry
 }
 
@@ -1132,6 +1133,9 @@ type captureEntry struct {
 // its []log.Field over as a single element, so the assertions below still read
 // f.Key/f.Value.
 func (c *captureLogger) Log(_ context.Context, level int, msg string, fields ...any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	c.entries = append(c.entries, captureEntry{level: level, msg: msg, fields: log.Fields(fields...)})
 }
 
@@ -1144,6 +1148,9 @@ func (c *captureLogger) Sync(context.Context) error  { return nil }
 // exactly one.
 func (c *captureLogger) only(t *testing.T, level int, what string) captureEntry {
 	t.Helper()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	var found []captureEntry
 
@@ -1158,6 +1165,35 @@ func (c *captureLogger) only(t *testing.T, level int, what string) captureEntry 
 	}
 
 	return found[0]
+}
+
+// waitFor blocks until an entry at level carrying msg has been logged, so a
+// test can pin a line a background goroutine produces without racing it.
+func (c *captureLogger) waitFor(t *testing.T, level int, msg string) captureEntry {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+
+	for {
+		c.mu.Lock()
+
+		for _, e := range c.entries {
+			if e.level == level && e.msg == msg {
+				c.mu.Unlock()
+
+				return e
+			}
+		}
+
+		seen := len(c.entries)
+		c.mu.Unlock()
+
+		if time.Now().After(deadline) {
+			t.Fatalf("no %q entry at level %d after 5s (%d entries logged)", msg, level, seen)
+		}
+
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // field returns the value of the named field, failing when it is absent.
@@ -1495,8 +1531,8 @@ func TestPostgresReconnect_BackoffEscalatesOnAcceptThenDropCycles(t *testing.T) 
 
 		prev = ceiling
 
-		if delay := retry.next(); delay < 0 || delay > ceiling {
-			t.Fatalf("cycle %d: delay %v outside [0, %v]", cycle, delay, ceiling)
+		if delay := retry.next(); delay < 0 || delay >= ceiling {
+			t.Fatalf("cycle %d: delay %v outside [0, %v)", cycle, delay, ceiling)
 		}
 
 		// The connection came up and died without carrying anything.
@@ -1582,4 +1618,140 @@ func TestPostgresFeed_SharedDatabaseIsRefusedAcrossTheZeroScope(t *testing.T) {
 			t.Errorf("a tenant with its own database was refused: %v", err)
 		}
 	})
+}
+
+// The delay is DRAWN, not taken: full jitter over [0, ceiling). A bounds-only
+// assertion passes for an implementation that always returns the ceiling, which
+// is precisely the lockstep this jitter exists to break — every feed of a
+// process that lost one database would redial on the same tick.
+func TestPostgresReconnect_DelayIsDrawnBelowItsCeiling(t *testing.T) {
+	t.Parallel()
+
+	// A ceiling several steps up the sequence, so the window is wide enough
+	// that repeated draws colliding is not a plausible outcome.
+	const attempt = 4
+
+	var retry reconnectBackoff
+
+	retry.attempt = attempt
+	ceiling := retry.ceiling()
+
+	draws := make(map[time.Duration]struct{})
+
+	for range 16 {
+		retry.attempt = attempt
+
+		delay := retry.next()
+		if delay < 0 || delay >= ceiling {
+			t.Fatalf("delay %v outside [0, %v)", delay, ceiling)
+		}
+
+		draws[delay] = struct{}{}
+	}
+
+	if len(draws) == 1 {
+		t.Fatalf("16 draws at ceiling %v all returned the same delay; the jitter is gone and every feed of one outage reconnects in lockstep", ceiling)
+	}
+}
+
+// A zero-scope Start whose connect is REFUSED must record the cause on the slot
+// it retains. Without that record f.err stays nil, so the next
+// Subscribe(Scope{}) succeeds and attaches to a feed with no reader behind it:
+// it never receives OpResync or OpDisconnect, and the engine therefore reads
+// that scope as fresh forever — the silent-stale state this feed exists to
+// close. The publish-time refusal is pinned by
+// TestPostgresZeroFeed_RefusalKeepsTheSlotAndIsReported, which drives failLocked
+// directly; the connect path is the one that slipped through.
+func TestPostgresZeroFeed_RefusedConnectIsReportedToSubscribe(t *testing.T) {
+	shrinkTimeouts(t, 250*time.Millisecond)
+
+	s := newSubscribeStore()
+	s.cfg.ListenDSN = unreachableDSN
+
+	s.feedsMu.Lock()
+	f := s.feeds[""]
+	f.dsn = unreachableDSN
+	s.feedsMu.Unlock()
+
+	startErr := s.Start(context.Background())
+	if startErr == nil {
+		t.Fatal("Start against a refused dialer returned nil")
+	}
+
+	unsub, err := s.Subscribe(context.Background(), store.Scope{}, func(store.Event) {})
+	if err == nil {
+		unsub()
+		t.Fatal("Subscribe after a refused Start returned nil; the caller is attached to a changefeed no reader serves and will never be told it is stale")
+	}
+
+	if !errors.Is(err, startErr) {
+		t.Fatalf("Subscribe error = %v, want the cause Start reported (%v)", err, startErr)
+	}
+
+	// The record belongs to the attempt that produced it: a retried Start takes
+	// the very feed the subscribers hold, with the refusal cleared.
+	retried, err := s.zeroFeedForStart()
+	if err != nil {
+		t.Fatalf("a retried Start was refused by the previous attempt's failure: %v", err)
+	}
+
+	if retried != f {
+		t.Fatalf("a retried Start took feed %p, want the one the subscribers hold (%p)", retried, f)
+	}
+
+	unsub2, err := s.Subscribe(context.Background(), store.Scope{}, func(store.Event) {})
+	if err != nil {
+		t.Fatalf("Subscribe once the refusal was cleared: %v", err)
+	}
+
+	unsub2()
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	waitForObserverExit(t)
+}
+
+// A reconnect attempt that fails has exactly one exit, and it is logged with
+// its cause. The LISTEN half used to be discarded with a bare continue: a feed
+// that reconnects but can never re-install LISTEN — pgbouncer in transaction
+// pooling refuses it, a revoked grant refuses it — then looped forever with
+// nothing after the single initial warning to say why it was never delivering.
+func TestPostgresReconnect_AttemptFailureIsLoggedWithItsCause(t *testing.T) {
+	shrinkTimeouts(t, 250*time.Millisecond)
+
+	s, logger := loggingStore()
+	f := newFeed(store.Scope{Tenant: "t1"}, unreachableDSN)
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		var retry reconnectBackoff
+
+		_, _ = s.reconnect(f, &retry)
+	}()
+
+	entry := logger.waitFor(t, log.LevelDebug, "reconnect attempt failed")
+
+	close(f.stop)
+	<-done
+
+	if entry.field(t, "tenant") != "t1" {
+		t.Errorf("failed attempt logged tenant %v, want t1: a process carrying dozens of feeds cannot tell which one is down", entry.field(t, "tenant"))
+	}
+
+	cause, ok := entry.field(t, "error").(error)
+	if !ok || cause == nil {
+		t.Fatalf("failed attempt logged error field %v, want the cause", entry.field(t, "error"))
+	}
+
+	// The cause names the STAGE it died at. That is what tells a dial nothing
+	// answered apart from a connection that came up and then refused LISTEN —
+	// the case that used to leave no line at all.
+	if !strings.Contains(cause.Error(), "listen connect") {
+		t.Errorf("failed attempt logged %q; the cause must name the stage so a refused LISTEN reads differently from a refused dial", cause)
+	}
 }

@@ -703,6 +703,8 @@ func (s *Store) Subscribe(ctx context.Context, scope store.Scope, fn func(store.
 	// subscriber slot goes with it.
 	if ctx != nil && ctx.Done() != nil {
 		go func() {
+			defer runtime.RecoverAndLog(s.cfg.Logger, "systemplane.postgres.subscriber")
+
 			select {
 			case <-ctx.Done():
 				teardown()
@@ -842,7 +844,14 @@ func (s *Store) startListener(ctx context.Context) error {
 	// reads that identity off the connection it just opened.
 	conn, dbKey, err := s.openListen(ctx, f)
 	if err != nil {
-		return err
+		// The refusal is recorded ON the slot, exactly as a publish-time refusal
+		// is. Returning it bare leaves f.err nil, and the next zero-scope
+		// Subscribe then attaches to a feed with no reader: it is never told a
+		// resync or a disconnect, so the engine reads the scope as fresh forever.
+		// failLocked keeps the zero slot — its subscribers hold it and a retried
+		// Start brings up the one they hold — and zeroFeedForStart clears the
+		// record for that retry.
+		return s.retractFeed(f, err)
 	}
 
 	return s.publishFeed(ctx, f, conn, dbKey)
@@ -1136,12 +1145,7 @@ func (s *Store) reconnect(f *feed, retry *reconnectBackoff) (*pgx.Conn, error) {
 			return nil, store.ErrClosed
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
-
-		conn, err := pgx.Connect(ctx, f.dsn)
-
-		cancel()
-
+		conn, err := s.dialAndListen(f)
 		if err != nil {
 			s.logDebug(context.Background(), "reconnect attempt failed",
 				log.Err(err),
@@ -1151,22 +1155,39 @@ func (s *Store) reconnect(f *feed, retry *reconnectBackoff) (*pgx.Conn, error) {
 			continue
 		}
 
-		listenCtx, listenCancel := context.WithTimeout(context.Background(), listenTimeout)
-
-		_, err = conn.Exec(listenCtx, "LISTEN "+quoteIdentifier(s.cfg.Channel))
-
-		listenCancel()
-
-		if err != nil {
-			closeCtx, closeCancel := context.WithTimeout(context.Background(), closeTimeout)
-
-			_ = conn.Close(closeCtx)
-
-			closeCancel()
-
-			continue
-		}
-
 		return conn, nil
 	}
+}
+
+// dialAndListen is one reconnect attempt: connect, then install LISTEN on that
+// connection, closing it when the LISTEN does not take. Both failures leave
+// through the same error return, which is what makes the caller's single log
+// line the ONLY exit from a failed attempt. A refused LISTEN used to be
+// discarded silently, so a feed that reconnects fine but can never re-install
+// it — pgbouncer in transaction pooling refuses LISTEN, so does a revoked
+// grant — looped forever delivering nothing, with only the one warning emitted
+// when the connection was first lost to go on. The wrapped cause names the
+// stage, so that case reads differently from a dial nothing answered.
+func (s *Store) dialAndListen(f *feed) (*pgx.Conn, error) {
+	connectCtx, cancelConnect := context.WithTimeout(context.Background(), connectTimeout)
+	defer cancelConnect()
+
+	conn, err := pgx.Connect(connectCtx, f.dsn)
+	if err != nil {
+		return nil, fmt.Errorf("systemplane/postgres: listen connect%s: %w", f.label(), err)
+	}
+
+	listenCtx, cancelListen := context.WithTimeout(context.Background(), listenTimeout)
+	defer cancelListen()
+
+	if _, err := conn.Exec(listenCtx, "LISTEN "+quoteIdentifier(s.cfg.Channel)); err != nil {
+		closeCtx, cancelClose := context.WithTimeout(context.Background(), closeTimeout)
+		defer cancelClose()
+
+		_ = conn.Close(closeCtx)
+
+		return nil, fmt.Errorf("systemplane/postgres: listen%s: %w", f.label(), err)
+	}
+
+	return conn, nil
 }
