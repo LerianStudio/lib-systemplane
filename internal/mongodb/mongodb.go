@@ -197,6 +197,13 @@ func (s *Store) Start(ctx context.Context) error {
 		return store.ErrClosed
 	}
 
+	// A nil ctx is normalized rather than dereferenced: the public API refuses
+	// one before the store is reached, but the store is its own unit and the
+	// first thing this path does is derive a timeout from ctx.
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	if s.cfg.MultiTenantEnabled {
 		return nil
 	}
@@ -413,7 +420,15 @@ func (s *Store) ensureSchemaByKey(ctx context.Context, cacheKey string, run func
 		onceVal, _ = s.schemaOnce.LoadOrStore(cacheKey, &sync.Once{})
 	}
 
-	once, _ := onceVal.(*sync.Once)
+	once, ok := onceVal.(*sync.Once)
+	if !ok {
+		// The map is written nowhere else, so this is unreachable today; it is
+		// kept because the alternative — discarding the comma-ok — turns any
+		// future writer of a different type into a nil-pointer panic on the
+		// read path of every read and write, instead of one wasted bootstrap.
+		once = &sync.Once{}
+		s.schemaOnce.Store(cacheKey, once)
+	}
 
 	// runErr captures the error produced by this Do invocation (if any). A
 	// transient runSchema failure must NOT cache permanently — callers would

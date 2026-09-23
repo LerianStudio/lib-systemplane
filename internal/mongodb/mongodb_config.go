@@ -22,13 +22,23 @@ func (d entryDoc) toEntry() store.Entry {
 // New creates a MongoDB-backed Store. Validates the config; schema bootstrap
 // is lazy (first access per resolved collection).
 func New(cfg Config) (*Store, error) {
-	// A Connector holding a nil POINTER is not == nil, so every `Connector ==
-	// nil` guard downstream would pass it through and the first
-	// ResolveDatabase would panic. Normalized once here, so those guards are
-	// truthful and a named tenant is refused with
-	// store.ErrTenantConnectorMissing instead.
+	// An interface field holding a nil POINTER is not == nil, so every `== nil`
+	// guard downstream would pass it through and the first call would panic:
+	// ResolveDatabase on the Connector, Tracer on the Telemetry — which this
+	// constructor itself calls, a few lines below — and Log on the Logger.
+	// Normalized once here, so every one of those guards is truthful: a named
+	// tenant is refused with store.ErrTenantConnectorMissing, and an absent
+	// logger or telemetry provider is silent instead of fatal.
 	if log.IsNil(cfg.Connector) {
 		cfg.Connector = nil
+	}
+
+	if log.IsNil(cfg.Logger) {
+		cfg.Logger = nil
+	}
+
+	if log.IsNil(cfg.Telemetry) {
+		cfg.Telemetry = nil
 	}
 
 	if cfg.Collection == "" {

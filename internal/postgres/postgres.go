@@ -188,6 +188,13 @@ func (s *Store) Start(ctx context.Context) error {
 		return store.ErrClosed
 	}
 
+	// A nil ctx is normalized rather than dereferenced: the public API refuses
+	// one before the store is reached, but the store is its own unit and the
+	// first thing this path does is derive a timeout from ctx.
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	if s.cfg.MultiTenantEnabled {
 		return nil
 	}

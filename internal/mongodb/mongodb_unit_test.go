@@ -11,10 +11,13 @@ import (
 	"time"
 
 	obsconstants "github.com/LerianStudio/lib-observability/v4/constants"
+	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -660,5 +663,100 @@ func TestNew_NilTracerKeepsTheNoopTracer(t *testing.T) {
 
 	if _, span := s.tracer.Start(context.Background(), "probe"); span.IsRecording() {
 		t.Fatal("tracer records spans; want the noop tracer left in place")
+	}
+}
+
+// typedNilLogger and typedNilTelemetry dereference their own receiver, so a
+// typed nil of either type panics on first use — the shape Config.Logger and
+// Config.Telemetry take when a consumer assigns its own concrete type without
+// a nil check. Both fields are interfaces, so a typed nil is != nil and every
+// `== nil` guard downstream would wave it through.
+type typedNilLogger struct{ inner log.Logger }
+
+func (l *typedNilLogger) Log(ctx context.Context, level int, msg string, fields ...any) {
+	l.inner.Log(ctx, level, msg, fields...)
+}
+
+//nolint:ireturn // mirrors log.Logger, which returns the interface.
+func (l *typedNilLogger) With(fields ...any) log.Logger { return l.inner.With(fields...) }
+
+//nolint:ireturn // mirrors log.Logger, which returns the interface.
+func (l *typedNilLogger) WithGroup(name string) log.Logger { return l.inner.WithGroup(name) }
+
+func (l *typedNilLogger) Enabled(level int) bool         { return l.inner.Enabled(level) }
+func (l *typedNilLogger) Sync(ctx context.Context) error { return l.inner.Sync(ctx) }
+
+type typedNilTelemetry struct{ inner store.Telemetry }
+
+//nolint:ireturn // mirrors store.Telemetry, which returns the interface.
+func (tl *typedNilTelemetry) Tracer(name string) (trace.Tracer, error) { return tl.inner.Tracer(name) }
+
+//nolint:ireturn // mirrors store.Telemetry, which returns the interface.
+func (tl *typedNilTelemetry) Meter(name string) (metric.Meter, error) { return tl.inner.Meter(name) }
+
+// Construction normalizes a typed-nil Logger and a typed-nil Telemetry to an
+// untyped nil, exactly as it already does for Connector. Telemetry is the
+// sharper of the two here: New itself calls Tracer behind a `!= nil` guard, so
+// a typed nil takes the store down at construction rather than at first use.
+func TestNew_TypedNilLoggerAndTelemetryAreTreatedAsAbsent(t *testing.T) {
+	t.Parallel()
+
+	s, err := New(Config{
+		MultiTenantEnabled: true,
+		Logger:             (*typedNilLogger)(nil),
+		Telemetry:          (*typedNilTelemetry)(nil),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if s.cfg.Logger != nil {
+		t.Fatalf("cfg.Logger = %v, want an untyped nil after normalization", s.cfg.Logger)
+	}
+
+	if s.cfg.Telemetry != nil {
+		t.Fatalf("cfg.Telemetry = %v, want an untyped nil after normalization", s.cfg.Telemetry)
+	}
+
+	ctx := context.Background()
+
+	s.logWarn(ctx, "a typed-nil logger must be silent, not fatal")
+
+	if _, _, err := s.Get(ctx, store.Scope{Tenant: "t1"}, "ns", "k"); !errors.Is(err, store.ErrTenantConnectorMissing) {
+		t.Fatalf("Get error = %v, want ErrTenantConnectorMissing", err)
+	}
+}
+
+// Start normalizes a nil ctx instead of panicking on it. The public API
+// refuses one before the store is reached, but the store is its own unit and
+// its own callers — the engine, the contract suite — reach Start directly.
+func TestStore_StartWithNilContextReturnsErrorNotPanic(t *testing.T) {
+	t.Parallel()
+
+	cl, err := mongo.Connect(options.Client().
+		ApplyURI("mongodb://127.0.0.1:1/").
+		SetServerSelectionTimeout(10 * time.Millisecond))
+	if err != nil {
+		t.Fatalf("mongo.Connect: %v", err)
+	}
+
+	t.Cleanup(func() { _ = cl.Disconnect(context.Background()) })
+
+	s, err := New(Config{Client: cl, Database: "systemplane"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// The collection bootstrap is stubbed through the package's schemaRunner
+	// seam: against an unreachable server it fails on its own first, and Start
+	// would return that error without ever reaching the changefeed — which is
+	// where the ctx is actually dereferenced, to time-box the identity probe.
+	s.schemaRunner = func(context.Context, string) error { return nil }
+
+	// The zero value a caller forwards without noticing.
+	var nilCtx context.Context
+
+	if err := s.Start(nilCtx); err == nil {
+		t.Fatal("Start(nil) = nil, want the connection error from an unreachable server")
 	}
 }

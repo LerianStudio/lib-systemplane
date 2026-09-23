@@ -13,6 +13,7 @@ import (
 
 	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
 	obsconstants "github.com/LerianStudio/lib-observability/v4/constants"
+	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 	"github.com/bxcodec/dbresolver/v2"
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -844,5 +845,92 @@ func TestNew_TypedNilConnectorIsTreatedAsAbsent(t *testing.T) {
 
 	if s.cfg.Connector != nil {
 		t.Fatalf("cfg.Connector = %v, want an untyped nil after normalization", s.cfg.Connector)
+	}
+}
+
+// typedNilLogger and typedNilTelemetry dereference their own receiver, so a
+// typed nil of either type panics on first use — the shape Config.Logger and
+// Config.Telemetry take when a consumer assigns its own concrete type without
+// a nil check. Both fields are interfaces, so a typed nil is != nil and every
+// `== nil` guard downstream would wave it through.
+type typedNilLogger struct{ inner log.Logger }
+
+func (l *typedNilLogger) Log(ctx context.Context, level int, msg string, fields ...any) {
+	l.inner.Log(ctx, level, msg, fields...)
+}
+
+//nolint:ireturn // mirrors log.Logger, which returns the interface.
+func (l *typedNilLogger) With(fields ...any) log.Logger { return l.inner.With(fields...) }
+
+//nolint:ireturn // mirrors log.Logger, which returns the interface.
+func (l *typedNilLogger) WithGroup(name string) log.Logger { return l.inner.WithGroup(name) }
+
+func (l *typedNilLogger) Enabled(level int) bool         { return l.inner.Enabled(level) }
+func (l *typedNilLogger) Sync(ctx context.Context) error { return l.inner.Sync(ctx) }
+
+type typedNilTelemetry struct{ inner store.Telemetry }
+
+//nolint:ireturn // mirrors store.Telemetry, which returns the interface.
+func (tl *typedNilTelemetry) Tracer(name string) (trace.Tracer, error) { return tl.inner.Tracer(name) }
+
+//nolint:ireturn // mirrors store.Telemetry, which returns the interface.
+func (tl *typedNilTelemetry) Meter(name string) (metric.Meter, error) { return tl.inner.Meter(name) }
+
+// Construction normalizes a typed-nil Logger and a typed-nil Telemetry to an
+// untyped nil, exactly as it already does for Connector, so the `== nil`
+// guards in startSpan and the log helpers are truthful instead of being the
+// thing that panics on the first read.
+func TestNew_TypedNilLoggerAndTelemetryAreTreatedAsAbsent(t *testing.T) {
+	t.Parallel()
+
+	s, err := New(Config{
+		MultiTenantEnabled: true,
+		Logger:             (*typedNilLogger)(nil),
+		Telemetry:          (*typedNilTelemetry)(nil),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if s.cfg.Logger != nil {
+		t.Fatalf("cfg.Logger = %v, want an untyped nil after normalization", s.cfg.Logger)
+	}
+
+	if s.cfg.Telemetry != nil {
+		t.Fatalf("cfg.Telemetry = %v, want an untyped nil after normalization", s.cfg.Telemetry)
+	}
+
+	ctx := context.Background()
+
+	// startSpan is the Telemetry chokepoint every read and write goes through.
+	_, _, finish := s.startSpan(ctx, "systemplane.postgres.test")
+	finish()
+
+	s.logWarn(ctx, "a typed-nil logger must be silent, not fatal")
+
+	if _, _, err := s.Get(ctx, store.Scope{Tenant: "t1"}, "ns", "k"); !errors.Is(err, store.ErrTenantConnectorMissing) {
+		t.Fatalf("Get error = %v, want ErrTenantConnectorMissing", err)
+	}
+}
+
+// Start normalizes a nil ctx instead of panicking on it. The public API
+// refuses one before the store is reached, but the store is its own unit and
+// its own callers — the engine, the contract suite — reach Start directly.
+func TestStore_StartWithNilContextReturnsErrorNotPanic(t *testing.T) {
+	t.Parallel()
+
+	s, err := New(Config{
+		DB:        &sql.DB{},
+		ListenDSN: "postgres://systemplane@127.0.0.1:1/systemplane?sslmode=disable&connect_timeout=1",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// The zero value a caller forwards without noticing.
+	var nilCtx context.Context
+
+	if err := s.Start(nilCtx); err == nil {
+		t.Fatal("Start(nil) = nil, want the connection error from an unreachable DSN")
 	}
 }
