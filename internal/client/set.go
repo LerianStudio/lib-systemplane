@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/LerianStudio/lib-systemplane/v4/internal/manager"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -38,7 +39,7 @@ func (c *Client) Set(ctx context.Context, namespace, key string, value any, acto
 	}
 
 	if def.validator != nil {
-		if err := def.validator(value); err != nil {
+		if err := def.validator(ctx, value); err != nil {
 			return fmt.Errorf("%w: %w", ErrValidation, err)
 		}
 	}
@@ -62,15 +63,25 @@ func (c *Client) Set(ctx context.Context, namespace, key string, value any, acto
 		return err
 	}
 
-	if !c.multiTenant {
-		var canonical any
-		if err := json.Unmarshal(jsonBytes, &canonical); err != nil {
-			canonical = value
-		}
+	// Write through the in-process cache. Without this a reader between the
+	// commit and the changefeed round trip falls back to the store, and a read
+	// that does not yet see the fresh row reports the registered default for a
+	// key that already had a value.
+	var canonical any
+	if err := json.Unmarshal(jsonBytes, &canonical); err != nil {
+		canonical = value
+	}
 
+	if !c.multiTenant {
 		c.cacheMu.Lock()
 		c.cache[nk] = canonical
 		c.cacheMu.Unlock()
+
+		return nil
+	}
+
+	if mgr, tenantID := c.boundManager(), manager.TenantIDFromContext(ctx); mgr != nil && tenantID != "" {
+		mgr.Populate(ctx, tenantID, namespace, key, canonical)
 	}
 
 	return nil
@@ -108,6 +119,12 @@ func (c *Client) Delete(ctx context.Context, namespace, key, actor string) error
 		c.cacheMu.Lock()
 		delete(c.cache, nk)
 		c.cacheMu.Unlock()
+
+		return nil
+	}
+
+	if mgr, tenantID := c.boundManager(), manager.TenantIDFromContext(ctx); mgr != nil && tenantID != "" {
+		mgr.Invalidate(ctx, tenantID, namespace, key)
 	}
 
 	return nil

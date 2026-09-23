@@ -19,8 +19,10 @@ func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOp
 }
 
 // Start hydrates registered keys from the backing store and begins consuming
-// backend change notifications. In multi-tenant mode it is a no-op beyond
-// marking the Client started — every read resolves a fresh tenant database.
+// backend change notifications. A stored value a key's validator refuses is
+// not hydrated: the registered default stays in force and a WARN is logged.
+// In multi-tenant mode it is a no-op beyond marking the Client started —
+// every read resolves a fresh tenant database.
 func (c *Client) Start(ctx context.Context) error {
 	return asInternalClient(c).Start(ctx)
 }

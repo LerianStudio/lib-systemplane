@@ -2,6 +2,7 @@
 package client
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -17,7 +18,7 @@ const (
 type keyDef struct {
 	defaultValue any
 	description  string
-	validator    func(any) error
+	validator    func(context.Context, any) error
 	redaction    RedactPolicy
 	catalog      CatalogKeyMetadata
 }
@@ -63,7 +64,9 @@ func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOp
 	}
 
 	if def.validator != nil {
-		if err := def.validator(def.defaultValue); err != nil {
+		// Background context, under startMu: see the register-time contract
+		// stated on WithContextValidator (no request scope, no I/O, no blocking).
+		if err := def.validator(context.Background(), def.defaultValue); err != nil {
 			return fmt.Errorf("%w: default value rejected: %w", ErrValidation, err)
 		}
 	}

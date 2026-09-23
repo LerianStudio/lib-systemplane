@@ -2,6 +2,7 @@
 package client
 
 import (
+	"context"
 	"time"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
@@ -163,7 +164,75 @@ func WithDescription(s string) KeyOption {
 }
 
 // WithValidator sets a validation function invoked on every Set.
+//
+// The function sees the value alone. A validator that has to read the request
+// scope of the write — the tenant a caller carried into Set, say — takes
+// [WithContextValidator] instead.
+//
+// A nil fn is ignored. WithValidator and [WithContextValidator] set the same
+// single validator, so when both are applied to one key the last NON-NIL one
+// applied wins, exactly as two WithValidator calls already do.
 func WithValidator(fn func(any) error) KeyOption {
+	return func(k *keyDef) {
+		if fn != nil {
+			k.validator = func(_ context.Context, value any) error { return fn(value) }
+		}
+	}
+}
+
+// WithContextValidator sets a validation function invoked on every Set with
+// that Set's own context, so validation can read what the caller carried into
+// the write — a tenant, a deadline, a trace — and consult another system with
+// it.
+//
+// Four callers invoke it today: [Client.Set], with the context of that write;
+// [Client.Register], with context.Background(); and, in single-tenant mode,
+// hydration at [Client.Start] and each changefeed refresh, with the contexts
+// described below. A context validator must therefore treat a context that
+// lacks the scope it expects as "cannot verify" and decide by its own policy —
+// accept it, or refuse it with its own error — rather than assume request scope
+// is there to read.
+//
+// The same function validates the registered default at [Client.Register]
+// time. Registering a default is not a write and carries no request scope, so
+// it is called there with a non-nil but empty context.Background(), while the
+// client holds its start lock. For the registered default the function MUST
+// NOT perform I/O or block: a validator that blocks there blocks registration,
+// [Client.Start] and [Client.Close] with it. Recognise the default (or empty)
+// value and return before any external call. Whether an empty context is
+// acceptable for the default is the validator's own policy: a refusal makes
+// [Client.Register] fail with the wrapped validation error, so the key is not
+// registered.
+//
+// In SINGLE-TENANT mode the same function also grades a value read back from
+// the store: on hydration at [Client.Start], and on every changefeed refresh. A
+// row can predate the key's validator, or be written by an older binary, or
+// written straight into the table, so a value never graded there would be one
+// the write path refuses while it is already in force. A refusal — a returned
+// error or a panic, which is treated as a refusal rather than propagated —
+// keeps the registered default (hydration) or the value already in force
+// (refresh), and logs a WARN carrying the error and never the value.
+//
+// Multi-tenant reads are ungraded on every path: the direct tenant-store read
+// in [Client.Get] and [Client.List], and, when a Manager is bound, the
+// Manager's per-tenant warm-load and NOTIFY cache update that Get serves hits
+// from. None of them runs this function, so a multi-tenant consumer that must
+// not act on a value the write path would refuse checks what it reads.
+//
+// The context is the one passed to [Client.Start] on hydration, and a bounded
+// context derived from the client's lifecycle on a refresh. Neither is a
+// caller's write, so a function that expects request scope should apply there
+// the same "cannot verify" policy it applies at registration. The no-I/O
+// restriction stated above for the registered default binds on hydration too:
+// it runs inside [Client.Start], under the same start lock, so a validator that
+// blocks there blocks [Client.Close] with it. The refresh call is the one
+// read-back call site where a validator may do I/O — its context carries a
+// bounded deadline and is cancelled by [Client.Close].
+//
+// A nil fn is ignored. [WithValidator] and WithContextValidator set the same
+// single validator, so when both are applied to one key the last NON-NIL one
+// applied wins.
+func WithContextValidator(fn func(ctx context.Context, value any) error) KeyOption {
 	return func(k *keyDef) {
 		if fn != nil {
 			k.validator = fn
