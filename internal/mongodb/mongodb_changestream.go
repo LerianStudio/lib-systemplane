@@ -1019,6 +1019,8 @@ func (s *Store) consumeUntilFailure(f *feed, stream *mongo.ChangeStream) (consum
 	defer cancel()
 
 	go func() {
+		defer runtime.RecoverAndLog(s.cfg.Logger, "systemplane.mongodb.observer")
+
 		select {
 		case <-f.stop:
 			cancel()

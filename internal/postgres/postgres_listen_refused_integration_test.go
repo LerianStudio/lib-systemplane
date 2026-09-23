@@ -106,7 +106,7 @@ func waitForNoBackends(t *testing.T, admin *sql.DB, dbName, what string) {
 // LISTEN stage — not the connect stage the caller's one log line would
 // otherwise show — and closes the connection it opened.
 func TestIntegration_PostgresReconnectRefusedListenIsReportedAndClosed(t *testing.T) {
-	const dbName = "refused_listen_reconnect"
+	dbName := fmt.Sprintf("refused_listen_reconnect_%d", time.Now().UnixNano())
 
 	admin, dsn := refusedListenDB(t, dbName)
 
@@ -128,7 +128,7 @@ func TestIntegration_PostgresReconnectRefusedListenIsReportedAndClosed(t *testin
 // listens, so a refusal here has a connection and an identity round trip behind
 // it and still must not leak either.
 func TestIntegration_PostgresOpenListenRefusedListenIsReportedAndClosed(t *testing.T) {
-	const dbName = "refused_listen_first_open"
+	dbName := fmt.Sprintf("refused_listen_first_open_%d", time.Now().UnixNano())
 
 	admin, dsn := refusedListenDB(t, dbName)
 

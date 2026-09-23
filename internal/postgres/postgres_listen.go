@@ -1030,6 +1030,8 @@ func (s *Store) consumeUntilFailure(f *feed, conn *pgx.Conn) (consumed bool) {
 	defer cancel()
 
 	go func() {
+		defer runtime.RecoverAndLog(s.cfg.Logger, "systemplane.postgres.observer")
+
 		select {
 		case <-f.stop:
 			cancel()
