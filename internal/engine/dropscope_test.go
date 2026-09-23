@@ -607,6 +607,17 @@ func runningCount(e *Engine) int {
 // has run and the dead state's reconcile fences have been written. Only the
 // validator assertion goes red for that mutation.
 //
+// The third case is why that re-resolution compares IDENTITY and not the scope
+// VALUE. A tenant dropped and brought back up during the round trip is a LIVE
+// state under the same scope value, so a by-value lookup hands the re-read a
+// perfectly tracked scope to publish into — and publish's own drop check,
+// which only refuses a state that was swept, waves it through. The row was
+// read under an entitlement this process no longer had when it came back; the
+// new state must reconcile the key from the store itself. Worse than a stale
+// value: the publication also records the key as answered by the feed, so the
+// re-activation's own reconcile skips the one snapshot row that would have
+// decided it.
+//
 // The drop is driven from inside Store.Get rather than raced for: that is
 // exactly where the re-read is when a suspension lands, and the fake invokes
 // the hook outside its own lock, the way a real driver holds nothing of the
@@ -617,23 +628,40 @@ func TestRereadRefusesAScopeDroppedDuringTheStoreCall(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		// hook runs inside Store.Get, after the scope has been dropped.
-		hook func()
+		hook func(t *testing.T, e *Engine)
 		// panics says the re-read unwinds instead of returning a row, which
 		// takes the recovery — and its own scope resolution — down the same
 		// untracked path.
 		panics bool
+		// reactivates says the hook brought the tenant back up, so the scope
+		// is tracked again by the time the row comes back — a NEW state, under
+		// the same scope value, that this row still has no business reaching.
+		reactivates bool
 	}{
 		{
 			name: "the row comes back after the tenant is gone",
-			hook: func() {},
+			hook: func(*testing.T, *Engine) {},
 		},
 		{
 			// The recovery resolves the scope of its own to fence the key as
 			// unusable, so a panic raised after the drop is the one path that
 			// reaches that resolution with nothing to resolve.
 			name:   "the store explodes after the tenant is gone",
-			hook:   func() { panic("the store driver exploded") },
+			hook:   func(*testing.T, *Engine) { panic("the store driver exploded") },
 			panics: true,
+		},
+		{
+			// The re-activation opens a reconcile window of its own, which is
+			// how production brings a tenant back: subscribe, then reconcile.
+			// That window is what the refused row must not be recorded into.
+			name: "the tenant is dropped and brought back up during the read",
+			hook: func(t *testing.T, e *Engine) {
+				t.Helper()
+
+				bringUp(t, e, dropTenant)
+				armWindow(e.scopeFor(dropTenant))
+			},
+			reactivates: true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -665,7 +693,7 @@ func TestRereadRefusesAScopeDroppedDuringTheStoreCall(t *testing.T) {
 
 			fs.onGet(func(scope store.Scope, _ NSKey) error {
 				e.dropScope(scope)
-				tc.hook()
+				tc.hook(t, e)
 
 				return nil
 			})
@@ -675,7 +703,7 @@ func TestRereadRefusesAScopeDroppedDuringTheStoreCall(t *testing.T) {
 			// the time onEvent returns.
 			e.onEvent(upsertEvent(dropTenant, nk, 7))
 
-			if tracked(e, dropTenant) {
+			if tracked(e, dropTenant) != tc.reactivates {
 				t.Error("the re-read re-created the tenant scope after it was dropped mid-Get: " +
 					"it has no changefeed and no reconcile goroutine, and reads would report it as current")
 			}
@@ -692,6 +720,14 @@ func TestRereadRefusesAScopeDroppedDuringTheStoreCall(t *testing.T) {
 				t.Error("the consumer's registered validator was handed a row belonging to a tenant " +
 					"dropped mid-Get: the re-read must re-resolve the scope after its round trip and " +
 					"stop there, not run consumer code and let publish refuse the result")
+			}
+
+			if tc.reactivates {
+				if touched, _ := recordedSets(e, dropTenant); len(touched) != 0 {
+					t.Errorf("the re-activated scope recorded %v as answered by the feed: the row was "+
+						"read under the dropped state, so the new state's own reconcile is the only "+
+						"thing that may decide the key, and it skips every key the feed touched", touched)
+				}
 			}
 
 			if !tc.panics {

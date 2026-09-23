@@ -64,8 +64,19 @@ import (
 // fence is armed only by a changefeed re-read, which spends a whole store round
 // trip outside every lock and can come back holding a row a delete has since
 // removed. A publication it no longer covers is dropped, not published: the
-// delete is the fresher fact, and the key is still recorded as read so a
-// reconcile does not decide it from an older photograph either.
+// delete is the fresher fact.
+//
+// The outcome recorded is the one that actually happened, which is why it is
+// computed once and used twice. A refused row taught the engine nothing
+// usable, so recording it as ANSWERED BY THE FEED would make a concurrent
+// reconcile skip the key — and the snapshot it skipped is the only thing
+// carrying a value recreated since the delete, so the key sits on its
+// registered default at revision 0, reporting itself fresh, until some later
+// reconnect happens to reconcile the scope. Recording it as unusable is both
+// true and sufficient: a snapshot row is applied regardless (applySnapshotRow
+// never consults the unusable set), and an ABSENT key with nothing usable from
+// the feed keeps its cached value instead of being reset to the default, which
+// is the protection this paragraph's guard was reaching for.
 func (e *Engine) ingest(ctx context.Context, sc *scopeState, se store.Entry, fence deleteFence) {
 	nk := NSKey{Namespace: se.Namespace, Key: se.Key}
 
@@ -78,11 +89,12 @@ func (e *Engine) ingest(ctx context.Context, sc *scopeState, se store.Entry, fen
 	sc.reconcileMu.Lock()
 	defer sc.reconcileMu.Unlock()
 
-	if usable && !sc.supersededByDelete(nk, fence) {
+	publishable := usable && !sc.supersededByDelete(nk, fence)
+	if publishable {
 		e.publish(sc, pub)
 	}
 
-	sc.record(nk, usable)
+	sc.record(nk, publishable)
 }
 
 // prepare is the ingress's consumer-facing half: it decodes the row and runs

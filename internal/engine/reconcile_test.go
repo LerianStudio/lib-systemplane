@@ -1495,6 +1495,110 @@ func TestDeleteIsNotResurrectedByAnInFlightReRead(t *testing.T) {
 	}
 }
 
+// TestFencedReReadLeavesTheRepairingSnapshotAlone is the RED test for the
+// fence's other half: what a REFUSED publication tells the reconciles in
+// flight.
+//
+// A re-read whose row the delete fence refuses learned nothing usable — the
+// row it is holding was removed while it read it — so "the feed answered this
+// key" is exactly the wrong thing to record. A reconcile skips every key the
+// feed touched, deliberately: the feed holds the fresher fact. Here it does
+// not, and the snapshot it is skipping is the only thing that carries the
+// recreated row. The key is then stranded on its registered default at
+// revision 0, reporting itself fresh, until some later reconnect happens to
+// reconcile the scope again — on a stable connection, never.
+//
+// Recording the refusal as unusable instead is both true and harmless: a
+// snapshot row is applied regardless of the unusable set (applySnapshotRow
+// consults only touched), and an ABSENT key with nothing usable from the feed
+// keeps its cached value rather than being reset to the default.
+func TestFencedReReadLeavesTheRepairingSnapshotAlone(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+
+	fs := newFakeStore()
+	e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0)
+
+	fs.seed(scope, jsonRow(nk, 5, `"five"`, "ops"))
+	settled(t, e, scope)
+
+	var delivered recorder
+
+	unsub := e.OnChange(nk, delivered.record)
+	defer unsub()
+
+	inGet, enteredGet := gate()
+	held, releaseGet := gate()
+
+	defer enteredGet()
+	defer releaseGet()
+
+	fs.onGet(func(store.Scope, NSKey) error {
+		fs.onGet(nil)
+		enteredGet()
+		<-held
+
+		return nil
+	})
+
+	reread := make(chan struct{})
+
+	go func() {
+		defer close(reread)
+
+		e.onEvent(upsertEvent(scope, nk, 5))
+	}()
+
+	<-inGet
+
+	// The delete commits while the re-read holds a snapshot that predates it,
+	// so the row it comes back with is older than the cache however high its
+	// revision — that is the publication the fence refuses.
+	e.onEvent(deleteEvent(scope, nk))
+
+	// An operator recreates the key. No event carries it: only the reconcile's
+	// snapshot can repair the cache, which is what makes the refused re-read's
+	// bookkeeping the whole question.
+	fs.seed(scope, jsonRow(nk, 9, `"nine"`, "ops"))
+
+	// Armed before the re-read comes back and held open across it, so the
+	// refusal is recorded INTO this reconcile's window — the overlap a live
+	// reconnect produces, and the only window in which the record matters.
+	releaseList := heldList(fs)
+	defer releaseList()
+
+	e.onEvent(resyncEvent(scope))
+
+	releaseGet()
+	<-reread
+
+	releaseList()
+	waitReconcileIdle(t, e, scope)
+	quiesce(t, e)
+
+	got, ok := e.Lookup(scope, nk)
+	if !ok {
+		t.Fatal("Lookup reports a miss after the reconcile that should have repaired the key")
+	}
+
+	if got.Value != "nine" || got.Revision != 9 {
+		t.Errorf("after the reconcile: got (%v, rev %d), want (nine, rev 9): the re-read the delete "+
+			"fence REFUSED was still recorded as touched, so the reconcile skipped the snapshot row "+
+			"that carries the recreated key and left it on its registered default, reporting fresh",
+			got.Value, got.Revision)
+	}
+
+	last := deliveries(&delivered)
+	if len(last) == 0 {
+		t.Fatal("no Change delivered for the recreated key")
+	}
+
+	if final := last[len(last)-1]; final.Value != "nine" || final.Revision != 9 {
+		t.Errorf("last Change delivered: (%v, rev %d), want (nine, rev 9): no subscriber was ever "+
+			"told the key came back", final.Value, final.Revision)
+	}
+}
+
 // TestConcurrentFeedUpsertSurvivesReconcileDefault is the RED test for the
 // other half of the same pair. The reconcile decides a key absent from its
 // snapshot while the feed publishes a fresh revision for it; the registered

@@ -405,12 +405,16 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
 	// holding it across a network round trip would stall every reconcile of
 	// the scope, and so does the validator ingest runs before taking it.
 	// The scope is resolved again because it can be dropped during that round
-	// trip, and this publication must not bring it back. A scope dropped and
-	// re-activated meanwhile is a NEW state whose counter starts at zero, so
-	// the fence armed above refuses this row there too — the re-activation
-	// reconciles the key from the store itself.
-	sc = e.scopeForEvent(scope, nk)
-	if sc == nil {
+	// trip, and this publication must not bring it back. It is compared by
+	// IDENTITY, exactly as applyScope compares before applying a snapshot: a
+	// tenant dropped and brought back up meanwhile is a NEW state under the
+	// same scope value, so a by-value check finds a live scope and publishes a
+	// row read under an entitlement this process no longer holds. The delete
+	// fence cannot stand in for that — it counts deletes, and a fresh state's
+	// counter starts at zero, so for the ordinary key that has never been
+	// deleted it compares zero against zero and lets the row through. The new
+	// state reconciles the key from the store itself.
+	if e.scopeForEvent(scope, nk) != sc {
 		return
 	}
 
