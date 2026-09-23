@@ -81,7 +81,11 @@ func (e *Engine) onEvent(evt store.Event) {
 	// The trade that bought those back is the drop line itself: it used to sit
 	// behind the debouncer's quiet window, so a chatty foreign writer reported
 	// one line per window and now reports one per write — which is why the
-	// fields below are built only when DEBUG is actually enabled.
+	// fields below are built only when DEBUG is actually enabled. That guard
+	// is real for a lib-observability logger and inert for the one-method
+	// Logger the public boundary accepts, which reports every level enabled
+	// until lib-observability's shim delegates Enabled; debugEnabled states
+	// the whole shape and carries the follow-up.
 	//
 	// What makes that drop safe is the SETUP ORDER the facade documents, not a
 	// lock: registration and Start are sequential setup calls — Register, then
@@ -171,14 +175,23 @@ func (e *Engine) onEvent(evt store.Event) {
 // having dropped unregistered keys before the debouncer ever sees them. It
 // does not bound the work those timers start: Debouncer.fire deletes the timer
 // entry BEFORE it invokes fn, so a notification arriving while the re-read is
-// still inside Store.Get arms a fresh timer and the two overlap. Under
-// sustained notifications on one key against a store slower than the window,
-// in-flight re-reads for that single key grow to roughly feedTimeout divided
-// by the window — about 50 at the 5s and 100ms defaults.
+// still inside Store.Get arms a fresh timer and the two overlap.
 //
-// There is no semaphore. A consumer sizing its *sql.DB pool should read
-// registered keys times tracked scopes as the floor, and add that per-key
-// overlap for as many keys as a degraded store can be hot on at once.
+// How many overlap is how long one re-read lives divided by the window, and a
+// re-read is not only its store call: refreshKey hands the row to the ingress,
+// which runs the CONSUMER's registered validator, bounded by nothing. So under
+// sustained notifications on one key the in-flight count for that single key
+// approaches (feedTimeout PLUS the validator's runtime) divided by the window
+// — about 50 at the 5s and 100ms defaults is the FLOOR, what the store call
+// alone produces, and a validator that blocks raises it without limit.
+//
+// There is no semaphore. The two halves size different things, so a consumer
+// reads them apart: connections are held for the store call only, so a
+// *sql.DB pool takes registered keys times tracked scopes as its floor plus
+// the feedTimeout share of that overlap for as many keys as a degraded store
+// can be hot on at once, while the validator's share adds goroutines and the
+// values they hold rather than connections — a slow validator therefore shows
+// up as goroutine growth under a flapping feed, not as pool exhaustion.
 func (e *Engine) trackedRefresh(scope store.Scope, nk NSKey) {
 	if !e.beginWork() {
 		return
@@ -362,11 +375,13 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
 
 		if e.canceledByShutdown(err) {
 			e.logDebug(ctx, "changefeed re-read canceled during shutdown",
+				log.String(constants.AttrKeyTenantID, scope.Tenant),
 				log.String("namespace", nk.Namespace),
 				log.String("keyname", nk.Key),
 			)
 		} else {
 			e.logWarn(ctx, "changefeed re-read failed, keeping current value",
+				log.String(constants.AttrKeyTenantID, scope.Tenant),
 				log.String("namespace", nk.Namespace),
 				log.String("keyname", nk.Key),
 				log.Err(err),
@@ -378,6 +393,7 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
 
 	if !found {
 		e.logDebug(ctx, "changefeed re-read found no row, keeping current value",
+			log.String(constants.AttrKeyTenantID, scope.Tenant),
 			log.String("namespace", nk.Namespace),
 			log.String("keyname", nk.Key),
 		)
@@ -445,8 +461,27 @@ func (e *Engine) canceledByShutdown(err error) bool {
 // The guard belongs at the call site, not inside logDebug: the []log.Field is
 // built by the variadic before the call, and boxed into the ...any Logger.Log
 // takes, so by the time logDebug could check anything the cost is already
-// paid. It is worth the noise only on the lines the changefeed emits per
+// paid. It is worth the noise only on the lines that run per row or per
 // event — everywhere else the line runs once per failure, not per write.
+//
+// How far it actually bites today depends on what the consumer passed to
+// WithLogger, and the honest answer is narrower than the guard looks:
+//
+//   - a lib-observability logger (its stdlib one, its zap adapter, its no-op)
+//     carries its own level check, so the guard reports the deployment's real
+//     level and the skipped lines are genuinely skipped;
+//   - so does a consumer type that happens to implement the whole
+//     lib-observability log.Logger — log.Adapt returns such a value untouched;
+//   - a consumer implementing only the one method the public Logger interface
+//     declares, which is the shape that boundary exists to allow, is wrapped
+//     by log.Adapt in a shim whose Enabled answers true for every VALID level.
+//     For that logger this reports DEBUG enabled whatever the consumer's own
+//     level is, the fields are built, and the line is thrown away inside the
+//     consumer's Log.
+//
+// Follow-up: the fix belongs in lib-observability, whose shim can consult the
+// wrapped logger when it implements Enabled(int) bool — queued there as its
+// own change, not worked around here.
 func (e *Engine) debugEnabled() bool {
 	return e.logger != nil && e.logger.Enabled(log.LevelDebug)
 }

@@ -114,10 +114,17 @@ func (r *recordingLogger) all() []string {
 }
 
 // requireLogged finds the single entry whose message is msg and asserts it was
-// emitted at level naming nk. Level is the load-bearing half: a rejection
-// logged at DEBUG is invisible on a production logger, and one logged at WARN
-// for an ordinary condition trains operators to ignore the channel.
-func requireLogged(t *testing.T, r *recordingLogger, level int, msg string, nk NSKey) {
+// emitted at level naming the whole identity of the key: tenant, namespace and
+// keyname. Level is one load-bearing half: a rejection logged at DEBUG is
+// invisible on a production logger, and one logged at WARN for an ordinary
+// condition trains operators to ignore the channel.
+//
+// The tenant is the other. A line that names a namespace and a key and no
+// tenant is not half an answer in a multi-tenant deployment — it sends an
+// operator through every tenant's logs to find which one holds the rejected
+// row, and it reads as complete in the source, so only this assertion keeps
+// the gap from reopening one line at a time.
+func requireLogged(t *testing.T, r *recordingLogger, level int, msg string, scope store.Scope, nk NSKey) {
 	t.Helper()
 
 	matches := make([]logRecord, 0, 1)
@@ -139,10 +146,14 @@ func requireLogged(t *testing.T, r *recordingLogger, level int, msg string, nk N
 
 	requireNotRedacted(t, got)
 
-	for key, want := range map[string]string{"namespace": nk.Namespace, "keyname": nk.Key} {
+	for key, want := range map[string]string{
+		constants.AttrKeyTenantID: scope.Tenant,
+		"namespace":               nk.Namespace,
+		"keyname":                 nk.Key,
+	} {
 		f, ok := got.field(key)
 		if !ok {
-			t.Errorf("%q carries no %q field, so an operator cannot tell which key it is about: %s", msg, key, got)
+			t.Errorf("%q carries no %q field, so an operator cannot tell which tenant's key it is about: %s", msg, key, got)
 
 			continue
 		}
@@ -322,7 +333,7 @@ func TestUnregisteredKeyIsLoggedAtDebug(t *testing.T) {
 
 	ingestRow(e, jsonRow(nk, 1, `"v"`, "ops"))
 
-	requireLogged(t, rec, log.LevelDebug, "value for unregistered key, skipping", nk)
+	requireLogged(t, rec, log.LevelDebug, "value for unregistered key, skipping", store.Scope{}, nk)
 }
 
 // TestUndecodableValueIsLoggedAtWarn pins the corrupt-row rejection. The cache
@@ -334,7 +345,7 @@ func TestUndecodableValueIsLoggedAtWarn(t *testing.T) {
 
 	ingestRow(e, jsonRow(nk, 1, `{not json`, "ops"))
 
-	requireLogged(t, rec, log.LevelWarn, "failed to unmarshal stored value, keeping cached value", nk)
+	requireLogged(t, rec, log.LevelWarn, "failed to unmarshal stored value, keeping cached value", store.Scope{}, nk)
 }
 
 // TestValidatorRejectionIsLoggedAtWarn pins the wrong-typed-row rejection. The
@@ -354,7 +365,7 @@ func TestValidatorRejectionIsLoggedAtWarn(t *testing.T) {
 
 	ingestRow(e, row)
 
-	requireLogged(t, rec, log.LevelWarn, msg, nk)
+	requireLogged(t, rec, log.LevelWarn, msg, store.Scope{}, nk)
 
 	// The line is announced once per INGESTION ATTEMPT, not once per key, and
 	// KeyDef.Validate says so. A changefeed that flaps re-reads the same
@@ -397,7 +408,7 @@ func TestReReadErrorIsLoggedAtWarn(t *testing.T) {
 
 	e.refreshKey(store.Scope{}, nk)
 
-	requireLogged(t, rec, log.LevelWarn, "changefeed re-read failed, keeping current value", nk)
+	requireLogged(t, rec, log.LevelWarn, "changefeed re-read failed, keeping current value", store.Scope{}, nk)
 }
 
 // TestReReadCanceledByCloseIsLoggedAtDebug pins the other half of the same
@@ -417,7 +428,7 @@ func TestReReadCanceledByCloseIsLoggedAtDebug(t *testing.T) {
 	// Close canceled the lifecycle context.
 	e.refreshKey(store.Scope{}, nk)
 
-	requireLogged(t, rec, log.LevelDebug, "changefeed re-read canceled during shutdown", nk)
+	requireLogged(t, rec, log.LevelDebug, "changefeed re-read canceled during shutdown", store.Scope{}, nk)
 }
 
 // TestLogLevelReReadWithNoRowIsDebug pins the re-read that finds nothing. The
@@ -431,7 +442,7 @@ func TestLogLevelReReadWithNoRowIsDebug(t *testing.T) {
 
 	e.refreshKey(store.Scope{}, nk)
 
-	requireLogged(t, rec, log.LevelDebug, "changefeed re-read found no row, keeping current value", nk)
+	requireLogged(t, rec, log.LevelDebug, "changefeed re-read found no row, keeping current value", store.Scope{}, nk)
 }
 
 // TestLogLevelUnregisteredFeedEventIsDebug pins the feed's registry filter for
@@ -453,7 +464,7 @@ func TestLogLevelUnregisteredFeedEventIsDebug(t *testing.T) {
 
 			e.onEvent(tc.evt)
 
-			requireLogged(t, rec, log.LevelDebug, "changefeed event for unregistered key, skipping", nk)
+			requireLogged(t, rec, log.LevelDebug, "changefeed event for unregistered key, skipping", store.Scope{}, nk)
 		})
 	}
 }
@@ -771,7 +782,7 @@ func TestReReadCanceledOutsideShutdownIsLoggedAtWarn(t *testing.T) {
 
 	e.refreshKey(store.Scope{}, nk)
 
-	requireLogged(t, rec, log.LevelWarn, "changefeed re-read failed, keeping current value", nk)
+	requireLogged(t, rec, log.LevelWarn, "changefeed re-read failed, keeping current value", store.Scope{}, nk)
 }
 
 // requireNotLogged fails when the engine emitted msg at all. It is the
@@ -810,7 +821,7 @@ func TestReconcileLogsAnUnregisteredSnapshotRowOnce(t *testing.T) {
 		t.Fatalf("first reconcile: %v", err)
 	}
 
-	requireLogged(t, rec, log.LevelDebug, "value for unregistered key, skipping", nk)
+	requireLogged(t, rec, log.LevelDebug, "value for unregistered key, skipping", scope, nk)
 	requireNotLogged(t, rec, "no-row event for unregistered key, skipping")
 }
 
@@ -845,7 +856,7 @@ func TestReconcileAnnouncesTheDefaultForARefusedSnapshotRow(t *testing.T) {
 		t.Errorf("after the reconcile: got (%v, rev %d), want (\"fallback\", rev 0)", got.Value, got.Revision)
 	}
 
-	requireLogged(t, rec, log.LevelWarn, "stored value rejected by validator, keeping cached value", nk)
+	requireLogged(t, rec, log.LevelWarn, "stored value rejected by validator, keeping cached value", scope, nk)
 }
 
 // TestScopeDropDiagnosticsAreDebug pins the level of the three lines a dropped
@@ -993,7 +1004,7 @@ func TestDebouncedReReadPanicNamesTheKey(t *testing.T) {
 		return reported && accounted
 	})
 
-	requireLogged(t, rec, log.LevelError, msg, nk)
+	requireLogged(t, rec, log.LevelError, msg, scope, nk)
 	requirePanicAccounted(t, rec, "refresh")
 
 	tenant, ok := findLogged(rec, msg).field(constants.AttrKeyTenantID)
@@ -1034,7 +1045,7 @@ func TestInlineReReadPanicNamesTheKey(t *testing.T) {
 
 	e.onEvent(upsertEvent(scope, nk, 1))
 
-	requireLogged(t, rec, log.LevelError, rereadPanicMsg, nk)
+	requireLogged(t, rec, log.LevelError, rereadPanicMsg, scope, nk)
 
 	tenant, ok := findLogged(rec, rereadPanicMsg).field(constants.AttrKeyTenantID)
 	if !ok || tenant.Value != scope.Tenant {
@@ -1111,7 +1122,7 @@ func TestPanicIdentityIsRecordedBeforeCloseReturns(t *testing.T) {
 		t.Fatalf("Close after a panicking re-read: %v, want nil", err)
 	}
 
-	requireLogged(t, rec, log.LevelError, rereadPanicMsg, nk)
+	requireLogged(t, rec, log.LevelError, rereadPanicMsg, scope, nk)
 }
 
 // findLogged returns the single entry carrying msg. requireLogged has already
@@ -1126,16 +1137,16 @@ func findLogged(r *recordingLogger, msg string) logRecord {
 	return logRecord{}
 }
 
-// TestPerEventDropLinesCostNothingWhenDebugIsOff pins the guard on the two
-// drop lines that run on the changefeed goroutine for traffic this process
-// does not own.
+// TestPerEventDropLinesCostNothingWhenDebugIsOff pins the guard on the three
+// drop lines that run per foreign row rather than per failure.
 //
 // `systemplane_entries` is one table per database, so every foreign write by
-// any other consumer reaches this feed, and a dropped tenant's subscription
-// keeps delivering until it is released. Both lines are DEBUG — off in every
-// production deployment — yet the fields are built at the call site, so
-// without the guard each of those events still costs a three-element
-// []log.Field and its boxing before the logger throws the line away.
+// any other consumer reaches this feed, every foreign ROW reaches the ingress
+// on every reconcile, and a dropped tenant's subscription keeps delivering
+// until it is released. All three lines are DEBUG — off in every production
+// deployment — yet the fields are built at the call site, so without the guard
+// each of those events still costs a []log.Field and its boxing before the
+// logger throws the line away.
 func TestPerEventDropLinesCostNothingWhenDebugIsOff(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 
@@ -1149,6 +1160,17 @@ func TestPerEventDropLinesCostNothingWhenDebugIsOff(t *testing.T) {
 			defs: map[NSKey]KeyDef{},
 			drive: func(e *Engine) {
 				e.onEvent(upsertEvent(store.Scope{}, nk, 1))
+			},
+		},
+		{
+			name: "a snapshot row another consumer owns",
+			defs: map[NSKey]KeyDef{},
+			drive: func(e *Engine) {
+				// The reconcile's path, not the feed's: the feed drops an
+				// unregistered key before the ingress, so a foreign ROW only
+				// reaches this line through a snapshot — once per reconcile,
+				// for every namespace sharing the table.
+				ingestRow(e, jsonRow(nk, 1, `"v"`, "ops"))
 			},
 		},
 		{
@@ -1268,7 +1290,7 @@ func TestFailedRereadFencesTheKeyBeforeLogging(t *testing.T) {
 			tt.arrange(fs)
 			e.onEvent(upsertEvent(scope, nk, 1))
 
-			requireLogged(t, rec, tt.level, tt.msg, nk)
+			requireLogged(t, rec, tt.level, tt.msg, scope, nk)
 
 			if !fencedYet {
 				t.Errorf("%q reached the consumer's logger with %v still unfenced: a reconcile running "+

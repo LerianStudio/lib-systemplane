@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/runtime"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
@@ -66,10 +67,18 @@ func (e *Engine) ingest(ctx context.Context, sc *scopeState, se store.Entry) {
 func (e *Engine) prepare(ctx context.Context, scope store.Scope, se store.Entry) (pub publication, usable bool) {
 	def, registered := e.lookup(se.Namespace, se.Key)
 	if !registered {
-		e.logDebug(ctx, "value for unregistered key, skipping",
-			log.String("namespace", se.Namespace),
-			log.String("keyname", se.Key),
-		)
+		// Guarded like the feed's own drop lines, and for the same reason:
+		// this one runs once per FOREIGN ROW per reconcile, not once per
+		// failure. One systemplane_entries table serves every consumer of a
+		// database, so a scope's snapshot carries every other consumer's
+		// namespaces and each of them reaches here on every OpResync.
+		if e.debugEnabled() {
+			e.logDebug(ctx, "value for unregistered key, skipping",
+				log.String(constants.AttrKeyTenantID, scope.Tenant),
+				log.String("namespace", se.Namespace),
+				log.String("keyname", se.Key),
+			)
+		}
 
 		return publication{}, false
 	}
@@ -77,6 +86,7 @@ func (e *Engine) prepare(ctx context.Context, scope store.Scope, se store.Entry)
 	var decoded any
 	if err := json.Unmarshal(se.Value, &decoded); err != nil {
 		e.logWarn(ctx, "failed to unmarshal stored value, keeping cached value",
+			log.String(constants.AttrKeyTenantID, scope.Tenant),
 			log.String("namespace", se.Namespace),
 			log.String("keyname", se.Key),
 			errorDetail(def.Redacted, "decode failed", err),
@@ -88,7 +98,7 @@ func (e *Engine) prepare(ctx context.Context, scope store.Scope, se store.Entry)
 	nk := NSKey{Namespace: se.Namespace, Key: se.Key}
 
 	if err := e.runValidator(ctx, def.Validate, decoded); err != nil {
-		e.logValidatorRejection(ctx, nk, def.Redacted, err)
+		e.logValidatorRejection(ctx, scope.Tenant, nk, def.Redacted, err)
 
 		return publication{}, false
 	}
@@ -118,8 +128,9 @@ func (e *Engine) prepare(ctx context.Context, scope store.Scope, se store.Entry)
 //
 // The error returned to the caller of Set is unchanged in both cases. This is
 // the log stream, not the API.
-func (e *Engine) logValidatorRejection(ctx context.Context, nk NSKey, redacted bool, err error) {
+func (e *Engine) logValidatorRejection(ctx context.Context, tenant string, nk NSKey, redacted bool, err error) {
 	e.logWarn(ctx, "stored value rejected by validator, keeping cached value",
+		log.String(constants.AttrKeyTenantID, tenant),
 		log.String("namespace", nk.Namespace),
 		log.String("keyname", nk.Key),
 		errorDetail(redacted, "validation failed", err),
@@ -161,11 +172,14 @@ func errorDetail(redacted bool, what string, err error) log.Field {
 //
 // sc is the caller's own scope state, for the reason publish takes one.
 func (e *Engine) ingestDefault(ctx context.Context, sc *scopeState, nk NSKey) (notify bool) {
-	// Unreachable from either production caller since the feed gained its
-	// registry filter: the feed drops an unregistered key before applyDelete
-	// can ask, and a reconcile only ever asks about keys it took from
-	// Registry.Keys. It is kept as a deliberate invariant check, so a future
-	// caller that does reach here publishes nothing rather than a nil default.
+	// Unreachable from all three production callers, each behind a guard of
+	// its own: applyDelete, because the feed drops an unregistered key before
+	// it is reached; applySnapshotRow, because it asks its own Registry
+	// lookup first and returns rather than fall through for a foreign row the
+	// snapshot carried; applyAbsentKey, because every key it decides came
+	// from Registry.Keys. It is kept as a deliberate invariant check, so a
+	// future caller — or one whose guard is removed — publishes nothing here
+	// rather than a nil default over a live value.
 	// TestIngestDefaultPublishesAtRevisionZero in ingest_test.go pins it, and
 	// asserts only that notify is false — no test asserts the level of the
 	// line below, which is a judgement about foreign traffic on a shared table
@@ -173,6 +187,7 @@ func (e *Engine) ingestDefault(ctx context.Context, sc *scopeState, nk NSKey) (n
 	def, registered := e.lookup(nk.Namespace, nk.Key)
 	if !registered {
 		e.logDebug(ctx, "no-row event for unregistered key, skipping",
+			log.String(constants.AttrKeyTenantID, sc.scope.Tenant),
 			log.String("namespace", nk.Namespace),
 			log.String("keyname", nk.Key),
 		)
