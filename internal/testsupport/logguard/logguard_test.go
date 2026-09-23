@@ -38,29 +38,34 @@ func TestAssertNoneRedacted(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		name  string
-		dir   string
-		err   string
-		fatal string
+		name   string
+		dir    string
+		errs   []string
+		fatals []string
 	}{
 		{
 			name: "a plain import is scanned",
 			dir:  "testdata/unaliased",
-			err:  `field name "key"`,
+			errs: []string{`field name "key"`},
 		},
 		{
 			name: "an aliased import is scanned",
 			dir:  "testdata/aliased",
-			err:  `field name "key"`,
+			errs: []string{`field name "key"`},
+		},
+		{
+			name: "every call site of a repeated name is reported, in source order",
+			dir:  "testdata/repeated",
+			errs: []string{"source.go:8:", "source.go:12:"},
 		},
 		{
 			name: "a name the scan cannot read is skipped",
 			dir:  "testdata/nonliteral",
 		},
 		{
-			name:  "another package's log is not scanned, and reading nothing fails",
-			dir:   "testdata/foreignlog",
-			fatal: "the scan matched nothing",
+			name:   "another package's log is not scanned, and reading nothing fails",
+			dir:    "testdata/foreignlog",
+			fatals: []string{"the scan matched nothing"},
 		},
 	}
 
@@ -71,30 +76,24 @@ func TestAssertNoneRedacted(t *testing.T) {
 			tb := &fakeTB{}
 			AssertNoneRedacted(tb, tc.dir)
 
-			requireOne(t, "error", tb.errs, tc.err)
-			requireOne(t, "fatal", tb.fatals, tc.fatal)
+			requireLines(t, "error", tb.errs, tc.errs)
+			requireLines(t, "fatal", tb.fatals, tc.fatals)
 		})
 	}
 }
 
-// requireOne asserts the guard reported exactly one line containing want, or
-// none at all when want is empty.
-func requireOne(t *testing.T, kind string, got []string, want string) {
+// requireLines asserts the guard reported exactly one line per entry of want,
+// each containing its entry, in order; an empty want means no line at all.
+func requireLines(t *testing.T, kind string, got, want []string) {
 	t.Helper()
 
-	if want == "" {
-		if len(got) != 0 {
-			t.Errorf("got %d %s lines, want none: %v", len(got), kind, got)
+	if len(got) != len(want) {
+		t.Fatalf("got %d %s lines, want %d containing %q: %v", len(got), kind, len(want), want, got)
+	}
+
+	for i := range want {
+		if !strings.Contains(got[i], want[i]) {
+			t.Errorf("%s line %d = %q, want it to contain %q", kind, i, got[i], want[i])
 		}
-
-		return
-	}
-
-	if len(got) != 1 {
-		t.Fatalf("got %d %s lines, want exactly 1 containing %q: %v", len(got), kind, want, got)
-	}
-
-	if !strings.Contains(got[0], want) {
-		t.Errorf("%s line = %q, want it to contain %q", kind, got[0], want)
 	}
 }

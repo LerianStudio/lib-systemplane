@@ -44,8 +44,9 @@ var fieldConstructors = map[string]bool{
 
 // AssertNoneRedacted parses every non-test Go file in dir — "." is the package
 // directory a test binary runs in — and fails tb for each literal log field
-// name on lib-observability's sensitive list, reporting the source position so
-// the offending call site is one jump away.
+// name on lib-observability's sensitive list — once per call site, in source
+// order — reporting the source position so the offending call site is one
+// jump away.
 //
 // It fails outright when the scan matches nothing: a guard that found no field
 // names proves nothing about the package it was pointed at.
@@ -62,8 +63,16 @@ func AssertNoneRedacted(tb testing.TB, dir string) {
 		tb.Fatalf("list package sources in %s: %v", dir, err)
 	}
 
+	// Every occurrence, in source order, not one entry per name: the same
+	// name logged from two sites is two call sites to fix.
+	type occurrence struct {
+		name string
+		pos  token.Position
+	}
+
 	fset := token.NewFileSet()
-	names := make(map[string]token.Position)
+
+	var found []occurrence
 
 	for _, source := range sources {
 		if strings.HasSuffix(source, "_test.go") {
@@ -82,21 +91,21 @@ func AssertNoneRedacted(tb testing.TB, dir string) {
 
 		ast.Inspect(file, func(n ast.Node) bool {
 			if name, lit, ok := fieldName(n, pkg); ok {
-				names[name] = fset.Position(lit.Pos())
+				found = append(found, occurrence{name: name, pos: fset.Position(lit.Pos())})
 			}
 
 			return true
 		})
 	}
 
-	if len(names) == 0 {
+	if len(found) == 0 {
 		tb.Fatalf("no log field names found in %s: the scan matched nothing, so it proves nothing", dir)
 	}
 
-	for name, pos := range names {
-		if redaction.IsSensitiveField(name) {
+	for _, o := range found {
+		if redaction.IsSensitiveField(o.name) {
 			tb.Errorf("%s: field name %q is on lib-observability's sensitive list, so the line "+
-				"reaches the operator with its value replaced by [REDACTED]", pos, name)
+				"reaches the operator with its value replaced by [REDACTED]", o.pos, o.name)
 		}
 	}
 }
