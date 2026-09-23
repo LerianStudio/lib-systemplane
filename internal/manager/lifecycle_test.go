@@ -134,6 +134,46 @@ func TestPopulate_BoundEnforced(t *testing.T) {
 	}
 }
 
+// TestPopulate_FullCacheStillOverwritesKnownKey pins that the bound rejects
+// only NEW keys. Replacing a key the cache already holds costs no entry, and
+// refusing it would strand a reader on a value the store has already replaced
+// — the write path populates this cache, so a dropped overwrite is a stale
+// read that survives until the changefeed lands.
+func TestPopulate_FullCacheStillOverwritesKnownKey(t *testing.T) {
+	t.Parallel()
+
+	m := New(nil)
+	m.cfg.maxEntriesPerTenantOverride = 2
+
+	ts := m.tenantStateFor("tenant-a")
+
+	m.Populate(context.Background(), "tenant-a", "ns", "a", "previous")
+	m.Populate(context.Background(), "tenant-a", "ns", "b", 2)
+
+	// Cache is now full. Overwriting an existing key must still apply.
+	m.Populate(context.Background(), "tenant-a", "ns", "a", "new")
+
+	got, hit, err := m.Lookup(context.Background(), "tenant-a", "ns", "a")
+	if err != nil || !hit {
+		t.Fatalf("lookup: value=%v hit=%v err=%v", got, hit, err)
+	}
+
+	if got != "new" {
+		t.Errorf("got %v, want the overwritten value at a full cache", got)
+	}
+
+	if ts.entryCount() != 2 {
+		t.Errorf("an overwrite must not grow the cache: got %d entries", ts.entryCount())
+	}
+
+	// A genuinely new key is still rejected at capacity.
+	m.Populate(context.Background(), "tenant-a", "ns", "c", 3)
+
+	if ts.entryCount() != 2 {
+		t.Errorf("expected cache bounded at 2 entries, got %d", ts.entryCount())
+	}
+}
+
 func TestRegisterCallback_DispatchesAfterDispatchCall(t *testing.T) {
 	t.Parallel()
 

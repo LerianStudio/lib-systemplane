@@ -32,7 +32,7 @@ Read `index.md` § Frozen Contracts FC-2, FC-3, FC-8, FC-9 and decisions D2, D3,
 | Phase | Milestone | Epics | Status |
 |-------|-----------|-------|--------|
 | 1 | Postgres stores and returns revisions, resolves named tenants through the connector, runs one LISTEN feed per scope, and narrates loss and recovery with `OpDisconnect` / `OpResync`; DDL v4 and the v3→v4 migration ship and are proven idempotent on a container | 1.1, 1.2, 1.3, 1.4, 1.5 | Detailed |
-| 2 | MongoDB does the same: connector, revision via an atomic update pipeline, per-scope change streams that are open before `Subscribe` returns (closing a live event-loss bug), `OpDisconnect` on cursor death and `OpResync` on every re-open, polling fallback honouring both | 2.1, 2.2, 2.3 | Epic-level |
+| 2 | MongoDB does the same: connector, revision via an atomic update pipeline, per-scope change streams that are open before `Subscribe` returns (closing a live event-loss bug), `OpDisconnect` on cursor death and `OpResync` on every re-open, polling fallback honouring both | 2.1, 2.2, 2.3 | Detailed |
 | 3 | The contract suite asserts revision, scope, disconnect and resync unconditionally and runs against both backends in both modes; `DefaultSeedSQL` is gone | 3.1, 3.2 | Epic-level |
 
 ---
@@ -424,6 +424,90 @@ D6 makes MongoDB equal to Postgres, not a degraded fallback: the Console runs on
 **Done when:** `Connector` and `NewTenantManagerConnector(*tmmongo.Manager)` exist per FC-3 over the manager's `GetDatabaseForTenant`; `Config.Connector` is carried through construction; `resolveCollection` resolves a named tenant through it and returns `store.ErrTenantConnectorMissing` when none is configured; the lazy per-database collection bootstrap (`ensureSchema`, keyed `"<db>/<collection>"`) covers connector-resolved databases exactly as it covers ctx-resolved ones; `Get`/`Set`/`Delete`/`List` under `Scope{Tenant:"t1"}` hit `t1`'s database with a ctx carrying no tenant at all. The tenant-manager package must be imported aliased (`tmmongo`) because its package name collides with the driver's `mongo`.
 **Status:** Pending
 
+#### Task 2.1.1: Land the MongoDB tenant connector over the tenant-manager Mongo Manager
+
+- [ ] Done
+
+**Context:** `internal/mongodb` has no connector at all. `resolveCollection` (`internal/mongodb/mongodb.go:196-219`) refuses every named tenant with `store.ErrTenantConnectorMissing` behind a comment that names this task ("MongoDB has no tenant connector yet; the storage lane adds one per FC-3"). The Postgres half of FC-3 is landed and is the template to mirror: `internal/postgres/connector.go` declares the `Connector` interface, the `ErrPgMgrUnavailable` sentinel, `NewTenantManagerConnector(*tmpostgres.Manager) Connector` and the unexported `pgMgrConnector` adapter, and `Config.Connector` sits on the Postgres `Config` (`internal/postgres/postgres.go:139`). The tenant-manager Mongo Manager is already a reachable dependency: `github.com/LerianStudio/lib-commons/v7` is a direct require in `go.mod` and its `commons/tenant-manager/mongo` package exposes `func (p *Manager) GetDatabaseForTenant(ctx context.Context, tenantID string) (*mongo.Database, error)`. No `go.mod` change is needed and none is permitted.
+
+**Implementation vision:** New file `internal/mongodb/connector.go` (a new file is explicitly allowed here — it is pure resolution logic with unit tests, exactly like the Postgres connector, and it is the only new file this phase creates). It declares, in FC-3's words:
+
+```go
+// Connector resolves a tenant's MongoDB database.
+type Connector interface {
+	ResolveDatabase(ctx context.Context, tenantID string) (*mongo.Database, error)
+}
+
+// NewTenantManagerConnector wraps a lib-commons tenant-manager Mongo Manager.
+func NewTenantManagerConnector(mgr *tmmongo.Manager) Connector
+```
+
+The import MUST be aliased `tmmongo "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/mongo"`: its package name is `mongo` and collides with the driver's `go.mongodb.org/mongo-driver/v2/mongo`, which every file in this package already imports. Add the sentinel `ErrMongoMgrUnavailable = errors.New("systemplane/mongodb: tenant-manager mongo manager is not configured")`, mirroring `ErrPgMgrUnavailable`, and have the unexported `mbMgrConnector` return it when the receiver or its manager is nil, so a connector built with a nil manager in a test fails with a named error instead of a nil dereference. On a manager error, wrap as `fmt.Errorf("systemplane/mongodb: get tenant database %s: %w", tenantID, err)`.
+
+Two decisions made here so no later task re-opens them. First, there is deliberately NO MongoDB analogue of `refuseSchemaIsolatedDSN` (`internal/postgres/connector.go:58-69`): Postgres refuses a schema-pinned DSN because NOTIFY is database-wide and two tenants sharing one database would cross-deliver notifications, while a MongoDB change stream is opened on ONE collection in ONE database, so two tenants sharing a Mongo server never observe each other's events. Say that in the interface's doc comment so a reviewer does not read the asymmetry as an omission. Second, the interface returns the `*mongo.Database`, not a `*mongo.Collection`: the collection name is the store's own configuration (`Config.Collection`) and the connector must not need to know it — this is what lets `resolveCollection` keep its single `db.Collection(s.cfg.Collection)` call site in Task 2.1.2.
+
+Then add `Connector Connector // nil only for a store that never resolves a named Scope.Tenant; a named scope needs it in either mode` to `Config` (`internal/mongodb/mongodb.go:55-83`), directly below `Module`, with the same comment the Postgres field carries. `New` (`internal/mongodb/mongodb_config.go:22-58`) needs no validation change: a nil connector is legal and is what makes a named tenant fail with `store.ErrTenantConnectorMissing` in Task 2.1.2. Note explicitly that `New`'s single-tenant branch still requires `Client` and `Database` — a store built ONLY to serve named tenants passes `MultiTenantEnabled: true` with a nil client, exactly as the Postgres store does.
+
+Unit tests in a new `internal/mongodb/connector_test.go` (`//go:build unit`, `package mongodb`): `NewTenantManagerConnector(nil)` returns a non-nil `Connector` whose `ResolveDatabase` yields `ErrMongoMgrUnavailable`; a nil `*mbMgrConnector` receiver does the same rather than panicking; and `New(Config{MultiTenantEnabled: true, Connector: c})` carries the connector through to `s.cfg.Connector`. Do not attempt to construct a live `tmmongo.Manager` — it needs a tenant-config client and is exercised only through the integration path in Task 2.1.2's fake connector.
+
+**Files:**
+- Create: `internal/mongodb/connector.go`
+- Create: `internal/mongodb/connector_test.go`
+- Modify: `internal/mongodb/mongodb.go:55-83` (`Config.Connector`)
+
+**Verification:** `go test -tags=unit -count=1 ./internal/mongodb/... -run 'TestConnector|TestNew_'` — passes, and `go build ./...` is clean. `git diff --stat go.mod go.sum` must be empty.
+
+**Done when:** `mongodb.Connector`, `mongodb.NewTenantManagerConnector` and `Config.Connector` exist per FC-3, the tenant-manager package is imported aliased, and a connector with no manager fails with a named sentinel instead of panicking.
+
+---
+
+#### Task 2.1.2: Resolve a named tenant collection through the connector
+
+- [ ] Done
+
+**Context:** `resolveCollection` (`internal/mongodb/mongodb.go:196-219`) is the single chokepoint every CRUD method already calls (`List` `:303`, `Get` `:347`, `Set` `:390`, `Delete` `:422`). Its named-tenant branch is the FC-2 shim: `if scope.Tenant != "" { return nil, store.ErrTenantConnectorMissing }`, whether or not a connector exists. The lazy per-database bootstrap it then performs for the ctx-resolved multi-tenant path — `ensureSchema(ctx, coll)` keyed by `"<db>/<collection>"` (`mongodb.go:221-295`, `schemaCacheKey` `:224`) — is already database-agnostic and will serve connector-resolved databases unchanged. `runSchema` (`internal/mongodb/mongodb_crud.go:34-57`) branches on `s.cfg.MultiTenantEnabled`: multi-tenant eagerly `CreateCollection`s (idempotent through `isNamespaceExists`), single-tenant only lists indexes. `internal/mongodb/mongodb_unit_test.go:224` (`TestStore_NamedTenantScopeIsRefused`) pins today's blanket refusal across all five methods. The Postgres counterpart to mirror is `resolveDB` (`internal/postgres/postgres.go:241-270`).
+
+**Implementation vision:** Replace the shim branch with the Postgres shape, line for line:
+
+```go
+if scope.Tenant != "" {
+	if s.cfg.Connector == nil {
+		return nil, store.ErrTenantConnectorMissing
+	}
+
+	db, err := s.cfg.Connector.ResolveDatabase(ctx, scope.Tenant)
+	if err != nil {
+		return nil, fmt.Errorf("systemplane/mongodb: resolve tenant %s: %w", scope.Tenant, err)
+	}
+
+	if db == nil {
+		return nil, fmt.Errorf("systemplane/mongodb: resolve tenant %s: %w", scope.Tenant, store.ErrTenantConnectorMissing)
+	}
+
+	coll := db.Collection(s.cfg.Collection)
+	if err := s.ensureSchema(ctx, coll, true); err != nil {
+		return nil, err
+	}
+
+	return coll, nil
+}
+```
+
+Four decisions, made here. (1) A connector returning a nil `*mongo.Database` with a nil error is a connector bug and is refused with the tenant named, not passed through to panic on the first command — the same rule `internal/postgres/postgres.go:253-256` applies to a nil `dbresolver.DB`. (2) The named-tenant branch deliberately ignores `MultiTenantEnabled` and ignores whatever tenant ctx carries, per FC-2 ("resolves through the tenant connector regardless of ctx"); an explicitly named scope and a request-scoped ctx tenant must never silently disagree. (3) The zero-scope branches stay byte-identical: single-tenant returns `s.coll`, multi-tenant reads `tmcore.GetMBContext(ctx, s.cfg.Module)` and returns `store.ErrTenantConnectionMissing` when absent. (4) `ensureSchema` grows a `tenantScoped bool` parameter threaded into `runSchema`, and `runSchema`'s eager-`CreateCollection` branch fires when `s.cfg.MultiTenantEnabled || tenantScoped`. A connector-resolved tenant database may be brand new, so the collection MUST be materialized or a `Get`/`List` before the first `Set` returns an empty result that masks a permissions problem — the exact reason the multi-tenant branch exists. The single-tenant index-list probe is KEPT rather than replaced by an unconditional `CreateCollection`: an existing single-tenant consumer whose collection is provisioned externally may hold a role without `createCollection`, and making v4 demand that grant would break a working deployment for no gain. Update `runSchema`'s doc comment to say the eager branch now covers every tenant-resolved database, ctx-carried or connector-resolved. Call sites: `Start` passes `false` (`mongodb.go:149`), the ctx path passes `true` (it is a tenant database too), the connector path passes `true`.
+
+Tests. Rename `TestStore_NamedTenantScopeIsRefused` to `TestStore_NamedTenantWithoutConnector` (the name Epic 2.3 uses) and keep it asserting `store.ErrTenantConnectorMissing` from `Get`, `Set`, `Delete` and `List` on a store with a nil connector. Leave its `Subscribe` assertion expecting `store.ErrNotSupportedInMultiTenant` UNCHANGED in this task — `Subscribe` only learns about connectors in Task 2.3.3, and flipping the expectation early leaves a red commit. Add `TestStore_NamedTenantNilDatabaseIsRefused` (unit, a fake connector returning `(nil, nil)`) asserting the wrapped `ErrTenantConnectorMissing`. New integration test `TestIntegration_MongoScopedCRUDIsolation` in `internal/mongodb/mongodb_integration_test.go`: reuse `startContainer` (`:22`), define a `fakeConnector` in `package mongodb_test` holding `map[string]*mongo.Database` under a mutex and returning an error for an unknown tenant (mirroring `newFakeConnector` in `internal/postgres/postgres_integration_test.go:607-650`), build the store with `mongodb.Config{MultiTenantEnabled: true, Module: "systemplane", Connector: fake}` and NO `Client`/`Database`, then `Set`/`Get`/`List`/`Delete` under `store.Scope{Tenant: "t1"}` and `store.Scope{Tenant: "t2"}` with a bare `context.Background()` carrying no tenant at all — proving resolution came from the connector and not from ctx — asserting each tenant sees only its own rows and that an unknown tenant surfaces the connector's error wrapped with the tenant id.
+
+**Files:**
+- Modify: `internal/mongodb/mongodb.go:196-219` (`resolveCollection`), `internal/mongodb/mongodb.go:228-234` (`ensureSchema` signature), `internal/mongodb/mongodb.go:149` (`Start` call site)
+- Modify: `internal/mongodb/mongodb_crud.go:34-57` (`runSchema` signature + branch condition + doc)
+- Test: `internal/mongodb/mongodb_unit_test.go:224` (rename + extend), `internal/mongodb/mongodb_integration_test.go` (fake connector + `TestIntegration_MongoScopedCRUDIsolation`)
+
+**Verification:** `go test -tags=unit -count=1 ./internal/mongodb/...` then `go test -tags=integration -count=1 -timeout 10m ./internal/mongodb/... -run 'TestIntegration_MongoScopedCRUDIsolation'` — both pass; the scoped test writes and reads two tenant databases through the connector with an empty context.
+
+**Done when:** a named tenant reads and writes its own MongoDB database through the connector with a context carrying no tenant, a fresh tenant database gets its collection materialized on first use, and a missing connector is still refused on every CRUD method.
+
+---
+
 ### Epic 2.2: Revision in the MongoDB document
 
 **Goal:** FC-9's `revision` is stored, set to `max(previous + 1, $toLong($$NOW))` only when `value` changes, returned by `Set`, and carried by every read and event; `Delete` leaves a tombstone so a recreate lands above every revision the key ever had (D11).
@@ -471,6 +555,69 @@ Race behaviour, stated because FC-9 warns about foreign writers: MongoDB guarant
 
 **Status:** Pending
 
+#### Task 2.2.1: Store and return a revision from a pipeline upsert
+
+- [ ] Done
+
+**Context:** `entryDoc` (`internal/mongodb/mongodb.go:93-101`) has no `revision` field and `toEntry` (`internal/mongodb/mongodb_config.go:10-18`) therefore leaves `store.Entry.Revision` at 0 on every read. `Set` (`internal/mongodb/mongodb.go:377-410`) calls the `upsert` helper (`internal/mongodb/mongodb_crud.go:60-80`) — a plain `$set` document through `UpdateOne` with `SetUpsert(true)` — and returns a hard-coded `0, nil`, the FC-2 shim. FC-2 documents `Entry.Revision == 0` as "the row carries no revision", which the engine never fences and never deduplicates, so a read path stuck at 0 defeats revision dedupe entirely. The Postgres counterpart landed in Epic 1.2: `Set` ends in `RETURNING revision` and `Get`/`List` select the column. MongoDB has no triggers and no sequences, so the arithmetic lives in the write itself (D11, FC-9). `fields.go:10-19` holds the BSON name constants; `mongo-driver/v2` v2.9.0 provides `options.FindOneAndUpdate().SetUpsert(true).SetReturnDocument(options.After)` and `mongo.IsDuplicateKeyError`.
+
+**Implementation vision:** Add `fieldRevision = "revision"` to `fields.go`. Add `Revision int64 \`bson:"revision"\`` to `entryDoc` (between `Value` and `UpdatedAt`, matching FC-9's field order) and propagate it in `toEntry`. Replace `upsert` with `upsertReturningRevision(ctx, coll, e) (int64, error)`, built from the two-stage aggregation pipeline Epic 2.2 already decided, run through `coll.FindOneAndUpdate(ctx, filter, pipeline, options.FindOneAndUpdate().SetUpsert(true).SetReturnDocument(options.After))` and decoded into an `entryDoc` whose `Revision` is returned. The filter stays `bson.D{{Key: fieldID, Value: compoundID{...}}}` — a query document matches literally, so a `$`-prefixed namespace or key needs no wrapping there.
+
+The pipeline is the snippet in this epic, verbatim, and the reasons it has that shape are settled: revision is computed in its OWN `$set` stage that runs BEFORE the stage writing `value`, so `"$value"` unambiguously means the PRE-update value; folding both into one stage would lean on same-stage input-document semantics and is a trap, not a saving. On an insert `$value` is missing, so `$ifNull` yields BSON null, the `$eq` against the new value (always a JSON string, never BSON null — even a JSON `null` payload is the four-character string `"null"`) is false, the bump branch runs and yields `max($ifNull($revision,0) + 1, $toLong($$NOW))` = the clock floor. `$setOnInsert` is illegal in a pipeline update, which is why the `$ifNull` defaults carry that case instead.
+
+**Every caller-supplied STRING is wrapped in `$literal`** — namespace, key, value and updated_by — and this is the only fix permitted for the `$`-prefix hazard. In a pipeline `$set`, a bare string beginning with `$` is an aggregation expression: `UpdatedBy: "$value"` would evaluate to the document's own JSON payload and silently persist it as the actor, and `"$x"` as a namespace would resolve to missing and DROP the field, corrupting the document shape. `UpdatedAt` is left bare on purpose — a BSON date is never parsed as a field path — and that is a decision, not an oversight; say so in a comment so a later reader does not "fix" it. Do NOT add validation rejecting `$`-prefixed namespaces, keys or actors: Postgres stores them verbatim through bind parameters (`TestIntegration_PostgresDollarPrefixedStringsStoredVerbatim`, `internal/postgres/postgres_integration_test.go:561`), and a key that works on one backend and is refused on the other is a worse defect than the one being closed.
+
+One race is handled explicitly: two concurrent upserts of a not-yet-existing `_id` can both attempt the insert and one receives a duplicate-key error. `Set` retries exactly once on `mongo.IsDuplicateKeyError(err)`; on the retry the document exists, so the pipeline takes the update path. Any other error is wrapped as today (`fmt.Errorf("systemplane/mongodb: set: %w", err)` with `tracing.HandleSpanError(span, "set upsert failed", err)` kept). `mongo.ErrNoDocuments` from the `FindOneAndUpdate` decode is NOT a special case: an upsert returning the after-image always produces a document, so if it appears it is a real error and must propagate rather than be swallowed into revision 0.
+
+`Get` and `List` need no query change in this task — they already decode the whole document, so adding the struct field is enough — but assert the value they now report. The Set pipeline gains one more stage in Task 2.2.2 (`$unset: "deleted"`, so a `Set` on a tombstone clears the flag); leave it out here, where no tombstone can exist yet.
+
+Tests. Unit (`internal/mongodb/mongodb_unit_test.go`): extend `TestEntryDocToEntry` to carry a revision; add `TestUpsertPipeline_WrapsEveryCallerString`, which builds the pipeline for an entry whose namespace, key, value and updated_by all begin with `$` and asserts that each of the four appears inside a `$literal` and that `updated_at` does not — a cheap regression guard that needs no server (the builder must therefore be a function returning `mongo.Pipeline`, not inline code). Integration (`internal/mongodb/mongodb_integration_test.go`): `TestIntegration_MongoIdenticalWriteKeepsRevision` (insert → revision > 0; different value → strictly greater; identical value → unchanged; `Get` and the matching `List` entry both report the last number) and `TestIntegration_MongoDollarPrefixedStringsStoredVerbatim` (`Namespace: "$ns"`, `Key: "$key"`, `UpdatedBy: "$value"` written, then read back byte-identical, with `Value` still the JSON that was written and not the actor field, then re-written with the same value and the revision asserted unmoved — proving the `$cond` still compares correctly with the surrounding fields wrapped). Both are integration rather than unit because pipeline expressions are evaluated server-side; a unit test cannot observe the field-path substitution this guards against.
+
+**Files:**
+- Modify: `internal/mongodb/fields.go` (add `fieldRevision`)
+- Modify: `internal/mongodb/mongodb.go:93-101` (`entryDoc.Revision`), `internal/mongodb/mongodb.go:377-410` (`Set` returns the revision, dup-key retry)
+- Modify: `internal/mongodb/mongodb_config.go:10-18` (`toEntry`)
+- Modify: `internal/mongodb/mongodb_crud.go:60-80` (replace `upsert` with the pipeline builder + `upsertReturningRevision`)
+- Test: `internal/mongodb/mongodb_unit_test.go`, `internal/mongodb/mongodb_integration_test.go`
+
+**Verification:** `go test -tags=integration -count=1 -timeout 10m ./internal/mongodb/... -run 'TestIntegration_MongoIdenticalWriteKeepsRevision|TestIntegration_MongoDollarPrefixedStringsStoredVerbatim'` — the first write reports a revision above zero, a changed value strictly increases it, an identical rewrite leaves it alone, and `$`-prefixed namespace, key and actor round-trip verbatim.
+
+**Done when:** `Set` reports the revision now stored, an identical rewrite does not advance it, `Get` and `List` carry it, and a `$`-prefixed identifier survives the pipeline unchanged with no validation added on either backend.
+
+---
+
+#### Task 2.2.2: Replace Delete's removal with a tombstone rewrite
+
+- [ ] Done
+
+**Context:** `Delete` (`internal/mongodb/mongodb.go:413-448`) runs `coll.DeleteOne` on the compound `_id`, so the document and its revision vanish. D11 and FC-9 forbid that: without the row, `previous` is gone and a recreate falls back to the clock floor `$toLong($$NOW)`, which can land at or below the pre-delete revision (the `previous + 1` branch runs ahead of the clock by one per write inside a millisecond) — and D2's fence would then reject the recreated value until some later write happened to arrive, which for a knob nobody touches again is never. The contract suite already asserts the rule: `runRevisionMonotonic` (`systemplanetest/contract.go:452-478`) deletes and recreates and requires the recreate to be strictly above the deleted row's last revision. Mongo passes that suite today only because `TestIntegration_MongoDBSingleTenant` sets `SkipRevisionAndResync: true` (`internal/mongodb/mongodb_integration_test.go:77-81`). `Get` (`mongodb.go:342-374`) and `List` (`:297-339`) filter on `_id` and `bson.D{}` respectively and would happily return a tombstone. FC-9 was amended on 2026-09-18 (plan commit `f862dae`) after a review finding: a repeated `Delete` that rewrote `updated_at` on an existing tombstone emitted a change-stream update that the decoder maps to `OpDelete` at revision 0 — which the engine never deduplicates — so every subscriber received a duplicate delete. The filter below is what makes a repeat delete write nothing at all.
+
+**Implementation vision:** Add `fieldDeleted = "deleted"` and `opUnset = "$unset"` to `fields.go`, and `Deleted bool \`bson:"deleted"\`` to `entryDoc` (last field, matching FC-9). Replace the `DeleteOne` call with a three-stage pipeline run through `coll.UpdateOne(ctx, filter, pipeline)` **without** `SetUpsert`, and — this is the load-bearing half — with the filter `bson.D{{Key: fieldID, Value: compoundID{...}}, {Key: fieldDeleted, Value: bson.D{{Key: "$ne", Value: true}}}}`:
+
+- Stage 1 (`$set` revision): ALWAYS bump, `$max[$add[$ifNull["$revision", 0], 1], $toLong("$$NOW")]`. No `$cond` on `deleted`, because the filter has already excluded every document that is one. Factor that bump expression into one helper shared with Task 2.2.1's changed-value branch so the two writers can never drift.
+- Stage 2 (`$set`): `deleted: true`, `updated_at` (a bare BSON date), `updated_by` wrapped in `$literal`.
+- Stage 3: `$unset: "value"`.
+
+The filter is what makes the three FC-9 consequences true, and each gets its own assertion. A `Delete` on a MISSING key matches nothing (no upsert) and writes nothing. A `Delete` on an EXISTING TOMBSTONE also matches nothing, so it writes nothing, bumps nothing and — the reason the filter exists rather than a `$cond` — emits NO change-stream event: an update that only refreshed `updated_at` would reach the decoder as an `update` whose full document carries `deleted: true`, map to `OpDelete` at revision 0, and revision 0 is never deduplicated, so every subscriber would receive a duplicate delete publication. And a `Set` after a `Delete` always bumps, because Task 2.2.1's stage 1 compares `$ifNull["$value", nil]` — unset on a tombstone — against the new value string, which can never be BSON null. `Delete` returns nil whether or not a document matched, idempotent exactly as on Postgres; do NOT surface `MatchedCount == 0` as an error, and do NOT report it to the caller in any form — the contract suite's `runDelete` (`systemplanetest/contract.go:230-254`) deletes the same key twice and requires both to succeed. Task 2.2.1's stage list therefore gains one more stage of its own: `$unset: "deleted"`, so `Set` on a tombstone clears the flag (FC-9: "Set on a tombstone clears `deleted` and bumps"). Put that stage last in the Set pipeline; no stage reads `deleted`, so its position is free, and stating that here stops a later reader from re-deriving it.
+
+`Get` and `List` add `deleted: {$ne: true}` to their filters, so the store surface never shows a tombstone: `Get` returns `(store.Entry{}, false, nil)` and `List` skips it. Use `$ne: true` rather than `deleted: {$exists: false}` — a document written before this change carries no `deleted` field at all and must still be visible, and `$ne` matches a missing field.
+
+Delete keeps its current guards unchanged: nil/closed store, empty namespace or key rejected with `store.ErrValidation`, `actor` deliberately NOT a span attribute (unbounded caller identity, `mongodb.go:430-433`), and `store.Store.Delete` still returns only an error — the tombstone's revision is not part of the interface. Timestamp: `Delete` takes no time argument, so use `time.Now().UTC()`, the same default `Set` applies when `e.UpdatedAt` is zero (`mongodb.go:386-388`).
+
+Tests. Integration (`internal/mongodb/mongodb_integration_test.go`): `TestIntegration_MongoDeleteLeavesTombstone` — `Set`, `Delete`, then `Get` reports not found, `List` omits the key, and a raw `coll.FindOne` on the compound `_id` (through the test's own client) still finds the document with `deleted: true`, no `value` field and a revision above the pre-delete one. `TestIntegration_MongoRecreateAfterDeleteExceedsTombstone` — `Set`, note r1, `Delete`, note the tombstone's revision through the raw read, `Set` again and assert the new revision is strictly greater than the tombstone's. `TestIntegration_MongoRepeatDeleteWritesNothing` — `Delete` an existing key, snapshot the raw document's `revision`, `updated_at` and `updated_by`, `Delete` again, and assert all three are byte-identical afterwards (a write of any kind would move `updated_at`), and that a `Delete` of a never-written key leaves `CountDocuments` on that `_id` at 0. The matching "and emits no event" half is asserted in Task 2.3.4, where a subscriber exists. Unit: extend `TestEntryDocToEntry` so a `Deleted` document still decodes; no unit test can exercise the pipeline itself.
+
+**Files:**
+- Modify: `internal/mongodb/fields.go` (`fieldDeleted`, `opUnset`)
+- Modify: `internal/mongodb/mongodb.go:93-101` (`entryDoc.Deleted`), `:297-339` (`List` filter), `:342-374` (`Get` filter), `:413-448` (`Delete` → tombstone)
+- Modify: `internal/mongodb/mongodb_crud.go` (tombstone pipeline + shared bump expression + `$unset: "deleted"` on the Set pipeline)
+- Test: `internal/mongodb/mongodb_integration_test.go`, `internal/mongodb/mongodb_unit_test.go`
+
+**Verification:** `go test -tags=integration -count=1 -timeout 10m ./internal/mongodb/... -run 'TestIntegration_MongoDeleteLeavesTombstone|TestIntegration_MongoRecreateAfterDeleteExceedsTombstone|TestIntegration_MongoRepeatDeleteWritesNothing'` — a deleted key reads as absent through `Get` and `List` while its document survives with `deleted: true`, the recreate lands strictly above the tombstone's revision, and a repeated delete leaves the document byte-identical.
+
+**Done when:** `Delete` never removes an existing document, a second `Delete` and a `Delete` on a missing key both match nothing and write nothing, `Delete` still returns nil in every case, `Get`/`List` treat a tombstone as absent, and a recreate after a delete is strictly above every revision the key ever had.
+
+---
+
 ### Epic 2.3: Per-scope change streams, `OpDisconnect` / `OpResync`, and the polling fallback
 
 **Goal:** `Subscribe(scope)` opens a change stream for exactly that scope, every cursor death announces `OpDisconnect`, every (re)open announces `OpResync` before any document event, and the polling fallback honours the same rules.
@@ -489,6 +636,237 @@ Tests this epic must name: `SubscribeThenImmediateWriteNeverLosesTheEvent` in `s
 Because the readiness fix removes a known flake, this epic's verification runs the Mongo suite repeatedly rather than once: `go test -tags=integration -count=5 -timeout 20m ./internal/mongodb/... -run 'TestIntegration_MongoDBSingleTenant'` must be green five times out of five. A single green run does not clear a defect that reproduced 3 times in 5.
 
 **Status:** Pending
+
+#### Task 2.3.1: Open the single-tenant change stream before Start returns, on a per-scope feed
+
+- [ ] Done
+
+**Context:** This closes the live event-loss bug. `Subscribe` (`internal/mongodb/mongodb_changestream.go:37-91`) only inserts `fn` into a flat `s.subscribers` map and returns; the stream is opened by `startListener` (`:93-121`), which launches a goroutine and returns immediately, and `coll.Watch` is not reached until `watchOnce` runs inside it (`:205`). A change stream opened with no resume token attaches at the CURRENT oplog position, so a write landing before the attach is never delivered — not late, never. The contracts lane reproduced this on mordor: 3 failures in 5 runs of the suite's `SubscribeReceivesUpsert` / `SubscribeReceivesDelete`, where delivered events arrive in ~110ms and lost ones never arrive. Postgres does not flake because `startListener` there opens the connection and executes `LISTEN` synchronously before returning (`internal/postgres/postgres_listen.go:702-724`, `openListen` `:645-676`). The Postgres feed shape this task mirrors is `internal/postgres/postgres_listen.go:63-106` (`feed`), `:108-114` (`subscription`), `:149-191` (`beginDisconnect` / `beginResync`), `:238-252` (`broadcast`, `beginDispatch`/`endDispatch`), `:702-724` (`startListener`), `:732-792` (`stopFeeds`/`signalFeed`), `:844-878` (`runFeed`). The store-wide shutdown channel is `Store.closedCh` (`internal/postgres/postgres.go:166-172`), closed once inside `Close` (`:214`).
+
+**Implementation vision:** Scope of this task: the ZERO scope only. Named-tenant feeds are Task 2.3.3; the joining-subscriber marker is Task 2.3.2; revision and tombstone decoding are Task 2.3.4; polling is Task 2.3.5. Split that way because the Postgres lane proved the order works and because each step keeps the suite green.
+
+Introduce a `feed` type in `mongodb_changestream.go` (a file already on `.ignorecoverunit`; do NOT create a `*_feed.go` — `.ignorecoverunit` is owned by `engine-core` and must not be edited). Copy the Postgres field set, substituting the Mongo handles:
+
+```go
+type feed struct {
+	scope store.Scope
+	coll  *mongo.Collection
+
+	ready       chan struct{}
+	err         error
+	readyClosed bool
+	refs        int
+
+	mu           sync.Mutex
+	subs         map[uint64]*subscription
+	nextID       uint64
+	connected    bool
+	disconnected bool
+	closing      bool
+	dispatching  int
+
+	stop chan struct{}
+	done chan struct{}
+}
+```
+
+Replace the flat `Store` fields `subscriberMu`, `subscribers`, `nextSubID`, `streamStop`, `streamDone` (`internal/mongodb/mongodb.go:125-130`) with `feedsMu sync.Mutex`, `feeds map[string]*feed`, `closing bool` and `closedCh chan struct{}`, exactly as `internal/postgres/postgres.go:146-173` has them. `New` (`mongodb_config.go:48-52`) creates `feeds` and `closedCh` instead of `subscribers`. `Close` (`mongodb.go:156-177`) sets `closed`, closes `closedCh` in the same `s.mu` hold, and calls `stopFeeds()` in place of `stopListener()`.
+
+`beginDisconnect` and `beginResync` are copied verbatim from Postgres, including their doc comments. They are the single edge-trigger rule and MongoDB must not invent a second one: `beginDisconnect` returns `ok` only on the connected→disconnected transition, and returns false when `f.closing` (clean shutdown) or `f.disconnected` (a reopen attempt failed while the feed was already known down) is set; `beginResync` clears `disconnected` so the next real loss can announce once more, and returns false once `f.closing` is set. This matters more here than on Postgres: `streamForever` (`mongodb_changestream.go:145-181`) calls `watchOnce` once per retry, so tying the emission to "`watchOnce` returned an error" would emit one disconnect per failed reopen and flood the engine through a long outage.
+
+`Start` (`mongodb.go:138-154`) keeps its multi-tenant no-op and its `ensureSchema` call, then calls the new `startListener(ctx)`, which: gets (creating if needed) the zero-scope feed through `zeroFeed`/`zeroFeedLocked` — including the `s.closing` refusal that stops a shut-down store from resurrecting a slot; returns nil when `f.done != nil` (already running, keeping `Start` idempotent, which the suite's `StartIsIdempotent` requires); the check-then-open is ONE interlock, mirroring the Postgres zero-scope feed: `startListener` reserves the zero-scope feed under `feedsMu` (an `opening` marker plus a `ready` channel on the feed) before calling `openWatch`, a second concurrent `Start` that finds the marker waits on `ready` and returns the first attempt's outcome instead of opening a second stream, and `publishFeed` clears the marker and closes `ready` under `feedsMu`; a losing attempt never reaches `openWatch`. `TestIntegration_MongoConcurrentStartOpensOneStream` and its polling twin assert exactly one stream or poller and no duplicate event after two concurrent `Start` calls; then opens the stream SYNCHRONOUSLY via `openWatch(ctx, f)`; and publishes through `publishFeed(ctx, f, stream)`, which rechecks `s.closing` under `feedsMu` and, if set, closes the stream and returns `store.ErrClosed` rather than leaving a live cursor behind a shut-down store. A failure from `openWatch` is returned from `Start` wrapped as `fmt.Errorf("systemplane/mongodb: watch%s: %w", f.label(), err)` and starts no goroutine.
+
+`openWatch` carries the `$match` pipeline the current code uses, unchanged (`insert|update|replace|delete`), plus `options.ChangeStream().SetFullDocument(options.UpdateLookup)` — Task 2.3.4 consumes the full document, and setting it here keeps the option in one place. No resume token is used; `OpResync` covers the gap (FC-9). Bound the first `Watch` with a timeout the way Postgres bounds its first connect (`connectTimeout`, `internal/postgres/postgres_listen.go:46-50`): add package vars `watchTimeout = 10 * time.Second` and `closeTimeout = 5 * time.Second`, vars rather than consts only so tests can shrink them. Without the bound, an unreachable Mongo parks `Start` for the life of the caller's ctx and pins the reserved feed slot with it.
+
+`runFeed(f, stream)` replaces `streamForever`/`watchOnce` and takes the already-open stream, mirroring Postgres's `runFeed(f, conn)`: emit `OpResync` through `beginResync`+`broadcast`; consume until failure; emit `OpDisconnect` through `beginDisconnect`+`broadcast`; close the dead stream on a ctx of its own (`context.WithoutCancel` + `closeTimeout`, because the ctx that just died would abandon the cursor rather than close it); return if `f.stop` is closed; otherwise reopen with the existing `backoff.ExponentialWithJitter(reconnectBaseDelay, attempt)` capped at `reconnectMaxDelay`, resetting `attempt` to 0 after a successful reopen. Keep `watchOnce`'s shutdown discrimination: it returns nil when its ctx was cancelled by `stop` (`mongodb_changestream.go:237-239`), and that plus the `f.closing` check inside `beginDisconnect` is what keeps a clean `Close` from announcing a disconnect.
+
+Consumption keeps today's decode-and-drop behaviour: a decode error logs and continues, an event missing identifiers increments `droppedEvents` and logs. Dispatch moves off the Store and onto the feed: `f.dispatch(logger, evt)` stamps `evt.Scope = f.scope` — the change stream cannot name the scope, so the feed that read it is the one place that can — snapshots the subscribers under `f.mu`, increments `dispatching`, releases the lock before any callback runs (a callback that unsubscribes from inside itself would otherwise deadlock), and delivers through `sub.deliver`, which holds `sub.mu` and runs `runtime.RecoverAndLog`. Put `dispatch`, `subscription.deliver`/`deliverLocked`, `snapshotLocked`, `joiningOpLocked`, `beginDispatch`/`endDispatch` and `broadcast` in `mongodb_events.go`, NOT in `mongodb_changestream.go`: they are pure fan-out with no I/O, `mongodb_events.go` is deliberately absent from `.ignorecoverunit`, and keeping them there preserves their unit coverage — the same division Postgres uses between `postgres_listen.go` and `postgres_notify.go`.
+
+`Subscribe` becomes the Postgres shape minus the tenant branch (Task 2.3.3 adds it): refuse a closed store; refuse the zero scope when `MultiTenantEnabled` with `store.ErrNotSupportedInMultiTenant`; return a no-op unsubscribe for a nil `fn` BEFORE touching any feed; acquire the feed; register the subscription under `f.mu`; build a `teardown` closure guarded by one `sync.Once` that removes the subscriber, closes `cancelCh` and releases the feed; and spawn the ctx observer only when `ctx != nil && ctx.Done() != nil`, selecting on `ctx.Done()`, `s.closedCh` and `cancelCh`. The `s.closedCh` arm is load-bearing: a subscription whose ctx outlives the store would otherwise park that goroutine — and the feed graph it closes over — forever after `Close`.
+
+Teardown: copy `stopFeeds`, `signalFeed(f, skipSelfWait)` and `stopFeed` verbatim in structure. `stopFeeds` raises `s.closing` in the SAME hold that walks the map, fails any slot whose creator is still in flight with `store.ErrClosed`, then signals every feed before waiting on all of them against ONE shared `closeTimeout` — signalling serially with a per-feed wait costs tenants × timeout and overruns the engine's 30s `Close` budget. `signalFeed` sets `f.closing` under `f.mu` BEFORE closing `f.stop`, so the reader's `beginDisconnect` can never announce a disconnect for a shutdown, and `skipSelfWait` (set only by the last-unsubscribe path, never by `Close`) plus `f.dispatching > 0` is the escape for a teardown reached from inside a callback, where waiting on the reader means waiting on the goroutine doing the waiting.
+
+Add a test-only `FeedsSnapshot(tenant string) (total, refs int)` to `internal/mongodb/main_test.go` (already `//go:build unit || integration`, `package mongodb`), copying `internal/postgres/main_test.go:36-48`, so the external `mongodb_test` package can assert the feeds map.
+
+Tests. Unit (`internal/mongodb/mongodb_changestream_test.go`, `package mongodb`): rework `newSubscribeStore` to build the new field set; keep every existing Subscribe-lifecycle test green (`TestSubscribe_ContextCancel_ObserverExits`, `..._ExplicitUnsubscribe_...`, `..._ConcurrentUnsubscribe_NoLeakNoPanic`, `..._CtxCancelRacingUnsubscribe_...`, `..._NilCtx_NoPanicNoObserver`); rewrite `TestChangeEventAndDispatch`'s dispatch half (`mongodb_unit_test.go:183-191`) against a feed instead of `s.subscribers`, still asserting that a panicking callback is recovered and the other subscriber still receives the event; add `TestMongoFeed_BeginDisconnectSuppressedWhenClosing` and `TestMongoFeed_BeginResyncSuppressedWhenClosing` mirroring `internal/postgres/postgres_listen_test.go:130` and `:430`; add `TestMongoSubscribe_CloseReapsCtxObservers`. Integration: `TestIntegration_MongoCleanCloseEmitsNoDisconnect` — start, subscribe, record events, `Close`, and assert no `OpDisconnect` was ever delivered.
+
+**Files:**
+- Modify: `internal/mongodb/mongodb_changestream.go` (feed type, `zeroFeed`, `startListener`, `openWatch`, `publishFeed`, `runFeed`, consume loop, `stopFeeds`/`signalFeed`/`stopFeed`, `Subscribe`)
+- Modify: `internal/mongodb/mongodb.go` (Store fields, `Start`, `Close`, `logDebug` helper alongside `logWarn`/`logInfo` at `:450-464`)
+- Modify: `internal/mongodb/mongodb_config.go:48-52` (`New` builds `feeds` + `closedCh`)
+- Modify: `internal/mongodb/mongodb_events.go` (feed-based `dispatch`, `subscription`, `broadcast`, dispatch-window helpers)
+- Modify: `internal/mongodb/main_test.go` (test-only `FeedsSnapshot`)
+- Test: `internal/mongodb/mongodb_changestream_test.go`, `internal/mongodb/mongodb_unit_test.go`, `internal/mongodb/mongodb_integration_test.go`
+
+**Verification:** `go test -tags=unit -count=1 -race ./internal/mongodb/...` then `go test -tags=integration -count=1 -timeout 10m ./internal/mongodb/... -run 'TestIntegration_MongoDBSingleTenant|TestIntegration_MongoCleanCloseEmitsNoDisconnect'` — the suite's Subscribe sub-tests pass and a clean `Close` emits no disconnect.
+
+**Done when:** `Start` returns only once the single-tenant change stream is established or has failed, every event carries its scope, one outage emits exactly one `OpDisconnect` and each (re)open exactly one `OpResync`, a clean shutdown announces neither, and `Close` reaps every subscription's ctx observer.
+
+---
+
+#### Task 2.3.2: Give a joining subscriber its own marker
+
+- [ ] Done
+
+**Context:** After Task 2.3.1 a feed announces `OpResync` when its reader (re)connects, but the engine subscribes AFTER `Start` has already connected, so a subscriber joining a quiet scope would hear nothing and never reconcile. Postgres solved this in Task 1.4.2: `Subscribe` reads the feed's announced state in the SAME `f.mu` hold that adds the subscriber and emits the marker itself (`internal/postgres/postgres_listen.go:536-590`, with `joiningOpLocked` at `:201-210`). The suite already asserts it for every backend that does not opt out: `runSubscribeEmitsResyncFirst` (`systemplanetest/contract.go:478-514`) requires the very first event a new subscriber receives to be `OpResync` for its own scope, carrying no namespace, no key and revision 0.
+
+**Implementation vision:** Copy the Postgres handshake exactly; the ordering argument is what makes it correct and is not to be re-derived. Take `sub.mu` BEFORE the subscription becomes reachable and release it only when `Subscribe` returns, through `defer` — the reader goroutine can reach the subscriber only after seeing it in `f.subs`, and any such delivery then blocks until the joining emission has returned, so the joining callback can never observe a key event before its own marker. The `defer` is load-bearing on the panicking path: a manual `Unlock` skipped by an unwinding callback would leave `sub.mu` held forever.
+
+Add the subscriber and read `f.joiningOpLocked()` in ONE `f.mu` hold. That is what keeps the announcement exactly-once: whichever of this and the reader's own `beginResync`/`beginDisconnect` runs second sees the other's work, so the joiner is either announced to here or included in the reader's broadcast, never both and never neither. `joiningOpLocked` returns `store.OpResync` when `f.connected`, `store.OpDisconnect` when `f.disconnected`, and `""` otherwise — a feed that has announced nothing yet (created, reader not through its first resync) emits nothing here, because that resync is imminent and this subscriber is already in the map. Use `f.disconnected` rather than `!f.connected`: the latter is also true of a feed whose reader has not reached its first resync, and announcing a disconnect there would either double the imminent resync or precede it for no reason.
+
+Emit through `sub.deliverLocked(s.cfg.Logger, store.Event{Scope: f.scope, Op: joining})`, never `sub.fn` directly: that puts the joining emission under the same `runtime.RecoverAndLog` guard as every reader-goroutine delivery, so a panicking callback cannot escape through `Subscribe` to the caller. A connection lost between the state read and this emission yields one extra marker, which is harmless — both markers are idempotent for the engine.
+
+Tests. Unit: `TestMongoSubscribe_JoinerIsToldTheFeedState`, mirroring `internal/postgres/postgres_listen_test.go:698` — drive a feed through `beginResync` and `beginDisconnect` directly (no server needed) and assert a subscriber joining in each state receives exactly one marker of the right kind, and that a freshly created feed emits none. `TestMongoSubscribe_PanickingCallbackDoesNotEscapeOrHoldLock`, mirroring `internal/postgres/postgres_listen_test.go:245`: a callback that panics on its joining marker must not escape `Subscribe`, and a later delivery to the same subscription must still succeed, proving `sub.mu` was released. Integration: `TestIntegration_MongoSubscribeAfterStartGetsResyncFirst` — `Start`, wait for the stream, then `Subscribe` and assert the first delivered event is `OpResync` with the suite's scope.
+
+**Files:**
+- Modify: `internal/mongodb/mongodb_changestream.go` (`Subscribe` handshake)
+- Modify: `internal/mongodb/mongodb_events.go` (`joiningOpLocked`, if not already landed in 2.3.1)
+- Test: `internal/mongodb/mongodb_changestream_test.go`, `internal/mongodb/mongodb_integration_test.go`
+
+**Verification:** `go test -tags=unit -count=1 -race ./internal/mongodb/... -run 'TestMongoSubscribe_JoinerIsToldTheFeedState|TestMongoSubscribe_PanickingCallbackDoesNotEscapeOrHoldLock'` then `go test -tags=integration -count=1 -timeout 10m ./internal/mongodb/... -run 'TestIntegration_MongoSubscribeAfterStartGetsResyncFirst'`.
+
+**Done when:** a subscriber joining a connected feed receives its own `OpResync` before any key event, one joining an announced outage receives `OpDisconnect`, one joining a feed that has announced nothing receives neither, and a panicking callback neither escapes `Subscribe` nor leaves its subscription lock held.
+
+---
+
+#### Task 2.3.3: Open a per-tenant change stream on the first Subscribe
+
+- [ ] Done
+
+**Context:** `Subscribe` still refuses every named tenant with `store.ErrNotSupportedInMultiTenant` (`internal/mongodb/mongodb_changestream.go:42-44`), and `TestStore_NamedTenantWithoutConnector` (renamed in Task 2.1.2) still pins that. D6 makes MongoDB first class in multi-tenant mode: the Console runs on MongoDB only and is the first consumer of this path. The Postgres equivalent landed in Task 1.4.3 and is the template: `acquireFeed` (`internal/postgres/postgres_listen.go:302-350`), `awaitFeed` (`:359-374`), `createFeed` (`:379-405`), `publishFeed` (`:416-438`), `closeReadyLocked` (`:443-452`), `failLocked` (`:461-471`), `retractFeed` (`:475-484`), `releaseFeed` (`:492-507`). Its integration coverage is `TestIntegration_PostgresTwoTenantFeedsAreIsolated` (`internal/postgres/postgres_integration_test.go:975`), `..._TenantFeedTornDownOnLastUnsubscribe` (`:1036`), `..._ConcurrentFirstSubscribeOpensOneConnection` (`:1188`) and `..._CloseDuringFeedCreationLeavesNothingRunning` (`:1319`).
+
+**Implementation vision:** Rewrite `Subscribe`'s guards to the Postgres shape:
+
+```go
+if scope.Tenant == "" {
+	if s.cfg.MultiTenantEnabled {
+		return nil, store.ErrNotSupportedInMultiTenant
+	}
+} else if s.cfg.Connector == nil {
+	return nil, store.ErrTenantConnectorMissing
+}
+```
+
+A named tenant is served regardless of `MultiTenantEnabled` — it resolves its own database through the connector — and the zero scope in multi-tenant mode still has no shared process-wide changefeed to attach to.
+
+`acquireFeed(ctx, scope)` takes one reference on the feed for that scope, creating it when this caller is the first to ask. Feeds are SHARED: a tenant has exactly one change stream no matter how many subscribers it has. The feeds-map lock is NEVER held across the connector call or `coll.Watch`, or one unreachable tenant would freeze every other tenant's `Subscribe`; the creator instead reserves the map slot with an unconnected placeholder carrying a `ready` channel, resolves and opens outside the lock, then publishes or retracts. Hoist the `s.closing` fence above BOTH branches so a closing store never reserves a slot and dials a tenant.
+
+`createFeed` resolves the tenant's collection through `s.cfg.Connector.ResolveDatabase(ctx, tenant)`, refuses a nil database with `store.ErrTenantConnectorMissing` wrapped with the tenant id (same rule as Task 2.1.2), runs `ensureSchema(ctx, coll, true)` so a fresh tenant database gets its collection materialized before the stream attaches, stores the handle on `f.coll`, opens the stream synchronously with `openWatch` and hands it to `publishFeed`. The connector is consulted ONCE per feed lifetime, not per reopen: a credentials rotation is picked up when the last subscriber leaves and a later `Subscribe` builds a fresh feed, which is exactly what `releaseFeed` removing the named slot buys. Say that in the doc comment.
+
+Failure handling is the contract, not an implementation detail. `retractFeed` records the cause and removes the dead slot under `feedsMu`, then closes `ready` in the SAME hold — `err` is written BEFORE the close, so the close is the happens-before edge that publishes it, and the slot is gone before the waiters wake, so the next `Subscribe` for that tenant builds a fresh placeholder instead of finding a corpse. The FIRST cause wins. Every waiter in `awaitFeed` therefore wakes with the CREATOR's own error rather than blocking until its own ctx dies; on ctx cancellation the waiter releases its reference and leaves the creator alone. No background retry is started: a caller must never believe it is subscribed when it is not.
+
+`publishFeed` rechecks `s.closing` under `feedsMu` and, if set, fails the slot with `store.ErrClosed`, closes `ready` and closes the stream on a `context.WithoutCancel` ctx bounded by `closeTimeout`. Publishing the feed and launching its reader happen in ONE `feedsMu` hold, because `Close` decides what to tear down by walking that map: a feed visible there without its goroutine already running would make `Close` wait the full `closeTimeout` on a `done` channel nothing will ever close.
+
+`releaseFeed` drops one reference under `feedsMu`; when the last one goes, a NAMED feed leaves the map and its reader is stopped through `stopFeed`. The zero-scope feed is exempt — `Start` owns it and it must survive an empty subscriber map. Deciding under `feedsMu` is what stops a concurrent `Subscribe` from attaching to a feed that is being torn down.
+
+Update `TestStore_NamedTenantWithoutConnector` so its `Subscribe` line now expects `store.ErrTenantConnectorMissing` (this is the task that makes that true; Task 2.1.2 deliberately left it alone).
+
+Tests. Unit: `TestMongoSubscribe_FailedFeedCreationFailsEveryWaiter` (a fake connector that errors; two concurrent subscribers both receive the creator's error and the feeds map ends empty), `TestMongoSubscribe_ClosingStoreResolvesNoTenant` (mirroring `internal/postgres/postgres_listen_test.go:790`: after `Close`, `Subscribe` for a tenant returns `store.ErrClosed` and the connector is never called). Integration, in `internal/mongodb/mongodb_integration_test.go` over the replica-set container from `startContainer`: `TestIntegration_MongoTwoTenantFeedsAreIsolated` (two tenant databases through the fake connector from Task 2.1.2; each subscriber receives its own scoped `OpResync` and only its own key events); `TestIntegration_MongoTenantFeedTornDownOnLastUnsubscribe` (after the last unsubscribe, `FeedsSnapshot` reports the named slot gone, and a second `Subscribe` calls the connector again); `TestIntegration_MongoConcurrentFirstSubscribeOpensOneFeed` (N concurrent first subscribers, exactly one connector resolution, one feed); `TestIntegration_MongoCloseDuringFeedCreationLeavesNothingRunning` (a blocking connector with `entered`/`release` channels mirroring `blockingConnector`; two callers park on the reserved slot, `Close` runs, every caller gets `store.ErrClosed`, `FeedsSnapshot` reports zero feeds, and the package goleak guard stays clean after joining the in-flight creator — `Close` does not wait for it); `TestIntegration_MongoSubscribeReturnsErrorWhenWatchFails` (run against a STANDALONE mongo from `startPollingContainer`, where `coll.Watch` fails deterministically with "only supported on replica sets": `Subscribe` for a named tenant returns that error, no feed is left in the map, every concurrent waiter gets the same error, and no goroutine remains; the zero-scope half of the same test asserts the error surfaces from `Start`, which is where the zero scope's first `Watch` lives).
+
+**Files:**
+- Modify: `internal/mongodb/mongodb_changestream.go` (`Subscribe` guards, `acquireFeed`, `awaitFeed`, `createFeed`, `publishFeed`, `retractFeed`, `failLocked`, `closeReadyLocked`, `releaseFeed`)
+- Test: `internal/mongodb/mongodb_changestream_test.go`, `internal/mongodb/mongodb_unit_test.go` (Subscribe expectation), `internal/mongodb/mongodb_integration_test.go`
+
+**Verification:** `go test -tags=integration -count=1 -timeout 10m ./internal/mongodb/... -run 'TestIntegration_MongoTwoTenantFeedsAreIsolated|TestIntegration_MongoTenantFeedTornDownOnLastUnsubscribe|TestIntegration_MongoConcurrentFirstSubscribeOpensOneFeed|TestIntegration_MongoCloseDuringFeedCreationLeavesNothingRunning|TestIntegration_MongoSubscribeReturnsErrorWhenWatchFails'` — all pass, container-backed.
+
+**Done when:** `Subscribe(Scope{Tenant:"t1"})` watches `t1`'s collection through the connector and returns only once that stream is open or has failed, two subscribed tenants never see each other's events, the last unsubscribe closes the tenant's stream, a failed creation reaches every waiter with the creator's cause and leaves no slot, and a `Close` racing a slow connector leaves nothing running.
+
+---
+
+#### Task 2.3.4: Carry revision and tombstones on every change event
+
+- [ ] Done
+
+**Context:** `changeEvent` (`internal/mongodb/mongodb_changestream.go:26-32`) decodes only `operationType` and `documentKey._id`, so `eventFromChange` (`internal/mongodb/mongodb_events.go:64-76`) produces events with `Revision` left at 0 on every upsert. FC-2 documents a store-surface revision of 0 as "unknown", never fenced and never deduplicated — correct for a delete, wasteful for every upsert. After Task 2.2.2 a `Delete` no longer produces a `delete` operation at all: it is an `update` whose full document carries `deleted: true`, and a change stream would report it as an upsert, publishing a tombstone as if it were a value. The suite pins both halves once the Mongo opt-out is gone: `runEventCarriesScopeAndRevision` (`systemplanetest/contract.go:519-560`) requires an upsert event's revision to equal what `Set` returned, and `runDeleteEventRevisionZero` (`:565-614`) requires a delete to arrive as `OpDelete` with revision 0.
+
+**Implementation vision:** Extend `changeEvent` with `FullDocument *entryDoc \`bson:"fullDocument"\``. The stream is already opened with `options.UpdateLookup` (Task 2.3.1), so `insert`, `update` and `replace` all carry the after-image; a raw `delete` never does, which is why `documentKey._id` stays the identity source and must not be replaced by the full document.
+
+**The model, stated before the rules because it decides what the tests may assert.** Classification reads the document as `updateLookup` returns it at PROCESSING time — the current majority-committed document, not a point-in-time image of the change — and FC-9 (amended 2026-09-18, plan commit `f862dae`) makes that deliberate: the store contract on both backends is final-state convergence, not point-in-time replay. It is the observation model Postgres already has, where NOTIFY carries no value and the engine re-reads the current row. Two consequences follow and are ACCEPTED, not defects to engineer around: a delete and a recreate that land inside one lookup window collapse into a single upsert at the recreate's revision (D2 accepts it, and the coalescing dispatcher already lets a subscriber miss an intermediate value), and a recreate followed by a delete inside that window can deliver `OpDelete` twice (revision 0 is never deduplicated). Both converge to the live document, and neither can fence a later value, because a delete is never fenced. **Do NOT switch classification to `updateDescription`** to recover point-in-time fidelity: it would make the event describe a state the store may no longer be in, which is the opposite of what the engine reconciles against.
+
+`eventFromChange` gains three rules, in this order:
+
+1. `documentKey._id` missing either half → drop the event (unchanged; increments `droppedEvents`).
+2. `operationType == "delete"` → `OpDelete`, `Revision: 0`. This is the FOREIGN-writer path: a `deleteOne` run by an operator in a Mongo shell, which removes the tombstone itself and reopens the clock-floor window D11 describes. The library itself never produces this operation any more.
+3. Otherwise, a full document carrying `Deleted == true` → `OpDelete`, `Revision: 0` — byte-identical to what rule 2 produces, per FC-9 ("the same event a raw `delete` operation produces"). Any other case → `OpUpsert` with `Revision` taken from the full document, or 0 when the full document is nil.
+
+The nil full document is a named edge case, not a defensive afterthought: the lookup happens at event-delivery time, so a document a FOREIGN `deleteOne` removed between the change and the lookup comes back nil (the library's own delete can never produce it — the tombstone document always exists). Publishing that as `OpUpsert` with revision 0 is correct and cheap: `store.Event` carries an identity and a revision and never a value, so a nil lookup costs only the dedupe hint. Revision 0 means unknown, the engine re-reads the row, treats the result as unknown, and the foreign `deleteOne`'s own `delete` operation event arrives right behind it and converges the key to absent. Do NOT drop such an event and do NOT invent an `OpDelete` from it; a real delete has its own two rules above.
+
+Nothing else changes in the loop: the scope is still stamped by `f.dispatch` at fan-out, because the change stream cannot name it.
+
+Tests. Unit (`internal/mongodb/mongodb_unit_test.go`, extending `TestChangeEventAndDispatch`): an `insert` with a full document carrying revision 7 yields `OpUpsert` with `Revision == 7`; an `update` whose full document has `Deleted: true` yields `OpDelete` with `Revision == 0` regardless of the revision that document carries; a raw `delete` with no full document yields `OpDelete` with `Revision == 0`; an `update` with a nil full document yields `OpUpsert` with `Revision == 0`; the three identifier-missing cases still drop. This is pure and lives in a file outside `.ignorecoverunit`, so it counts toward unit coverage.
+
+Integration: `TestIntegration_MongoEventCarriesRevision` (subscribe, `Set`, assert the delivered event's revision equals what `Set` returned and its scope equals the subscription's); `TestIntegration_MongoTombstoneEventIsADelete` (`Set`, then `Delete`, assert the delivered event is `OpDelete` with revision 0 and the right namespace/key, then `Delete` the same key AGAIN and assert no further event arrives within `EventWait` — the "emits no change-stream event" half of Task 2.2.2's filter, asserted here where a subscriber exists); and `TestIntegration_MongoDeleteThenRecreateConvergesToLiveValue`, which pins the final-state model. That one subscribes, `Set`s, then issues `Delete` and `Set` back to back with no wait between them, and asserts ONLY that the LAST event delivered for the key is an upsert carrying the revision the second `Set` returned and that a `Get` agrees with it. It must NOT assert that the intermediate `OpDelete` was observed, and must not fail when it was not: the lookup window is exactly what FC-9 permits to collapse, and an ordering assertion there would be a flaky test encoding a guarantee the contract does not make. Drain and inspect the recorded slice for the key rather than taking the next event.
+
+Then the outage sequence tests, which need a deterministic way to sever the feed's connection. **Mechanism, decided: an in-process TCP proxy.** The test listens on a local port, forwards both directions to the container's mapped Mongo port with `io.Copy`, and builds the store's client over `mongo.Connect(options.Client().ApplyURI("mongodb://127.0.0.1:<proxyPort>").SetDirect(true).SetServerSelectionTimeout(2 * time.Second))`. Closing the listener and every live connection severs the feed; re-listening on the same port restores it. The short server-selection timeout is what makes the failure fast and the test deterministic. **`killCursors` is the rejected alternative**: it works (a `CursorKilled`, code 237, carries no `ResumableChangeStreamError` label, so on Mongo 7 the driver does not transparently resume it — verified in `mongo/change_stream.go:772-791`), but obtaining the live cursor id means exposing the feed's `*mongo.ChangeStream` from production code purely for a test. **Dropping the container is also rejected**: a plain network error IS resumable, the driver resumes it internally, and a short outage would then produce no `OpDisconnect` at all. Note the same hazard for the proxy: the outage must outlast the driver's single internal resume attempt, hence the 2s server-selection bound and a sever window comfortably longer than it.
+
+`TestIntegration_MongoResyncAfterCursorKill`: subscribe, write, record the prefix (joining `OpResync`, then the upsert), sever the proxy, write a DIFFERENT value through a second client connected DIRECTLY to the container (so the write lands while the feed is blind), restore the proxy, then assert the recorded sequence after the prefix is exactly one `OpDisconnect`, then one `OpResync`, then any key events — nothing out of order — and that a `Get` afterwards returns the gap write's value and revision. `TestIntegration_MongoRepeatedReopenFailuresEmitOneDisconnect`: the same harness with the proxy kept down long enough for at least two reopen attempts to fail (the backoff is 500ms base, exponential with jitter, and each attempt burns the 2s server-selection bound, so ~8s is ample), asserting exactly one `OpDisconnect` and exactly one `OpResync` across the whole outage, with nothing emitted by the failed attempts in between.
+
+**Files:**
+- Modify: `internal/mongodb/mongodb_changestream.go:26-32` (`changeEvent.FullDocument`)
+- Modify: `internal/mongodb/mongodb_events.go:64-76` (`eventFromChange`)
+- Test: `internal/mongodb/mongodb_unit_test.go`, `internal/mongodb/mongodb_integration_test.go` (proxy harness + the three tests)
+
+**Verification:** `go test -tags=integration -count=1 -timeout 10m ./internal/mongodb/... -run 'TestIntegration_MongoEventCarriesRevision|TestIntegration_MongoTombstoneEventIsADelete|TestIntegration_MongoResyncAfterCursorKill|TestIntegration_MongoRepeatedReopenFailuresEmitOneDisconnect'` — every upsert event carries the revision `Set` reported, a tombstone arrives as `OpDelete` at revision 0, and one outage produces exactly one `OpDisconnect` followed by exactly one `OpResync` however many reopen attempts failed.
+
+**Done when:** an upsert event carries the revision now stored, a tombstone and a foreign `deleteOne` are indistinguishable at the store surface (`OpDelete`, revision 0), a lookup that came back empty publishes revision 0 rather than being dropped, and a forced outage narrates exactly one disconnect and one resync with the gap write visible afterwards.
+
+---
+
+#### Task 2.3.5: Bring the polling fallback onto the feed, with a synchronous first round trip
+
+- [ ] Done
+
+**Context:** `pollForever` (`internal/mongodb/mongodb_changestream.go:255-297`) and `pollOnce` (`:313-412`) read `s.coll` directly, dispatch through the old flat `dispatchEvent`, synthesize `OpUpsert`/`OpDelete` with no revision (`:368-372`, `:402-406`), detect deletes by diffing the key set returned by `snapshotKeys` (`:417-457`), and on a failed round trip merely log and `continue` (`:284-289`) — so a poll outage is invisible to the engine. `Config.PollInterval` (`internal/mongodb/mongodb.go:67-70`) still documents polling as single-tenant only. The polling path carries the SAME event-loss bug the change stream had: the watermark is anchored at `time.Now()` when the loop starts, so a write landing between `Subscribe` and the first tick is swallowed by the `$gte` filter exactly the way a pre-attach write is swallowed by a change stream. Two integration tests call `s.pollOnce` directly with its current signature and pin the same-millisecond discrimination rule that a previous silent-skip bug produced: `TestIntegration_PollOnce_SameMsDifferentValue_EmitsBoth` (`internal/mongodb/mongodb_polling_integration_test.go:139`) and `TestIntegration_PollOnce_SameMsSameValue_EmitsOnce` (`:224`). Both MUST keep asserting exactly that after the signature change.
+
+**Implementation vision:** Make polling a feed citizen. `pollForever(f *feed)` and `pollOnce` become feed-scoped, reading `f.coll` instead of `s.coll`, dispatching through `f.dispatch`, and so a named tenant can poll too; drop the "single-tenant only" sentence from `Config.PollInterval`'s doc. Move the per-loop state (`watermark`, `known`, `seenAtWatermark`, `firstPoll`) onto the feed's loop as it is today — it is loop-local and needs no locking.
+
+The first round trip runs SYNCHRONOUSLY on the caller's goroutine — `Start` for the zero scope, `Subscribe`'s creator path for a named tenant — exactly mirroring the change-stream handshake, and only once it has succeeded and established the watermark does the ticker loop start in the background. If that first round trip fails, the caller returns the wrapped error, the reserved slot is retracted and nothing is left behind: no placeholder, no ticker, no partial subscription. Both paths share the retraction machinery Task 2.3.3 specifies (`err` set, slot removed under the map lock, `ready` closed last) and both honour the store-wide `closing` recheck, so a `Close` racing a slow first poll yields `store.ErrClosed` and no goroutine. The successful first round trip emits `OpResync` through `beginResync`+`broadcast`, the same edge-triggered pair the change stream uses — MongoDB gets ONE disconnect rule, not two.
+
+Connectivity narration on the loop: a failed round trip calls `beginDisconnect` and, when it returns `ok`, broadcasts one `OpDisconnect`; subsequent failures while the flag is set emit nothing, so a long outage costs one disconnect, not one per tick. The first round trip that succeeds after a failure calls `beginResync` and broadcasts one `OpResync`. A failure must NOT advance the watermark or replace `known`/`seenAtWatermark` — the current code already returns the previous values on error and that behaviour is load-bearing: advancing on a partial read would silently skip the rows the failed round trip never saw.
+
+Revision and tombstones. The synthesized upsert carries `doc.Revision`. A document whose `deleted` is true is a tombstone and the poller treats it as an absent row: it emits `store.Event{Namespace, Key, Op: store.OpDelete}` with `Revision: 0` and it is EXCLUDED from `currentKnown`, so the next round's key-set diff sees it as already gone and does not emit a second delete. `snapshotKeys` gains the same `deleted: {$ne: true}` filter the reads got in Task 2.2.2, which keeps the diff meaningful for the one case it still covers — a foreign `deleteOne` that removes a document outright. Both delete sources therefore reach the engine, and neither double-fires. The incremental `$gte` query itself is NOT filtered on `deleted`: the poller must SEE a tombstone in order to announce it.
+
+The polling fallback is inherently final-state — every round trip reads the current documents — so FC-9's convergence model needs nothing extra here; the one thing to avoid is reconstructing history from consecutive snapshots beyond the single delete diff described above.
+
+The boundary dedup keeps its content discriminator unchanged (`hashValue` over the stored value string, `boundaryDedupHit` in `internal/mongodb/mongodb_events.go:29-62`): a tombstone's `value` is unset and hashes differently from the value it replaced, so the delete transition always emits, and two consecutive observations of the same tombstone at the same watermark millisecond correctly collapse. Do not widen the hash to cover `deleted` — it buys nothing and changes a rule two tests pin.
+
+Tests, in `internal/mongodb/mongodb_polling_integration_test.go` (`package mongodb`, `//go:build integration`, container from `startPollingContainer` — a standalone, no replica set, which is the whole point of the fallback): update `TestIntegration_PollOnce_SameMsDifferentValue_EmitsBoth` and `TestIntegration_PollOnce_SameMsSameValue_EmitsOnce` to the feed-scoped signature while keeping their assertions identical — same-millisecond, different value emits twice; same-millisecond, same value emits once. Add `TestIntegration_MongoPollingDisconnectAndResyncAroundFailedRound`: run a polling feed, force a round-trip failure (drop the database's collection out from under it is not enough — a `Find` on a missing collection succeeds and returns nothing; instead sever the client the way Task 2.3.4's proxy harness does, or point the feed at a collection on a disconnected client), and assert exactly one `OpDisconnect` for the failure streak followed by exactly one `OpResync` when it recovers. Add `TestIntegration_MongoSubscribeReturnsErrorWhenFirstPollFails`: build a store whose client points at an unused local port with a short server-selection timeout and no container at all — for the zero scope the error surfaces from `Start`, for a named tenant from `Subscribe`; in both cases the feeds map is empty afterwards, no ticker is running and the package goleak guard stays clean. Add `TestIntegration_MongoPollingTombstoneIsADelete`: `Set`, `Delete`, and assert the poller emits one `OpDelete` and then nothing further for that key.
+
+**Files:**
+- Modify: `internal/mongodb/mongodb_changestream.go:255-457` (`pollForever`, `pollOnce`, `snapshotKeys` — all feed-scoped), `internal/mongodb/mongodb.go:67-70` (`Config.PollInterval` doc), plus the `Start`/`createFeed` branch that chooses polling over watching
+- Test: `internal/mongodb/mongodb_polling_integration_test.go`
+
+**Verification:** `go test -tags=integration -count=1 -timeout 10m ./internal/mongodb/... -run 'TestIntegration_PollOnce_|TestIntegration_MongoPolling|TestIntegration_MongoSubscribeReturnsErrorWhenFirstPollFails'` — the two same-millisecond tests still pass unchanged in meaning, a failed polling round announces exactly one `OpDisconnect` and its recovery one `OpResync`, a tombstone arrives as one `OpDelete`, and a first round trip that fails leaves no feed and no ticker.
+
+**Done when:** polling runs per feed and serves named tenants, its first round trip is synchronous and its failure returns from `Start`/`Subscribe` leaving nothing behind, it emits `OpResync` on the first success and after every recovery and exactly one `OpDisconnect` per failure streak, its events carry the stored revision, and a tombstone reaches the engine as a delete exactly once.
+
+Tombstones in the incremental scan, decided here so the polling loop is not re-opened by review: a key that `pollOnce` reads as a tombstone in this round is emitted once as `OpDelete` at Revision 0 and recorded in a per-round `handledTombstones` set; the same round's `prevKnown` diff skips keys in that set (otherwise the live key vanishing from `snapshotKeys` would emit a second delete for the same key), and the key is dropped from the next round's live-key set so a foreign `deleteOne` still surfaces through the diff. `TestPollTombstoneEmitsExactlyOneDelete` pins it with the fake collection.
+
+---
+
+#### Task 2.3.6: Assert subscribe readiness in the shared suite and drop the Mongo opt-out
+
+- [ ] Done
+
+**Context:** The readiness defect this phase fixes is loss, not latency: a write issued immediately after `Subscribe` returns was never delivered, 3 runs in 5 on mordor. Nothing in `systemplanetest/contract.go` asserts it — `runSubscribeUpsert` (`:291-316`) writes once after subscribing and would simply time out, indistinguishably from a slow backend. `RunOptions.SkipRevisionAndResync` (`systemplanetest/contract.go:39-42`) still gates `RevisionMonotonic`, `SubscribeEmitsResyncFirst`, `EventCarriesScopeAndRevision` and `DeleteEventRevisionZero` (`:107-137`), and `TestIntegration_MongoDBSingleTenant` sets it true (`internal/mongodb/mongodb_integration_test.go:77-81`) with the comment "Phase 2 of lane-storage turns this off". Phase 3 deletes the FIELD and adds the named-tenant suite configurations; this task only flips the Mongo call site.
+
+**Implementation vision:** Add `SubscribeThenImmediateWriteNeverLosesTheEvent` to `Run`, UNGATED (outside the `SkipRevisionAndResync` block, inside the `!opts.SkipSubscribe` block), because Postgres already satisfies it and MongoDB does from this phase on. Place it as a new `t.Run` alongside the other Subscribe sub-tests, not appended after the gated block — a sub-test appended below a gate is skipped by position alone, silently, which the existing comment at `:104-106` already warns about.
+
+The sub-test loops 20 times, calling the suite `Factory` for a FRESH store each iteration, so each iteration exercises a fresh feed open; a loop of subscribe/unsubscribe over one shared feed would not, and would prove nothing about the attach race. Per iteration: `Start`, `Subscribe`, then `Set` with NO sleep in between, and assert the upsert for that key arrives within `opts.EventWait`. Zero losses across 20 iterations is the pass condition; ONE is a failure, because the defect is loss, not latency. Write the per-iteration key with the iteration index so a stray event from a previous iteration can never satisfy the assertion. Use `waitFor` (`:243`), not `waitNext` (`:266`) — the joining `OpResync` arrives first on a backend that emits it, and `waitNext` would take that for the answer. Drive each iteration's cleanup immediately (the factory's cleanup func) rather than deferring 20 of them to the end.
+
+Then flip `SkipRevisionAndResync` to false in `TestIntegration_MongoDBSingleTenant` and delete the "Phase 2 turns this off" comment. The FIELD stays — Phase 3 removes it, and nothing else in this lane sets it. With it off, the Mongo single-tenant run now executes `RevisionMonotonic` (which Tasks 2.2.1 and 2.2.2 satisfy, including the delete-then-recreate rule the tombstone exists for), `SubscribeEmitsResyncFirst` (Task 2.3.2), `EventCarriesScopeAndRevision` and `DeleteEventRevisionZero` (Task 2.3.4). If any of them fails, the defect is in this phase's implementation and the fix belongs in the owning task — do NOT re-enable the gate.
+
+Because this task closes a reproducible flake, its verification runs the Mongo suite five times, not once: a single green run does not clear a defect that reproduced 3 times in 5. Postgres runs the new sub-test too and must stay green with no Postgres change.
+
+**Files:**
+- Modify: `systemplanetest/contract.go:81-102` (register the new sub-test) and a new `runSubscribeThenImmediateWrite` helper alongside the other `run*` functions
+- Modify: `internal/mongodb/mongodb_integration_test.go:77-81` (`SkipRevisionAndResync: false`, comment deleted)
+
+**Verification:** `go test -tags=integration -count=5 -timeout 20m ./internal/mongodb/... -run 'TestIntegration_MongoDBSingleTenant'` — green five runs out of five — and `go test -tags=integration -count=1 -timeout 10m ./internal/postgres/... -run 'TestIntegration_PostgresSingleTenant'` — still green with no Postgres change.
+
+**Done when:** the shared suite asserts twenty consecutive subscribe-then-write cycles with zero lost events for every backend, and the MongoDB single-tenant run passes every revision, scope, resync and delete assertion with no opt-out.
+
+---
 
 **Phase 2 exit gate:** `make test-unit` green, and `go test -tags=integration -count=1 -timeout 10m ./internal/mongodb/...` green, including the replica-set container (change streams) and the standalone container (polling). Additionally, because this phase closes a reproducible flake, `go test -tags=integration -count=5 -timeout 20m ./internal/mongodb/... -run 'TestIntegration_MongoDBSingleTenant'` must pass five runs out of five, and the Postgres suite must still pass unchanged (`SubscribeThenImmediateWriteNeverLosesTheEvent` is added to the shared suite in this phase and Postgres runs it too).
 

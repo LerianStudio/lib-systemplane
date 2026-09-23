@@ -469,12 +469,19 @@ func TestGroupSnapshotReturnsStoredDocument(t *testing.T) {
 	}
 }
 
+// TestGroupSnapshotReturnsDecodeErrorNotPartialValue keeps its name and its
+// subject — a row nothing about which decodes into the group's type — but the
+// row no longer reaches the reader: hydration runs the group's own ingress
+// validator over what it read and refuses this row, so the registered defaults
+// stay in force. A half-filled T was never the alternative; that the decoder
+// yields the zero value rather than a partial one is pinned directly on
+// internal/group.Decode.
 func TestGroupSnapshotReturnsDecodeErrorNotPartialValue(t *testing.T) {
 	t.Parallel()
 
 	s := newGroupMemoryStore()
 	// A JSON string where the document belongs: nothing about it decodes into
-	// groupConfig, so a partial value would be the only way to return one.
+	// groupConfig.
 	s.seed(t, "runtime", "ingest", "not-a-document")
 
 	c := newGroupClientOn(t, s)
@@ -490,13 +497,12 @@ func TestGroupSnapshotReturnsDecodeErrorNotPartialValue(t *testing.T) {
 	}
 
 	snap, err := g.Snapshot(ctx)
-	if !errors.Is(err, systemplane.ErrValidation) {
-		t.Fatalf("Snapshot error = %v, want ErrValidation", err)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
 	}
 
-	var zero groupConfig
-	if !reflect.DeepEqual(snap.Value, zero) {
-		t.Fatalf("Snapshot.Value = %#v, want the zero value on a decode failure", snap.Value)
+	if !reflect.DeepEqual(snap.Value, groupDefaults()) {
+		t.Fatalf("Snapshot.Value = %#v, want the registered defaults %#v", snap.Value, groupDefaults())
 	}
 }
 
@@ -868,12 +874,11 @@ func TestGroupDocumentIsAtomicAcrossFields(t *testing.T) {
 // would hand the consumer a T with a half-filled slice. Snapshot returns the
 // error and a zero Value instead.
 //
-// This is D-G4's defence-in-depth assertion, not a statement about invalid
-// rows in the shipped system: once the engine's ingress lands, such a row is
-// rejected before publication and the group keeps the last valid value, or the
-// registered default when nothing valid was ever published. It is assertable
-// here only because the wave-1 facade hydrates without validating, which is the
-// sole reason the row can reach a reader at all.
+// The row is now rejected before publication — hydration grades what it read
+// through the group's own ingress validator — so the group keeps the
+// registered defaults and no reader ever sees the half-filled document. The
+// decoder-level property (zero value, never a partial T) is pinned directly on
+// internal/group.Decode.
 func TestGroupDocumentPartialDecodeIsRejected(t *testing.T) {
 	t.Parallel()
 
@@ -897,18 +902,12 @@ func TestGroupDocumentPartialDecodeIsRejected(t *testing.T) {
 	}
 
 	snap, err := g.Snapshot(ctx)
-	if !errors.Is(err, systemplane.ErrValidation) {
-		t.Fatalf("Snapshot error = %v, want ErrValidation", err)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
 	}
 
-	var typeErr *json.UnmarshalTypeError
-	if !errors.As(err, &typeErr) {
-		t.Fatalf("Snapshot error = %v, want one that resolves to *json.UnmarshalTypeError", err)
-	}
-
-	var zero groupConfig
-	if !reflect.DeepEqual(snap.Value, zero) {
-		t.Fatalf("Snapshot.Value = %#v, want the zero value — the scalar fields decoded, so anything else is a half-filled document", snap.Value)
+	if !reflect.DeepEqual(snap.Value, groupDefaults()) {
+		t.Fatalf("Snapshot.Value = %#v, want the registered defaults %#v — the half-filled row must not reach a reader", snap.Value, groupDefaults())
 	}
 }
 
@@ -1036,9 +1035,10 @@ func TestGroupIngressValidatesTheCanonicalDocument(t *testing.T) {
 
 // TestGroupSnapshotRejectsANullRow is the read-side half of the null guard.
 // Ingress refuses to write a null, but a row holding one can predate this
-// binary — an older version, another writer, a hand-edited row. Handing back a
-// zero T with no error would report a wholly blank configuration as if it were
-// the real one.
+// binary — an older version, another writer, a hand-edited row. Hydration runs
+// that same ingress over what it reads, so the null never becomes the group's
+// document: the registered defaults stay in force, rather than a wholly blank
+// configuration being reported as the real one.
 func TestGroupSnapshotRejectsANullRow(t *testing.T) {
 	t.Parallel()
 
@@ -1058,13 +1058,12 @@ func TestGroupSnapshotRejectsANullRow(t *testing.T) {
 	}
 
 	snap, err := g.Snapshot(ctx)
-	if !errors.Is(err, systemplane.ErrValidation) {
-		t.Fatalf("Snapshot of a null row = %v, want ErrValidation", err)
+	if err != nil {
+		t.Fatalf("Snapshot of a null row: %v", err)
 	}
 
-	var zero groupConfig
-	if !reflect.DeepEqual(snap.Value, zero) {
-		t.Fatalf("Snapshot.Value = %#v, want the zero Snapshot on a rejected row", snap.Value)
+	if !reflect.DeepEqual(snap.Value, groupDefaults()) {
+		t.Fatalf("Snapshot.Value = %#v, want the registered defaults %#v — a null row must not become the document", snap.Value, groupDefaults())
 	}
 }
 
@@ -2264,4 +2263,60 @@ func TestGroupOnApplyAfterCloseRegistersAndReplays(t *testing.T) {
 			t.Errorf("Status = %#v, want empty: a failed seed read observes no scope", status)
 		}
 	})
+}
+
+// TestGroupSnapshotOverAnUngradedTenantRow is the multi-tenant half of the two
+// tests above. Single-tenant hydration grades a stored row through the group's
+// own ingress, so an undecodable or null row never reaches a reader there.
+// Multi-tenant mode has no hydration: the tenant row is read through on every
+// Snapshot, ungraded, and the decode guard is what stands between it and a
+// half-filled or wholly blank document reported as the one in force.
+func TestGroupSnapshotOverAnUngradedTenantRow(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		row  any
+	}{
+		{name: "undecodable", row: "not-a-document"},
+		{name: "partial", row: map[string]any{"name": "ingest", "retries": 3, "hosts": "a-string-not-a-list"}},
+		{name: "null", row: nil},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := newGroupMemoryStore()
+
+			c, err := systemplane.NewForTesting(s, systemplane.WithMultiTenantEnabled())
+			if err != nil {
+				t.Fatalf("NewForTesting: %v", err)
+			}
+
+			t.Cleanup(func() { _ = c.Close() })
+
+			g, err := systemplane.Bind(c, "runtime", "ingest", groupDefaults(), nil)
+			if err != nil {
+				t.Fatalf("Bind: %v", err)
+			}
+
+			ctx := context.Background()
+			if err := c.Start(ctx); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+
+			s.seed(t, "runtime", "ingest", tc.row)
+
+			snap, err := g.Snapshot(ctx)
+			if !errors.Is(err, systemplane.ErrValidation) {
+				t.Fatalf("Snapshot of an ungraded %s tenant row = %v, want ErrValidation", tc.name, err)
+			}
+
+			var zero groupConfig
+			if !reflect.DeepEqual(snap.Value, zero) {
+				t.Fatalf("Snapshot.Value = %#v, want the zero value — never a half-filled document", snap.Value)
+			}
+		})
+	}
 }

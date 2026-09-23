@@ -46,12 +46,16 @@ type Snapshot[T any] struct {
 // Bind registers (namespace, key) with defaults as the value in force when no
 // row exists. validate (may be nil) becomes the key's registered validator: the
 // client runs it on the default at Bind, on every Set, and on every other
-// ingress the client validates. A row already in the store is decoded on read
-// and never re-validated by the group, so a row that entered the store without
-// passing the registered validator surfaces as a decode error at worst — from
-// [Group.Snapshot] on a read, and as a rejection recorded in [Group.Status] on
-// a publication — never as a validated document. Must be called before
-// c.Start.
+// ingress the client validates. In single-tenant mode that includes the row
+// already in the store: the client grades it while hydrating at Start, so a row
+// that entered the store without passing the registered validator never becomes
+// the group's document — the registered defaults stay in force and
+// [Group.Snapshot] returns them with no error. In multi-tenant mode no read path
+// re-validates a tenant row — not the direct tenant-store read, and not a bound
+// Manager's warm-load or NOTIFY cache — so a row that entered the store without
+// passing the registered validator surfaces as a decode error at worst, not as
+// a validated document.
+// Must be called before c.Start.
 //
 // The value registered is not defaults itself but its canonical JSON document:
 // defaults marshaled and unmarshaled back into an any. A stored row, a Set
@@ -72,10 +76,12 @@ type Snapshot[T any] struct {
 // see that nil. A validator for such a group must guard its argument rather
 // than dereference it.
 //
-// The validate parameter is the group's validator. A [WithValidator] passed in
-// opts is ignored: Bind's own validator is registered last and replaces it, so
-// a caller cannot disable the type check on their own group. Every other key
-// option in opts is forwarded to [Client.Register] unchanged.
+// The validate parameter is the group's validator. A [WithValidator] or a
+// [WithContextValidator] passed in opts is ignored: both set the same single
+// validator, and Bind appends its own [WithValidator] after opts, so whichever
+// of the two a caller passes is replaced and cannot disable the type check on
+// their own group. Every other key option in opts is forwarded to
+// [Client.Register] unchanged.
 //
 // Bind also takes the group's one subscription to (namespace, key). It is taken
 // here, before c.Start and therefore before any publication can exist, which is
@@ -144,8 +150,9 @@ func Bind[T any](c *Client, namespace, key string, defaults T, validate func(T) 
 	}
 
 	// The type check goes LAST: applyKeyOptions applies options in order and
-	// the last writer wins, so a caller's own WithValidator would otherwise
-	// silently disable it for their own group.
+	// the last writer wins, so a caller's own WithValidator — or
+	// WithContextValidator, which sets the same single validator — would
+	// otherwise silently disable it for their own group.
 	keyOpts := make([]KeyOption, 0, len(opts)+1)
 	keyOpts = append(keyOpts, opts...)
 	keyOpts = append(keyOpts, WithValidator(ingress))
@@ -223,9 +230,11 @@ func (g *Group[T]) seedCurrentEntry() (group.Publication, bool, error) {
 // Snapshot does NOT run the consumer's validate: whatever is in force already
 // passed it on ingress, so a second call would be a callback per read that can
 // never fail. A document that cannot decode into T returns an error wrapping
-// [ErrValidation] and a zero Value — never a half-filled T. Through an
-// engine-backed Client that path is unreachable, because a document that fails
-// to decode cannot pass the registered validator either.
+// [ErrValidation] and a zero Value — never a half-filled T. In single-tenant
+// mode that path is unreachable: a document that fails to decode cannot pass
+// the group's ingress, which hydration runs over the stored row. It is reachable
+// in multi-tenant mode, where every read path (the tenant store, or a bound
+// Manager's cache) returns the tenant row ungraded.
 //
 // A row holding a JSON null is refused the same way, unless the zero T is
 // itself nil — in which case the null IS the document and Snapshot returns that
@@ -254,7 +263,9 @@ func (g *Group[T]) Snapshot(ctx context.Context) (Snapshot[T], error) {
 	// Defence in depth behind the ingress guard: a row holding a null predates
 	// it (an older binary, another writer, a hand-edited row), and Decode turns
 	// a null into the zero T by design (D-G2). Returning that would report a
-	// wholly blank configuration as the one in force.
+	// wholly blank configuration as the one in force. Single-tenant hydration
+	// refuses such a row before it reaches a reader; any multi-tenant read
+	// path (tenant store or bound Manager cache) delivers it here ungraded.
 	if entry.Value == nil && !g.nullIsDocument {
 		var zero T
 

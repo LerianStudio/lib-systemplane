@@ -275,18 +275,63 @@ func (c *Client) Start(ctx context.Context) error {
 	return nil
 }
 
+// validateStored runs a key's registered validator over a value read back from
+// the store and reports whether the value may be put in force.
+//
+// A nil validate accepts, so a key registered without a validator hydrates and
+// refreshes exactly as before. A panic is a refusal, not a crash: hydration and
+// refresh are the only call sites that hand the validator bytes this process
+// did not write, so a validator that type-asserts its argument can panic on a
+// legacy row — and hydration runs inside Start, where a panic would abort boot.
+//
+// The returned error carries the validator's own error, or errValidatorPanicked
+// wrapping what it panicked with. A panic value that is not an error is rendered
+// as its type only: the rejected value may be a secret, and panic(value) would
+// otherwise reproduce its bytes in the caller's log line.
+func validateStored(ctx context.Context, validate func(context.Context, any) error, value any) (err error) {
+	if validate == nil {
+		return nil
+	}
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+
+		if panicked, isErr := r.(error); isErr {
+			err = fmt.Errorf("%w: %w", errValidatorPanicked, panicked)
+
+			return
+		}
+
+		err = fmt.Errorf("%w: panicked with %T", errValidatorPanicked, r)
+	}()
+
+	return validate(ctx, value)
+}
+
 func (c *Client) hydrate(ctx context.Context) error {
 	entries, err := c.store.List(ctx, store.Scope{})
 	if err != nil {
 		return err
 	}
 
-	c.registryMu.RLock()
-
 	for _, entry := range entries {
 		nk := nskey{Namespace: entry.Namespace, Key: entry.Key}
 
-		if _, registered := c.registry[nk]; !registered {
+		// The registry lock is taken per entry instead of around the whole
+		// loop so the validator called below never runs under it. That does
+		// NOT make blocking there safe: hydration runs inside Start, which
+		// holds startMu, and Close takes the same lock — so a validator that
+		// blocks here blocks shutdown too (see WithContextValidator).
+		// Per-entry locking loses nothing — the registry cannot change during
+		// hydration, since Register takes startMu and Start holds it here.
+		c.registryMu.RLock()
+		def, registered := c.registry[nk]
+		c.registryMu.RUnlock()
+
+		if !registered {
 			c.logWarn(ctx, "unregistered key in store, skipping",
 				log.String("namespace", entry.Namespace),
 				log.String("key", entry.Key),
@@ -316,12 +361,37 @@ func (c *Client) hydrate(ctx context.Context) error {
 			continue
 		}
 
-		c.cacheMu.Lock()
-		c.cache[nk] = decoded
-		c.cacheMu.Unlock()
-	}
+		// A row can predate the key's validator, or be written by an older
+		// binary, or straight into the table. Grading it here is what keeps
+		// in force a value the write path would also accept.
+		if err := validateStored(ctx, def.validator, decoded); err != nil {
+			// The error, never the value: a rejected value may be a secret.
+			c.logWarn(ctx, "stored value rejected by validator, keeping default",
+				log.String("namespace", entry.Namespace),
+				log.String("key", entry.Key),
+				log.Err(err),
+			)
 
-	c.registryMu.RUnlock()
+			continue
+		}
+
+		// Re-read `touched` and write the cache under one hold of
+		// hydratingMu. The check above is only a cheap skip: a refresh that
+		// lands while the validator runs marks the key and writes a fresher
+		// value, and this snapshot must not overwrite it. refreshFromStore
+		// marks the key BEFORE its own cache write and never takes cacheMu
+		// under hydratingMu, so this nesting orders the two writes without
+		// inverting the locks.
+		c.hydratingMu.Lock()
+
+		if _, touchedNow := c.hydrationTouched[nk]; !touchedNow {
+			c.cacheMu.Lock()
+			c.cache[nk] = decoded
+			c.cacheMu.Unlock()
+		}
+
+		c.hydratingMu.Unlock()
+	}
 
 	return nil
 }
@@ -441,6 +511,19 @@ func (c *Client) refreshFromStore(nk nskey, op string) {
 		var decoded any
 		if err := json.Unmarshal(entry.Value, &decoded); err != nil {
 			c.logWarn(ctx, "failed to unmarshal refreshed value, keeping current",
+				log.String("namespace", nk.Namespace),
+				log.String("key", nk.Key),
+				log.Err(err),
+			)
+
+			return
+		}
+
+		// Same grading as hydrate: a value arriving through the changefeed
+		// was written by whoever wrote the row, not necessarily through Set.
+		if err := validateStored(ctx, def.validator, decoded); err != nil {
+			// The error, never the value: a rejected value may be a secret.
+			c.logWarn(ctx, "refreshed value rejected by validator, keeping current value",
 				log.String("namespace", nk.Namespace),
 				log.String("key", nk.Key),
 				log.Err(err),

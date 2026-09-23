@@ -21,7 +21,7 @@
 - **D4 — Read-your-writes in every mode.** `Set` publishes to the caller's scope cache with the revision the store returned before returning; the feed echo dedupes by revision.
 - **D5 — Typed groups are one key each.** `Bind[T]` registers `(namespace, key)` whose value is the JSON document of `T`. Atomicity of a group = atomicity of one row. No cross-key transactions.
 - **D6 — Both backends, both modes (Fred, 2026-09-17).** MongoDB is a first-class backend in single- AND multi-tenant mode, with the same guarantees as Postgres: revision per document, `OpResync` after every change-stream (re)open, per-tenant change streams through the tenant-manager Mongo connector, per-tenant cached scopes in the engine. Reason: the Console (product-console) will consume systemplane and runs on MongoDB only; Fred decided (2026-09-17) that the Console's Go service imports this lib with `WithMongoTenantManager` and exposes the admin HTTP surface to the Next.js front end, so the lib is the only writer of the collection and FC-9 stays an internal shape. Change streams need a replica set; `WithPollInterval` remains the fallback for standalone Mongo and must honor the same `OpResync` and revision rules.
-- **D7 — Tenant activation: lazy on first read, plus lifecycle events.** With `WithPostgresTenantManager(pgMgr)` or `WithMongoTenantManager(mbMgr)`, the first read for tenant X activates its scope (resolve DSN via connector, subscribe, reconcile). `Client.HandleTenantLifecycle` keeps handling suspended/deleted/credentials-rotated (and activated, idempotently). Suspended and Deleted drop the scope AND leave a `blocked` marker for that tenant: a read for a blocked tenant never re-activates it (it falls through to the per-request path, which the tenant-manager itself refuses for a suspended tenant); only an Activated event clears the marker; CredentialsRotated on a blocked tenant keeps the marker and re-activates nothing. Activation is single-flight per tenant and atomic: subscribe, then reconcile; if either step fails, the engine unsubscribes, discards the partial cache and scope state, leaves no marker, and the next read retries from scratch. Reads that arrive while an activation is in flight go per-request; they do not block and do not start a second activation. Consumers no longer copy a `systemplane_lifecycle.go`.
+- **D7 — Tenant activation: lazy on first read, plus lifecycle events.** With `WithPostgresTenantManager(pgMgr)` or `WithMongoTenantManager(mbMgr)`, the first read for tenant X activates its scope (resolve DSN via connector, subscribe, reconcile). `Client.HandleTenantLifecycle` keeps handling suspended/deleted/credentials-rotated (and activated, idempotently). Suspended and Deleted drop the scope AND leave a `blocked` marker for that tenant: a read for a blocked tenant never re-activates it (it falls through to the per-request path, which the tenant-manager itself refuses for a suspended tenant); only an Activated event clears the marker; CredentialsRotated on a blocked tenant keeps the marker and re-activates nothing. Activation is single-flight per tenant and atomic: subscribe, then reconcile; if either step fails, the engine unsubscribes, discards the partial cache and scope state, leaves no marker, and the next read retries from scratch. Reads that arrive while an activation is in flight go per-request; they do not block and do not start a second activation. Consumers no longer copy a `systemplane_lifecycle.go`. Asymmetry recorded 2026-09-18 (engine-tenants D-T3): the zero scope keeps a failed first reconcile, `Start` returns the error and the next `OpResync` retries; a tenant scope that fails activation is discarded and the next read retries from scratch.
 - **D8 — Canonical names only.** `WithTable`, `WithListenChannel`, `WithCollection` are removed (`systemplane_entries` / `systemplane_changes`). `DefaultSeedSQL()` and `ddl/default_seed.sql` are removed: defaults live in code; consumers who want persisted overrides write their own migration. Known breakage: billing-worker and plugin-br-pix-jd call `WithListenChannel`; billing-worker, plugin-br-pix-jd and finance-hub have DDL generators built on `DefaultSeedSQL()`. billing-worker (v2.0.0) and finance-hub (v1.6.0) migrate majors anyway; plugin-br-pix-jd is on v3.0.0 and takes the v4 hop like everyone else; `MIGRATION-v4.md` names each.
 - **D9 — Facade kept for the per-key API.** `Register`, `Get*`, `Set`, `Delete`, `List`, `Catalog*`, `OnChange` (new signature), `KeyDescription`, `KeyRedaction`, `IsRegistered`, `Logger`, `NewForTesting` stay. Admin HTTP keeps its four routes.
 - **D10 — `Close` replaces `Drain`.** `Client.Close()` keeps its signature: it cancels every scope's feed and the ctx handed to every in-flight callback, then waits for dispatch workers to exit up to a bound (`WithCloseTimeout`, default 30s). Cancellation is cooperative: a callback that honors ctx ends and Close returns nil with no goroutine left; a callback that ignores ctx makes Close return `ErrCloseTimeout` naming the (scope, key) still running, and that goroutine is the subscriber's leak, made visible rather than hidden.
@@ -49,19 +49,22 @@ No Go consumer uses the MongoDB backend yet; the Console will. Nobody consumes c
 | Lane | Delivers | Depends on | Wave | Worktree / Branch | Plan | Status |
 |------|----------|-----------|------|-------------------|------|--------|
 | contracts | `/v4` module path; `Store` interface with `Scope` + `Revision` + `OpResync` and compiling shims in both backends; connector moved to `internal/postgres`; public `Change`, new `OnChange` signature, `Entry` + `GetEntry` shims; all in-repo callers and tests updated | none | 1 | `/srv/worktrees/v4-contracts` / `feat/v4-contracts` | lane-contracts.md | Merged |
-| engine-core | `internal/engine` replacing Client cache + Manager for the single-tenant scope: ingress, reconcile on `OpResync`, revision dedupe, coalescing dispatch, read-your-writes, delete→default; `internal/manager` and root Manager API deleted; options in D8 removed; Mongo MT rejected at construction | contracts | 2 | `/srv/worktrees/v4-engine-core` / `feat/v4-engine-core` | lane-engine-core.md | In flight |
-| storage | Postgres: scope resolution via connector, `RETURNING revision`, per-tenant `Subscribe(scope)` LISTEN, `OpDisconnect` on loss and `OpResync` after (re)connect, revision in NOTIFY; MongoDB: `revision` `$inc`, `OpResync` after stream re-open and after every polling round-trip failure, tenant connector + per-tenant `Subscribe(scope)` change stream; DDL v4 + `migrate_v3_to_v4.sql`; `DefaultSeedSQL` removed; contract suite extended and run against both backends in both modes | contracts | 2 | `/srv/worktrees/v4-storage` / `feat/v4-storage` | lane-storage.md | In flight |
-| groups | `Bind[T]`, `Group[T].Snapshot/Set/OnApply/Status` over the per-key facade | contracts | 2 | `/srv/worktrees/v4-groups` / `feat/v4-groups` | lane-groups.md | Merged |
+| engine-core | `internal/engine` replacing Client cache + Manager for the single-tenant scope: ingress, reconcile on `OpResync`, revision dedupe, coalescing dispatch, read-your-writes, delete→default; `internal/manager` and root Manager API deleted; options in D8 removed; Mongo MT rejected at construction | contracts | 2 | `/srv/worktrees/v4-engine-core` / `feat/v4-engine-core` | lane-engine-core.md | In review |
+| storage | Postgres: scope resolution via connector, `RETURNING revision`, per-tenant `Subscribe(scope)` LISTEN, `OpDisconnect` on loss and `OpResync` after (re)connect, revision in NOTIFY; MongoDB: `revision = max(previous + 1, $toLong($$NOW))` on every value change and tombstone deletes (FC-9, D11), `OpDisconnect` on cursor loss or a failed poll and `OpResync` after every successful (re)open or recovered poll (FC-2), tenant connector + per-tenant `Subscribe(scope)` change stream; DDL v4 + `migrate_v3_to_v4.sql`; `DefaultSeedSQL` removed; contract suite extended and run against both backends in both modes | contracts | 2 | `/srv/worktrees/v4-storage` / `feat/v4-storage` | lane-storage.md | In review |
+| groups | `Bind[T]`, `Group[T].Snapshot/Set/OnApply/Status` over the per-key facade | contracts | 2 | `/srv/worktrees/v4-groups` / `feat/v4-groups-hot-reload` (Phase 2) | lane-groups.md | In flight |
 | engine-tenants | `WithPostgresTenantManager` / `WithMongoTenantManager`, lazy activation, `Client.HandleTenantLifecycle`, per-scope feeds through `Store.Subscribe(scope)` on both backends, stale marking, per-tenant metrics with aggregate threshold | engine-core, storage | 3 | `/srv/worktrees/v4-engine-tenants` / `feat/v4-engine-tenants` | lane-engine-tenants.md | Pending |
 | admin | GET responses carry `revision`, `updatedAt`, `updatedBy`, `stale`; list too; handlers read through `GetEntry` | contracts | 2 | `/srv/worktrees/v4-admin` / `feat/v4-admin` | lane-admin.md | Merged |
 | docs | README, CLAUDE.md, `MIGRATION-v4.md`, `.env.reference` deleted, `docs/PROJECT_RULES.md` corrected, three compiled examples (single-tenant, multi-tenant, groups) built in CI, godoc truth sweep | engine-core, storage, groups | 3 | `/srv/worktrees/v4-docs` / `feat/v4-docs` | lane-docs.md | Pending |
 | matcher-pilot | matcher on v4 groups: glue deleted, migrated env vars removed from charts, before/after line count reported | engine-core, storage, groups | 3 | repo `matcher`: `/srv/worktrees/matcher-v4-pilot` / `feat/systemplane-v4` | (lives in matcher: `docs/plans/`) | Pending |
+| groups-redaction | field-level redaction for group documents (FC-13): `Bind` derives per-field policies from `systemplane:"redact=full|mask"` struct tags, `WithFieldRedaction` / `KeyFieldRedaction`, admin renders GET and list per field | engine-core (Phase 2, `internal/client`), groups (Phase 2) | 3 | `/srv/worktrees/v4-groups-redaction` / `feat/v4-groups-redaction` | lane-groups.md (Phase 3) | Pending |
 | integration | audit §10 acceptance suite end to end (feed loss → write → reconnect → converge without a second write, in ST Postgres, MT Postgres, ST Mongo, MT Mongo; two tenants get distinct identity on both backends; invalid external row keeps last valid; activation gap; slow callback does not stall the pump; `-race` + goleak), repo-wide absence checks, manual `v4.0.0` cut | every other lane | 4 | `/srv/worktrees/v4-integration` / `feat/v4-integration` | lane-integration.md | Pending |
 
 `Status` lifecycle: Pending → In flight → In review → Merged | Failed.
 The orchestrator session owns this column. Lanes never write to this file.
 
 **Worktrees on mordor** are created with `agent new lib-systemplane v4-<slug>` (lands on `/srv/worktrees/v4-<slug>`), then `git checkout -B feat/v4-<slug> origin/develop` inside it: the `agent/` prefix the tool creates is not a valid Lerian branch name. Base branch for every PR: `develop`. PR titles use one of the repo's `pr_title_scopes` (`client`, `core`, `store`, `postgres`, `mongodb`, `admin`, `docs`, `tests`, `systemplanetest`, ...) or no scope; `engine`, `manager`, `group` are not registered scopes.
+
+**Phase progress (orchestrator's note, 2026-09-18).** `engine-core`: Phase 1 built, fix pass 2 in review, PR next; Phase 2 Detailed. `storage`: Postgres Phase 1 built, fix pass 3 in review, PR next; Phase 2 (MongoDB) Detailed and in flight on `/srv/worktrees/v4-storage-mongo` / `feat/v4-storage-mongo`. `groups`: Phase 1 (`Bind`, `Snapshot`, `Set`) Merged as PR #72 on `feat/v4-groups`; Phase 2 (`OnApply`, `Applied`, `ApplyStatus`, `Status`, FC-7) is NOT landed, is being elaborated and runs on `feat/v4-groups-hot-reload`; the acceptance suite depends on it. `engine-tenants` and `docs`: lane plans written and Phase 1 Detailed on 2026-09-18, Pending until their dependencies read Merged (docs Phase 1 needs only the frozen contracts and may open earlier). `matcher-pilot`: Fred approved the spike on 2026-09-18; the lane plan is being written into the matcher repo. `integration`: the acceptance suite is being authored ahead of time on `/srv/worktrees/v4-integration` / `feat/v4-acceptance` under build tag `acceptance` (red by design until the lanes land).
 
 ## Waves
 
@@ -223,6 +226,9 @@ type Change struct {
 // Returns ErrUnknownKey for a key that was not registered, in both modes: a
 // subscription to an unregistered key can never deliver anything, so it is
 // refused instead of silently returning a no-op unsubscribe.
+// In multi-tenant mode with no tenant manager configured (WithMultiTenantEnabled()
+// alone) it returns ErrNotSupportedInMultiTenant for every key: no scope is
+// tracked and no feed runs, so no callback could ever fire (frozen 2026-09-18).
 func (c *Client) OnChange(namespace, key string, fn func(ctx context.Context, ch Change)) (unsubscribe func(), err error)
 ```
 
@@ -255,9 +261,12 @@ package systemplane
 // WithPostgresTenantManager / WithMongoTenantManager enable per-tenant cache
 // and push hot-reload in multi-tenant mode; each implies
 // WithMultiTenantEnabled(). The option must match the backend of the
-// constructor (NewPostgres / NewMongoDB); a mismatch is a construction error.
+// constructor (NewPostgres / NewMongoDB); a mismatch is a construction error:
+// the constructor returns ErrTenantManagerBackendMismatch (frozen 2026-09-18).
 func WithPostgresTenantManager(mgr *tmpostgres.Manager) Option
 func WithMongoTenantManager(mgr *tmmongo.Manager) Option
+
+var ErrTenantManagerBackendMismatch = errors.New("systemplane: tenant manager does not match the client backend")
 
 // HandleTenantLifecycle has the tmevent.EventHandler signature so it can be
 // registered directly with the tenant-manager event dispatcher. Activated is
@@ -318,7 +327,7 @@ type ApplyStatus struct {
 	Tenant   string
 	Desired  int64 // latest published revision
 	Applied  int64 // latest revision fn accepted
-	LastErr  error // nil when Desired == Applied
+	LastErr  error // nil once every registered fn has accepted the newest published revision (amended 2026-09-18: a rejection stays visible until the next acceptance; Revision 0 equality never clears it)
 }
 
 func (g *Group[T]) Status() []ApplyStatus
@@ -327,6 +336,29 @@ func (g *Group[T]) Status() []ApplyStatus
 ### FC-8 DDL v4 (`ddl/schema.sql` becomes this; `ddl/migrate_v3_to_v4.sql` is the delta)
 
 ```sql
+DO $$
+DECLARE
+	foreign_schema TEXT := (
+		SELECT n.nspname
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE c.relname = 'systemplane_entries'
+		  AND c.relkind IN ('r', 'p')
+		  AND n.nspname <> current_schema()
+		  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+		  AND n.nspname NOT LIKE 'pg_toast%'
+		  AND n.nspname NOT LIKE 'pg_temp%'
+		LIMIT 1
+	);
+BEGIN
+	IF foreign_schema IS NOT NULL THEN
+		RAISE EXCEPTION
+			'systemplane_entries already exists in schema %, but this role would provision into %; applying the full schema here would fork the install into a second, empty table and orphan the populated one',
+			foreign_schema, current_schema()
+			USING HINT = 'put the existing schema first in search_path, or upgrade that install with ddl/migrate_v3_to_v4.sql, which creates no table';
+	END IF;
+END
+$$;
 CREATE TABLE IF NOT EXISTS systemplane_entries (
 	namespace   TEXT NOT NULL,
 	"key"       TEXT NOT NULL,
@@ -338,6 +370,7 @@ CREATE TABLE IF NOT EXISTS systemplane_entries (
 );
 
 ALTER TABLE systemplane_entries ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;
+ALTER TABLE systemplane_entries ALTER COLUMN revision SET DEFAULT 1;
 
 DO $$
 DECLARE
@@ -412,7 +445,42 @@ EXECUTE FUNCTION systemplane_notify_v4('systemplane_changes');
 ALTER TABLE systemplane_entries ALTER COLUMN revision DROP DEFAULT;
 ```
 
-Re-setting an identical value bumps `updated_at` but not `revision`; the NOTIFY fires with the same revision and the engine dedupes it. Every revision comes from `systemplane_revision_seq` (D11), and ONLY through `systemplane_bump_revision_v4()`: the function is SECURITY DEFINER with a pinned search_path and fires BEFORE INSERT OR UPDATE, so the runtime role needs plain DML and no grant on the sequence (a column default calling `nextval` would run as the invoking role and fail a DML-only role with 42501); the column therefore carries no default. The sequence is created and seeded inside a DO block in the schema that owns `systemplane_entries`, resolved exactly the way the trigger resolves it (`TG_TABLE_SCHEMA`), because an unqualified CREATE SEQUENCE lands in the applier's first search_path schema and a v3 table living elsewhere would then fail every write at runtime while the migration reported success. `MigrationV3ToV4SQL()` is this file minus the `CREATE TABLE`; on a v3 table it adds the column at 1, seeds the sequence past the highest existing revision, installs the triggers and only then drops the transitional default, so an untransacted migration never leaves an insert without a revision. A recreated key is always above the revision it had before the delete; numbers may skip and start at 2 on a fresh database, and nothing depends on their magnitude. Both artifacts assume one database per tenant and must never be applied per schema inside a shared database: NOTIFY is database-wide, every feed listens on the same channel, and the unqualified `DROP FUNCTION IF EXISTS systemplane_notify_v3()` resolves through the whole search_path. `SchemaSQL()` returns the full file; `MigrationV3ToV4SQL()` returns the delta (the `ALTER` plus the function/trigger replacement). NOTIFY payload is `{"namespace","key","op","revision"}`; decoders treat a missing `revision` as 0.
+**Guard that opens `MigrationV3ToV4SQL()`** (the migration runs unqualified statements, so it must be told which install it is altering; it never creates a table):
+
+```sql
+DO $$
+DECLARE
+	target_schema TEXT := (
+		SELECT n.nspname
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE c.oid = to_regclass('systemplane_entries')
+	);
+	other_schema TEXT;
+BEGIN
+	IF target_schema IS NULL THEN
+		RAISE EXCEPTION 'systemplane_entries is not visible on search_path; this migration alters the table search_path resolves and creates none'
+			USING HINT = 'put the schema that holds the v3 install first in search_path, then re-run';
+	END IF;
+	SELECT n.nspname INTO other_schema
+	FROM pg_class c
+	JOIN pg_namespace n ON n.oid = c.relnamespace
+	WHERE c.relname = 'systemplane_entries'
+	  AND c.relkind IN ('r', 'p')
+	  AND n.nspname <> target_schema
+	  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+	  AND n.nspname NOT LIKE 'pg_toast%'
+	  AND n.nspname NOT LIKE 'pg_temp%'
+	LIMIT 1;
+	IF other_schema IS NOT NULL THEN
+		RAISE EXCEPTION 'systemplane_entries exists in schema % as well as in %, which search_path resolves first; refusing to guess which install to migrate', other_schema, target_schema
+			USING HINT = 'drop or rename the stray table, or narrow search_path to the schema that holds the install to migrate';
+	END IF;
+END
+$$;
+```
+
+Re-setting an identical value bumps `updated_at` but not `revision`; the NOTIFY fires with the same revision and the engine dedupes it. Every revision comes from `systemplane_revision_seq` (D11), and ONLY through `systemplane_bump_revision_v4()`: the function is SECURITY DEFINER with a pinned search_path and fires BEFORE INSERT OR UPDATE, so the runtime role needs plain DML and no grant on the sequence (a column default calling `nextval` would run as the invoking role and fail a DML-only role with 42501); the column therefore carries no default. The guard DO block that opens the file (added 2026-09-18 after the storage lane reproduced the fork; re-amended the same day to scan every schema through `pg_class`/`pg_namespace`, because `to_regclass` only sees schemas on the applier's `search_path` and would have let the most likely fork through) raises when ANY `systemplane_entries` exists in a non-system schema other than `current_schema()`, whether or not the current schema also holds one (re-amended after review: preferring the current schema would let a stray copy elsewhere pass and stay orphaned): `CREATE TABLE IF NOT EXISTS` looks only at the first schema of `search_path`, so applying the full file to an install living elsewhere would provision a second, empty table, exit 0 and orphan the populated one; such an install is upgraded with `MigrationV3ToV4SQL()`, which creates no table. The sequence is created and seeded inside a DO block in the schema that owns `systemplane_entries`, resolved exactly the way the trigger resolves it (`TG_TABLE_SCHEMA`), because an unqualified CREATE SEQUENCE lands in the applier's first search_path schema and a v3 table living elsewhere would then fail every write at runtime while the migration reported success. `MigrationV3ToV4SQL()` is its own guard block (below) followed by this file minus the schema guard and the `CREATE TABLE`, so from the `ALTER TABLE` line to the end the two artifacts are byte-identical; on a v3 table it adds the column at 1, and on EVERY application it re-sets the transitional default unconditionally (the `ADD COLUMN IF NOT EXISTS` is a no-op on a second run and would restore nothing), seeds the sequence past the highest existing revision, installs the triggers and only then drops the default, so an untransacted first or repeated application never leaves an insert without a revision. A recreated key is always above the revision it had before the delete; numbers may skip and start at 2 on a fresh database, and nothing depends on their magnitude. Both artifacts assume one database per tenant and must never be applied per schema inside a shared database: NOTIFY is database-wide, every feed listens on the same channel, and the unqualified `DROP FUNCTION IF EXISTS systemplane_notify_v3()` resolves through the whole search_path. `SchemaSQL()` returns the full file; `MigrationV3ToV4SQL()` returns the delta (the `ALTER` plus the function/trigger replacement). NOTIFY payload is `{"namespace","key","op","revision"}`; decoders treat a missing `revision` as 0.
 
 ### FC-9 MongoDB document
 
@@ -424,9 +492,41 @@ When a scope completes its first reconcile (single-tenant at `Start`, a tenant a
 
 ### FC-10 Facade surface kept unchanged (admin and consumers rely on it)
 
-`NewPostgres(db *sql.DB, listenDSN string, opts ...Option)`, `NewMongoDB(client *mongo.Client, database string, opts ...Option)`, `NewForTesting`, `Register`, `Start`, `Close`, `Get`, `GetString`, `GetInt`, `GetBool`, `GetFloat64`, `GetDuration`, `Set`, `Delete`, `List`, `Catalog`, `CatalogKey`, `CatalogService`, `KeyDescription`, `KeyRedaction`, `IsRegistered`, `Logger`, key options `WithDescription`, `WithValidator`, `WithRedaction`, `WithCatalogMetadata`, client options `WithLogger`, `WithTelemetry`, `WithDebounce`, `WithPollInterval`, `WithMultiTenantEnabled`, `WithModule`, `WithCatalogService`. `admin.Mount` / `admin.MountCatalog` and their options unchanged.
+`NewPostgres(db *sql.DB, listenDSN string, opts ...Option)`, `NewMongoDB(client *mongo.Client, database string, opts ...Option)`, `NewForTesting`, `Register`, `Start`, `Close`, `Get`, `GetString`, `GetInt`, `GetBool`, `GetFloat64`, `GetDuration`, `Set`, `Delete`, `List`, `Catalog`, `CatalogKey`, `CatalogService`, `KeyDescription`, `KeyRedaction`, `IsRegistered`, `Logger`, key options `WithDescription`, `WithValidator`, `WithContextValidator` (landed on `develop` 2026-09-22 in PR #79: the validator receives the `Set` context; in v4 every other ingress passes a context with no tenant for the zero scope; whether a tenant scope's read-back context carries the tenant id is decided at engine-tenants elaboration, see lane-engine-core Task 2.1.3), `WithRedaction`, `WithCatalogMetadata`, client options `WithLogger`, `WithTelemetry`, `WithDebounce`, `WithPollInterval`, `WithMultiTenantEnabled`, `WithModule`, `WithCatalogService`. `admin.Mount` / `admin.MountCatalog` and their options unchanged.
 
-Removed in v4: `Manager`, `ManagerOption`, `NewManager`, `WithManagerLogger`, `WithManagerTelemetry`, `WithManagerAggregateTenantThreshold`, `(*Manager).*`, `WithTable`, `WithListenChannel`, `WithCollection`, `DefaultSeedSQL`. Replacement for the aggregate threshold: `WithAggregateTenantThreshold(n int) Option` on the Client (engine-tenants lane). Added: `WithCloseTimeout(d time.Duration) Option` and sentinel `ErrCloseTimeout` (engine-core lane, D10).
+Removed in v4: `Manager`, `ManagerOption`, `NewManager`, `WithManagerLogger`, `WithManagerTelemetry`, `WithManagerAggregateTenantThreshold`, `(*Manager).*`, `WithTable`, `WithListenChannel`, `WithCollection`, `DefaultSeedSQL`. Replacement for the aggregate threshold: `WithAggregateTenantThreshold(n int) Option` on the Client (engine-tenants lane); frozen 2026-09-18: the default is the exported `DefaultAggregateTenantThreshold = 1000`, per-tenant metric attributes collapse to the literal `aggregate` once more than `n` tenant scopes are active, and a non-positive `n` disables the collapse (per-tenant attributes whatever the cardinality). Added: `WithCloseTimeout(d time.Duration) Option` and sentinel `ErrCloseTimeout` (engine-core lane, D10).
+
+### FC-12 Engine metrics (frozen 2026-09-18, engine-tenants D-T7)
+
+Meter `systemplane.engine`. Instruments: `systemplane.scopes_active` (gauge: tracked scopes), `systemplane.cache_entries` (gauge, per scope), `systemplane.changefeed_events_total` (counter, per scope), `systemplane.changefeed_disconnects_total` (counter, per scope), `systemplane.activation_latency_seconds` (histogram, tenant scopes only: from the first read that activates a tenant until its scope reports `Stale=false`), `systemplane.cache_reads_total` (counter, per scope, attribute `result` = `hit` | `miss`). Per-scope instruments carry `tenant_id` while at most `WithAggregateTenantThreshold` tenant scopes are active and the literal `aggregate` above that (FC-10); the single-tenant scope carries no `tenant_id`. Any further attribute is the lane's call and must be low-cardinality (no key names, no values). The v3 names under meter `systemplane.manager` (`tenants_active`, `cache_entries`, `notify_received_total`, `listen_disconnects_total`, `warmload_latency_seconds`, `get_cache_hits_total`) are gone: the manager no longer exists and two of them name Postgres mechanics MongoDB does not have. `MIGRATION-v4.md` lists each old name beside its replacement so dashboards and alerts can be rewritten.
+
+### FC-13 Field-level redaction for group documents (frozen 2026-09-18, Fred's decision on the matcher pilot)
+
+```go
+package systemplane
+
+// A group document is redacted on the admin surface per FIELD. Bind[T] walks T
+// at registration (nested structs included; json tag names give the field path)
+// and derives one policy per tagged field from the `systemplane` struct tag:
+// `systemplane:"redact=full"` renders the field as the full-redaction
+// placeholder, `systemplane:"redact=mask"` as the masked form (non-string values
+// under mask render as the full placeholder), untagged fields render in clear. A
+// tagged struct-typed field redacts its whole sub-document; a tagged slice or map
+// applies the policy to every element. The key's own policy stays RedactNone
+// unless the caller passes WithRedaction to Bind, which redacts the whole
+// document as before and wins over every tag. Stored values are never altered:
+// redaction is a rendering rule of the admin surface, as today.
+//
+// WithFieldRedaction sets per-field policies explicitly on a per-key
+// registration (the non-generic path); Bind derives them from tags.
+// KeyFieldRedaction reports them, keyed by dotted JSON path; nil when the key
+// carries none. admin applies them on GET (single and list) whenever the key's
+// policy is RedactNone and a field map exists.
+func WithFieldRedaction(policies map[string]RedactPolicy) KeyOption
+func (c *Client) KeyFieldRedaction(namespace, key string) map[string]RedactPolicy
+```
+
+Reason: a group is one row and the v3 per-key redaction is per row, so a group holding one secret would mask every neighbouring field for the operator (matcher: object-storage endpoint, bucket and region beside two credentials). Alternatives considered and rejected by Fred on 2026-09-18: moving the secrets out of systemplane (loses runtime rotation), accepting whole-document masking. Owned by the `groups-redaction` lane (wave 3): root `api_group.go` (tag walk at `Bind`), root key options and `KeyFieldRedaction`, `internal/client` registry (stores the map), `admin/` rendering. Not a behaviour change for existing consumers: opt-in through tags or the option.
 
 ## Lane blocks (not yet in flight)
 
@@ -454,7 +554,7 @@ Removed in v4: `Manager`, `ManagerOption`, `NewManager`, `WithManagerLogger`, `W
 ### Lane: engine-tenants
 
 **Goal:** Multi-tenant scopes get the same engine: lazy activation, lifecycle events, per-tenant feeds, stale marking, metrics.
-**Scope:** `internal/engine/` (all files; tenant scope management is added to the core landed in wave 2), `internal/client/options.go` (`WithPostgresTenantManager`, `WithMongoTenantManager`, `WithAggregateTenantThreshold`), root `api_constructors.go`, `api_client.go` (`HandleTenantLifecycle`), metrics port from the deleted `internal/manager/metrics.go` semantics (cache entries, listen disconnects, per-tenant labels collapsing above the aggregate threshold).
+**Scope:** amended 2026-09-18 (lane plan D-T1): `internal/engine/**` (tenant scope management is added to the core landed in wave 2; `startMu` moves from `bringUpScope` to `Engine.Start`, D-T2 approved), `internal/client/{options,client,get,set,onchange,errors}.go` plus the new `internal/client/tenant.go` and their tests, root `api_constructors.go` (`WithPostgresTenantManager`, `WithMongoTenantManager`, `WithAggregateTenantThreshold`, and the godoc stating the operational facts: own database per tenant, one LISTEN backend per active tenant per replica, opaque revisions, and the shared-database refusal: a second feed whose DSN names a database another live feed of the same Store already listens on (the signature of schema-per-tenant, or of a connector handing two tenants one connection string) is refused at `Subscribe` with `ErrSharedDatabaseUnsupported`, because NOTIFY is database-wide; a pinned `search_path` alone is not refused, and two processes sharing one database cannot see each other, so one database per tenant stays the operator's responsibility beyond this one process), `api_client.go` (`HandleTenantLifecycle`), `api_errors.go` (`ErrTenantManagerBackendMismatch`, root alias of `ErrSharedDatabaseUnsupported`), metrics per FC-12. Reserved test files: `internal/engine/tenants_integration_test.go`, `internal/client/tenant_integration_test.go`, `internal/client/tenant_mongo_integration_test.go`. Tenant identity in ctx is read through `tmcore.GetTenantIDContext` and set through `tmcore.ContextWithTenantID` (lib-commons/v7 `commons/tenant-manager/core`), the carrier the acceptance suite uses. Lane plan: `lane-engine-tenants.md` (Phase 1 Detailed 2026-09-18).
 **Depends on:** engine-core, storage.
 **Done when:** first `Get` for tenant `t1` activates its scope (subscribe, then reconcile, then `Stale=false`) and later reads hit the cache, on Postgres AND on MongoDB; `HandleTenantLifecycle(Suspended)` drops the scope, reads fall back to per-request and do NOT re-activate the tenant until an Activated event arrives; `CredentialsRotated` re-activates an active tenant on the new DSN and leaves a blocked tenant blocked (Suspended then CredentialsRotated then a read: still per-request, no subscription); a `Change` for `t1` carries `Tenant == "t1"` and a callback registered once fires separately for `t1` and `t2`; a failed activation (subscribe ok, reconcile fails) unsubscribes and leaves no scope state, so the next read retries from scratch and the store sees exactly one live subscription per activated tenant (asserted through the fake store's subscription count); two concurrent first reads for the same tenant start one activation; metrics carry `tenant_id` up to the threshold and `aggregate` above it. Integration tests run on testcontainers Postgres and MongoDB (replica set) with two tenant databases each.
 
@@ -468,9 +568,9 @@ Removed in v4: `Manager`, `ManagerOption`, `NewManager`, `WithManagerLogger`, `W
 ### Lane: docs
 
 **Goal:** Every document and example describes v4 as it is, and the examples compile in CI.
-**Scope:** `README.md`, `CLAUDE.md`, `MIGRATION-v4.md` (new), `MIGRATION-v3.md` (kept), `.env.reference` (deleted), `docs/PROJECT_RULES.md`, `examples/single-tenant/`, `examples/multi-tenant/`, `examples/groups/`, `.github/workflows/go-combined-analysis.yml` (add `go build ./examples/...`), `doc.go`.
+**Scope:** `README.md`, `CLAUDE.md`, `MIGRATION-v4.md` (new), `MIGRATION-v3.md` (kept), `.env.reference` (deleted), `docs/PROJECT_RULES.md`, `examples/single-tenant/`, `examples/multi-tenant/`, `examples/groups/`, `.github/workflows/go-combined-analysis.yml` (add `go build ./examples/...`), `doc.go`. The godoc truth sweep is read-only against root `api_*.go`: a correction needed there is reported to the orchestrator and landed after engine-tenants merges (D-T6). The godoc of `WithPostgresTenantManager` is engine-tenants' deliverable, not this lane's. notifications (v1.6.1) and finance-hub (v1.6.0) reach v4 through hops this plan does not own (Fiber v2 to v3, lib-commons v5 to v7, lib-observability v1 to v4); `MIGRATION-v4.md` states them as preconditions and documents from v3 onward (accepted 2026-09-18). Lane plan: `lane-docs.md` (Phase 1 Detailed 2026-09-18; Phase 1 needs only the frozen contracts and may open before its dependencies merge).
 **Depends on:** engine-core, storage, groups.
-**Done when:** no product document (README, CLAUDE.md, `docs/PROJECT_RULES.md`, godoc, examples) mentions `lib-commons/v6`, `Manager`, `NewManager`, `Slice`, `WithLazyTenantLoad`, `WithTenantAuthorizer`, `WithTenantSchemaEnabled`, `DefaultSeedSQL`, `WithTable` or `WithListenChannel` except `MIGRATION-v4.md` as removed items; `CHANGELOG.md` and `docs/plans/` are out of scope for this check; `MIGRATION-v4.md` has one section per consumer in the matrix naming what breaks and what replaces it, plus a behavior-change section (FC-11 initial publication at Start; coalesced delivery; `Change` signature; removed options); the three examples build in CI and each demonstrates a value changing at runtime; `CLAUDE.md` API invariants match the facade. Also, from the storage fix pass: `MIGRATION-v4.md` and the godoc of the root Postgres tenant-connector option state that (a) each tenant needs its own database, and a schema-isolated DSN (a `search_path` option) is refused at `Subscribe` with a named error because NOTIFY is database-wide; (b) each active tenant costs one extra LISTEN backend per replica on top of the tenant-manager pool, so `max_connections` is sized against active tenants × replicas; (c) revisions are opaque, may skip, and start at 2 on a fresh database.
+**Done when:** no product document (README, CLAUDE.md, `docs/PROJECT_RULES.md`, godoc, examples) mentions `lib-commons/v6`, `Manager`, `NewManager`, `Slice`, `WithLazyTenantLoad`, `WithTenantAuthorizer`, `WithTenantSchemaEnabled`, `DefaultSeedSQL`, `WithTable` or `WithListenChannel` except `MIGRATION-v4.md` as removed items; `CHANGELOG.md` and `docs/plans/` are out of scope for this check; `MIGRATION-v4.md` has one section per consumer in the matrix naming what breaks and what replaces it, plus a behavior-change section (FC-11 initial publication at Start; coalesced delivery; `Change` signature; removed options); the three examples build in CI and each demonstrates a value changing at runtime; `CLAUDE.md` API invariants match the facade. Also, from the storage fix pass: `MIGRATION-v4.md` and the godoc of the root Postgres tenant-connector option state that (a) each tenant needs its own database, and a schema-isolated DSN (a `search_path` option) is refused at `Subscribe` only when it collides with a live feed on the same database, with `ErrSharedDatabaseUnsupported` (storage defines it in `internal/postgres`; engine-tenants exports the root alias); the rule in full: a second feed whose DSN names a database another live feed of the same Store already listens on (the signature of schema-per-tenant, or of a connector handing two tenants one connection string) is refused at `Subscribe` with `ErrSharedDatabaseUnsupported`, because NOTIFY is database-wide; a pinned `search_path` alone is not refused, and two processes sharing one database cannot see each other, so one database per tenant stays the operator's responsibility beyond this one process; (b) each active tenant costs one extra LISTEN backend per replica on top of the tenant-manager pool, so `max_connections` is sized against active tenants × replicas; (c) revisions are opaque, may skip, and start at 2 on a fresh database.
 
 ### Lane: matcher-pilot (repo `matcher`)
 
@@ -479,10 +579,17 @@ Removed in v4: `Manager`, `ManagerOption`, `NewManager`, `WithManagerLogger`, `W
 **Depends on:** engine-core, storage, groups.
 **Done when:** matcher registers its runtime knobs as typed groups; `systemplane_keys_defs.go`, `systemplane_keys_validators.go`, `systemplane_keys.go`, `runtime_settings.go` are deleted or reduced to the `Bind` calls; every env var that duplicated a migrated knob is removed from code, chart and docs; `make test` and the matcher integration suite pass; the lane's PR description states the line count before and after.
 
+### Lane: groups-redaction
+
+**Goal:** An operator reading a group document on the admin surface sees every field in clear except the ones the consumer tagged as secret.
+**Scope:** root `api_group.go` (struct-tag walk at `Bind`, FC-13), root key options file (`WithFieldRedaction`) and `api_client.go` (`KeyFieldRedaction`), `internal/client` registry (per-key field policy map, `KeyFieldRedaction`), `admin/admin.go` and `admin/admin_responses.go` (apply the map on single GET and list when the key policy is `RedactNone`), tests for each.
+**Depends on:** engine-core Phase 2 (owns `internal/client` until it merges), groups Phase 2.
+**Done when:** a `Bind[T]` whose `T` tags two fields `redact=full` and one `redact=mask` registers a key whose `KeyFieldRedaction` names exactly those three paths with those policies (nested path included); admin GET of that key renders the tagged fields redacted and every other field in clear, list too; `WithRedaction` on the same `Bind` masks the whole document and `KeyFieldRedaction` still reports the map; a per-key `Register` with `WithFieldRedaction` behaves identically; stored values are unchanged (a direct read of the row shows clear text); `release_policy_test.go` and the admin suite stay green; the matcher pilot's three secret-carrying groups render with only their credentials masked against a beta carrying this lane.
+
 ### Lane: integration
 
 **Goal:** The audit's acceptance criteria hold end to end, and v4.0.0 ships.
-**Scope:** new `internal/engine/*_integration_test.go` and `acceptance_integration_test.go` at the root package (testcontainers Postgres + Mongo), CI workflow adjustments, repo-wide absence checks, release cut.
+**Scope:** the acceptance suite as package `acceptance/` under build tag `acceptance` (authored ahead of the lanes on `/srv/worktrees/v4-integration` / `feat/v4-acceptance`, red by design until they land; testcontainers Postgres + Mongo replica set), any engine-level integration file it adds under the prefix `internal/engine/acceptance_*_integration_test.go` (the plain names are reserved by engine-tenants), CI workflow adjustments, repo-wide absence checks, release cut.
 **Depends on:** every other lane.
 **Done when:** the scenarios in the Integration Lane section below pass under `-race` with goleak; `grep -rn "lib-systemplane/v3\|internal/manager\|Slice 1\|DefaultSeedSQL\|WithTable\|WithListenChannel" --include='*.go' --include='*.md' --exclude-dir=plans --exclude=CHANGELOG.md --exclude='MIGRATION-*.md' .` returns nothing; `make ci` green; `develop → main` promoted and `v4.0.0` cut on `main` by the Merge Order step 4 rule (dry-run first; hand tag plus channel note only if the run would not cut it itself).
 
@@ -493,7 +600,7 @@ Required: `engine-core`, `engine-tenants`, `storage` and `groups` all touch the 
 1. **Feed loss, ST Postgres.** Start Client, kill the LISTEN backend with `pg_terminate_backend`, write a new value via a separate connection, let the listener reconnect: `GetEntry` returns the new value and revision, `OnChange` fired exactly once, `Stale` was true during the gap (from `OpDisconnect`) and false after the reconcile. Variant: a second write lands between the reconcile's `List` and its application; the cache ends at the second write's revision and `OnChange` never observes the first.
 2. **Feed loss, MT Postgres.** Same for tenant `t1` with `WithTenantManager`; `t2` unaffected.
 3. **Feed loss, Mongo.** Same with the change stream cursor killed, in ST and for tenant `t1` with `WithMongoTenantManager` (`t2` unaffected).
-4. **Two tenants, one subscription.** Write different values for `t1` and `t2`; the single `OnChange` receives two `Change`s with distinct `Tenant`, and `Group.OnApply` `Status()` shows both tenants applied.
+4. **Two tenants, one subscription.** Write different values for `t1` and `t2`; the single `OnChange` receives two `Change`s with distinct `Tenant`, and `Group.OnApply` `Status()` shows both tenants applied. The group assertion is on state (the applier holds the current document for each tenant and `Status()` reports both applied), never on a delivery count: a pre-`Start` `OnApply` may legitimately receive the registered default before `Start` and the stored document during it (groups Phase 2 elaboration, C3).
 5. **Invalid external row.** Insert JSON of the wrong type directly in SQL; `GetEntry` keeps the previous value, `Stale` false, a rejection is logged, no callback fires.
 6. **Activation gap.** Write for `t1` concurrently with the first read that activates it; the value is visible after activation without a second write.
 7. **Slow subscriber.** A subscriber for key A blocks 5s; changes for key B are delivered within 500ms; the LISTEN connection keeps draining.
@@ -503,6 +610,25 @@ Required: `engine-core`, `engine-tenants`, `storage` and `groups` all touch the 
 11. Revision 0 is kept apart per surface: a delete publishes the registered default at Revision 0; a store row that carries no revision (a v3 MongoDB document, or a foreign writer that omitted it) is published with its own value at Revision 0, is never deduplicated, and is superseded by the first real revision; the fence never mistakes one for the other (D3).
 
 Absence checks deferred from lanes under rule 4 live here (see the lane's Done-when).
+
+## Behaviour changes MIGRATION-v4.md must name (collected for the docs lane)
+
+- A single-tenant consumer whose store holds a row its own registered validator rejects no longer sees that row on read. The last valid value, or the registered default, stays in force and the rejection is logged (D1, FC-11). In v3 the raw row reached `Get`/`Group.Snapshot`. Found at engine-core Phase 2 elaboration: three groups tests asserted the v3 behaviour.
+- A key validator runs on every ingress in v4, with the caller's context on `Set` and with an engine
+  context that carries no tenant on changefeed and reconcile read-back. That is settled for the zero
+  scope. For tenant scopes it is PROVISIONAL: whether the read-back context carries the tenant id (not
+  its connection) is decided at engine-tenants elaboration (lane-engine-core Task 2.1.3); until then a
+  tenant scope behaves like the zero scope. v3 `develop` grades single-tenant read-back only (PR #84)
+  and leaves multi-tenant reads ungraded; v4 grades both. A validator registered with
+  `WithContextValidator` that refuses without a tenant pins the last valid value (or the default) for
+  every stored row on read-back. Found at the 2026-09-23 merge check of engine-core against `develop`.
+- MongoDB `Delete` leaves a tombstone document (`deleted: true`) instead of removing the row (D11, FC-9). Anyone reading `systemplane_entries` directly must filter `deleted: {$ne: true}`.
+- A connector-resolved MongoDB tenant database requires `createCollection` on first use, exactly as a ctx-resolved multi-tenant database does today; the single-tenant lazy bootstrap keeps skipping `CreateCollection` (storage Phase 2 elaboration, deviation 1).
+- Postgres `SchemaSQL()` refuses to run when a `systemplane_entries` exists in any non-system schema other than the applying role's `current_schema()` (FC-8 guard); such installs use `MigrationV3ToV4SQL()`, which itself refuses to run when the table does not resolve on `search_path` or exists in two schemas.
+- Postgres, multi-tenant: a second feed whose DSN names a database another live feed of the same Store already listens on (the signature of schema-per-tenant, or of a connector handing two tenants one connection string) is refused at `Subscribe` with `ErrSharedDatabaseUnsupported`, because NOTIFY is database-wide; a pinned `search_path` alone is not refused, and two processes sharing one database cannot see each other, so one database per tenant stays the operator's responsibility beyond this one process (storage fix passes 2 and 3; the check covers the tenant DSNs and `ListenDSN` alike). The refusal is permanent while the two scopes resolve to one database, and the engine retries the failed activation on every read of that tenant.
+- `Client.HandleTenantLifecycle` RETURNS handler errors (FC-6). The v3 `Manager.HandleTenantLifecycle` logged them at WARN and swallowed them by design. plugin-br-pix-jd and notifications register this handler with the tenant-manager dispatcher; a dispatcher that treats a returned error as fatal or retries the event behaves differently on the first transient tenant-DB failure (engine-tenants D-T5).
+- Multi-tenant `OnChange` with no tenant manager configured (`WithMultiTenantEnabled()` alone, billing-worker's shape) keeps returning `ErrNotSupportedInMultiTenant` (FC-4, frozen 2026-09-18): a documented refusal, not an unfinished feature.
+- Postgres reads under a dbresolver that carries replicas are pinned to the primary (storage fix pass 2): a standby can no longer serve a revision below the one `Set` just returned.
 
 ## Merge Order
 
