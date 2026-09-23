@@ -119,7 +119,7 @@ func (e *Engine) onEvent(evt store.Event) {
 	}
 
 	if evt.Op == store.OpDelete {
-		e.applyDelete(evt.Scope, nk)
+		e.PublishDelete(evt.Scope, nk)
 
 		return
 	}
@@ -299,7 +299,7 @@ func (e *Engine) markStale(scope store.Scope) {
 	sc.disconnectGen++
 }
 
-// applyDelete publishes the registered default at revision 0 for a deleted
+// PublishDelete publishes the registered default at revision 0 for a deleted
 // row. Revision 0 always wins the fence, so the delete is never deduplicated
 // away, and the key is recorded as touched so a reconcile running concurrently
 // does not resurrect the deleted row from its snapshot.
@@ -308,7 +308,24 @@ func (e *Engine) markStale(scope store.Scope) {
 // takes the same lock across its own check-and-apply pair, so it can no longer
 // read an empty fence, wait, and then republish a snapshot row that predates
 // this delete — which is exactly how a deleted key came back to life.
-func (e *Engine) applyDelete(scope store.Scope, nk NSKey) {
+//
+// Two callers share this one operation: the changefeed, when the store reports
+// a row removed, and the Client's own Delete, which needs the same publication
+// under the same fence for the same reason. Leaving Delete to the feed alone
+// would make read-your-writes on a delete wait for a NOTIFY round trip, so the
+// caller's next read could still be answered by the value it just removed
+// (D4). A Client Delete therefore also bumps the key's delete counter, and a
+// changefeed re-read that was already in flight when the caller deleted is
+// refused exactly as it is for a feed delete.
+func (e *Engine) PublishDelete(scope store.Scope, nk NSKey) {
+	// Exported, so this runs on the consumer's goroutine: the same guard
+	// Publish takes, for the same reason. The feed's own callers can never
+	// reach a nil or closed engine; a Client built by a path that never
+	// reached New can.
+	if e == nil || e.closed.Load() {
+		return
+	}
+
 	sc := e.scopeForEvent(scope, nk)
 	if sc == nil {
 		return
@@ -399,7 +416,7 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
 	}
 
 	// The publication and the fence it writes are one atomic step, for the
-	// same reason as in applyDelete: a reconcile deciding this key must see
+	// same reason as in PublishDelete: a reconcile deciding this key must see
 	// either both or neither, never an empty fence followed by this
 	// publication. The store read above deliberately stays outside the lock —
 	// holding it across a network round trip would stall every reconcile of

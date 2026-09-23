@@ -41,6 +41,14 @@ func TestNilEngineIsInert(t *testing.T) {
 			},
 		},
 		{
+			name: "PublishDelete is dropped",
+			call: func(t *testing.T) {
+				var e *Engine
+
+				e.PublishDelete(store.Scope{}, nk)
+			},
+		},
+		{
 			name: "Close succeeds",
 			call: func(t *testing.T) {
 				var e *Engine

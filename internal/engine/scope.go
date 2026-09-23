@@ -80,7 +80,7 @@ func (sc *scopeState) deleteFenceFor(nk NSKey) deleteFence {
 // armed, which makes whatever the re-read is holding older than the cache.
 //
 // The caller holds sc.reconcileMu, which is what makes the answer and the
-// publication it gates one step: applyDelete holds the same lock across its own
+// publication it gates one step: PublishDelete holds the same lock across its own
 // publish-and-record pair, so a delete can no longer land between this check
 // and the publication it permitted.
 func (sc *scopeState) supersededByDelete(nk NSKey, fence deleteFence) bool {

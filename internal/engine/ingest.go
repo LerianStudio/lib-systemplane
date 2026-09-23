@@ -217,7 +217,7 @@ func errorDetail(redacted bool, what string, err error) log.Field {
 // sc is the caller's own scope state, for the reason publish takes one.
 func (e *Engine) ingestDefault(ctx context.Context, sc *scopeState, nk NSKey, deleted bool) (notify bool) {
 	// Unreachable from all three production callers, each behind a guard of
-	// its own: applyDelete, because the feed drops an unregistered key before
+	// its own: PublishDelete, because the feed drops an unregistered key before
 	// it is reached; applySnapshotRow, because it asks its own Registry
 	// lookup first and returns rather than fall through for a foreign row the
 	// snapshot carried; applyAbsentKey, because every key it decides came

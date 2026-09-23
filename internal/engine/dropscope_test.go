@@ -74,7 +74,7 @@ func TestDropScopeUnsubscribesTheFeed(t *testing.T) {
 //
 // All four operations the engine branches on are played, because the guard
 // sits in four separate call sites — onResync, refreshKey, markStale and
-// applyDelete — and each can regress alone. A late delete is the worst of
+// PublishDelete — and each can regress alone. A late delete is the worst of
 // them: it re-creates the scope AND publishes the registered default into it,
 // so the dropped tenant reads as current with a value nothing confirms.
 func TestLateFeedEventAfterDropDoesNotRecreateScope(t *testing.T) {

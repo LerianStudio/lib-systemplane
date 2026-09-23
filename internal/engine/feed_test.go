@@ -715,3 +715,87 @@ func TestForeignUpsertEventCostsNoStoreRead(t *testing.T) {
 		})
 	}
 }
+
+// TestPublishDeleteOnUntrackedScopeCreatesNoScope covers the path the Client's
+// own Delete takes in multi-tenant mode and before Start: there is no tracked
+// scope, and an exported publication must drop rather than bring one up. A
+// scope created here would have no changefeed behind it, no reconcile to
+// confirm it and a delivery worker registered in the WaitGroup Close drains —
+// a cache that reads as current forever.
+func TestPublishDeleteOnUntrackedScopeCreatesNoScope(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	fs := newFakeStore()
+	e := untrackedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs)
+
+	e.PublishDelete(store.Scope{}, nk)
+
+	if got := scopeCount(e); got != 0 {
+		t.Errorf("scopes tracked after PublishDelete: got %d, want 0", got)
+	}
+
+	if got, ok := e.Lookup(store.Scope{}, nk); ok || got != (Entry{}) {
+		t.Errorf("Lookup after PublishDelete on an untracked scope: got (%+v, %t), want (Entry{}, false)", got, ok)
+	}
+}
+
+// untrackedEngine is registryEngine without the scope: an engine that has been
+// built but never brought a scope up, which is what the Client holds in
+// multi-tenant mode and before Start.
+func untrackedEngine(t *testing.T, defs map[NSKey]KeyDef, fs *fakeStore) *Engine {
+	t.Helper()
+
+	e := New(Config{Store: fs, Registry: fakeRegistry{defs: defs}, Debounce: 0})
+
+	t.Cleanup(func() {
+		e.debouncer.Close()
+		e.lifecycleCancel()
+		e.closeWorkers()
+		e.dispatchWG.Wait()
+	})
+
+	return e
+}
+
+// TestPublishDeleteRecordsTheKeyAsTouched is the exported entry point standing
+// in for the feed in the scenario the delete fence exists for: a reconcile's
+// photograph still carries the row, and the caller deletes the key while that
+// List is held open. The snapshot row is NEWER than the revision-0 default a
+// delete publishes, so the revision fence alone lets it back in; only the
+// touched record keeps the deleted key dead. A Client Delete has to write that
+// record too, or a delete issued during a reconnect is undone by the snapshot.
+func TestPublishDeleteRecordsTheKeyAsTouched(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0)
+
+	fs.seed(scope, jsonRow(nk, 5, `"five"`, "ops"))
+	settled(t, e, scope)
+
+	release := heldList(fs)
+	defer release()
+
+	fs.freezeNextList([]store.Entry{jsonRow(nk, 5, `"five"`, "ops")})
+
+	e.onEvent(disconnectEvent(scope))
+	e.onEvent(resyncEvent(scope))
+
+	waitFor(t, hangGuard, "the reconcile to reach its List", func() bool { return fs.listCount() >= 2 })
+
+	fs.remove(scope, nk)
+	e.PublishDelete(scope, nk)
+
+	release()
+	waitReconcileIdle(t, e, scope)
+	quiesce(t, e)
+
+	got, ok := e.Lookup(scope, nk)
+	if !ok {
+		t.Fatal("Lookup reports a miss after a delete that spanned a reconcile")
+	}
+
+	if got.Value != "fallback" || got.Revision != 0 {
+		t.Errorf("after the delete: got (%v, rev %d), want the registered default at rev 0: "+
+			"the reconcile's snapshot resurrected a key the caller deleted", got.Value, got.Revision)
+	}
+}
