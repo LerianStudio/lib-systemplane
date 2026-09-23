@@ -1011,6 +1011,26 @@ Decided by Fred on 2026-09-18 for the matcher pilot: secrets stay inside group d
 
 ---
 
+### Epic 3.3: The group validator sees the Set context
+
+**Goal:** A group's own validator can use the tenant and request scope the writer carried, the way a
+per-key `WithContextValidator` (landed on `develop` in PR #79) already can.
+**Scope:** `api_group.go` (`Bind`'s `validate` signature or a `BindOption` that registers the ingress
+through `WithContextValidator` instead of `WithValidator`), its tests, the `Bind` godoc that today says a
+caller's `WithContextValidator` in opts is ignored.
+**Dependencies:** Phase 2 merged; engine-core Task 2.1.3 (defines which context each ingress passes; on
+changefeed and reconcile read-back the context carries no tenant, so a group validator that refuses
+without one pins the last accepted document); the engine-tenants decision on whether a tenant scope's
+read-back context carries the tenant id (provisional until that lane elaborates: tenant scopes behave
+like the zero scope).
+**Done when:** a group validator receives the `Set` caller's context on the write path and a tenant-less
+context on read-back, pinned by tests; the godoc states both.
+**Status:** Pending
+
+Found at the 2026-09-23 merge check of the groups lane against `develop`: `Bind`'s `validate func(T) error`
+is registered through the ctx-less `WithValidator`, which drops the context at
+`internal/client/options.go` before the group's validator runs.
+
 ## Requests to index.md
 
 One promise this lane needs from a sibling, written so the orchestrator can freeze it verbatim.

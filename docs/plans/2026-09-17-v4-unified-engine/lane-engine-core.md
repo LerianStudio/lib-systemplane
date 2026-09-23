@@ -144,6 +144,9 @@ type NSKey struct {
 }
 ```
 
+Amended 2026-09-23: `Validate` widens to `func(context.Context, any) error` in Task 2.1.3, which states the
+per-ingress context contract; Phase 1 shipped the ctx-less form above.
+
 `internal/engine/scope.go` holds the per-scope state. The zero `store.Scope` is the single-tenant scope and is the only one this lane creates; the type is written so a non-empty `Scope.Tenant` is just another key in `Engine.scopes` and the wave-3 lane adds tenants without touching it:
 
 ```go
@@ -723,6 +726,37 @@ subscriber reaching the registry's own default object through the cache. `Keys()
 takes `registryMu.RLock` and returns every registered key. Neither name collides with an existing
 method, and neither reaches the public surface: `systemplane.Client` is a **defined type**
 (`api_types.go:16`), not an alias, so it inherits no methods and `boundary_test.go` is unaffected.
+
+**The validator slot widens first (amended 2026-09-23).** `develop` now registers every key
+validator as `func(context.Context, any) error`: `WithContextValidator` (PR #79) sets it directly and
+`WithValidator` wraps a ctx-less function into that shape (`internal/client/options.go`). So before the
+adapter above is written, `engine.KeyDef.Validate` (`internal/engine/registry.go:20`) and
+`runValidator` (`internal/engine/ingest.go:181`) widen to the same signature, `runValidator` hands its
+own `ctx` to the validator, and every Phase 1 test that builds a `KeyDef{Validate: func(any) error}`
+is updated in the same commit. Which context each ingress passes is the contract, and it is the one
+`develop` already promises for v3 read-back (PR #84 and the `WithContextValidator` godoc):
+
+- A value that arrives through `Publish` is validated with the **writer's** context, the one the
+  caller handed to `Set`, so a tenant-aware validator sees the tenant on the local write path
+  (`Publish` already carries it; `internal/engine/engine.go:395`).
+- A value that arrives from the changefeed re-read or from a reconcile `List` is validated with the
+  engine's dispatch context, which carries **no tenant and no request**. A validator that refuses
+  whenever the context lacks a tenant therefore refuses every stored row: the last valid value stays
+  in force, or the registered default when no row was ever accepted (Task 1.2.1's rule and D-G4), and
+  the rejection is logged once per key with namespace, key and the validator's error, never the
+  stored bytes.
+- A validator that panics is a refusal on every ingress; `runValidator`'s recovery already does this.
+- Whether a **tenant scope's** read-back context should carry the tenant id (not its connection)
+  through lib-commons tenant-manager core is decided at `engine-tenants` elaboration, not here;
+  until then the tenant scope behaves like the zero scope: no tenant in the context.
+
+Verification for this paragraph: `TestIngestValidatorSeesTheWriterContextOnPublish` (a value carried
+by the ctx handed to `Publish` is visible inside the validator) and
+`TestIngestValidatorGetsNoTenantOnFeedAndReconcile` (a validator that refuses without a tenant leaves
+the previous value in force after a feed re-read and after a reconcile, and the rejection is logged
+once; the same test stamps a request marker on the ctx handed to `Start` and to `Store.Subscribe` and
+asserts the validator cannot observe it on either read-back path, since the engine dispatch context
+carries no request values), both under `-race`.
 
 **`Start`** (`internal/client/client.go:189-277`) keeps its guards and its `c.store.Start(ctx)` call,
 and then, in single-tenant mode, is exactly `if err := c.engine.Start(ctx); err != nil { return err }`.
