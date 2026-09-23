@@ -763,3 +763,68 @@ func TestScopeDropDiagnosticsAreDebug(t *testing.T) {
 		})
 	}
 }
+
+// TestDebouncedReReadPanicNamesTheKey pins the identity on the one panic the
+// debouncer alone would report anonymously.
+//
+// runtime.RecoverAndLog, the debouncer's generic guard, logs source="debounce"
+// and — in production mode — a redacted value with no stack, so an operator
+// paged by it learns something under the debouncer blew up and never which
+// tenant, namespace or key. The engine's own recovery is what turns that into
+// an actionable line, and the engine stays usable afterwards: the re-read is
+// dropped, not the process.
+func TestDebouncedReReadPanicNamesTheKey(t *testing.T) {
+	const msg = "systemplane.engine: debounced re-read panicked"
+
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{Tenant: "acme"}
+	fs := newFakeStore()
+	rec := &recordingLogger{Logger: log.NewNop()}
+
+	e := New(Config{
+		Store:    fs,
+		Registry: fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: "fallback"}}},
+		Logger:   rec,
+		Debounce: time.Millisecond,
+	})
+	track(t, e, scope)
+
+	fs.onGet(func(store.Scope, NSKey) error { panic("the store driver exploded") })
+
+	e.onEvent(upsertEvent(scope, nk, 1))
+
+	waitFor(t, time.Second, "the panicking re-read to be reported", func() bool {
+		for _, r := range rec.snapshot() {
+			if r.Msg == msg {
+				return true
+			}
+		}
+
+		return false
+	})
+
+	requireLogged(t, rec, log.LevelError, msg, nk)
+
+	tenant, ok := findLogged(rec, msg).field(constants.AttrKeyTenantID)
+	if !ok || tenant.Value != scope.Tenant {
+		t.Errorf("%q tenant field: got %v (present=%t), want %q: a panic naming no tenant sends an "+
+			"operator through every tenant's logs", msg, tenant.Value, ok, scope.Tenant)
+	}
+
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close after a panicking re-read: %v, want nil: one exploding store call must not "+
+			"strand shutdown", err)
+	}
+}
+
+// findLogged returns the single entry carrying msg. requireLogged has already
+// asserted there is exactly one by the time a caller reaches here.
+func findLogged(r *recordingLogger, msg string) logRecord {
+	for _, rec := range r.snapshot() {
+		if rec.Msg == msg {
+			return rec
+		}
+	}
+
+	return logRecord{}
+}

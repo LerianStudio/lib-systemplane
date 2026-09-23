@@ -25,6 +25,12 @@ type entry struct {
 	// sql.RawBytes handed back instead would leave the fence comparing bytes
 	// that changed underneath it, and a real configuration change whose new
 	// text happened to land in the same buffer would be swallowed as an echo.
+	//
+	// Retaining it costs one copy of every key's row JSON, so the engine's
+	// cache holds the registered keys times the tracked scopes in raw bytes on
+	// top of the decoded values. Negligible single-tenant, where there is one
+	// scope; in wave 3 it is multiplied by the number of tenants the process
+	// has activated.
 	Raw       []byte
 	Revision  int64
 	UpdatedAt time.Time

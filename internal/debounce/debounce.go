@@ -155,10 +155,14 @@ func (d *Debouncer[K]) fire(key K, generation uint64, fn func()) {
 // recoveryComponent is the component name every panic recovery in this
 // package reports. It is a constant on purpose: arguments to a deferred call
 // are evaluated at defer time, so rendering the key here charged a reflective
-// Sprintf to every debounced invocation whether or not anything panicked, and
-// produced one unbounded label value per (tenant, namespace, key). Which
-// callback blew up is already in the stack trace lib-observability logs
-// beside it.
+// Sprintf to every debounced invocation whether or not anything panicked.
+//
+// It is also all the identity this guard can offer. RecoverAndLog logs
+// "panic recovered" with this name, and in production mode the recovered value
+// and the stack are redacted out of that line, so it says something under the
+// debouncer blew up and never which key. A caller whose submitted function
+// must be identifiable recovers first and logs its own identity, leaving this
+// as the outer net — see (*engine.Engine).recoverRefresh.
 const recoveryComponent = "debounce"
 
 // invokeWithRecover calls fn inside a deferred RecoverAndLog so that a

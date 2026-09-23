@@ -71,8 +71,11 @@ type Engine struct {
 	running       sync.Map // *dispatchWorker -> workerKey
 
 	// startMu serializes scope bring-up so two concurrent Starts open one
-	// subscription instead of two. It is held across Store.Subscribe and never
-	// together with a scope's own lock.
+	// subscription instead of two. It is held across Store.Subscribe and,
+	// inside that, across the scope's own lock while the unsubscribe handle is
+	// stored — that nesting is what settles the race with Close over the
+	// handle. It is never acquired while a scope lock is already held, so the
+	// order is one-way and cannot deadlock against it.
 	startMu sync.Mutex
 
 	// closed refuses new scopes, publications and subscriptions from the

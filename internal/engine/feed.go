@@ -7,6 +7,7 @@ import (
 
 	"github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
+	"github.com/LerianStudio/lib-observability/v4/runtime"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -137,7 +138,17 @@ func (e *Engine) onEvent(evt store.Event) {
 // door beginWork checks is the same one dispatch workers pass, so a re-read
 // that loses the race to Close is dropped whole rather than reaching a store
 // the Client is about to close.
+//
+// These re-reads run concurrently, one goroutine per key whose quiet window
+// closed, and their number is bounded by the registered keys of the tracked
+// scopes: the feed drops a notification for an unregistered key before it ever
+// reaches the debouncer, and the debouncer holds at most one timer per (scope,
+// key). There is no semaphore, so a consumer sizing its *sql.DB pool should
+// read that product — registered keys times tracked scopes — as the engine's
+// worst-case simultaneous demand on the store.
 func (e *Engine) trackedRefresh(scope store.Scope, nk NSKey) {
+	defer e.recoverRefresh(scope, nk)
+
 	if !e.beginWork() {
 		return
 	}
@@ -145,6 +156,39 @@ func (e *Engine) trackedRefresh(scope store.Scope, nk NSKey) {
 	defer e.dispatchWG.Done()
 
 	e.refreshKey(scope, nk)
+}
+
+// recoverRefresh reports a panic raised under a debounced re-read, naming the
+// key it happened on.
+//
+// The debouncer's own guard would catch it, and that is what this replaces at
+// the top of the stack rather than duplicates: runtime.RecoverAndLog logs
+// source="debounce" and nothing else, and in production mode the value and the
+// stack are redacted out of that line, so an operator learns something under
+// the debouncer blew up and never which tenant, namespace or key. The
+// debouncer's guard stays the outer net — including for a consumer logger that
+// panics on the line below.
+//
+// HandlePanicValue rather than a re-panic into that net because only it
+// records panic_recovered_total and the span event: RecoverAndLog takes no
+// context and records neither. The recovered value stays out of the identity
+// line — it is whatever the panicking code was holding, and redacting it
+// belongs with the handler.
+func (e *Engine) recoverRefresh(scope store.Scope, nk NSKey) {
+	recovered := recover()
+	if recovered == nil {
+		return
+	}
+
+	ctx := e.dispatchContext()
+
+	e.logError(ctx, "systemplane.engine: debounced re-read panicked",
+		log.String(constants.AttrKeyTenantID, scope.Tenant),
+		log.String("namespace", nk.Namespace),
+		log.String("keyname", nk.Key),
+	)
+
+	runtime.HandlePanicValue(ctx, e.logger, recovered, "systemplane.engine", "refresh")
 }
 
 // scopeForEvent resolves the scope a changefeed event, a reconcile or a
@@ -333,4 +377,14 @@ func (e *Engine) logDebug(ctx context.Context, msg string, fields ...log.Field) 
 	}
 
 	e.logger.Log(ctx, log.LevelDebug, msg, fields)
+}
+
+// logError reports something an operator has to act on — a panic raised under
+// engine work. A nil logger is a no-op, like logWarn.
+func (e *Engine) logError(ctx context.Context, msg string, fields ...log.Field) {
+	if e.logger == nil {
+		return
+	}
+
+	e.logger.Log(ctx, log.LevelError, msg, fields)
 }
