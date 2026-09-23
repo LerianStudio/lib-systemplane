@@ -78,6 +78,11 @@ func (e *Engine) onEvent(evt store.Event) {
 	// keys, so answering a foreign upsert cost a debounce timer, a goroutine
 	// Close waits for and a pooled connection, per foreign write.
 	//
+	// The trade that bought those back is the drop line itself: it used to sit
+	// behind the debouncer's quiet window, so a chatty foreign writer reported
+	// one line per window and now reports one per write — which is why the
+	// fields below are built only when DEBUG is actually enabled.
+	//
 	// The registry is final by the time any event can arrive: Register after
 	// Start returns ErrRegisterAfterStart, and Start opens the changefeed only
 	// after that door has shut. Outcomes are unchanged — prepare rejects the
@@ -85,11 +90,13 @@ func (e *Engine) onEvent(evt store.Event) {
 	// path, and a nil registry still reports nothing registered, so it rejects
 	// everything exactly as before.
 	if _, registered := e.lookup(nk.Namespace, nk.Key); !registered {
-		e.logDebug(e.dispatchContext(), "changefeed event for unregistered key, skipping",
-			log.String(constants.AttrKeyTenantID, evt.Scope.Tenant),
-			log.String("namespace", nk.Namespace),
-			log.String("keyname", nk.Key),
-		)
+		if e.debugEnabled() {
+			e.logDebug(e.dispatchContext(), "changefeed event for unregistered key, skipping",
+				log.String(constants.AttrKeyTenantID, evt.Scope.Tenant),
+				log.String("namespace", nk.Namespace),
+				log.String("keyname", nk.Key),
+			)
+		}
 
 		return
 	}
@@ -227,11 +234,13 @@ func (e *Engine) scopeForEvent(scope store.Scope, nk NSKey) *scopeState {
 		return sc
 	}
 
-	e.logDebug(e.dispatchContext(), "changefeed work for an untracked scope, dropping",
-		log.String(constants.AttrKeyTenantID, scope.Tenant),
-		log.String("namespace", nk.Namespace),
-		log.String("keyname", nk.Key),
-	)
+	if e.debugEnabled() {
+		e.logDebug(e.dispatchContext(), "changefeed work for an untracked scope, dropping",
+			log.String(constants.AttrKeyTenantID, scope.Tenant),
+			log.String("namespace", nk.Namespace),
+			log.String("keyname", nk.Key),
+		)
+	}
 
 	return nil
 }
@@ -392,6 +401,18 @@ func (e *Engine) recordFeedOutcome(scope store.Scope, nk NSKey, usable bool) {
 // it is unaffected and stays at WARN.
 func (e *Engine) canceledByShutdown(err error) bool {
 	return errors.Is(err, context.Canceled) && e.dispatchContext().Err() != nil
+}
+
+// debugEnabled reports whether a DEBUG line would survive the logger's level,
+// so a caller can skip building its fields.
+//
+// The guard belongs at the call site, not inside logDebug: the []log.Field is
+// built by the variadic before the call, and boxed into the ...any Logger.Log
+// takes, so by the time logDebug could check anything the cost is already
+// paid. It is worth the noise only on the lines the changefeed emits per
+// event — everywhere else the line runs once per failure, not per write.
+func (e *Engine) debugEnabled() bool {
+	return e.logger != nil && e.logger.Enabled(log.LevelDebug)
 }
 
 // logDebug reports something that is expected rather than wrong — a re-read

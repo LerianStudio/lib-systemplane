@@ -69,8 +69,21 @@ func (r logRecord) String() string {
 type recordingLogger struct {
 	log.Logger
 
+	// debugOff makes the recorder report DEBUG as disabled, the way a
+	// production logger configured at INFO does. The zero value reports every
+	// level enabled, because a recorder that claimed otherwise would make the
+	// engine skip the very lines these tests read.
+	debugOff bool
+
 	mu      sync.Mutex
 	records []logRecord
+}
+
+// Enabled overrides the embedded no-op logger, which reports every level
+// disabled. A caller that asks before building its fields would then never
+// emit anything into this recorder.
+func (r *recordingLogger) Enabled(level int) bool {
+	return !r.debugOff || level != log.LevelDebug
 }
 
 func (r *recordingLogger) Log(ctx context.Context, level int, msg string, fields ...any) {
@@ -164,6 +177,15 @@ func loggingEngine(t *testing.T, defs map[NSKey]KeyDef, fs *fakeStore) (*Engine,
 	t.Helper()
 
 	rec := &recordingLogger{Logger: log.NewNop()}
+
+	return loggingEngineWith(t, defs, fs, rec), rec
+}
+
+// loggingEngineWith is loggingEngine over a recorder the caller configured —
+// the one knob being whether it reports DEBUG enabled.
+func loggingEngineWith(t *testing.T, defs map[NSKey]KeyDef, fs *fakeStore, rec *recordingLogger) *Engine {
+	t.Helper()
+
 	e := New(Config{Store: fs, Registry: fakeRegistry{defs: defs}, Logger: rec})
 
 	track(t, e, store.Scope{})
@@ -174,7 +196,7 @@ func loggingEngine(t *testing.T, defs map[NSKey]KeyDef, fs *fakeStore) (*Engine,
 		}
 	})
 
-	return e, rec
+	return e
 }
 
 // TestUnregisteredKeyIsLoggedAtDebug pins the one rejection that is ordinary
@@ -953,4 +975,53 @@ func findLogged(r *recordingLogger, msg string) logRecord {
 	}
 
 	return logRecord{}
+}
+
+// TestPerEventDropLinesCostNothingWhenDebugIsOff pins the guard on the two
+// drop lines that run on the changefeed goroutine for traffic this process
+// does not own.
+//
+// `systemplane_entries` is one table per database, so every foreign write by
+// any other consumer reaches this feed, and a dropped tenant's subscription
+// keeps delivering until it is released. Both lines are DEBUG — off in every
+// production deployment — yet the fields are built at the call site, so
+// without the guard each of those events still costs a three-element
+// []log.Field and its boxing before the logger throws the line away.
+func TestPerEventDropLinesCostNothingWhenDebugIsOff(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+
+	tests := []struct {
+		name  string
+		defs  map[NSKey]KeyDef
+		drive func(e *Engine)
+	}{
+		{
+			name: "an event for a key another consumer owns",
+			defs: map[NSKey]KeyDef{},
+			drive: func(e *Engine) {
+				e.onEvent(upsertEvent(store.Scope{}, nk, 1))
+			},
+		},
+		{
+			name: "a notification that outlived its scope",
+			defs: map[NSKey]KeyDef{nk: {Default: "fallback"}},
+			drive: func(e *Engine) {
+				e.dropScope(store.Scope{})
+				e.onEvent(upsertEvent(store.Scope{}, nk, 1))
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := &recordingLogger{Logger: log.NewNop(), debugOff: true}
+			e := loggingEngineWith(t, tt.defs, newFakeStore(), rec)
+
+			tt.drive(e)
+
+			if got := rec.all(); len(got) != 0 {
+				t.Errorf("logger with DEBUG off received %d entries, want 0: %v", len(got), got)
+			}
+		})
+	}
 }
