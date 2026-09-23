@@ -245,10 +245,14 @@ func TestIntegration_MongoDBPolling(t *testing.T) {
 // — the alternative, reaching the live *mongo.ChangeStream, would mean
 // exposing it from the store purely for a test.
 //
-// A killed cursor surfaces to the reader as CursorKilled or CursorNotFound.
-// Neither carries the ResumableChangeStreamError label, so the driver does not
-// resume it behind the feed's back and the outage is narrated rather than
-// swallowed.
+// The design depends on the kill landing on a getMore in flight: the reader
+// then gets CursorKilled (237) from the interrupted getMore, which the driver
+// does not resume, so the outage is narrated rather than swallowed. A cursor
+// killed while idle between getMores is different: the next getMore finds it
+// gone with CursorNotFound (43), which the driver treats as resumable whatever
+// the error labels say, resumes silently, and the feed announces nothing.
+// awaitSingleChangeStreamCursor therefore only ever returns a cursor with a
+// getMore in flight.
 //
 // dbName is read through a pointer rather than captured by value because the
 // hook runs inside a sub-test, against whichever database that sub-test's own
@@ -278,37 +282,39 @@ func killChangeStreamCursor(client *mongo.Client, dbName *string) func(*testing.
 	}
 }
 
-// awaitSingleChangeStreamCursor polls the server until exactly one cursor is
-// open on the feed's collection and returns its id.
+// awaitSingleChangeStreamCursor polls the server until exactly one cursor on
+// the feed's collection has a getMore in flight and returns its id.
 //
 // Polling rather than a single look: between two getMore round-trips the feed's
-// cursor is idle and between a List and its exhaustion a second cursor exists,
-// so a single sample can legitimately see zero or two. Exactly one is the state
-// the kill is meaningful in, and it is the steady state of a subscribed feed.
+// cursor is idle and absent from the census, and between a List and its
+// exhaustion a second cursor exists, so a single sample can legitimately see
+// zero or two. Exactly one in-flight getMore is the state the kill is
+// meaningful in (see killChangeStreamCursor), and it is the steady state of a
+// subscribed feed, whose awaitData getMore blocks server-side most of the time.
 func awaitSingleChangeStreamCursor(t *testing.T, client *mongo.Client, dbName string) int64 {
 	t.Helper()
 
 	deadline := time.Now().Add(30 * time.Second)
 
 	for {
-		ids := openCursorIDs(t, client, dbName)
+		ids := inFlightGetMoreCursorIDs(t, client, dbName)
 		if len(ids) == 1 {
 			return ids[0]
 		}
 
 		if time.Now().After(deadline) {
-			t.Fatalf("waiting for exactly one open cursor on %s.%s: found %v", dbName, changefeedCollection, ids)
+			t.Fatalf("waiting for exactly one in-flight getMore on %s.%s: found cursors %v", dbName, changefeedCollection, ids)
 		}
 
 		time.Sleep(50 * time.Millisecond)
 	}
 }
 
-// openCursorIDs asks the server which cursors are open on the feed's
-// collection. An awaitData getMore in flight is reported as a running
-// operation and a cursor between getMores as an idle cursor; both carry the
-// cursor id, which is why idleCursors is on.
-func openCursorIDs(t *testing.T, client *mongo.Client, dbName string) []int64 {
+// inFlightGetMoreCursorIDs asks the server which cursors on the feed's
+// collection have a getMore running right now. Idle cursors are left out on
+// purpose (idleCursors stays off, and the match pins type "op" and op
+// "getmore"): killing one of those is resumed silently by the driver.
+func inFlightGetMoreCursorIDs(t *testing.T, client *mongo.Client, dbName string) []int64 {
 	t.Helper()
 
 	ctx := context.Background()
@@ -316,11 +322,15 @@ func openCursorIDs(t *testing.T, client *mongo.Client, dbName string) []int64 {
 	cur, err := client.Database("admin").Aggregate(ctx, mongo.Pipeline{
 		bson.D{{Key: "$currentOp", Value: bson.D{
 			{Key: "allUsers", Value: true},
-			{Key: "idleCursors", Value: true},
 		}}},
 		bson.D{{Key: "$match", Value: bson.D{
 			{Key: "ns", Value: dbName + "." + changefeedCollection},
+			{Key: "type", Value: "op"},
+			{Key: "op", Value: "getmore"},
 			{Key: "cursor.cursorId", Value: bson.D{{Key: "$exists", Value: true}}},
+		}}},
+		bson.D{{Key: "$project", Value: bson.D{
+			{Key: "cursor.cursorId", Value: 1},
 		}}},
 	})
 	if err != nil {
@@ -2069,14 +2079,16 @@ func TestIntegration_MongoDeleteThenRecreateConvergesToLiveValue(t *testing.T) {
 // tcpProxy forwards a local port to the container's MongoDB port so a test can
 // sever the store's connection and restore it on the same address.
 //
-// This is how an outage is produced deterministically. killCursors would also
-// work — a CursorKilled carries no ResumableChangeStreamError label, so the
-// driver does not resume it transparently — but obtaining the live cursor id
-// means exposing the feed's *mongo.ChangeStream from production code purely for
-// a test. Dropping the container is worse: a plain network error IS resumable,
-// the driver resumes it internally, and a short outage would announce nothing
-// at all. The same hazard applies here, which is why the store's client is
-// built with a 2s server-selection bound and every outage below outlasts it.
+// The proxy exists because it produces a sustained, restorable outage: the
+// address stays dead for as long as a test wants, longer than the store
+// client's 2s server-selection bound, so every reopen attempt fails until the
+// test restores it. TestIntegration_MongoRepeatedReopenFailuresEmitOneDisconnect
+// needs exactly that. A one-shot severance cannot provide it; that is what
+// killChangeStreamCursor does for the contract suite's Reconnect hook, and the
+// feed reopens at once behind it. Dropping the container instead is worse: a
+// plain network error IS resumable, the driver resumes it internally, and a
+// short outage would announce nothing at all — which is why every outage below
+// outlasts the server-selection bound.
 type tcpProxy struct {
 	target string
 	addr   string
