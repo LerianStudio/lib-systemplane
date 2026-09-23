@@ -241,6 +241,8 @@ func (e *Engine) workerFor(sc *scopeState, nk NSKey) *dispatchWorker {
 // dropped, dropping whatever is still pending: a Change nobody has started
 // delivering is not worth holding shutdown for, and one addressed to a scope
 // the engine no longer tracks has nowhere to go.
+// Either stop wins over a wake that is ready at the same moment, so no
+// callback starts once the scope's drop or Close has begun.
 //
 // The whole goroutine, not just the callback, runs under lib-observability's
 // recovery — a panic anywhere in the loop, cloning a pathological value say,
@@ -275,6 +277,25 @@ func (e *Engine) runWorker(ctx context.Context, wk workerKey, w *dispatchWorker)
 			// the re-activated scope's worker for the same key share wk, so
 			// clearing by wk would erase the other one's mark.
 			e.running.Store(w, mark)
+
+			// Re-checked after the wake, because select picks at random among
+			// ready cases: a worker coming back from a delivery can find its
+			// signal ready together with a stop and take the signal. Without
+			// this it would hand a dropped scope's Change to subscribers after
+			// dropScope returned, or start a callback after Close began. The
+			// mark stays up across the check so the window it closes above
+			// does not reopen here.
+			select {
+			case <-ctx.Done():
+				e.running.Delete(w)
+
+				return
+			case <-w.done:
+				e.running.Delete(w)
+
+				return
+			default:
+			}
 
 			if ch, ok := w.take(); ok {
 				e.deliver(ctx, wk.NSKey, ch)

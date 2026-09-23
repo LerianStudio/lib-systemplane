@@ -794,3 +794,90 @@ func TestUnsubscribeReleasesTheCallback(t *testing.T) {
 		}
 	}
 }
+
+// TestWorkerDeliversNothingOnceStopped pins the re-check a worker makes after
+// it wakes. Go's select picks at random among ready cases, so a worker that
+// comes back from a delivery to find BOTH its wake signal and a stop signal
+// ready — its scope dropped, or the engine closing — takes the wake about
+// half the time. Without the re-check it then hands a dropped scope's Change
+// to subscribers after dropScope returned, or starts a callback after Close
+// began.
+//
+// The worker is held inside a subscriber while the next Change is queued and
+// the stop is raised, because only a worker that is NOT parked on its select
+// can find both cases ready at once: a parked one is woken by whichever
+// arrives first. Repeated so the coin toss comes up "wake" on some run.
+func TestWorkerDeliversNothingOnceStopped(t *testing.T) {
+	stops := map[string]func(e *Engine, w *dispatchWorker){
+		"scope dropped":  func(_ *Engine, w *dispatchWorker) { w.stop() },
+		"engine closing": func(e *Engine, _ *dispatchWorker) { e.lifecycleCancel() },
+	}
+
+	for name, stop := range stops {
+		t.Run(name, func(t *testing.T) {
+			for range 200 {
+				workerStopRace(t, stop)
+
+				if t.Failed() {
+					return
+				}
+			}
+		})
+	}
+}
+
+func workerStopRace(t *testing.T, stop func(e *Engine, w *dispatchWorker)) {
+	t.Helper()
+
+	e := dispatchEngine(t)
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+
+	inside := make(chan struct{})
+	release := make(chan struct{})
+
+	var rec recorder
+
+	unsub := e.OnChange(nk, func(ctx context.Context, ch Change) {
+		rec.record(ctx, ch)
+
+		if ch.Revision == 1 {
+			close(inside)
+			<-release
+		}
+	})
+	defer unsub()
+
+	e.publishInto(pub(nk, 1, "v1"))
+	<-inside
+
+	w := scopeWorker(e, e.trackedScope(store.Scope{}), nk)
+	if w == nil {
+		close(release)
+		t.Fatal("no dispatch worker for the key a delivery is inside")
+	}
+
+	w.submit(Change{Namespace: nk.Namespace, Key: nk.Key, Revision: 2, Value: "v2"})
+	stop(e, w)
+	close(release)
+
+	exited := make(chan struct{})
+
+	go func() {
+		e.dispatchWG.Wait()
+		close(exited)
+	}()
+
+	select {
+	case <-exited:
+	case <-time.After(hangGuard):
+		t.Fatal("the stopped worker never exited")
+	}
+
+	if got := rec.revisions(); len(got) != 1 {
+		t.Errorf("revisions delivered: got %v, want [1] — the worker delivered after it was stopped", got)
+	}
+
+	if _, busy := e.running.Load(w); busy {
+		t.Error("the exited worker left its busy mark behind")
+	}
+}
