@@ -322,6 +322,65 @@ func TestGroupBindRejectsInvalidDefaults(t *testing.T) {
 	}
 }
 
+// groupOpaqueConfig carries an untyped field, so a caller can put a value in it
+// that JSON cannot represent at all.
+type groupOpaqueConfig struct {
+	Name  string `json:"name"`
+	Extra any    `json:"extra"`
+}
+
+// TestGroupRefusesADocumentThatCannotBeCanonicalized pins both places a group
+// canonicalizes a caller's Go value: Bind's defaults and every ingress write. A
+// value JSON cannot marshal has no document to persist or validate, so each is
+// refused as a validation failure instead of reaching the store.
+func TestGroupRefusesADocumentThatCannotBeCanonicalized(t *testing.T) {
+	t.Parallel()
+
+	t.Run("defaults", func(t *testing.T) {
+		t.Parallel()
+
+		c := newGroupClient(t)
+
+		g, err := systemplane.Bind(c, "runtime", "opaque", groupOpaqueConfig{Name: "ingest", Extra: make(chan int)}, nil)
+		if !errors.Is(err, systemplane.ErrValidation) {
+			t.Fatalf("Bind error = %v, want ErrValidation", err)
+		}
+
+		if g != nil {
+			t.Fatal("Bind returned a group despite defaults that cannot be canonicalized")
+		}
+
+		if c.IsRegistered("runtime", "opaque") {
+			t.Fatal("rejected Bind left the key registered")
+		}
+	})
+
+	t.Run("ingress", func(t *testing.T) {
+		t.Parallel()
+
+		s := newGroupMemoryStore()
+		c := newGroupClientOn(t, s)
+
+		if _, err := systemplane.Bind(c, "runtime", "opaque", groupOpaqueConfig{Name: "ingest"}, nil); err != nil {
+			t.Fatalf("Bind: %v", err)
+		}
+
+		ctx := context.Background()
+		if err := c.Start(ctx); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+
+		err := c.Set(ctx, "runtime", "opaque", groupOpaqueConfig{Name: "ingest", Extra: func() {}}, "actor")
+		if !errors.Is(err, systemplane.ErrValidation) {
+			t.Fatalf("Set of a value that cannot be canonicalized = %v, want ErrValidation", err)
+		}
+
+		if _, ok := s.stored("runtime", "opaque"); ok {
+			t.Fatal("a refused write reached the store")
+		}
+	})
+}
+
 func TestGroupBindRejectsAfterStart(t *testing.T) {
 	t.Parallel()
 

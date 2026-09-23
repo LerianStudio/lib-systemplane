@@ -362,6 +362,10 @@ func TestCoordinatorDeliversAfterASeedItCannotProveIdentical(t *testing.T) {
 			if names := rec.names(); len(names) != 2 {
 				t.Fatalf("deliveries = %v, want two: the seed, and the publication the watermark could not prove identical to it", names)
 			}
+
+			if st := statusOf(t, c, "t1"); st.Desired != 1 || st.Applied != 1 || st.LastErr != nil {
+				t.Errorf("Status() = %+v, want desired and applied 1 with no error", st)
+			}
 		})
 	}
 }

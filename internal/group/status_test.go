@@ -958,18 +958,25 @@ func TestCoordinatorAppliedIsTheOldestObservationNotTheLowestRevision(t *testing
 // true. Clearing there tells the next reader a group nobody applied is healthy,
 // and a crashed hook becomes indistinguishable from a successful one.
 func TestCoordinatorLastApplierRejectingAndLeavingKeepsTheRejection(t *testing.T) {
+	// A consumer that configured no logger is the common case in tests and the
+	// default in a service that has not wired observability yet. The panic
+	// handler serializes the recovered value through that logger, so a nil one
+	// has to be absorbed at the boundary: reaching the assertions is the proof
+	// that Publish returned instead of unwinding into the publisher.
 	cases := []struct {
-		name  string
-		apply func() error
-		want  error
+		name   string
+		logger log.Logger
+		apply  func() error
+		want   error
 	}{
-		{name: "returns an error", apply: func() error { return errRejected }, want: errRejected},
-		{name: "panics", apply: func() error { panic("boom") }, want: ErrApplyPanicked},
+		{name: "returns an error", logger: newRecordingLogger(), apply: func() error { return errRejected }, want: errRejected},
+		{name: "panics", logger: newRecordingLogger(), apply: func() error { panic("boom") }, want: ErrApplyPanicked},
+		{name: "panics with no logger configured", logger: nil, apply: func() error { panic("boom") }, want: ErrApplyPanicked},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			c := NewCoordinator[coordDoc](newRecordingLogger(), Decode[coordDoc], nil)
+			c := NewCoordinator[coordDoc](tc.logger, Decode[coordDoc], nil)
 
 			var (
 				unsubscribe func()
@@ -987,40 +994,12 @@ func TestCoordinatorLastApplierRejectingAndLeavingKeepsTheRejection(t *testing.T
 
 			got := statusOf(t, c, "t1")
 			if !errors.Is(got.LastErr, tc.want) {
-				t.Errorf("Status after the only applier rejected and left = %#v, want LastErr matching %v", got, tc.want)
+				t.Fatalf("Status after the only applier rejected and left = %#v, want LastErr matching %v", got, tc.want)
+			}
+
+			if strings.Contains(got.LastErr.Error(), "boom") {
+				t.Errorf("LastErr = %q, want the panic value kept out of it: a panicking hook is routinely holding the decoded document with its endpoints and credentials", got.LastErr)
 			}
 		})
 	}
-
-	// A consumer that configured no logger is the common case in tests and the
-	// default in a service that has not wired observability yet. The panic
-	// handler serializes the recovered value through that logger, so a nil one
-	// has to be absorbed at the boundary: reaching the assertions below is the
-	// proof that Publish returned instead of unwinding into the publisher.
-	t.Run("panics with no logger configured", func(t *testing.T) {
-		c := newCoordinator(t)
-
-		var (
-			unsubscribe func()
-			once        sync.Once
-		)
-
-		unsubscribe = mustRegister(t, c, func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
-			once.Do(unsubscribe)
-
-			panic("boom")
-		})
-		defer unsubscribe()
-
-		c.Publish(context.Background(), publication("t1", 4, "four"))
-
-		got := statusOf(t, c, "t1")
-		if !errors.Is(got.LastErr, ErrApplyPanicked) {
-			t.Fatalf("Status after the only applier panicked and left = %#v, want LastErr matching ErrApplyPanicked", got)
-		}
-
-		if strings.Contains(got.LastErr.Error(), "boom") {
-			t.Errorf("LastErr = %q, want the panic value kept out of it: a panicking hook is routinely holding the decoded document with its endpoints and credentials", got.LastErr)
-		}
-	})
 }

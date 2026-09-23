@@ -619,6 +619,10 @@ func TestCoordinatorRegisterFromInsideAnApplierIsDeliveredAfterIt(t *testing.T) 
 		if duringDelivery[0].Applied != 0 {
 			t.Errorf("Applied during the delivery = %d, want 0: the applier registered a moment earlier has never been offered this scope, so revision 1 is not in force everywhere", duringDelivery[0].Applied)
 		}
+
+		if got := statusOf(t, c, "t1"); got.Desired != 2 || got.Applied != 2 || got.LastErr != nil {
+			t.Errorf("Status after the fan-out drained = %+v, want Desired 2 Applied 2 and no error: the deferred registration must be offered and recorded on the drain's next iteration", got)
+		}
 	})
 }
 
