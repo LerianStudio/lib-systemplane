@@ -190,6 +190,13 @@ func TestSubscribe_NilCtx_NoPanicNoObserver(t *testing.T) {
 	waitForObserverExit(t)
 }
 
+// seamRunner adapts the store's schemaRunner test seam to the run closure
+// ensureSchemaByKey requires. The seam lives in ensureSchema alone, so a test
+// driving the memo core directly supplies its own runner.
+func seamRunner(s *Store, cacheKey string) func(context.Context) error {
+	return func(ctx context.Context) error { return s.schemaRunner(ctx, cacheKey) }
+}
+
 // A4 follow-up — runSchema must retry after a transient failure. The first
 // invocation returns an error; the second must NOT see the cached failure and
 // must run runSchema again to success. This test drives ensureSchemaByKey
@@ -231,7 +238,7 @@ func TestEnsureSchema_TransientFailureRetries(t *testing.T) {
 	failNow = true
 	mu.Unlock()
 
-	if err := s.ensureSchemaByKey(context.Background(), cacheKey, nil); err == nil {
+	if err := s.ensureSchemaByKey(context.Background(), cacheKey, seamRunner(s, cacheKey)); err == nil {
 		t.Fatal("first ensureSchemaByKey: expected error, got nil")
 	}
 
@@ -254,7 +261,7 @@ func TestEnsureSchema_TransientFailureRetries(t *testing.T) {
 	failNow = false
 	mu.Unlock()
 
-	if err := s.ensureSchemaByKey(context.Background(), cacheKey, nil); err != nil {
+	if err := s.ensureSchemaByKey(context.Background(), cacheKey, seamRunner(s, cacheKey)); err != nil {
 		t.Fatalf("second ensureSchemaByKey: %v", err)
 	}
 
@@ -335,7 +342,7 @@ func TestEnsureSchema_ConcurrentCallersObserveFailure(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 
-			results[idx] = s.ensureSchemaByKey(context.Background(), cacheKey, nil)
+			results[idx] = s.ensureSchemaByKey(context.Background(), cacheKey, seamRunner(s, cacheKey))
 		}(i)
 	}
 
@@ -374,7 +381,7 @@ func TestEnsureSchema_ConcurrentCallersObserveFailure(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 
-			results[idx] = s.ensureSchemaByKey(context.Background(), cacheKey, nil)
+			results[idx] = s.ensureSchemaByKey(context.Background(), cacheKey, seamRunner(s, cacheKey))
 		}(i)
 	}
 
@@ -1970,28 +1977,81 @@ func offlineCollection(t *testing.T, database string) *mongo.Collection {
 // bootstrapped and its collection never materialized. ensureSchema must re-run
 // the bootstrap instead.
 func TestEnsureSchema_CtxTenantWithoutIDSkipsMemo(t *testing.T) {
-	s := newSubscribeStore()
-
-	var calls int
-
-	s.schemaRunner = func(context.Context, string) error {
-		calls++
-
-		return nil
-	}
-
-	// Same database name, two different clusters — exactly the collision.
-	for _, coll := range []*mongo.Collection{
-		offlineCollection(t, "systemplane"),
-		offlineCollection(t, "systemplane"),
+	for _, tc := range []struct {
+		name   string
+		runErr error
+	}{
+		{name: "bootstrap succeeds"},
+		{name: "bootstrap fails", runErr: errors.New("create collection refused")},
 	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newSubscribeStore()
+
+			var keys []string
+
+			s.schemaRunner = func(_ context.Context, key string) error {
+				keys = append(keys, key)
+
+				return tc.runErr
+			}
+
+			// Same database name, two different clusters — exactly the
+			// collision. Both calls therefore arrive under ONE memo key, and
+			// running twice under one key is only possible because the memo
+			// is skipped. The unmemoized path must also propagate the
+			// bootstrap failure: swallowing it reports a tenant whose
+			// collection was never materialized as ready.
+			for _, coll := range []*mongo.Collection{
+				offlineCollection(t, "systemplane"),
+				offlineCollection(t, "systemplane"),
+			} {
+				if err := s.ensureSchema(context.Background(), "", coll, true); !errors.Is(err, tc.runErr) {
+					t.Fatalf("ensureSchema = %v, want %v", err, tc.runErr)
+				}
+			}
+
+			if len(keys) != 2 {
+				t.Fatalf("bootstrap ran %d times, want 2 (once per tenant database)", len(keys))
+			}
+
+			if keys[0] != keys[1] {
+				t.Fatalf("calls arrived under keys %q and %q; the collision this guards is one shared key", keys[0], keys[1])
+			}
+		})
+	}
+}
+
+// The unmemoized path pays a round trip on every read and write, so it says so
+// once — a line per call would be a line per request. One WARN per process,
+// naming what is missing and who normally supplies it.
+func TestEnsureSchema_CtxTenantWithoutIDWarnsOnce(t *testing.T) {
+	logger := &captureLogger{}
+
+	s := newSubscribeStore()
+	s.cfg.Logger = logger
+	s.schemaRunner = func(context.Context, string) error { return nil }
+
+	coll := offlineCollection(t, "systemplane")
+
+	for range 2 {
 		if err := s.ensureSchema(context.Background(), "", coll, true); err != nil {
 			t.Fatalf("ensureSchema: %v", err)
 		}
 	}
 
-	if calls != 2 {
-		t.Fatalf("bootstrap ran %d times, want 2 (once per tenant database)", calls)
+	logger.mu.Lock()
+	defer logger.mu.Unlock()
+
+	var warns int
+
+	for _, e := range logger.entries {
+		if e.level == log.LevelWarn && e.msg == warnSchemaWithoutTenantID {
+			warns++
+		}
+	}
+
+	if warns != 1 {
+		t.Fatalf("logged the no-tenant-id warning %d times, want exactly 1 per process", warns)
 	}
 }
 

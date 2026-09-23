@@ -139,6 +139,12 @@ type Store struct {
 	// construct a *mongo.Collection; we pass the cacheKey string instead.
 	schemaRunner func(ctx context.Context, cacheKey string) error
 
+	// noTenantIDWarn bounds warnSchemaWithoutTenantID to one line per process.
+	// The path it narrates is on every read and write, so a per-call line
+	// would be a line per request; the condition is a wiring mistake that is
+	// either there for the life of the process or not there at all.
+	noTenantIDWarn sync.Once
+
 	// feedsMu guards feeds, the changefeeds keyed by scope.Tenant ("" is the
 	// zero, single-tenant scope), and every feed's reference count: a feed's
 	// lifetime decision and its map slot change together, in one lock hold.
@@ -339,6 +345,13 @@ func schemaCacheKey(tenant string, coll *mongo.Collection) string {
 	return tenant + "/" + db.Name() + "/" + coll.Name()
 }
 
+// warnSchemaWithoutTenantID is emitted once per process, without fields: the
+// message is the whole signal, and the tenant it would name is precisely what
+// is missing.
+const warnSchemaWithoutTenantID = "tenant-scoped collection arrived without a tenant id; " +
+	"re-running the collection bootstrap on every call because the memo key would be ambiguous. " +
+	"The tenant-manager middleware sets both context keys"
+
 // ensureSchema memoizes the per-database bootstrap. tenant names the scope the
 // collection was resolved for and is empty for the store's own database.
 // tenantScoped marks a collection that belongs to a tenant database — carried
@@ -354,8 +367,10 @@ func schemaCacheKey(tenant string, coll *mongo.Collection) string {
 // exists to prevent. Such a call re-runs the bootstrap instead. runSchema is
 // idempotent (CreateCollection treats NamespaceExists as success, CreateMany
 // is a no-op on existing indexes), so the cost is one extra round trip per
-// call on a path no shipped connector takes — the tenant-manager middleware
-// sets both keys.
+// call, two in polling mode — runSchema issues CreateCollection and, when
+// PollInterval > 0, an index CreateMany. No shipped connector takes this path
+// (the tenant-manager middleware sets both keys), so it warns once per process
+// rather than staying silent about what it is paying for.
 func (s *Store) ensureSchema(ctx context.Context, tenant string, coll *mongo.Collection, tenantScoped bool) error {
 	cacheKey := schemaCacheKey(tenant, coll)
 
@@ -369,6 +384,8 @@ func (s *Store) ensureSchema(ctx context.Context, tenant string, coll *mongo.Col
 	}
 
 	if tenantScoped && tenant == "" {
+		s.noTenantIDWarn.Do(func() { s.logWarn(ctx, warnSchemaWithoutTenantID) })
+
 		return run(ctx)
 	}
 
@@ -376,14 +393,12 @@ func (s *Store) ensureSchema(ctx context.Context, tenant string, coll *mongo.Col
 }
 
 // ensureSchemaByKey is the testable core of ensureSchema. It accepts a stable
-// cache key plus a runner closure so tests can drive the once/err cache via a
-// stubbed runSchema without standing up a real *mongo.Collection.
+// cache key plus a runner closure so tests can drive the once/err cache
+// without standing up a real *mongo.Collection. run MUST be non-nil: the
+// schemaRunner test seam is consulted by ensureSchema's run closure alone, so
+// that a nil runner is a compile-time-visible caller mistake here rather than
+// a nil-func panic inside once.Do.
 func (s *Store) ensureSchemaByKey(ctx context.Context, cacheKey string, run func(context.Context) error) error {
-	if s.schemaRunner != nil {
-		// Test seam — replace the runner entirely.
-		run = func(ctx context.Context) error { return s.schemaRunner(ctx, cacheKey) }
-	}
-
 	// Load first: a bootstrapped database keeps its once entry, so the Load
 	// allocates nothing; only the first caller for a key, and a retry after a
 	// failure, reaches LoadOrStore. Composing cacheKey upstream does allocate,
