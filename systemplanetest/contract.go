@@ -307,6 +307,13 @@ func runUpsert(t *testing.T, s store.Store, opts RunOptions) {
 	}
 }
 
+// The single namespace and key the value-ownership case works with. At file
+// scope so its two read helpers below need no constant parameters.
+const (
+	ownedNS  = "ns"
+	ownedKey = "owned"
+)
+
 // runValueOwnership pins store.Entry.Value ownership: the slice a backend
 // returns is the caller's from that moment on. The engine keeps it in its
 // snapshots and in the changes it publishes and reads it much later, so a
@@ -320,27 +327,22 @@ func runValueOwnership(t *testing.T, s store.Store, opts RunOptions) {
 
 	ctx := context.Background()
 
-	const (
-		ns  = "ns"
-		key = "owned"
-	)
-
-	first := entry(ns, key, "first")
+	first := entry(ownedNS, ownedKey, "first")
 	wantFirst := bytes.Clone(first.Value)
 
 	setEntry(ctx, t, s, opts.Scope, first)
 
 	// Held, untouched, until the end of the case.
-	kept := getValue(ctx, t, s, opts.Scope, ns, key)
+	kept := getValue(ctx, t, s, opts.Scope)
 	if !bytes.Equal(kept, wantFirst) {
 		t.Fatalf("get value = %q, want %q", kept, wantFirst)
 	}
 
 	// Writing through a returned slice reaches neither the stored value nor
 	// any slice another read handed out.
-	scribble(getValue(ctx, t, s, opts.Scope, ns, key))
+	scribble(getValue(ctx, t, s, opts.Scope))
 
-	if got := getValue(ctx, t, s, opts.Scope, ns, key); !bytes.Equal(got, wantFirst) {
+	if got := getValue(ctx, t, s, opts.Scope); !bytes.Equal(got, wantFirst) {
 		t.Errorf("mutating the slice Get returned changed the stored value: %q, want %q", got, wantFirst)
 	}
 
@@ -348,7 +350,7 @@ func runValueOwnership(t *testing.T, s store.Store, opts RunOptions) {
 		t.Errorf("mutating one Get result changed a slice an earlier Get returned: %q, want %q", kept, wantFirst)
 	}
 
-	second := entry(ns, key, "second")
+	second := entry(ownedNS, ownedKey, "second")
 	wantSecond := bytes.Clone(second.Value)
 
 	setEntry(ctx, t, s, opts.Scope, second)
@@ -358,18 +360,34 @@ func runValueOwnership(t *testing.T, s store.Store, opts RunOptions) {
 	}
 
 	// List hands out the same ownership.
-	keptFromList := listedValue(ctx, t, s, opts.Scope, ns, key)
+	keptFromList := listedValue(ctx, t, s, opts.Scope)
 	if !bytes.Equal(keptFromList, wantSecond) {
 		t.Fatalf("listed value = %q, want %q", keptFromList, wantSecond)
 	}
 
-	scribble(listedValue(ctx, t, s, opts.Scope, ns, key))
+	scribble(listedValue(ctx, t, s, opts.Scope))
 
-	if got := listedValue(ctx, t, s, opts.Scope, ns, key); !bytes.Equal(got, wantSecond) {
+	if got := listedValue(ctx, t, s, opts.Scope); !bytes.Equal(got, wantSecond) {
 		t.Errorf("mutating the slice List returned changed the stored value: %q, want %q", got, wantSecond)
 	}
 
-	setEntry(ctx, t, s, opts.Scope, entry(ns, key, "third"))
+	third := entry(ownedNS, ownedKey, "third")
+	wantThird := bytes.Clone(third.Value)
+
+	setEntry(ctx, t, s, opts.Scope, third)
+
+	// Read both ways again AFTER the last write, or the case has no teeth
+	// against the commonest aliasing shape: a backend that reuses one buffer
+	// PER OPERATION (sql.RawBytes, pgx RawValues) refills every slice still
+	// held with the very value the closing assertions compare it against, so
+	// the aliasing stays invisible. These two reads move that buffer on.
+	if got := getValue(ctx, t, s, opts.Scope); !bytes.Equal(got, wantThird) {
+		t.Errorf("get after the last set = %q, want %q", got, wantThird)
+	}
+
+	if got := listedValue(ctx, t, s, opts.Scope); !bytes.Equal(got, wantThird) {
+		t.Errorf("list after the last set = %q, want %q", got, wantThird)
+	}
 
 	if !bytes.Equal(keptFromList, wantSecond) {
 		t.Errorf("a slice retained from List changed after later reads and a Set: %q, want %q", keptFromList, wantSecond)
@@ -389,24 +407,24 @@ func scribble(b []byte) {
 	}
 }
 
-// getValue returns the value Get reports for ns/key.
-func getValue(ctx context.Context, t *testing.T, s store.Store, scope store.Scope, ns, key string) []byte {
+// getValue returns the value Get reports for the value-ownership case's key.
+func getValue(ctx context.Context, t *testing.T, s store.Store, scope store.Scope) []byte {
 	t.Helper()
 
-	e, found, err := s.Get(ctx, scope, ns, key)
+	e, found, err := s.Get(ctx, scope, ownedNS, ownedKey)
 	if err != nil {
-		t.Fatalf("get %s/%s: %v", ns, key, err)
+		t.Fatalf("get %s/%s: %v", ownedNS, ownedKey, err)
 	}
 
 	if !found {
-		t.Fatalf("get %s/%s: not found", ns, key)
+		t.Fatalf("get %s/%s: not found", ownedNS, ownedKey)
 	}
 
 	return e.Value
 }
 
-// listedValue returns the value List reports for ns/key.
-func listedValue(ctx context.Context, t *testing.T, s store.Store, scope store.Scope, ns, key string) []byte {
+// listedValue returns the value List reports for the value-ownership case's key.
+func listedValue(ctx context.Context, t *testing.T, s store.Store, scope store.Scope) []byte {
 	t.Helper()
 
 	entries, err := s.List(ctx, scope)
@@ -414,9 +432,9 @@ func listedValue(ctx context.Context, t *testing.T, s store.Store, scope store.S
 		t.Fatalf("list: %v", err)
 	}
 
-	e, ok := findEntry(entries, ns, key)
+	e, ok := findEntry(entries, ownedNS, ownedKey)
 	if !ok {
-		t.Fatalf("list: %s/%s missing", ns, key)
+		t.Fatalf("list: %s/%s missing", ownedNS, ownedKey)
 	}
 
 	return e.Value
