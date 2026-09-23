@@ -16,6 +16,8 @@ package postgres
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"sync"
 	"testing"
 
@@ -68,11 +70,21 @@ func startSharedContainer() {
 	if err != nil {
 		sharedContainerErr = err
 
-		_ = testcontainers.TerminateContainer(container)
+		terminateContainer(container, "after a failed connection-string read")
 
 		return
 	}
 
 	sharedContainerDSN = dsn
-	terminateSharedContainer = func() { _ = testcontainers.TerminateContainer(container) }
+	terminateSharedContainer = func() { terminateContainer(container, "after the last test") }
+}
+
+// terminateContainer stops the server and says so on stderr when it cannot.
+// A container we failed to stop outlives the run and keeps its port and its
+// disk, and a discarded error makes that leak look exactly like a clean
+// teardown — the suite stays green while Docker fills up.
+func terminateContainer(container testcontainers.Container, when string) {
+	if err := testcontainers.TerminateContainer(container); err != nil {
+		fmt.Fprintf(os.Stderr, "systemplane/postgres: shared container not terminated (%s): %v\n", when, err)
+	}
 }

@@ -2232,15 +2232,30 @@ func TestIntegration_PostgresTwoTenantsOnOneDatabase(t *testing.T) {
 		t.Fatalf("subscribe t2 error = %v, want postgres.ErrSharedDatabaseUnsupported", err)
 	}
 
+	// The refused feed leaves nothing behind: t1 keeps its one backend. A
+	// refused connection is closed by the creator and reaped by Postgres
+	// asynchronously, so this waits for the count instead of sampling it once.
+	// It runs before the respelling case below, which may skip: the refusal
+	// above is proven in every environment and its assertions must not ride on
+	// one that is not.
+	waitForListenBackends(t, admin, dbName, 1, "after the shared-database refusal")
+
 	// A third tenant on the same database, reached by a different SPELLING of
 	// the same host. Nothing forces two operators to type one connection
 	// string, and a key read off the DSN text calls "localhost" and
 	// "127.0.0.1" two databases and lets this feed through. The server reports
 	// one identity for both.
-	altDSN, ok := respellHost(tenantDSN)
-	if !ok {
-		t.Logf("container host in %q has no second spelling here; skipping the respelling case", tenantDSN)
-	} else {
+	//
+	// Its own subtest because it is the one case here that depends on the
+	// environment offering a second spelling that dials: a skip taken on the
+	// parent would discard every assertion above it, which is the whole proof
+	// of ErrSharedDatabaseUnsupported.
+	t.Run("host respelled", func(t *testing.T) {
+		altDSN, ok := respellHost(tenantDSN)
+		if !ok {
+			t.Skipf("container host in %q has no second spelling here", tenantDSN)
+		}
+
 		requireDialable(t, altDSN)
 
 		conn.set("t3", db, altDSN)
@@ -2254,12 +2269,7 @@ func TestIntegration_PostgresTwoTenantsOnOneDatabase(t *testing.T) {
 		if !errors.Is(err, postgres.ErrSharedDatabaseUnsupported) {
 			t.Fatalf("subscribe t3 error = %v, want postgres.ErrSharedDatabaseUnsupported", err)
 		}
-	}
-
-	// The refused feeds leave nothing behind: t1 keeps its one backend. A
-	// refused connection is closed by the creator and reaped by Postgres
-	// asynchronously, so this waits for the count instead of sampling it once.
-	waitForListenBackends(t, admin, dbName, 1, "after the shared-database refusal")
+	})
 }
 
 // respellHost returns dsn with its host swapped for another spelling of the
@@ -2288,7 +2298,10 @@ func respellHost(dsn string) (string, bool) {
 
 // requireDialable skips the caller when the alternate spelling cannot reach the
 // container at all — an environment fact (no IPv4 loopback publish, a resolver
-// that sends localhost to ::1), not something the store decides.
+// that sends localhost to ::1), not something the store decides. Pass the t of
+// the SUBTEST that needs the spelling, never a parent's: the skip is taken on
+// whatever t it is handed, and a parent's skip throws away every sibling
+// assertion with it.
 func requireDialable(t *testing.T, dsn string) {
 	t.Helper()
 

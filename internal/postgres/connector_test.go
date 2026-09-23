@@ -122,3 +122,73 @@ func TestNewTenantManagerConnector_WrapsSuppliedManager(t *testing.T) {
 		t.Fatal("connector must wrap the supplied tenant-manager Manager")
 	}
 }
+
+// TestFormatServerDatabaseKey pins the identity format serverDatabaseKey
+// produces once the server has answered, including the socket branch no
+// container test reaches: every test here connects over TCP, so the branch
+// that decides whether two feeds are one database would otherwise never run.
+func TestFormatServerDatabaseKey(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		database string
+		addr     string
+		port     int32
+		dsn      string
+		want     string
+		wantErr  bool
+	}{
+		{
+			name:     "tcp address reported by the server wins over the DSN text",
+			database: "app",
+			addr:     "10.0.0.5",
+			port:     5432,
+			dsn:      "postgres://an-alias.example:5432/app",
+			want:     "tcp:10.0.0.5:5432/app",
+		},
+		{
+			name:     "no address means a unix socket: the socket directory identifies it",
+			database: "app",
+			dsn:      "postgres:///app?host=/var/run/postgresql",
+			want:     "unix:/var/run/postgresql/app",
+		},
+		{
+			name:     "no address and an unparseable DSN is an error, never a bare key",
+			database: "app",
+			dsn:      "postgres://%zz/app",
+			wantErr:  true,
+		},
+		{
+			name:     "no address with a TCP DSN falls back to the DSN host",
+			database: "app",
+			dsn:      "postgres://localhost:5432/app?sslmode=disable",
+			want:     "unix:localhost/app",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := formatServerDatabaseKey(tc.database, tc.addr, tc.port, tc.dsn)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("formatServerDatabaseKey = %q, want an error", got)
+				}
+
+				if !strings.Contains(err.Error(), "parse DSN for socket identity") {
+					t.Fatalf("error %q must name the parse step it failed in", err)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("formatServerDatabaseKey: %v", err)
+			}
+
+			if got != tc.want {
+				t.Fatalf("formatServerDatabaseKey = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

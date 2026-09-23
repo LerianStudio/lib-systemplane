@@ -133,6 +133,17 @@ func serverDatabaseKey(ctx context.Context, conn *pgx.Conn, dsn string) (string,
 		return "", fmt.Errorf("server identity query: %w", err)
 	}
 
+	return formatServerDatabaseKey(database, addr, port, dsn)
+}
+
+// formatServerDatabaseKey turns what the server answered into the key
+// serverDatabaseKey compares, and holds every decision that comparison rests
+// on — see that function's comment for what the key does and does not tell
+// apart. Split out so those decisions are testable without a server: an
+// address the server reported keys as TCP; no address means a Unix socket, and
+// the socket directory the DSN names stands in for the address it cannot
+// report.
+func formatServerDatabaseKey(database, addr string, port int32, dsn string) (string, error) {
 	if addr != "" {
 		return fmt.Sprintf("tcp:%s:%d/%s", addr, port, database), nil
 	}
