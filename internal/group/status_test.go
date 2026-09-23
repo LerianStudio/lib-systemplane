@@ -5,6 +5,7 @@ package group
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -586,8 +587,21 @@ func TestCoordinatorDecodeFailureOnAFreshScopeIsObserved(t *testing.T) {
 	// it must record nothing either: per-applier bookkeeping is keyed by the
 	// scope, so keying it on the zero observation's payload invents an entry for
 	// a tenant that does not exist.
-	if applierHasStateFor(t, c, "") {
-		t.Error(`an applier keeps bookkeeping for tenant "", want none: the only scope is "t1" and nothing was ever delivered`)
+	if keys := applierScopeKeys(t, c); !slices.Equal(keys, []string{"t1"}) {
+		t.Errorf(`applier scope keys = %q, want ["t1"]: bookkeeping is keyed by the scope, never by a payload`, keys)
+	}
+
+	// A document that DOES decode now delivers, which is the write-back half of
+	// the same rule: an acceptance must land under the scope's own tenant and
+	// leave no second key behind.
+	c.Publish(context.Background(), publication("t1", 5, "good"))
+
+	if got := rec.names(); len(got) != 1 || got[0] != "good" {
+		t.Errorf("deliveries = %v, want the decodable document delivered once", got)
+	}
+
+	if keys := applierScopeKeys(t, c); !slices.Equal(keys, []string{"t1"}) {
+		t.Errorf(`applier scope keys after a delivery = %q, want ["t1"]`, keys)
 	}
 }
 

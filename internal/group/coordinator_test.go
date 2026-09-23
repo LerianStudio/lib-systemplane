@@ -5,6 +5,7 @@ package group
 import (
 	"context"
 	goruntime "runtime"
+	"slices"
 	"strconv"
 	"sync"
 	"testing"
@@ -655,24 +656,30 @@ func mustRegister(t *testing.T, c *Coordinator[coordDoc], fn ApplyFunc[coordDoc]
 	return unsubscribe
 }
 
-// applierHasStateFor reports whether any registered applier keeps bookkeeping
-// for the named scope. Per-applier state is keyed by the SCOPE, so a drain that
-// finds nothing to deliver — a scope observed through a document that never
-// decoded — must leave no entry at all, least of all one under the zero
-// observation's empty tenant.
-func applierHasStateFor(t *testing.T, c *Coordinator[coordDoc], tenant string) bool {
+// applierScopeKeys reports every scope key any registered applier keeps
+// bookkeeping under, sorted and deduplicated. Per-applier state is keyed by the
+// SCOPE on the way in and on the way out alike, so the only key that may ever
+// appear is the scope's own tenant — never the delivered payload's, which is
+// empty on the zero observation and would file a real scope under "".
+func applierScopeKeys(t *testing.T, c *Coordinator[coordDoc]) []string {
 	t.Helper()
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	var keys []string
+
 	for _, ap := range c.appliers {
-		if _, ok := ap.state[tenant]; ok {
-			return true
+		for tenant := range ap.state {
+			if !slices.Contains(keys, tenant) {
+				keys = append(keys, tenant)
+			}
 		}
 	}
 
-	return false
+	slices.Sort(keys)
+
+	return keys
 }
 
 // scopeObserved reports the scope's observed flag, which is what decides

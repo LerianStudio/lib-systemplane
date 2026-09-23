@@ -470,7 +470,7 @@ func (c *Coordinator[T]) remove(id uint64) {
 			continue
 		}
 
-		c.appliers = append(c.appliers[:i], c.appliers[i+1:]...)
+		c.appliers = slices.Delete(c.appliers, i, i+1)
 
 		// The applier that left may have been the one holding the scope back,
 		// and its rejection no longer describes anybody still registered.
@@ -804,11 +804,14 @@ func swallowPanic() {
 // acceptance moves that applier's accepted observation and applied revision and
 // becomes its next previous, while a rejection leaves all three untouched and is
 // recorded on the scope. Nothing is ever retried — the drain marked the
-// observation as offered before invoking. The caller holds the state mutex.
+// observation as offered before invoking. Bookkeeping is keyed by the SCOPE,
+// exactly as pendingLocked keyed it on the way in, so the pair of entries a
+// delivery touches can never split across two keys. The caller holds the state
+// mutex.
 func (c *Coordinator[T]) recordLocked(sc *scope[T], pending []delivery[T]) {
 	for i := range pending {
 		d := &pending[i]
-		st := d.ap.scopeState(d.current.Tenant)
+		st := d.ap.scopeState(sc.tenant)
 
 		if d.err != nil {
 			sc.lastErr = d.err

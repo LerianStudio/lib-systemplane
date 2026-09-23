@@ -5,6 +5,7 @@ package group
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -258,8 +259,21 @@ func TestCoordinatorSeedThatFailsToDecodeIsRecorded(t *testing.T) {
 		t.Errorf("deliveries to the second registration = %v, want none: nothing decodable was ever seeded", names)
 	}
 
-	if applierHasStateFor(t, c, "") {
-		t.Error(`an applier keeps bookkeeping for tenant "", want none: the only scope is "t1"`)
+	if keys := applierScopeKeys(t, c); !slices.Equal(keys, []string{"t1"}) {
+		t.Errorf(`applier scope keys = %q, want ["t1"]: bookkeeping is keyed by the scope, never by a payload`, keys)
+	}
+
+	// A document that DOES decode now delivers to both registrations, which is
+	// the write-back half of the same rule: an acceptance must land under the
+	// scope's own tenant and leave no second key behind.
+	c.Publish(context.Background(), publication("t1", 8, "good"))
+
+	if names := second.names(); len(names) != 1 || names[0] != "good" {
+		t.Errorf("deliveries to the second registration = %v, want the decodable document delivered once", names)
+	}
+
+	if keys := applierScopeKeys(t, c); !slices.Equal(keys, []string{"t1"}) {
+		t.Errorf(`applier scope keys after a delivery = %q, want ["t1"]`, keys)
 	}
 }
 
