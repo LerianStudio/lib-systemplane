@@ -39,10 +39,11 @@ type Snapshot[T any] struct {
 // already in the store: the client grades it while hydrating at Start, so a row
 // that entered the store without passing the registered validator never becomes
 // the group's document — the registered defaults stay in force and
-// [Group.Snapshot] returns them with no error. In multi-tenant mode there is no
-// hydration: a tenant row is read through on every Snapshot without being
-// re-validated, and one that entered the store without passing the registered
-// validator surfaces as a decode error at worst, not as a validated document.
+// [Group.Snapshot] returns them with no error. In multi-tenant mode no read path
+// re-validates a tenant row — not the direct tenant-store read, and not a bound
+// Manager's warm-load or NOTIFY cache — so a row that entered the store without
+// passing the registered validator surfaces as a decode error at worst, not as
+// a validated document.
 // Must be called before c.Start.
 //
 // The value registered is not defaults itself but its canonical JSON document:
@@ -151,7 +152,8 @@ func Bind[T any](c *Client, namespace, key string, defaults T, validate func(T) 
 // [ErrValidation] and a zero Value — never a half-filled T. In single-tenant
 // mode that path is unreachable: a document that fails to decode cannot pass
 // the group's ingress, which hydration runs over the stored row. It is reachable
-// in multi-tenant mode, where the tenant row is read through ungraded.
+// in multi-tenant mode, where every read path (the tenant store, or a bound
+// Manager's cache) returns the tenant row ungraded.
 //
 // A row holding a JSON null is refused the same way, unless the zero T is
 // itself nil — in which case the null IS the document and Snapshot returns that
@@ -181,8 +183,8 @@ func (g *Group[T]) Snapshot(ctx context.Context) (Snapshot[T], error) {
 	// it (an older binary, another writer, a hand-edited row), and Decode turns
 	// a null into the zero T by design (D-G2). Returning that would report a
 	// wholly blank configuration as the one in force. Single-tenant hydration
-	// refuses such a row before it reaches a reader; a multi-tenant read
-	// through to the tenant row arrives here.
+	// refuses such a row before it reaches a reader; any multi-tenant read
+	// path (tenant store or bound Manager cache) delivers it here ungraded.
 	if entry.Value == nil && !g.nullIsDocument {
 		var zero T
 

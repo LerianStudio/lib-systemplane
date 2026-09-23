@@ -185,11 +185,13 @@ func WithValidator(fn func(any) error) KeyOption {
 // the write — a tenant, a deadline, a trace — and consult another system with
 // it.
 //
-// Two callers invoke it today: [Client.Set], with the context of that write,
-// and [Client.Register], with context.Background(). A context validator must
-// therefore treat a context that lacks the scope it expects as "cannot verify"
-// and decide by its own policy — accept it, or refuse it with its own error —
-// rather than assume request scope is there to read.
+// Four callers invoke it today: [Client.Set], with the context of that write;
+// [Client.Register], with context.Background(); and, in single-tenant mode,
+// hydration at [Client.Start] and each changefeed refresh, with the contexts
+// described below. A context validator must therefore treat a context that
+// lacks the scope it expects as "cannot verify" and decide by its own policy —
+// accept it, or refuse it with its own error — rather than assume request scope
+// is there to read.
 //
 // The same function validates the registered default at [Client.Register]
 // time. Registering a default is not a write and carries no request scope, so
@@ -211,10 +213,11 @@ func WithValidator(fn func(any) error) KeyOption {
 // keeps the registered default (hydration) or the value already in force
 // (refresh), and logs a WARN carrying the error and never the value.
 //
-// Multi-tenant mode has neither hydration nor a changefeed: a tenant row is
-// read through on every [Client.Get] and returned as it was stored, ungraded.
-// A multi-tenant consumer that must not act on a value the write path would
-// refuse checks what it reads.
+// Multi-tenant reads are ungraded on every path: the direct tenant-store read
+// in [Client.Get] and [Client.List], and, when a Manager is bound, the
+// Manager's per-tenant warm-load and NOTIFY cache update that Get serves hits
+// from. None of them runs this function, so a multi-tenant consumer that must
+// not act on a value the write path would refuse checks what it reads.
 //
 // The context is the one passed to [Client.Start] on hydration, and a bounded
 // context derived from the client's lifecycle on a refresh. Neither is a
