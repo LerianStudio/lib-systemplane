@@ -457,7 +457,43 @@ func (c *Client) onEvent(evt store.Event) {
 	})
 }
 
+// recoverRefresh reports a panic raised under a changefeed re-read, naming the
+// key it happened on.
+//
+// The debouncer's guard catches the panic either way, and this is what that
+// guard cannot say: runtime.RecoverAndLog logs source="debounce" and nothing
+// else, and in production mode the recovered value and the stack are redacted
+// out of that line, so an operator learns something under the debouncer blew up
+// and never which namespace or key. internal/engine.(*Engine).recoverRefresh is
+// the same guard on the v4 path.
+//
+// HandlePanicValue rather than a re-panic into that net because only it records
+// panic_recovered_total and the span event: RecoverAndLog takes no context and
+// records neither, so recovering here counts the panic once instead of not at
+// all. The recovered value stays out of the identity line — it is whatever the
+// panicking code was holding, and redacting it belongs with the handler.
+func (c *Client) recoverRefresh(nk nskey) {
+	recovered := recover()
+	if recovered == nil {
+		return
+	}
+
+	ctx := c.lifecycleCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	c.logError(ctx, "systemplane: changefeed re-read panicked",
+		log.String("namespace", nk.Namespace),
+		log.String("keyname", nk.Key),
+	)
+
+	runtime.HandlePanicValue(ctx, c.logger, recovered, "systemplane.client", "refresh")
+}
+
 func (c *Client) refreshFromStore(nk nskey, op string) {
+	defer c.recoverRefresh(nk)
+
 	c.registryMu.RLock()
 	def, registered := c.registry[nk]
 	c.registryMu.RUnlock()

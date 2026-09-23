@@ -6,10 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"go/ast"
-	"go/parser"
-	"go/token"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +16,7 @@ import (
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/redaction"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/testsupport/logguard"
 )
 
 // logRecord is one entry the engine emitted. Args is kept raw so a test can
@@ -185,113 +182,11 @@ func requireNotRedacted(t *testing.T, rec logRecord) {
 	}
 }
 
-// logFieldConstructors are the log.Field constructors whose first argument is
-// the field NAME — the string an operator greps by and the string
-// lib-observability matches its sensitive list against. log.Err is absent
-// because it names no field.
-var logFieldConstructors = map[string]bool{
-	"String":   true,
-	"Any":      true,
-	"Int":      true,
-	"Int64":    true,
-	"Bool":     true,
-	"Duration": true,
-	"Float64":  true,
-	"Strings":  true,
-}
-
-// TestNoLoggedFieldNameIsRedacted reads the package's own source and refuses
-// any field name lib-observability erases.
-//
-// requireNotRedacted only sees the lines a test happens to drive, and this
-// package emits from a dozen sites the suite reaches unevenly. "key" is an
-// exact entry in the default sensitive-field list, so one log.String("key", …)
-// slipping back in publishes namespace=billing key=[REDACTED] to an operator
-// hunting a rejected row — a line that survives review because it reads
-// correctly in the source and is only wrong in production.
+// TestNoLoggedFieldNameIsRedacted reads this package's own source and refuses
+// any field name lib-observability erases. requireNotRedacted only sees the
+// lines a test happens to drive; this reaches every call site.
 func TestNoLoggedFieldNameIsRedacted(t *testing.T) {
-	names := loggedFieldNames(t)
-
-	if len(names) == 0 {
-		t.Fatal("no log field names found in this package: the scan matched nothing, so it proves nothing")
-	}
-
-	for name, pos := range names {
-		if redaction.IsSensitiveField(name) {
-			t.Errorf("%s: field name %q is on lib-observability's sensitive list, so the line "+
-				"reaches the operator with its value replaced by [REDACTED]", pos, name)
-		}
-	}
-}
-
-// loggedFieldNames parses every non-test file of the package under test — the
-// test binary runs with its package directory as cwd — and returns each
-// literal field name a log.Field constructor is called with, keyed by name so
-// the same name reported twice fails once. A name built from a constant or a
-// variable is skipped: it is not a literal this scan can read, and
-// constants.AttrKeyTenantID is the library's own and already checked there.
-func loggedFieldNames(t *testing.T) map[string]token.Position {
-	t.Helper()
-
-	sources, err := filepath.Glob("*.go")
-	if err != nil {
-		t.Fatalf("list package sources: %v", err)
-	}
-
-	fset := token.NewFileSet()
-	names := make(map[string]token.Position)
-
-	for _, source := range sources {
-		if strings.HasSuffix(source, "_test.go") {
-			continue
-		}
-
-		file, err := parser.ParseFile(fset, source, nil, 0)
-		if err != nil {
-			t.Fatalf("parse %s: %v", source, err)
-		}
-
-		ast.Inspect(file, func(n ast.Node) bool {
-			name, lit, ok := logFieldName(n)
-			if ok {
-				names[name] = fset.Position(lit.Pos())
-			}
-
-			return true
-		})
-	}
-
-	return names
-}
-
-// logFieldName reports the literal field name of a log.<Constructor>("name",
-// …) call, and false for every other node.
-func logFieldName(n ast.Node) (string, *ast.BasicLit, bool) {
-	call, ok := n.(*ast.CallExpr)
-	if !ok || len(call.Args) == 0 {
-		return "", nil, false
-	}
-
-	sel, ok := call.Fun.(*ast.SelectorExpr)
-	if !ok || !logFieldConstructors[sel.Sel.Name] {
-		return "", nil, false
-	}
-
-	if pkg, ok := sel.X.(*ast.Ident); !ok || pkg.Name != "log" {
-		return "", nil, false
-	}
-
-	lit, ok := call.Args[0].(*ast.BasicLit)
-	if !ok || lit.Kind != token.STRING {
-		return "", nil, false
-	}
-
-	name, err := strconv.Unquote(lit.Value)
-	if err != nil {
-		return "", nil, false
-	}
-
-	return name, lit, true
+	logguard.AssertNoneRedacted(t, ".")
 }
 
 // loggingEngine builds the engine the way the Client does — through New, with

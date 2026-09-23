@@ -170,10 +170,14 @@ func TestDebouncer_PanicInFnRecovered(t *testing.T) {
 		t.Fatal("debouncer broke after panic; second submit did not fire")
 	}
 
-	// The recovery component is a constant, never the key. Rendering the key
-	// into it costs a reflective Sprintf on every debounced invocation, panic
-	// or not, and gives one unbounded label value per key to a line whose
-	// stack trace already names the callback that blew up.
+	// The recovery component is a constant, never the key. Arguments to a
+	// deferred call are evaluated at defer time, so rendering the key into it
+	// would charge a Sprintf to every debounced invocation, panic or not.
+	// What that costs in identity, and who pays it back, is debounce.go:160-165:
+	// RecoverAndLog captures no context, so it records neither the panic metric
+	// nor a span event, and in production mode its line carries source and a
+	// redacted value and no stack at all. A caller whose submitted function
+	// must be identifiable recovers first and logs its own identity.
 	source, ok := rec.field("source")
 	if !ok {
 		t.Fatalf("panic recovery logged no source field: %v", rec.snapshot())
