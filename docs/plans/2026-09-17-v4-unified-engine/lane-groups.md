@@ -616,8 +616,10 @@ helper would, at error level, through the injected `log.Logger`, guarded by a ni
 **Unsubscribe** removes the applier from the slice AND from the per-scope bookkeeping, so it stops
 holding `Applied` down. Called from inside its own applier it must not deadlock: it takes the
 state mutex, which the drain does not hold across an invocation. Calling it twice is a no-op
-(`sync.Once`), and a delivery already in flight for that applier completes — the removal takes
-effect from the next drain iteration.
+(`sync.Once`). An invocation already running for that applier completes; an applier snapshotted
+into a running batch and unsubscribed before its turn is skipped, so the function is never started
+after its unsubscribe returned (amended 2026-09-23 from the PR #86 review). The seed runs before the
+applier is appended, so a seed that panics leaves nothing registered (same amendment).
 
 Named edge cases. An applier that panics on its FIRST delivery: `Applied` stays 0, `LastErr`
 non-nil, `previous` stays nil for its next delivery. An applier that rejects revision 5 and accepts

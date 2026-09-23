@@ -1100,3 +1100,77 @@ func TestCoordinatorReplayDoesNotRunUnderADeadPublisherContext(t *testing.T) {
 		t.Errorf("LastErr = %v, want nil: the replay was applied", got.LastErr)
 	}
 }
+
+// TestCoordinatorRegisterWhoseSeedPanicsRegistersNothing pins the ordering
+// inside add: the seed runs consumer code, and a panic there escapes Register
+// before the caller holds an unsubscribe, so an applier appended BEFORE the
+// seed would stay registered with no way to remove it and receive every later
+// delivery.
+func TestCoordinatorRegisterWhoseSeedPanicsRegistersNothing(t *testing.T) {
+	c := NewCoordinator[coordDoc](nil, constantDecode, func() (Publication, bool, error) {
+		panic("the seed read exploded")
+	})
+
+	var rec recorder
+
+	mustPanic(t, "Register whose seed read panics", func() { c.Register(rec.apply) })
+
+	c.mu.Lock()
+	registered := len(c.appliers)
+	c.mu.Unlock()
+
+	if registered != 0 {
+		t.Fatalf("appliers registered after the seed panicked = %d, want 0: the caller never received an unsubscribe for it", registered)
+	}
+
+	c.Publish(context.Background(), publication("", 1, "after"))
+
+	if got := rec.names(); len(got) != 0 {
+		t.Fatalf("deliveries to an applier whose registration panicked = %v, want none", got)
+	}
+}
+
+// TestCoordinatorUnsubscribeMidBatchSkipsTheApplierNotYetInvoked pins what a
+// returned unsubscribe promises: the function is not started again. A batch
+// is snapshotted under the state mutex and delivered without it, so a sibling
+// applier can unsubscribe another one between the snapshot and that one's
+// turn; the one that left must be skipped, and its absence must not be
+// recorded as a rejection or hold Applied back.
+func TestCoordinatorUnsubscribeMidBatchSkipsTheApplierNotYetInvoked(t *testing.T) {
+	c := newCoordinator(t)
+
+	var (
+		first, second recorder
+		unsubSecond   func()
+	)
+
+	firstApply := func(ctx context.Context, current Decoded[coordDoc], previous *Decoded[coordDoc]) error {
+		if current.Revision == 2 {
+			unsubSecond()
+		}
+
+		return first.apply(ctx, current, previous)
+	}
+
+	unsubFirst := mustRegister(t, c, firstApply)
+	defer unsubFirst()
+
+	unsubSecond = mustRegister(t, c, second.apply)
+	defer unsubSecond()
+
+	c.Publish(context.Background(), publication("", 1, "one"))
+	c.Publish(context.Background(), publication("", 2, "two"))
+
+	if got := first.names(); !slices.Equal(got, []string{"one", "two"}) {
+		t.Fatalf("first applier saw %v, want [one two]", got)
+	}
+
+	if got := second.names(); !slices.Equal(got, []string{"one"}) {
+		t.Fatalf("second applier saw %v after its unsubscribe returned mid-batch, want [one]", got)
+	}
+
+	status := c.Status()
+	if len(status) != 1 || status[0].Applied != 2 || status[0].LastErr != nil {
+		t.Fatalf("Status = %+v, want Applied 2 with no error: the skipped applier is gone and records nothing", status)
+	}
+}

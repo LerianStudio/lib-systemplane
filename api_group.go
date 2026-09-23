@@ -465,7 +465,9 @@ type ApplyStatus struct {
 //
 // A nil fn registers nothing and returns no error, matching [Client.OnChange].
 // unsubscribe is idempotent, is safe to call from inside fn itself, and
-// releases that function's hold on the scope's applied revision. In
+// releases that function's hold on the scope's applied revision. Once it has
+// returned fn is not started again, including by a fan-out already under way
+// that had not reached it; an invocation already running completes. In
 // multi-tenant mode with no bound Manager OnApply returns
 // ErrNotSupportedInMultiTenant, while [Group.Snapshot] and [Group.Set] keep
 // working. With a bound Manager it registers and returns no error, and there is

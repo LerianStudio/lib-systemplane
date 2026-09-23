@@ -23,6 +23,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
@@ -124,6 +125,11 @@ type applier[T any] struct {
 	id    uint64
 	fn    ApplyFunc[T]
 	state map[string]*applierScope[T]
+	// removed is set by the unsubscribe, under the state mutex, and read by a
+	// fan-out that holds no lock: an applier snapshotted into a batch and
+	// unsubscribed before its turn is skipped instead of invoked after its
+	// unsubscribe returned.
+	removed atomic.Bool
 }
 
 // delivery is one applier's pending invocation for one observation, carried
@@ -133,6 +139,9 @@ type delivery[T any] struct {
 	current  Decoded[T]
 	previous *Decoded[T]
 	err      error
+	// skipped says the applier unsubscribed between the snapshot and its turn,
+	// so nothing ran and nothing is recorded for it.
+	skipped bool
 }
 
 // Coordinator holds the per-scope publication cache and the registered
@@ -398,22 +407,25 @@ func (c *Coordinator[T]) Register(fn ApplyFunc[T]) (func(), error) {
 	}, seeded.readErr
 }
 
-// add appends fn, takes the seed when no publication has been observed yet, and
-// reports the scopes worth replaying. The unlock is deferred rather than manual
-// because this critical section runs code the consumer owns — the seed read,
-// the group's decoder and json.Marshal on its own document — and a panic in it
-// must not leave the group's mutex held: every later Publish and every Status
-// would then block forever, silently, with hot reload stopped and no signal
-// anywhere.
+// add takes the seed when no publication has been observed yet, then appends
+// fn and reports the scopes worth replaying. The unlock is deferred rather than
+// manual because this critical section runs code the consumer owns — the seed
+// read, the group's decoder and json.Marshal on its own document — and a panic
+// in it must not leave the group's mutex held: every later Publish and every
+// Status would then block forever, silently, with hot reload stopped and no
+// signal anywhere. The append comes AFTER the seed for the same reason: that
+// panic escapes Register before the caller holds an unsubscribe, so an applier
+// appended first would stay registered, unreachable, and receive every later
+// delivery.
 func (c *Coordinator[T]) add(fn ApplyFunc[T]) (uint64, []*scope[T], seedOutcome) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	seeded := c.seedLocked()
+
 	c.nextID++
 	id := c.nextID
 	c.appliers = append(c.appliers, &applier[T]{id: id, fn: fn, state: map[string]*applierScope[T]{}})
-
-	seeded := c.seedLocked()
 
 	observed := make([]*scope[T], 0, len(c.scopes))
 
@@ -481,6 +493,8 @@ func (c *Coordinator[T]) remove(id uint64) {
 		if ap.id != id {
 			continue
 		}
+
+		ap.removed.Store(true)
 
 		c.appliers = slices.Delete(c.appliers, i, i+1)
 
@@ -668,11 +682,24 @@ func deliveryCtx[T any](fallback context.Context, observed observation[T]) conte
 // mutex before returning — on the panic path too, so the caller's deferred
 // bookkeeping still runs under the lock and still releases it however an
 // applier fails.
+//
+// The batch was snapshotted under the mutex, and an unsubscribe takes that
+// mutex freely while the batch runs, so an applier can leave between the
+// snapshot and its own turn. It is skipped: once its unsubscribe has returned
+// the function is not started again. An invocation already running when the
+// unsubscribe arrives completes, because nothing here waits and nothing here
+// can tell that unsubscribe from one the function makes on itself.
 func (c *Coordinator[T]) deliver(ctx context.Context, pending []delivery[T]) {
 	c.mu.Unlock()
 	defer c.mu.Lock()
 
 	for i := range pending {
+		if pending[i].ap.removed.Load() {
+			pending[i].skipped = true
+
+			continue
+		}
+
 		pending[i].err = c.invoke(ctx, pending[i].ap.fn, pending[i].current, pending[i].previous)
 	}
 }
@@ -823,6 +850,10 @@ func swallowPanic() {
 func (c *Coordinator[T]) recordLocked(sc *scope[T], pending []delivery[T]) {
 	for i := range pending {
 		d := &pending[i]
+		if d.skipped {
+			continue
+		}
+
 		st := d.ap.scopeState(sc.tenant)
 
 		if d.err != nil {
