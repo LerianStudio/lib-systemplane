@@ -1162,8 +1162,6 @@ func TestPollBackoffAdvancesTheStreakAndStopsWithTheFeed(t *testing.T) {
 // Set; a delete carries 0, which FC-2 reads as unknown and never fences or
 // deduplicates.
 func TestChangeEventDecodesTombstoneAsDelete(t *testing.T) {
-	t.Parallel()
-
 	now := time.Now().UTC()
 
 	// What the library itself writes.
@@ -1269,10 +1267,12 @@ func TestChangeEventDecodesTombstoneAsDelete(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		evt, ok := eventFromChange(tt.ce)
-		if !ok || evt.Op != tt.wantOp || evt.Revision != tt.wantRevision || evt.Namespace != "ns" || evt.Key != "k" {
-			t.Errorf("%s: eventFromChange = (%#v, %v), want Op %q at revision %d for ns/k", tt.name, evt, ok, tt.wantOp, tt.wantRevision)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			evt, ok := eventFromChange(tt.ce)
+			if !ok || evt.Op != tt.wantOp || evt.Revision != tt.wantRevision || evt.Namespace != "ns" || evt.Key != "k" {
+				t.Errorf("eventFromChange = (%#v, %v), want Op %q at revision %d for ns/k", evt, ok, tt.wantOp, tt.wantRevision)
+			}
+		})
 	}
 }
 

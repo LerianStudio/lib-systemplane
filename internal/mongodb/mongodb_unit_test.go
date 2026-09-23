@@ -47,8 +47,6 @@ func TestEntryDocToEntry(t *testing.T) {
 // one: it must read as a live value at revision 0 — unknown to the engine,
 // never fenced, never deduplicated — and never as a tombstone.
 func TestEntryDoc_PreV4DocumentReadsAtRevisionZero(t *testing.T) {
-	t.Parallel()
-
 	// A BSON date holds milliseconds, so the round trip truncates anything
 	// finer and an untruncated stamp would compare unequal for that reason
 	// alone.
@@ -87,8 +85,6 @@ func TestEntryDoc_PreV4DocumentReadsAtRevisionZero(t *testing.T) {
 // evaluates it as a field path. updated_at must stay bare — a BSON date is
 // never parsed as a path.
 func TestUpsertPipeline_WrapsEveryCallerString(t *testing.T) {
-	t.Parallel()
-
 	now := time.Now().UTC()
 	pipeline := upsertPipeline(store.Entry{
 		Namespace: "$ns",
@@ -440,8 +436,6 @@ func (nilDBConnector) ResolveDatabase(context.Context, string) (*mongo.Database,
 // Refuse it with the tenant named rather than hand back a handle that panics
 // on the first command.
 func TestStore_NamedTenantNilDatabaseIsRefused(t *testing.T) {
-	t.Parallel()
-
 	s, err := New(Config{MultiTenantEnabled: true, Connector: nilDBConnector{}})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -465,8 +459,6 @@ func TestStore_NamedTenantNilDatabaseIsRefused(t *testing.T) {
 // tombstones), the marker and provenance are written with the actor wrapped
 // against the $-prefix hazard, and the value is unset.
 func TestTombstonePipeline_ShapeAndWrapping(t *testing.T) {
-	t.Parallel()
-
 	now := time.Now().UTC()
 
 	pipeline := tombstonePipeline("$value", now)
@@ -517,8 +509,6 @@ func TestTombstonePipeline_ShapeAndWrapping(t *testing.T) {
 // $exists: a document written before v4 carries no "deleted" field at all and
 // must stay visible to Get and List.
 func TestNotDeleted_MatchesMissingField(t *testing.T) {
-	t.Parallel()
-
 	guard := notDeleted()
 	if guard.Key != fieldDeleted {
 		t.Fatalf("guard key = %q, want %q", guard.Key, fieldDeleted)
@@ -543,8 +533,6 @@ func TestNotDeleted_MatchesMissingField(t *testing.T) {
 // collection or indexes. Keying on the tenant makes that case moot by
 // construction rather than unlikely.
 func TestSchemaCacheKey_DistinguishesTenants(t *testing.T) {
-	t.Parallel()
-
 	clusterA := &mongo.Client{}
 	clusterB := &mongo.Client{}
 
@@ -576,8 +564,6 @@ func TestSchemaCacheKey_DistinguishesTenants(t *testing.T) {
 // touched: a named tenant is on every span, and the single-tenant scope adds
 // nothing.
 func TestScopeAttrs_NamesTheTenant(t *testing.T) {
-	t.Parallel()
-
 	key := attribute.String(fieldKey, "k")
 
 	zero := scopeAttrs(store.Scope{}, key)

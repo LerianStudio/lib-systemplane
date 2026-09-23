@@ -445,6 +445,12 @@ func (s *Store) List(ctx context.Context, scope store.Scope) ([]store.Entry, err
 	}
 	defer cursor.Close(ctx)
 
+	// Non-nil even when the scope is empty, matching Postgres: a caller that
+	// marshals the result must not get null from one backend and [] from the
+	// other. No capacity hint: the cursor below is drained one document at a
+	// time, so the count is unknown until it is done.
+	entries := make([]store.Entry, 0)
+
 	// Decoded one document at a time, never in bulk. A single foreign-written
 	// document with a badly typed field — a value stored as a sub-document
 	// rather than as the JSON string this store writes — fails its own decode,
@@ -452,8 +458,6 @@ func (s *Store) List(ctx context.Context, scope store.Scope) ([]store.Entry, err
 	// engine's reconcile after every OpResync could never converge again. One
 	// bad document costs one key instead: it is skipped with a warning naming
 	// it, and that key falls back to its registered default (FC-11).
-	var entries []store.Entry
-
 	for cursor.Next(ctx) {
 		var doc entryDoc
 

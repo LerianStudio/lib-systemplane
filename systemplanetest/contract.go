@@ -190,6 +190,18 @@ func runSetGetList(t *testing.T, s store.Store, opts RunOptions) {
 
 	ctx := context.Background()
 
+	// An empty scope lists as an empty slice, never as nil. Both backends must
+	// agree: a caller that json.Marshals the result gets [] from one backend
+	// and null from the other otherwise, and the admin surface renders it.
+	empty, err := s.List(ctx, opts.Scope)
+	if err != nil {
+		t.Fatalf("list on an empty scope: %v", err)
+	}
+
+	if empty == nil {
+		t.Errorf("list on an empty scope returned a nil slice, want an empty non-nil one")
+	}
+
 	setEntry(ctx, t, s, opts.Scope, entry("ns", "a", 1))
 
 	setEntry(ctx, t, s, opts.Scope, entry("ns", "b", "hello"))

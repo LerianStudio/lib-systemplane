@@ -128,8 +128,6 @@ func TestNewTenantManagerConnector_WrapsSuppliedManager(t *testing.T) {
 // container test reaches: every test here connects over TCP, so the branch
 // that decides whether two feeds are one database would otherwise never run.
 func TestFormatServerDatabaseKey(t *testing.T) {
-	t.Parallel()
-
 	for _, tc := range []struct {
 		name     string
 		database string
@@ -167,8 +165,6 @@ func TestFormatServerDatabaseKey(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
 			got, err := formatServerDatabaseKey(tc.database, tc.addr, tc.port, tc.dsn)
 			if tc.wantErr {
 				if err == nil {

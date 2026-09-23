@@ -360,8 +360,6 @@ func (typedNilHandleConnector) ResolveDSN(context.Context, string) (string, erro
 // the tenant-manager context — rather than reaching pinPrimary and panicking
 // on the first read.
 func TestStore_TypedNilHandleIsRefused(t *testing.T) {
-	t.Parallel()
-
 	tests := []struct {
 		name    string
 		cfg     Config
@@ -389,8 +387,6 @@ func TestStore_TypedNilHandleIsRefused(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
 			s, err := New(tt.cfg)
 			if err != nil {
 				t.Fatalf("New: %v", err)
@@ -736,8 +732,6 @@ func hasTenantAttr(attrs []attribute.KeyValue, tenant string) bool {
 // applies, so a trace reads the same whichever backend produced it. The tenant
 // is a span attribute and never a metric label: a tenant id is unbounded.
 func TestPostgresCRUDSpans_NameTheTenant(t *testing.T) {
-	t.Parallel()
-
 	spanNames := []string{
 		"systemplane.postgres.list",
 		"systemplane.postgres.get",
@@ -783,8 +777,6 @@ func TestPostgresCRUDSpans_NameTheTenant(t *testing.T) {
 	t.Cleanup(func() { _ = dead.Close() })
 
 	t.Run("named tenant", func(t *testing.T) {
-		t.Parallel()
-
 		tracer := exercise(t, Config{
 			MultiTenantEnabled: true,
 			Connector:          deadResolverConnector{db: dbresolver.New(dbresolver.WithPrimaryDBs(dead))},
@@ -798,8 +790,6 @@ func TestPostgresCRUDSpans_NameTheTenant(t *testing.T) {
 	})
 
 	t.Run("zero scope", func(t *testing.T) {
-		t.Parallel()
-
 		tracer := exercise(t, Config{
 			DB:        dead,
 			ListenDSN: "postgres://u:p@127.0.0.1:1/db?sslmode=disable",

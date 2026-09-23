@@ -884,8 +884,6 @@ func TestPostgresSubscribe_SchemaPinnedDSNStillDials(t *testing.T) {
 // directly here. A reserved slot still connecting carries no dbKey and must be
 // invisible to it: it is not listening yet, so it cannot receive anything.
 func TestPostgresFeed_SharedDatabaseIsRefused(t *testing.T) {
-	t.Parallel()
-
 	live := newFeed(store.Scope{Tenant: "t1"}, "")
 	live.dbKey = "db.example:5432/shared"
 
@@ -1228,8 +1226,6 @@ func loggingStore() (*Store, *captureLogger) {
 // the tenant on the line, a process carrying dozens of feeds cannot say which
 // one skipped the wait.
 func TestFeed_SelfTeardownSkipIsLoggedWithItsTenant(t *testing.T) {
-	t.Parallel()
-
 	s, logger := loggingStore()
 
 	f := newFeed(store.Scope{Tenant: "t1"}, "")
@@ -1255,8 +1251,6 @@ func TestFeed_SelfTeardownSkipIsLoggedWithItsTenant(t *testing.T) {
 // teardown that is NOT the reader tearing itself down waits for the reader and
 // says nothing, so the line above stays a signal rather than shutdown noise.
 func TestFeed_TeardownFromOutsideACallbackLogsNothing(t *testing.T) {
-	t.Parallel()
-
 	s, logger := loggingStore()
 
 	f := newFeed(store.Scope{Tenant: "t1"}, "")
@@ -1279,8 +1273,6 @@ func TestFeed_TeardownFromOutsideACallbackLogsNothing(t *testing.T) {
 // written by whoever holds NOTIFY rights on the channel and must not be able to
 // stretch a log line without bound.
 func TestStore_NotifyDecodeWarningNamesItsTenant(t *testing.T) {
-	t.Parallel()
-
 	s, logger := loggingStore()
 
 	f := newFeed(store.Scope{Tenant: "t1"}, "")
@@ -1517,8 +1509,6 @@ func TestPostgresZeroFeed_StartRetriesTheSameFeed(t *testing.T) {
 // before the drop was accounted for. Each iteration below is one such cycle:
 // the connect succeeds, nothing is consumed, the connection dies immediately.
 func TestPostgresReconnect_BackoffEscalatesOnAcceptThenDropCycles(t *testing.T) {
-	t.Parallel()
-
 	var retry reconnectBackoff
 
 	prev := time.Duration(0)
@@ -1566,13 +1556,9 @@ func TestPostgresReconnect_BackoffEscalatesOnAcceptThenDropCycles(t *testing.T) 
 // database. NOTIFY is database-wide, so either pairing would deliver one
 // install's notifications to the other stamped with the wrong scope.
 func TestPostgresFeed_SharedDatabaseIsRefusedAcrossTheZeroScope(t *testing.T) {
-	t.Parallel()
-
 	const dbKey = "db.example:5432/shared"
 
 	t.Run("tenant joining the single-tenant database", func(t *testing.T) {
-		t.Parallel()
-
 		live := newFeed(store.Scope{}, "")
 		live.dbKey = dbKey
 
@@ -1589,8 +1575,6 @@ func TestPostgresFeed_SharedDatabaseIsRefusedAcrossTheZeroScope(t *testing.T) {
 	})
 
 	t.Run("single-tenant feed joining a tenant database", func(t *testing.T) {
-		t.Parallel()
-
 		live := newFeed(store.Scope{Tenant: "t1"}, "")
 		live.dbKey = dbKey
 
@@ -1607,8 +1591,6 @@ func TestPostgresFeed_SharedDatabaseIsRefusedAcrossTheZeroScope(t *testing.T) {
 	})
 
 	t.Run("its own database is admitted", func(t *testing.T) {
-		t.Parallel()
-
 		live := newFeed(store.Scope{}, "")
 		live.dbKey = dbKey
 
@@ -1625,8 +1607,6 @@ func TestPostgresFeed_SharedDatabaseIsRefusedAcrossTheZeroScope(t *testing.T) {
 // is precisely the lockstep this jitter exists to break — every feed of a
 // process that lost one database would redial on the same tick.
 func TestPostgresReconnect_DelayIsDrawnBelowItsCeiling(t *testing.T) {
-	t.Parallel()
-
 	// A ceiling several steps up the sequence, so the window is wide enough
 	// that repeated draws colliding is not a plausible outcome.
 	const attempt = 4

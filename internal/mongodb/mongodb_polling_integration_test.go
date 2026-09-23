@@ -822,3 +822,187 @@ func TestIntegration_MongoPollingFirstRoundAnnouncesBeforeKeyEvents(t *testing.T
 		t.Fatal("timed out waiting for the feed's first marker")
 	}
 }
+
+// startAuthPollingContainer brings up a standalone mongo with authentication
+// enabled and returns a client bound to its root account plus the container's
+// connection string, so a test can mint a restricted account of its own.
+//
+// Separate from startPollingContainer because enabling auth changes every
+// connection in the process: the other polling tests would then need
+// credentials for no benefit.
+func startAuthPollingContainer(t *testing.T) (*mongo.Client, string, func()) {
+	t.Helper()
+
+	ctx := context.Background()
+
+	container, err := mongocontainer.Run(ctx, "mongo:7",
+		mongocontainer.WithUsername("root"),
+		mongocontainer.WithPassword("rootpass"),
+	)
+	if err != nil {
+		t.Fatalf("start auth container: %v", err)
+	}
+
+	uri, err := container.ConnectionString(ctx)
+	if err != nil {
+		_ = testcontainers.TerminateContainer(container)
+
+		t.Fatalf("connection string: %v", err)
+	}
+
+	root, err := mongo.Connect(options.Client().ApplyURI(uri).SetDirect(true))
+	if err != nil {
+		_ = testcontainers.TerminateContainer(container)
+
+		t.Fatalf("mongo connect as root: %v", err)
+	}
+
+	cleanup := func() {
+		_ = root.Disconnect(context.Background())
+		_ = testcontainers.TerminateContainer(container)
+	}
+
+	return root, uri, cleanup
+}
+
+// The single-tenant branch of runSchema WARNS when the polling indexes cannot
+// be created, where the tenant-scoped branch returns the error. That asymmetry
+// is deliberate — a consumer whose collection is provisioned externally may
+// hold nothing but DML and listIndexes, and refusing to start such a store
+// would take the feature away from exactly the deployment that provisions
+// carefully — so it is pinned here rather than left to be "tidied" into a
+// return. A store built on a role that may not create an index starts, serves
+// reads and writes, and merely polls slower.
+func TestIntegration_MongoPollingIndexCreationDeniedStillStarts(t *testing.T) {
+	root, uri, cleanup := startAuthPollingContainer(t)
+	t.Cleanup(cleanup)
+
+	ctx := context.Background()
+
+	dbName := fmt.Sprintf("pollindexes_denied_%d", time.Now().UnixNano())
+	adminDB := root.Database(dbName)
+
+	t.Cleanup(func() { _ = adminDB.Drop(context.Background()) })
+
+	// Created by the privileged account, the way an external provisioning
+	// pipeline would: the restricted role below cannot create it, and the test
+	// is about the index grant, not about implicit collection creation.
+	if err := adminDB.CreateCollection(ctx, defaultCollection); err != nil {
+		t.Fatalf("create collection as root: %v", err)
+	}
+
+	// Everything the store needs at runtime, and NOT createIndex.
+	createRole := bson.D{
+		{Key: "createRole", Value: "systemplaneNoIndex"},
+		{Key: "privileges", Value: bson.A{bson.D{
+			{Key: "resource", Value: bson.D{
+				{Key: "db", Value: dbName},
+				{Key: "collection", Value: defaultCollection},
+			}},
+			{Key: "actions", Value: bson.A{"find", "insert", "update", "remove", "listIndexes"}},
+		}}},
+		{Key: "roles", Value: bson.A{}},
+	}
+	if err := adminDB.RunCommand(ctx, createRole).Err(); err != nil {
+		t.Fatalf("create role: %v", err)
+	}
+
+	createUser := bson.D{
+		{Key: "createUser", Value: "systemplane"},
+		{Key: "pwd", Value: "lppass"},
+		{Key: "roles", Value: bson.A{bson.D{
+			{Key: "role", Value: "systemplaneNoIndex"},
+			{Key: "db", Value: dbName},
+		}}},
+	}
+	if err := adminDB.RunCommand(ctx, createUser).Err(); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+
+	lp, err := mongo.Connect(options.Client().
+		ApplyURI(uri).
+		SetDirect(true).
+		SetAuth(options.Credential{
+			Username:   "systemplane",
+			Password:   "lppass",
+			AuthSource: dbName,
+		}))
+	if err != nil {
+		t.Fatalf("mongo connect as the least-privilege user: %v", err)
+	}
+
+	t.Cleanup(func() { _ = lp.Disconnect(context.Background()) })
+
+	s, err := New(Config{Client: lp, Database: dbName, PollInterval: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	t.Cleanup(func() { _ = s.Close() })
+
+	// The claim: a denied CreateMany is logged, not returned.
+	if err := s.Start(ctx); err != nil {
+		t.Fatalf("Start with a role that may not create an index: %v", err)
+	}
+
+	// Proves the warn branch was actually taken rather than the grant being
+	// wider than intended — without this the test would pass on a role that
+	// could create the indexes after all.
+	assertNoPollingIndexes(t, lp.Database(dbName).Collection(defaultCollection))
+
+	if _, err := s.Set(ctx, store.Scope{}, store.Entry{
+		Namespace: "ns",
+		Key:       "k",
+		Value:     []byte(`{"enabled":true}`),
+		UpdatedAt: time.Now().UTC(),
+		UpdatedBy: "tester",
+	}); err != nil {
+		t.Fatalf("set on an index-less collection: %v", err)
+	}
+
+	got, found, err := s.Get(ctx, store.Scope{}, "ns", "k")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+
+	if !found {
+		t.Fatalf("get: ns/k not found after Set")
+	}
+
+	if string(got.Value) != `{"enabled":true}` {
+		t.Errorf("get value = %s, want %s", got.Value, `{"enabled":true}`)
+	}
+}
+
+// assertNoPollingIndexes is the inverse of assertPollingIndexes: it fails when
+// either index the poller would like exists, which is what makes the
+// denial-tolerated test prove its own premise.
+func assertNoPollingIndexes(t *testing.T, coll *mongo.Collection) {
+	t.Helper()
+
+	unwanted := map[string]bool{
+		fieldUpdatedAt + "_1_" + fieldNamespace + "_1_" + fieldKey + "_1": true,
+		fieldDeleted + "_1_" + fieldNamespace + "_1_" + fieldKey + "_1":   true,
+	}
+
+	cur, err := coll.Indexes().List(context.Background())
+	if err != nil {
+		t.Fatalf("list indexes: %v", err)
+	}
+
+	defer cur.Close(context.Background())
+
+	for cur.Next(context.Background()) {
+		var idx struct {
+			Name string `bson:"name"`
+		}
+
+		if err := cur.Decode(&idx); err != nil {
+			t.Fatalf("decode index: %v", err)
+		}
+
+		if unwanted[idx.Name] {
+			t.Errorf("index %q exists: the role was allowed to create it, so this test never exercised the denial", idx.Name)
+		}
+	}
+}

@@ -631,6 +631,11 @@ func (s *Store) Subscribe(ctx context.Context, scope store.Scope, fn func(store.
 	// subscriber slot goes with it.
 	if ctx != nil && ctx.Done() != nil {
 		go func() {
+			// Same guard the reader goroutine carries: teardown releases the
+			// feed, and a panic here would take the process down from a
+			// goroutine no caller can recover for.
+			defer runtime.RecoverAndLog(s.cfg.Logger, "systemplane.mongodb.subscriber")
+
 			select {
 			case <-ctx.Done():
 				teardown()

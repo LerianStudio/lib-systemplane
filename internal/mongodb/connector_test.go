@@ -9,8 +9,6 @@ import (
 )
 
 func TestConnectorWithNilManagerFailsWithSentinel(t *testing.T) {
-	t.Parallel()
-
 	c := NewTenantManagerConnector(nil)
 	if c == nil {
 		t.Fatal("NewTenantManagerConnector(nil) = nil, want a non-nil Connector")
@@ -27,8 +25,6 @@ func TestConnectorWithNilManagerFailsWithSentinel(t *testing.T) {
 }
 
 func TestConnectorNilReceiverFailsWithSentinel(t *testing.T) {
-	t.Parallel()
-
 	var c *mbMgrConnector
 
 	db, err := c.ResolveDatabase(context.Background(), "t1")
@@ -42,8 +38,6 @@ func TestConnectorNilReceiverFailsWithSentinel(t *testing.T) {
 }
 
 func TestNew_CarriesConnector(t *testing.T) {
-	t.Parallel()
-
 	c := NewTenantManagerConnector(nil)
 
 	s, err := New(Config{MultiTenantEnabled: true, Connector: c})
