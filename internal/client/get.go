@@ -23,10 +23,10 @@ type ListEntry struct {
 
 // Get returns the current value for (namespace, key).
 //
-// In single-tenant mode it returns the cached value (or the registered
-// default when the cache is empty). In multi-tenant mode it resolves the
-// tenant database from ctx and reads through, returning the registered
-// default when the row is absent.
+// In single-tenant mode it returns the value the engine has published (or the
+// registered default when the engine has published nothing for the key yet).
+// In multi-tenant mode it resolves the tenant database from ctx and reads
+// through, returning the registered default when the row is absent.
 func (c *Client) Get(ctx context.Context, namespace, key string) (any, bool, error) {
 	e, ok, err := c.getEntry(ctx, namespace, key)
 
@@ -35,10 +35,32 @@ func (c *Client) Get(ctx context.Context, namespace, key string) (any, bool, err
 
 // GetEntry resolves the caller's scope like Get. ok is false for an
 // unregistered key. Revision, UpdatedAt and UpdatedBy describe the persisted
-// row backing the cached value; only the wave-1 shim may report zeros for a
-// cached row, and engine-core removes that limitation.
+// row backing the value in force, and Stale reports whether anything is
+// currently confirming it.
 func (c *Client) GetEntry(ctx context.Context, namespace, key string) (e Entry, ok bool, err error) {
 	return c.getEntry(ctx, namespace, key)
+}
+
+// singleTenantEntry serves a registered key from the engine's published state.
+func (c *Client) singleTenantEntry(namespace, key string, def keyDef) Entry {
+	published, ok := c.engine.Lookup(store.Scope{}, engine.NSKey{Namespace: namespace, Key: key})
+	if ok {
+		// Returned verbatim: Entry is an alias of the engine's, the value is
+		// already a private clone, and the revision and provenance are the
+		// row's.
+		return published
+	}
+
+	// A miss means the engine has published nothing for this key: before
+	// Start, or after a Start whose first reconcile confirmed nothing. The
+	// registered default is what reads serve, and it is Stale — nobody has
+	// confirmed it (FC-5). The engine's own flag covers a tracked scope; a
+	// scope it does not track at all reports the zero Entry, and the Client is
+	// the only one that knows Start has not run.
+	return Entry{
+		Value: engine.Clone(def.defaultValue),
+		Stale: published.Stale || !c.started.Load(),
+	}
 }
 
 // getEntry is the single read path behind Get and GetEntry.
@@ -62,15 +84,7 @@ func (c *Client) getEntry(ctx context.Context, namespace, key string) (Entry, bo
 	}
 
 	if !c.multiTenant {
-		c.cacheMu.RLock()
-		v, inCache := c.cache[nk]
-		c.cacheMu.RUnlock()
-
-		if inCache {
-			return Entry{Value: engine.Clone(v)}, true, nil
-		}
-
-		return Entry{Value: engine.Clone(def.defaultValue)}, true, nil
+		return c.singleTenantEntry(namespace, key, def), true, nil
 	}
 
 	// Multi-tenant: try the bound Manager's per-tenant cache first; fall
@@ -240,8 +254,8 @@ func (c *Client) GetDuration(ctx context.Context, namespace, key string) (time.D
 // List returns all registered entries in namespace sorted by key.
 //
 // In multi-tenant mode List resolves the tenant database from ctx; in
-// single-tenant mode it serves from the in-process cache and registered
-// defaults.
+// single-tenant mode it serves what the engine has published, falling back to
+// the registered defaults.
 func (c *Client) List(ctx context.Context, namespace string) ([]ListEntry, error) {
 	if c == nil || c.closed.Load() {
 		return nil, ErrClosed
@@ -275,21 +289,28 @@ func (c *Client) List(ctx context.Context, namespace string) ([]ListEntry, error
 		return c.listFromStore(ctx, namespace, keys)
 	}
 
-	return c.listFromCache(keys), nil
+	return c.listFromEngine(keys), nil
 }
 
-func (c *Client) listFromCache(keys []nskey) []ListEntry {
+// listFromEngine reads every key through the engine, falling back to the
+// registered default for one the engine has published nothing for. ListEntry
+// carries no revision (FC-10), so the provenance the engine holds is dropped
+// here on purpose.
+func (c *Client) listFromEngine(keys []nskey) []ListEntry {
 	entries := make([]ListEntry, 0, len(keys))
 
-	c.registryMu.RLock()
-	c.cacheMu.RLock()
-
 	for _, nk := range keys {
-		val, inCache := c.cache[nk]
+		// The engine is read OUTSIDE registryMu: it takes locks of its own and
+		// must never be called under the Client's.
+		published, ok := c.engine.Lookup(store.Scope{}, engine.NSKey{Namespace: nk.Namespace, Key: nk.Key})
 
+		c.registryMu.RLock()
 		def, registered := c.registry[nk]
-		if !inCache && registered {
-			val = def.defaultValue
+		c.registryMu.RUnlock()
+
+		val := published.Value
+		if !ok && registered {
+			val = engine.Clone(def.defaultValue)
 		}
 
 		var desc string
@@ -299,13 +320,10 @@ func (c *Client) listFromCache(keys []nskey) []ListEntry {
 
 		entries = append(entries, ListEntry{
 			Key:         nk.Key,
-			Value:       engine.Clone(val),
+			Value:       val,
 			Description: desc,
 		})
 	}
-
-	c.cacheMu.RUnlock()
-	c.registryMu.RUnlock()
 
 	return entries
 }

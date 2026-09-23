@@ -98,11 +98,15 @@ func WithValidator(fn func(any) error) KeyOption { return internalclient.WithVal
 // that Set's own context, so validation can use what the caller carried into
 // the write — a tenant, a deadline — to consult another system.
 //
-// Two callers invoke it today: [Client.Set], with the context of that write,
-// and [Client.Register], with context.Background(). A context validator must
-// therefore treat a context that lacks the scope it expects as "cannot verify"
-// and decide by its own policy — accept it, or refuse it with its own error —
-// rather than assume request scope is there to read.
+// [Client.Set] invokes it with the context of that write, and [Client.Register]
+// with context.Background(). In single-tenant mode it also grades every value
+// read back from the store — the first reconcile at [Client.Start] and every
+// later reconcile and changefeed re-read — with a context derived from the
+// client's lifecycle, which carries no request values and no tenant. A context
+// validator must therefore treat a context that lacks the scope it expects as
+// "cannot verify" and decide by its own policy — accept it, or refuse it with
+// its own error — rather than assume request scope is there to read, and must
+// be deterministic on the same value.
 //
 // The registered default is validated at [Client.Register] time with a
 // non-nil, empty context.Background(), because registering a default is not a

@@ -7,14 +7,20 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/LerianStudio/lib-systemplane/v4/internal/engine"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/manager"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
-// Set writes a new value for (namespace, key). The value is validated against
-// the key's registered validator (if any), JSON-marshaled, and persisted to
-// the resolved backing store. In single-tenant mode the in-process cache is
-// updated synchronously for same-process read consistency.
+// Set writes a new value for (namespace, key), then publishes it so the
+// caller's own next read sees its write before the changefeed echoes it (D4).
+//
+// The value is JSON-marshaled and the registered validator grades the CANONICAL
+// decoded shape — what the store will hand back — not the caller's Go value.
+// Every ingress therefore presents the validator the same shapes (float64 for
+// numbers, map[string]any, []any, string, bool, nil), so a validator that type-
+// asserts a Go type fails loudly here instead of passing Set and being refused
+// silently when the row is read back.
 func (c *Client) Set(ctx context.Context, namespace, key string, value any, actor string) error {
 	if c == nil || c.closed.Load() {
 		return ErrClosed
@@ -38,15 +44,22 @@ func (c *Client) Set(ctx context.Context, namespace, key string, value any, acto
 		return fmt.Errorf("%w: %s/%s", ErrUnknownKey, namespace, key)
 	}
 
-	if def.validator != nil {
-		if err := def.validator(ctx, value); err != nil {
-			return fmt.Errorf("%w: %w", ErrValidation, err)
-		}
-	}
-
 	jsonBytes, err := json.Marshal(value)
 	if err != nil {
 		return fmt.Errorf("%w: value is not JSON-serializable: %w", ErrValidation, err)
+	}
+
+	if def.validator != nil {
+		var canonical any
+		if err := json.Unmarshal(jsonBytes, &canonical); err != nil {
+			return fmt.Errorf("%w: value does not survive a JSON round trip: %w", ErrValidation, err)
+		}
+
+		// The caller's own context, so a validator can read the tenant, the
+		// deadline and the trace the write carried.
+		if err := def.validator(ctx, canonical); err != nil {
+			return fmt.Errorf("%w: %w", ErrValidation, err)
+		}
 	}
 
 	entry := store.Entry{
@@ -57,27 +70,27 @@ func (c *Client) Set(ctx context.Context, namespace, key string, value any, acto
 		UpdatedBy: actor,
 	}
 
-	// The revision the store reports is discarded here: publishing it is
-	// the engine's job, not the facade's.
-	if _, err := c.store.Set(ctx, store.Scope{}, entry); err != nil {
+	revision, err := c.store.Set(ctx, store.Scope{}, entry)
+	if err != nil {
 		return err
 	}
 
-	// Write through the in-process cache. Without this a reader between the
-	// commit and the changefeed round trip falls back to the store, and a read
-	// that does not yet see the fresh row reports the registered default for a
-	// key that already had a value.
+	if !c.multiTenant {
+		// Through the engine's own ingress, so the cached shape is the one the
+		// feed produces and this write's echo deduplicates by revision. The
+		// UpdatedAt stamped above is this process's clock, not the row's: the
+		// echo arrives at the same revision with an equal value and refreshes
+		// the provenance without firing a callback.
+		entry.Revision = revision
+
+		c.engine.Publish(ctx, store.Scope{}, entry)
+
+		return nil
+	}
+
 	var canonical any
 	if err := json.Unmarshal(jsonBytes, &canonical); err != nil {
 		canonical = value
-	}
-
-	if !c.multiTenant {
-		c.cacheMu.Lock()
-		c.cache[nk] = canonical
-		c.cacheMu.Unlock()
-
-		return nil
 	}
 
 	if mgr, tenantID := c.boundManager(), manager.TenantIDFromContext(ctx); mgr != nil && tenantID != "" {
@@ -116,9 +129,9 @@ func (c *Client) Delete(ctx context.Context, namespace, key, actor string) error
 	}
 
 	if !c.multiTenant {
-		c.cacheMu.Lock()
-		delete(c.cache, nk)
-		c.cacheMu.Unlock()
+		// The registered default at revision 0, under the engine's delete
+		// fence, so a re-read already in flight cannot resurrect the row.
+		c.engine.PublishDelete(store.Scope{}, engine.NSKey{Namespace: namespace, Key: key})
 
 		return nil
 	}

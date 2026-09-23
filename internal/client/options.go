@@ -204,14 +204,15 @@ func WithValidator(fn func(any) error) KeyOption {
 // [Client.Register] fail with the wrapped validation error, so the key is not
 // registered.
 //
-// In SINGLE-TENANT mode the same function also grades a value read back from
-// the store: on hydration at [Client.Start], and on every changefeed refresh. A
-// row can predate the key's validator, or be written by an older binary, or
-// written straight into the table, so a value never graded there would be one
-// the write path refuses while it is already in force. A refusal — a returned
-// error or a panic, which is treated as a refusal rather than propagated —
-// keeps the registered default (hydration) or the value already in force
-// (refresh), and logs a WARN carrying the error and never the value.
+// In SINGLE-TENANT mode the same function also grades every value read back
+// from the store: the first reconcile at [Client.Start], and every later
+// reconcile and changefeed re-read. A row can predate the key's validator, or
+// be written by an older binary, or written straight into the table, so a
+// value never graded there would be one the write path refuses while it is
+// already in force. A refusal — a returned error or a panic, which is treated
+// as a refusal rather than propagated — keeps the registered default (nothing
+// valid was ever accepted) or the value already in force, and logs a WARN
+// carrying the error and never the value.
 //
 // Multi-tenant reads are ungraded on every path: the direct tenant-store read
 // in [Client.Get] and [Client.List], and, when a Manager is bound, the
@@ -219,15 +220,21 @@ func WithValidator(fn func(any) error) KeyOption {
 // from. None of them runs this function, so a multi-tenant consumer that must
 // not act on a value the write path would refuse checks what it reads.
 //
-// The context is the one passed to [Client.Start] on hydration, and a bounded
-// context derived from the client's lifecycle on a refresh. Neither is a
-// caller's write, so a function that expects request scope should apply there
-// the same "cannot verify" policy it applies at registration. The no-I/O
-// restriction stated above for the registered default binds on hydration too:
-// it runs inside [Client.Start], under the same start lock, so a validator that
-// blocks there blocks [Client.Close] with it. The refresh call is the one
-// read-back call site where a validator may do I/O — its context carries a
-// bounded deadline and is cancelled by [Client.Close].
+// Every read-back call gets a context derived from the client's own lifecycle,
+// never the one passed to [Client.Start] and never a caller's: it carries no
+// request values and no tenant, so a function that expects request scope
+// should apply there the same "cannot verify" policy it applies at
+// registration. The first reconcile's context carries no deadline; a
+// changefeed re-read's carries a bounded one. Both are cancelled by
+// [Client.Close]. The no-I/O restriction stated above for the registered
+// default binds on the first reconcile too: [Client.Start] waits for it while
+// holding the start lock, so a validator that blocks there blocks
+// [Client.Close] with it. A re-read is the one read-back call site where a
+// validator may do I/O.
+//
+// A read-back is graded on every ingress, so the function must be
+// deterministic on the same value: one that answers differently across calls
+// makes the value in force depend on when the changefeed happened to fire.
 //
 // A nil fn is ignored. [WithValidator] and WithContextValidator set the same
 // single validator, so when both are applied to one key the last NON-NIL one

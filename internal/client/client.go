@@ -4,18 +4,14 @@ package client
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
-	"github.com/LerianStudio/lib-observability/v4/runtime"
-	"github.com/LerianStudio/lib-systemplane/v4/internal/debounce"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/engine"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/manager"
 	mongoDB "github.com/LerianStudio/lib-systemplane/v4/internal/mongodb"
@@ -23,18 +19,10 @@ import (
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
-// refreshTimeout bounds Get calls made by the changefeed-driven refresh loop.
-const refreshTimeout = 5 * time.Second
-
-// nskey is the composite map key for registry/cache/subscriber lookups.
+// nskey is the composite map key for registry lookups.
 type nskey struct {
 	Namespace string
 	Key       string
-}
-
-type subscription struct {
-	id uint64
-	fn func(ctx context.Context, newValue any)
 }
 
 // Client is the runtime-config handle. Read methods are nil-receiver safe,
@@ -42,7 +30,6 @@ type subscription struct {
 type Client struct {
 	store     store.Store
 	engine    *engine.Engine
-	debouncer *debounce.Debouncer[nskey]
 	logger    log.Logger
 	telemetry store.Telemetry
 
@@ -51,25 +38,6 @@ type Client struct {
 
 	registryMu sync.RWMutex
 	registry   map[nskey]keyDef
-
-	// cache is only populated in single-tenant mode. Multi-tenant mode reads
-	// directly from the resolved tenant DB.
-	cacheMu sync.RWMutex
-	cache   map[nskey]any
-
-	subsMu      sync.RWMutex
-	subscribers map[nskey][]subscription
-	nextSubID   atomic.Uint64
-
-	storeUnsubscribe func()
-
-	// hydratingMu guards hydrating / hydrationTouched. The changefeed
-	// callback consults these to record which keys it observed during
-	// hydration so hydrate() can skip those keys (the changefeed already has
-	// fresher values for them).
-	hydratingMu      sync.Mutex
-	hydrating        bool
-	hydrationTouched map[nskey]struct{}
 
 	// lifecycleCtx is the Client's process-wide context. It is derived in
 	// newClient() and canceled by Close(). Dispatch paths (changefeed
@@ -168,8 +136,6 @@ func newClient(s store.Store, cfg clientConfig) *Client {
 		multiTenant:     cfg.multiTenantEnabled,
 		catalogService:  cfg.catalogService,
 		registry:        make(map[nskey]keyDef),
-		cache:           make(map[nskey]any),
-		subscribers:     make(map[nskey][]subscription),
 		lifecycleCtx:    ctx,
 		lifecycleCancel: cancel,
 	}
@@ -185,15 +151,14 @@ func newClient(s store.Store, cfg clientConfig) *Client {
 		Debounce: cfg.debounce,
 	})
 
-	if !cfg.multiTenantEnabled {
-		c.debouncer = debounce.New[nskey](cfg.debounce, debounce.WithLogger[nskey](logger))
-	}
-
 	return c
 }
 
-// Start performs backend bootstrap and (in single-tenant mode) hydrates the
-// in-process cache. In multi-tenant mode it only marks the Client started;
+// Start performs backend bootstrap and, in single-tenant mode, starts the
+// engine: it opens the changefeed and returns once the first reconcile has
+// confirmed every registered key against the store, so an OnChange subscriber
+// registered beforehand has been handed the value in force (FC-11) before
+// Start returns. In multi-tenant mode it only marks the Client started;
 // schema bootstrap and reads run lazily against the per-request tenant DB.
 //
 // Start and Close are mutually exclusive: both take startMu for the duration
@@ -228,184 +193,17 @@ func (c *Client) Start(ctx context.Context) error {
 		return err
 	}
 
-	// Seed cache with registered defaults in single-tenant mode.
+	// The engine subscribes before it reconciles and rolls a failed Subscribe
+	// back itself, so a write landing between the snapshot and the first feed
+	// event is still observed. A failed Start leaves the Client usable: the
+	// engine retries the scope from nothing on the next Start.
 	if !c.multiTenant {
-		c.registryMu.RLock()
-		c.cacheMu.Lock()
-
-		for nk, def := range c.registry {
-			c.cache[nk] = engine.Clone(def.defaultValue)
-		}
-
-		c.cacheMu.Unlock()
-		c.registryMu.RUnlock()
-
-		// Mark hydration in progress BEFORE Subscribe so the changefeed
-		// callback knows to record which keys it touched. hydrate() then
-		// skips those keys to avoid overwriting fresh changefeed state with
-		// the older List() snapshot.
-		c.hydratingMu.Lock()
-		c.hydrating = true
-		c.hydrationTouched = make(map[nskey]struct{})
-		c.hydratingMu.Unlock()
-
-		// Subscribe BEFORE hydration so writes that land between List() and
-		// the change feed's first event are still observed.
-		unsub, err := c.store.Subscribe(ctx, store.Scope{}, c.onEvent)
-		if err != nil {
-			c.hydratingMu.Lock()
-			c.hydrating = false
-			c.hydrationTouched = nil
-			c.hydratingMu.Unlock()
-
+		if err := c.engine.Start(ctx); err != nil {
 			return err
 		}
-
-		c.storeUnsubscribe = unsub
-
-		if err := c.hydrate(ctx); err != nil {
-			if c.storeUnsubscribe != nil {
-				c.storeUnsubscribe()
-				c.storeUnsubscribe = nil
-			}
-
-			c.hydratingMu.Lock()
-			c.hydrating = false
-			c.hydrationTouched = nil
-			c.hydratingMu.Unlock()
-
-			return err
-		}
-
-		// Hydration done — release the touched set.
-		c.hydratingMu.Lock()
-		c.hydrating = false
-		c.hydrationTouched = nil
-		c.hydratingMu.Unlock()
 	}
 
 	c.started.Store(true)
-
-	return nil
-}
-
-// validateStored runs a key's registered validator over a value read back from
-// the store and reports whether the value may be put in force.
-//
-// A nil validate accepts, so a key registered without a validator hydrates and
-// refreshes exactly as before. A panic is a refusal, not a crash: hydration and
-// refresh are the only call sites that hand the validator bytes this process
-// did not write, so a validator that type-asserts its argument can panic on a
-// legacy row — and hydration runs inside Start, where a panic would abort boot.
-//
-// The returned error carries the validator's own error, or errValidatorPanicked
-// wrapping what it panicked with. A panic value that is not an error is rendered
-// as its type only: the rejected value may be a secret, and panic(value) would
-// otherwise reproduce its bytes in the caller's log line.
-func validateStored(ctx context.Context, validate func(context.Context, any) error, value any) (err error) {
-	if validate == nil {
-		return nil
-	}
-
-	defer func() {
-		r := recover()
-		if r == nil {
-			return
-		}
-
-		if panicked, isErr := r.(error); isErr {
-			err = fmt.Errorf("%w: %w", errValidatorPanicked, panicked)
-
-			return
-		}
-
-		err = fmt.Errorf("%w: panicked with %T", errValidatorPanicked, r)
-	}()
-
-	return validate(ctx, value)
-}
-
-func (c *Client) hydrate(ctx context.Context) error {
-	entries, err := c.store.List(ctx, store.Scope{})
-	if err != nil {
-		return err
-	}
-
-	for _, entry := range entries {
-		nk := nskey{Namespace: entry.Namespace, Key: entry.Key}
-
-		// The registry lock is taken per entry instead of around the whole
-		// loop so the validator called below never runs under it. That does
-		// NOT make blocking there safe: hydration runs inside Start, which
-		// holds startMu, and Close takes the same lock — so a validator that
-		// blocks here blocks shutdown too (see WithContextValidator).
-		// Per-entry locking loses nothing — the registry cannot change during
-		// hydration, since Register takes startMu and Start holds it here.
-		c.registryMu.RLock()
-		def, registered := c.registry[nk]
-		c.registryMu.RUnlock()
-
-		if !registered {
-			c.logWarn(ctx, "unregistered key in store, skipping",
-				log.String("namespace", entry.Namespace),
-				log.String("keyname", entry.Key),
-			)
-
-			continue
-		}
-
-		// Skip keys the changefeed already wrote during hydration — those
-		// values are by definition fresher than this List() snapshot.
-		c.hydratingMu.Lock()
-		_, touched := c.hydrationTouched[nk]
-		c.hydratingMu.Unlock()
-
-		if touched {
-			continue
-		}
-
-		var decoded any
-		if err := json.Unmarshal(entry.Value, &decoded); err != nil {
-			c.logWarn(ctx, "failed to unmarshal stored value, keeping default",
-				log.String("namespace", entry.Namespace),
-				log.String("keyname", entry.Key),
-				log.Err(err),
-			)
-
-			continue
-		}
-
-		// A row can predate the key's validator, or be written by an older
-		// binary, or straight into the table. Grading it here is what keeps
-		// in force a value the write path would also accept.
-		if err := validateStored(ctx, def.validator, decoded); err != nil {
-			// The error, never the value: a rejected value may be a secret.
-			c.logWarn(ctx, "stored value rejected by validator, keeping default",
-				log.String("namespace", entry.Namespace),
-				log.String("keyname", entry.Key),
-				log.Err(err),
-			)
-
-			continue
-		}
-
-		// Re-read `touched` and write the cache under one hold of
-		// hydratingMu. The check above is only a cheap skip: a refresh that
-		// lands while the validator runs marks the key and writes a fresher
-		// value, and this snapshot must not overwrite it. refreshFromStore
-		// marks the key BEFORE its own cache write and never takes cacheMu
-		// under hydratingMu, so this nesting orders the two writes without
-		// inverting the locks.
-		c.hydratingMu.Lock()
-
-		if _, touchedNow := c.hydrationTouched[nk]; !touchedNow {
-			c.cacheMu.Lock()
-			c.cache[nk] = decoded
-			c.cacheMu.Unlock()
-		}
-
-		c.hydratingMu.Unlock()
-	}
 
 	return nil
 }
@@ -433,15 +231,6 @@ func (c *Client) Close() error {
 			c.lifecycleCancel()
 		}
 
-		if c.storeUnsubscribe != nil {
-			c.storeUnsubscribe()
-			c.storeUnsubscribe = nil
-		}
-
-		if c.debouncer != nil {
-			c.debouncer.Close()
-		}
-
 		// Engine first, store second, and the order is load-bearing: the
 		// engine cancels its lifecycle, unsubscribes every scope, drops
 		// pending re-reads and drains its dispatch workers before returning,
@@ -462,183 +251,4 @@ func (c *Client) Close() error {
 	})
 
 	return closeErr
-}
-
-// onEvent debounces a backend event by (namespace, key) and refreshes the
-// cache when the debounce window closes. Single-tenant mode only.
-func (c *Client) onEvent(evt store.Event) {
-	nk := nskey{Namespace: evt.Namespace, Key: evt.Key}
-
-	if c.debouncer == nil {
-		c.refreshFromStore(nk, evt.Op)
-
-		return
-	}
-
-	op := evt.Op
-
-	c.debouncer.Submit(nk, func() {
-		c.refreshFromStore(nk, op)
-	})
-}
-
-// recoverRefresh reports a panic raised under a changefeed re-read, naming the
-// key it happened on.
-//
-// The debouncer's guard catches the panic either way, and this is what that
-// guard cannot say: runtime.RecoverAndLog logs source="debounce" and nothing
-// else, and in production mode the recovered value and the stack are redacted
-// out of that line, so an operator learns something under the debouncer blew up
-// and never which namespace or key. internal/engine.(*Engine).recoverRefresh is
-// the same guard on the v4 path.
-//
-// HandlePanicValue rather than a re-panic into that net because only it records
-// panic_recovered_total and the span event: RecoverAndLog takes no context and
-// records neither, so recovering here counts the panic once instead of not at
-// all. The recovered value stays out of the identity line — it is whatever the
-// panicking code was holding, and redacting it belongs with the handler.
-func (c *Client) recoverRefresh(nk nskey) {
-	recovered := recover()
-	if recovered == nil {
-		return
-	}
-
-	ctx := c.lifecycleCtx
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	c.logError(ctx, "systemplane: changefeed re-read panicked",
-		log.String("namespace", nk.Namespace),
-		log.String("keyname", nk.Key),
-	)
-
-	runtime.HandlePanicValue(ctx, c.logger, recovered, "systemplane.client", "refresh")
-}
-
-func (c *Client) refreshFromStore(nk nskey, op string) {
-	defer c.recoverRefresh(nk)
-
-	c.registryMu.RLock()
-	def, registered := c.registry[nk]
-	c.registryMu.RUnlock()
-
-	if !registered {
-		c.logWarn(context.Background(), "changefeed event for unregistered key, skipping",
-			log.String("namespace", nk.Namespace),
-			log.String("keyname", nk.Key),
-		)
-
-		return
-	}
-
-	// Use the Client's lifecycle context as the parent so a Close() cancels
-	// the refresh and all downstream subscriber invocations.
-	parent := c.lifecycleCtx
-	if parent == nil {
-		parent = context.Background()
-	}
-
-	ctx, cancel := context.WithTimeout(parent, refreshTimeout)
-	defer cancel()
-
-	newValue := engine.Clone(def.defaultValue)
-
-	if op != store.OpDelete {
-		entry, found, err := c.store.Get(ctx, store.Scope{}, nk.Namespace, nk.Key)
-		if err != nil {
-			c.logWarn(ctx, "refresh from store failed",
-				log.String("namespace", nk.Namespace),
-				log.String("keyname", nk.Key),
-				log.Err(err),
-			)
-
-			return
-		}
-
-		if !found {
-			// The change notification and this re-read are separate
-			// operations: the write may simply not be visible to this reader
-			// yet. A real removal arrives as store.OpDelete and is handled
-			// above, so a miss here is a non-answer — keep the last
-			// known-good value instead of resetting to the default.
-			c.logWarn(ctx, "refreshed key not found in store, keeping current value",
-				log.String("namespace", nk.Namespace),
-				log.String("keyname", nk.Key),
-			)
-
-			return
-		}
-
-		var decoded any
-		if err := json.Unmarshal(entry.Value, &decoded); err != nil {
-			c.logWarn(ctx, "failed to unmarshal refreshed value, keeping current",
-				log.String("namespace", nk.Namespace),
-				log.String("keyname", nk.Key),
-				log.Err(err),
-			)
-
-			return
-		}
-
-		// Same grading as hydrate: a value arriving through the changefeed
-		// was written by whoever wrote the row, not necessarily through Set.
-		if err := validateStored(ctx, def.validator, decoded); err != nil {
-			// The error, never the value: a rejected value may be a secret.
-			c.logWarn(ctx, "refreshed value rejected by validator, keeping current value",
-				log.String("namespace", nk.Namespace),
-				log.String("keyname", nk.Key),
-				log.Err(err),
-			)
-
-			return
-		}
-
-		newValue = decoded
-	}
-
-	// Record that hydration's later List() pass MUST NOT overwrite this key:
-	// the changefeed has just delivered a fresher value (or a delete event).
-	// We set this AFTER the refresh has produced a usable value — if Get
-	// failed, reported not-found, or the JSON decode failed, we return above
-	// without touching the cache, so hydrate()'s List() snapshot remains the
-	// correct source of truth.
-	c.hydratingMu.Lock()
-	if c.hydrating && c.hydrationTouched != nil {
-		c.hydrationTouched[nk] = struct{}{}
-	}
-	c.hydratingMu.Unlock()
-
-	c.cacheMu.Lock()
-	c.cache[nk] = engine.Clone(newValue)
-	c.cacheMu.Unlock()
-
-	// Fire subscribers with the lifecycle context (NOT the per-refresh timeout
-	// context); subscribers may outlive the Get call's bounded timeout.
-	dispatchCtx := c.lifecycleCtx
-	if dispatchCtx == nil {
-		dispatchCtx = context.Background()
-	}
-
-	c.fireSubscribers(dispatchCtx, nk, engine.Clone(newValue))
-}
-
-// fireSubscribers invokes all OnChange callbacks for a key with panic
-// recovery. ctx is derived from the Client's lifecycle so subscribers receive
-// cancellation when the Client shuts down.
-func (c *Client) fireSubscribers(ctx context.Context, nk nskey, newValue any) {
-	c.subsMu.RLock()
-	subs := make([]subscription, len(c.subscribers[nk]))
-	copy(subs, c.subscribers[nk])
-	c.subsMu.RUnlock()
-
-	for _, sub := range subs {
-		fn := sub.fn
-
-		func() {
-			defer runtime.RecoverAndLog(c.logger, "systemplane.onchange")
-
-			fn(ctx, engine.Clone(newValue))
-		}()
-	}
 }

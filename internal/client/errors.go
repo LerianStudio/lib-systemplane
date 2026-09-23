@@ -44,9 +44,4 @@ var (
 	// mode and the caller's context carries no tenant database for the
 	// configured module.
 	ErrTenantConnectionMissing = store.ErrTenantConnectionMissing
-
-	// errValidatorPanicked reports that a key's registered validator panicked
-	// while grading a value read back from the store. It is never returned to a
-	// caller: hydration and refresh log it and keep the value already in force.
-	errValidatorPanicked = errors.New("systemplane: validator panicked")
 )

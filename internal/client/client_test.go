@@ -49,6 +49,33 @@ type memStore struct {
 	// (entry, found) result is returned instead of the stored one, letting a
 	// test simulate a read that does not yet see a row that exists.
 	getHook func(ns, key string) (entry store.Entry, found, handled bool)
+
+	// listErr is returned by the next List and then cleared, standing in for a
+	// database that blinked once while the Client was starting.
+	listErr error
+
+	// silent makes Subscribe register without announcing a connected
+	// changefeed, standing in for a backend whose connection never comes up.
+	// Start then waits for a resync that has to be fired by hand.
+	silent bool
+}
+
+// failListOnce makes the next List fail, so a test can drive a first reconcile
+// that reports an error and then retry it.
+func (m *memStore) failListOnce(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.listErr = err
+}
+
+// staySilent makes every later Subscribe register without announcing a
+// connected changefeed.
+func (m *memStore) staySilent() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.silent = true
 }
 
 func newMemStore(multiTenant bool) *memStore {
@@ -126,6 +153,12 @@ func (m *memStore) List(_ context.Context, _ store.Scope) ([]store.Entry, error)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if err := m.listErr; err != nil {
+		m.listErr = nil
+
+		return nil, err
+	}
+
 	out := make([]store.Entry, 0, len(m.entries))
 	for _, e := range m.entries {
 		out = append(out, e)
@@ -145,11 +178,17 @@ func (m *memStore) Subscribe(_ context.Context, _ store.Scope, fn func(store.Eve
 	m.subs[id] = fn
 	m.subsMu.Unlock()
 
+	m.mu.Lock()
+	silent := m.silent
+	m.mu.Unlock()
+
 	// Announce a connected changefeed, exactly as a real backend does after
 	// every (re)connect (FC-2). The engine answers OpResync with the scope's
 	// first reconcile, which is what Start waits on; a fake that stays silent
 	// blocks Start forever.
-	fn(store.Event{Op: store.OpResync})
+	if !silent {
+		fn(store.Event{Op: store.OpResync})
+	}
 
 	return func() {
 		m.subsMu.Lock()
@@ -1121,9 +1160,7 @@ func TestRefreshOnDeleteEventRestoresDefault(t *testing.T) {
 
 // TestGetEntryPopulatesPublishedState pins FC-5: GetEntry reports the value in
 // force plus the provenance of the persisted row backing it, and reports
-// ok == false for an unregistered key. Stale is never true in wave 1, and the
-// caches hold only values, so a cached row reports Revision 0 and no
-// provenance until engine-core lands.
+// ok == false for an unregistered key.
 func TestGetEntryPopulatesPublishedState(t *testing.T) {
 	updatedAt := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
 
@@ -1134,9 +1171,13 @@ func TestGetEntryPopulatesPublishedState(t *testing.T) {
 		key    string
 		want   Entry
 		wantOK bool
+		// provenance replaces the whole-struct comparison for a case whose
+		// UpdatedAt is a clock reading rather than a literal. Only Value is
+		// compared against want; everything else is this function's business.
+		provenance func(t *testing.T, got Entry)
 	}{
 		{
-			name: "single-tenant cache hit reports the cached value without provenance",
+			name: "single-tenant hit reports the written row's revision and provenance",
 			setup: func(t *testing.T) *Client {
 				t.Helper()
 
@@ -1150,6 +1191,21 @@ func TestGetEntryPopulatesPublishedState(t *testing.T) {
 			key:    "k",
 			want:   Entry{Value: "from-cache"},
 			wantOK: true,
+			provenance: func(t *testing.T, got Entry) {
+				t.Helper()
+
+				if got.Revision != 1 {
+					t.Errorf("Revision = %d, want 1: the revision the store assigned to this write", got.Revision)
+				}
+
+				if got.UpdatedBy != "actor" {
+					t.Errorf("UpdatedBy = %q, want the actor that wrote the row", got.UpdatedBy)
+				}
+
+				if got.UpdatedAt.IsZero() {
+					t.Error("UpdatedAt is zero: a row is in force, so the entry must carry when it was written")
+				}
+			},
 		},
 		{
 			name: "default in force reports the registered default at revision 0",
@@ -1241,12 +1297,19 @@ func TestGetEntryPopulatesPublishedState(t *testing.T) {
 				t.Fatalf("ok = %v, want %v", ok, tt.wantOK)
 			}
 
-			if got != tt.want {
+			switch {
+			case tt.provenance != nil:
+				if got.Value != tt.want.Value {
+					t.Errorf("GetEntry value = %v, want %v", got.Value, tt.want.Value)
+				}
+
+				tt.provenance(t, got)
+			case got != tt.want:
 				t.Errorf("GetEntry = %+v, want %+v", got, tt.want)
 			}
 
 			if got.Stale {
-				t.Error("Stale = true; wave 1 never reports a stale entry")
+				t.Error("Stale = true; every case here has completed its first reconcile")
 			}
 
 			v, vOK, vErr := c.Get(ctx, "ns", tt.key)

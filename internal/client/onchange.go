@@ -4,7 +4,6 @@ package client
 import (
 	"context"
 	"fmt"
-	"sync"
 
 	"github.com/LerianStudio/lib-systemplane/v4/internal/engine"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/manager"
@@ -16,8 +15,23 @@ import (
 // subscription could never deliver anything, so refusing it surfaces the typo
 // instead of hiding it behind a callback that never fires.
 //
-// In single-tenant mode the callback fires whenever the changefeed echo for
-// (namespace, key) arrives.
+// In single-tenant mode deliveries are COALESCED per key and serialized, off
+// the changefeed goroutine: while fn runs, a newer revision of the same key
+// replaces the pending one, so fn may skip intermediate revisions but always
+// receives the newest and never sees revisions out of order. Different keys
+// deliver independently.
+//
+// A subscriber registered before [Client.Start] is handed the value in force
+// once, during Start, as the first reconcile publishes every registered key
+// (FC-11). That delivery runs while Start is still on the stack, which decides
+// what a callback may do:
+//
+//   - it may call Get, GetEntry, List and OnChange re-entrantly — no Client or
+//     engine lock is held while it runs;
+//   - Set and Delete called from that first delivery return ErrNotStarted,
+//     because Start has not returned yet;
+//   - Register, Start and Close block on the Client's start lock until Start
+//     returns, and during Close until the close timeout expires.
 //
 // In multi-tenant mode without a bound Manager, OnChange returns
 // ErrNotSupportedInMultiTenant — preserving the v1.4.0 contract for callers
@@ -70,38 +84,10 @@ func (c *Client) OnChange(namespace, key string, fn func(ctx context.Context, ch
 		return noop, nil
 	}
 
-	id := c.nextSubID.Add(1)
-
-	c.subsMu.Lock()
-	c.subscribers[nk] = append(c.subscribers[nk], subscription{
-		id: id,
-		// ctx is the Client's lifecycle context (passed in by fireSubscribers);
-		// callbacks receive cancellation when the Client shuts down. Falling
-		// back to context.Background() here would defeat that propagation.
-		fn: func(ctx context.Context, newValue any) {
-			// fireSubscribers already handed us a private clone.
-			fn(ctx, Change{Namespace: namespace, Key: key, Value: newValue})
-		},
-	})
-	c.subsMu.Unlock()
-
-	var once sync.Once
-
-	return func() {
-		once.Do(func() {
-			c.subsMu.Lock()
-			defer c.subsMu.Unlock()
-
-			subs := c.subscribers[nk]
-			for i, s := range subs {
-				if s.id == id {
-					c.subscribers[nk] = append(subs[:i], subs[i+1:]...)
-
-					return
-				}
-			}
-		})
-	}, nil
+	// Straight through: the engine builds the whole Change — tenant, revision,
+	// value — and hands each subscriber its own clone, so wrapping fn here
+	// would double-clone and drop the revision.
+	return c.engine.OnChange(engine.NSKey{Namespace: namespace, Key: key}, fn), nil
 }
 
 // managerCallback adapts a subscriber to the Manager dispatch signature. The

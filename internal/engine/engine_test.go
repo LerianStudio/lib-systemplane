@@ -5,6 +5,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -491,5 +492,95 @@ func TestStartFailsWhenFirstReconcilePanics(t *testing.T) {
 
 	if errors.Is(err, store.ErrValidation) {
 		t.Error("a panicked reconcile reports as a store validation failure; it is an internal engine failure")
+	}
+}
+
+// failListOnce makes the fake's next List fail and every later one succeed,
+// standing in for the transient store failure a consumer must be able to
+// retry Start after.
+func failListOnce(fs *fakeStore) {
+	var failed atomic.Bool
+
+	fs.onList(func(store.Scope) error {
+		if failed.CompareAndSwap(false, true) {
+			return errList
+		}
+
+		return nil
+	})
+}
+
+// TestStartRetriesAfterAFailedFirstReconcile pins that a first reconcile that
+// failed does not poison the engine for good. Start records its scope's first
+// outcome once and never rewrites it, so without a retry a consumer whose
+// database blinked at boot would get that same error from every later Start
+// for the life of the process.
+//
+// The retry lives here rather than in the Client discarding its engine: the
+// subscriber registry is the engine's and is keyed by key, not by scope, so a
+// discarded engine takes every OnChange registered before Start with it.
+func TestStartRetriesAfterAFailedFirstReconcile(t *testing.T) {
+	scope := store.Scope{}
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+
+	fs := newFakeStore()
+	fs.resyncOnSubscribe()
+	fs.seed(scope, store.Entry{Namespace: nk.Namespace, Key: nk.Key, Value: []byte(`"stored"`), Revision: 4})
+	failListOnce(fs)
+
+	e := startEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs)
+
+	if err := e.Start(startCtx(t, 2*time.Second)); !errors.Is(err, errList) {
+		t.Fatalf("first Start: got %v, want one wrapping %v", err, errList)
+	}
+
+	if err := e.Start(startCtx(t, 2*time.Second)); err != nil {
+		t.Fatalf("second Start: got %v, want nil — a store that blinked once must not be permanent", err)
+	}
+
+	got, ok := e.Lookup(scope, nk)
+	if !ok || got.Value != "stored" || got.Revision != 4 {
+		t.Fatalf("Lookup after the retry = (%+v, %v), want the stored row at revision 4", got, ok)
+	}
+
+	if got.Stale {
+		t.Error("the scope still reports Stale after a successful retry")
+	}
+}
+
+// TestStartRetryKeepsSubscriptions pins what the retry must not cost: an
+// OnChange registered before the failed Start still receives the announcement
+// the successful one makes (FC-11).
+func TestStartRetryKeepsSubscriptions(t *testing.T) {
+	scope := store.Scope{}
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+
+	fs := newFakeStore()
+	fs.resyncOnSubscribe()
+	fs.seed(scope, store.Entry{Namespace: nk.Namespace, Key: nk.Key, Value: []byte(`"stored"`), Revision: 4})
+	failListOnce(fs)
+
+	e := startEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs)
+
+	delivered := make(chan Change, 4)
+
+	unsubscribe := e.OnChange(nk, func(_ context.Context, ch Change) { delivered <- ch })
+	t.Cleanup(unsubscribe)
+
+	if err := e.Start(startCtx(t, 2*time.Second)); !errors.Is(err, errList) {
+		t.Fatalf("first Start: got %v, want one wrapping %v", err, errList)
+	}
+
+	if err := e.Start(startCtx(t, 2*time.Second)); err != nil {
+		t.Fatalf("second Start: got %v, want nil", err)
+	}
+
+	select {
+	case ch := <-delivered:
+		if ch.Value != "stored" || ch.Revision != 4 {
+			t.Errorf("announced %+v, want the stored row at revision 4", ch)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the subscriber registered before the failed Start never heard the retry's announcement")
 	}
 }

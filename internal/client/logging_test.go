@@ -65,7 +65,7 @@ func TestLogLinesNameTheKeyUnderKeyname(t *testing.T) {
 
 	t.Cleanup(func() { _ = c.Close() })
 
-	warns := logger.warns("stored value rejected by validator, keeping default")
+	warns := logger.warns("stored value rejected by validator, keeping cached value")
 	if len(warns) != 1 {
 		t.Fatalf("got %d WARN lines for the rejected stored value, want exactly 1", len(warns))
 	}
@@ -106,8 +106,11 @@ func TestNoLoggedFieldNameIsRedacted(t *testing.T) {
 // and in production mode the recovered value and the stack are redacted out of
 // that line (lib-observability/v4 runtime/recover.go logPanicWithStack), so an
 // operator learns something under the debouncer blew up and never which
-// namespace or key. internal/engine.(*Engine).recoverRefresh is the same guard
-// on the v4 path.
+// namespace or key. The guard is now the engine's, so the line is its own.
+//
+// source on the accounting line stays "refresh": runtime.HandlePanicValue puts
+// its NAME argument there and its component nowhere on the line, so "refresh"
+// is what names the call site that was recovered.
 func TestRefreshPanicNamesTheKey(t *testing.T) {
 	m := newMemStore(false)
 	logger := &recordingLogger{}
@@ -129,7 +132,7 @@ func TestRefreshPanicNamesTheKey(t *testing.T) {
 
 	m.fire(store.Event{Op: store.OpUpsert, Namespace: "ns", Key: "k"})
 
-	lines := logger.errs("systemplane: changefeed re-read panicked")
+	lines := logger.errs("systemplane.engine: changefeed re-read panicked")
 	if len(lines) != 1 {
 		t.Fatalf("got %d ERROR lines naming the panicking re-read, want exactly 1: %s", len(lines), logger.rendered())
 	}

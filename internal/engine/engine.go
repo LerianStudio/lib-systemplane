@@ -183,9 +183,22 @@ func New(cfg Config) *Engine {
 // opening a changefeed whose events it could not answer. A nil Engine reports
 // the same nil-backend sentinel; the read paths stay nil-safe instead.
 //
-// Start is idempotent: a second call finds the changefeed open and the first
-// reconcile finished, and returns that same recorded outcome without
+// Start is idempotent on success: a second call finds the changefeed open and
+// the first reconcile finished, and returns that same recorded outcome without
 // subscribing or listing again.
+//
+// A FAILED first reconcile is the exception, and deliberately so. Its outcome
+// is recorded once and no later reconcile rewrites it, so without a retry a
+// consumer whose database blinked during boot would get that same error from
+// every Start for the life of the process — a configuration library that needs
+// a new Client after one hiccup. So a Start that finds its scope's recorded
+// outcome is an error tears the scope down and brings it up again, and the
+// store's OpResync after the fresh Subscribe drives a fresh first reconcile.
+// Subscriptions survive it: they belong to the engine and are keyed by key,
+// never by scope, so an OnChange registered before the failed Start hears the
+// retry's announcement (FC-11). A ctx expiry needs none of this — the scope is
+// still subscribed and still waiting for its first resync, so the next Start
+// waits on the same channel.
 func (e *Engine) Start(ctx context.Context) error {
 	if e == nil {
 		return store.ErrNilBackend
@@ -204,6 +217,8 @@ func (e *Engine) Start(ctx context.Context) error {
 	}
 
 	scope := store.Scope{}
+
+	e.retryFailedScope(scope)
 
 	sc, err := e.bringUpScope(scope)
 	if err != nil {
@@ -230,6 +245,38 @@ func (e *Engine) Start(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// retryFailedScope drops scope when its first reconcile is on record as having
+// FAILED, so the Start that follows brings it up again from nothing.
+//
+// It runs under the same lock as bring-up, which is what keeps two concurrent
+// Starts from dropping the scope the other has just rebuilt. A scope whose
+// first reconcile has not finished is left alone: it is still subscribed and
+// its resync is still coming, and tearing it down would throw away the
+// changefeed the caller is waiting on.
+func (e *Engine) retryFailedScope(scope store.Scope) {
+	e.startMu.Lock()
+	defer e.startMu.Unlock()
+
+	sc := e.trackedScope(scope)
+	if sc == nil {
+		return
+	}
+
+	select {
+	case <-sc.firstReconcileDone:
+	default:
+		return
+	}
+
+	sc.mu.RLock()
+	failed := sc.firstReconcileErr != nil
+	sc.mu.RUnlock()
+
+	if failed {
+		e.dropScope(scope)
+	}
 }
 
 // bringUpScope creates scope's state and opens its changefeed, exactly once.
