@@ -71,6 +71,28 @@ func (e *Engine) onEvent(evt store.Event) {
 
 	nk := NSKey{Namespace: evt.Namespace, Key: evt.Key}
 
+	// A key this process never registered is dropped here, at the feed, rather
+	// than after a re-read the ingress throws away. `systemplane_entries` is
+	// one table per database and every consumer sharing it notifies on its own
+	// keys, so answering a foreign upsert cost a debounce timer, a goroutine
+	// Close waits for and a pooled connection, per foreign write.
+	//
+	// The registry is final by the time any event can arrive: Register after
+	// Start returns ErrRegisterAfterStart, and Start opens the changefeed only
+	// after that door has shut. Outcomes are unchanged — prepare rejects the
+	// same rows on the upsert path, ingestDefault the same keys on the delete
+	// path, and a nil registry still reports nothing registered, so it rejects
+	// everything exactly as before.
+	if _, registered := e.lookup(nk.Namespace, nk.Key); !registered {
+		e.logDebug(e.dispatchContext(), "changefeed event for unregistered key, skipping",
+			log.String(constants.AttrKeyTenantID, evt.Scope.Tenant),
+			log.String("namespace", nk.Namespace),
+			log.String("keyname", nk.Key),
+		)
+
+		return
+	}
+
 	if evt.Op == store.OpDelete {
 		e.applyDelete(evt.Scope, nk)
 

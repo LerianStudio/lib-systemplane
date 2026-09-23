@@ -299,17 +299,28 @@ func TestLogLevelReReadWithNoRowIsDebug(t *testing.T) {
 	requireLogged(t, rec, log.LevelDebug, "changefeed re-read found no row, keeping current value", nk)
 }
 
-// TestLogLevelNoRowEventForUnregisteredKeyIsDebug pins the delete of a key this
-// process never registered. A store legitimately holds another service's keys
-// in the same table, so those deletes are ordinary traffic on the feed — at
-// WARN they would bury the rejections that matter.
-func TestLogLevelNoRowEventForUnregisteredKeyIsDebug(t *testing.T) {
+// TestLogLevelUnregisteredFeedEventIsDebug pins the feed's registry filter for
+// both operations. A store legitimately holds another service's keys in the
+// same table, so notifications about them are ordinary traffic — at WARN they
+// would bury the rejections that matter, once per foreign write.
+func TestLogLevelUnregisteredFeedEventIsDebug(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "unknown"}
-	e, rec := loggingEngine(t, map[NSKey]KeyDef{}, newFakeStore())
 
-	e.onEvent(deleteEvent(store.Scope{}, nk))
+	for _, tc := range []struct {
+		name string
+		evt  store.Event
+	}{
+		{name: "upsert", evt: upsertEvent(store.Scope{}, nk, 1)},
+		{name: "delete", evt: deleteEvent(store.Scope{}, nk)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e, rec := loggingEngine(t, map[NSKey]KeyDef{}, newFakeStore())
 
-	requireLogged(t, rec, log.LevelDebug, "no-row event for unregistered key, skipping", nk)
+			e.onEvent(tc.evt)
+
+			requireLogged(t, rec, log.LevelDebug, "changefeed event for unregistered key, skipping", nk)
+		})
+	}
 }
 
 // requireLoggedAt asserts the single entry with this message was emitted at

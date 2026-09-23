@@ -665,3 +665,43 @@ func TestSlowValidatorDoesNotBlockTheChangefeedGoroutine(t *testing.T) {
 	close(release)
 	<-reread
 }
+
+// TestForeignUpsertEventCostsNoStoreRead pins the filter that keeps another
+// service's traffic off this engine's store. `systemplane_entries` is one
+// table per database, so every consumer sharing it emits notifications for
+// keys this process never registered; answering each one with a debounce timer
+// and a pooled connection buys a row the ingress throws away.
+//
+// Both quiet windows are covered because they take different paths out of
+// onEvent: zero runs the re-read inline on the changefeed goroutine, non-zero
+// arms a timer and a tracked goroutine.
+func TestForeignUpsertEventCostsNoStoreRead(t *testing.T) {
+	foreign := NSKey{Namespace: "billing", Key: "another-service"}
+	mine := NSKey{Namespace: "billing", Key: "limits"}
+
+	for _, tc := range []struct {
+		name   string
+		window time.Duration
+	}{
+		{name: "inline", window: 0},
+		{name: "debounced", window: 20 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := newFakeStore()
+			fs.seed(store.Scope{}, jsonRow(foreign, 1, `"theirs"`, "them"))
+
+			e := feedEngine(t, map[NSKey]KeyDef{mine: {Default: "fallback"}}, fs, tc.window)
+
+			e.onEvent(upsertEvent(store.Scope{}, foreign, 1))
+
+			// The sentinel goes through the same debouncer with the same
+			// window and is armed after the event above, so its delivery
+			// proves any window that event opened has already closed.
+			quiesce(t, e)
+
+			if reads := fs.getCount(); reads != 0 {
+				t.Errorf("store reads for an upsert on a key this process never registered: got %d, want 0", reads)
+			}
+		})
+	}
+}
