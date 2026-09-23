@@ -18,8 +18,8 @@ import (
 )
 
 // groupMemoryStore is this file's own fake store. Every helper here is
-// prefixed "group" so it can never collide with the apiMemoryStore helpers
-// that live alongside the per-key facade tests.
+// prefixed "group" so it can never collide with the fake store helpers that
+// live alongside the per-key facade tests in api_client_test.go.
 type groupMemoryStore struct {
 	mu      sync.Mutex
 	entries map[string]systemplane.TestEntry

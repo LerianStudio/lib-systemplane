@@ -290,8 +290,8 @@ func (g *Group[T]) Snapshot(ctx context.Context) (Snapshot[T], error) {
 		return Snapshot[T]{}, err
 	}
 
-	// A group's key is registered by construction, so !ok means the Client was
-	// torn down underneath the group.
+	// Defensive guard: GetEntry reports !ok only for an unregistered key, and a
+	// group's own key is registered by construction, so this cannot fire.
 	if !ok {
 		return Snapshot[T]{}, fmt.Errorf("%w: %s/%s", ErrUnknownKey, g.namespace, g.key)
 	}
@@ -377,9 +377,11 @@ type Applied[T any] struct {
 // accepted by the function furthest behind, so it means the document is in force
 // everywhere; with no function registered nothing can lag and the scope reads as
 // converged. LastErr holds the last rejection and survives until every
-// registered function has accepted the newest published revision. Only an
-// acceptance clears it: unregistering every function, including the last one
-// unsubscribing from inside its own delivery, leaves the rejection standing.
+// registered function has accepted the newest published revision. It clears
+// when every function still registered has accepted the newest observation: an
+// acceptance, or the departure of the function that was holding the scope back.
+// Unregistering every function never clears it, including the last one
+// unsubscribing from inside its own delivery.
 // So a group nobody applies keeps reporting its last rejection rather than
 // reading healthy while it is being torn down.
 //

@@ -152,6 +152,12 @@ type delivery[T any] struct {
 // unbounded rather than deadlocked: an applier that publishes on EVERY delivery
 // keeps the fan-out looping forever.
 //
+// FC-7's "same non-zero revision with the same value bytes is never delivered
+// twice" is satisfied upstream: the Client's OnChange (FC-4) dedupes by
+// revision and bytes before the single subscription a group takes, so the
+// coordinator dedupes only by arrival sequence and owns only the seed
+// watermark.
+//
 // A nil *Coordinator is safe: Publish and Register are no-ops and Status
 // returns nil.
 type Coordinator[T any] struct {
@@ -429,9 +435,11 @@ func (c *Coordinator[T]) add(fn ApplyFunc[T]) (uint64, []*scope[T], seedOutcome)
 // accepted, so it means the document is in force everywhere; with no applier
 // registered nothing can lag and the scope reads as converged. LastErr holds
 // the last rejection and survives until every registered applier has accepted
-// the scope's newest observation. Only an acceptance clears it: unregistering
-// every applier, including the last one unsubscribing from inside its own
-// delivery, leaves the rejection standing. So a scope nobody applies keeps
+// the scope's newest observation. It clears when every applier still
+// registered has accepted the newest observation: an acceptance, or the
+// departure of the applier that was holding the scope back. Unregistering every
+// applier never clears it, including the last one unsubscribing from inside its
+// own delivery. So a scope nobody applies keeps
 // reporting its last rejection rather than reading healthy while it is being
 // torn down.
 //
