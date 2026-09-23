@@ -268,7 +268,7 @@ func TestRefreshRunsTheValidatorOnRefreshedValues(t *testing.T) {
 		// up in force.
 		seedEntry(t, m, "ns", "k", "accepted-from-list")
 
-		listReady := make(chan struct{})
+		listReady := make(chan struct{}, 1)
 		listRelease := make(chan struct{})
 		m.listHook = func() {
 			select {
