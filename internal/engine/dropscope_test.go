@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -582,4 +583,99 @@ func runningCount(e *Engine) int {
 	})
 
 	return n
+}
+
+// TestRereadRefusesAScopeDroppedDuringTheStoreCall closes the last window a
+// changefeed re-read leaves open. refreshKey resolves the scope, then spends a
+// whole network round trip outside every lock — deliberately, so a slow store
+// cannot stall the scope's reconciles — and a tenant suspended in the meantime
+// is gone by the time the row comes back.
+//
+// Publishing that row re-created the scope: tracked, readable, with no
+// changefeed behind it and no reconcile goroutine to confirm it, holding a
+// value for a tenant whose database this process is no longer entitled to
+// read. Re-resolving the scope after the round trip is what refuses it, and
+// nothing else covers that guard — the pre-call check passes, because at that
+// point the scope is still very much alive.
+//
+// The drop is driven from inside Store.Get rather than raced for: that is
+// exactly where the re-read is when a suspension lands, and the fake invokes
+// the hook outside its own lock, the way a real driver holds nothing of the
+// engine's.
+func TestRereadRefusesAScopeDroppedDuringTheStoreCall(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+
+	for _, tc := range []struct {
+		name string
+		// hook runs inside Store.Get, after the scope has been dropped.
+		hook func()
+		// panics says the re-read unwinds instead of returning a row, which
+		// takes the recovery — and its own scope resolution — down the same
+		// untracked path.
+		panics bool
+	}{
+		{
+			name: "the row comes back after the tenant is gone",
+			hook: func() {},
+		},
+		{
+			// The recovery resolves the scope of its own to fence the key as
+			// unusable, so a panic raised after the drop is the one path that
+			// reaches that resolution with nothing to resolve.
+			name:   "the store explodes after the tenant is gone",
+			hook:   func() { panic("the store driver exploded") },
+			panics: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := newFakeStore()
+			rec := &recordingLogger{Logger: log.NewNop()}
+			e := loggingEngineWith(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, rec)
+
+			bringUp(t, e, dropTenant)
+			fs.seed(dropTenant, jsonRow(nk, 7, `"seven"`, "ops"))
+
+			var delivered recorder
+
+			unsub := e.OnChange(nk, delivered.record)
+			defer unsub()
+
+			fs.onGet(func(scope store.Scope, _ NSKey) error {
+				e.dropScope(scope)
+				tc.hook()
+
+				return nil
+			})
+
+			// A zero quiet window runs the re-read inline on this goroutine,
+			// so the publication has already been decided — or refused — by
+			// the time onEvent returns.
+			e.onEvent(upsertEvent(dropTenant, nk, 7))
+
+			if tracked(e, dropTenant) {
+				t.Error("the re-read re-created the tenant scope after it was dropped mid-Get: " +
+					"it has no changefeed and no reconcile goroutine, and reads would report it as current")
+			}
+
+			if _, ok := e.Lookup(dropTenant, nk); ok {
+				t.Error("a row read for a dropped tenant became readable")
+			}
+
+			if got := delivered.len(); got != 0 {
+				t.Errorf("%d Change(s) delivered for a tenant dropped mid-Get, want 0", got)
+			}
+
+			if !tc.panics {
+				return
+			}
+
+			// The identity line is the whole point of the engine's own
+			// recovery, and it must survive a scope that no longer exists:
+			// resolving the scope to fence the key comes first, and a
+			// recovery that dereferenced the miss would take the process with
+			// it instead of naming the key.
+			requireLogged(t, rec, log.LevelError, rereadPanicMsg, dropTenant, nk)
+			requirePanicAccounted(t, rec, "refresh")
+		})
+	}
 }

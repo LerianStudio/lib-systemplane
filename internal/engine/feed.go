@@ -124,15 +124,6 @@ func (e *Engine) onEvent(evt store.Event) {
 		return
 	}
 
-	// A nil debouncer refreshes inline rather than dropping the event:
-	// swallowing a changefeed notification would leave the cache silently
-	// behind the store until the next reconcile.
-	if e.debouncer == nil {
-		e.refreshKey(evt.Scope, nk)
-
-		return
-	}
-
 	// With a real quiet window the debouncer fires the re-read on a timer
 	// goroutine of its own, which Close must wait for: an untracked one is
 	// still inside Store.Get after Close has returned and the Client is about
@@ -206,10 +197,10 @@ func (e *Engine) trackedRefresh(scope store.Scope, nk NSKey) {
 // key it happened on, and records that key as unusable.
 //
 // It is deferred by refreshKey rather than by the one caller that wraps it, so
-// all three re-read paths carry the identity: the tracked one, the inline one
-// a consumer on WithDebounce(0) takes, and the one an engine with no debouncer
-// takes. The debouncer's own guard would catch a panic on two of them, and
-// that is what this replaces at the top of the stack rather than duplicates:
+// both re-read paths carry the identity: the tracked one, and the inline one a
+// consumer on WithDebounce(0) takes. The debouncer's own guard would catch a
+// panic on either, and that is what this replaces at the top of the stack
+// rather than duplicates:
 // runtime.RecoverAndLog logs source="debounce" and nothing else, and in
 // production mode the value and the stack are redacted out of that line, so an
 // operator learns something under the debouncer blew up and never which
@@ -354,8 +345,8 @@ func (e *Engine) applyDelete(scope store.Scope, nk NSKey) {
 // A panic under any of it is the fourth, and recoverRefresh decides it: the
 // deferred recovery lives here, on the one function every re-read path runs
 // through, so an exploding store call names its key whether the re-read was
-// tracked, inline or debouncer-less. A validator that panics never reaches it
-// — runValidator turns that into an ordinary rejection.
+// tracked or inline. A validator that panics never reaches it — runValidator
+// turns that into an ordinary rejection.
 func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
 	defer e.recoverRefresh(scope, nk)
 

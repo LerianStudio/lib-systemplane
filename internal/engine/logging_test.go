@@ -929,9 +929,9 @@ func TestScopeDropDiagnosticsAreDebug(t *testing.T) {
 }
 
 // rereadPanicMsg is the one line a panic under a changefeed re-read produces,
-// whichever of the three re-read paths raised it. It says "changefeed" rather
-// than "debounced" because two of those paths are not debounced at all: a
-// consumer on WithDebounce(0), and an engine built with no debouncer.
+// whichever of the two re-read paths raised it. It says "changefeed" rather
+// than "debounced" because one of those paths is not debounced at all: the
+// inline re-read a consumer on WithDebounce(0) takes.
 const rereadPanicMsg = "systemplane.engine: changefeed re-read panicked"
 
 // panicRecoveredMsg is the line lib-observability's own handler emits, and the
@@ -958,103 +958,98 @@ func requirePanicAccounted(t *testing.T, r *recordingLogger, source string) {
 	}
 }
 
-// TestDebouncedReReadPanicNamesTheKey pins the identity on the one panic the
-// debouncer alone would report anonymously.
+// TestReReadPanicNamesTheKey pins the identity on the one panic the debouncer
+// alone would report anonymously.
 //
 // runtime.RecoverAndLog, the debouncer's generic guard, logs source="debounce"
 // and — in production mode — a redacted value with no stack, so an operator
 // paged by it learns something under the debouncer blew up and never which
 // tenant, namespace or key. The engine's own recovery is what turns that into
-// an actionable line, and the engine stays usable afterwards: the re-read is
-// dropped, not the process.
-func TestDebouncedReReadPanicNamesTheKey(t *testing.T) {
-	const msg = rereadPanicMsg
-
-	nk := NSKey{Namespace: "billing", Key: "limits"}
-	scope := store.Scope{Tenant: "acme"}
-	fs := newFakeStore()
-	rec := &recordingLogger{Logger: log.NewNop()}
-
-	e := New(Config{
-		Store:    fs,
-		Registry: fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: "fallback"}}},
-		Logger:   rec,
-		Debounce: time.Millisecond,
-	})
-	track(t, e, scope)
-
-	fs.onGet(func(store.Scope, NSKey) error { panic("the store driver exploded") })
-
-	e.onEvent(upsertEvent(scope, nk, 1))
-
-	// Both lines, because the engine's own is emitted first: waiting on it
-	// alone would read the accounting line before the handler wrote it.
-	waitFor(t, time.Second, "the panicking re-read to be reported and accounted", func() bool {
-		var reported, accounted bool
-
-		for _, r := range rec.snapshot() {
-			switch r.Msg {
-			case msg:
-				reported = true
-			case panicRecoveredMsg:
-				accounted = true
-			}
-		}
-
-		return reported && accounted
-	})
-
-	requireLogged(t, rec, log.LevelError, msg, scope, nk)
-	requirePanicAccounted(t, rec, "refresh")
-
-	tenant, ok := findLogged(rec, msg).field(constants.AttrKeyTenantID)
-	if !ok || tenant.Value != scope.Tenant {
-		t.Errorf("%q tenant field: got %v (present=%t), want %q: a panic naming no tenant sends an "+
-			"operator through every tenant's logs", msg, tenant.Value, ok, scope.Tenant)
-	}
-
-	if err := e.Close(); err != nil {
-		t.Fatalf("Close after a panicking re-read: %v, want nil: one exploding store call must not "+
-			"strand shutdown", err)
-	}
-}
-
-// TestInlineReReadPanicNamesTheKey is the twin of the test above for the path
-// a consumer on WithDebounce(0) takes — a documented production mode, not only
-// a test convenience — and for an engine built with no debouncer at all.
+// an actionable line.
 //
-// Both refresh inline instead of on a timer goroutine, so neither ever entered
-// the recovery that named the key: the panic was reported by the debouncer's
-// anonymous guard, which in production mode redacts the value and the stack
-// and leaves an operator with "something under the debouncer blew up".
-func TestInlineReReadPanicNamesTheKey(t *testing.T) {
+// Both quiet windows are covered because they reach the recovery by different
+// routes: zero runs the re-read inline on the changefeed goroutine — a
+// documented production mode, not only a test convenience — and non-zero hands
+// it to a timer goroutine the WaitGroup tracks. Neither may lose the identity.
+//
+// Each case then proves the engine survives its own panic rather than merely
+// reporting it: the exploding hook is cleared, a newer row is seeded, and a
+// second notification for the same key has to travel the whole path again —
+// re-read, ingress, publish, delivery. A recovery that left the key fenced,
+// the scope locked or the debouncer's timer entry behind would go silent here
+// while the first half of the test still passed.
+func TestReReadPanicNamesTheKey(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 	scope := store.Scope{Tenant: "acme"}
-	fs := newFakeStore()
-	rec := &recordingLogger{Logger: log.NewNop()}
 
-	// No Debounce: Submit runs the re-read inline, on this goroutine.
-	e := New(Config{
-		Store:    fs,
-		Registry: fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: "fallback"}}},
-		Logger:   rec,
-	})
-	track(t, e, scope)
+	for _, tc := range []struct {
+		name   string
+		window time.Duration
+	}{
+		{name: "inline", window: 0},
+		{name: "debounced", window: time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := newFakeStore()
+			rec := &recordingLogger{Logger: log.NewNop()}
 
-	fs.onGet(func(store.Scope, NSKey) error { panic("the store driver exploded") })
+			e := New(Config{
+				Store:    fs,
+				Registry: fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: "fallback"}}},
+				Logger:   rec,
+				Debounce: tc.window,
+			})
+			track(t, e, scope)
 
-	e.onEvent(upsertEvent(scope, nk, 1))
+			t.Cleanup(func() { _ = e.Close() })
 
-	requireLogged(t, rec, log.LevelError, rereadPanicMsg, scope, nk)
+			fs.onGet(func(store.Scope, NSKey) error { panic("the store driver exploded") })
 
-	tenant, ok := findLogged(rec, rereadPanicMsg).field(constants.AttrKeyTenantID)
-	if !ok || tenant.Value != scope.Tenant {
-		t.Errorf("%q tenant field: got %v (present=%t), want %q: a panic naming no tenant sends an "+
-			"operator through every tenant's logs", rereadPanicMsg, tenant.Value, ok, scope.Tenant)
-	}
+			e.onEvent(upsertEvent(scope, nk, 1))
 
-	if err := e.Close(); err != nil {
-		t.Fatalf("Close after a panicking inline re-read: %v, want nil", err)
+			// Both lines, because the engine's own is emitted first: waiting
+			// on it alone would read the accounting line before the handler
+			// wrote it.
+			waitFor(t, hangGuard, "the panicking re-read to be reported and accounted", func() bool {
+				var reported, accounted bool
+
+				for _, r := range rec.snapshot() {
+					switch r.Msg {
+					case rereadPanicMsg:
+						reported = true
+					case panicRecoveredMsg:
+						accounted = true
+					}
+				}
+
+				return reported && accounted
+			})
+
+			// requireLogged carries the tenant assertion: a panic naming a
+			// namespace and a key and no tenant sends an operator through
+			// every tenant's logs to find which one exploded.
+			requireLogged(t, rec, log.LevelError, rereadPanicMsg, scope, nk)
+			requirePanicAccounted(t, rec, "refresh")
+
+			fs.onGet(nil)
+			fs.seed(scope, jsonRow(nk, 2, `"after"`, "ops"))
+
+			var delivered recorder
+
+			unsub := e.OnChange(nk, delivered.record)
+			defer unsub()
+
+			e.onEvent(upsertEvent(scope, nk, 2))
+
+			waitFor(t, hangGuard, "the key to be published after the panic", func() bool {
+				return delivered.len() == 1
+			})
+
+			if got := delivered.changes()[0]; got.Value != "after" || got.Revision != 2 {
+				t.Errorf("delivered (rev %d, %v) after a panicking re-read, want (rev 2, %q)",
+					got.Revision, got.Value, "after")
+			}
+		})
 	}
 }
 
