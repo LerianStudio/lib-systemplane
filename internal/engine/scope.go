@@ -49,21 +49,28 @@ type scopeState struct {
 	// and never waits on a List that is in flight.
 	//
 	// reconcileStop is closed when the scope is dropped, so the goroutine ends
-	// with the scope instead of lingering until Close. workerStarted and
-	// workersDropped are guarded by Engine.workersMu, alongside the WaitGroup
-	// the goroutines are registered in.
+	// with the scope instead of lingering until Close. workers, workerStarted
+	// and workersDropped are guarded by Engine.workersMu, alongside the
+	// WaitGroup the goroutines are registered in.
+	//
+	// workers holds this scope's delivery goroutines, one per key that has
+	// actually published a change to a subscribed key. It lives on the state
+	// rather than in one engine-wide map keyed by scope, for the same reason
+	// workersDropped does: a scope dropped and brought back up is a NEW state,
+	// so the drop's sweep reaches only the workers of the state it is ending,
+	// and a re-activation racing that sweep keeps its own. The sweep also
+	// touches only this scope's keys instead of walking every tenant's under
+	// the lock each publication takes.
 	//
 	// workersDropped is set when this scope's delivery workers are swept, and
-	// refuses every later one. It lives on the state rather than in a map
-	// keyed by scope for the same reason publish takes the caller's own state:
-	// a scope dropped and brought back up is a NEW state, so a publisher still
-	// holding the old one is refused forever while the new one starts workers
-	// freely.
+	// refuses every later one. A publisher still holding the old state is
+	// refused forever while the new one starts workers freely.
 	resyncMu       sync.Mutex
 	resyncPending  *reconcileArming
 	resyncSignal   chan struct{}
 	reconcileStop  chan struct{}
 	stopOnce       sync.Once
+	workers        map[NSKey]*dispatchWorker
 	workerStarted  bool
 	workersDropped bool
 
@@ -104,6 +111,7 @@ func newScopeState(scope store.Scope) *scopeState {
 	return &scopeState{
 		scope:              scope,
 		entries:            make(map[NSKey]entry),
+		workers:            make(map[NSKey]*dispatchWorker),
 		stale:              true,
 		firstReconcileDone: make(chan struct{}),
 		resyncSignal:       make(chan struct{}, 1),

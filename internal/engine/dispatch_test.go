@@ -618,11 +618,16 @@ func workersIdle(e *Engine) bool {
 		return false
 	}
 
+	scopes := e.trackedScopes()
+
 	e.workersMu.Lock()
 
-	ws := make([]*dispatchWorker, 0, len(e.workers))
-	for _, w := range e.workers {
-		ws = append(ws, w)
+	var ws []*dispatchWorker
+
+	for _, sc := range scopes {
+		for _, w := range sc.workers {
+			ws = append(ws, w)
+		}
 	}
 
 	e.workersMu.Unlock()
@@ -696,12 +701,11 @@ func TestQuiesceNeverReturnsBeforeAPendingDelivery(t *testing.T) {
 	waitFor(t, hangGuard, "the worker's first delivery", func() bool { return rec.len() == 1 })
 	quiesce(t, e)
 
+	// running is still keyed by (scope, key): it is what a timed-out Close
+	// reads, and that message has to name the tenant.
 	wk := workerKey{NSKey: nk}
 
-	e.workersMu.Lock()
-	w := e.workers[wk]
-	e.workersMu.Unlock()
-
+	w := scopeWorker(e, e.trackedScope(store.Scope{}), nk)
 	if w == nil {
 		t.Fatal("no dispatch worker for the key a delivery just went to")
 	}

@@ -190,11 +190,7 @@ func TestPublishIntoAlreadyDroppedStateIsRefused(t *testing.T) {
 		t.Error("a publication into a dropped scope state became readable")
 	}
 
-	e.workersMu.Lock()
-	workers := len(e.workers)
-	e.workersMu.Unlock()
-
-	if workers != 0 {
+	if workers := scopeWorkerCount(e, sc); workers != 0 {
 		t.Errorf("publish started %d delivery worker(s) for a dropped scope, want 0", workers)
 	}
 
@@ -233,11 +229,7 @@ func TestPublishRacingDropScopeStartsNoWorker(t *testing.T) {
 
 	e.dispatch(sc, publication{Scope: dropTenant, NSKey: nk, Revision: 9, Value: "late"})
 
-	e.workersMu.Lock()
-	workers := len(e.workers)
-	e.workersMu.Unlock()
-
-	if workers != 0 {
+	if workers := scopeWorkerCount(e, sc); workers != 0 {
 		t.Errorf("a publication racing the drop started %d delivery worker(s), want 0: "+
 			"a dropped tenant keeps a parked goroutine per key until the process shuts down", workers)
 	}
@@ -291,4 +283,149 @@ func TestReconcileForDroppedScopeDoesNotList(t *testing.T) {
 	if err := e.Close(); err != nil {
 		t.Fatalf("Close() = %v, want nil", err)
 	}
+}
+
+// TestDropSweepDoesNotStopAReactivatedScopesWorkers is the other half of the
+// drop-versus-publish race. dropScope removes the scope from the map, releases
+// its changefeed — a backend unsubscribe waits for its own feed goroutine, so
+// that step is not instant — and only then sweeps the scope's delivery
+// workers. A tenant re-activated inside that gap is a NEW state, and the
+// straggler sweep of the old one must not touch the new one's workers.
+//
+// A sweep that selected workers by scope VALUE did exactly that: it stopped
+// the re-activated tenant's goroutine and discarded the Change waiting in its
+// mailbox, contradicting the refusal flag, which lives on the state precisely
+// so that a new state starts workers freely.
+//
+// The gap is reproduced rather than raced for: the old state's sweep runs
+// after the re-activation has published, which is where a drop stuck inside
+// unsubscribe lands.
+func TestDropSweepDoesNotStopAReactivatedScopesWorkers(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	fs := newFakeStore()
+	e := storeEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0, 2*time.Second)
+
+	bringUp(t, e, dropTenant)
+
+	old := e.trackedScope(dropTenant)
+	if old == nil {
+		t.Fatal("the tenant scope was not brought up")
+	}
+
+	e.dropScope(dropTenant)
+	bringUp(t, e, dropTenant)
+
+	sc := e.trackedScope(dropTenant)
+	if sc == nil {
+		t.Fatal("the re-activated tenant scope was not brought up")
+	}
+
+	if sc == old {
+		t.Fatal("re-activation reused the dropped scope state")
+	}
+
+	unsub := e.OnChange(nk, func(context.Context, Change) {})
+	defer unsub()
+
+	if notify := e.publish(sc, publication{Scope: dropTenant, NSKey: nk, Revision: 9, Value: "back"}); !notify {
+		t.Fatal("the re-activated scope refused a first publication")
+	}
+
+	w := scopeWorker(e, sc, nk)
+	if w == nil {
+		t.Fatal("a publication into the re-activated scope started no delivery worker")
+	}
+
+	// The drop that was still inside unsubscribe finally reaches its sweep.
+	e.stopScopeWorkers(old)
+
+	if got := scopeWorkerCount(e, sc); got != 1 {
+		t.Errorf("the re-activated scope owns %d delivery worker(s) after the old state's sweep, want 1", got)
+	}
+
+	select {
+	case <-w.done:
+		t.Error("the old state's sweep stopped the re-activated scope's delivery worker: " +
+			"its pending Change is discarded and the tenant goes silent until Close")
+	default:
+	}
+
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close() = %v, want nil", err)
+	}
+}
+
+// TestScopeBroughtUpAfterADropDeliversAgain walks the one escape from the
+// sticky refusal a sweep leaves behind. A scope whose workers were swept
+// refuses every later one forever, and the only way back is a new state — so
+// if bring-up ever reused the dropped state, the scope would be tracked, fed
+// and reconciled while no subscriber ever heard from it again.
+//
+// The path is reachable today: Start opens the changefeed, a Subscribe failure
+// drops the scope it had just created, and the consumer retries Start.
+func TestScopeBroughtUpAfterADropDeliversAgain(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	fs := newFakeStore()
+	e := storeEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0, 2*time.Second)
+
+	fs.onSubscribe(func(store.Scope) error { return errSubscribe })
+
+	if _, err := e.bringUpScope(dropTenant); err == nil {
+		t.Fatal("bringUpScope succeeded with a failing Subscribe, want an error")
+	}
+
+	if tracked(e, dropTenant) {
+		t.Fatal("a failed Subscribe left the scope tracked")
+	}
+
+	fs.onSubscribe(nil)
+	bringUp(t, e, dropTenant)
+
+	sc := e.trackedScope(dropTenant)
+	if sc == nil {
+		t.Fatal("the retried bring-up did not track the scope")
+	}
+
+	var rec recorder
+
+	unsub := e.OnChange(nk, rec.record)
+	defer unsub()
+
+	if notify := e.publish(sc, publication{Scope: dropTenant, NSKey: nk, Revision: 4, Value: "retried"}); !notify {
+		t.Fatal("the scope brought up after a drop refused a first publication")
+	}
+
+	waitFor(t, hangGuard, "a delivery from the scope brought up after a drop",
+		func() bool { return rec.len() == 1 })
+
+	if got := rec.changes()[0].Value; got != "retried" {
+		t.Errorf("delivered value %v, want %q", got, "retried")
+	}
+
+	if got := scopeWorkerCount(e, sc); got != 1 {
+		t.Errorf("the scope brought up after a drop owns %d delivery worker(s), want 1", got)
+	}
+
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close() = %v, want nil", err)
+	}
+}
+
+// scopeWorker returns the delivery worker sc owns for nk, or nil when it owns
+// none, under the engine lock that guards them.
+func scopeWorker(e *Engine, sc *scopeState, nk NSKey) *dispatchWorker {
+	e.workersMu.Lock()
+	defer e.workersMu.Unlock()
+
+	return sc.workers[nk]
+}
+
+// scopeWorkerCount returns how many delivery workers sc owns. A scope owns its
+// own workers, so this is the count a drop of ANOTHER state must leave alone
+// and the count a dropped state must be left with.
+func scopeWorkerCount(e *Engine, sc *scopeState) int {
+	e.workersMu.Lock()
+	defer e.workersMu.Unlock()
+
+	return len(sc.workers)
 }

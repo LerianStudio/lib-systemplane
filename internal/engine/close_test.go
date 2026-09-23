@@ -239,7 +239,7 @@ func TestPublishRacingCloseStartsNoWorker(t *testing.T) {
 
 	// Nothing may start a worker once Close has shut the door, whichever side
 	// of the race a straggler landed on.
-	if w := e.workerFor(sc, workerKey{NSKey: NSKey{Namespace: "ns", Key: "after"}}); w != nil {
+	if w := e.workerFor(sc, NSKey{Namespace: "ns", Key: "after"}); w != nil {
 		t.Error("workerFor started a worker after Close")
 	}
 }

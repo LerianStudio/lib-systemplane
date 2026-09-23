@@ -144,8 +144,10 @@ type NSKey struct {
 }
 ```
 
-Amended 2026-09-23: `Validate` widens to `func(context.Context, any) error` in Task 2.1.3, which states the
-per-ingress context contract; Phase 1 shipped the ctx-less form above.
+Amended 2026-09-23: the ctx-less form above is what Task 1.1.2 landed, and Phase 1 fix pass 3
+(commit `941e77a`) then widened `Validate` to `func(context.Context, any) error` — the shape
+`develop` already registers every validator in. So Phase 1 ships the WIDE form, not the one written
+above; Task 2.1.3 states the per-ingress context contract that widening carries.
 
 `internal/engine/scope.go` holds the per-scope state. The zero `store.Scope` is the single-tenant scope and is the only one this lane creates; the type is written so a non-empty `Scope.Tenant` is just another key in `Engine.scopes` and the wave-3 lane adds tenants without touching it:
 
@@ -722,9 +724,14 @@ as key.
 
 **The Client implements `engine.Registry`** in a new file `internal/client/registry.go`.
 `Lookup(namespace, key string) (engine.KeyDef, bool)` takes `registryMu.RLock`, and returns
-`engine.KeyDef{Default: engine.Clone(def.defaultValue), Validate: def.validator}` — the clone is
-required by the port's own contract (`internal/engine/registry.go:16-18`) and is what stops a
-subscriber reaching the registry's own default object through the cache. `Keys() []engine.NSKey`
+`engine.KeyDef{Default: engine.Clone(def.defaultValue), Validate: def.validator}`. Amended
+2026-09-23: that clone is OPTIONAL, not required — Phase 1 fix pass 2 (commit `db9babd`) relaxed the
+port's contract, which now says the engine never mutates what it receives and clones before caching
+or delivering (`internal/engine/registry.go:18-21`). Both of the engine's reads of `KeyDef.Default`
+keep that promise: `ingestDefault` clones before publishing
+(`internal/engine/ingest.go:177`) and `keepsCachedValue` only compares
+(`internal/engine/reconcile.go:451`). Keeping the clone here costs one copy per `Lookup` and buys
+nothing the engine does not already guarantee; dropping it is safe. `Keys() []engine.NSKey`
 takes `registryMu.RLock` and returns every registered key. Neither name collides with an existing
 method, and neither reaches the public surface: `systemplane.Client` is a **defined type**
 (`api_types.go:16`), not an alias, so it inherits no methods and `boundary_test.go` is unaffected.

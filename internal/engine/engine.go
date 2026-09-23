@@ -49,16 +49,16 @@ type Engine struct {
 	subscribers map[NSKey][]subscription
 	nextSubID   atomic.Uint64
 
-	// workers holds one delivery goroutine per (scope, key), started on the
-	// first notification for that pair and tracked by dispatchWG so shutdown
-	// can wait for them. running holds the workerKey of every worker currently
-	// inside a subscriber callback, so a Close that times out names the real
-	// (scope, key) pairs it is stuck on instead of guessing.
+	// workersMu guards every scope's worker map and refusal flag, so the lock
+	// that starts a delivery worker is the lock that sweeps one. The workers
+	// themselves live on the scope state that owns them; dispatchWG tracks all
+	// of them so shutdown can wait, and running holds the workerKey of every
+	// worker currently inside a subscriber callback, so a Close that times out
+	// names the real (scope, key) pairs it is stuck on instead of guessing.
 	//
 	// workersClosed is set under workersMu before Close waits on dispatchWG,
 	// which is what makes every Add to that WaitGroup happen-before its Wait.
 	workersMu     sync.Mutex
-	workers       map[workerKey]*dispatchWorker
 	workersClosed bool
 	dispatchWG    sync.WaitGroup
 	running       sync.Map // workerKey -> struct{}
@@ -131,7 +131,6 @@ func New(cfg Config) *Engine {
 		debounceAsync:    cfg.Debounce > 0,
 		scopes:           make(map[store.Scope]*scopeState),
 		subscribers:      make(map[NSKey][]subscription),
-		workers:          make(map[workerKey]*dispatchWorker),
 		closeTimeout:     closeTimeout,
 		reconcileTimeout: defaultReconcileTimeout,
 		lifecycleCtx:     ctx,
@@ -291,10 +290,16 @@ func (e *Engine) bringUpScope(scope store.Scope) (*scopeState, error) {
 // refused and starts none, so its value reaches neither a subscriber nor a
 // goroutine that outlives the tenant.
 //
-// It is idempotent. A tenant suspended and then deleted arrives as two
-// lifecycle events, and the second must not release a subscription the backend
-// has already forgotten, so the unsubscribe is taken out of the scope as it is
-// called. It runs OUTSIDE the scope lock: a backend's unsubscribe waits for
+// It is idempotent, but only in effect: a second concurrent drop of the same
+// scope finds the state already out of the map and returns from the early exit
+// below BEFORE the first has unsubscribed and swept. That return is therefore
+// not a "teardown finished" point for its caller — the changefeed may still be
+// open and the delivery workers still running when it lands. Nothing in the
+// engine reads it as one; a caller that needs teardown to have completed would
+// have to be given something to wait on. A tenant suspended and then deleted
+// arrives as two lifecycle events, and the second must not release a
+// subscription the backend has already forgotten, so the unsubscribe is taken
+// out of the scope as it is called. It runs OUTSIDE the scope lock: a backend's unsubscribe waits for
 // its changefeed goroutine, which may be inside onEvent, which takes that
 // lock.
 func (e *Engine) dropScope(scope store.Scope) {
@@ -333,20 +338,23 @@ func (e *Engine) dropScope(scope store.Scope) {
 // dropScope closes one step before this sweep runs; a publisher that passed
 // that select in between reaches workerFor after the sweep and leaves a parked
 // goroutine, and a WaitGroup entry, for a scope only Close ever ends.
+//
+// It sweeps sc's own map, which is what makes the sweep identity-scoped rather
+// than value-scoped: a tenant re-activated while this drop was still inside
+// unsubscribe is a different state with a map of its own, and its workers —
+// and whatever is waiting in their mailboxes — survive a sweep that is ending
+// the state before it.
 func (e *Engine) stopScopeWorkers(sc *scopeState) {
 	e.workersMu.Lock()
 	defer e.workersMu.Unlock()
 
 	sc.workersDropped = true
 
-	for wk, w := range e.workers {
-		if wk.Scope != sc.scope {
-			continue
-		}
-
+	for _, w := range sc.workers {
 		w.stop()
-		delete(e.workers, wk)
 	}
+
+	clear(sc.workers)
 }
 
 // beginWork registers one engine-owned goroutine in the WaitGroup Close

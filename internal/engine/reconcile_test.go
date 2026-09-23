@@ -1851,23 +1851,24 @@ func TestConcurrentResyncsCannotStrandAScope(t *testing.T) {
 	}
 }
 
-// TestArmReconcileQueuesTheNewerArming is the pin for the one-step arming, and
-// it is deterministic: whichever order two simultaneous OpResync events land
-// in, the mailbox holds the NEWER generation and the older one comes back as
-// displaced.
+// TestArmReconcileQueuesTheNewerArming pins the invariant the reconcile
+// mailbox rests on, deterministically: whichever order two simultaneous
+// OpResync events land in, the mailbox ends up holding the NEWER generation
+// and the older one comes back to its caller as displaced.
 //
-// Opening a reconcile window and queueing it used to be two steps under two
-// locks, so the two could reach the mailbox in the opposite order to the one
-// they opened in. The mailbox then held the OLDER arming, which the reconcile
-// goroutine drops as superseded, while the newer window had already been
-// released as the one it displaced. Nothing reconciled, and the scope stayed
-// stale until some later resync happened to arrive — for a knob nobody touches
-// again, never.
+// It guards the invariant, not a regression. Arming has always opened the
+// window and queued it under one acquisition of resyncMu; merging the two into
+// one function body removed the seam a future edit could split, not a defect
+// that shipped. What makes the invariant worth pinning is the cost of losing
+// it: a mailbox holding the OLDER arming is dropped by the reconcile goroutine
+// as superseded, while the newer window has already been released as the one
+// it displaced. Nothing reconciles, and the scope stays stale until some later
+// resync happens to arrive — for a knob nobody touches again, never.
 //
-// The end-to-end version of this (TestConcurrentResyncsCannotStrandAScope)
-// caught the split roughly one run in 68, which is not a guard. This asserts
-// the invariant itself, on one scope state, with no store and no goroutine of
-// the engine's involved.
+// It asserts on one scope state, with no store and no goroutine of the
+// engine's involved, which is what makes it deterministic where the end-to-end
+// version (TestConcurrentResyncsCannotStrandAScope) has to win a race to
+// observe anything at all.
 func TestArmReconcileQueuesTheNewerArming(t *testing.T) {
 	sc := newScopeState(store.Scope{})
 

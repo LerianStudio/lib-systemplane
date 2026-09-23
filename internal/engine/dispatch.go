@@ -17,9 +17,10 @@ type subscription struct {
 	fn func(ctx context.Context, ch Change)
 }
 
-// workerKey names the one worker that serializes deliveries for a key inside
-// one scope. The same key in two scopes gets two workers, so a blocked tenant
-// never delays another.
+// workerKey names one scope's worker for one key. Each scope owns its workers,
+// so the pairing is only ever assembled for the outside world: the marker a
+// timed-out Close reads to name what it is stuck on. The same key in two
+// scopes gets two workers, so a blocked tenant never delays another.
 type workerKey struct {
 	Scope store.Scope
 	NSKey
@@ -159,7 +160,7 @@ func (e *Engine) dispatch(sc *scopeState, pub publication) {
 		return
 	}
 
-	w := e.workerFor(sc, workerKey{Scope: pub.Scope, NSKey: pub.NSKey})
+	w := e.workerFor(sc, pub.NSKey)
 	if w == nil {
 		return
 	}
@@ -173,10 +174,14 @@ func (e *Engine) dispatch(sc *scopeState, pub publication) {
 	})
 }
 
-// workerFor returns wk's worker, starting it on first use. Workers live until
-// the lifecycle context is canceled, so the goroutine count is bounded by the
-// number of (scope, key) pairs that actually published a change to a
-// subscribed key.
+// workerFor returns sc's worker for nk, starting it on first use. Workers live
+// until the lifecycle context is canceled or their scope is dropped, so the
+// goroutine count is bounded by the number of (scope, key) pairs that actually
+// published a change to a subscribed key.
+//
+// The worker belongs to the scope state the caller resolved, not to the scope
+// VALUE: a state that has been swept never hands one out again, and the state
+// that replaced it keeps its own.
 //
 // It returns nil once Close has shut the door. That check and the
 // dispatchWG.Add below are under the same lock Close takes before it waits, so
@@ -189,7 +194,7 @@ func (e *Engine) dispatch(sc *scopeState, pub publication) {
 // same reason: the sweep that ended the scope's workers marked its state, so a
 // publisher that slipped past publish's refusal cannot start a replacement the
 // drop will never come back to stop. The caller discards the publication.
-func (e *Engine) workerFor(sc *scopeState, wk workerKey) *dispatchWorker {
+func (e *Engine) workerFor(sc *scopeState, nk NSKey) *dispatchWorker {
 	e.workersMu.Lock()
 	defer e.workersMu.Unlock()
 
@@ -197,18 +202,16 @@ func (e *Engine) workerFor(sc *scopeState, wk workerKey) *dispatchWorker {
 		return nil
 	}
 
-	if w := e.workers[wk]; w != nil {
+	if w := sc.workers[nk]; w != nil {
 		return w
 	}
 
-	if e.workers == nil {
-		e.workers = make(map[workerKey]*dispatchWorker)
-	}
-
 	w := &dispatchWorker{signal: make(chan struct{}, 1), done: make(chan struct{})}
-	e.workers[wk] = w
+	sc.workers[nk] = w
 
 	e.dispatchWG.Add(1)
+
+	wk := workerKey{Scope: sc.scope, NSKey: nk}
 
 	runtime.SafeGoWithContextAndComponent(e.dispatchContext(), e.logger,
 		"systemplane.engine", "dispatch", runtime.KeepRunning,
