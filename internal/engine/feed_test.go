@@ -599,7 +599,7 @@ func TestSlowValidatorDoesNotBlockTheChangefeedGoroutine(t *testing.T) {
 	fs.seed(scope, jsonRow(slow, 1, `"v"`, "ops"))
 
 	e := feedEngine(t, map[NSKey]KeyDef{
-		slow: {Default: "fallback", Validate: func(any) error {
+		slow: {Default: "fallback", Validate: func(context.Context, any) error {
 			once.Do(func() { close(entered) })
 			<-release
 

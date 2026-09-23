@@ -1,5 +1,7 @@
 package engine
 
+import "context"
+
 // Registry is the engine's read-only view of the Client's key registry.
 // internal/client implements it; the engine never imports internal/client.
 type Registry interface {
@@ -17,7 +19,20 @@ type KeyDef struct {
 	// the engine may keep.
 	Default any
 	// Validate rejects a decoded value at ingress. nil accepts anything.
-	Validate func(any) error
+	//
+	// The context is the one the ingress itself runs under, and which context
+	// that is differs per ingress by design. A value arriving through Publish
+	// is validated with the WRITER's context — the one the consumer handed to
+	// Set — so a validator may resolve a tenant, a locale or a policy from the
+	// request that is writing. A value arriving from the changefeed re-read or
+	// from a reconcile snapshot is validated with the engine's dispatch
+	// context, which carries no tenant and no request: nothing of whatever
+	// goroutine called Start survives into it. A validator that refuses
+	// whenever the context lacks a tenant therefore refuses every stored row,
+	// and the ingress contract decides what follows — the last value that
+	// passed stays in force, or the registered default at Revision 0 when no
+	// row was ever accepted, and the rejection is logged once per key.
+	Validate func(context.Context, any) error
 	// Redacted reports that the key was registered with a redaction policy
 	// other than "none": its value is sensitive and must never reach a log
 	// line. The engine needs the fact, not the policy — masking and hiding

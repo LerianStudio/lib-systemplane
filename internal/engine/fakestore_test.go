@@ -54,6 +54,12 @@ type fakeStore struct {
 
 	nextSubID int
 	feeds     map[int]feedSubscription
+
+	// subCtx is the context of the last Subscribe. The engine must open a
+	// changefeed on its own lifecycle context, never on the caller's: a feed
+	// that dies with the request that started it stops delivering the moment
+	// Start returns.
+	subCtx context.Context
 }
 
 // feedSubscription is one live Subscribe: the scope it covers and the callback
@@ -130,6 +136,14 @@ func (f *fakeStore) resyncOnSubscribe() {
 	defer f.mu.Unlock()
 
 	f.autoResync = true
+}
+
+// subscribeContext reports the context the last Subscribe was handed.
+func (f *fakeStore) subscribeContext() context.Context {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return f.subCtx
 }
 
 func (f *fakeStore) getCount() int {
@@ -315,9 +329,10 @@ func (f *fakeStore) List(ctx context.Context, scope store.Scope) ([]store.Entry,
 //
 // A failing subscribeHook registers nothing, which is how a test models a
 // listener that could not be opened.
-func (f *fakeStore) Subscribe(_ context.Context, scope store.Scope, fn func(store.Event)) (func(), error) {
+func (f *fakeStore) Subscribe(ctx context.Context, scope store.Scope, fn func(store.Event)) (func(), error) {
 	f.mu.Lock()
 	f.subscribeCalls++
+	f.subCtx = ctx
 	hook := f.subscribeHook
 	f.mu.Unlock()
 

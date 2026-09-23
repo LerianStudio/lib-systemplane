@@ -490,7 +490,7 @@ func TestReconcileKeepsCachedValueWhenRereadWasUnusable(t *testing.T) {
 		"the reread is rejected by the validator": {
 			def: KeyDef{
 				Default: "fallback",
-				Validate: func(v any) error {
+				Validate: func(_ context.Context, v any) error {
 					if v == "poison" {
 						return errors.New("rejected")
 					}
@@ -766,7 +766,7 @@ func TestFirstReconcileRejectsInvalidSnapshotRow(t *testing.T) {
 	scope := store.Scope{}
 	def := KeyDef{
 		Default: "fallback",
-		Validate: func(v any) error {
+		Validate: func(_ context.Context, v any) error {
 			if _, ok := v.(string); !ok {
 				return errors.New("want a string")
 			}
@@ -874,7 +874,7 @@ func TestRejectedRowIsAnnouncedAfterATransientListFailure(t *testing.T) {
 	fs := newFakeStore()
 	e := feedEngine(t, map[NSKey]KeyDef{nk: {
 		Default: "fallback",
-		Validate: func(v any) error {
+		Validate: func(_ context.Context, v any) error {
 			if _, ok := v.(string); !ok {
 				return errors.New("want a string")
 			}
@@ -989,7 +989,7 @@ func TestReconcileSurvivesPanickingValidator(t *testing.T) {
 	// runs it on the engine's own reconcile goroutine.
 	def := KeyDef{
 		Default:  "fallback",
-		Validate: func(v any) error { _ = v.(string); return nil },
+		Validate: func(_ context.Context, v any) error { _ = v.(string); return nil },
 	}
 
 	e := feedEngine(t, map[NSKey]KeyDef{nk: def}, fs, 0)
@@ -1656,7 +1656,7 @@ func TestPublishRecordsARejectedWriteAgainstAConcurrentReconcile(t *testing.T) {
 	fs := newFakeStore()
 	e := feedEngine(t, map[NSKey]KeyDef{nk: {
 		Default: "fallback",
-		Validate: func(v any) error {
+		Validate: func(_ context.Context, v any) error {
 			if _, ok := v.(string); !ok {
 				return errors.New("want a string")
 			}

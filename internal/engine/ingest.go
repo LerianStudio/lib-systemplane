@@ -161,6 +161,12 @@ func (e *Engine) ingestDefault(ctx context.Context, sc *scopeState, nk NSKey) (n
 // runValidator runs the consumer's registered validator and turns a panic into
 // a rejection.
 //
+// ctx is the ingress's own context and is handed straight to the validator, so
+// which context a validator sees is decided by which ingress ran: the writer's
+// on Publish, the engine's dispatch context — no tenant, no request — on the
+// changefeed re-read and on a reconcile. KeyDef.Validate states the contract
+// and what a refusal leaves in force.
+//
 // The validator is consumer code, and v4 is the first version that runs it on
 // engine-owned goroutines: the reconcile, and the changefeed re-read. v3 only
 // ever ran it on the caller's own Set, where a panic was the caller's problem.
@@ -178,7 +184,7 @@ func (e *Engine) ingestDefault(ctx context.Context, sc *scopeState, nk NSKey) (n
 // returned here names only that the validator panicked. Interpolating the
 // panic value into it would put that row's contents into a WARN line the
 // redaction never sees.
-func (e *Engine) runValidator(ctx context.Context, validate func(any) error, value any) (err error) {
+func (e *Engine) runValidator(ctx context.Context, validate func(context.Context, any) error, value any) (err error) {
 	if validate == nil {
 		return nil
 	}
@@ -194,7 +200,7 @@ func (e *Engine) runValidator(ctx context.Context, validate func(any) error, val
 	}()
 	defer runtime.RecoverAndLogWithContext(ctx, e.logger, "systemplane.engine", "validator")
 
-	err = validate(value)
+	err = validate(ctx, value)
 	panicked = false
 
 	return err

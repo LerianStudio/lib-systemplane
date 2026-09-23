@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
@@ -59,7 +60,7 @@ func TestIngestRejectsInvalidValueKeepingPrevious(t *testing.T) {
 	e := engineWithRegistry(fakeRegistry{defs: map[NSKey]KeyDef{
 		nk: {
 			Default: "default",
-			Validate: func(v any) error {
+			Validate: func(_ context.Context, v any) error {
 				if _, ok := v.(string); !ok {
 					return errors.New("want a string")
 				}
@@ -182,7 +183,7 @@ func TestIngestRejectsPanickingValidatorWithoutLeakingPanicValue(t *testing.T) {
 	e := engineWithRegistry(fakeRegistry{defs: map[NSKey]KeyDef{
 		nk: {
 			Default: "default",
-			Validate: func(v any) error {
+			Validate: func(_ context.Context, v any) error {
 				if v == "a" {
 					return nil
 				}
@@ -220,4 +221,156 @@ func TestIngestRejectsPanickingValidatorWithoutLeakingPanicValue(t *testing.T) {
 	if !recovered {
 		t.Errorf("no panic-recovery entry was logged, got %v", entries)
 	}
+}
+
+// ctxMarkerKey is the request marker these tests stamp on a context. Each
+// ingress either carries it to the registered validator or must not: the write
+// path is the caller's own goroutine and keeps it, the two read-back paths run
+// on engine-owned goroutines and carry nothing of the caller's.
+type ctxMarkerKey struct{}
+
+const ctxMarker = "request-42"
+
+func markedContext() context.Context {
+	return context.WithValue(context.Background(), ctxMarkerKey{}, ctxMarker)
+}
+
+// markerWatcher is a registered validator that records, per call, whether the
+// context it was handed carried the request marker — and refuses the value
+// when it did not, the way a tenant-aware validator refuses a row it cannot
+// scope to a tenant.
+type markerWatcher struct {
+	mu   sync.Mutex
+	sawn []bool
+}
+
+func (w *markerWatcher) validate(ctx context.Context, _ any) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	saw := ctx.Value(ctxMarkerKey{}) == ctxMarker
+	w.sawn = append(w.sawn, saw)
+
+	if !saw {
+		return errors.New("no tenant in context")
+	}
+
+	return nil
+}
+
+func (w *markerWatcher) observations() []bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return append([]bool(nil), w.sawn...)
+}
+
+// TestIngestValidatorSeesTheWriterContextOnPublish pins the write half of the
+// per-ingress context contract: a value that arrives through Publish is
+// validated with the WRITER's context, the one the consumer handed to Set. A
+// validator that resolves a tenant, a locale or a policy from the request
+// context can only do that on the path where a request exists, and this is it.
+func TestIngestValidatorSeesTheWriterContextOnPublish(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+
+	var watcher markerWatcher
+
+	e, _ := loggingEngine(t, map[NSKey]KeyDef{nk: {
+		Default:  "fallback",
+		Validate: watcher.validate,
+	}}, newFakeStore())
+
+	e.Publish(markedContext(), store.Scope{}, jsonRow(nk, 1, `"accepted"`, "ops"))
+
+	if got := watcher.observations(); len(got) != 1 || !got[0] {
+		t.Fatalf("validator context on the write path: saw the caller's marker = %v, want [true]", got)
+	}
+
+	entry, ok := e.Lookup(store.Scope{}, nk)
+	if !ok || entry.Value != "accepted" {
+		t.Errorf("the write the validator accepted did not reach the cache: %+v (ok=%v)", entry, ok)
+	}
+}
+
+// TestIngestValidatorGetsNoTenantOnFeedAndReconcile pins the read-back half.
+// A value that arrives from the changefeed re-read or from a reconcile
+// snapshot is validated with the engine's dispatch context, which carries no
+// tenant and no request — nothing of whatever goroutine happened to call
+// Start. A validator that refuses without a tenant therefore refuses every
+// stored row, and the contract is what happens then: the last value that
+// passed stays in force, nothing is delivered, and the rejection is logged
+// once so an operator can find it.
+func TestIngestValidatorGetsNoTenantOnFeedAndReconcile(t *testing.T) {
+	const rejection = "stored value rejected by validator, keeping cached value"
+
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+
+	// arrange seeds the cache through the one ingress that carries a request —
+	// the write path — so both subtests start from a value that passed, and
+	// the observation recorded by that write is the leading true below.
+	arrange := func(t *testing.T) (*Engine, *fakeStore, *recordingLogger, *markerWatcher) {
+		t.Helper()
+
+		watcher := &markerWatcher{}
+		fs := newFakeStore()
+
+		e, rec := loggingEngine(t, map[NSKey]KeyDef{nk: {
+			Default:  "fallback",
+			Validate: watcher.validate,
+		}}, fs)
+
+		e.Publish(markedContext(), scope, jsonRow(nk, 1, `"in-force"`, "ops"))
+
+		// The store moves on behind the engine's back, which is what both
+		// read-back paths exist to notice.
+		fs.seed(scope, jsonRow(nk, 2, `"from-the-store"`, "operator"))
+
+		return e, fs, rec, watcher
+	}
+
+	requireValueInForce := func(t *testing.T, e *Engine, watcher *markerWatcher, rec *recordingLogger) {
+		t.Helper()
+
+		entry, ok := e.Lookup(scope, nk)
+		if !ok || entry.Value != "in-force" || entry.Revision != 1 {
+			t.Errorf("a row the validator refused replaced the value in force: %+v (ok=%v)", entry, ok)
+		}
+
+		if got := watcher.observations(); len(got) != 2 || !got[0] || got[1] {
+			t.Errorf("validator contexts: got %v, want [true false] — the write carries the "+
+				"caller's request, the read-back carries none", got)
+		}
+
+		requireOneRecord(t, rec, rejection)
+	}
+
+	t.Run("changefeed re-read", func(t *testing.T) {
+		e, _, rec, watcher := arrange(t)
+
+		e.onEvent(upsertEvent(scope, nk, 2))
+
+		requireValueInForce(t, e, watcher, rec)
+	})
+
+	t.Run("reconcile", func(t *testing.T) {
+		e, fs, rec, watcher := arrange(t)
+
+		fs.resyncOnSubscribe()
+
+		// Start is handed a context carrying the request marker. Nothing of it
+		// may reach the reconcile: the engine subscribes and reconciles on its
+		// own lifecycle context, so the marker must be invisible both to the
+		// store's Subscribe and to the validator the reconcile runs.
+		if err := e.Start(markedContext()); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+
+		if got := fs.subscribeContext(); got == nil || got.Value(ctxMarkerKey{}) != nil {
+			t.Errorf("the changefeed was opened on the caller's context, so it dies with the "+
+				"request instead of with Close: %v", got)
+		}
+
+		requireValueInForce(t, e, watcher, rec)
+	})
 }

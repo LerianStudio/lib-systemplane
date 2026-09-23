@@ -208,7 +208,7 @@ func TestValidatorRejectionIsLoggedAtWarn(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 	e, rec := loggingEngine(t, map[NSKey]KeyDef{nk: {
 		Default:  "fallback",
-		Validate: func(any) error { return errors.New("want a string") },
+		Validate: func(context.Context, any) error { return errors.New("want a string") },
 	}}, newFakeStore())
 
 	ingestRow(e, jsonRow(nk, 1, `42`, "ops"))
@@ -384,7 +384,7 @@ func TestPublishLogsUnderTheCallerContext(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 	e, rec := loggingEngine(t, map[NSKey]KeyDef{nk: {
 		Default:  "fallback",
-		Validate: func(any) error { return errors.New("want a string") },
+		Validate: func(context.Context, any) error { return errors.New("want a string") },
 	}}, newFakeStore())
 
 	ctx := context.WithValue(context.Background(), ctxKey{}, "caller-span")
@@ -418,7 +418,7 @@ func TestValidatorErrorIsRedactedByKeyPolicy(t *testing.T) {
 		msg      = "stored value rejected by validator, keeping cached value"
 	)
 
-	rejecting := func(any) error { return validatorError{"rejected " + sentinel} }
+	rejecting := func(context.Context, any) error { return validatorError{"rejected " + sentinel} }
 
 	visible := NSKey{Namespace: "billing", Key: "limits"}
 	secret := NSKey{Namespace: "billing", Key: "apitoken"}
