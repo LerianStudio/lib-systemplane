@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/LerianStudio/lib-commons/v7/commons/backoff"
+	obsconstants "github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/runtime"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
@@ -782,7 +783,7 @@ func (s *Store) openListen(ctx context.Context, f *feed) (*pgx.Conn, string, err
 
 	s.logInfo(ctx, "LISTEN connection established",
 		log.String("channel", s.cfg.Channel),
-		log.String("tenant", f.scope.Tenant),
+		log.String(obsconstants.AttrKeyTenantID, f.scope.Tenant),
 		log.String("database", dbKey),
 	)
 
@@ -946,7 +947,7 @@ func (s *Store) signalFeed(f *feed, skipSelfWait bool) <-chan struct{} {
 
 	if selfTeardown {
 		s.logDebug(context.Background(), "changefeed torn down from inside a callback; not waiting for its reader",
-			log.String("tenant", f.scope.Tenant),
+			log.String(obsconstants.AttrKeyTenantID, f.scope.Tenant),
 		)
 
 		return nil
@@ -1042,7 +1043,7 @@ func (s *Store) consumeUntilFailure(f *feed, conn *pgx.Conn) (consumed bool) {
 			if !errors.Is(err, context.Canceled) {
 				s.logDebug(ctx, "LISTEN wait failed",
 					log.Err(err),
-					log.String("tenant", f.scope.Tenant),
+					log.String(obsconstants.AttrKeyTenantID, f.scope.Tenant),
 				)
 			}
 
@@ -1066,7 +1067,7 @@ func (s *Store) handleNotification(ctx context.Context, f *feed, payload string)
 	if !ok {
 		s.logWarn(ctx, "failed to decode NOTIFY payload",
 			log.String("payload", truncateString(payload, 200)),
-			log.String("tenant", f.scope.Tenant),
+			log.String(obsconstants.AttrKeyTenantID, f.scope.Tenant),
 		)
 
 		return
@@ -1122,7 +1123,7 @@ func (s *Store) reconnect(f *feed, retry *reconnectBackoff) (*pgx.Conn, error) {
 	// of a flat zero.
 	s.logWarn(context.Background(), "LISTEN connection lost, reconnecting",
 		log.Int("attempt", retry.attempt),
-		log.String("tenant", f.scope.Tenant),
+		log.String(obsconstants.AttrKeyTenantID, f.scope.Tenant),
 	)
 
 	for {
@@ -1153,7 +1154,7 @@ func (s *Store) reconnect(f *feed, retry *reconnectBackoff) (*pgx.Conn, error) {
 		if err != nil {
 			s.logStreakFailure(firstOfStreak, "reconnect attempt failed",
 				log.Err(err),
-				log.String("tenant", f.scope.Tenant),
+				log.String(obsconstants.AttrKeyTenantID, f.scope.Tenant),
 			)
 
 			continue

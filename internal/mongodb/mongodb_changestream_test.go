@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	obsconstants "github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -1890,7 +1891,7 @@ func TestMongoReopenWatch_FirstFailureWarnsThenGoesQuiet(t *testing.T) {
 	close(f.stop)
 	<-done
 
-	if got := entry.field(t, "tenant"); got != "t1" {
+	if got := entry.field(t, obsconstants.AttrKeyTenantID); got != "t1" {
 		t.Errorf("first failure logged tenant %v, want t1: a process carrying dozens of feeds cannot tell which one is down", got)
 	}
 

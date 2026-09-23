@@ -12,6 +12,7 @@ import (
 	"time"
 
 	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
+	obsconstants "github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 	"github.com/bxcodec/dbresolver/v2"
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -719,7 +720,7 @@ func (c deadResolverConnector) ResolveDSN(context.Context, string) (string, erro
 
 func hasTenantAttr(attrs []attribute.KeyValue, tenant string) bool {
 	for _, a := range attrs {
-		if a == attribute.String("tenant", tenant) {
+		if a == attribute.String(obsconstants.AttrKeyTenantID, tenant) {
 			return true
 		}
 	}
@@ -797,7 +798,7 @@ func TestPostgresCRUDSpans_NameTheTenant(t *testing.T) {
 
 		for _, name := range spanNames {
 			for _, a := range tracer.attrs(name) {
-				if a.Key == "tenant" {
+				if a.Key == obsconstants.AttrKeyTenantID {
 					t.Errorf("span %q carries %v; the single-tenant scope names no tenant", name, a)
 				}
 			}

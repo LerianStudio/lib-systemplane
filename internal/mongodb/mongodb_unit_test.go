@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	obsconstants "github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -561,22 +562,39 @@ func TestSchemaCacheKey_DistinguishesTenants(t *testing.T) {
 }
 
 // TestScopeAttrs_NamesTheTenant pins what a CRUD span says about whose data it
-// touched: a named tenant is on every span, and the single-tenant scope adds
-// nothing.
+// touched and which database it hit: the database system, name and collection
+// on every span, a named tenant under the fleet-wide tenant.id key, and
+// nothing tenant-shaped on the single-tenant scope.
 func TestScopeAttrs_NamesTheTenant(t *testing.T) {
 	key := attribute.String(fieldKey, "k")
+	coll := (&mongo.Client{}).Database("sysplane").Collection(defaultCollection)
 
-	zero := scopeAttrs(store.Scope{}, key)
-	if len(zero) != 1 || zero[0] != key {
-		t.Errorf("zero scope attributes = %#v, want only the caller's", zero)
+	dbAttrs := []attribute.KeyValue{
+		attribute.String(obsconstants.AttrDBSystem, obsconstants.DBSystemMongoDB),
+		attribute.String(obsconstants.AttrDBName, "sysplane"),
+		attribute.String(obsconstants.AttrDBMongoDBCollection, defaultCollection),
 	}
 
-	tenant := scopeAttrs(store.Scope{Tenant: "t1"}, key)
-	if len(tenant) != 2 || tenant[0] != key || tenant[1] != attribute.String("tenant", "t1") {
-		t.Errorf("tenant scope attributes = %#v, want the caller's plus tenant=t1", tenant)
+	want := append(append([]attribute.KeyValue{}, dbAttrs...), key)
+	if got := scopeAttrs(coll, store.Scope{}, key); !reflect.DeepEqual(got, want) {
+		t.Errorf("zero scope attributes = %#v, want %#v", got, want)
 	}
 
-	if got := scopeAttrs(store.Scope{Tenant: "t1"}); len(got) != 1 || got[0] != attribute.String("tenant", "t1") {
-		t.Errorf("bare tenant attributes = %#v, want tenant=t1", got)
+	want = append(append(append([]attribute.KeyValue{}, dbAttrs...), key),
+		attribute.String(obsconstants.AttrKeyTenantID, "t1"))
+	if got := scopeAttrs(coll, store.Scope{Tenant: "t1"}, key); !reflect.DeepEqual(got, want) {
+		t.Errorf("tenant scope attributes = %#v, want %#v", got, want)
+	}
+
+	// A nil collection still names the system: the span helper must never
+	// panic on a path that failed to resolve one.
+	got := scopeAttrs(nil, store.Scope{Tenant: "t1"})
+	want = []attribute.KeyValue{
+		attribute.String(obsconstants.AttrDBSystem, obsconstants.DBSystemMongoDB),
+		attribute.String(obsconstants.AttrKeyTenantID, "t1"),
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("nil-collection attributes = %#v, want %#v", got, want)
 	}
 }

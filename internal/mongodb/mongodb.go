@@ -35,6 +35,7 @@ import (
 	"time"
 
 	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
+	obsconstants "github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/tracing"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
@@ -404,16 +405,41 @@ func (s *Store) ensureSchemaByKey(ctx context.Context, cacheKey string, run func
 	return nil
 }
 
-// scopeAttrs names the tenant a CRUD span touched, when the call named one.
-// The tenant is a span attribute and never a metric label: a tenant id is
-// unbounded, so it belongs where a trace already costs one entry per call
-// rather than in a time series per tenant.
-func scopeAttrs(scope store.Scope, attrs ...attribute.KeyValue) []attribute.KeyValue {
-	if scope.Tenant == "" {
-		return attrs
+// logFieldKeyName is the log field a warning names a configuration key under.
+// NOT "key": lib-observability's redaction matches that field name exactly, so
+// the canonical logger replaces the value with [REDACTED] and the warning whose
+// whole purpose is to name the offending key ships without it. Span attributes
+// are not redacted and keep the plain "key" name.
+const logFieldKeyName = "keyname"
+
+// scopeAttrs names the database a CRUD span hit and the tenant it touched,
+// when the call named one. The tenant is a span attribute and never a metric
+// label: a tenant id is unbounded, so it belongs where a trace already costs
+// one entry per call rather than in a time series per tenant. It goes under
+// the fleet-wide constants.AttrKeyTenantID so one trace query selects a tenant
+// across every Lerian service.
+//
+// coll may be nil on a path that never resolved one; the system attribute is
+// still stamped, because a span that says nothing about its backend is worse
+// than one that says only which backend it was.
+func scopeAttrs(coll *mongo.Collection, scope store.Scope, attrs ...attribute.KeyValue) []attribute.KeyValue {
+	out := make([]attribute.KeyValue, 0, len(attrs)+4)
+	out = append(out, attribute.String(obsconstants.AttrDBSystem, obsconstants.DBSystemMongoDB))
+
+	if coll != nil {
+		out = append(out,
+			attribute.String(obsconstants.AttrDBName, coll.Database().Name()),
+			attribute.String(obsconstants.AttrDBMongoDBCollection, coll.Name()),
+		)
 	}
 
-	return append(attrs, attribute.String("tenant", scope.Tenant))
+	out = append(out, attrs...)
+
+	if scope.Tenant == "" {
+		return out
+	}
+
+	return append(out, attribute.String(obsconstants.AttrKeyTenantID, scope.Tenant))
 }
 
 // List returns every entry from the resolved collection ordered by (namespace, key).
@@ -430,7 +456,7 @@ func (s *Store) List(ctx context.Context, scope store.Scope) ([]store.Entry, err
 	ctx, span := s.tracer.Start(ctx, "systemplane.mongodb.list")
 	defer span.End()
 
-	span.SetAttributes(scopeAttrs(scope)...)
+	span.SetAttributes(scopeAttrs(coll, scope)...)
 
 	findOpts := options.Find().SetSort(bson.D{
 		{Key: fieldNamespace, Value: 1},
@@ -464,10 +490,15 @@ func (s *Store) List(ctx context.Context, scope store.Scope) ([]store.Entry, err
 		if err := cursor.Decode(&doc); err != nil {
 			namespace, key := docIdentity(cursor.Current)
 
+			// The tenant is on this warning, and on every other
+			// document-level warning in this backend, because without it an
+			// operator reading the logs of a process carrying dozens of
+			// tenant feeds cannot tell which database is emitting garbage.
 			s.logWarn(ctx, "list decode error, skipping document",
 				log.Err(err),
 				log.String("namespace", namespace),
-				log.String("key", key),
+				log.String(logFieldKeyName, key),
+				log.String(obsconstants.AttrKeyTenantID, scope.Tenant),
 			)
 
 			continue
@@ -501,7 +532,7 @@ func (s *Store) Get(ctx context.Context, scope store.Scope, namespace, key strin
 	ctx, span := s.tracer.Start(ctx, "systemplane.mongodb.get")
 	defer span.End()
 
-	span.SetAttributes(scopeAttrs(scope,
+	span.SetAttributes(scopeAttrs(coll, scope,
 		attribute.String("namespace", namespace),
 		attribute.String("key", key),
 	)...)
@@ -531,7 +562,8 @@ func (s *Store) Get(ctx context.Context, scope store.Scope, namespace, key strin
 		s.logWarn(ctx, "get decode error, serving the key as absent",
 			log.Err(err),
 			log.String("namespace", namespace),
-			log.String("key", key),
+			log.String(logFieldKeyName, key),
+			log.String(obsconstants.AttrKeyTenantID, scope.Tenant),
 		)
 
 		return store.Entry{}, false, nil
@@ -562,7 +594,7 @@ func (s *Store) Set(ctx context.Context, scope store.Scope, e store.Entry) (int6
 	ctx, span := s.tracer.Start(ctx, "systemplane.mongodb.set")
 	defer span.End()
 
-	span.SetAttributes(scopeAttrs(scope,
+	span.SetAttributes(scopeAttrs(coll, scope,
 		attribute.String("namespace", e.Namespace),
 		attribute.String("key", e.Key),
 	)...)
@@ -612,7 +644,7 @@ func (s *Store) Delete(ctx context.Context, scope store.Scope, namespace, key, a
 	// actor is intentionally NOT a span attribute: it is unbounded caller
 	// identity and would create a high-cardinality / potentially PII tag. It
 	// is recorded where audit trails read it: the tombstone's updated_by.
-	span.SetAttributes(scopeAttrs(scope,
+	span.SetAttributes(scopeAttrs(coll, scope,
 		attribute.String("namespace", namespace),
 		attribute.String("key", key),
 	)...)

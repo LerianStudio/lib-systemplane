@@ -49,6 +49,7 @@ import (
 	"time"
 
 	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
+	obsconstants "github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/tracing"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
@@ -331,16 +332,26 @@ func pinPrimary(db dbresolver.DB) dbExecutor {
 	return db
 }
 
-// scopeAttrs names the tenant a CRUD span touched, when the call named one.
-// The tenant is a span attribute and never a metric label: a tenant id is
-// unbounded, so it belongs where a trace already costs one entry per call
-// rather than in a time series per tenant.
+// scopeAttrs names the database system a CRUD span hit and the tenant it
+// touched, when the call named one. The tenant is a span attribute and never a
+// metric label: a tenant id is unbounded, so it belongs where a trace already
+// costs one entry per call rather than in a time series per tenant. It goes
+// under the fleet-wide constants.AttrKeyTenantID so one trace query selects a
+// tenant across every Lerian service.
+//
+// No db.name: the CRUD path never learns one. The handle arrives from the
+// caller (*sql.DB), from ctx, or from the connector, and none of them carries
+// the database name without an extra round trip this store will not spend.
 func scopeAttrs(scope store.Scope, attrs ...attribute.KeyValue) []attribute.KeyValue {
+	out := make([]attribute.KeyValue, 0, len(attrs)+2)
+	out = append(out, attribute.String(obsconstants.AttrDBSystem, obsconstants.DBSystemPostgreSQL))
+	out = append(out, attrs...)
+
 	if scope.Tenant == "" {
-		return attrs
+		return out
 	}
 
-	return append(attrs, attribute.String("tenant", scope.Tenant))
+	return append(out, attribute.String(obsconstants.AttrKeyTenantID, scope.Tenant))
 }
 
 // List returns every entry in the resolved database, ordered by (namespace, key).

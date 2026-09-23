@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/LerianStudio/lib-commons/v7/commons/backoff"
+	obsconstants "github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/runtime"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
@@ -845,7 +846,7 @@ func (s *Store) openWatch(ctx context.Context, f *feed) (*mongo.ChangeStream, er
 
 	s.logInfo(ctx, "change stream established",
 		log.String("collection", s.cfg.Collection),
-		log.String("tenant", f.scope.Tenant),
+		log.String(obsconstants.AttrKeyTenantID, f.scope.Tenant),
 	)
 
 	return stream, nil
@@ -1008,6 +1009,11 @@ func (s *Store) runFeed(f *feed, stream *mongo.ChangeStream) {
 //
 // It DOES report whether the cursor carried at least one event, which is what
 // tells runFeed the stream was worth keeping and its backoff can start over.
+//
+// Every document-level warning in this file, here and in the polling loop,
+// names the feed's tenant. Without it an operator reading the logs of a
+// process carrying dozens of tenant feeds cannot tell which database is
+// emitting garbage, and the warning degrades into noise nobody can act on.
 func (s *Store) consumeUntilFailure(f *feed, stream *mongo.ChangeStream) (consumed bool) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1027,7 +1033,10 @@ func (s *Store) consumeUntilFailure(f *feed, stream *mongo.ChangeStream) (consum
 
 		var event changeEvent
 		if err := stream.Decode(&event); err != nil {
-			s.logWarn(ctx, "change stream decode error, skipping event", log.Err(err))
+			s.logWarn(ctx, "change stream decode error, skipping event",
+				log.Err(err),
+				log.String(obsconstants.AttrKeyTenantID, f.scope.Tenant),
+			)
 
 			continue
 		}
@@ -1038,6 +1047,7 @@ func (s *Store) consumeUntilFailure(f *feed, stream *mongo.ChangeStream) (consum
 
 			s.logWarn(ctx, "change stream event dropped — missing identifiers",
 				log.String("operationType", event.OperationType),
+				log.String(obsconstants.AttrKeyTenantID, f.scope.Tenant),
 			)
 
 			continue
@@ -1049,7 +1059,7 @@ func (s *Store) consumeUntilFailure(f *feed, stream *mongo.ChangeStream) (consum
 	if err := stream.Err(); err != nil && ctx.Err() == nil {
 		s.logDebug(ctx, "change stream read failed",
 			log.Err(err),
-			log.String("tenant", f.scope.Tenant),
+			log.String(obsconstants.AttrKeyTenantID, f.scope.Tenant),
 		)
 	}
 
@@ -1096,7 +1106,7 @@ func (s *Store) reopenWatch(f *feed, attempt *int) (*mongo.ChangeStream, error) 
 	// attempt == 0 would now do, since a bare reopen no longer clears it.
 	s.logWarn(context.Background(), "change stream disconnected, reconnecting",
 		log.Int("attempt", *attempt),
-		log.String("tenant", f.scope.Tenant),
+		log.String(obsconstants.AttrKeyTenantID, f.scope.Tenant),
 	)
 
 	for {
@@ -1122,7 +1132,7 @@ func (s *Store) reopenWatch(f *feed, attempt *int) (*mongo.ChangeStream, error) 
 		if err := s.refreshFeedColl(context.Background(), f); err != nil {
 			s.logStreakFailure(firstOfStreak, "tenant re-resolve before reopen failed",
 				log.Err(err),
-				log.String("tenant", f.scope.Tenant),
+				log.String(obsconstants.AttrKeyTenantID, f.scope.Tenant),
 			)
 
 			continue
@@ -1132,7 +1142,7 @@ func (s *Store) reopenWatch(f *feed, attempt *int) (*mongo.ChangeStream, error) 
 		if err != nil {
 			s.logStreakFailure(firstOfStreak, "change stream reopen failed",
 				log.Err(err),
-				log.String("tenant", f.scope.Tenant),
+				log.String(obsconstants.AttrKeyTenantID, f.scope.Tenant),
 			)
 
 			continue
@@ -1293,7 +1303,7 @@ func (s *Store) signalFeed(f *feed, skipSelfWait bool) <-chan struct{} {
 
 	if selfTeardown {
 		s.logDebug(context.Background(), "changefeed torn down from inside a callback; not waiting for its reader",
-			log.String("tenant", f.scope.Tenant),
+			log.String(obsconstants.AttrKeyTenantID, f.scope.Tenant),
 		)
 
 		return nil
@@ -1424,7 +1434,7 @@ func (s *Store) pollForever(f *feed, st pollState) {
 				// advance below, so 0 is the opening failure of this streak.
 				s.logStreakFailure(attempt == 0, "poll round trip failed",
 					log.Err(err),
-					log.String("tenant", f.scope.Tenant),
+					log.String(obsconstants.AttrKeyTenantID, f.scope.Tenant),
 				)
 
 				if subs, ok := f.beginDisconnect(); ok {
@@ -1441,7 +1451,7 @@ func (s *Store) pollForever(f *feed, st pollState) {
 				if err := s.refreshFeedColl(context.Background(), f); err != nil {
 					s.logWarn(context.Background(), "tenant re-resolve after a failed poll failed",
 						log.Err(err),
-						log.String("tenant", f.scope.Tenant),
+						log.String(obsconstants.AttrKeyTenantID, f.scope.Tenant),
 					)
 				}
 
@@ -1577,7 +1587,10 @@ func (s *Store) pollOnce(ctx context.Context, f *feed, st pollState, emit func(s
 		var doc entryDoc
 
 		if err := cur.Decode(&doc); err != nil {
-			s.logWarn(ctx, "poll decode error, skipping document", log.Err(err))
+			s.logWarn(ctx, "poll decode error, skipping document",
+				log.Err(err),
+				log.String(obsconstants.AttrKeyTenantID, f.scope.Tenant),
+			)
 
 			continue
 		}
@@ -1622,12 +1635,15 @@ func (s *Store) pollOnce(ctx context.Context, f *feed, st pollState, emit func(s
 		return st, fmt.Errorf("systemplane/mongodb: poll cursor%s: %w", f.label(), err)
 	}
 
-	currentKnown, err := s.snapshotKeys(ctx, f.coll)
+	currentKnown, err := s.snapshotKeys(ctx, f)
 	if err != nil {
 		// A partial scan would synthesize deletes for rows it merely failed to
 		// read, so the previous key set is kept and the diff skipped: a late
 		// delete beats a phantom one.
-		s.logWarn(ctx, "poll snapshot failed, skipping delete diff", log.Err(err))
+		s.logWarn(ctx, "poll snapshot failed, skipping delete diff",
+			log.Err(err),
+			log.String(obsconstants.AttrKeyTenantID, f.scope.Tenant),
+		)
 
 		return next, nil
 	}
@@ -1656,7 +1672,9 @@ func (s *Store) pollOnce(ctx context.Context, f *feed, st pollState, emit func(s
 // this lib deleted is already gone from here and is announced from its
 // tombstone instead. What the resulting diff still covers is the delete that
 // leaves nothing to read: a foreign deleteOne.
-func (s *Store) snapshotKeys(ctx context.Context, coll *mongo.Collection) (map[nsKey]struct{}, error) {
+func (s *Store) snapshotKeys(ctx context.Context, f *feed) (map[nsKey]struct{}, error) {
+	coll := f.coll
+
 	projection := bson.D{
 		{Key: fieldNamespace, Value: 1},
 		{Key: fieldKey, Value: 1},
@@ -1679,7 +1697,10 @@ func (s *Store) snapshotKeys(ctx context.Context, coll *mongo.Collection) (map[n
 		}
 
 		if err := cur.Decode(&doc); err != nil {
-			s.logWarn(ctx, "snapshot decode error, skipping document", log.Err(err))
+			s.logWarn(ctx, "snapshot decode error, skipping document",
+				log.Err(err),
+				log.String(obsconstants.AttrKeyTenantID, f.scope.Tenant),
+			)
 
 			continue
 		}
