@@ -8,6 +8,12 @@ import (
 	"github.com/LerianStudio/lib-systemplane/v4/internal/group"
 )
 
+var (
+	// ErrApplyPanicked is what an OnApply function's panic becomes in
+	// ApplyStatus.LastErr; the recovered value and the stack stay in the log.
+	ErrApplyPanicked = group.ErrApplyPanicked
+)
+
 // Group binds a typed configuration document to one (namespace, key).
 //
 // A group is exactly one registered key whose stored value is the JSON
@@ -371,7 +377,11 @@ type Applied[T any] struct {
 // accepted by the function furthest behind, so it means the document is in force
 // everywhere; with no function registered nothing can lag and the scope reads as
 // converged. LastErr holds the last rejection and survives until every
-// registered function has accepted the newest published revision.
+// registered function has accepted the newest published revision. Only an
+// acceptance clears it: unregistering every function, including the last one
+// unsubscribing from inside its own delivery, leaves the rejection standing.
+// So a group nobody applies keeps reporting its last rejection rather than
+// reading healthy while it is being torn down.
 //
 // Desired equal to Applied is not convergence on its own: a delete publishes
 // Revision 0, and until this Client is engine-backed every publication carries

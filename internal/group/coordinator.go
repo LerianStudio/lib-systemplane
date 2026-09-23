@@ -429,7 +429,11 @@ func (c *Coordinator[T]) add(fn ApplyFunc[T]) (uint64, []*scope[T], seedOutcome)
 // accepted, so it means the document is in force everywhere; with no applier
 // registered nothing can lag and the scope reads as converged. LastErr holds
 // the last rejection and survives until every registered applier has accepted
-// the scope's newest observation.
+// the scope's newest observation. Only an acceptance clears it: unregistering
+// every applier, including the last one unsubscribing from inside its own
+// delivery, leaves the rejection standing. So a scope nobody applies keeps
+// reporting its last rejection rather than reading healthy while it is being
+// torn down.
 //
 // Desired equal to Applied is therefore not convergence on its own: a delete
 // publishes Revision 0 and every publication the wave-1 facade makes carries
