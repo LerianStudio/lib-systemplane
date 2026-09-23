@@ -177,8 +177,8 @@ func TestCoordinatorApplierPanicIsRecordedLikeAnError(t *testing.T) {
 		t.Errorf("Status = %#v, want Desired 3 and Applied 0", got)
 	}
 
-	if got.LastErr == nil || !strings.Contains(got.LastErr.Error(), "panicked") {
-		t.Errorf("LastErr = %v, want an error naming the panic", got.LastErr)
+	if !errors.Is(got.LastErr, ErrApplyPanicked) {
+		t.Errorf("LastErr = %v, want ErrApplyPanicked: a consumer matches the panic with errors.Is, not by parsing the message", got.LastErr)
 	}
 
 	// The recovered value is whatever the hook was holding — routinely the
@@ -245,8 +245,8 @@ func TestCoordinatorApplierPanicIsRedactedInProductionMode(t *testing.T) {
 	}
 
 	got := statusOf(t, c, "t1")
-	if got.LastErr == nil || !strings.Contains(got.LastErr.Error(), "panicked") {
-		t.Errorf("LastErr = %v, want the rejection recorded", got.LastErr)
+	if !errors.Is(got.LastErr, ErrApplyPanicked) {
+		t.Errorf("LastErr = %v, want ErrApplyPanicked recorded", got.LastErr)
 	}
 
 	if strings.Contains(got.LastErr.Error(), "boom") {
@@ -254,6 +254,64 @@ func TestCoordinatorApplierPanicIsRedactedInProductionMode(t *testing.T) {
 	}
 
 	assertPanicScopeLine(t, logger, "t1", 3)
+}
+
+// countingRecorder is the panic metric factory lib-observability records
+// through. It counts increments so a test can prove the panic counter fired.
+type countingRecorder struct {
+	mu    sync.Mutex
+	count int64
+}
+
+func (r *countingRecorder) AddCounter(_ context.Context, _, _, _ string, _ map[string]string, delta int64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.count += delta
+
+	return nil
+}
+
+func (r *countingRecorder) recorded() int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.count
+}
+
+// TestCoordinatorAPanickingLoggerStillRecordsThePanic pins the observability
+// half of a recovered applier panic against the consumer's own logger failing:
+// the panic handler logs BEFORE it records the counter, the span event and the
+// error report, so a logger that panics on that line used to take all three
+// with it and the coordinator's own recovery then swallowed the unwind — a
+// fleet whose hot reload stopped, with the panic counter flat.
+//
+// Process-global like the production-mode toggle above: no test in this package
+// calls t.Parallel().
+func TestCoordinatorAPanickingLoggerStillRecordsThePanic(t *testing.T) {
+	recorderMetrics := &countingRecorder{}
+
+	runtime.ResetPanicMetrics()
+	runtime.InitPanicMetrics(recorderMetrics)
+
+	defer runtime.ResetPanicMetrics()
+
+	c := NewCoordinator[coordDoc](&alwaysPanickingLogger{NopLogger: &log.NopLogger{}}, Decode[coordDoc], nil)
+
+	unsubscribe := mustRegister(t, c, func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
+		panic("the apply function exploded")
+	})
+	defer unsubscribe()
+
+	publishWithoutPanicking(t, c, publication("t1", 1, "one"))
+
+	if got := recorderMetrics.recorded(); got != 1 {
+		t.Errorf("panic counter incremented %d times, want 1: the metric, the span event and the error report must not depend on the consumer's logger surviving", got)
+	}
+
+	if got := statusOf(t, c, "t1"); !errors.Is(got.LastErr, ErrApplyPanicked) {
+		t.Errorf("LastErr = %v, want ErrApplyPanicked", got.LastErr)
+	}
 }
 
 // TestCoordinatorApplierErrorIsLogged pins the operational half of a rejection:
@@ -391,6 +449,18 @@ func TestCoordinatorDecodeFailureIsRecordedAndNeverDelivered(t *testing.T) {
 	if names := late.names(); len(names) != 1 || names[0] != "good" {
 		t.Errorf("replay = %v, want the last decodable document", names)
 	}
+
+	// The replay hands revision 1 to a second applier, and that acceptance must
+	// not read as convergence: the newest thing the scope observed is the
+	// malformed revision 2, which nobody applied.
+	got = statusOf(t, c, "t1")
+	if got.Desired != 2 {
+		t.Errorf("Desired after the replay = %d, want 2: the malformed revision is still the newest observation", got.Desired)
+	}
+
+	if got.LastErr == nil {
+		t.Error("LastErr after the replay = nil, want the decode failure: replaying an older revision is not an acceptance of the newest one")
+	}
 }
 
 // TestCoordinatorSupersededDecodeFailureIsStillLogged pins the one malformed
@@ -510,6 +580,14 @@ func TestCoordinatorDecodeFailureOnAFreshScopeIsObserved(t *testing.T) {
 
 	if got.LastErr == nil {
 		t.Error("LastErr = nil, want the decode failure")
+	}
+
+	// The replay of a scope holding no decodable document delivers nothing, and
+	// it must record nothing either: per-applier bookkeeping is keyed by the
+	// scope, so keying it on the zero observation's payload invents an entry for
+	// a tenant that does not exist.
+	if applierHasStateFor(t, c, "") {
+		t.Error(`an applier keeps bookkeeping for tenant "", want none: the only scope is "t1" and nothing was ever delivered`)
 	}
 }
 
@@ -687,6 +765,28 @@ func TestCoordinatorUnsubscribeStopsDeliveryAndReleasesStatus(t *testing.T) {
 
 	if names := rec.names(); len(names) != 2 {
 		t.Errorf("the remaining applier received %v, want both publications", names)
+	}
+}
+
+// TestCoordinatorUnsubscribingTheLastApplierKeepsTheRejection pins A12 at the
+// boundary where the convergence test reads as vacuously true: with nobody
+// registered, "every applier has accepted the newest observation" holds by
+// default, so clearing the scope's error on the way out erases a decode failure
+// or a refusal that nothing ever applied — and the next reader is told a group
+// nobody is applying is healthy. LastErr clears when an applier ACCEPTS, and
+// leaving is not accepting.
+func TestCoordinatorUnsubscribingTheLastApplierKeepsTheRejection(t *testing.T) {
+	c := NewCoordinator[coordDoc](newRecordingLogger(), rejectingDecode("bad"), nil)
+
+	c.Publish(context.Background(), publication("t1", 4, "bad"))
+
+	var rec recorder
+
+	unsubscribe := mustRegister(t, c, rec.apply)
+	unsubscribe()
+
+	if got := statusOf(t, c, "t1"); got.LastErr == nil {
+		t.Errorf("Status after the only applier unsubscribed = %#v, want the decode failure still readable", got)
 	}
 }
 

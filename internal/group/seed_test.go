@@ -236,6 +236,14 @@ func TestCoordinatorSeedThatFailsToDecodeIsRecorded(t *testing.T) {
 		t.Fatalf("logged = %v, want the decode failure at error level", lines)
 	}
 
+	// A6 parity with the published-document branch: the rejection IS an
+	// observation, so the observed flag and not just the spent-seed flag says
+	// the coordinator has been heard from, and anyObservedLocked stays the one
+	// truth a later guard can read.
+	if !scopeObserved(t, c, "t1") {
+		t.Error("the seeded scope is not marked observed, want it observed: a rejection at decode is still an observation")
+	}
+
 	// The scope counts as observed for seeding purposes: the seed is not retried.
 	var second recorder
 
@@ -244,6 +252,14 @@ func TestCoordinatorSeedThatFailsToDecodeIsRecorded(t *testing.T) {
 
 	if seed.calls != 1 {
 		t.Fatalf("seed consulted %d times, want 1: a failed decode is not retried", seed.calls)
+	}
+
+	if names := second.names(); len(names) != 0 {
+		t.Errorf("deliveries to the second registration = %v, want none: nothing decodable was ever seeded", names)
+	}
+
+	if applierHasStateFor(t, c, "") {
+		t.Error(`an applier keeps bookkeeping for tenant "", want none: the only scope is "t1"`)
 	}
 }
 

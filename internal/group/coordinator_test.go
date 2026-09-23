@@ -600,6 +600,11 @@ func TestCoordinatorRegisterRefusesANilApplyFunc(t *testing.T) {
 	}
 
 	c.Publish(ctx, publication("t1", 1, "one"))
+
+	if got := statusOf(t, c, "t1"); got.LastErr != nil {
+		t.Errorf("LastErr = %v, want nil: a nil apply function is refused at Register, so nothing can reject a publication", got.LastErr)
+	}
+
 	unsubscribe()
 }
 
@@ -648,6 +653,39 @@ func mustRegister(t *testing.T, c *Coordinator[coordDoc], fn ApplyFunc[coordDoc]
 	}
 
 	return unsubscribe
+}
+
+// applierHasStateFor reports whether any registered applier keeps bookkeeping
+// for the named scope. Per-applier state is keyed by the SCOPE, so a drain that
+// finds nothing to deliver — a scope observed through a document that never
+// decoded — must leave no entry at all, least of all one under the zero
+// observation's empty tenant.
+func applierHasStateFor(t *testing.T, c *Coordinator[coordDoc], tenant string) bool {
+	t.Helper()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for _, ap := range c.appliers {
+		if _, ok := ap.state[tenant]; ok {
+			return true
+		}
+	}
+
+	return false
+}
+
+// scopeObserved reports the scope's observed flag, which is what decides
+// whether a later registration seeds and what a replay iterates.
+func scopeObserved(t *testing.T, c *Coordinator[coordDoc], tenant string) bool {
+	t.Helper()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	sc, ok := c.scopes[tenant]
+
+	return ok && sc.observed
 }
 
 func mustPanic(t *testing.T, what string, fn func()) {

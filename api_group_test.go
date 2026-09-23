@@ -1624,6 +1624,36 @@ func TestGroupOnApplyErrorIsVisibleInStatus(t *testing.T) {
 	}
 }
 
+// TestGroupOnApplyPanicIsReportedAsErrApplyPanicked pins the sentinel a
+// consumer matches on: an apply hook that panics leaves the group unapplied,
+// and the only way to tell that apart from a hook that returned an error is a
+// sentinel — parsing LastErr's message is not an API.
+func TestGroupOnApplyPanicIsReportedAsErrApplyPanicked(t *testing.T) {
+	t.Parallel()
+
+	c := newGroupHotClient(t, newGroupMemoryStore())
+	g := bindGroupOn(t, c)
+	startGroupClient(t, c)
+
+	unsubscribe, err := g.OnApply(func(context.Context, systemplane.Applied[groupConfig]) error {
+		panic("the apply hook exploded")
+	})
+	if err != nil {
+		t.Fatalf("OnApply: %v", err)
+	}
+
+	t.Cleanup(unsubscribe)
+
+	status := g.Status()
+	if len(status) != 1 {
+		t.Fatalf("Status = %#v, want one scope", status)
+	}
+
+	if !errors.Is(status[0].LastErr, systemplane.ErrApplyPanicked) {
+		t.Errorf("Status[0].LastErr = %v, want ErrApplyPanicked", status[0].LastErr)
+	}
+}
+
 // TestGroupOnApplyUnsubscribeStopsDelivery proves the handle OnApply returns
 // detaches the applier and releases its hold on the scope's applied revision.
 func TestGroupOnApplyUnsubscribeStopsDelivery(t *testing.T) {

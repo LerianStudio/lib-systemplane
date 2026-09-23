@@ -1,6 +1,9 @@
 package systemplane
 
-import internalclient "github.com/LerianStudio/lib-systemplane/v4/internal/client"
+import (
+	internalclient "github.com/LerianStudio/lib-systemplane/v4/internal/client"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/group"
+)
 
 // Sentinel errors returned by Client methods.
 var (
@@ -35,4 +38,8 @@ var (
 	// multi-tenant mode and the caller's context carries no tenant database
 	// for the configured module.
 	ErrTenantConnectionMissing = internalclient.ErrTenantConnectionMissing
+
+	// ErrApplyPanicked is what an OnApply function's panic becomes in
+	// ApplyStatus.LastErr; the recovered value and the stack stay in the log.
+	ErrApplyPanicked = group.ErrApplyPanicked
 )

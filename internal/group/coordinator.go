@@ -472,6 +472,14 @@ func (c *Coordinator[T]) remove(id uint64) {
 
 		c.appliers = append(c.appliers[:i], c.appliers[i+1:]...)
 
+		// With nobody registered the convergence test is vacuously true, and
+		// clearing on it would erase a rejection nothing ever applied (A12:
+		// LastErr clears when an applier ACCEPTS). The error waits for the next
+		// acceptance instead.
+		if len(c.appliers) == 0 {
+			return
+		}
+
 		// The applier that left may have been the one holding the scope back,
 		// and its rejection no longer describes anybody still registered.
 		for _, sc := range c.scopes {
@@ -528,8 +536,15 @@ func (c *Coordinator[T]) seedLocked() seedOutcome {
 
 	value, decodeErr := c.decode(pub.Value)
 	if decodeErr != nil {
+		// Observed, exactly as commit marks a published document that failed to
+		// decode (A6): the rejection is what the coordinator heard from this
+		// scope, so anyObservedLocked is the single truth about whether anything
+		// has been heard at all and cannot disagree with the spent-seed flag.
+		// current stays as it was, so the replay this arms finds nothing to
+		// deliver and no applier is ever handed a document nobody could parse.
 		sc.latestSeq = seq
 		sc.lastErr = decodeErr
+		sc.observed = true
 
 		return seedOutcome{pub: pub, decodeErr: decodeErr}
 	}
@@ -661,11 +676,16 @@ func (c *Coordinator[T]) deliver(ctx context.Context, pending []delivery[T]) {
 // pendingLocked collects the appliers that have not been offered obs yet and
 // marks them as offered BEFORE the invocation, because a rejection is never
 // retried. The caller holds the state mutex.
+//
+// Bookkeeping is keyed by the SCOPE, never by the observation's own tenant:
+// a scope observed only through a document that failed to decode still has the
+// zero observation as its current one, and that carries no tenant at all, so
+// keying on the payload would file this scope's state under the empty tenant.
 func (c *Coordinator[T]) pendingLocked(sc *scope[T], observed observation[T]) []delivery[T] {
 	pending := make([]delivery[T], 0, len(c.appliers))
 
 	for _, ap := range c.appliers {
-		st := ap.scopeState(observed.value.Tenant)
+		st := ap.scopeState(sc.tenant)
 		if st.deliveredSeq >= observed.seq {
 			continue
 		}
@@ -677,6 +697,14 @@ func (c *Coordinator[T]) pendingLocked(sc *scope[T], observed observation[T]) []
 
 	return pending
 }
+
+// ErrApplyPanicked is the error an apply function's panic becomes. It carries
+// no part of the recovered value: a panic value is whatever the panicking hook
+// was holding, routinely the decoded document with its endpoints and its
+// credentials, and this error is a field operators read and log. The value and
+// the stack are in the log line the panic handler writes, redacted in
+// production mode.
+var ErrApplyPanicked = errors.New("systemplane/group: apply function panicked; the value and stack are in the log line under group.apply")
 
 // invoke runs one applier and turns every failure mode into an error: a
 // returned error passes through, and a panic is recovered into one. The recover
@@ -702,7 +730,7 @@ func (c *Coordinator[T]) invoke(
 ) (err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			err = errors.New("systemplane/group: apply function panicked; the value and stack are in the log line under group.apply")
+			err = ErrApplyPanicked
 
 			// Two lines, because HandlePanicValue carries the recovered value
 			// and the stack but neither the tenant nor the revision, and
@@ -734,10 +762,32 @@ func (c *Coordinator[T]) invoke(
 // through the consumer's logger, so a logger that panics would otherwise unwind
 // out of invoke — past the error return that LastErr is built on, and out
 // through the fan-out that recorded the scope as delivering.
+//
+// The logger goes in wrapped because HandlePanicValue LOGS the panic before it
+// records the counter, the span event and the error report: a logger that
+// panics on that line would take all three down with it, and the recover above
+// would then swallow the unwind, leaving a panicking hot-reload hook visible
+// nowhere but Status. Wrapping keeps the canonical handler and its production
+// redaction while making the record step independent of the consumer's logger.
 func (c *Coordinator[T]) reportPanic(ctx context.Context, recovered any) {
 	defer swallowPanic()
 
-	runtime.HandlePanicValue(ctx, c.logger, recovered, "systemplane", "group.apply")
+	runtime.HandlePanicValue(ctx, safeLogger{inner: c.logger}, recovered, "systemplane", "group.apply")
+}
+
+// safeLogger is a logger whose Log cannot unwind into its caller. It exists for
+// the panic handler above, which runs the consumer's logger ahead of everything
+// else it does.
+type safeLogger struct{ inner log.Logger }
+
+func (l safeLogger) Log(ctx context.Context, level int, msg string, fields ...any) {
+	if l.inner == nil {
+		return
+	}
+
+	defer swallowPanic()
+
+	l.inner.Log(ctx, level, msg, fields...)
 }
 
 func (c *Coordinator[T]) logError(ctx context.Context, msg string, fields ...log.Field) {
