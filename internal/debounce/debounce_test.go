@@ -33,6 +33,16 @@ func (r *recordingLogger) Log(_ context.Context, _ int, _ string, fields ...any)
 	}
 }
 
+// snapshot copies the captured fields under the lock. A timer goroutine can
+// still be inside Log while a test renders a failure, so formatting the slice
+// itself is a data race the race detector fails the run on.
+func (r *recordingLogger) snapshot() []log.Field {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return append([]log.Field(nil), r.fields...)
+}
+
 func (r *recordingLogger) field(key string) (log.Field, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -166,7 +176,7 @@ func TestDebouncer_PanicInFnRecovered(t *testing.T) {
 	// stack trace already names the callback that blew up.
 	source, ok := rec.field("source")
 	if !ok {
-		t.Fatalf("panic recovery logged no source field: %v", rec.fields)
+		t.Fatalf("panic recovery logged no source field: %v", rec.snapshot())
 	}
 
 	if source.Value != "debounce" {

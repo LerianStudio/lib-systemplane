@@ -482,6 +482,7 @@ func TestTenantIsLoggedUnderTheCanonicalKey(t *testing.T) {
 	e.Publish(context.Background(), store.Scope{Tenant: tenant}, jsonRow(nk, 1, `"5"`, "ops"))
 
 	got := requireOneRecord(t, rec, "write for an untracked scope, dropping")
+	requireNotRedacted(t, got)
 
 	f, ok := got.field(constants.AttrKeyTenantID)
 	if !ok {
@@ -749,6 +750,19 @@ func TestScopeDropDiagnosticsAreDebug(t *testing.T) {
 			msg:  "write for an untracked scope, dropping",
 			drive: func(t *testing.T, e *Engine) {
 				e.Publish(context.Background(), store.Scope{Tenant: "acme"}, jsonRow(nk, 1, `"5"`, "ops"))
+			},
+		},
+		{
+			// The third path into the same drop, and the one that runs on the
+			// backend's own changefeed goroutine: a notification the feed was
+			// already carrying when the scope went away. The key is
+			// registered, so nothing earlier rejects it — the drop is what
+			// stops it.
+			name: "a changefeed notification that outlived its scope",
+			msg:  "changefeed work for an untracked scope, dropping",
+			drive: func(_ *testing.T, e *Engine) {
+				e.dropScope(store.Scope{})
+				e.onEvent(upsertEvent(store.Scope{}, nk, 1))
 			},
 		},
 	}

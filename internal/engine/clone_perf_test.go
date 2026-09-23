@@ -2,7 +2,10 @@
 
 package engine
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 // TestPerf_CloneJSONMap is BenchmarkCloneJSONMap with a number CI enforces.
 // The benchmark asserts nothing and no job runs it, so the guard against
@@ -16,17 +19,26 @@ import "testing"
 // meaningful in the build the AC15 perf gate runs
 // (`go test -tags=unit -run=^TestPerf_ ./...`, no -race).
 //
-// wantAllocs is measured, not derived: it is what the fast path costs for this
-// tree today, and it is here to change loudly. A regression to the reflective
-// walk multiplies it; a genuine improvement lowers it, and then the number
-// moves in a commit that says why.
+// wantAllocs is measured, not derived: it is the ceiling the fast path costs
+// for this tree today. The bound is one-sided on purpose — the regression this
+// guards against is the fall back to the reflective walk, which MULTIPLIES the
+// count, and an exact equality would also fail on the improvement it is not
+// here to police.
 func TestPerf_CloneJSONMap(t *testing.T) {
 	const wantAllocs = 6
 
 	value := jsonCloneTree()
 
-	if got := testing.AllocsPerRun(100, func() { _ = Clone(value) }); got != wantAllocs {
-		t.Errorf("Clone over a decoded JSON tree allocates %v times, want %d: the read and "+
+	// AllocsPerRun reads the process-wide Mallocs counter, so an allocation
+	// made by another goroutine between its two samples is charged to this
+	// one; the minimum of three measurements is the one least polluted by it.
+	got := math.Inf(1)
+	for range 3 {
+		got = math.Min(got, testing.AllocsPerRun(100, func() { _ = Clone(value) }))
+	}
+
+	if got > wantAllocs {
+		t.Errorf("Clone over a decoded JSON tree allocates %v times, up from %d: the read and "+
 			"delivery paths left the JSON fast path", got, wantAllocs)
 	}
 }

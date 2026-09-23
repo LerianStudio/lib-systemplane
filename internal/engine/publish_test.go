@@ -172,6 +172,29 @@ func TestPublishFence(t *testing.T) {
 			wantRaw:        []byte(`{"burst":2,"limit":10}`),
 		},
 		{
+			// The publication that carries no bytes at all: a reconcile row
+			// the snapshot decoded, or any candidate assembled in-process
+			// rather than read back from the store. It must not erase the
+			// spelling the cache already holds — an entry left with no bytes
+			// misses the fence's memcmp on every later re-read of this
+			// revision and walks the whole decoded document again, for the
+			// life of the revision.
+			name: "an equal revision carrying no bytes keeps the cached spelling",
+			seed: []publication{{
+				NSKey: nk, Revision: 3, Value: map[string]any{"limit": float64(10)},
+				Raw:       []byte(`{"limit":10}`),
+				UpdatedAt: first, UpdatedBy: "ops",
+			}},
+			candidate: publication{
+				NSKey: nk, Revision: 3, Value: map[string]any{"limit": float64(10)},
+				UpdatedAt: second, UpdatedBy: "console",
+			},
+			wantValue:      map[string]any{"limit": float64(10)},
+			wantRevision:   3,
+			wantProvenance: provenance{UpdatedAt: second, UpdatedBy: "console"},
+			wantRaw:        []byte(`{"limit":10}`),
+		},
+		{
 			// D3's foreign-writer rule: MongoDB has no triggers, so a Console
 			// process writing the collection directly can change value and
 			// leave revision alone. Deduplicating on revision alone would make
