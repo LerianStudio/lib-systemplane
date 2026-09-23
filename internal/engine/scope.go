@@ -17,6 +17,14 @@ type entry struct {
 	// comparing bytes instead of walking the decoded document. It is nil for a
 	// publication that has no row behind it — a delete, or a reconcile-absent
 	// publishing the registered default.
+	//
+	// The engine RETAINS the store's own slice here for the life of the cache
+	// entry and compares it against every later publication of the key, so a
+	// Store must return a slice it will never mutate afterwards. database/sql
+	// decodes into a fresh *[]byte per row today; a pooled buffer or a
+	// sql.RawBytes handed back instead would leave the fence comparing bytes
+	// that changed underneath it, and a real configuration change whose new
+	// text happened to land in the same buffer would be swallowed as an echo.
 	Raw       []byte
 	Revision  int64
 	UpdatedAt time.Time

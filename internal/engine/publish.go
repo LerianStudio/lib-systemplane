@@ -17,6 +17,11 @@ type publication struct {
 	// Raw is the row's JSON as the store returned it, or nil when no row
 	// backs the publication. publish compares it against the cached bytes
 	// before it compares decoded values; see the fence below.
+	//
+	// An accepted publication's slice is RETAINED by the cache and compared
+	// against every later publication of that key, so a Store must hand over
+	// bytes it will never mutate. See entry.Raw for what a pooled buffer
+	// would cost.
 	Raw       []byte
 	UpdatedAt time.Time
 	UpdatedBy string
@@ -84,15 +89,18 @@ func (e *Engine) publish(sc *scopeState, pub publication) (notify bool) {
 	case pub.Revision < cached.Revision:
 		return false
 	case len(pub.Raw) > 0 && bytes.Equal(pub.Raw, cached.Raw):
-		// The common case by far: the echo of a write this process just made.
-		// Set publishes with the revision the store returned (D4) and the
-		// changefeed then re-reads the same row, so an equal revision carrying
-		// identical bytes is what every write produces. Bytes are compared
-		// FIRST because they answer it in one memcmp, while reflect.DeepEqual
-		// walks the whole decoded document under this scope's write lock —
-		// with every Lookup of the scope waiting behind it, and with equal
-		// values as its worst case, since nothing short-circuits. Refresh
-		// provenance and stop.
+		// The same row read twice: bytes the store itself handed over last
+		// time, which is what a changefeed re-read and a reconcile snapshot
+		// of an unchanged row produce. The echo of a Set reaches this branch
+		// only after the first adoption below — on Postgres the client
+		// marshals {"burst":2,"limit":10} while jsonb reads the row back as
+		// {"burst": 2, "limit": 10}, so a write's own echo is decided by the
+		// decoded comparison and adopts the store's spelling there.
+		// Bytes are compared FIRST because they answer it in one memcmp,
+		// while reflect.DeepEqual walks the whole decoded document under this
+		// scope's write lock — with every Lookup of the scope waiting behind
+		// it, and with equal values as its worst case, since nothing
+		// short-circuits. Refresh provenance and stop.
 		cached.UpdatedAt = pub.UpdatedAt
 		cached.UpdatedBy = pub.UpdatedBy
 		sc.entries[pub.NSKey] = cached
@@ -100,11 +108,25 @@ func (e *Engine) publish(sc *scopeState, pub publication) (notify bool) {
 		return false
 	case reflect.DeepEqual(pub.Value, cached.Value):
 		// Equal non-zero revision, different bytes, same meaning: a writer
-		// reformatted the JSON or reordered object keys. Equality is on the
-		// decoded value, never on raw bytes alone, so that no-op does not fire
-		// a callback. This walk only runs when the bytes already differ — a
-		// reformatted row, or D3's foreign writer — both rare. Refresh
-		// provenance and stop.
+		// reformatted the JSON or reordered object keys, or a Set echo is
+		// arriving in the store's own spelling rather than this process's.
+		// Equality is on the decoded value, never on raw bytes alone, so that
+		// no-op does not fire a callback. This walk only runs when the bytes
+		// already differ — a reformatted row, a first echo, or D3's foreign
+		// writer.
+		//
+		// Adopt the new spelling along with the provenance: keeping the old
+		// bytes would make every later re-read of this revision miss the
+		// memcmp above and walk the whole document again, for the life of the
+		// revision. The fence invariant survives it — pub.Raw decodes to
+		// pub.Value, which this branch just proved equal to the cached value —
+		// so Raw stays a byte spelling of Value and the entry converges on the
+		// store's own text after one re-read. A publication carrying no bytes
+		// must not erase the spelling the cache has.
+		if len(pub.Raw) > 0 {
+			cached.Raw = pub.Raw
+		}
+
 		cached.UpdatedAt = pub.UpdatedAt
 		cached.UpdatedBy = pub.UpdatedBy
 		sc.entries[pub.NSKey] = cached

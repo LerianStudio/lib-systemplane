@@ -3,6 +3,7 @@
 package engine
 
 import (
+	"bytes"
 	"fmt"
 	"reflect"
 	"sync"
@@ -82,6 +83,10 @@ func TestPublishFence(t *testing.T) {
 		wantValue      any
 		wantRevision   int64
 		wantProvenance provenance
+		// wantRaw, when set, is the byte spelling the cache must hold after
+		// the candidate. A refreshed entry that kept the OLD spelling would
+		// miss the fence's memcmp on every later re-read of that revision.
+		wantRaw []byte
 	}{
 		{
 			name:           "a key that is not cached yet is accepted",
@@ -164,6 +169,7 @@ func TestPublishFence(t *testing.T) {
 			wantValue:      map[string]any{"limit": float64(10), "burst": float64(2)},
 			wantRevision:   3,
 			wantProvenance: provenance{UpdatedAt: second, UpdatedBy: "console"},
+			wantRaw:        []byte(`{"burst":2,"limit":10}`),
 		},
 		{
 			// D3's foreign-writer rule: MongoDB has no triggers, so a Console
@@ -239,7 +245,28 @@ func TestPublishFence(t *testing.T) {
 				t.Errorf("provenance: got (%s, %q), want (%s, %q)",
 					got.UpdatedAt, got.UpdatedBy, tt.wantProvenance.UpdatedAt, tt.wantProvenance.UpdatedBy)
 			}
+
+			if tt.wantRaw != nil && !bytes.Equal(got.Raw, tt.wantRaw) {
+				t.Errorf("cached raw: got %s, want %s", got.Raw, tt.wantRaw)
+			}
 		})
+	}
+}
+
+// TestIngestedRowCachesTheRowBytes pins the fast path's INPUT. Every other
+// assertion on Raw is a hand-built publication literal, so dropping either
+// assignment that carries the store's bytes into the cache — the ingress's or
+// the fence's — leaves the suite green while the memcmp compares against nil
+// forever. Put a real row through the ingress and read the bytes back.
+func TestIngestedRowCachesTheRowBytes(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	e := engineWithRegistry(fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: map[string]any{}}}})
+
+	row := jsonRow(nk, 1, `{"limit":10}`, "ops")
+	ingestRow(e, row)
+
+	if got := cachedEntry(t, e, store.Scope{}, nk); !bytes.Equal(got.Raw, row.Value) {
+		t.Errorf("cached raw after ingesting a row: got %s, want %s", got.Raw, row.Value)
 	}
 }
 
