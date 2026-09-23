@@ -24,7 +24,7 @@
 | Phase | Milestone | Epics | Status |
 |-------|-----------|-------|--------|
 | 1 | A consumer binds a typed document, reads it back as `T` with revision/tenant/staleness, and writes it; an invalid document is rejected at every ingress the facade owns | 1.1, 1.2 | Complete |
-| 2 | The same group delivers hot reload: `OnApply` fires serialized, coalesced, never twice for the same revision, and `Status` reports desired vs applied per tenant | 2.1, 2.2, 2.3 | Detailed |
+| 2 | The same group delivers hot reload: `OnApply` fires serialized, coalesced, never twice for the same revision, and `Status` reports desired vs applied per tenant | 2.1, 2.2, 2.3 | Complete |
 | 3 | A group document renders per field on the admin surface: fields tagged `systemplane:"redact=full"` or `redact=mask` are redacted, every other field is in clear (FC-13); opens after engine-core Phase 2 merges, in its own worktree `/srv/worktrees/v4-groups-redaction` / `feat/v4-groups-redaction` | 3.1, 3.2 | Epic-level |
 
 ---
@@ -279,7 +279,7 @@ At the end of Phase 2 a consumer registers an apply function once and receives e
 - **A9, seed errors.** The seed closure returns `(Publication, ok bool, err error)`. A `GetEntry` error (`ErrClosed` after `Start`, a store or decode error on the multi-tenant path) is returned by `Register`, whose signature is `Register(fn ApplyFunc[T]) (func(), error)`, and `OnApply` returns it (after `subscribeErr`); `ok=false` is reserved for a confirmed `!ok` or `Entry.Stale`. The contract blocks in Epic 2.1 and Task 2.1.1 carry the amended signatures.
 - **A10, re-entrancy and the debounce window.** With the default positive debounce the Client publishes a synchronous store echo from a timer goroutine, not from the applier's goroutine; the same-goroutine deferred-delivery statement holds only when the upstream callback invokes `Publish` inline during the delivery (`WithDebounce(0)` in the tests, and the engine-backed Client). The godoc states the `Set` case that way and documents `OnApply` re-entry separately, as a direct coordinator path.
 - **A11, delivery before return.** `OnApply` delivers the current snapshot before returning whenever no fan-out for that scope is in flight. When another goroutine is mid-fan-out for the scope, `Register` appends the applier and returns, and THAT fan-out delivers to the new applier before it completes (its loop re-reads the applier list on every iteration). The alternative, blocking the registrant until the running fan-out reaches it, needs re-entrancy detection Go cannot provide safely and would reinstate the publisher stall C1 removed. FC-7's sentence "subscribes first and then delivers the current snapshot" is read as: the delivery is initiated before return and completes on whichever goroutine holds the scope; D-G7's "the applier runs before OnApply returns" is narrowed the same way. The godoc says exactly this.
-- **A12, `LastErr` survives until acceptance.** Implements A8 literally: `LastErr` is cleared only when an applier ACCEPTS a delivery and every registered applier has accepted the latest observation; it is never cleared on revision equality, so a rejection at Revision 0 (every revision on the wave-1 facade) stays visible. FC-7's field comment is amended in `index.md` to "nil once every registered fn has accepted the newest published revision". A rejection is also logged at error level through the injected logger (tenant, revision, error), the same site the panic path uses. `LastErr` clears when every applier still registered has accepted the newest observation: an acceptance, or the departure of the applier that was holding the scope back. Unregistering every applier never clears it, including the last one unsubscribing from inside its own delivery (fix pass 3 heal, e51dc14).
+- **A12, `LastErr` survives until acceptance.** Implements A8 literally: `LastErr` clears only when every applier still registered has accepted the latest observation (an acceptance, or the departure of the applier holding the scope back), and never while no applier is registered; it is never cleared on revision equality, so a rejection at Revision 0 (every revision on the wave-1 facade) stays visible. FC-7's field comment is amended in `index.md` to "nil once every registered fn has accepted the newest published revision". A rejection is also logged at error level through the injected logger (tenant, revision, error), the same site the panic path uses. `LastErr` clears when every applier still registered has accepted the newest observation: an acceptance, or the departure of the applier that was holding the scope back. Unregistering every applier never clears it, including the last one unsubscribing from inside its own delivery (fix pass 3 heal, e51dc14).
 - **A13, wave-1 ordering limit.** The coordinator orders by arrival sequence (A5) and cannot repair a caller that delivers one key's callbacks out of order, which the current Client's debounce dispatch can do from timer goroutines; the engine-backed Client serializes per (scope, key) in revision order (FC-4). Documented in the coordinator godoc as a wave-1 limitation; no code.
 - **A14, scope retention hook.** Per-tenant scope entries and per-applier state are never pruned. Not fixed in this lane: the engine-tenants lane gets a `DropScope(tenant string)` hook on the coordinator, called from the Client's tenant teardown, recorded here so that work lands with a place to release the scope.
 
@@ -289,7 +289,7 @@ At the end of Phase 2 a consumer registers an apply function once and receives e
 **Scope:** `internal/group/` (new files alongside the codec).
 **Dependencies:** Phase 1.
 **Done when:** the coordinator's tests drive revision 0, a repeated non-zero revision, an advancing revision, a publication arriving while an applier is running, an applier returning an error, two scopes interleaved, and a `Register` with nothing observed yet that seeds from the injected read and then drops the publication following it at the same revision — all with no goroutine surviving `goleak`.
-**Status:** Pending
+**Status:** Done
 
 The contract between this epic and Epic 2.2 is the coordinator's surface, written here so the two cannot disagree:
 
@@ -726,7 +726,7 @@ Applied == ` the seeded revision.
 **Scope:** root `api_group.go`, `api_group_test.go`.
 **Dependencies:** Epic 2.1.
 **Done when:** `Bind` takes the group's single `OnChange` subscription and feeds the coordinator; `OnApply` before `Start` registers and receives its initial delivery when the engine publishes at `Start`; `OnApply` after `Start` delivers the current snapshot before returning, seeding it from `GetEntry` when the publication has not been delivered yet (D-G7); the same non-zero revision is never delivered twice; a slow applier does not lose a revision, only intermediate ones; `Status` reports per tenant; multi-tenant `OnApply` returns `ErrNotSupportedInMultiTenant` until engine-tenants lands. The root test that pins the pre-`Start` case uses a fake store whose `Subscribe` fires an event for the seeded key, so the publication lands DURING `Start` — the same shape the engine's reconcile will take.
-**Status:** Pending
+**Status:** Done
 
 The RED test for the seed, `TestGroupOnApplyAfterStartSeedsUndeliveredPublication`: the fake store is seeded with a row and its `Subscribe` HOLDS the publication instead of firing it during `Start`, standing in for a dispatch worker that has not run yet. `OnApply` called immediately after `Start` returns fires the applier exactly once, with the stored document rather than the registered default. Releasing the held publication at the same revision does NOT fire it again. The matching coordinator-level tests in Epic 2.1 drive the revision arithmetic the wave-1 facade cannot express (D-G9): a released publication at a HIGHER revision does fire, and a Revision 0 delete arriving after the dropped first publication fires too.
 
@@ -932,7 +932,7 @@ exact delivery count for a delete.
 **Scope:** root `example_group_test.go` (new), doc comments in `api_group.go`.
 **Dependencies:** Epic 2.2.
 **Done when:** `example_group_test.go` is in package `systemplane_test` with NO build tag and NO `// Output:` comment, so it compiles in the untagged build (`go vet ./...`, `go build`) as well as under `-tags=unit`, and is never executed. It therefore must not reference `NewForTesting`, which is build-tag gated — it constructs through `NewPostgres` inside a function that never runs. It shows: declaring the config struct, `Bind` with a validator, `OnApply`, `Start`, `Snapshot` and `Set`. Every FC-7 doc comment in `api_group.go` matches the behavior that landed.
-**Status:** Pending
+**Status:** Done
 
 #### Task 2.3.1: Add the compiling group example and sweep the group godoc
 
