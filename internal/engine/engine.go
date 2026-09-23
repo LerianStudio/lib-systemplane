@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/runtime"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/debounce"
@@ -455,7 +456,7 @@ func (e *Engine) Publish(ctx context.Context, scope store.Scope, se store.Entry)
 	sc := e.trackedScope(scope)
 	if sc == nil {
 		e.logDebug(ctx, "write for an untracked scope, dropping",
-			log.String("tenant", scope.Tenant),
+			log.String(constants.AttrKeyTenantID, scope.Tenant),
 			log.String("namespace", se.Namespace),
 			log.String("keyname", se.Key),
 		)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 
+	"github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/runtime"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
@@ -247,7 +248,7 @@ func (e *Engine) applyScope(sc *scopeState, arm reconcileArming) (superseded boo
 	// reach.
 	if e.trackedScope(sc.scope) != sc {
 		e.logDebug(ctx, "reconcile for a scope state the engine no longer tracks, abandoning",
-			log.String("tenant", sc.scope.Tenant),
+			log.String(constants.AttrKeyTenantID, sc.scope.Tenant),
 		)
 
 		return true, nil
@@ -257,7 +258,7 @@ func (e *Engine) applyScope(sc *scopeState, arm reconcileArming) (superseded boo
 	if err != nil {
 		const msg = "scope reconcile failed to list, keeping cached values"
 
-		fields := []log.Field{log.String("tenant", sc.scope.Tenant), log.Err(err)}
+		fields := []log.Field{log.String(constants.AttrKeyTenantID, sc.scope.Tenant), log.Err(err)}
 
 		// Every ordinary Close with a reconcile in flight cancels its List, so
 		// reporting that at WARN makes a clean shutdown look like an incident

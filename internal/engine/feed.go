@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
@@ -144,7 +145,7 @@ func (e *Engine) scopeForEvent(scope store.Scope, nk NSKey) *scopeState {
 	}
 
 	e.logDebug(e.dispatchContext(), "changefeed work for an untracked scope, dropping",
-		log.String("tenant", scope.Tenant),
+		log.String(constants.AttrKeyTenantID, scope.Tenant),
 		log.String("namespace", nk.Namespace),
 		log.String("keyname", nk.Key),
 	)

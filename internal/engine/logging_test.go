@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/redaction"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
@@ -417,6 +418,36 @@ func TestPublishLogsUnderTheCallerContext(t *testing.T) {
 	got := requireOneRecord(t, rec, "stored value rejected by validator, keeping cached value")
 	if got.Ctx == nil || got.Ctx.Value(ctxKey{}) != "caller-span" {
 		t.Errorf("the write path logged under a context that is not the caller's: %s", got)
+	}
+}
+
+// TestTenantIsLoggedUnderTheCanonicalKey pins the field key every tenant-scoped
+// line in this package uses. Three spellings were live in one repository at
+// once — a bare "tenant" here, "tenant_id" in internal/manager, and
+// lib-observability's own constants.AttrKeyTenantID — so an operator filtering
+// a log stream by tenant matched two of the three and silently lost the rest.
+// The engine follows the library constant; this assertion is what stops the
+// literal coming back.
+func TestTenantIsLoggedUnderTheCanonicalKey(t *testing.T) {
+	const tenant = "acme"
+
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	e, rec := loggingEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, newFakeStore())
+
+	// loggingEngine tracks only the zero scope, so a write addressed to a
+	// tenant is dropped — and the drop names the tenant it was addressed to.
+	e.Publish(context.Background(), store.Scope{Tenant: tenant}, jsonRow(nk, 1, `"5"`, "ops"))
+
+	got := requireOneRecord(t, rec, "write for an untracked scope, dropping")
+
+	f, ok := got.field(constants.AttrKeyTenantID)
+	if !ok {
+		t.Fatalf("no %q field, so a tenant filter never matches the engine's lines: %s",
+			constants.AttrKeyTenantID, got)
+	}
+
+	if f.Value != tenant {
+		t.Errorf("field %q: got %v, want %q", constants.AttrKeyTenantID, f.Value, tenant)
 	}
 }
 

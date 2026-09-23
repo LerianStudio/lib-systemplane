@@ -1,10 +1,50 @@
 package debounce
 
 import (
+	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/LerianStudio/lib-observability/v4/log"
 )
+
+// recordingLogger captures the fields lib-observability's panic recovery
+// emits, so a test can read the component name the debouncer handed it.
+type recordingLogger struct {
+	log.Logger
+
+	mu     sync.Mutex
+	fields []log.Field
+}
+
+func (r *recordingLogger) Log(_ context.Context, _ int, _ string, fields ...any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for _, arg := range fields {
+		switch v := arg.(type) {
+		case []log.Field:
+			r.fields = append(r.fields, v...)
+		case log.Field:
+			r.fields = append(r.fields, v)
+		}
+	}
+}
+
+func (r *recordingLogger) field(key string) (log.Field, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for _, f := range r.fields {
+		if f.Key == key {
+			return f, true
+		}
+	}
+
+	return log.Field{}, false
+}
 
 const (
 	testWindow = 50 * time.Millisecond
@@ -102,7 +142,8 @@ func TestDebouncer_NilReceiverSafe(t *testing.T) {
 func TestDebouncer_PanicInFnRecovered(t *testing.T) {
 	t.Parallel()
 
-	d := New[string](testWindow)
+	rec := &recordingLogger{Logger: log.NewNop()}
+	d := New[string](testWindow, WithLogger[string](rec))
 	t.Cleanup(d.Close)
 
 	var secondFired atomic.Int32
@@ -117,6 +158,19 @@ func TestDebouncer_PanicInFnRecovered(t *testing.T) {
 
 	if secondFired.Load() != 1 {
 		t.Fatal("debouncer broke after panic; second submit did not fire")
+	}
+
+	// The recovery component is a constant, never the key. Rendering the key
+	// into it costs a reflective Sprintf on every debounced invocation, panic
+	// or not, and gives one unbounded label value per key to a line whose
+	// stack trace already names the callback that blew up.
+	source, ok := rec.field("source")
+	if !ok {
+		t.Fatalf("panic recovery logged no source field: %v", rec.fields)
+	}
+
+	if source.Value != "debounce" {
+		t.Errorf("panic recovery source: got %v, want %q", source.Value, "debounce")
 	}
 }
 
