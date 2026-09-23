@@ -934,3 +934,47 @@ func TestCoordinatorAppliedIsTheOldestObservationNotTheLowestRevision(t *testing
 		t.Errorf("LastErr = %v, want the refused delete", got.LastErr)
 	}
 }
+
+// TestCoordinatorLastApplierRejectingAndLeavingKeepsTheRejection covers the
+// re-entrant half of A12 that TestCoordinatorUnsubscribingTheLastApplierKeepsTheRejection
+// leaves open: the only applier unsubscribes itself from inside its own
+// delivery — a pattern OnApply's godoc explicitly blesses — and then refuses the
+// document. Its rejection is written and the convergence test that follows runs
+// against an empty applier list, where "every applier accepted" is vacuously
+// true. Clearing there tells the next reader a group nobody applied is healthy,
+// and a crashed hook becomes indistinguishable from a successful one.
+func TestCoordinatorLastApplierRejectingAndLeavingKeepsTheRejection(t *testing.T) {
+	cases := []struct {
+		name  string
+		apply func() error
+		want  error
+	}{
+		{name: "returns an error", apply: func() error { return errRejected }, want: errRejected},
+		{name: "panics", apply: func() error { panic("boom") }, want: ErrApplyPanicked},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := NewCoordinator[coordDoc](newRecordingLogger(), Decode[coordDoc], nil)
+
+			var (
+				unsubscribe func()
+				once        sync.Once
+			)
+
+			unsubscribe = mustRegister(t, c, func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
+				once.Do(unsubscribe)
+
+				return tc.apply()
+			})
+			defer unsubscribe()
+
+			c.Publish(context.Background(), publication("t1", 4, "four"))
+
+			got := statusOf(t, c, "t1")
+			if !errors.Is(got.LastErr, tc.want) {
+				t.Errorf("Status after the only applier rejected and left = %#v, want LastErr matching %v", got, tc.want)
+			}
+		})
+	}
+}

@@ -472,14 +472,6 @@ func (c *Coordinator[T]) remove(id uint64) {
 
 		c.appliers = append(c.appliers[:i], c.appliers[i+1:]...)
 
-		// With nobody registered the convergence test is vacuously true, and
-		// clearing on it would erase a rejection nothing ever applied (A12:
-		// LastErr clears when an applier ACCEPTS). The error waits for the next
-		// acceptance instead.
-		if len(c.appliers) == 0 {
-			return
-		}
-
 		// The applier that left may have been the one holding the scope back,
 		// and its rejection no longer describes anybody still registered.
 		for _, sc := range c.scopes {
@@ -840,6 +832,15 @@ func (c *Coordinator[T]) recordLocked(sc *scope[T], pending []delivery[T]) {
 // the instant it was recorded and leave a consumer with no error surface at all.
 // The caller holds the state mutex.
 func (c *Coordinator[T]) clearErrIfConvergedLocked(sc *scope[T]) {
+	// With nobody registered the loop below is vacuously true, and clearing on
+	// it would erase a rejection nothing ever applied (A12: LastErr clears when
+	// an applier ACCEPTS). The error waits for the next acceptance instead.
+	// Both entry points reach this — an unsubscribe, and a delivery whose
+	// applier unsubscribed itself before rejecting — so the guard lives here.
+	if len(c.appliers) == 0 {
+		return
+	}
+
 	for _, ap := range c.appliers {
 		if st, ok := ap.state[sc.tenant]; !ok || st.acceptedSeq < sc.latestSeq {
 			return
