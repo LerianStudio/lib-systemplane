@@ -67,6 +67,13 @@ func WithPollInterval(d time.Duration) Option { return internalclient.WithPollIn
 // WithDebounce sets the trailing-edge debounce window for change notifications.
 func WithDebounce(d time.Duration) Option { return internalclient.WithDebounce(d) }
 
+// WithCloseTimeout bounds how long Close waits for subscriber callbacks after
+// cancelling the context handed to them. It bounds the engine's wait only:
+// closing the backend store is not covered, and Close returns the engine's
+// timeout joined with the store's own error. A zero or negative value means
+// the engine default.
+func WithCloseTimeout(d time.Duration) Option { return internalclient.WithCloseTimeout(d) }
+
 // WithCollection overrides the MongoDB collection name.
 func WithCollection(name string) Option { return internalclient.WithCollection(name) }
 

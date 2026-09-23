@@ -3,6 +3,7 @@ package client
 import (
 	"errors"
 
+	"github.com/LerianStudio/lib-systemplane/v4/internal/engine"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -39,6 +40,12 @@ var (
 	// process-wide changefeed primitive) when the Client was constructed with
 	// WithMultiTenantEnabled().
 	ErrNotSupportedInMultiTenant = store.ErrNotSupportedInMultiTenant
+
+	// ErrCloseTimeout is returned by Close when a subscriber callback was
+	// still running after the WithCloseTimeout bound elapsed. Aliased to
+	// engine.ErrCloseTimeout so errors.Is matches the error the engine
+	// actually returns, the same way ErrValidation aliases the store's.
+	ErrCloseTimeout = engine.ErrCloseTimeout
 
 	// ErrTenantConnectionMissing is returned when a method runs in multi-tenant
 	// mode and the caller's context carries no tenant database for the

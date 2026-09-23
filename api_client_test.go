@@ -5,6 +5,7 @@ package systemplane
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -327,5 +328,124 @@ func TestPublicGetEntryCarriesRevisionAndProvenance(t *testing.T) {
 
 	if _, ok, err := c.GetEntry(ctx, "runtime", "absent"); ok || err != nil {
 		t.Errorf("GetEntry for unregistered key = (%v, %v), want (false, nil)", ok, err)
+	}
+}
+
+// TestPublicCloseTimeoutNamesTheStuckKey pins D10 at the facade: a subscriber
+// that ignores its canceled context makes Close return ErrCloseTimeout naming
+// the key it is stuck on, and WithCloseTimeout is what bounds the wait — the
+// 30s engine default would make this test a timeout instead of an assertion.
+func TestPublicCloseTimeoutNamesTheStuckKey(t *testing.T) {
+	t.Parallel()
+
+	c, err := NewForTesting(newAPIMemoryStore(), WithCloseTimeout(100*time.Millisecond))
+	if err != nil {
+		t.Fatalf("NewForTesting: %v", err)
+	}
+
+	if err := c.Register("runtime", "name", "default"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Subscribed after Start so the FC-11 announcement is not what wedges the
+	// worker: the only delivery this callback ever sees is the Set below.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+
+	var enterOnce, doneOnce sync.Once
+
+	if _, err := c.OnChange("runtime", "name", func(context.Context, Change) {
+		enterOnce.Do(func() { close(entered) })
+		<-release
+		doneOnce.Do(func() { close(done) })
+	}); err != nil {
+		t.Fatalf("OnChange: %v", err)
+	}
+
+	if err := c.Set(ctx, "runtime", "name", "changed", "actor"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("subscriber callback never ran")
+	}
+
+	err = c.Close()
+	if !errors.Is(err, ErrCloseTimeout) {
+		t.Fatalf("Close() = %v, want an error wrapping ErrCloseTimeout", err)
+	}
+
+	if msg := err.Error(); !strings.Contains(msg, "runtime") || !strings.Contains(msg, "name") {
+		t.Errorf("Close() error = %q, want it to name the namespace and the key", msg)
+	}
+
+	close(release)
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("subscriber callback never returned after release")
+	}
+}
+
+// TestPublicCloseReturnsNilWhenTheSubscriberHonoursCancellation is the other
+// half of D10: cancellation is cooperative, so a callback that watches its ctx
+// ends on Close and Close reports no leak.
+func TestPublicCloseReturnsNilWhenTheSubscriberHonoursCancellation(t *testing.T) {
+	t.Parallel()
+
+	c, err := NewForTesting(newAPIMemoryStore(), WithCloseTimeout(5*time.Second))
+	if err != nil {
+		t.Fatalf("NewForTesting: %v", err)
+	}
+
+	if err := c.Register("runtime", "name", "default"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	entered := make(chan struct{})
+	done := make(chan struct{})
+
+	var enterOnce, doneOnce sync.Once
+
+	if _, err := c.OnChange("runtime", "name", func(cbCtx context.Context, _ Change) {
+		enterOnce.Do(func() { close(entered) })
+		<-cbCtx.Done()
+		doneOnce.Do(func() { close(done) })
+	}); err != nil {
+		t.Fatalf("OnChange: %v", err)
+	}
+
+	if err := c.Set(ctx, "runtime", "name", "changed", "actor"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("subscriber callback never ran")
+	}
+
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close() = %v, want nil for a callback that honours cancellation", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("subscriber callback never observed its canceled context")
 	}
 }

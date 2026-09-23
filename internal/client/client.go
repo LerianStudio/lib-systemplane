@@ -149,6 +149,10 @@ func newClient(s store.Store, cfg clientConfig) *Client {
 		Registry: c,
 		Logger:   logger,
 		Debounce: cfg.debounce,
+
+		// Left zero when the caller set no WithCloseTimeout, so the engine's
+		// own default is the single place that names a duration.
+		CloseTimeout: cfg.closeTimeout,
 	})
 
 	return c

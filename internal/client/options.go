@@ -16,6 +16,7 @@ type clientConfig struct {
 	listenChannel  string
 	pollInterval   time.Duration
 	debounce       time.Duration
+	closeTimeout   time.Duration
 	collection     string
 	table          string
 	catalogService string
@@ -83,6 +84,22 @@ func WithPollInterval(d time.Duration) Option {
 func WithDebounce(d time.Duration) Option {
 	return func(cfg *clientConfig) {
 		cfg.debounce = d
+	}
+}
+
+// WithCloseTimeout bounds how long Close waits for subscriber callbacks after
+// it cancels the context handed to them. A callback that honours cancellation
+// returns and Close reports nil; one that ignores it makes Close return
+// ErrCloseTimeout naming every scope and key still running.
+//
+// The bound covers the engine's wait only. Close also closes the backend
+// store, which this option does not bound; Close returns the engine's timeout
+// joined with the store's own error, so both are visible.
+//
+// Last-wins. A zero or negative value means the engine default.
+func WithCloseTimeout(d time.Duration) Option {
+	return func(cfg *clientConfig) {
+		cfg.closeTimeout = d
 	}
 }
 
