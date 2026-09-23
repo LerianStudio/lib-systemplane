@@ -94,9 +94,10 @@ type feed struct {
 	// with err nil the feed is live, with err non-nil creation failed and the
 	// slot has already been retracted from the feeds map. err is written BEFORE
 	// the close, so the close is the happens-before edge that publishes it.
-	// On the zero-scope feed it is Start's reservation marker: a non-nil ready
-	// means some Start is already opening this feed, so a concurrent one waits
-	// on it instead of opening a second stream.
+	// Only a named tenant's feed has one. On the zero-scope feed ready is always
+	// nil: Start alone brings that feed up, serialized by startMu, so nothing
+	// waits on it, and stopFeeds relies on the nil to signal it rather than
+	// fail it.
 	// readyClosed guards the single close of ready. Both the creator and Close
 	// can reach a reserved slot, so the flag lives under Store.feedsMu — the
 	// lock both of them already take — not under f.mu.
@@ -771,8 +772,9 @@ func (s *Store) Subscribe(ctx context.Context, scope store.Scope, fn func(store.
 //
 // Polling mode has no stream to open: its first round trip runs here instead,
 // on this goroutine, and its reader is launched with a nil stream. A first
-// round trip that fails returns the error and retracts the slot, so Start
-// leaves no feed and no ticker behind.
+// round trip that fails returns the error and launches no ticker; the
+// zero-scope slot stays in the feeds map with the cause recorded, so its
+// subscribers keep the feed a retried Start reopens.
 func (s *Store) startListener(ctx context.Context) error {
 	// ONE Start at a time, end to end. The zero-scope feed is SHARED, so the
 	// "already running" check below and the reader launch inside publishFeed
