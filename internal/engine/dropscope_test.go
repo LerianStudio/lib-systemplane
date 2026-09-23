@@ -202,3 +202,47 @@ func TestPublishIntoAlreadyDroppedStateIsRefused(t *testing.T) {
 		t.Fatalf("Close() = %v, want nil", err)
 	}
 }
+
+// TestPublishRacingDropScopeStartsNoWorker closes the window publish's own
+// refusal cannot. That refusal selects on the scope's reconcileStop channel;
+// dropScope closes that channel and sweeps the worker map as two steps, so a
+// publisher that passed the select microseconds before the drop began reaches
+// the dispatch step after the sweep has already run. It then started a parked
+// delivery goroutine — and a WaitGroup entry — for a scope the engine no
+// longer tracks, which nothing ends before Close.
+//
+// The race is driven rather than raced for: the publication is handed to
+// dispatch after the drop has completed, which is exactly the state that
+// publisher is in.
+func TestPublishRacingDropScopeStartsNoWorker(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	fs := newFakeStore()
+	e := storeEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0, 2*time.Second)
+
+	bringUp(t, e, dropTenant)
+
+	sc := e.trackedScope(dropTenant)
+	if sc == nil {
+		t.Fatal("the tenant scope was not brought up")
+	}
+
+	// A subscriber, or dispatch would decline the publication for having
+	// nowhere to deliver it and the test would prove nothing.
+	e.OnChange(nk, func(context.Context, Change) {})
+	e.dropScope(dropTenant)
+
+	e.dispatch(sc, publication{Scope: dropTenant, NSKey: nk, Revision: 9, Value: "late"})
+
+	e.workersMu.Lock()
+	workers := len(e.workers)
+	e.workersMu.Unlock()
+
+	if workers != 0 {
+		t.Errorf("a publication racing the drop started %d delivery worker(s), want 0: "+
+			"a dropped tenant keeps a parked goroutine per key until the process shuts down", workers)
+	}
+
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close() = %v, want nil", err)
+	}
+}

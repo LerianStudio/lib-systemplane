@@ -77,11 +77,20 @@ func jsonRow(nk NSKey, revision int64, value, actor string) store.Entry {
 	}
 }
 
-// armReconcile opens a reconcile window on the scope the way an OpResync does,
-// so a test can assert what the feed records during that window without owning
-// the reconcile itself. It returns the arming, which names the window.
-func armReconcile(e *Engine, scope store.Scope) reconcileArming {
-	return e.scopeFor(scope).beginReconcile()
+// armWindow opens a reconcile window on the scope the way an OpResync does and
+// hands back the arming that names it, so a test can assert what the feed
+// records during that window without owning the reconcile itself.
+//
+// It empties the mailbox afterwards because arming and queueing are one step
+// in production: a test that wants the window and no reconcile takes the
+// arming back out rather than leaving it for a goroutine to run. The window
+// stays open; the caller closes it.
+func armWindow(sc *scopeState) reconcileArming {
+	sc.armReconcile()
+
+	arm, _ := sc.takeReconcile()
+
+	return arm
 }
 
 // recordedSets unions the fences of every window currently open on the scope.
@@ -272,7 +281,7 @@ func TestFeedRecordsTouchedOnlyWhileReconciling(t *testing.T) {
 		t.Errorf("outside a reconcile: touched=%v unusable=%v, want both empty", touched, unusable)
 	}
 
-	_ = armReconcile(e, store.Scope{})
+	_ = armWindow(e.scopeFor(store.Scope{}))
 
 	fs.seed(store.Scope{}, jsonRow(nk, 2, `"two"`, "ops"))
 	e.onEvent(upsertEvent(store.Scope{}, nk, 2))
@@ -322,7 +331,7 @@ func TestReReadRejectedByRevisionFenceLandsInTouchedNotUnusable(t *testing.T) {
 	fs.seed(scope, jsonRow(nk, 5, `"five"`, "ops"))
 	e.onEvent(upsertEvent(scope, nk, 5))
 
-	arm := armReconcile(e, scope)
+	arm := armWindow(e.scopeFor(scope))
 	defer e.scopeFor(scope).closeWindow(arm)
 
 	// A row the fence refuses: it decodes and it validates, it is simply older

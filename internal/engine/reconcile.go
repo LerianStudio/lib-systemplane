@@ -29,7 +29,7 @@ type reconcileWindow struct {
 	unusable map[NSKey]struct{}
 }
 
-// reconcileArming is what beginReconcile hands the reconcile that follows it.
+// reconcileArming is what armReconcile hands the reconcile that follows it.
 //
 // reconcile names the window this reconcile opened: a newer OpResync bumps it,
 // which is how a reconcile learns its snapshot has been superseded and must be
@@ -442,47 +442,6 @@ func (e *Engine) keepsCachedValue(sc *scopeState, arm reconcileArming, nk NSKey)
 	return registered && cached.Revision == 0 && reflect.DeepEqual(cached.Value, def.Default)
 }
 
-// beginReconcile opens a reconcile window and reports the generations the
-// reconcile must still see to be allowed to apply its snapshot and to clear
-// stale. It runs on the changefeed goroutine, before the List.
-//
-// Every call gets its OWN empty fences, even while another reconcile is still
-// applying a snapshot under a window of its own. Sharing them was the defect:
-// the feed publishes revision 3 during the first window, the store moves to
-// revision 9 during the second outage, and a second reconcile that inherited
-// the first window's touched set skips the very row its own List went and
-// fetched — leaving the cache six revisions behind and reporting it as fresh.
-// Both windows stay open and the feed fills both, so neither photograph can
-// overwrite a publication the feed made while it was being taken.
-func (sc *scopeState) beginReconcile() reconcileArming {
-	// One acquisition covers marking the scope stale AND bumping the
-	// generation, so clearStale — which holds the same lock across its own
-	// check-and-write — can never land between the two and clear a flag this
-	// arming has just set.
-	sc.reconcileMu.Lock()
-	defer sc.reconcileMu.Unlock()
-
-	sc.mu.Lock()
-	sc.stale = true
-	disconnect := sc.disconnectGen
-	sc.mu.Unlock()
-
-	sc.reconcileGen++
-
-	window := &reconcileWindow{
-		touched:  make(map[NSKey]struct{}),
-		unusable: make(map[NSKey]struct{}),
-	}
-
-	if sc.windows == nil {
-		sc.windows = make(map[uint64]*reconcileWindow, 1)
-	}
-
-	sc.windows[sc.reconcileGen] = window
-
-	return reconcileArming{reconcile: sc.reconcileGen, disconnect: disconnect, window: window}
-}
-
 // superseded reports whether a newer OpResync has taken the window this
 // reconcile armed. Such a reconcile abandons its snapshot: it is holding a
 // photograph of a connection that has already dropped.
@@ -518,7 +477,7 @@ func (sc *scopeState) closeWindow(arm reconcileArming) {
 // unchanged.
 //
 // The check and the write are ONE acquisition of reconcileMu, the lock
-// beginReconcile holds across arming. Split in two, an OpResync arriving
+// armReconcile holds across arming. Split in two, an OpResync arriving
 // between them marked the scope stale and armed its window, and this reconcile
 // then cleared the flag that resync had just set — a scope reporting itself
 // confirmed against a connection that had already dropped.

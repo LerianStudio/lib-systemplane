@@ -107,7 +107,7 @@ func (e *Engine) publish(sc *scopeState, pub publication) (notify bool) {
 	// would see the older revision last. No callback runs here — the worker
 	// goroutine does that — so the lock is held for a mutex and a
 	// non-blocking channel send.
-	e.dispatch(pub)
+	e.dispatch(sc, pub)
 
 	return true
 }

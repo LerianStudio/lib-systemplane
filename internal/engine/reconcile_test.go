@@ -1302,8 +1302,8 @@ func TestSupersededReconcileClosesItsWindow(t *testing.T) {
 
 	sc := e.scopeFor(scope)
 
-	stale := sc.beginReconcile()
-	newer := sc.beginReconcile()
+	stale := armWindow(sc)
+	newer := armWindow(sc)
 
 	// The newer reconcile finishes first, so the only window left is the one
 	// the superseded reconcile has to release itself.
@@ -1462,7 +1462,7 @@ func TestSupersededWindowStopsApplyingItsSnapshot(t *testing.T) {
 	ctx := e.dispatchContext()
 
 	// The control: a window that still owns the scope applies its own row.
-	current := sc.beginReconcile()
+	current := armWindow(sc)
 
 	if superseded := e.applySnapshotRow(ctx, sc, current, jsonRow(nk, 7, `"seven"`, "ops")); superseded {
 		t.Fatal("the window that owns the scope reported itself superseded")
@@ -1477,8 +1477,8 @@ func TestSupersededWindowStopsApplyingItsSnapshot(t *testing.T) {
 
 	// A newer OpResync takes the scope while the older window still holds
 	// rows it has not applied.
-	stale := sc.beginReconcile()
-	newer := sc.beginReconcile()
+	stale := armWindow(sc)
+	newer := armWindow(sc)
 
 	defer sc.closeWindow(newer)
 	defer sc.closeWindow(stale)
@@ -1798,6 +1798,12 @@ func TestReconcileListIsBoundedAndTheScopeRecovers(t *testing.T) {
 // The assertion is the product-level one: after a reconnect, the scope ends up
 // confirmed against the store. Which of the two armings runs is the engine's
 // business.
+//
+// This is a smoke test, NOT the pin. Two reviewers measured it killing the
+// two-lock split roughly one run in 68, because it has to win a race to
+// observe anything. TestArmReconcileQueuesTheNewerArming is the guard: it
+// asserts the invariant directly, and the arming step is now one function body
+// with no seam left to split.
 func TestConcurrentResyncsCannotStrandAScope(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 	scope := store.Scope{}
@@ -1845,6 +1851,88 @@ func TestConcurrentResyncsCannotStrandAScope(t *testing.T) {
 	}
 }
 
+// TestArmReconcileQueuesTheNewerArming is the pin for the one-step arming, and
+// it is deterministic: whichever order two simultaneous OpResync events land
+// in, the mailbox holds the NEWER generation and the older one comes back as
+// displaced.
+//
+// Opening a reconcile window and queueing it used to be two steps under two
+// locks, so the two could reach the mailbox in the opposite order to the one
+// they opened in. The mailbox then held the OLDER arming, which the reconcile
+// goroutine drops as superseded, while the newer window had already been
+// released as the one it displaced. Nothing reconciled, and the scope stayed
+// stale until some later resync happened to arrive — for a knob nobody touches
+// again, never.
+//
+// The end-to-end version of this (TestConcurrentResyncsCannotStrandAScope)
+// caught the split roughly one run in 68, which is not a guard. This asserts
+// the invariant itself, on one scope state, with no store and no goroutine of
+// the engine's involved.
+func TestArmReconcileQueuesTheNewerArming(t *testing.T) {
+	sc := newScopeState(store.Scope{})
+
+	var (
+		mu        sync.Mutex
+		displaced []*reconcileArming
+	)
+
+	start := make(chan struct{})
+
+	var wg sync.WaitGroup
+
+	wg.Add(2)
+
+	for range 2 {
+		go func() {
+			defer wg.Done()
+			<-start
+
+			d := sc.armReconcile()
+
+			mu.Lock()
+			displaced = append(displaced, d)
+			mu.Unlock()
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+
+	var older *reconcileArming
+
+	for _, d := range displaced {
+		if d != nil {
+			older = d
+		}
+	}
+
+	if older == nil {
+		t.Fatal("neither arming displaced the other: one of the two never reached the mailbox")
+	}
+
+	pending := pendingArming(t, sc)
+
+	if older.reconcile != 1 || pending.reconcile != 2 {
+		t.Errorf("displaced generation %d and pending generation %d, want 1 displaced and 2 pending: "+
+			"the mailbox holds the older arming, which the reconcile goroutine drops as superseded — "+
+			"nothing reconciles the scope", older.reconcile, pending.reconcile)
+	}
+}
+
+// pendingArming returns what the scope's single-slot reconcile mailbox holds.
+func pendingArming(t *testing.T, sc *scopeState) reconcileArming {
+	t.Helper()
+
+	sc.resyncMu.Lock()
+	defer sc.resyncMu.Unlock()
+
+	if sc.resyncPending == nil {
+		t.Fatal("the reconcile mailbox is empty: an arming never reached it")
+	}
+
+	return *sc.resyncPending
+}
+
 // TestClearStaleRespectsANewerResync pins the last step of a reconcile against
 // the first step of the next one.
 //
@@ -1859,7 +1947,7 @@ func TestConcurrentResyncsCannotStrandAScope(t *testing.T) {
 func TestClearStaleRespectsANewerResync(t *testing.T) {
 	for round := range 2000 {
 		sc := newScopeState(store.Scope{})
-		arm := sc.beginReconcile()
+		arm := armWindow(sc)
 
 		start := make(chan struct{})
 
@@ -1878,7 +1966,7 @@ func TestClearStaleRespectsANewerResync(t *testing.T) {
 			defer wg.Done()
 			<-start
 
-			sc.beginReconcile()
+			sc.armReconcile()
 		}()
 
 		close(start)

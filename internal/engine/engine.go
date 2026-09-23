@@ -269,7 +269,11 @@ func (e *Engine) bringUpScope(scope store.Scope) (*scopeState, error) {
 //
 // Its goroutines go with it too: the reconcile goroutine and every delivery
 // worker of that scope are stopped here, for the same reason — otherwise one
-// parked goroutine per key per dropped tenant, alive until shutdown.
+// parked goroutine per key per dropped tenant, alive until shutdown. A
+// publication racing the drop is discarded rather than delivered: one that
+// passed publish's refusal before this ran finds the scope's workers already
+// refused and starts none, so its value reaches neither a subscriber nor a
+// goroutine that outlives the tenant.
 //
 // It is idempotent. A tenant suspended and then deleted arrives as two
 // lifecycle events, and the second must not release a subscription the backend
@@ -283,9 +287,10 @@ func (e *Engine) dropScope(scope store.Scope) {
 	delete(e.scopes, scope)
 	e.scopesMu.Unlock()
 
+	// Already dropped, or never tracked: the drop that removed it swept its
+	// workers and refused every later one under the worker lock, and a scope
+	// that was never tracked never had a publication to start one.
 	if sc == nil {
-		e.stopScopeWorkers(scope)
-
 		return
 	}
 
@@ -300,18 +305,26 @@ func (e *Engine) dropScope(scope store.Scope) {
 
 	sc.stopReconcileWorker()
 
-	e.stopScopeWorkers(scope)
+	e.stopScopeWorkers(sc)
 }
 
-// stopScopeWorkers ends every delivery worker of scope and forgets them, under
-// the same lock that starts one: a worker created between the stop and the
-// delete would otherwise survive with nothing to feed it.
-func (e *Engine) stopScopeWorkers(scope store.Scope) {
+// stopScopeWorkers ends every delivery worker of sc, forgets them, and refuses
+// every later one — all under the single lock that starts a worker, which is
+// what makes the refusal and the start agree.
+//
+// Refusing is the half a sweep alone cannot do. publish declines a publication
+// for a dropped scope by selecting on the scope's reconcileStop channel, which
+// dropScope closes one step before this sweep runs; a publisher that passed
+// that select in between reaches workerFor after the sweep and leaves a parked
+// goroutine, and a WaitGroup entry, for a scope only Close ever ends.
+func (e *Engine) stopScopeWorkers(sc *scopeState) {
 	e.workersMu.Lock()
 	defer e.workersMu.Unlock()
 
+	sc.workersDropped = true
+
 	for wk, w := range e.workers {
-		if wk.Scope != scope {
+		if wk.Scope != sc.scope {
 			continue
 		}
 

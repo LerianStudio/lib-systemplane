@@ -146,7 +146,11 @@ func (e *Engine) OnChange(nk NSKey, fn func(ctx context.Context, ch Change)) (un
 // A key nobody subscribes to starts no worker: the delivery would have nowhere
 // to go, and a process registering hundreds of keys should not pay a goroutine
 // for each one that happens to change.
-func (e *Engine) dispatch(pub publication) {
+//
+// sc is the publisher's own scope state, not a lookup by pub.Scope: a
+// publication that raced the scope's drop must be discarded rather than
+// delivered, and only the state it was fenced against can say so.
+func (e *Engine) dispatch(sc *scopeState, pub publication) {
 	e.subsMu.RLock()
 	subscribed := len(e.subscribers[pub.NSKey]) > 0
 	e.subsMu.RUnlock()
@@ -155,7 +159,7 @@ func (e *Engine) dispatch(pub publication) {
 		return
 	}
 
-	w := e.workerFor(workerKey{Scope: pub.Scope, NSKey: pub.NSKey})
+	w := e.workerFor(sc, workerKey{Scope: pub.Scope, NSKey: pub.NSKey})
 	if w == nil {
 		return
 	}
@@ -180,11 +184,16 @@ func (e *Engine) dispatch(pub publication) {
 // passed publish's closed check microseconds earlier could reach Add while
 // Close is inside Wait, which Go answers with an unrecovered "WaitGroup misuse:
 // Add called concurrently with Wait" — a process kill during shutdown.
-func (e *Engine) workerFor(wk workerKey) *dispatchWorker {
+//
+// It returns nil for a dropped scope too, under that same lock and for the
+// same reason: the sweep that ended the scope's workers marked its state, so a
+// publisher that slipped past publish's refusal cannot start a replacement the
+// drop will never come back to stop. The caller discards the publication.
+func (e *Engine) workerFor(sc *scopeState, wk workerKey) *dispatchWorker {
 	e.workersMu.Lock()
 	defer e.workersMu.Unlock()
 
-	if e.workersClosed {
+	if e.workersClosed || sc.workersDropped {
 		return nil
 	}
 

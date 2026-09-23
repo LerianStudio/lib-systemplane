@@ -181,6 +181,11 @@ func TestPublishRacingCloseStartsNoWorker(t *testing.T) {
 	// during shutdown, which this test reproduces by racing the two.
 	e := closeEngine(t, 5*time.Second)
 
+	sc := e.trackedScope(store.Scope{})
+	if sc == nil {
+		t.Fatal("the single-tenant scope was not tracked")
+	}
+
 	for i := range 64 {
 		nk := NSKey{Namespace: "ns", Key: fmt.Sprintf("key-%d", i)}
 		e.OnChange(nk, func(context.Context, Change) {})
@@ -218,7 +223,7 @@ func TestPublishRacingCloseStartsNoWorker(t *testing.T) {
 
 	// Nothing may start a worker once Close has shut the door, whichever side
 	// of the race a straggler landed on.
-	if w := e.workerFor(workerKey{NSKey: NSKey{Namespace: "ns", Key: "after"}}); w != nil {
+	if w := e.workerFor(sc, workerKey{NSKey: NSKey{Namespace: "ns", Key: "after"}}); w != nil {
 		t.Error("workerFor started a worker after Close")
 	}
 }

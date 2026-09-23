@@ -45,19 +45,27 @@ type scopeState struct {
 	// per scope drains that slot, which is what serializes reconciles — two
 	// OpResync events can never apply two snapshots at once — and what makes a
 	// burst of reconnects coalesce into ONE pending reconcile instead of one
-	// goroutine each. beginReconcile still runs on the changefeed goroutine
+	// goroutine each. armReconcile still runs on the changefeed goroutine
 	// and never waits on a List that is in flight.
 	//
 	// reconcileStop is closed when the scope is dropped, so the goroutine ends
-	// with the scope instead of lingering until Close. workerStarted is
-	// guarded by Engine.workersMu, alongside the WaitGroup the goroutine is
-	// registered in.
-	resyncMu      sync.Mutex
-	resyncPending *reconcileArming
-	resyncSignal  chan struct{}
-	reconcileStop chan struct{}
-	stopOnce      sync.Once
-	workerStarted bool
+	// with the scope instead of lingering until Close. workerStarted and
+	// workersDropped are guarded by Engine.workersMu, alongside the WaitGroup
+	// the goroutines are registered in.
+	//
+	// workersDropped is set when this scope's delivery workers are swept, and
+	// refuses every later one. It lives on the state rather than in a map
+	// keyed by scope for the same reason publish takes the caller's own state:
+	// a scope dropped and brought back up is a NEW state, so a publisher still
+	// holding the old one is refused forever while the new one starts workers
+	// freely.
+	resyncMu       sync.Mutex
+	resyncPending  *reconcileArming
+	resyncSignal   chan struct{}
+	reconcileStop  chan struct{}
+	stopOnce       sync.Once
+	workerStarted  bool
+	workersDropped bool
 
 	// reconcileMu guards reconcileGen and windows, and is held across every
 	// check-and-publish pair on both sides of the fence: a reconcile deciding
@@ -72,7 +80,7 @@ type scopeState struct {
 	// inherit each other's: a window that did would skip keys ITS OWN List
 	// answered freshly.
 	//
-	// reconcileGen names the newest window. Every beginReconcile bumps it, so
+	// reconcileGen names the newest window. Every armReconcile bumps it, so
 	// a reconcile whose generation no longer matches knows a newer OpResync
 	// took the scope and abandons its snapshot instead of publishing a
 	// photograph of a connection that has already dropped.
@@ -104,26 +112,64 @@ func newScopeState(scope store.Scope) *scopeState {
 }
 
 // armReconcile opens a reconcile window and puts it in the scope's single-slot
-// mailbox as ONE indivisible step, waking the reconcile goroutine. The send is
-// non-blocking: a full buffer already means "there is work", and blocking here
-// would push a reconcile's List latency onto the changefeed goroutine.
+// mailbox as ONE indivisible step, waking the reconcile goroutine. It runs on
+// the changefeed goroutine, before the List. The send is non-blocking: a full
+// buffer already means "there is work", and blocking here would push a
+// reconcile's List latency onto the changefeed goroutine.
+//
+// The arming names the generations the reconcile must still see to be allowed
+// to apply its snapshot and to clear stale.
 //
 // It returns the arming it displaced, if any. A displaced reconcile will never
 // take a photograph, so the caller releases its window: fences nobody closes
 // go on collecting every feed event for the life of the scope.
 //
-// Arming and queueing are one step because two OpResync events that armed
-// under one lock and queued under another could reach the mailbox in the
-// opposite order to the one they armed in. The mailbox then held the OLDER
-// arming — which the reconcile goroutine drops as superseded — while the newer
-// window had already been released as the one it displaced. Nothing
-// reconciled, and the scope stayed stale until another resync happened to
-// arrive. Under one lock, mailbox order is arming order.
+// Opening the window and queueing it are ONE function body, with no separately
+// callable step between them, because two OpResync events that opened under
+// one lock and queued under another could reach the mailbox in the opposite
+// order to the one they opened in. The mailbox then held the OLDER arming —
+// which the reconcile goroutine drops as superseded — while the newer window
+// had already been released as the one it displaced. Nothing reconciled, and
+// the scope stayed stale until another resync happened to arrive. With one
+// body there is no seam to split: mailbox order is arming order.
+//
+// Every call gets its OWN empty fences, even while another reconcile is still
+// applying a snapshot under a window of its own. Sharing them was the defect:
+// the feed publishes revision 3 during the first window, the store moves to
+// revision 9 during the second outage, and a second reconcile that inherited
+// the first window's touched set skips the very row its own List went and
+// fetched — leaving the cache six revisions behind and reporting it as fresh.
+// Both windows stay open and the feed fills both, so neither photograph can
+// overwrite a publication the feed made while it was being taken.
 func (sc *scopeState) armReconcile() (displaced *reconcileArming) {
 	sc.resyncMu.Lock()
 	defer sc.resyncMu.Unlock()
 
-	arm := sc.beginReconcile()
+	// One acquisition covers marking the scope stale AND bumping the
+	// generation, so clearStale — which holds the same lock across its own
+	// check-and-write — can never land between the two and clear a flag this
+	// arming has just set.
+	sc.reconcileMu.Lock()
+	defer sc.reconcileMu.Unlock()
+
+	sc.mu.Lock()
+	sc.stale = true
+	disconnect := sc.disconnectGen
+	sc.mu.Unlock()
+
+	sc.reconcileGen++
+
+	if sc.windows == nil {
+		sc.windows = make(map[uint64]*reconcileWindow, 1)
+	}
+
+	window := &reconcileWindow{
+		touched:  make(map[NSKey]struct{}),
+		unusable: make(map[NSKey]struct{}),
+	}
+	sc.windows[sc.reconcileGen] = window
+
+	arm := reconcileArming{reconcile: sc.reconcileGen, disconnect: disconnect, window: window}
 	displaced, sc.resyncPending = sc.resyncPending, &arm
 
 	select {
