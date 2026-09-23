@@ -1693,11 +1693,16 @@ func TestPostgresZeroFeed_RefusedConnectIsReportedToSubscribe(t *testing.T) {
 	waitForObserverExit(t)
 }
 
-// A reconnect attempt that fails has exactly one exit, and it is logged with
-// its cause. The LISTEN half used to be discarded with a bare continue: a feed
-// that reconnects but can never re-install LISTEN — pgbouncer in transaction
-// pooling refuses it, a revoked grant refuses it — then looped forever with
-// nothing after the single initial warning to say why it was never delivering.
+// A reconnect attempt that fails has exactly one exit, it is logged with its
+// cause, and the FIRST failure of a streak is logged at WARN. The LISTEN half
+// used to be discarded with a bare continue: a feed that reconnects but can
+// never re-install LISTEN — pgbouncer in transaction pooling refuses it, a
+// revoked grant refuses it — then looped forever with nothing after the single
+// initial warning to say why it was never delivering. Logging every attempt at
+// DEBUG reinstated that silence at a production Info level: the whole failure
+// class stayed invisible while the cache served stale configuration. So the
+// first failure of each streak carries the cause at WARN and the rest drop to
+// DEBUG, which keeps the signal at one line per outage.
 func TestPostgresReconnect_AttemptFailureIsLoggedWithItsCause(t *testing.T) {
 	shrinkTimeouts(t, 250*time.Millisecond)
 
@@ -1714,7 +1719,11 @@ func TestPostgresReconnect_AttemptFailureIsLoggedWithItsCause(t *testing.T) {
 		_, _ = s.reconnect(f, &retry)
 	}()
 
-	entry := logger.waitFor(t, log.LevelDebug, "reconnect attempt failed")
+	entry := logger.waitFor(t, log.LevelWarn, "reconnect attempt failed")
+
+	// The second consecutive failure of the same streak drops to DEBUG: the
+	// backoff already bounds the volume, and one line per outage is the signal.
+	logger.waitFor(t, log.LevelDebug, "reconnect attempt failed")
 
 	close(f.stop)
 	<-done

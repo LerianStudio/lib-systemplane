@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -1773,5 +1774,132 @@ func TestMongoServerKey(t *testing.T) {
 				t.Fatalf("serverKey = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// captureLogger records what the store logs so a test can pin the LEVEL a line
+// is emitted at, not only its text.
+type captureLogger struct {
+	mu      sync.Mutex
+	entries []captureEntry
+}
+
+type captureEntry struct {
+	level  int
+	msg    string
+	fields []log.Field
+}
+
+// Log normalizes the ...any variadic the way the library does: the store hands
+// its []log.Field over as a single element.
+func (c *captureLogger) Log(_ context.Context, level int, msg string, fields ...any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.entries = append(c.entries, captureEntry{level: level, msg: msg, fields: log.Fields(fields...)})
+}
+
+func (c *captureLogger) With(...any) log.Logger      { return c }
+func (c *captureLogger) WithGroup(string) log.Logger { return c }
+func (c *captureLogger) Enabled(int) bool            { return true }
+func (c *captureLogger) Sync(context.Context) error  { return nil }
+
+// waitFor blocks until an entry at level carrying msg has been logged, so a
+// test can pin a line a background goroutine produces without racing it.
+func (c *captureLogger) waitFor(t *testing.T, level int, msg string) captureEntry {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+
+	for {
+		c.mu.Lock()
+
+		for _, e := range c.entries {
+			if e.level == level && e.msg == msg {
+				c.mu.Unlock()
+
+				return e
+			}
+		}
+
+		seen := len(c.entries)
+		c.mu.Unlock()
+
+		if time.Now().After(deadline) {
+			t.Fatalf("no %q entry at level %d after 5s (%d entries logged)", msg, level, seen)
+		}
+
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// field returns the value of the named field, failing when it is absent.
+func (e captureEntry) field(t *testing.T, key string) any {
+	t.Helper()
+
+	for _, f := range e.fields {
+		if f.Key == key {
+			return f.Value
+		}
+	}
+
+	t.Fatalf("log entry %q carries no %q field (%+v)", e.msg, key, e.fields)
+
+	return nil
+}
+
+// The first failure of a reopen streak must be loud. A change stream that can
+// never reopen — a tenant manager that stopped resolving, a revoked grant, a
+// server that lost its replica set — otherwise produced exactly one WARN at
+// the moment of loss and then permanent silence at a production Info level,
+// while the engine kept serving the scope it last reconciled as if it were
+// fresh. The first failure carries the cause at WARN; the rest of the streak
+// drops to DEBUG, so the signal stays at one line per outage.
+func TestMongoReopenWatch_FirstFailureWarnsThenGoesQuiet(t *testing.T) {
+	conn := &stubConnector{resolve: func(int) (*mongo.Database, error) {
+		return nil, errors.New("tenant manager is down")
+	}}
+
+	logger := &captureLogger{}
+
+	s := newSubscribeStore()
+	s.cfg.MultiTenantEnabled = true
+	s.cfg.Connector = conn
+	s.cfg.Logger = logger
+
+	defer func() { _ = s.Close() }()
+
+	f := newFeed(store.Scope{Tenant: "t1"}, nil)
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		attempt := 0
+
+		_, _ = s.reopenWatch(f, &attempt)
+	}()
+
+	entry := logger.waitFor(t, log.LevelWarn, "tenant re-resolve before reopen failed")
+
+	// The second consecutive failure of the same streak drops to DEBUG: the
+	// backoff already bounds the volume, one line per outage is the signal.
+	logger.waitFor(t, log.LevelDebug, "tenant re-resolve before reopen failed")
+
+	close(f.stop)
+	<-done
+
+	if got := entry.field(t, "tenant"); got != "t1" {
+		t.Errorf("first failure logged tenant %v, want t1: a process carrying dozens of feeds cannot tell which one is down", got)
+	}
+
+	cause, ok := entry.field(t, "error").(error)
+	if !ok || cause == nil {
+		t.Fatalf("first failure logged error field %v, want the cause", entry.field(t, "error"))
+	}
+
+	if !strings.Contains(cause.Error(), "tenant manager is down") {
+		t.Errorf("first failure logged %q; the WARN must keep the wrapped cause", cause)
 	}
 }

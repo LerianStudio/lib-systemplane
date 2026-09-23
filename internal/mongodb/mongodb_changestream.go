@@ -1106,6 +1106,10 @@ func (s *Store) reopenWatch(f *feed, attempt *int) (*mongo.ChangeStream, error) 
 		default:
 		}
 
+		// Read before the increment: attempt 0 is the opening attempt of this
+		// backoff streak, and its failure is the one that gets to be loud.
+		firstOfStreak := *attempt == 0
+
 		delay := reconnectDelay(*attempt)
 		*attempt++
 
@@ -1116,7 +1120,7 @@ func (s *Store) reopenWatch(f *feed, attempt *int) (*mongo.ChangeStream, error) 
 		}
 
 		if err := s.refreshFeedColl(context.Background(), f); err != nil {
-			s.logDebug(context.Background(), "tenant re-resolve before reopen failed",
+			s.logStreakFailure(firstOfStreak, "tenant re-resolve before reopen failed",
 				log.Err(err),
 				log.String("tenant", f.scope.Tenant),
 			)
@@ -1126,7 +1130,7 @@ func (s *Store) reopenWatch(f *feed, attempt *int) (*mongo.ChangeStream, error) 
 
 		stream, err := s.openWatch(context.Background(), f)
 		if err != nil {
-			s.logDebug(context.Background(), "change stream reopen failed",
+			s.logStreakFailure(firstOfStreak, "change stream reopen failed",
 				log.Err(err),
 				log.String("tenant", f.scope.Tenant),
 			)
@@ -1416,7 +1420,9 @@ func (s *Store) pollForever(f *feed, st pollState) {
 		case <-ticker.C:
 			next, err := s.pollOnce(context.Background(), f, st, s.pollEmitter(f))
 			if err != nil {
-				s.logWarn(context.Background(), "poll round trip failed",
+				// attempt is still the pre-increment value pollBackoff will
+				// advance below, so 0 is the opening failure of this streak.
+				s.logStreakFailure(attempt == 0, "poll round trip failed",
 					log.Err(err),
 					log.String("tenant", f.scope.Tenant),
 				)

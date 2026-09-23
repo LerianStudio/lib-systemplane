@@ -1132,6 +1132,10 @@ func (s *Store) reconnect(f *feed, retry *reconnectBackoff) (*pgx.Conn, error) {
 		default:
 		}
 
+		// Read before next() advances it: attempt 0 is the opening attempt of
+		// this backoff streak, and its failure is the one that gets to be loud.
+		firstOfStreak := retry.attempt == 0
+
 		select {
 		case <-f.stop:
 			return nil, errFeedStopped
@@ -1147,7 +1151,7 @@ func (s *Store) reconnect(f *feed, retry *reconnectBackoff) (*pgx.Conn, error) {
 
 		conn, err := s.dialAndListen(f)
 		if err != nil {
-			s.logDebug(context.Background(), "reconnect attempt failed",
+			s.logStreakFailure(firstOfStreak, "reconnect attempt failed",
 				log.Err(err),
 				log.String("tenant", f.scope.Tenant),
 			)

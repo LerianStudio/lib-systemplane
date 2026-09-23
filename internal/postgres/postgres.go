@@ -572,3 +572,21 @@ func (s *Store) logDebug(ctx context.Context, msg string, fields ...log.Field) {
 		s.cfg.Logger.Log(ctx, log.LevelDebug, msg, fields)
 	}
 }
+
+// logStreakFailure narrates a retry loop: the FIRST failure of a backoff
+// streak at WARN, every later one at DEBUG. A failure class that never
+// resolves on its own — a feed that dials fine but can never re-install LISTEN
+// (pgbouncer in transaction pooling, a revoked grant) — is otherwise invisible
+// at a production Info level, because the one WARN emitted when the connection
+// was lost says nothing about why every attempt since has failed, and the
+// cache keeps serving stale configuration in the silence. Dropping the rest of
+// the streak to DEBUG keeps that signal at one line per outage.
+func (s *Store) logStreakFailure(first bool, msg string, fields ...log.Field) {
+	if first {
+		s.logWarn(context.Background(), msg, fields...)
+
+		return
+	}
+
+	s.logDebug(context.Background(), msg, fields...)
+}
