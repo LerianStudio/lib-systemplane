@@ -24,6 +24,12 @@ type memStore struct {
 	mu      sync.Mutex
 	entries map[string]store.Entry
 
+	// revision is the store-assigned revision counter FC-2 promises: Set
+	// increments it, stamps it on the stored entry and returns it, so a write
+	// and its changefeed echo carry the same non-zero revision and the
+	// engine's fence deduplicates the echo instead of firing twice.
+	revision int64
+
 	subsMu sync.Mutex
 	subs   map[uint64]func(store.Event)
 	nextID uint64
@@ -82,11 +88,14 @@ func (m *memStore) Get(_ context.Context, _ store.Scope, ns, key string) (store.
 
 func (m *memStore) Set(_ context.Context, _ store.Scope, e store.Entry) (int64, error) {
 	m.mu.Lock()
+	m.revision++
+	rev := m.revision
+	e.Revision = rev
 	m.entries[memKey(e.Namespace, e.Key)] = e
 	m.mu.Unlock()
 	m.fire(store.Event{Namespace: e.Namespace, Key: e.Key, Op: store.OpUpsert})
 
-	return 0, nil
+	return rev, nil
 }
 
 func (m *memStore) Delete(_ context.Context, _ store.Scope, ns, key, _ string) error {
@@ -130,6 +139,12 @@ func (m *memStore) Subscribe(_ context.Context, _ store.Scope, fn func(store.Eve
 	id := m.nextID
 	m.subs[id] = fn
 	m.subsMu.Unlock()
+
+	// Announce a connected changefeed, exactly as a real backend does after
+	// every (re)connect (FC-2). The engine answers OpResync with the scope's
+	// first reconcile, which is what Start waits on; a fake that stays silent
+	// blocks Start forever.
+	fn(store.Event{Op: store.OpResync})
 
 	return func() {
 		m.subsMu.Lock()

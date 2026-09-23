@@ -15,6 +15,7 @@ import (
 
 	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
 	systemplane "github.com/LerianStudio/lib-systemplane/v4"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
 // groupMemoryStore is this file's own fake store. Every helper here is
@@ -24,6 +25,10 @@ type groupMemoryStore struct {
 	mu      sync.Mutex
 	entries map[string]systemplane.TestEntry
 	sub     func(systemplane.TestEvent)
+
+	// revision is the store-assigned revision FC-2 promises from Set, so a
+	// write and its changefeed echo carry the same non-zero revision.
+	revision int64
 
 	// getErr and setErr let a test make the backend fail. They are read on the
 	// caller's goroutine and on the changefeed's, so they live under mu like
@@ -75,12 +80,15 @@ func (s *groupMemoryStore) Set(_ context.Context, _ systemplane.TestScope, e sys
 		return 0, err
 	}
 
+	s.revision++
+	rev := s.revision
+	e.Revision = rev
 	s.entries[groupMemoryKey(e.Namespace, e.Key)] = e
 	s.mu.Unlock()
 
 	s.fire(systemplane.TestEvent{Namespace: e.Namespace, Key: e.Key, Op: "upsert"})
 
-	return 0, nil
+	return rev, nil
 }
 
 func (s *groupMemoryStore) Delete(_ context.Context, _ systemplane.TestScope, namespace, key, _ string) error {
@@ -117,6 +125,11 @@ func (s *groupMemoryStore) Subscribe(_ context.Context, _ systemplane.TestScope,
 	}
 
 	s.mu.Unlock()
+
+	// Announce a connected changefeed (FC-2) directly, never through fire:
+	// fire queues while the store is holding, and a test that holds before
+	// Start would then hang Start on a resync it never delivers.
+	fn(systemplane.TestEvent{Op: store.OpResync})
 
 	// Announce outside the lock: the subscriber re-reads this store on the
 	// calling goroutine, which is exactly what makes the publication land
