@@ -393,3 +393,221 @@ func TestAcceptingValidatorSeesTheValueBothPathsCache(t *testing.T) {
 		t.Errorf("validator saw %#v, want %#v", seen, want)
 	}
 }
+
+// readBackCtxKey marks a context so a validator can tell which context it was
+// handed on a read-back path.
+type readBackCtxKey struct{}
+
+// TestStoredValueValidatorSeesTheReadBackContext pins the context contract the
+// two read-back call sites document: the context passed to Start on hydration,
+// and a deadline-bounded one derived from the client's lifecycle on a refresh.
+// Without it, passing context.Background() at either call site is a silent
+// change — a validator that reads a deadline or a value loses both.
+func TestStoredValueValidatorSeesTheReadBackContext(t *testing.T) {
+	m := newMemStore(false)
+	c := newSingleTenantClientWithLogger(t, m, &recordingLogger{})
+
+	type observation struct {
+		carried  any
+		deadline bool
+	}
+
+	var (
+		seenMu sync.Mutex
+		seen   = map[any]observation{}
+	)
+
+	validator := func(ctx context.Context, value any) error {
+		_, hasDeadline := ctx.Deadline()
+
+		seenMu.Lock()
+		defer seenMu.Unlock()
+
+		seen[value] = observation{carried: ctx.Value(readBackCtxKey{}), deadline: hasDeadline}
+
+		return nil
+	}
+
+	if err := c.Register("ns", "k", "default", WithContextValidator(validator)); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	seedEntry(t, m, "ns", "k", "from-list")
+
+	if err := c.Start(context.WithValue(context.Background(), readBackCtxKey{}, "start-context")); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	t.Cleanup(func() { _ = c.Close() })
+
+	seedEntry(t, m, "ns", "k", "from-feed")
+	m.fire(store.Event{Namespace: "ns", Key: "k", Op: store.OpUpsert})
+
+	seenMu.Lock()
+	defer seenMu.Unlock()
+
+	if got := seen["from-list"].carried; got != "start-context" {
+		t.Errorf("hydration handed the validator a context carrying %v, want the one passed to Start", got)
+	}
+
+	if !seen["from-feed"].deadline {
+		t.Error("the refresh handed the validator a context with no deadline, want the bounded refresh context")
+	}
+}
+
+// TestPanickingValidatorIsARefusal covers the row class the read-back grading
+// exists for, met by a validator that is not defensive: a legacy row of the
+// wrong shape makes a type-asserting validator panic. Hydration runs inside
+// Start, so an unrecovered panic there would take down boot — the very deploy
+// the fix was written to survive.
+func TestPanickingValidatorIsARefusal(t *testing.T) {
+	t.Run("hydration keeps the default and does not abort start", func(t *testing.T) {
+		m := newMemStore(false)
+		logger := &recordingLogger{}
+		c := newSingleTenantClientWithLogger(t, m, logger)
+
+		// Panics with the value itself: no log line may reproduce its bytes.
+		validator := func(_ context.Context, value any) error {
+			if value == rejectedSecret {
+				panic(value)
+			}
+
+			return nil
+		}
+
+		if err := c.Register("ns", "k", "default", WithContextValidator(validator)); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+
+		seedEntry(t, m, "ns", "k", rejectedSecret)
+
+		if err := c.Start(context.Background()); err != nil {
+			t.Fatalf("start: %v", err)
+		}
+
+		t.Cleanup(func() { _ = c.Close() })
+
+		got, ok, err := c.Get(context.Background(), "ns", "k")
+		if err != nil || !ok {
+			t.Fatalf("get: value=%v ok=%v err=%v", got, ok, err)
+		}
+
+		if got != "default" {
+			t.Errorf("value in force = %v, want the registered default", got)
+		}
+
+		if n := len(logger.warns("stored value rejected by validator, keeping default")); n != 1 {
+			t.Errorf("got %d WARN lines for the panicking validator, want exactly 1", n)
+		}
+
+		if rendered := logger.rendered(); strings.Contains(rendered, rejectedSecret) {
+			t.Errorf("a log line reproduced the panicked value's bytes: %q", rendered)
+		}
+	})
+
+	t.Run("refresh keeps the value already in force", func(t *testing.T) {
+		m := newMemStore(false)
+		logger := &recordingLogger{}
+		c := newSingleTenantClientWithLogger(t, m, logger)
+
+		validator := func(_ context.Context, value any) error {
+			if value == rejectedSecret {
+				panic(errSchemeRefused)
+			}
+
+			return nil
+		}
+
+		if err := c.Register("ns", "k", "default", WithContextValidator(validator)); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+
+		seedEntry(t, m, "ns", "k", "known-good")
+
+		if err := c.Start(context.Background()); err != nil {
+			t.Fatalf("start: %v", err)
+		}
+
+		t.Cleanup(func() { _ = c.Close() })
+
+		seedEntry(t, m, "ns", "k", rejectedSecret)
+		m.fire(store.Event{Namespace: "ns", Key: "k", Op: store.OpUpsert})
+
+		got, ok, err := c.Get(context.Background(), "ns", "k")
+		if err != nil || !ok {
+			t.Fatalf("get: value=%v ok=%v err=%v", got, ok, err)
+		}
+
+		if got != "known-good" {
+			t.Errorf("value in force = %v, want the value that was already in force", got)
+		}
+
+		warns := logger.warns("refreshed value rejected by validator, keeping current value")
+		if len(warns) != 1 {
+			t.Fatalf("got %d WARN lines for the panicking validator, want exactly 1", len(warns))
+		}
+
+		if rendered := fmt.Sprintf("%v", warns[0]); !strings.Contains(rendered, errSchemeRefused.Error()) {
+			t.Errorf("WARN line %q does not carry what the validator panicked with", rendered)
+		}
+	})
+}
+
+// TestHydrationYieldsToARefreshThatLandedDuringValidation closes the window the
+// grading opened. hydrationTouched exists so a changefeed value that arrives
+// mid-hydration is not overwritten by the older List snapshot; reading it
+// before the validator runs and writing the cache after leaves that window
+// open for as long as the validator takes, which is now consumer time.
+func TestHydrationYieldsToARefreshThatLandedDuringValidation(t *testing.T) {
+	m := newMemStore(false)
+	c := newSingleTenantClientWithLogger(t, m, &recordingLogger{})
+
+	hydrating := make(chan struct{})
+	release := make(chan struct{})
+
+	validator := func(_ context.Context, value any) error {
+		if value == "old-from-list" {
+			close(hydrating)
+			<-release
+		}
+
+		return nil
+	}
+
+	if err := c.Register("ns", "k", "default", WithContextValidator(validator)); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	seedEntry(t, m, "ns", "k", "old-from-list")
+
+	startDone := make(chan error, 1)
+
+	go func() {
+		startDone <- c.Start(context.Background())
+	}()
+
+	<-hydrating
+
+	// The whole refresh runs inline on this goroutine (the debounce window is
+	// zero), so when fire returns the changefeed value is cached and the key is
+	// claimed against hydration.
+	seedEntry(t, m, "ns", "k", "new-from-feed")
+	m.fire(store.Event{Namespace: "ns", Key: "k", Op: store.OpUpsert})
+
+	close(release)
+
+	if err := <-startDone; err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	t.Cleanup(func() { _ = c.Close() })
+
+	got, ok, err := c.Get(context.Background(), "ns", "k")
+	if err != nil || !ok {
+		t.Fatalf("get: value=%v ok=%v err=%v", got, ok, err)
+	}
+
+	if got != "new-from-feed" {
+		t.Errorf("value in force = %v, want the changefeed value — the List snapshot overwrote a refresh that landed while the validator ran", got)
+	}
+}
