@@ -346,6 +346,20 @@ func TestValidateCloneSafe(t *testing.T) {
 	}
 }
 
+// jsonCloneTree is the value both clone measurements below run on: a nested
+// map[string]any / []any tree of exactly the kind json.Unmarshal produces, so
+// the number of allocations it costs is a property of the fast path rather
+// than of the shape a benchmark happened to invent.
+func jsonCloneTree() map[string]any {
+	return map[string]any{
+		"enabled":   true,
+		"limit":     float64(10),
+		"name":      "billing",
+		"threshold": float64(0.75),
+		"tiers":     []any{"bronze", float64(1), map[string]any{"silver": float64(2)}},
+	}
+}
+
 // BenchmarkCloneJSONMap pins the cost of the shape Clone actually sees on the
 // read path (one call per consumer read) and the delivery path (one per
 // subscriber per change): the map[string]any / []any tree json.Unmarshal
@@ -353,13 +367,7 @@ func TestValidateCloneSafe(t *testing.T) {
 // flake on a loaded box — but a regression back to the generic reflective walk
 // shows up here as several times the time and the allocations.
 func BenchmarkCloneJSONMap(b *testing.B) {
-	value := map[string]any{
-		"enabled":   true,
-		"limit":     float64(10),
-		"name":      "billing",
-		"threshold": float64(0.75),
-		"tiers":     []any{"bronze", float64(1), map[string]any{"silver": float64(2)}},
-	}
+	value := jsonCloneTree()
 
 	b.ReportAllocs()
 

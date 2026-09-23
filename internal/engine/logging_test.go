@@ -207,15 +207,47 @@ func TestUndecodableValueIsLoggedAtWarn(t *testing.T) {
 // operator who hand-edited a row to the wrong shape sees no effect at all
 // except this line.
 func TestValidatorRejectionIsLoggedAtWarn(t *testing.T) {
+	const msg = "stored value rejected by validator, keeping cached value"
+
 	nk := NSKey{Namespace: "billing", Key: "limits"}
+	row := jsonRow(nk, 1, `42`, "ops")
+
 	e, rec := loggingEngine(t, map[NSKey]KeyDef{nk: {
 		Default:  "fallback",
 		Validate: func(context.Context, any) error { return errors.New("want a string") },
 	}}, newFakeStore())
 
-	ingestRow(e, jsonRow(nk, 1, `42`, "ops"))
+	ingestRow(e, row)
 
-	requireLogged(t, rec, log.LevelWarn, "stored value rejected by validator, keeping cached value", nk)
+	requireLogged(t, rec, log.LevelWarn, msg, nk)
+
+	// The line is announced once per INGESTION ATTEMPT, not once per key, and
+	// KeyDef.Validate says so. A changefeed that flaps re-reads the same
+	// unusable row on every resync, and an operator waiting for someone to fix
+	// that row needs each attempt to report itself: deduplicating the line
+	// would make a key that has been refused for an hour look like a key that
+	// was refused once, long ago.
+	ingestRow(e, row)
+
+	warns := 0
+
+	for _, got := range rec.snapshot() {
+		if got.Msg != msg {
+			continue
+		}
+
+		warns++
+
+		if got.Level != log.LevelWarn {
+			t.Errorf("rejection %d logged at level %s, want %s",
+				warns, log.LevelName(got.Level), log.LevelName(log.LevelWarn))
+		}
+	}
+
+	if warns != 2 {
+		t.Errorf("entries with message %q after two ingestion attempts: got %d, want 2; all entries: %v",
+			msg, warns, rec.all())
+	}
 }
 
 // TestReReadErrorIsLoggedAtWarn pins the changefeed's read failure. The engine
@@ -666,4 +698,57 @@ func TestReconcileAnnouncesTheDefaultForARefusedSnapshotRow(t *testing.T) {
 	}
 
 	requireLogged(t, rec, log.LevelWarn, "stored value rejected by validator, keeping cached value", nk)
+}
+
+// TestScopeDropDiagnosticsAreDebug pins the level of the two lines a dropped
+// scope emits for work that was already moving when it was dropped: a
+// reconcile sitting in the mailbox, and a write on the consumer's goroutine
+// that had already resolved its scope. Both are the ordinary shape of a tenant
+// being suspended or deleted under load — the engine is refusing to act on
+// state nothing tracks, which is the guard working — so at WARN a single
+// dropped tenant with queued work would report a burst of faults for a
+// correctly handled drop, in the same channel the real failures use.
+func TestScopeDropDiagnosticsAreDebug(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+
+	tests := []struct {
+		name  string
+		msg   string
+		drive func(t *testing.T, e *Engine)
+	}{
+		{
+			name: "a reconcile queued behind the drop",
+			msg:  "reconcile for a scope state the engine no longer tracks, abandoning",
+			drive: func(t *testing.T, e *Engine) {
+				sc := e.trackedScope(store.Scope{})
+
+				sc.armReconcile()
+
+				pending, ok := sc.takeReconcile()
+				if !ok {
+					t.Fatal("arming a reconcile left the mailbox empty")
+				}
+
+				e.dropScope(store.Scope{})
+				e.runOneReconcile(e.dispatchContext(), sc, pending)
+			},
+		},
+		{
+			name: "a write addressed to a scope the engine never tracked",
+			msg:  "write for an untracked scope, dropping",
+			drive: func(t *testing.T, e *Engine) {
+				e.Publish(context.Background(), store.Scope{Tenant: "acme"}, jsonRow(nk, 1, `"5"`, "ops"))
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e, rec := loggingEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, newFakeStore())
+
+			tt.drive(t, e)
+
+			requireLoggedAt(t, rec, log.LevelDebug, tt.msg)
+		})
+	}
 }
