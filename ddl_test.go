@@ -38,6 +38,14 @@ func TestSchemaSQL_ContainsCanonicalStatements(t *testing.T) {
 		// orphaned.
 		"AND n.nspname <> current_schema()",
 		"IF foreign_schema IS NOT NULL THEN",
+		// The guard fires for a stray copy AND for the second tenant of a
+		// schema-per-tenant install in one database, so its HINT has to name a
+		// remedy for both: an operator who reads only the search_path advice
+		// answers the second case by provisioning tenant B into tenant A's
+		// schema, which is the fork the guard exists to prevent.
+		"if that is a stray or empty copy, drop it or put the schema holding the real install first in search_path",
+		"one schema per tenant in one database, that layout is unsupported",
+		"ErrSharedDatabaseUnsupported",
 		"CREATE TABLE IF NOT EXISTS systemplane_entries (",
 		"namespace   TEXT NOT NULL,",
 		`"key"       TEXT NOT NULL,`,

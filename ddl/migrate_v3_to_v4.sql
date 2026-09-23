@@ -89,7 +89,6 @@ BEGIN
 	END IF;
 END
 $$;
-
 ALTER TABLE systemplane_entries ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 1;
 ALTER TABLE systemplane_entries ALTER COLUMN revision SET DEFAULT 1;
 
