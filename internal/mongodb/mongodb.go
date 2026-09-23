@@ -139,6 +139,11 @@ type Store struct {
 	// construct a *mongo.Collection; we pass the cacheKey string instead.
 	schemaRunner func(ctx context.Context, cacheKey string) error
 
+	// identityProbe allows unit tests to answer the hello collIdentityOf asks,
+	// which no offline handle can. Production callers leave this nil;
+	// collIdentityFor falls back to collIdentityOf in that case.
+	identityProbe func(ctx context.Context, coll *mongo.Collection) collIdentity
+
 	// noTenantIDWarn bounds warnSchemaWithoutTenantID to one line per process.
 	// The path it narrates is on every read and write, so a per-call line
 	// would be a line per request; the condition is a wiring mistake that is

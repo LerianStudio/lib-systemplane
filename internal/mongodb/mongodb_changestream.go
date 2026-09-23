@@ -60,6 +60,10 @@ const pollRoundTimeout = 5 * time.Second
 // reaches a caller.
 var errFeedStopped = errors.New("systemplane/mongodb: changefeed stopped")
 
+// errIdentityProbeFailed ends a reopen that resolved a tenant database whose
+// server would not say who it is. Retryable: the next cycle probes again.
+var errIdentityProbeFailed = errors.New("systemplane/mongodb: server identity probe failed")
+
 // changeEvent is the subset of a MongoDB change stream event we decode.
 type changeEvent struct {
 	OperationType string `bson:"operationType"`
@@ -396,7 +400,17 @@ func collIdentityOf(ctx context.Context, coll *mongo.Collection) collIdentity {
 // it. The zero-scope slot never leaves, which is correct — it is the store's
 // own collection for as long as the store lives.
 func (s *Store) claimFeedColl(ctx context.Context, f *feed, coll *mongo.Collection) error {
-	return s.claimFeedIdentity(f, collIdentityOf(ctx, coll))
+	return s.claimFeedIdentity(f, s.collIdentityFor(ctx, coll))
+}
+
+// collIdentityFor is collIdentityOf behind the identityProbe test seam.
+func (s *Store) collIdentityFor(ctx context.Context, coll *mongo.Collection) collIdentity {
+	if s.identityProbe != nil {
+		// Test seam — see the identityProbe field.
+		return s.identityProbe(ctx, coll)
+	}
+
+	return collIdentityOf(ctx, coll)
 }
 
 // claimFeedIdentity is claimFeedColl's decision, with the round trip already
@@ -406,16 +420,17 @@ func (s *Store) claimFeedIdentity(f *feed, id collIdentity) error {
 	s.feedsMu.Lock()
 	defer s.feedsMu.Unlock()
 
-	// A probe that could not identify the server refuses nothing — and must
-	// also stop this feed from refusing anyone on the strength of what it used
-	// to watch. refreshFeedColl re-claims BEFORE it rewrites f.coll, so a feed
-	// that arrives here unidentified is on its way to a collection nobody has
-	// confirmed: holding the old claim would refuse a scope that legitimately
-	// resolves to the collection this feed has left, and leave the one it is
-	// moving to unclaimed. The next successful reopen re-claims.
+	// A probe that could not identify the server refuses nothing — and changes
+	// nothing either. The zero identity means "the server did not answer", not
+	// "this feed has moved", so a feed that arrives here unidentified keeps
+	// what it holds: clearing it opened a window in which a scope misconfigured
+	// onto this collection was admitted while the holder's hello was timing
+	// out, streamed the holder's rows as its own, and then owned the claim the
+	// holder could never win back. A claim is released by the feed leaving the
+	// feeds map or by a SUCCESSFUL re-claim that replaces it; refreshFeedColl
+	// keeps f.coll and f.collID consistent by refusing to move either until a
+	// probe answers.
 	if id == (collIdentity{}) {
-		f.collID = collIdentity{}
-
 		return nil
 	}
 
@@ -1187,6 +1202,13 @@ func (s *Store) reopenWatch(f *feed, attempt *int) (*mongo.ChangeStream, error) 
 // also picks up rotated credentials without waiting for the last subscriber to
 // leave.
 //
+// The freshly resolved handle is adopted only once its server has said who it
+// is: an unanswered hello returns errIdentityProbeFailed and leaves BOTH f.coll
+// and f.collID as they were, so the pair the shared-collection refusal is
+// decided on never goes half-updated and the claim this feed already holds
+// stands. Every caller treats that as retryable — reopenWatch logs it through
+// logStreakFailure and comes back after the backoff.
+//
 // Called only from the reader goroutine, which owns f.coll once the feed is
 // published, so the write needs no lock.
 func (s *Store) refreshFeedColl(ctx context.Context, f *feed) error {
@@ -1212,8 +1234,16 @@ func (s *Store) refreshFeedColl(ctx context.Context, f *feed) error {
 
 	// The tenant may have been moved onto a collection another live scope
 	// watches; re-claiming keeps the identity the refusal is decided on honest
-	// through every reopen.
-	if err := s.claimFeedColl(ctx, f, coll); err != nil {
+	// through every reopen. The probe is run here rather than through
+	// claimFeedColl so an unanswered one aborts the whole refresh: admitting it
+	// would leave f.coll on the new collection and f.collID on the old one, and
+	// the refusal would then be decided on a pair that never existed.
+	id := s.collIdentityFor(ctx, coll)
+	if id == (collIdentity{}) {
+		return fmt.Errorf("systemplane/mongodb: reopen tenant %s: %w", f.scope.Tenant, errIdentityProbeFailed)
+	}
+
+	if err := s.claimFeedIdentity(f, id); err != nil {
 		return err
 	}
 

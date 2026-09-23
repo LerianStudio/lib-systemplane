@@ -1015,6 +1015,7 @@ func TestMongoStore_RefreshFeedCollReresolvesNamedScope(t *testing.T) {
 	s := newSubscribeStore()
 	s.cfg.MultiTenantEnabled = true
 	s.cfg.Connector = conn
+	s.identityProbe = answeringProbe
 
 	defer func() { _ = s.Close() }()
 
@@ -1060,6 +1061,52 @@ func TestMongoStore_RefreshFeedCollRefusesNilDatabase(t *testing.T) {
 	err := s.refreshFeedColl(context.Background(), f)
 	if !errors.Is(err, store.ErrTenantConnectorMissing) {
 		t.Fatalf("refreshFeedColl error = %v, want store.ErrTenantConnectorMissing", err)
+	}
+}
+
+// A reopen adopts the freshly resolved handle only once the server behind it
+// has said who it is. Rewriting f.coll on an unanswered probe left the feed
+// watching a collection whose identity is the OLD one, so the refusal that
+// keeps two scopes off one collection would be decided on a stale pair. The
+// reopen fails instead, retryably, and the feed keeps both the handle and the
+// claim it already had until a probe succeeds.
+func TestMongoStore_RefreshFeedCollKeepsHandleWhenProbeFails(t *testing.T) {
+	held := collIdentity{server: "rs:rs0/mongo-a:27017", db: "tenant_before", coll: defaultCollection}
+
+	// A handle that resolves locally but whose hello cannot reach a server.
+	unreachable := offlineCollection(t, "tenant_after").Database()
+
+	conn := &stubConnector{resolve: func(int) (*mongo.Database, error) { return unreachable, nil }}
+
+	s := newSubscribeStore()
+	s.cfg.MultiTenantEnabled = true
+	s.cfg.Connector = conn
+
+	defer func() { _ = s.Close() }()
+
+	before := (&mongo.Client{}).Database("tenant_before").Collection(defaultCollection)
+
+	f := newFeed(store.Scope{Tenant: "t1"}, before)
+	f.collID = held
+	f.refs = 1
+
+	s.feeds["t1"] = f
+
+	err := s.refreshFeedColl(context.Background(), f)
+	if err == nil {
+		t.Fatal("refreshFeedColl accepted a collection no server confirmed")
+	}
+
+	if !strings.Contains(err.Error(), "t1") {
+		t.Errorf("error %q does not name the tenant whose reopen failed", err)
+	}
+
+	if got := f.coll.Database().Name(); got != "tenant_before" {
+		t.Errorf("feed moved to database %q; an unconfirmed handle must not replace %q", got, "tenant_before")
+	}
+
+	if f.collID != held {
+		t.Errorf("feed holds identity %+v, want the one it still watches %+v", f.collID, held)
 	}
 }
 
@@ -1747,13 +1794,14 @@ func TestMongoFeed_ReleasedCollectionIsClaimableAgain(t *testing.T) {
 	}
 }
 
-// A re-claim the probe could not answer must drop the identity the feed used
-// to hold. refreshFeedColl re-claims before it rewrites the collection it
-// watches, so a feed whose hello failed there is on its way to a DIFFERENT
-// collection: keeping the old claim would refuse a scope that legitimately
-// resolves to the collection this one has left, and leave the one it is
-// moving to unclaimed.
-func TestMongoFeed_ClaimDropsAnIdentityTheProbeCannotConfirm(t *testing.T) {
+// A re-claim the probe could not answer changes nothing: the zero identity
+// means "the server did not answer", never "this feed has moved". Dropping the
+// claim on a failed probe opened a window — tenant A's cursor dies, its hello
+// times out, and a tenant misconfigured onto A's collection is admitted in the
+// gap, streams A's rows as its own, and then holds the collection A can never
+// re-claim. A claim is released by the feed leaving the feeds map or by a
+// SUCCESSFUL re-claim that replaces it.
+func TestMongoFeed_ClaimSurvivesAProbeThatCouldNotAnswer(t *testing.T) {
 	id := collIdentity{server: "rs:rs0/mongo-a:27017", db: "systemplane", coll: defaultCollection}
 
 	s := newSubscribeStore()
@@ -1771,14 +1819,14 @@ func TestMongoFeed_ClaimDropsAnIdentityTheProbeCannotConfirm(t *testing.T) {
 		t.Fatalf("an unidentified re-claim was refused: %v", err)
 	}
 
-	if live.collID != (collIdentity{}) {
-		t.Errorf("feed still holds identity %+v after a re-claim that could not confirm it", live.collID)
+	if live.collID != id {
+		t.Errorf("feed holds identity %+v after a probe that could not answer, want the one it still watches %+v", live.collID, id)
 	}
 
 	joining := newFeed(store.Scope{Tenant: "t2"}, nil)
 
-	if err := s.claimFeedIdentity(joining, id); err != nil {
-		t.Fatalf("a second scope was refused a collection nobody is known to watch: %v", err)
+	if err := s.claimFeedIdentity(joining, id); !errors.Is(err, ErrSharedDatabaseUnsupported) {
+		t.Fatalf("second scope claim error = %v, want ErrSharedDatabaseUnsupported: a failed probe must not free the collection", err)
 	}
 }
 
@@ -1985,6 +2033,13 @@ func offlineCollection(t *testing.T, database string) *mongo.Collection {
 	return cl.Database(database).Collection(defaultCollection)
 }
 
+// answeringProbe stands in for the hello collIdentityOf asks, which no offline
+// handle can answer. The identity it reports is the real one minus the server:
+// distinct per database, so two handles still compare as two collections.
+func answeringProbe(_ context.Context, coll *mongo.Collection) collIdentity {
+	return collIdentity{server: "test", db: coll.Database().Name(), coll: coll.Name()}
+}
+
 // A tenant database that arrives through ctx without a tenant id has no stable
 // identity: tmcore.GetMBContext and tmcore.GetTenantIDContext read independent
 // context keys, so a caller can carry the database and omit the id. The memo
@@ -2172,6 +2227,7 @@ func TestMongoReopenWatch_EachCauseWarnsOnceInAStreak(t *testing.T) {
 	s.cfg.MultiTenantEnabled = true
 	s.cfg.Connector = conn
 	s.cfg.Logger = logger
+	s.identityProbe = answeringProbe
 
 	defer func() { _ = s.Close() }()
 
