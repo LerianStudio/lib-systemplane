@@ -20,13 +20,6 @@ var schemaSQL string
 //go:embed ddl/migrate_v3_to_v4.sql
 var migrationV3ToV4SQL string
 
-// defaultSeedSQL is the universal default seed for the runtime_config
-// namespace, embedded from ddl/default_seed.sql. Values are neutral baselines
-// inserted with ON CONFLICT (namespace, "key") DO NOTHING.
-//
-//go:embed ddl/default_seed.sql
-var defaultSeedSQL string
-
 // SchemaSQL returns the full systemplane schema DDL as an importable artifact.
 //
 // The returned SQL creates the systemplane_entries table, the
@@ -136,15 +129,4 @@ func SchemaSQL() string {
 // the caller.
 func MigrationV3ToV4SQL() string {
 	return migrationV3ToV4SQL
-}
-
-// DefaultSeedSQL returns the universal default seed INSERTs as an importable
-// artifact.
-//
-// The returned SQL seeds neutral runtime_config defaults (log level, CORS,
-// rate limit, idempotency) with ON CONFLICT (namespace, "key") DO NOTHING so
-// operator-set values are never overwritten. Consumers fold this into their
-// own migration pipeline; lib-systemplane does not execute it for the caller.
-func DefaultSeedSQL() string {
-	return defaultSeedSQL
 }
