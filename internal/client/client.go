@@ -281,12 +281,20 @@ func (c *Client) hydrate(ctx context.Context) error {
 		return err
 	}
 
-	c.registryMu.RLock()
-
 	for _, entry := range entries {
 		nk := nskey{Namespace: entry.Namespace, Key: entry.Key}
 
-		if _, registered := c.registry[nk]; !registered {
+		// The registry lock is taken per entry instead of around the whole
+		// loop because the validator called below MAY block or do I/O: that
+		// restriction binds only the register-time call (see
+		// WithContextValidator), and no blocking call belongs under a lock.
+		// Per-entry locking loses nothing — the registry cannot change during
+		// hydration, since Register takes startMu and Start holds it here.
+		c.registryMu.RLock()
+		def, registered := c.registry[nk]
+		c.registryMu.RUnlock()
+
+		if !registered {
 			c.logWarn(ctx, "unregistered key in store, skipping",
 				log.String("namespace", entry.Namespace),
 				log.String("key", entry.Key),
@@ -316,12 +324,26 @@ func (c *Client) hydrate(ctx context.Context) error {
 			continue
 		}
 
+		// A row can predate the key's validator, or be written by an older
+		// binary, or straight into the table. Grading it here is what keeps
+		// the value in force one the write path would also accept.
+		if def.validator != nil {
+			if err := def.validator(ctx, decoded); err != nil {
+				// The error, never the value: a rejected value may be a secret.
+				c.logWarn(ctx, "stored value rejected by validator, keeping default",
+					log.String("namespace", entry.Namespace),
+					log.String("key", entry.Key),
+					log.Err(err),
+				)
+
+				continue
+			}
+		}
+
 		c.cacheMu.Lock()
 		c.cache[nk] = decoded
 		c.cacheMu.Unlock()
 	}
-
-	c.registryMu.RUnlock()
 
 	return nil
 }
@@ -447,6 +469,21 @@ func (c *Client) refreshFromStore(nk nskey, op string) {
 			)
 
 			return
+		}
+
+		// Same grading as hydrate: a value arriving through the changefeed
+		// was written by whoever wrote the row, not necessarily through Set.
+		if def.validator != nil {
+			if err := def.validator(ctx, decoded); err != nil {
+				// The error, never the value: a rejected value may be a secret.
+				c.logWarn(ctx, "refreshed value rejected by validator, keeping current value",
+					log.String("namespace", nk.Namespace),
+					log.String("key", nk.Key),
+					log.Err(err),
+				)
+
+				return
+			}
 		}
 
 		newValue = decoded

@@ -202,6 +202,18 @@ func WithValidator(fn func(any) error) KeyOption {
 // [Client.Register] fail with the wrapped validation error, so the key is not
 // registered.
 //
+// The same function also grades a value read back from the store: on
+// hydration at [Client.Start], and on every changefeed refresh. A row can
+// predate the key's validator, or be written by an older binary, or written
+// straight into the table, so a value never graded there would be one the
+// write path refuses while it is already in force. A refusal keeps the
+// registered default (hydration) or the value already in force (refresh) and
+// logs a WARN carrying the returned error and never the value. The context is
+// the one passed to [Client.Start] on hydration, and a bounded context derived
+// from the client's lifecycle on a refresh. Neither is a caller's write, so a
+// function that expects request scope should apply there the same "cannot
+// verify" policy it applies at registration.
+//
 // A nil fn is ignored. [WithValidator] and WithContextValidator set the same
 // single validator, so when both are applied to one key the last NON-NIL one
 // applied wins.

@@ -5,6 +5,8 @@ package client
 import (
 	"context"
 	"errors"
+	"slices"
+	"sync"
 	"testing"
 )
 
@@ -31,10 +33,19 @@ func startForValidator(t *testing.T, c *Client) {
 func TestContextValidatorSeesTheSetContext(t *testing.T) {
 	c := newSingleTenantClient(t, newMemStore(false))
 
-	var seen any
+	// Every observation is kept, not just the last: the write Set persists
+	// comes back through the changefeed, and that refresh validates the same
+	// value again with its own context, which carries no marker.
+	var (
+		seenMu sync.Mutex
+		seen   []any
+	)
 
 	err := c.Register("ns", "k", "default", WithContextValidator(func(ctx context.Context, _ any) error {
-		seen = ctx.Value(validatorMarkerKey{})
+		seenMu.Lock()
+		defer seenMu.Unlock()
+
+		seen = append(seen, ctx.Value(validatorMarkerKey{}))
 
 		return nil
 	}))
@@ -50,8 +61,11 @@ func TestContextValidatorSeesTheSetContext(t *testing.T) {
 		t.Fatalf("set: %v", err)
 	}
 
-	if seen != "tenant-42" {
-		t.Errorf("validator saw %v, want the marker carried by the Set context", seen)
+	seenMu.Lock()
+	defer seenMu.Unlock()
+
+	if !slices.Contains(seen, any("tenant-42")) {
+		t.Errorf("validator saw %v, want one call carrying the marker from the Set context", seen)
 	}
 }
 
