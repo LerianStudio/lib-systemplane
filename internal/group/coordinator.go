@@ -213,14 +213,19 @@ func (c *Coordinator[T]) Publish(ctx context.Context, pub Publication) {
 	value, err := c.decode(pub.Value)
 
 	sc := c.commit(ctx, pub, seq, value, err)
-	if sc == nil {
-		return
-	}
 
+	// Logged before the nil check, not after: a malformed document that is also
+	// superseded, or spent by the seed watermark, records nothing on any scope,
+	// so the log line is the only place it is ever named. Every document that
+	// cannot be parsed is named exactly once.
 	if err != nil {
 		c.logError(ctx, "systemplane.group: published document failed to decode",
 			log.Err(err), log.String(constants.AttrKeyTenantID, pub.Tenant), log.Any("revision", pub.Revision))
 
+		return
+	}
+
+	if sc == nil {
 		return
 	}
 
@@ -281,9 +286,13 @@ func (c *Coordinator[T]) commit(
 		// The failure counts as an observation even though it never becomes
 		// current: no applier can have accepted it, so the scope stays
 		// unconverged and the error stays readable until a document that does
-		// decode is accepted by everyone.
+		// decode is accepted by everyone. Observed with it, so a later Register
+		// spends no read seeding a scope that has already been heard from and
+		// decodes no unparseable document twice; the replay it triggers finds
+		// nothing pending, because current is still whatever last decoded.
 		sc.latestSeq = seq
 		sc.lastErr = decodeErr
+		sc.observed = true
 
 		return sc
 	}
@@ -694,6 +703,16 @@ func (c *Coordinator[T]) invoke(
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			err = errors.New("systemplane/group: apply function panicked; the value and stack are in the log line under group.apply")
+
+			// Two lines, because HandlePanicValue carries the recovered value
+			// and the stack but neither the tenant nor the revision, and
+			// redacts both in production mode: without this one the log says
+			// something panicked and never says what stopped being applied.
+			// The recovered value stays out of it — redaction lives with the
+			// handler.
+			c.logError(ctx, "systemplane.group: apply function panicked",
+				log.String(constants.AttrKeyTenantID, current.Tenant),
+				log.Any("revision", current.Revision))
 
 			c.reportPanic(ctx, recovered)
 		}

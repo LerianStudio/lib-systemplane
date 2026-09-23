@@ -70,6 +70,36 @@ func (r *recordingLogger) lineContaining(t *testing.T, want string) logLine {
 	return logLine{}
 }
 
+// assertPanicScopeLine pins the line that names WHICH scope and WHICH revision
+// the panicking applier was handed. runtime.HandlePanicValue carries the
+// recovered value and the stack but neither the tenant nor the revision, and in
+// production mode it redacts even those, so without this second line an
+// operator reading the log learns that something panicked and nothing about
+// what stopped being applied. The recovered value stays out of it: redaction is
+// the panic handler's job and duplicating the payload here would undo it.
+func assertPanicScopeLine(t *testing.T, logger *recordingLogger, tenant string, revision int64) {
+	t.Helper()
+
+	line := logger.lineContaining(t, "apply function panicked")
+	if line.level != log.LevelError {
+		t.Errorf("the panic scope line logged at %s level, want error", log.LevelName(line.level))
+	}
+
+	if got := line.fields[constants.AttrKeyTenantID]; got != tenant {
+		t.Errorf("%s = %v, want %q: the line must name the scope that stopped being applied", constants.AttrKeyTenantID, got, tenant)
+	}
+
+	if got, _ := line.fields["revision"].(int64); got != revision {
+		t.Errorf("revision = %v, want %d", line.fields["revision"], revision)
+	}
+
+	for key, value := range line.fields {
+		if text, _ := value.(string); strings.Contains(text, "boom") {
+			t.Errorf("%s = %v, want no recovered value on this line: production redaction lives with the panic handler", key, value)
+		}
+	}
+}
+
 func newRecordingLogger() *recordingLogger {
 	return &recordingLogger{NopLogger: &log.NopLogger{}}
 }
@@ -175,6 +205,8 @@ func TestCoordinatorApplierPanicIsRecordedLikeAnError(t *testing.T) {
 	if stack, _ := line.fields["stack_trace"].(string); stack == "" {
 		t.Error("stack_trace is empty, want the panicking goroutine's stack")
 	}
+
+	assertPanicScopeLine(t, logger, "t1", 3)
 }
 
 // TestCoordinatorApplierPanicIsRedactedInProductionMode pins the other half of
@@ -216,6 +248,8 @@ func TestCoordinatorApplierPanicIsRedactedInProductionMode(t *testing.T) {
 	if strings.Contains(got.LastErr.Error(), "boom") {
 		t.Errorf("LastErr = %v, want no recovered value: Status would republish in the clear what the log line redacts", got.LastErr)
 	}
+
+	assertPanicScopeLine(t, logger, "t1", 3)
 }
 
 // TestCoordinatorApplierErrorIsLogged pins the operational half of a rejection:
@@ -352,6 +386,126 @@ func TestCoordinatorDecodeFailureIsRecordedAndNeverDelivered(t *testing.T) {
 
 	if names := late.names(); len(names) != 1 || names[0] != "good" {
 		t.Errorf("replay = %v, want the last decodable document", names)
+	}
+}
+
+// TestCoordinatorSupersededDecodeFailureIsStillLogged pins the one malformed
+// document that used to vanish: a publication that fails to decode AND is
+// superseded before it commits reaches no applier, records nothing on the scope
+// (a newer observation already owns it) and so has only the log left to name it.
+// Dropping that line left an operator with a document nobody could parse and no
+// trace of it anywhere.
+func TestCoordinatorSupersededDecodeFailureIsStillLogged(t *testing.T) {
+	logger := newRecordingLogger()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+
+	// The malformed document parks inside the decoder, which runs outside the
+	// coordinator's mutex, so the good publication behind it commits first and
+	// the malformed one arrives at commit already superseded.
+	decode := func(value any) (coordDoc, error) {
+		doc, err := Decode[coordDoc](value)
+		if err != nil {
+			return doc, err
+		}
+
+		if doc.Name == "bad" {
+			close(entered)
+			<-release
+
+			return coordDoc{}, errors.New("decode: refused bad")
+		}
+
+		return doc, nil
+	}
+
+	c := NewCoordinator[coordDoc](logger, decode, nil)
+	ctx := context.Background()
+
+	var rec recorder
+
+	unsubscribe := mustRegister(t, c, rec.apply)
+	defer unsubscribe()
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		c.Publish(ctx, publication("t1", 1, "bad"))
+	}()
+
+	waitFor(t, entered, "the malformed publication to reach the decoder")
+
+	c.Publish(ctx, publication("t1", 2, "good"))
+
+	close(release)
+	waitFor(t, done, "the superseded publication to commit")
+
+	var lines int
+
+	for _, line := range logger.recorded() {
+		if strings.Contains(line.msg, "failed to decode") {
+			lines++
+
+			if got := line.fields[constants.AttrKeyTenantID]; got != "t1" {
+				t.Errorf("%s = %v, want the scope the malformed document was published to", constants.AttrKeyTenantID, got)
+			}
+
+			if got, _ := line.fields["revision"].(int64); got != 1 {
+				t.Errorf("revision = %v, want 1", line.fields["revision"])
+			}
+		}
+	}
+
+	if lines != 1 {
+		t.Errorf("decode-failure lines = %d, want exactly 1: every malformed document is named once", lines)
+	}
+
+	if got := rec.names(); len(got) != 1 || got[0] != "good" {
+		t.Errorf("deliveries = %v, want only the decodable document", got)
+	}
+}
+
+// TestCoordinatorDecodeFailureOnAFreshScopeIsObserved pins A6 on a scope whose
+// FIRST publication is the one that fails: the rejection counts as an
+// observation, so a later registration neither spends a read on the seed nor
+// decodes the same unparseable document a second time. Status still reports the
+// scope and its error.
+func TestCoordinatorDecodeFailureOnAFreshScopeIsObserved(t *testing.T) {
+	var seeds int
+
+	seed := func() (Publication, bool, error) {
+		seeds++
+
+		return Publication{}, false, nil
+	}
+
+	c := NewCoordinator[coordDoc](newRecordingLogger(), rejectingDecode("bad"), seed)
+
+	c.Publish(context.Background(), publication("t1", 4, "bad"))
+
+	var rec recorder
+
+	unsubscribe := mustRegister(t, c, rec.apply)
+	defer unsubscribe()
+
+	if seeds != 0 {
+		t.Errorf("seed taken %d times, want 0: a scope whose publication was rejected has been observed", seeds)
+	}
+
+	if got := rec.names(); len(got) != 0 {
+		t.Errorf("deliveries = %v, want none: nothing decodable was ever published", got)
+	}
+
+	got := statusOf(t, c, "t1")
+	if got.Desired != 4 {
+		t.Errorf("Desired = %d, want 4", got.Desired)
+	}
+
+	if got.LastErr == nil {
+		t.Error("LastErr = nil, want the decode failure")
 	}
 }
 
