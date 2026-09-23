@@ -545,6 +545,23 @@ func (c *Coordinator[T]) seedLocked() seedOutcome {
 		return seedOutcome{}
 	}
 
+	// Consumer code runs before any state is committed: the group's decoder and
+	// the document's own MarshalJSON can panic, and a panic escaping Register
+	// after the seed was marked taken would leave nothing observed and nothing
+	// replayable, so the next registration would return success and deliver
+	// nothing. With the seed still untaken, the next registration reads again.
+	value, decodeErr := c.decode(pub.Value)
+
+	// Bytes that fail to marshal stay nil, which disarms the drop: the next
+	// publication can then never be proven identical, so it is delivered.
+	var seedBytes []byte
+
+	if decodeErr == nil {
+		if data, marshalErr := json.Marshal(pub.Value); marshalErr == nil {
+			seedBytes = data
+		}
+	}
+
 	c.seedTaken = true
 
 	sc := c.scopeLocked(pub.Tenant)
@@ -552,7 +569,6 @@ func (c *Coordinator[T]) seedLocked() seedOutcome {
 
 	seq := c.nextSeqLocked()
 
-	value, decodeErr := c.decode(pub.Value)
 	if decodeErr != nil {
 		// Observed, exactly as commit marks a published document that failed to
 		// decode (A6): the rejection is what the coordinator heard from this
@@ -573,12 +589,7 @@ func (c *Coordinator[T]) seedLocked() seedOutcome {
 
 	sc.seedArmed = true
 	sc.seedRev = pub.Revision
-
-	// Bytes that fail to marshal stay nil, which disarms the drop: the next
-	// publication can then never be proven identical, so it is delivered.
-	if data, marshalErr := json.Marshal(pub.Value); marshalErr == nil {
-		sc.seedBytes = data
-	}
+	sc.seedBytes = seedBytes
 
 	return seedOutcome{pub: pub}
 }

@@ -1174,3 +1174,71 @@ func TestCoordinatorUnsubscribeMidBatchSkipsTheApplierNotYetInvoked(t *testing.T
 		t.Fatalf("Status = %+v, want Applied 2 with no error: the skipped applier is gone and records nothing", status)
 	}
 }
+
+// TestCoordinatorRegisterWhoseSeedPanicsKeepsTheSeedRetryable pins the order
+// inside seedLocked: the decoder and the document's MarshalJSON are consumer
+// code that can panic, and a seed marked taken BEFORE they ran would leave
+// nothing observed and nothing replayable, so the next registration would
+// return success and deliver nothing. The seed must stay untaken until both
+// have returned, so the next registration reads it again.
+func TestCoordinatorRegisterWhoseSeedPanicsKeepsTheSeedRetryable(t *testing.T) {
+	cases := []struct {
+		name  string
+		build func() *Coordinator[coordDoc]
+	}{
+		{
+			name: "decoder panics once",
+			build: func() *Coordinator[coordDoc] {
+				calls := 0
+				decode := func(v any) (coordDoc, error) {
+					calls++
+					if calls == 1 {
+						panic("the decoder exploded")
+					}
+
+					return Decode[coordDoc](v)
+				}
+
+				return NewCoordinator[coordDoc](nil, decode, seedOf(publication("", 1, "seeded")))
+			},
+		},
+		{
+			name: "MarshalJSON panics once",
+			build: func() *Coordinator[coordDoc] {
+				calls := 0
+				seed := func() (Publication, bool, error) {
+					calls++
+					if calls == 1 {
+						return Publication{Revision: 1, Value: blowUpOnMarshal{}}, true, nil
+					}
+
+					return publication("", 1, "seeded"), true, nil
+				}
+
+				return NewCoordinator[coordDoc](nil, constantDecode, seed)
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := tc.build()
+
+			var rec recorder
+
+			mustPanic(t, "Register whose seed panics", func() { c.Register(rec.apply) })
+
+			unsubscribe := mustRegister(t, c, rec.apply)
+			defer unsubscribe()
+
+			if got := rec.names(); len(got) != 1 {
+				t.Fatalf("second registration delivered %v, want the seeded document: the seed was spent by a registration that never completed", got)
+			}
+
+			status := c.Status()
+			if len(status) != 1 || status[0].Desired != 1 || status[0].Applied != 1 || status[0].LastErr != nil {
+				t.Fatalf("Status = %+v, want Desired 1, Applied 1, no error", status)
+			}
+		})
+	}
+}
