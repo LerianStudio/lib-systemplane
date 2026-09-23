@@ -2276,6 +2276,107 @@ func TestIntegration_PostgresTwoTenantsOnOneDatabase(t *testing.T) {
 	})
 }
 
+// Two tenants whose connection strings authenticate as DIFFERENT roles on one
+// database are still one database, so the second feed is refused. The key the
+// guard compares must not vary with what the connecting role may read: a key
+// that did would call the pair two databases and admit both feeds.
+//
+// The second role is denied EXECUTE on pg_control_system(), the privilege an
+// earlier key depended on. Revoking it from PUBLIC is cluster-wide, so this
+// test runs on its own server rather than the shared one.
+func TestIntegration_PostgresTwoRolesOnOneDatabaseAreRefused(t *testing.T) {
+	base := startDedicatedContainer(t)
+
+	admin := adminDSN(t, base)
+
+	defer func() { _ = admin.Close() }()
+
+	_, ownerDSN, db := provisionTenantDB(t, admin, base, "two_roles")
+
+	roleName := fmt.Sprintf("sp_dml_%d", time.Now().UnixNano())
+
+	for _, stmt := range []string{
+		fmt.Sprintf(`CREATE ROLE %s LOGIN PASSWORD 'dmlpass'`, roleName),
+		`REVOKE EXECUTE ON FUNCTION pg_control_system() FROM PUBLIC`,
+		fmt.Sprintf(`GRANT USAGE ON SCHEMA public TO %s`, roleName),
+		fmt.Sprintf(`GRANT SELECT, INSERT, UPDATE, DELETE ON systemplane_entries TO %s`, roleName),
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatalf("provision role %q: %v", stmt, err)
+		}
+	}
+
+	roleDSN := dsnWithUser(ownerDSN, roleName, "dmlpass")
+
+	roleDB, err := sql.Open("pgx", roleDSN)
+	if err != nil {
+		t.Fatalf("open as %s: %v", roleName, err)
+	}
+
+	defer func() { _ = roleDB.Close() }()
+
+	var canSysID bool
+	if err := roleDB.QueryRow(`SELECT has_function_privilege('pg_control_system()', 'EXECUTE')`).Scan(&canSysID); err != nil {
+		t.Fatalf("probe the second role's privilege: %v", err)
+	}
+
+	if canSysID {
+		t.Fatalf("%s may still execute pg_control_system(); the test would not exercise a privilege difference", roleName)
+	}
+
+	conn := newFakeConnector()
+	conn.set("t1", db, ownerDSN)
+	conn.set("t2", roleDB, roleDSN)
+
+	s := tenantStore(t, conn)
+	ctx := context.Background()
+
+	unsub, err := s.Subscribe(ctx, store.Scope{Tenant: "t1"}, func(store.Event) {})
+	if err != nil {
+		t.Fatalf("subscribe t1 as the owner: %v", err)
+	}
+
+	t.Cleanup(unsub)
+
+	unsub2, err := s.Subscribe(ctx, store.Scope{Tenant: "t2"}, func(store.Event) {})
+	if err == nil {
+		unsub2()
+		t.Fatal("a second role on t1's database was admitted; want ErrSharedDatabaseUnsupported")
+	}
+
+	if !errors.Is(err, postgres.ErrSharedDatabaseUnsupported) {
+		t.Fatalf("subscribe t2 error = %v, want postgres.ErrSharedDatabaseUnsupported", err)
+	}
+}
+
+// startDedicatedContainer starts a Postgres server private to t and returns its
+// admin DSN, for a test that needs a server-level property the shared one
+// cannot give.
+func startDedicatedContainer(t *testing.T) string {
+	t.Helper()
+
+	ctx := context.Background()
+
+	container, err := pgcontainer.Run(ctx, "postgres:16-alpine",
+		pgcontainer.WithDatabase("postgres"),
+		pgcontainer.WithUsername("postgres"),
+		pgcontainer.WithPassword("postgres"),
+		pgcontainer.BasicWaitStrategies(),
+	)
+	testcontainers.CleanupContainer(t, container)
+
+	if err != nil {
+		t.Fatalf("start a dedicated server: %v", err)
+	}
+
+	dsn, err := container.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		t.Fatalf("dedicated server connection string: %v", err)
+	}
+
+	return dsn
+}
+
 // Two SERVERS that both carry a database of the same name are two databases,
 // so the second tenant's feed is admitted. This proves admission across two
 // servers only: both containers run on one Docker host with different bridge
@@ -2285,23 +2386,7 @@ func TestIntegration_PostgresTwoTenantsOnOneDatabase(t *testing.T) {
 // covers the same-address case.
 func TestIntegration_PostgresTwoDatabasesOnTwoServersAreAdmitted(t *testing.T) {
 	ctx := context.Background()
-
-	second, err := pgcontainer.Run(ctx, "postgres:16-alpine",
-		pgcontainer.WithDatabase("postgres"),
-		pgcontainer.WithUsername("postgres"),
-		pgcontainer.WithPassword("postgres"),
-		pgcontainer.BasicWaitStrategies(),
-	)
-	testcontainers.CleanupContainer(t, second)
-
-	if err != nil {
-		t.Fatalf("start the second server: %v", err)
-	}
-
-	secondBase, err := second.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		t.Fatalf("second server connection string: %v", err)
-	}
+	secondBase := startDedicatedContainer(t)
 
 	dbName := fmt.Sprintf("same_name_%d", time.Now().UnixNano())
 	conn := newFakeConnector()

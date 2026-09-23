@@ -93,22 +93,30 @@ var ErrSharedDatabaseUnsupported = errors.New("systemplane/postgres: two scopes 
 // how the SERVER sees itself, and two distinct servers can report the same one
 // — containers on separate hosts each on 172.17.0.2:5432, overlapping private
 // ranges, every tenant cluster naming its database alike — so the address
-// alone would refuse a valid tenant forever. The server identity is the
-// system_identifier from pg_control_system() together with
-// pg_postmaster_start_time(). The system identifier alone is not enough:
-// cloned data directories (pg_basebackup plus promote, a volume or cloud
-// snapshot restore, a container image shipping a pre-initialized PGDATA) share
-// it, and two such tenant servers can also report the same address, port and
-// database, so the second tenant would be refused for good. The start time
-// tells those apart. A role that may not execute pg_control_system() (it is
-// granted to PUBLIC by default) keys on the start time alone. Either way a
-// restart changes the key: that only admits a pair it should have refused, the
-// failure this key already accepts, never the reverse. DSN text is a description
-// of how to get there and two descriptions that land on one NOTIFY namespace
-// need not match — a host name and the literal address it resolves to, a CNAME
-// and its target, a pgbouncer address and the backend behind it — and a key
-// built from the text would call those different databases and admit the
-// second feed.
+// alone would refuse a valid tenant forever. The server identity is
+// pg_postmaster_start_time(), as epoch seconds at full microsecond precision.
+//
+// Every component is readable by every role, so the key does not vary with
+// who connects: the guard compares keys across connections that may
+// authenticate as different roles, and a key that depended on a privilege
+// would call one database two and admit both feeds. That rules out the
+// system_identifier from pg_control_system(), whose EXECUTE can be revoked.
+// Epoch seconds rather than the timestamp's text form, because that text
+// follows the session's TimeZone and DateStyle, which a role can set.
+//
+// Two distinct servers that also share address, port and database name would
+// have to start in the same microsecond to collide; that is treated as
+// impossible. Cloned data directories (pg_basebackup plus promote, a snapshot
+// restore, a container image shipping a pre-initialized PGDATA) are told apart
+// the same way, by their start times. A restart changes the key: that only
+// admits a pair it should have refused, the failure this key already accepts,
+// never the reverse.
+//
+// DSN text is a description of how to get there and two descriptions that
+// land on one NOTIFY namespace need not match — a host name and the literal
+// address it resolves to, a CNAME and its target, a pgbouncer address and the
+// backend behind it — and a key built from the text would call those different
+// databases and admit the second feed.
 //
 // What this key CANNOT tell apart, by construction, is two routes the server
 // itself describes differently:
@@ -139,42 +147,29 @@ func serverDatabaseKey(ctx context.Context, conn *pgx.Conn, dsn string) (string,
 		database  string
 		addr      string
 		port      int32
-		canSysID  bool
 		startedAt string
 	)
 
 	const q = `SELECT current_database(), COALESCE(host(inet_server_addr()), ''), COALESCE(inet_server_port(), 0),
-		has_function_privilege('pg_control_system()', 'EXECUTE'), extract(epoch FROM pg_postmaster_start_time())::text`
+		extract(epoch FROM pg_postmaster_start_time())::text`
 
-	if err := conn.QueryRow(ctx, q).Scan(&database, &addr, &port, &canSysID, &startedAt); err != nil {
+	if err := conn.QueryRow(ctx, q).Scan(&database, &addr, &port, &startedAt); err != nil {
 		return "", fmt.Errorf("server identity query: %w", err)
 	}
 
-	// A separate round trip: Postgres checks EXECUTE when it initializes the
-	// expression, so no CASE inside the first query can skip a revoked call.
-	var sysID string
-	if canSysID {
-		if err := conn.QueryRow(ctx, `SELECT system_identifier::text FROM pg_control_system()`).Scan(&sysID); err != nil {
-			return "", fmt.Errorf("server system identifier query: %w", err)
-		}
-	}
-
-	return formatServerDatabaseKey(database, addr, port, sysID, startedAt, dsn)
+	return formatServerDatabaseKey(database, addr, port, startedAt, dsn)
 }
 
 // formatServerDatabaseKey turns what the server answered into the key
 // serverDatabaseKey compares, and holds every decision that comparison rests
 // on — see that function's comment for what the key does and does not tell
 // apart. Split out so those decisions are testable without a server: the
-// system identifier (empty when the role may not read it) and the postmaster
-// start time name the server process and prefix every key; an address the
-// server reported keys as TCP; no address means a Unix socket, and the socket
-// directory the DSN names stands in for the address it cannot report.
-func formatServerDatabaseKey(database, addr string, port int32, sysID, startedAt, dsn string) (string, error) {
+// postmaster start time names the server process and prefixes every key; an
+// address the server reported keys as TCP; no address means a Unix socket,
+// and the socket directory the DSN names stands in for the address it cannot
+// report.
+func formatServerDatabaseKey(database, addr string, port int32, startedAt, dsn string) (string, error) {
 	server := "started:" + startedAt
-	if sysID != "" {
-		server = "sysid:" + sysID + "," + server
-	}
 
 	if addr != "" {
 		return fmt.Sprintf("%s/tcp:%s:%d/%s", server, addr, port, database), nil

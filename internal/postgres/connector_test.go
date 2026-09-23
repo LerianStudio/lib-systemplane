@@ -133,7 +133,6 @@ func TestFormatServerDatabaseKey(t *testing.T) {
 		database string
 		addr     string
 		port     int32
-		sysID    string
 		started  string
 		dsn      string
 		want     string
@@ -144,46 +143,34 @@ func TestFormatServerDatabaseKey(t *testing.T) {
 			database: "app",
 			addr:     "10.0.0.5",
 			port:     5432,
-			sysID:    "7688833940378984488",
-			started:  "1790000000.5",
+			started:  "1790000000.123456",
 			dsn:      "postgres://an-alias.example:5432/app",
-			want:     "sysid:7688833940378984488,started:1790000000.5/tcp:10.0.0.5:5432/app",
+			want:     "started:1790000000.123456/tcp:10.0.0.5:5432/app",
 		},
 		{
-			name:     "a second server reporting the same address, port and database is another key",
+			name:     "another server (or a clone) with the same address, port and database starts at another time",
 			database: "app",
 			addr:     "10.0.0.5",
 			port:     5432,
-			sysID:    "7688834050251304993",
-			started:  "1790000000.5",
+			started:  "1790000000.123457",
 			dsn:      "postgres://an-alias.example:5432/app",
-			want:     "sysid:7688834050251304993,started:1790000000.5/tcp:10.0.0.5:5432/app",
+			want:     "started:1790000000.123457/tcp:10.0.0.5:5432/app",
 		},
 		{
-			name:     "a cloned data directory shares the sysid: the start time still tells the servers apart",
+			name:     "the same server reached through another DSN spelling is the same key",
 			database: "app",
 			addr:     "10.0.0.5",
 			port:     5432,
-			sysID:    "7688833940378984488",
-			started:  "1790000999.25",
-			dsn:      "postgres://an-alias.example:5432/app",
-			want:     "sysid:7688833940378984488,started:1790000999.25/tcp:10.0.0.5:5432/app",
-		},
-		{
-			name:     "a role that may not read the sysid keys on the start time alone",
-			database: "app",
-			addr:     "10.0.0.5",
-			port:     5432,
-			started:  "1790000000.5",
-			dsn:      "postgres://an-alias.example:5432/app",
-			want:     "started:1790000000.5/tcp:10.0.0.5:5432/app",
+			started:  "1790000000.123456",
+			dsn:      "postgres://10.0.0.5:5432/app?options=-csearch_path%3Dtenant_b",
+			want:     "started:1790000000.123456/tcp:10.0.0.5:5432/app",
 		},
 		{
 			name:     "no address means a unix socket: the socket directory identifies it",
 			database: "app",
-			started:  "1790000000.5",
+			started:  "1790000000.123456",
 			dsn:      "postgres:///app?host=/var/run/postgresql",
-			want:     "started:1790000000.5/unix:/var/run/postgresql/app",
+			want:     "started:1790000000.123456/unix:/var/run/postgresql/app",
 		},
 		{
 			name:     "no address and an unparseable DSN is an error, never a bare key",
@@ -194,14 +181,13 @@ func TestFormatServerDatabaseKey(t *testing.T) {
 		{
 			name:     "no address with a TCP DSN falls back to the DSN host",
 			database: "app",
-			sysID:    "1",
-			started:  "1790000000.5",
+			started:  "1790000000.123456",
 			dsn:      "postgres://localhost:5432/app?sslmode=disable",
-			want:     "sysid:1,started:1790000000.5/unix:localhost/app",
+			want:     "started:1790000000.123456/unix:localhost/app",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := formatServerDatabaseKey(tc.database, tc.addr, tc.port, tc.sysID, tc.started, tc.dsn)
+			got, err := formatServerDatabaseKey(tc.database, tc.addr, tc.port, tc.started, tc.dsn)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("formatServerDatabaseKey = %q, want an error", got)
