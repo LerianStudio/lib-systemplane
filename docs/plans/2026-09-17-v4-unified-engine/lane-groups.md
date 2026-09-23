@@ -1055,6 +1055,8 @@ Why this lane needs it: FC-7 states that `OnApply` called before `Start` registe
 
 Consequence the orchestrator should route to the docs lane: a per-key `OnChange` subscriber registered before `Start` now fires once at `Start`. That is a visible v4 behavior change for every consumer that calls `OnChange` (br-sfn has 17), and a benign one — it removes the read-then-subscribe race each of them currently hand-rolls — but `MIGRATION-v4.md` should name it.
 
+- engine-core: dispatch must never hold an engine or Client lock while invoking a subscriber, and a subscriber may call `Get`/`GetEntry` re-entrantly (the groups coordinator seeds under its own mutex); engine-tenants: once multi-tenant `OnChange` exists, a `Register` blocks `Publish`/`Status` of the group for one tenant-DB round trip, so take the seed outside the mutex there and re-check `anyObservedLocked` before recording it (2026-09-23, groups fix pass 2)
+
 ---
 
 ## Self-review

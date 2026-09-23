@@ -382,6 +382,19 @@ type ApplyStatus struct {
 // current; the engine does not retry. Before Start, OnApply registers and the
 // initial delivery happens during Start.
 //
+// That last sentence is FC-7, and it holds once the Client is engine-backed:
+// FC-11 makes the first reconcile at Start publish every stored row through
+// the ingress and the dispatch (engine-core Phase 2). Until then this Client
+// hydrates its cache at Start WITHOUT announcing anything to subscribers, so a
+// registration made before Start is handed the REGISTERED DEFAULTS as its
+// initial delivery, the stored document does not arrive during Start, and no
+// further delivery comes until the next write to the key — which for a knob
+// nobody touches again is never. Status reports that state as converged, with
+// Desired and Applied both 0 and no error, so it cannot be used to tell a
+// document in force from a document never read. Registering AFTER Start
+// delivers the document actually in force, which is the ordering to use while
+// this holds.
+//
 // fn runs with no lock held and may call [Group.Snapshot], [Group.Status],
 // [Group.Set] or OnApply for its own group. A re-entrant OnApply appends its
 // function and returns without delivering: the initial delivery is deferred to

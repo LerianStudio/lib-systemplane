@@ -488,6 +488,14 @@ func (c *Coordinator[T]) remove(id uint64) {
 // fails to decode is recorded exactly like a published document that does,
 // reaches no applier, and is never retried. A failed read takes no seed, so the
 // next registration reads again. The caller holds the state mutex.
+//
+// Holding it across the seed is deliberate, and it is what lets commit's
+// seq < latestSeq guard drop a publication stamped after the seed read, so the
+// invariant it imposes on the Client is load-bearing: the seed closure reaches
+// Client.GetEntry from inside this mutex, therefore the Client must never hold
+// a lock across an OnChange dispatch, and must tolerate a subscriber calling
+// Get or GetEntry re-entrantly. Verified 2026-09-23: refreshFromStore releases
+// registryMu and cacheMu before fireSubscribers (internal/client/client.go).
 func (c *Coordinator[T]) seedLocked() seedOutcome {
 	if c.seed == nil || c.seedTaken || c.decode == nil || c.anyObservedLocked() {
 		return seedOutcome{}

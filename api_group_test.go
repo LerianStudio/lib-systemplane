@@ -1894,6 +1894,68 @@ func TestGroupOnApplyBeforeStartIsDeliveredDuringStart(t *testing.T) {
 	}
 }
 
+// TestGroupOnApplyBeforeStartHoldsDefaultsUntilTheEnginePublishesAtStart pins
+// the limitation the sibling test above hides. That one enables the fake
+// store's announceOnSubscribe, a behaviour no real backend has: Postgres
+// NOTIFY and MongoDB change streams announce nothing as a subscription
+// registers, so a stored row reaches a pre-Start registration only if the
+// Client publishes it at Start. This Client does not: its hydrate writes the
+// cache without firing OnChange subscribers (PR #84 only graded the rows it
+// hydrates, it did not start announcing them).
+//
+// So on a real backend an OnApply registered before Start is handed the
+// REGISTERED DEFAULTS, as an observed and converged publication, and the
+// document sitting in the store never arrives until somebody writes the key
+// again. Status reports that as converged with no error, which is the sharp
+// edge: a consumer cannot tell "my document is in force" from "my document was
+// never read" by reading Status.
+//
+// The fix is not in this lane and not a stopgap in internal/client: it is
+// FC-11, the engine-backed Client whose first reconcile at Start publishes
+// every stored row through the ingress and the dispatch (engine-core Phase 2).
+// THIS TEST MUST GO RED WHEN THAT LANDS, and must then be inverted to assert
+// the stored document at its real revision — the red is the signal that the
+// limitation is gone, not a regression.
+func TestGroupOnApplyBeforeStartHoldsDefaultsUntilTheEnginePublishesAtStart(t *testing.T) {
+	t.Parallel()
+
+	s := newGroupMemoryStore()
+	stored := groupConfig{Name: "stored", Retries: 9, Hosts: []string{"z"}}
+	s.seed(t, "runtime", "ingest", stored)
+
+	c := newGroupHotClient(t, s)
+	g := bindGroupOn(t, c)
+
+	var rec applyRecorder
+
+	unsubscribe, err := g.OnApply(rec.apply)
+	if err != nil {
+		t.Fatalf("OnApply: %v", err)
+	}
+
+	t.Cleanup(unsubscribe)
+
+	startGroupClient(t, c)
+
+	seen := rec.all()
+	if len(seen) != 1 {
+		t.Fatalf("deliveries by the time Start returned = %d, want exactly 1: the seed at registration, and nothing from Start", len(seen))
+	}
+
+	if want := groupDefaults(); !reflect.DeepEqual(seen[0].Value, want) {
+		t.Errorf("delivered document = %#v, want the registered defaults %#v: without an announcing store the row %#v never reaches the applier", seen[0].Value, want, stored)
+	}
+
+	status := g.Status()
+	if len(status) != 1 {
+		t.Fatalf("Status() = %#v, want exactly one scope entry", status)
+	}
+
+	if status[0].Desired != 0 || status[0].Applied != 0 || status[0].LastErr != nil {
+		t.Errorf("Status entry = %#v, want Desired and Applied both 0 with no error: the group reports converged on a document it never read", status[0])
+	}
+}
+
 // TestGroupOnApplyAfterStartSeedsUndeliveredPublication covers D-G7's window:
 // Start has returned but the publication for the scope has not been delivered
 // yet, standing in for a dispatch worker that has not run. FC-7 still promises
