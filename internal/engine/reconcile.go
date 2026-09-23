@@ -377,6 +377,16 @@ func (e *Engine) applySnapshotRow(ctx context.Context, sc *scopeState, arm recon
 		return false
 	}
 
+	// An unregistered key is not a refusal to repair: the ingress skipped it
+	// as the ordinary foreign traffic it is and said so once, at DEBUG. Falling
+	// through would hand ingestDefault a key it looks up a second time and
+	// reports as a no-row event — a second line, for a key the snapshot plainly
+	// carried, per foreign row, on every reconcile of a table one database
+	// shares with every other consumer.
+	if _, registered := e.lookup(nk.Namespace, nk.Key); !registered {
+		return false
+	}
+
 	// The ingress refused the row — undecodable, or refused by the registered
 	// validator — and has already said so at WARN. FC-11 as amended: the first
 	// reconcile that SEES the row, with nothing cached for the key, announces

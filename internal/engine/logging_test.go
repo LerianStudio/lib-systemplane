@@ -593,3 +593,77 @@ func TestReReadCanceledOutsideShutdownIsLoggedAtWarn(t *testing.T) {
 
 	requireLogged(t, rec, log.LevelWarn, "changefeed re-read failed, keeping current value", nk)
 }
+
+// requireNotLogged fails when the engine emitted msg at all. It is the
+// assertion a line's VOLUME needs: requireLogged pins the one line an event
+// must produce, and this pins the ones it must not, which is the only way a
+// duplicate announcement shows up as a test failure rather than as noise in a
+// production log.
+func requireNotLogged(t *testing.T, r *recordingLogger, msg string) {
+	t.Helper()
+
+	for _, rec := range r.snapshot() {
+		if rec.Msg == msg {
+			t.Fatalf("entries with message %q: got at least 1, want 0; all entries: %v", msg, r.all())
+		}
+	}
+}
+
+// TestReconcileLogsAnUnregisteredSnapshotRowOnce pins the volume of the one
+// rejection that is both ordinary and repeated on every reconcile. A single
+// systemplane_entries table serves every consumer of a database, so a scope's
+// snapshot carries every foreign namespace's rows — and the reconcile used to
+// announce each of them twice: once by the ingress that refused the row, then
+// again by a no-row fallback that looked the key up a second time and reported
+// it missing for a key the snapshot plainly carried.
+func TestReconcileLogsAnUnregisteredSnapshotRowOnce(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "unknown"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	e, rec := loggingEngine(t, map[NSKey]KeyDef{}, fs)
+
+	fs.seed(scope, jsonRow(nk, 1, `"v"`, "ops"))
+
+	e.onEvent(resyncEvent(scope))
+
+	if err := waitFirstReconcile(t, e, scope); err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+
+	requireLogged(t, rec, log.LevelDebug, "value for unregistered key, skipping", nk)
+	requireNotLogged(t, rec, "no-row event for unregistered key, skipping")
+}
+
+// TestReconcileAnnouncesTheDefaultForARefusedSnapshotRow is the other side of
+// that branch, and the behaviour the volume fix must not touch: a row the
+// engine refused for a key the consumer DID register still announces the
+// registered default at revision 0 (FC-11), with the rejection reported once
+// at WARN.
+func TestReconcileAnnouncesTheDefaultForARefusedSnapshotRow(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	e, rec := loggingEngine(t, map[NSKey]KeyDef{nk: {
+		Default:  "fallback",
+		Validate: func(context.Context, any) error { return errors.New("want a string") },
+	}}, fs)
+
+	fs.seed(scope, jsonRow(nk, 7, `42`, "ops"))
+
+	e.onEvent(resyncEvent(scope))
+
+	if err := waitFirstReconcile(t, e, scope); err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+
+	got, ok := e.Lookup(scope, nk)
+	if !ok {
+		t.Fatal("Lookup reports a miss: the registered default was never announced for the refused row")
+	}
+
+	if got.Value != "fallback" || got.Revision != 0 {
+		t.Errorf("after the reconcile: got (%v, rev %d), want (\"fallback\", rev 0)", got.Value, got.Revision)
+	}
+
+	requireLogged(t, rec, log.LevelWarn, "stored value rejected by validator, keeping cached value", nk)
+}
