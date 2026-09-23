@@ -310,6 +310,11 @@ type collIdentity struct {
 //     so a feed that claimed before the restart no longer matches one claiming
 //     after it. Named feeds re-claim on every reopen, which closes the window
 //     they can actually reach.
+//   - A replica set reconfigured between two claims. The key is the set name
+//     plus the sorted member hosts, so adding or replacing a member changes
+//     it, and a feed that claimed before the reconfiguration no longer matches
+//     one claiming after it. Same mitigation as the restart above: named feeds
+//     re-claim on every reopen.
 //
 // An empty key means the server said nothing that identifies it; the caller
 // admits the feed rather than refuse on a guess.

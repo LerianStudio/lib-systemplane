@@ -122,10 +122,12 @@ type Store struct {
 	tracer trace.Tracer
 
 	// schemaOnce caches the lazy ensure-collection step per resolved tenant
-	// database. Keyed by a stable string ("<db.Name()>/<collectionName>")
-	// rather than the *mongo.Collection pointer — the mongo-driver/v2
-	// Database.Collection method MAY return a fresh handle per call, so a
-	// pointer-keyed map would miss every time and rerun the schema probe.
+	// database. Keyed by the stable string schemaCacheKey composes,
+	// "<tenant>/<db.Name()>/<collection>", rather than by the
+	// *mongo.Collection pointer: the mongo-driver/v2 Database.Collection
+	// method MAY return a fresh handle per call, so a pointer-keyed map would
+	// miss every time and rerun the schema probe. See schemaCacheKey for why
+	// the tenant leads the key and why the client handle is absent.
 	schemaOnce sync.Map // map[string]*sync.Once
 	schemaErr  sync.Map // map[string]error
 
@@ -345,10 +347,10 @@ func (s *Store) ensureSchemaByKey(ctx context.Context, cacheKey string, run func
 		run = func(ctx context.Context) error { return s.schemaRunner(ctx, cacheKey) }
 	}
 
-	// Load first: a bootstrapped database keeps its once entry, so the hot path
-	// — every read and write of an already-bootstrapped scope — allocates
-	// nothing. Only the first caller for a key, and a retry after a failure,
-	// reaches LoadOrStore.
+	// Load first: a bootstrapped database keeps its once entry, so the Load
+	// allocates nothing; only the first caller for a key, and a retry after a
+	// failure, reaches LoadOrStore. Composing cacheKey upstream does allocate,
+	// once per call, on every read and write.
 	onceVal, ok := s.schemaOnce.Load(cacheKey)
 	if !ok {
 		onceVal, _ = s.schemaOnce.LoadOrStore(cacheKey, &sync.Once{})
