@@ -1715,6 +1715,19 @@ func TestGroupOnApplyWithNilFunctionIsANoOp(t *testing.T) {
 	if err := g.Set(context.Background(), groupConfig{Name: "rolled", Retries: 7, Hosts: []string{"c"}}, "operator"); err != nil {
 		t.Fatalf("Set after a nil OnApply: %v", err)
 	}
+
+	// The write is observed — the scope exists — and it converged with no
+	// error. A nil function that had been REGISTERED would be invoked here and
+	// recovered into a rejection, so LastErr is what makes "registers nothing"
+	// fail loudly instead of passing on the Set's own nil error.
+	status := g.Status()
+	if len(status) != 1 {
+		t.Fatalf("Status after a nil OnApply = %#v, want the one observed scope", status)
+	}
+
+	if status[0].LastErr != nil {
+		t.Errorf("Status[0].LastErr = %v, want nil: a nil function must register nothing, not a panicking applier", status[0].LastErr)
+	}
 }
 
 // TestGroupOnApplyInMultiTenantReturnsErrNotSupported pins D-G7's multi-tenant

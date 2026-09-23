@@ -174,12 +174,20 @@ func Bind[T any](c *Client, namespace, key string, defaults T, validate func(T) 
 	//
 	// The unsubscribe is discarded: a group has no Close, so the subscription
 	// outlives every caller of it.
-	_, subscribeErr := c.OnChange(namespace, key, func(ctx context.Context, ch Change) {
-		g.coordinator.Publish(ctx, group.Publication{Tenant: ch.Tenant, Revision: ch.Revision, Value: ch.Value})
-	})
+	_, subscribeErr := c.OnChange(namespace, key, g.publish)
 	g.subscribeErr = subscribeErr
 
 	return g, nil
+}
+
+// publish is the group's OnChange handler: it carries one published change of
+// the group's key into the coordinator, which decodes it and fans it out to the
+// registered appliers. The tenant travels Change.Tenant -> Publication.Tenant
+// -> Decoded.Tenant -> Applied.Tenant, and this is the only hop the root
+// package owns, so it is a method rather than a closure to keep that hop
+// testable in-package without a live multi-tenant feed.
+func (g *Group[T]) publish(ctx context.Context, ch Change) {
+	g.coordinator.Publish(ctx, group.Publication{Tenant: ch.Tenant, Revision: ch.Revision, Value: ch.Value})
 }
 
 // decodePublished is the codec the coordinator decodes every publication with.
@@ -220,6 +228,14 @@ func (g *Group[T]) decodePublished(value any) (T, error) {
 // only. CatalogKey is how the facade asks; on a closed Client it reports no
 // key at all, and the read below is then the right answer either way, because
 // it fails with ErrClosed and that travels back to the registrant.
+//
+// The question the gate actually asks is "is this Client multi-tenant".
+// CatalogKey answers it only because TenantScoped is a catalog PRESENTATION
+// field that reports the Client's mode verbatim, and it pays a deep clone of
+// the registered default to return one bool. This lane may not edit
+// internal/client, so the indirection stays: replace it with a direct probe of
+// the Client's mode when engine-core reopens that package, and revisit it with
+// FC-13's Phase 3, which reworks the catalog.
 func (g *Group[T]) seedCurrentEntry() (group.Publication, bool, error) {
 	if detail, known := g.client.CatalogKey(g.namespace, g.key); known && detail.TenantScoped {
 		return group.Publication{}, false, nil
@@ -405,6 +421,9 @@ type ApplyStatus struct {
 // own goroutine — which is what WithDebounce(0) does; under the default
 // debounce the publication comes from a timer goroutine instead. Either way an
 // applier that writes on every delivery keeps the group reloading forever.
+// An error fn returns is logged at error level and published in
+// [Group.Status]'s LastErr, where it is held until the next acceptance, so it
+// must name what was refused and must not embed the decoded document.
 //
 // The initial delivery — the replay, or the seeded one — runs on the calling
 // goroutine, before OnApply returns, whenever no fan-out for that scope is in
@@ -427,8 +446,10 @@ type ApplyStatus struct {
 // instead of running its compiled-in defaults until a write that may never come.
 // Reading after [Client.Close] fails this way. A key with nothing stored is not
 // a failure — the registered defaults are delivered once the Client tracks it.
-// Multi-tenant mode takes no such read, for the reason the next paragraph
-// gives.
+// Multi-tenant mode takes no such read while the Client is open, for the
+// reason the next paragraph gives; a CLOSED one falls through to the read and
+// returns ErrClosed, because a closed Client reports no registered key to
+// recognise as tenant-scoped.
 //
 // A nil fn registers nothing and returns no error, matching [Client.OnChange].
 // unsubscribe is idempotent, is safe to call from inside fn itself, and
@@ -438,7 +459,14 @@ type ApplyStatus struct {
 // working. With a bound Manager it registers and returns no error, and there is
 // no initial delivery: every document belongs to a tenant, so none is in force
 // until that tenant publishes one. Each tenant's later publications then reach
-// fn with that tenant in Applied.Tenant. On a nil *Group it returns ErrClosed.
+// fn with that tenant in Applied.Tenant, which is the ONLY tenant identity fn
+// receives: the delivered ctx is the one the Client published with and is not
+// tenant-scoped, so a re-read or a write-back must run under a tenant-scoped
+// context the consumer owns — the one tenant-manager middleware builds — and
+// never under the delivered one. And no publication path re-validates a tenant
+// row in that mode, so a document delivered to fn may not have passed validate;
+// that closes once engine-tenants routes tenant publications through the
+// engine's ingress. On a nil *Group it returns ErrClosed.
 // unsubscribe is never nil, so a caller may defer it before checking err.
 func (g *Group[T]) OnApply(fn func(ctx context.Context, a Applied[T]) error) (unsubscribe func(), err error) {
 	noop := func() {}

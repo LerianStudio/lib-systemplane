@@ -52,8 +52,19 @@ func ExampleBind() {
 		return
 	}
 
-	// Hot reload. Returning an error records that revision as rejected and
-	// keeps the previously applied one in force; the engine does not retry.
+	ctx := context.Background()
+
+	// Start loads the stored documents and begins listening.
+	if err := client.Start(ctx); err != nil {
+		fmt.Println("starting the client:", err)
+
+		return
+	}
+
+	// Hot reload, registered after Start so the first delivery is the document
+	// actually in force rather than the compiled-in defaults. Returning an
+	// error records that revision as rejected and keeps the previously applied
+	// one in force; the engine does not retry.
 	unsubscribe, err := group.OnApply(func(_ context.Context, a systemplane.Applied[limits]) error {
 		if a.Value.MaxConcurrent > 64 {
 			return fmt.Errorf("refusing %d workers: above the safe ceiling", a.Value.MaxConcurrent)
@@ -70,16 +81,6 @@ func ExampleBind() {
 	}
 
 	defer unsubscribe()
-
-	ctx := context.Background()
-
-	// Start hydrates every registered key and begins listening. The applier
-	// registered above has its first delivery here.
-	if err := client.Start(ctx); err != nil {
-		fmt.Println("starting the client:", err)
-
-		return
-	}
 
 	// Read the document in force, decoded into limits.
 	snapshot, err := group.Snapshot(ctx)
