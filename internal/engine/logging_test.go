@@ -6,6 +6,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -168,6 +172,115 @@ func requireNotRedacted(t *testing.T, rec logRecord) {
 				"the operator with its value replaced by [REDACTED]", rec.Msg, f.Key)
 		}
 	}
+}
+
+// logFieldConstructors are the log.Field constructors whose first argument is
+// the field NAME — the string an operator greps by and the string
+// lib-observability matches its sensitive list against. log.Err is absent
+// because it names no field.
+var logFieldConstructors = map[string]bool{
+	"String":   true,
+	"Any":      true,
+	"Int":      true,
+	"Int64":    true,
+	"Bool":     true,
+	"Duration": true,
+	"Float64":  true,
+	"Strings":  true,
+}
+
+// TestNoLoggedFieldNameIsRedacted reads the package's own source and refuses
+// any field name lib-observability erases.
+//
+// requireNotRedacted only sees the lines a test happens to drive, and this
+// package emits from a dozen sites the suite reaches unevenly. "key" is an
+// exact entry in the default sensitive-field list, so one log.String("key", …)
+// slipping back in publishes namespace=billing key=[REDACTED] to an operator
+// hunting a rejected row — a line that survives review because it reads
+// correctly in the source and is only wrong in production.
+func TestNoLoggedFieldNameIsRedacted(t *testing.T) {
+	names := loggedFieldNames(t)
+
+	if len(names) == 0 {
+		t.Fatal("no log field names found in this package: the scan matched nothing, so it proves nothing")
+	}
+
+	for name, pos := range names {
+		if redaction.IsSensitiveField(name) {
+			t.Errorf("%s: field name %q is on lib-observability's sensitive list, so the line "+
+				"reaches the operator with its value replaced by [REDACTED]", pos, name)
+		}
+	}
+}
+
+// loggedFieldNames parses every non-test file of the package under test — the
+// test binary runs with its package directory as cwd — and returns each
+// literal field name a log.Field constructor is called with, keyed by name so
+// the same name reported twice fails once. A name built from a constant or a
+// variable is skipped: it is not a literal this scan can read, and
+// constants.AttrKeyTenantID is the library's own and already checked there.
+func loggedFieldNames(t *testing.T) map[string]token.Position {
+	t.Helper()
+
+	sources, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("list package sources: %v", err)
+	}
+
+	fset := token.NewFileSet()
+	names := make(map[string]token.Position)
+
+	for _, source := range sources {
+		if strings.HasSuffix(source, "_test.go") {
+			continue
+		}
+
+		file, err := parser.ParseFile(fset, source, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", source, err)
+		}
+
+		ast.Inspect(file, func(n ast.Node) bool {
+			name, lit, ok := logFieldName(n)
+			if ok {
+				names[name] = fset.Position(lit.Pos())
+			}
+
+			return true
+		})
+	}
+
+	return names
+}
+
+// logFieldName reports the literal field name of a log.<Constructor>("name",
+// …) call, and false for every other node.
+func logFieldName(n ast.Node) (string, *ast.BasicLit, bool) {
+	call, ok := n.(*ast.CallExpr)
+	if !ok || len(call.Args) == 0 {
+		return "", nil, false
+	}
+
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || !logFieldConstructors[sel.Sel.Name] {
+		return "", nil, false
+	}
+
+	if pkg, ok := sel.X.(*ast.Ident); !ok || pkg.Name != "log" {
+		return "", nil, false
+	}
+
+	lit, ok := call.Args[0].(*ast.BasicLit)
+	if !ok || lit.Kind != token.STRING {
+		return "", nil, false
+	}
+
+	name, err := strconv.Unquote(lit.Value)
+	if err != nil {
+		return "", nil, false
+	}
+
+	return name, lit, true
 }
 
 // loggingEngine builds the engine the way the Client does — through New, with
@@ -444,6 +557,10 @@ func TestReconcileListFailureLevelsSplitOnShutdown(t *testing.T) {
 // requireOneRecord returns the single entry whose message is msg, failing when
 // the engine emitted none or several: every assertion below is about WHAT one
 // line carries, which is meaningless if the line is ambiguous.
+//
+// It runs requireNotRedacted for the same reason requireLogged and
+// requireLoggedAt do — a caller that forgot to repeat the check by hand read a
+// line whose fields lib-observability erases before an operator sees them.
 func requireOneRecord(t *testing.T, r *recordingLogger, msg string) logRecord {
 	t.Helper()
 
@@ -458,6 +575,8 @@ func requireOneRecord(t *testing.T, r *recordingLogger, msg string) logRecord {
 	if len(matches) != 1 {
 		t.Fatalf("entries with message %q: got %d, want 1; all entries: %v", msg, len(matches), r.all())
 	}
+
+	requireNotRedacted(t, matches[0])
 
 	return matches[0]
 }
@@ -504,7 +623,6 @@ func TestTenantIsLoggedUnderTheCanonicalKey(t *testing.T) {
 	e.Publish(context.Background(), store.Scope{Tenant: tenant}, jsonRow(nk, 1, `"5"`, "ops"))
 
 	got := requireOneRecord(t, rec, "write for an untracked scope, dropping")
-	requireNotRedacted(t, got)
 
 	f, ok := got.field(constants.AttrKeyTenantID)
 	if !ok {
@@ -551,7 +669,6 @@ func TestValidatorErrorIsRedactedByKeyPolicy(t *testing.T) {
 		ingestRow(e, jsonRow(visible, 1, `42`, "ops"))
 
 		got := requireOneRecord(t, rec, msg)
-		requireNotRedacted(t, got)
 
 		if !strings.Contains(got.String(), sentinel) {
 			t.Errorf("a key registered without redaction lost its validator's message: %s", got)
@@ -566,7 +683,6 @@ func TestValidatorErrorIsRedactedByKeyPolicy(t *testing.T) {
 		ingestRow(e, jsonRow(secret, 1, `42`, "ops"))
 
 		got := requireOneRecord(t, rec, msg)
-		requireNotRedacted(t, got)
 
 		if strings.Contains(got.String(), sentinel) {
 			t.Errorf("a redacted key published its value through the validator's error message: %s", got)
@@ -606,7 +722,6 @@ func TestUndecodableValueIsRedactedByKeyPolicy(t *testing.T) {
 		ingestRow(e, jsonRow(visible, 1, secret, "ops"))
 
 		got := requireOneRecord(t, rec, msg)
-		requireNotRedacted(t, got)
 
 		if !strings.Contains(got.String(), "invalid character") {
 			t.Errorf("a key registered without redaction lost the decoder's message: %s", got)
@@ -621,7 +736,6 @@ func TestUndecodableValueIsRedactedByKeyPolicy(t *testing.T) {
 		ingestRow(e, jsonRow(sensitive, 1, secret, "ops"))
 
 		got := requireOneRecord(t, rec, msg)
-		requireNotRedacted(t, got)
 
 		rendered := fmt.Sprint(got.fields())
 
@@ -734,14 +848,17 @@ func TestReconcileAnnouncesTheDefaultForARefusedSnapshotRow(t *testing.T) {
 	requireLogged(t, rec, log.LevelWarn, "stored value rejected by validator, keeping cached value", nk)
 }
 
-// TestScopeDropDiagnosticsAreDebug pins the level of the two lines a dropped
+// TestScopeDropDiagnosticsAreDebug pins the level of the three lines a dropped
 // scope emits for work that was already moving when it was dropped: a
-// reconcile sitting in the mailbox, and a write on the consumer's goroutine
-// that had already resolved its scope. Both are the ordinary shape of a tenant
-// being suspended or deleted under load — the engine is refusing to act on
-// state nothing tracks, which is the guard working — so at WARN a single
-// dropped tenant with queued work would report a burst of faults for a
-// correctly handled drop, in the same channel the real failures use.
+// reconcile sitting in the mailbox, a write on the consumer's goroutine that
+// had already resolved its scope, and a notification the backend's own
+// changefeed goroutine was already carrying — its key is registered, so the
+// feed's unregistered-key filter does not reject it first and the drop is what
+// stops it. All three are the ordinary shape of a tenant being suspended or
+// deleted under load — the engine is refusing to act on state nothing tracks,
+// which is the guard working — so at WARN a single dropped tenant with queued
+// work would report a burst of faults for a correctly handled drop, in the
+// same channel the real failures use.
 func TestScopeDropDiagnosticsAreDebug(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 
@@ -806,6 +923,30 @@ func TestScopeDropDiagnosticsAreDebug(t *testing.T) {
 // consumer on WithDebounce(0), and an engine built with no debouncer.
 const rereadPanicMsg = "systemplane.engine: changefeed re-read panicked"
 
+// panicRecoveredMsg is the line lib-observability's own handler emits, and the
+// only thing a test can see of the accounting that comes with it:
+// HandlePanicValue records panic_recovered_total and a span event, neither of
+// which is readable from here. Asserting the line is what keeps the call — and
+// therefore the metric and the span event — from being dropped in favour of
+// the engine's own identity line, which a reader mistakes for the whole
+// report.
+const panicRecoveredMsg = "panic recovered"
+
+// requirePanicAccounted asserts the handler ran for the named source, so the
+// panic counter and the span event were recorded and not only logged.
+func requirePanicAccounted(t *testing.T, r *recordingLogger, source string) {
+	t.Helper()
+
+	requireLoggedAt(t, r, log.LevelError, panicRecoveredMsg)
+
+	got, ok := findLogged(r, panicRecoveredMsg).field("source")
+	if !ok || got.Value != source {
+		t.Errorf("%q source field: got %v (present=%t), want %q: the accounting was recorded under "+
+			"another site, or the engine reported the panic without it",
+			panicRecoveredMsg, got.Value, ok, source)
+	}
+}
+
 // TestDebouncedReReadPanicNamesTheKey pins the identity on the one panic the
 // debouncer alone would report anonymously.
 //
@@ -835,17 +976,25 @@ func TestDebouncedReReadPanicNamesTheKey(t *testing.T) {
 
 	e.onEvent(upsertEvent(scope, nk, 1))
 
-	waitFor(t, time.Second, "the panicking re-read to be reported", func() bool {
+	// Both lines, because the engine's own is emitted first: waiting on it
+	// alone would read the accounting line before the handler wrote it.
+	waitFor(t, time.Second, "the panicking re-read to be reported and accounted", func() bool {
+		var reported, accounted bool
+
 		for _, r := range rec.snapshot() {
-			if r.Msg == msg {
-				return true
+			switch r.Msg {
+			case msg:
+				reported = true
+			case panicRecoveredMsg:
+				accounted = true
 			}
 		}
 
-		return false
+		return reported && accounted
 	})
 
 	requireLogged(t, rec, log.LevelError, msg, nk)
+	requirePanicAccounted(t, rec, "refresh")
 
 	tenant, ok := findLogged(rec, msg).field(constants.AttrKeyTenantID)
 	if !ok || tenant.Value != scope.Tenant {

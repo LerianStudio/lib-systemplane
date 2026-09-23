@@ -696,8 +696,18 @@ func TestForeignUpsertEventCostsNoStoreRead(t *testing.T) {
 
 			// The sentinel goes through the same debouncer with the same
 			// window and is armed after the event above, so its delivery
-			// proves any window that event opened has already closed.
+			// proves any window that event opened has already closed. It does
+			// NOT prove the re-read that window would have scheduled has
+			// finished: on the debounced path the timer hands the re-read to a
+			// tracked goroutine, so a Store.Get could still be in flight here
+			// and the count below would read zero for a filter that is not
+			// there. Close is what drains it — the same wait a consumer's own
+			// shutdown gets — so the count is read against finished work.
 			quiesce(t, e)
+
+			if err := e.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
 
 			if reads := fs.getCount(); reads != 0 {
 				t.Errorf("store reads for an upsert on a key this process never registered: got %d, want 0", reads)
