@@ -38,8 +38,8 @@ type memStore struct {
 	// surfaces a backend close failure instead of swallowing it.
 	closeErr error
 
-	// listHook is invoked at the top of List(), allowing tests to block
-	// hydration to inject race conditions deterministically. nil disables it.
+	// listHook is invoked at the top of List(), allowing tests to block a
+	// reconcile to inject race conditions deterministically. nil disables it.
 	listHook func()
 
 	// getHook is consulted at the top of Get(). When it reports handled, its
@@ -85,7 +85,7 @@ func newMemStore(multiTenant bool) *memStore {
 
 // newMemStoreWithListHook returns a memStore whose List() pauses at the
 // listHook callback set by the test. Used to deterministically inject a
-// changefeed event during the hydrate() window.
+// changefeed event while a reconcile is in flight.
 func newMemStoreWithListHook(multiTenant bool) *memStore {
 	return newMemStore(multiTenant)
 }
@@ -1009,16 +1009,18 @@ func TestListReturnsErrorOnCorruptedJSON(t *testing.T) {
 	}
 }
 
-// Item #9: Hydration must not overwrite fresher changefeed state. We seed a
-// row, then between Subscribe registration and List() completion we force a
-// change event to fire for the same key with a newer value. The expected
-// outcome: the cache holds the changefeed-delivered value, not the older
-// List snapshot.
+// Item #9: the first reconcile must not overwrite fresher changefeed state. We
+// seed a row, then between Subscribe registration and List() completion we
+// force a change event to fire for the same key with a newer value. The
+// expected outcome: the value in force is the changefeed-delivered one, not the
+// older List snapshot, because the feed recorded the key as touched while the
+// reconcile was in flight and the snapshot row is skipped for it
+// (reconcileWindow, internal/engine/reconcile.go).
 //
-// We exercise this by having the memStore's List sleep briefly before
-// returning, while a writer goroutine pushes the newer value into the
-// changefeed during that window.
-func TestHydrationDoesNotOverwriteFresherChangefeedState(t *testing.T) {
+// We exercise this by having the memStore's List block until the injected
+// upsert has been published, which the test observes through a subscriber
+// registered before Start rather than by sleeping.
+func TestReconcileDoesNotOverwriteFresherChangefeedState(t *testing.T) {
 	m := newMemStoreWithListHook(false)
 	c := newSingleTenantClient(t, m)
 
@@ -1043,6 +1045,24 @@ func TestHydrationDoesNotOverwriteFresherChangefeedState(t *testing.T) {
 		<-listRelease
 	}
 
+	// Subscribed BEFORE Start, so the injected upsert can be waited for
+	// instead of slept on. A pre-Start subscriber also receives the FC-11
+	// announcement of every registered key, so the wait below matches on the
+	// injected value AND revision rather than on the first delivery.
+	changes := make(chan Change, 16)
+
+	unsubscribe, err := c.OnChange("ns", "k", func(_ context.Context, ch Change) {
+		select {
+		case changes <- ch:
+		default:
+		}
+	})
+	if err != nil {
+		t.Fatalf("onchange: %v", err)
+	}
+
+	defer unsubscribe()
+
 	startDone := make(chan error, 1)
 
 	go func() {
@@ -1053,16 +1073,19 @@ func TestHydrationDoesNotOverwriteFresherChangefeedState(t *testing.T) {
 	<-listReady
 
 	// Inject a fresh upsert via the memStore's fire() (simulates the
-	// changefeed delivering a newer value during hydration).
+	// changefeed delivering a newer value while the first reconcile is in
+	// flight). Revision 7 is above the seeded row's, so the publish fence
+	// accepts it and GetEntry can report it.
 	rawNew, _ := json.Marshal("new-from-changefeed")
 	m.mu.Lock()
-	m.entries[memKey("ns", "k")] = store.Entry{Namespace: "ns", Key: "k", Value: rawNew}
+	m.entries[memKey("ns", "k")] = store.Entry{Namespace: "ns", Key: "k", Value: rawNew, Revision: 7}
 	m.mu.Unlock()
 	m.fire(store.Event{Namespace: "ns", Key: "k", Op: store.OpUpsert})
 
-	// Give the changefeed callback time to land in the cache before
-	// releasing List().
-	time.Sleep(50 * time.Millisecond)
+	// Release List() only once the injected value has actually been published,
+	// so the reconcile applies its snapshot against a key the feed has already
+	// claimed.
+	waitForChange(t, changes, "new-from-changefeed", 7)
 	close(listRelease)
 
 	if err := <-startDone; err != nil {
@@ -1071,26 +1094,53 @@ func TestHydrationDoesNotOverwriteFresherChangefeedState(t *testing.T) {
 
 	defer c.Close()
 
-	// Allow any debounce window to flush.
-	time.Sleep(50 * time.Millisecond)
-
 	v, ok, err := c.Get(context.Background(), "ns", "k")
 	if err != nil || !ok {
 		t.Fatalf("get: ok=%v err=%v", ok, err)
 	}
 
 	if v.(string) != "new-from-changefeed" {
-		t.Errorf("cache holds %q — hydration overwrote fresher changefeed state", v)
+		t.Errorf("value in force is %q — the first reconcile overwrote fresher changefeed state", v)
+	}
+
+	e, ok, err := c.GetEntry(context.Background(), "ns", "k")
+	if err != nil || !ok {
+		t.Fatalf("get entry: ok=%v err=%v", ok, err)
+	}
+
+	if e.Revision != 7 {
+		t.Errorf("Revision = %d, want 7: the revision the injected upsert carried", e.Revision)
 	}
 }
 
-// TestRefreshKeepsCacheWhenReReadReportsNotFound pins the behavior for a
-// changefeed event whose follow-up read does not see the row: the
+// waitForChange drains deliveries until one carries value at revision, or
+// fails the test after a bounded wait.
+func waitForChange(t *testing.T, changes <-chan Change, value any, revision int64) {
+	t.Helper()
+
+	deadline := time.After(2 * time.Second)
+
+	for {
+		select {
+		case ch := <-changes:
+			if ch.Value == value && ch.Revision == revision {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("no Change carrying %v at revision %d arrived", value, revision)
+		}
+	}
+}
+
+// TestRefreshKeepsCacheWhenReReadReportsNotFound pins one of the three
+// outcomes refreshKey (internal/engine/feed.go) distinguishes for a changefeed
+// event: a re-read that errors and a re-read that finds no row both keep the
+// value already in force, and only a row that comes back is ingested. The
 // notification and the re-read are separate operations, so "not found" is a
 // non-answer (the write may not be visible to the reader yet), not evidence
-// the row is gone. Removal has its own path (store.OpDelete). The cache must
-// keep its last known-good value instead of being reset to the registered
-// default.
+// the row is gone. Removal has its own path (store.OpDelete). The published
+// state must keep its last known-good value and revision instead of being
+// reset to the registered default.
 func TestRefreshKeepsCacheWhenReReadReportsNotFound(t *testing.T) {
 	m := newMemStore(false)
 	c := newSingleTenantClient(t, m)
@@ -1155,7 +1205,18 @@ func TestRefreshKeepsCacheWhenReReadReportsNotFound(t *testing.T) {
 	}
 
 	if v.(string) != "known-good" {
-		t.Errorf("cache holds %v — a not-found re-read erased the cached value", v)
+		t.Errorf("value in force is %v — a not-found re-read erased the published value", v)
+	}
+
+	// Revision as well as value: a published state reset to the default would
+	// report 0 here even if some later path restored the value.
+	e, ok, err := c.GetEntry(context.Background(), "ns", "k")
+	if err != nil || !ok {
+		t.Fatalf("post-refresh get entry: ok=%v err=%v", ok, err)
+	}
+
+	if e.Revision != 1 {
+		t.Errorf("Revision = %d, want 1: the known-good row's revision", e.Revision)
 	}
 }
 

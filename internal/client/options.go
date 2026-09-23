@@ -204,9 +204,9 @@ func WithValidator(fn func(any) error) KeyOption {
 //
 // Four callers invoke it today: [Client.Set], with the context of that write;
 // [Client.Register], with context.Background(); and, in single-tenant mode,
-// hydration at [Client.Start] and each changefeed refresh, with the contexts
-// described below. A context validator must therefore treat a context that
-// lacks the scope it expects as "cannot verify" and decide by its own policy —
+// the first reconcile at [Client.Start] and each changefeed refresh, with the
+// contexts described below. A context validator must therefore treat a context
+// that lacks the scope it expects as "cannot verify" and decide by its own policy —
 // accept it, or refuse it with its own error — rather than assume request scope
 // is there to read.
 //
