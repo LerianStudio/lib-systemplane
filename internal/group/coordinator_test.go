@@ -4,6 +4,7 @@ package group
 
 import (
 	"context"
+	"errors"
 	goruntime "runtime"
 	"slices"
 	"strconv"
@@ -573,6 +574,52 @@ func TestCoordinatorRegisterFromInsideAnApplierIsDeliveredAfterIt(t *testing.T) 
 
 		assertEvents(t, events, []string{"enter:one", "exit:one"})
 	})
+
+	// A re-entrant registration is the only moment an applier exists and has
+	// not been offered a scope the coordinator already published: the fan-out
+	// picks it up on its next iteration. Applied has to read 0 in that window
+	// rather than the revision the incumbent applier already accepted, because
+	// the document is demonstrably not in force everywhere and reporting it
+	// would call a half-applied group converged.
+	t.Run("a newly registered applier leaves the scope unapplied until it is offered", func(t *testing.T) {
+		c := newCoordinator(t)
+		ctx := context.Background()
+
+		var (
+			duringDelivery []Status
+			once           sync.Once
+		)
+
+		second := func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error { return nil }
+
+		first := func(_ context.Context, current Decoded[coordDoc], _ *Decoded[coordDoc]) error {
+			if current.Revision == 2 {
+				once.Do(func() {
+					// Not mustRegister: t.Fatalf is not allowed here, and the
+					// coordinator takes no seed, so this cannot fail.
+					c.Register(second)
+
+					duringDelivery = c.Status()
+				})
+			}
+
+			return nil
+		}
+
+		unsubscribe := mustRegister(t, c, first)
+		defer unsubscribe()
+
+		c.Publish(ctx, publication("t1", 1, "one")) // accepted by the only applier
+		c.Publish(ctx, publication("t1", 2, "two")) // registers the second one mid-delivery
+
+		if len(duringDelivery) != 1 || duringDelivery[0].Tenant != "t1" {
+			t.Fatalf("Status() during the delivery = %+v, want the one scope t1", duringDelivery)
+		}
+
+		if duringDelivery[0].Applied != 0 {
+			t.Errorf("Applied during the delivery = %d, want 0: the applier registered a moment earlier has never been offered this scope, so revision 1 is not in force everywhere", duringDelivery[0].Applied)
+		}
+	})
 }
 
 // assertEvents compares a delivery trace in order, so a test reads as the
@@ -633,6 +680,31 @@ func TestCoordinatorNilReceiverIsSafe(t *testing.T) {
 type blowUpOnMarshal struct{}
 
 func (blowUpOnMarshal) MarshalJSON() ([]byte, error) { panic("MarshalJSON exploded") }
+
+// refuseMarshal is a document whose MarshalJSON FAILS rather than panicking, so
+// the seed watermark has nothing to compare and can never prove a publication
+// identical to the seed it anticipates. Like blowUpOnMarshal it is the
+// consumer's own type: a group persists the caller's struct verbatim, so it is
+// the consumer's MarshalJSON that the watermark runs.
+type refuseMarshal struct{}
+
+func (refuseMarshal) MarshalJSON() ([]byte, error) { return nil, errors.New("marshal refused") }
+
+// decodeRefusing maps refuseMarshal onto the same document every other value in
+// the same test decodes to, so a delivery can only be explained by the
+// watermark refusing to spend itself and never by the two documents differing.
+// Decode goes through JSON, which refuseMarshal fails, so it cannot decode one.
+func decodeRefusing(v any) (coordDoc, error) {
+	if _, ok := v.(refuseMarshal); ok {
+		return coordDoc{Name: unmarshallableName}, nil
+	}
+
+	return Decode[coordDoc](v)
+}
+
+// unmarshallableName is what both sides of an unprovable watermark comparison
+// decode to.
+const unmarshallableName = "unmarshallable"
 
 func constantDecode(any) (coordDoc, error) { return coordDoc{Name: "decoded"}, nil }
 

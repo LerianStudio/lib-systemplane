@@ -327,3 +327,41 @@ func TestCoordinatorSeedReadErrorReachesTheRegistrant(t *testing.T) {
 		t.Fatalf("deliveries to the second registration = %v, want the seeded revision 4", second.names())
 	}
 }
+
+// TestCoordinatorDeliversAfterASeedItCannotProveIdentical pins the watermark's
+// "not proven identical means deliver" rule on the only two ways the proof can
+// be impossible: the seeded document refuses to marshal, so there are no bytes
+// to compare against, or the publication that follows refuses to, so there is
+// nothing to compare. Either way the seed and the publication are two
+// observations, not one. Spending the watermark on an unproven match would drop
+// a document silently, at a revision no later write has to beat, and the
+// consumer would run the seeded configuration believing the published one is in
+// force.
+func TestCoordinatorDeliversAfterASeedItCannotProveIdentical(t *testing.T) {
+	cases := []struct {
+		name      string
+		seeded    any
+		published any
+	}{
+		{name: "the seed cannot be marshalled", seeded: refuseMarshal{}, published: refuseMarshal{}},
+		{name: "the publication cannot be marshalled", seeded: document(unmarshallableName), published: refuseMarshal{}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			seed := &seeder{pub: Publication{Tenant: "t1", Revision: 1, Value: tc.seeded}, ok: true}
+			c := NewCoordinator[coordDoc](nil, decodeRefusing, seed.read)
+
+			var rec recorder
+
+			unsubscribe := mustRegister(t, c, rec.apply)
+			defer unsubscribe()
+
+			c.Publish(context.Background(), Publication{Tenant: "t1", Revision: 1, Value: tc.published})
+
+			if names := rec.names(); len(names) != 2 {
+				t.Fatalf("deliveries = %v, want two: the seed, and the publication the watermark could not prove identical to it", names)
+			}
+		})
+	}
+}

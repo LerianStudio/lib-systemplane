@@ -991,4 +991,36 @@ func TestCoordinatorLastApplierRejectingAndLeavingKeepsTheRejection(t *testing.T
 			}
 		})
 	}
+
+	// A consumer that configured no logger is the common case in tests and the
+	// default in a service that has not wired observability yet. The panic
+	// handler serializes the recovered value through that logger, so a nil one
+	// has to be absorbed at the boundary: reaching the assertions below is the
+	// proof that Publish returned instead of unwinding into the publisher.
+	t.Run("panics with no logger configured", func(t *testing.T) {
+		c := newCoordinator(t)
+
+		var (
+			unsubscribe func()
+			once        sync.Once
+		)
+
+		unsubscribe = mustRegister(t, c, func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
+			once.Do(unsubscribe)
+
+			panic("boom")
+		})
+		defer unsubscribe()
+
+		c.Publish(context.Background(), publication("t1", 4, "four"))
+
+		got := statusOf(t, c, "t1")
+		if !errors.Is(got.LastErr, ErrApplyPanicked) {
+			t.Fatalf("Status after the only applier panicked and left = %#v, want LastErr matching ErrApplyPanicked", got)
+		}
+
+		if strings.Contains(got.LastErr.Error(), "boom") {
+			t.Errorf("LastErr = %q, want the panic value kept out of it: a panicking hook is routinely holding the decoded document with its endpoints and credentials", got.LastErr)
+		}
+	})
 }
