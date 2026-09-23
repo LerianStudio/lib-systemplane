@@ -217,6 +217,13 @@ func (e *Engine) trackedRefresh(scope store.Scope, nk NSKey) {
 // every frame between here and the panic have already run by the time this
 // one does, so the scope's reconcile mutex is free to take.
 //
+// That fence is written FIRST, before any consumer code can run. Everything
+// below it is the consumer's — its logger, and whatever lib-observability's
+// handler calls into — and nothing bounds how long it holds this goroutine. A
+// reconcile that reaches the key while one slow log line is in flight would
+// read the empty fence and publish the default over a live value, which is
+// precisely the reset the fence exists to prevent.
+//
 // HandlePanicValue rather than a re-panic into that net because only it
 // records panic_recovered_total and the span event: RecoverAndLog takes no
 // context and records neither. The recovered value stays out of the identity
@@ -230,13 +237,13 @@ func (e *Engine) recoverRefresh(scope store.Scope, nk NSKey) {
 
 	ctx := e.dispatchContext()
 
+	e.recordFeedOutcome(scope, nk, false)
+
 	e.logError(ctx, "systemplane.engine: changefeed re-read panicked",
 		log.String(constants.AttrKeyTenantID, scope.Tenant),
 		log.String("namespace", nk.Namespace),
 		log.String("keyname", nk.Key),
 	)
-
-	e.recordFeedOutcome(scope, nk, false)
 
 	runtime.HandlePanicValue(ctx, e.logger, recovered, "systemplane.engine", "refresh")
 }
@@ -317,8 +324,11 @@ func (e *Engine) applyDelete(scope store.Scope, nk NSKey) {
 // Three outcomes that are not a publication, each deliberately different:
 //
 //   - a store error teaches the engine nothing, so the key is recorded as
-//     unusable and the cached value stands. An error that is the lifecycle
-//     context being canceled is a shutdown, not an incident, and logs at DEBUG.
+//     unusable and the cached value stands. The fence is written before the
+//     line, for the reason recoverRefresh states: the logger is the consumer's
+//     and a reconcile must never reach the key while it is still unfenced. An
+//     error that is the lifecycle context being canceled is a shutdown, not an
+//     incident, and logs at DEBUG.
 //   - not found keeps the current value and publishes nothing: the write may
 //     simply not be visible to this reader yet, and a real removal arrives as
 //     OpDelete, so this is expected rather than wrong and logs at DEBUG. It is
@@ -348,6 +358,8 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
 
 	se, found, err := e.store.Get(ctx, scope, nk.Namespace, nk.Key)
 	if err != nil {
+		e.recordFeedOutcome(scope, nk, false)
+
 		if e.canceledByShutdown(err) {
 			e.logDebug(ctx, "changefeed re-read canceled during shutdown",
 				log.String("namespace", nk.Namespace),
@@ -360,8 +372,6 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
 				log.Err(err),
 			)
 		}
-
-		e.recordFeedOutcome(scope, nk, false)
 
 		return
 	}

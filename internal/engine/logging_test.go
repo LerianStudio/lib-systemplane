@@ -1174,3 +1174,185 @@ func TestPerEventDropLinesCostNothingWhenDebugIsOff(t *testing.T) {
 		})
 	}
 }
+
+// hookLogger runs fn at the instant the engine emits msg, BEFORE the line
+// reaches the recorder beneath it.
+//
+// It is how a test reads engine state at the exact moment the consumer's
+// logger is handed control — the only way to pin that a fence was written
+// BEFORE any consumer code could run — and how it holds that moment open long
+// enough for a reconcile to run inside it.
+type hookLogger struct {
+	*recordingLogger
+
+	msg string
+	fn  func()
+}
+
+func (h *hookLogger) Log(ctx context.Context, level int, msg string, fields ...any) {
+	if msg == h.msg {
+		h.fn()
+	}
+
+	h.recordingLogger.Log(ctx, level, msg, fields...)
+}
+
+// TestFailedRereadFencesTheKeyBeforeLogging pins the ORDER of the two things a
+// re-read that learned nothing does: it must tell every reconcile in flight
+// that the key is unusable BEFORE it hands a line to the consumer's logger.
+//
+// The logger is consumer code and nothing bounds it. A reconcile that reaches
+// the key while that code runs finds an empty fence, reads the key's absence
+// from its snapshot as a deletion, and publishes the registered default at
+// revision 0 — which never loses the fence. Both paths exist to stop exactly
+// that, so both have to close it before anything reentrant runs.
+func TestFailedRereadFencesTheKeyBeforeLogging(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+
+	tests := []struct {
+		name    string
+		msg     string
+		level   int
+		arrange func(fs *fakeStore)
+	}{
+		{
+			name:  "the re-read panicked",
+			msg:   rereadPanicMsg,
+			level: log.LevelError,
+			arrange: func(fs *fakeStore) {
+				fs.onGet(func(store.Scope, NSKey) error { panic("the store driver exploded") })
+			},
+		},
+		{
+			name:  "the re-read errored",
+			msg:   "changefeed re-read failed, keeping current value",
+			level: log.LevelWarn,
+			arrange: func(fs *fakeStore) {
+				fs.onGet(func(store.Scope, NSKey) error { return errors.New("backend down") })
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fs := newFakeStore()
+			rec := &recordingLogger{Logger: log.NewNop()}
+
+			var (
+				e         *Engine
+				fencedYet bool
+			)
+
+			e = New(Config{
+				Store:    fs,
+				Registry: fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: "fallback"}}},
+				Logger: &hookLogger{recordingLogger: rec, msg: tt.msg, fn: func() {
+					_, unusable := recordedSets(e, scope)
+					fencedYet = len(unusable) == 1 && unusable[0] == nk
+				}},
+			})
+
+			track(t, e, scope)
+
+			t.Cleanup(func() {
+				if err := e.Close(); err != nil {
+					t.Errorf("Close: %v", err)
+				}
+			})
+
+			// The fence needs somewhere to land: the sets exist only for the
+			// window between a reconcile's List and its application.
+			_ = armWindow(e.scopeFor(scope))
+
+			tt.arrange(fs)
+			e.onEvent(upsertEvent(scope, nk, 1))
+
+			requireLogged(t, rec, tt.level, tt.msg, nk)
+
+			if !fencedYet {
+				t.Errorf("%q reached the consumer's logger with %v still unfenced: a reconcile running "+
+					"inside that call treats the key as absent and publishes the registered default "+
+					"over a live value", tt.msg, nk)
+			}
+		})
+	}
+}
+
+// TestPanicUnderReReadCannotResetALiveValue is the failure that order prevents,
+// end to end and on the clock: a key whose re-read panics while a reconcile
+// applies a snapshot taken after the row was removed, with a consumer logger
+// slow enough — 50ms, what shipping a line to a remote sink costs — for the
+// whole reconcile to run inside the panic report.
+func TestPanicUnderReReadCannotResetALiveValue(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	rec := &recordingLogger{Logger: log.NewNop()}
+	logging := make(chan struct{})
+
+	e := New(Config{
+		Store:    fs,
+		Registry: fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: "fallback"}}},
+		Logger: &hookLogger{recordingLogger: rec, msg: rereadPanicMsg, fn: func() {
+			close(logging)
+			time.Sleep(50 * time.Millisecond)
+		}},
+	})
+
+	t.Cleanup(func() {
+		if err := e.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+
+	fs.seed(scope, jsonRow(nk, 2, `"live"`, "ops"))
+	settled(t, e, scope)
+
+	var sub recorder
+
+	unsub := e.OnChange(nk, sub.record)
+	defer unsub()
+
+	e.onEvent(disconnectEvent(scope))
+
+	release := heldList(fs)
+	e.onEvent(resyncEvent(scope))
+
+	// The snapshot the held List is about to take no longer carries the row,
+	// and the re-read that would have taught the engine about the key blows up.
+	fs.remove(scope, nk)
+	fs.onGet(func(store.Scope, NSKey) error { panic("the store driver exploded") })
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		e.onEvent(upsertEvent(scope, nk, 3))
+	}()
+
+	// Release the snapshot the moment the panic report reaches the consumer's
+	// logger: the reconcile then decides the key inside that call.
+	<-logging
+
+	release()
+	waitReconcileIdle(t, e, scope)
+
+	got, ok := e.Lookup(scope, nk)
+	if !ok {
+		t.Fatal("Lookup reports a miss: the reconcile erased the cache")
+	}
+
+	if got.Value != "live" || got.Revision != 2 {
+		t.Errorf("with the panic report still inside the consumer's logger: got (%v, rev %d), want the "+
+			"cached (\"live\", rev 2) — the reconcile read an empty fence and reset a live value to "+
+			"its registered default", got.Value, got.Revision)
+	}
+
+	if n := sub.len(); n != 0 {
+		t.Errorf("deliveries: got %d, want 0: every subscriber of the key was told it changed", n)
+	}
+
+	<-done
+}

@@ -160,7 +160,7 @@ func New(cfg Config) *Engine {
 // no row — revision 0 is never deduplicated, so the second publication is
 // accepted and delivered, which is the double delivery FC-11 forbids.
 //
-// Three failures, three different outcomes:
+// Four failures, four different outcomes:
 //
 //   - Subscribe fails: the scope is dropped entirely and the error returned. A
 //     tracked scope whose feed never opened would look fresh forever. A
