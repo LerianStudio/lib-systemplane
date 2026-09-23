@@ -591,12 +591,21 @@ func runningCount(e *Engine) int {
 // cannot stall the scope's reconciles — and a tenant suspended in the meantime
 // is gone by the time the row comes back.
 //
-// Publishing that row re-created the scope: tracked, readable, with no
-// changefeed behind it and no reconcile goroutine to confirm it, holding a
-// value for a tenant whose database this process is no longer entitled to
-// read. Re-resolving the scope after the round trip is what refuses it, and
-// nothing else covers that guard — the pre-call check passes, because at that
-// point the scope is still very much alive.
+// Nothing of that row may reach the tenant: not the cache, which would be
+// tracked and readable with no changefeed behind it and no reconcile goroutine
+// to confirm it, and not the CONSUMER's registered validator, which would be
+// handed a configuration row for a tenant this process is no longer entitled
+// to read. The pre-call check cannot cover either, because at that point the
+// scope is still very much alive.
+//
+// Two guards answer it, and the assertions below separate them. publish's own
+// drop check refuses the cache write, which is why the scope stays untracked
+// and the read reports a miss — that guard has its own test in
+// TestPublishIntoAlreadyDroppedStateIsRefused. Re-resolving the scope after
+// the round trip is what stops everything BEFORE that: hoist the pre-call
+// resolution and reuse it, and the value is still refused, but the validator
+// has run and the dead state's reconcile fences have been written. Only the
+// validator assertion goes red for that mutation.
 //
 // The drop is driven from inside Store.Get rather than raced for: that is
 // exactly where the re-read is when a suspension lands, and the fake invokes
@@ -630,7 +639,21 @@ func TestRereadRefusesAScopeDroppedDuringTheStoreCall(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fs := newFakeStore()
 			rec := &recordingLogger{Logger: log.NewNop()}
-			e := loggingEngineWith(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, rec)
+
+			// A zero quiet window runs the whole re-read inline on this
+			// goroutine, so the validator — if it runs at all — runs here too
+			// and a plain bool is all the flag needs.
+			validated := false
+			defs := map[NSKey]KeyDef{nk: {
+				Default: "fallback",
+				Validate: func(context.Context, any) error {
+					validated = true
+
+					return nil
+				},
+			}}
+
+			e := loggingEngineWith(t, defs, fs, rec)
 
 			bringUp(t, e, dropTenant)
 			fs.seed(dropTenant, jsonRow(nk, 7, `"seven"`, "ops"))
@@ -663,6 +686,12 @@ func TestRereadRefusesAScopeDroppedDuringTheStoreCall(t *testing.T) {
 
 			if got := delivered.len(); got != 0 {
 				t.Errorf("%d Change(s) delivered for a tenant dropped mid-Get, want 0", got)
+			}
+
+			if validated {
+				t.Error("the consumer's registered validator was handed a row belonging to a tenant " +
+					"dropped mid-Get: the re-read must re-resolve the scope after its round trip and " +
+					"stop there, not run consumer code and let publish refuse the result")
 			}
 
 			if !tc.panics {

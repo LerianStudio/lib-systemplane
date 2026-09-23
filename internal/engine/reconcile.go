@@ -403,7 +403,7 @@ func (e *Engine) applySnapshotRow(ctx context.Context, sc *scopeState, arm recon
 	// failed to list — it completed, with an error, and the row it never saw
 	// was never announced by any reconcile after it.
 	if _, isCached := sc.cached(nk); !isCached {
-		e.ingestDefault(ctx, sc, nk)
+		e.ingestDefault(ctx, sc, nk, false)
 	}
 
 	return false
@@ -428,7 +428,7 @@ func (e *Engine) applyAbsentKey(ctx context.Context, sc *scopeState, arm reconci
 		return false
 	}
 
-	e.ingestDefault(ctx, sc, nk)
+	e.ingestDefault(ctx, sc, nk, false)
 
 	return false
 }
@@ -538,6 +538,12 @@ func (sc *scopeState) clearStale(arm reconcileArming) {
 // in unusable, so a reconcile keeps the cached value instead of treating the
 // key as absent and publishing the registered default over it.
 //
+// A usable outcome also CLEARS unusable, which is what lets the ingress fence a
+// key before it runs the consumer's validator and still leave the two sets
+// disjoint afterwards. The reverse does not hold: a failed re-read after a
+// successful one leaves touched alone, because a publication that happened
+// stays a fact the snapshot must not overwrite.
+//
 // The caller holds sc.reconcileMu, and for a publication it holds it across
 // the publication too: that pairing is what makes the feed atomic against a
 // reconcile.
@@ -545,6 +551,7 @@ func (sc *scopeState) record(nk NSKey, usable bool) {
 	for _, window := range sc.windows {
 		if usable {
 			window.touched[nk] = struct{}{}
+			delete(window.unusable, nk)
 
 			continue
 		}

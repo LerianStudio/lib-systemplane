@@ -22,7 +22,13 @@ type publication struct {
 	// against every later publication of that key, so a Store must hand over
 	// bytes it will never mutate. See entry.Raw for what a pooled buffer
 	// would cost.
-	Raw       []byte
+	Raw []byte
+	// Deleted marks the one publication that is a row's REMOVAL rather than a
+	// value: it bumps the key's delete counter, which is what a changefeed
+	// re-read still inside its store call is fenced against. A reconcile
+	// publishing the default for a key its photograph did not carry is not a
+	// delete — see entry.Deletes.
+	Deleted   bool
 	UpdatedAt time.Time
 	UpdatedBy string
 }
@@ -137,10 +143,16 @@ func (e *Engine) publish(sc *scopeState, pub publication) (notify bool) {
 		// writer, which changed value without bumping revision. Observed.
 	}
 
+	deletes := cached.Deletes
+	if pub.Deleted {
+		deletes++
+	}
+
 	sc.entries[pub.NSKey] = entry{
 		Value:     pub.Value,
 		Raw:       pub.Raw,
 		Revision:  pub.Revision,
+		Deletes:   deletes,
 		UpdatedAt: pub.UpdatedAt,
 		UpdatedBy: pub.UpdatedBy,
 	}

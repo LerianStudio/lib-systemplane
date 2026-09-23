@@ -1387,6 +1387,114 @@ func TestConcurrentFeedDeleteIsNotResurrected(t *testing.T) {
 	}
 }
 
+// TestDeleteIsNotResurrectedByAnInFlightReRead is the RED test for the delete
+// fence. The two tests above are feed-vs-reconcile; this one is feed-vs-feed
+// and needs no reconcile at all.
+//
+// A delete publishes the registered default at revision 0, which is what FC-4
+// and FC-5 require at the public surface, so the revision alone cannot refuse
+// a re-read armed by an earlier notification and still inside Store.Get when
+// the DELETE commits: under READ COMMITTED that reader holds a snapshot taken
+// before the commit, comes back with the pre-delete row, and every revision
+// beats 0. The deleted key came back to life, reported itself fresh, and
+// stayed that way until some later reconnect happened to reconcile the scope —
+// on a stable connection, never, and two processes of one consumer then
+// disagree about a key an operator deleted.
+//
+// The row deliberately stays in the store double. A reader whose snapshot
+// predates the commit still sees it, and that reader is the whole hazard.
+func TestDeleteIsNotResurrectedByAnInFlightReRead(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+
+	for _, tc := range []struct {
+		name    string
+		arrange func(t *testing.T, e *Engine, fs *fakeStore)
+	}{
+		{
+			name: "the key was published before the delete",
+			arrange: func(t *testing.T, e *Engine, fs *fakeStore) {
+				fs.seed(scope, jsonRow(nk, 5, `"five"`, "ops"))
+				settled(t, e, scope)
+			},
+		},
+		{
+			// The delete is then the key's FIRST publication, so there is no
+			// cached revision to fence the re-read against either. Counting
+			// deletes answers both; remembering the deleted row's revision
+			// would answer only the case above.
+			name: "the key had never been published",
+			arrange: func(t *testing.T, e *Engine, fs *fakeStore) {
+				bringUp(t, e, scope)
+				fs.seed(scope, jsonRow(nk, 5, `"five"`, "ops"))
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := newFakeStore()
+			e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0)
+
+			tc.arrange(t, e, fs)
+
+			var delivered recorder
+
+			unsub := e.OnChange(nk, delivered.record)
+			defer unsub()
+
+			inGet, enteredGet := gate()
+			held, releaseGet := gate()
+
+			defer enteredGet()
+			defer releaseGet()
+
+			fs.onGet(func(store.Scope, NSKey) error {
+				fs.onGet(nil)
+				enteredGet()
+				<-held
+
+				return nil
+			})
+
+			reread := make(chan struct{})
+
+			go func() {
+				defer close(reread)
+
+				e.onEvent(upsertEvent(scope, nk, 5))
+			}()
+
+			<-inGet
+
+			e.onEvent(deleteEvent(scope, nk))
+
+			releaseGet()
+			<-reread
+			quiesce(t, e)
+
+			got, ok := e.Lookup(scope, nk)
+			if !ok {
+				t.Fatal("Lookup reports a miss after a delete concurrent with a re-read")
+			}
+
+			if got.Value != "fallback" || got.Revision != 0 {
+				t.Errorf("after the delete: got (%v, rev %d), want the registered default at rev 0: a "+
+					"re-read holding the pre-delete row republished it on top of the delete",
+					got.Value, got.Revision)
+			}
+
+			last := deliveries(&delivered)
+			if len(last) == 0 {
+				t.Fatal("no Change delivered for the delete")
+			}
+
+			if final := last[len(last)-1]; final.Value != "fallback" || final.Revision != 0 {
+				t.Errorf("last Change delivered: (%v, rev %d), want the registered default at rev 0: "+
+					"every subscriber was told the deleted key came back", final.Value, final.Revision)
+			}
+		})
+	}
+}
+
 // TestConcurrentFeedUpsertSurvivesReconcileDefault is the RED test for the
 // other half of the same pair. The reconcile decides a key absent from its
 // snapshot while the feed publishes a fresh revision for it; the registered

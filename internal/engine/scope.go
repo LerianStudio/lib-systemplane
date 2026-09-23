@@ -31,10 +31,66 @@ type entry struct {
 	// top of the decoded values. Negligible single-tenant, where there is one
 	// scope; in wave 3 it is multiplied by the number of tenants the process
 	// has activated.
-	Raw       []byte
-	Revision  int64
+	Raw      []byte
+	Revision int64
+	// Deletes counts the deletes this key has taken in this scope. A delete
+	// publishes the registered default at Revision 0, which FC-4 and FC-5
+	// require at the public surface, so the revision alone cannot tell a
+	// changefeed re-read that the row it is holding has since been removed:
+	// every revision beats 0.
+	//
+	// A re-read reads this counter BEFORE its store call and hands it back
+	// afterwards, and a publication whose count no longer matches is refused.
+	// That is causal rather than numeric — it asks "did a delete land while I
+	// was reading?", not "is this revision high enough" — so it refuses a row
+	// read under a snapshot that predates the DELETE (READ COMMITTED gives a
+	// reader exactly that) while still accepting a recreate at any revision,
+	// including one below the deleted row's. D11 makes a recreate through the
+	// library come back strictly above every earlier revision, but it names a
+	// residual where it does not, and the engine does not need to care.
+	//
+	// A reconcile that finds a key absent does NOT bump it: absence from a
+	// photograph is a conclusion about a snapshot, and a re-read in flight may
+	// hold the fresher fact.
+	Deletes   uint64
 	UpdatedAt time.Time
 	UpdatedBy string
+}
+
+// deleteFence is what a changefeed re-read carries across its store call: the
+// number of deletes the key had taken when the read began. The zero value is
+// unarmed, and every ingress that is not a re-read passes it — a write's own
+// value is never superseded by a delete it did not see.
+type deleteFence struct {
+	deletes uint64
+	armed   bool
+}
+
+// deleteFenceFor arms a fence for nk as it stands now. A key with nothing
+// cached yet reads zero, which is what makes the FIRST delete of a key — the
+// one that has no cached revision to fence against either — still refuse a
+// re-read that started before it.
+func (sc *scopeState) deleteFenceFor(nk NSKey) deleteFence {
+	cached, _ := sc.cached(nk)
+
+	return deleteFence{deletes: cached.Deletes, armed: true}
+}
+
+// supersededByDelete reports whether a delete landed on nk since fence was
+// armed, which makes whatever the re-read is holding older than the cache.
+//
+// The caller holds sc.reconcileMu, which is what makes the answer and the
+// publication it gates one step: applyDelete holds the same lock across its own
+// publish-and-record pair, so a delete can no longer land between this check
+// and the publication it permitted.
+func (sc *scopeState) supersededByDelete(nk NSKey, fence deleteFence) bool {
+	if !fence.armed {
+		return false
+	}
+
+	cached, _ := sc.cached(nk)
+
+	return cached.Deletes != fence.deletes
 }
 
 // scopeState is one tracked scope.

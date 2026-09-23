@@ -47,17 +47,42 @@ import (
 // of that scope behind consumer code the engine does not control. The mutex
 // covers only the pair that must be indivisible to a reconcile in flight: the
 // publication, and the outcome recorded in that reconcile's fences.
-func (e *Engine) ingest(ctx context.Context, sc *scopeState, se store.Entry) {
+//
+// Which leaves the key unfenced for exactly as long as that consumer code
+// runs — the validator, and the logger a rejection hands its line to, neither
+// of them bounded by anything. A reconcile reaching the key inside that window
+// reads an empty fence, takes the key's absence from its own snapshot as a
+// deletion, and publishes the registered default at revision 0, which never
+// loses the fence: one slow validator, one silent config reset. So the key is
+// fenced as unusable FIRST, before prepare runs, and the real outcome replaces
+// it afterwards. "Unusable" is the safe answer while an ingress is in flight —
+// a reconcile keeps the cached value instead of concluding the row is gone —
+// and it costs nothing when the value turns out to be good, because record
+// clears it the moment the publication lands. This is the same order the two
+// re-read failure paths take (recoverRefresh, and the store error in
+// refreshKey), for the same reason.
+// fence is armed only by a changefeed re-read, which spends a whole store round
+// trip outside every lock and can come back holding a row a delete has since
+// removed. A publication it no longer covers is dropped, not published: the
+// delete is the fresher fact, and the key is still recorded as read so a
+// reconcile does not decide it from an older photograph either.
+func (e *Engine) ingest(ctx context.Context, sc *scopeState, se store.Entry, fence deleteFence) {
+	nk := NSKey{Namespace: se.Namespace, Key: se.Key}
+
+	sc.reconcileMu.Lock()
+	sc.record(nk, false)
+	sc.reconcileMu.Unlock()
+
 	pub, usable := e.prepare(ctx, sc.scope, se)
 
 	sc.reconcileMu.Lock()
 	defer sc.reconcileMu.Unlock()
 
-	if usable {
+	if usable && !sc.supersededByDelete(nk, fence) {
 		e.publish(sc, pub)
 	}
 
-	sc.record(NSKey{Namespace: se.Namespace, Key: se.Key}, usable)
+	sc.record(nk, usable)
 }
 
 // prepare is the ingress's consumer-facing half: it decodes the row and runs
@@ -170,8 +195,14 @@ func errorDetail(redacted bool, what string, err error) log.Field {
 // never be reached — let alone mutated — through the cache or through a
 // subscriber's callback.
 //
+// deleted separates the two callers that share this ingress. A feed delete is
+// the removal of a row and bumps the key's delete counter, which refuses any
+// re-read that began before it; a reconcile publishing the default for a key
+// its photograph did not carry is a conclusion about that photograph, not a
+// removal, and leaves the counter alone.
+//
 // sc is the caller's own scope state, for the reason publish takes one.
-func (e *Engine) ingestDefault(ctx context.Context, sc *scopeState, nk NSKey) (notify bool) {
+func (e *Engine) ingestDefault(ctx context.Context, sc *scopeState, nk NSKey, deleted bool) (notify bool) {
 	// Unreachable from all three production callers, each behind a guard of
 	// its own: applyDelete, because the feed drops an unregistered key before
 	// it is reached; applySnapshotRow, because it asks its own Registry
@@ -200,6 +231,7 @@ func (e *Engine) ingestDefault(ctx context.Context, sc *scopeState, nk NSKey) (n
 		NSKey:    nk,
 		Revision: 0,
 		Value:    Clone(def.Default),
+		Deleted:  deleted,
 	})
 }
 

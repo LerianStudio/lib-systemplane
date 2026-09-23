@@ -1116,8 +1116,16 @@ func (h *hookLogger) Log(ctx context.Context, level int, msg string, fields ...a
 // The logger is consumer code and nothing bounds it. A reconcile that reaches
 // the key while that code runs finds an empty fence, reads the key's absence
 // from its snapshot as a deletion, and publishes the registered default at
-// revision 0 — which never loses the fence. Both paths exist to stop exactly
-// that, so both have to close it before anything reentrant runs.
+// revision 0 — which never loses the fence. Every path that reports a row it
+// could not use exists to stop exactly that, so each has to close the fence
+// before anything reentrant runs.
+//
+// All four ways a re-read ends without a value are here. Two never reach the
+// ingress — the store call panics, the store call errors — and fence the key
+// themselves. Two are the ingress's own rejections, and they run further inside
+// consumer code than either: the row that will not decode, and the row the
+// CONSUMER's registered validator refuses, which is itself unbounded code
+// running on the same goroutine before the line is ever built.
 func TestFailedRereadFencesTheKeyBeforeLogging(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 	scope := store.Scope{}
@@ -1126,12 +1134,14 @@ func TestFailedRereadFencesTheKeyBeforeLogging(t *testing.T) {
 		name    string
 		msg     string
 		level   int
+		def     KeyDef
 		arrange func(fs *fakeStore)
 	}{
 		{
 			name:  "the re-read panicked",
 			msg:   rereadPanicMsg,
 			level: log.LevelError,
+			def:   KeyDef{Default: "fallback"},
 			arrange: func(fs *fakeStore) {
 				fs.onGet(func(store.Scope, NSKey) error { panic("the store driver exploded") })
 			},
@@ -1140,9 +1150,26 @@ func TestFailedRereadFencesTheKeyBeforeLogging(t *testing.T) {
 			name:  "the re-read errored",
 			msg:   "changefeed re-read failed, keeping current value",
 			level: log.LevelWarn,
+			def:   KeyDef{Default: "fallback"},
 			arrange: func(fs *fakeStore) {
 				fs.onGet(func(store.Scope, NSKey) error { return errors.New("backend down") })
 			},
+		},
+		{
+			name:  "the registered validator refused the row",
+			msg:   "stored value rejected by validator, keeping cached value",
+			level: log.LevelWarn,
+			def: KeyDef{Default: "fallback", Validate: func(context.Context, any) error {
+				return errors.New("limit out of range")
+			}},
+			arrange: func(fs *fakeStore) { fs.seed(scope, jsonRow(nk, 1, `"v"`, "ops")) },
+		},
+		{
+			name:    "the row would not decode",
+			msg:     "failed to unmarshal stored value, keeping cached value",
+			level:   log.LevelWarn,
+			def:     KeyDef{Default: "fallback"},
+			arrange: func(fs *fakeStore) { fs.seed(scope, jsonRow(nk, 1, `{`, "ops")) },
 		},
 	}
 
@@ -1158,7 +1185,7 @@ func TestFailedRereadFencesTheKeyBeforeLogging(t *testing.T) {
 
 			e = New(Config{
 				Store:    fs,
-				Registry: fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: "fallback"}}},
+				Registry: fakeRegistry{defs: map[NSKey]KeyDef{nk: tt.def}},
 				Logger: &hookLogger{recordingLogger: rec, msg: tt.msg, fn: func() {
 					_, unusable := recordedSets(e, scope)
 					fencedYet = len(unusable) == 1 && unusable[0] == nk

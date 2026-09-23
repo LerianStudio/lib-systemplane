@@ -317,7 +317,7 @@ func (e *Engine) applyDelete(scope store.Scope, nk NSKey) {
 	sc.reconcileMu.Lock()
 	defer sc.reconcileMu.Unlock()
 
-	if e.ingestDefault(e.dispatchContext(), sc, nk) {
+	if e.ingestDefault(e.dispatchContext(), sc, nk, true) {
 		sc.record(nk, true)
 	}
 }
@@ -353,9 +353,15 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
 	// Checked before the store call, not only after it: a re-read for a
 	// dropped tenant would otherwise open a connection to a database that
 	// tenant no longer has, to publish into a scope nothing tracks.
-	if e.scopeForEvent(scope, nk) == nil {
+	sc := e.scopeForEvent(scope, nk)
+	if sc == nil {
 		return
 	}
+
+	// Armed BEFORE the store call, because the whole question is what happened
+	// during it. A delete that lands while this read is in flight makes the row
+	// it comes back with older than the cache, however high its revision.
+	fence := sc.deleteFenceFor(nk)
 
 	ctx, cancel := context.WithTimeout(e.dispatchContext(), feedTimeout)
 	defer cancel()
@@ -399,13 +405,16 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
 	// holding it across a network round trip would stall every reconcile of
 	// the scope, and so does the validator ingest runs before taking it.
 	// The scope is resolved again because it can be dropped during that round
-	// trip, and this publication must not bring it back.
-	sc := e.scopeForEvent(scope, nk)
+	// trip, and this publication must not bring it back. A scope dropped and
+	// re-activated meanwhile is a NEW state whose counter starts at zero, so
+	// the fence armed above refuses this row there too — the re-activation
+	// reconciles the key from the store itself.
+	sc = e.scopeForEvent(scope, nk)
 	if sc == nil {
 		return
 	}
 
-	e.ingest(ctx, sc, se)
+	e.ingest(ctx, sc, se, fence)
 }
 
 // recordFeedOutcome tells every reconcile in flight what the feed learned

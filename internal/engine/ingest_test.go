@@ -52,7 +52,7 @@ func engineWithRegistry(reg Registry) *Engine {
 // it made of the row is asserted where it is visible: the cache it did or did
 // not change, and the line it logged.
 func ingestRow(e *Engine, se store.Entry) {
-	e.ingest(context.Background(), e.scopeFor(store.Scope{}), se)
+	e.ingest(context.Background(), e.scopeFor(store.Scope{}), se, deleteFence{})
 }
 
 func TestIngestRejectsInvalidValueKeepingPrevious(t *testing.T) {
@@ -127,7 +127,7 @@ func TestIngestDefaultPublishesAtRevisionZero(t *testing.T) {
 	seeded := store.Entry{Namespace: nk.Namespace, Key: nk.Key, Value: []byte(`"a"`), Revision: 7, UpdatedBy: "ops"}
 	ingestRow(e, seeded)
 
-	if notify := e.ingestDefault(context.Background(), e.scopeFor(store.Scope{}), nk); !notify {
+	if notify := e.ingestDefault(context.Background(), e.scopeFor(store.Scope{}), nk, true); !notify {
 		t.Error("no-row publication: notify is false, want true")
 	}
 
@@ -140,7 +140,7 @@ func TestIngestDefaultPublishesAtRevisionZero(t *testing.T) {
 		t.Errorf("provenance: got (%s, %q), want (zero time, \"\")", got.UpdatedAt, got.UpdatedBy)
 	}
 
-	if notify := e.ingestDefault(context.Background(), e.scopeFor(store.Scope{}), NSKey{Namespace: "billing", Key: "unknown"}); notify {
+	if notify := e.ingestDefault(context.Background(), e.scopeFor(store.Scope{}), NSKey{Namespace: "billing", Key: "unknown"}, true); notify {
 		t.Error("no-row publication for an unregistered key: notify is true, want false")
 	}
 }
@@ -150,7 +150,7 @@ func TestIngestClonesRegisteredDefault(t *testing.T) {
 	registered := map[string]any{"limit": float64(10)}
 	e := engineWithRegistry(fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: registered}}})
 
-	if notify := e.ingestDefault(context.Background(), e.scopeFor(store.Scope{}), nk); !notify {
+	if notify := e.ingestDefault(context.Background(), e.scopeFor(store.Scope{}), nk, true); !notify {
 		t.Fatal("no-row publication: notify is false, want true")
 	}
 
