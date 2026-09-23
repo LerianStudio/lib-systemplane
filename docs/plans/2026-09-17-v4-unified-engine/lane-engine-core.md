@@ -685,7 +685,7 @@ except the resync-tolerant callback in `testing_facade_test.go`.
 - [ ] Done
 
 **Context:** The Client needs two things from the engine that Phase 1 kept unexported. First,
-`Client.Delete` (`internal/client/set.go:80-114`) removes the key from its own cache before returning
+`Client.Delete` (`internal/client/set.go`) removes the key from its own cache before returning
 so a caller reading back after a delete sees the registered default; the engine has exactly that
 operation in `applyDelete` (`internal/engine/feed.go`) — publish the registered default at
 revision 0 under `reconcileMu`, recording the key as touched — but only the changefeed can reach it.
@@ -852,13 +852,13 @@ both outcomes: `errors.Is(err, ErrCloseTimeout)` still answers true when a subsc
 stop, and a store failure is not swallowed by it; `errors.Join(nil, nil)` is nil, so the clean path
 is unchanged. Delete `storeUnsubscribe` and the `debouncer.Close()` call.
 
-**Delete the dispatch half of the Client outright:** `onEvent` (`:372-388`), `refreshFromStore`
-(`:390-480`), `fireSubscribers` (`:482-500`), the `subscription` type (`:34-37`), and the
+**Delete the dispatch half of the Client outright** (all in `internal/client/client.go`): the
+`onEvent`, `refreshFromStore` and `fireSubscribers` methods, the `subscription` type, and the
 `subsMu`/`subscribers`/`nextSubID`, `cacheMu`/`cache`, `hydratingMu`/`hydrating`/`hydrationTouched`
 fields. Keep `nskey` — it is still the registry's map key. Sweep the imports: `encoding/json`,
 `time`, `internal/debounce` and `lib-observability/v4/runtime` all become unused in `client.go`.
 
-**`getEntry`** (`internal/client/get.go:45-121`) keeps every guard and the registry check. Its
+**`getEntry`** (`internal/client/get.go`) keeps every guard and the registry check. Its
 single-tenant branch (`:64-74`) becomes: `if e, ok := c.engine.Lookup(store.Scope{},
 engine.NSKey{Namespace: namespace, Key: key}); ok { return e, true, nil }`, and on a miss
 `return Entry{Value: engine.Clone(def.defaultValue), Stale: c.engine.Stale(store.Scope{})}, true, nil`.
@@ -868,12 +868,12 @@ verbatim — the value is already a private clone, the revision and provenance a
 only before the first reconcile or after a failed one, which is exactly when `Stale` must be true.
 The multi-tenant branch (`:76-120`) is not touched in this task.
 
-**`List`** (`internal/client/get.go:245-311`): rename `listFromCache` to `listFromEngine` and read
+**`List`** (`internal/client/get.go`): rename its `listFromCache` helper to `listFromEngine` and read
 each key through `c.engine.Lookup(store.Scope{}, nk)`, falling back to the registered default on a
 miss. Keep the existing sort, the description lookup and the `[]ListEntry` shape — FC-10 keeps
 `ListEntry` at `{Key, Value, Description}`, so nothing here grows a revision.
 
-**`Set`** (`internal/client/set.go:17-77`) keeps validation and marshalling, captures the revision the
+**`Set`** (`internal/client/set.go`) keeps validation and marshalling, captures the revision the
 store returns, and in single-tenant mode publishes the entry it just wrote:
 `entry.Revision = revision; c.engine.Publish(store.Scope{}, entry)`. Delete the `canonical`
 round-trip and the cache write (`:65-74`). `Engine.Publish` runs the same ingress as the feed
@@ -883,7 +883,7 @@ row's; the echo arrives at the same revision with an equal value and refreshes p
 callback (`internal/engine/publish.go`), so the row's real `updated_at` lands one round-trip later.
 That is the designed behaviour — do not add a re-read here to "fix" it.
 
-**`Delete`** (`internal/client/set.go:80-114`): replace the cache delete with
+**`Delete`** (`internal/client/set.go`): replace the cache delete with
 `c.engine.PublishDelete(store.Scope{}, engine.NSKey{Namespace: namespace, Key: key})` in
 single-tenant mode. A fake store that fires its delete event synchronously will make a subscriber see
 the default twice — once from the feed, once from this publication — because revision 0 is never
