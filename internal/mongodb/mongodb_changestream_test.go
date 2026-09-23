@@ -1724,6 +1724,41 @@ func TestMongoFeed_ReleasedCollectionIsClaimableAgain(t *testing.T) {
 	}
 }
 
+// A re-claim the probe could not answer must drop the identity the feed used
+// to hold. refreshFeedColl re-claims before it rewrites the collection it
+// watches, so a feed whose hello failed there is on its way to a DIFFERENT
+// collection: keeping the old claim would refuse a scope that legitimately
+// resolves to the collection this one has left, and leave the one it is
+// moving to unclaimed.
+func TestMongoFeed_ClaimDropsAnIdentityTheProbeCannotConfirm(t *testing.T) {
+	id := collIdentity{server: "rs:rs0/mongo-a:27017", db: "systemplane", coll: defaultCollection}
+
+	s := newSubscribeStore()
+
+	live := newFeed(store.Scope{Tenant: "t1"}, nil)
+	live.refs = 1
+
+	s.feeds["t1"] = live
+
+	if err := s.claimFeedIdentity(live, id); err != nil {
+		t.Fatalf("the first feed was refused its own collection: %v", err)
+	}
+
+	if err := s.claimFeedIdentity(live, collIdentity{}); err != nil {
+		t.Fatalf("an unidentified re-claim was refused: %v", err)
+	}
+
+	if live.collID != (collIdentity{}) {
+		t.Errorf("feed still holds identity %+v after a re-claim that could not confirm it", live.collID)
+	}
+
+	joining := newFeed(store.Scope{Tenant: "t2"}, nil)
+
+	if err := s.claimFeedIdentity(joining, id); err != nil {
+		t.Fatalf("a second scope was refused a collection nobody is known to watch: %v", err)
+	}
+}
+
 // serverKey is what makes the refusal see through the one-client-per-tenant
 // shape lib-commons produces, so the rules it encodes are pinned here rather
 // than left to the one integration test that can observe a real hello.

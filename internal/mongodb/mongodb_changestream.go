@@ -403,12 +403,21 @@ func (s *Store) claimFeedColl(ctx context.Context, f *feed, coll *mongo.Collecti
 // paid. Split out so the comparison — which pair of scopes is refused, which is
 // admitted — is exercised without a server.
 func (s *Store) claimFeedIdentity(f *feed, id collIdentity) error {
-	if id == (collIdentity{}) {
-		return nil
-	}
-
 	s.feedsMu.Lock()
 	defer s.feedsMu.Unlock()
+
+	// A probe that could not identify the server refuses nothing — and must
+	// also stop this feed from refusing anyone on the strength of what it used
+	// to watch. refreshFeedColl re-claims BEFORE it rewrites f.coll, so a feed
+	// that arrives here unidentified is on its way to a collection nobody has
+	// confirmed: holding the old claim would refuse a scope that legitimately
+	// resolves to the collection this feed has left, and leave the one it is
+	// moving to unclaimed. The next successful reopen re-claims.
+	if id == (collIdentity{}) {
+		f.collID = collIdentity{}
+
+		return nil
+	}
 
 	for _, other := range s.feeds {
 		// A feed that has not claimed a collection yet carries the zero

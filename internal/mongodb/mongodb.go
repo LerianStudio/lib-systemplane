@@ -322,6 +322,17 @@ func (s *Store) resolveCollection(ctx context.Context, scope store.Scope) (*mong
 // allocated can land on the freed address — so a pointer-keyed memo could hand
 // a brand-new client the previous one's completed bootstrap and never create
 // its collection or indexes.
+//
+// What this key CANNOT tell apart, stated rather than discovered: the key
+// carries no SERVER identity, so a tenant whose database is relocated to
+// another cluster under the same database name keeps the entry the old cluster
+// filled, and its collection and indexes are never created on the new one. The
+// key is deliberately not re-derived from the server the way a feed's identity
+// is (collIdentityOf in mongodb_changestream.go asks hello): that is a round
+// trip, and this memo sits on the request path of every read and write. A
+// relocation is answered by restarting the process, or by the consumer
+// bootstrapping the new database itself, not by paying that round trip on
+// every call.
 func schemaCacheKey(tenant string, coll *mongo.Collection) string {
 	db := coll.Database()
 
@@ -524,7 +535,7 @@ func (s *Store) List(ctx context.Context, scope store.Scope) ([]store.Entry, err
 			// tenant feeds cannot tell which database is emitting garbage.
 			s.logWarn(ctx, "list decode error, skipping document",
 				log.Err(err),
-				log.String("namespace", namespace),
+				log.String(fieldNamespace, namespace),
 				log.String(logFieldKeyName, key),
 				log.String(obsconstants.AttrKeyTenantID, scope.Tenant),
 			)
@@ -589,7 +600,7 @@ func (s *Store) Get(ctx context.Context, scope store.Scope, namespace, key strin
 		// error here would instead fail every read of that key.
 		s.logWarn(ctx, "get decode error, serving the key as absent",
 			log.Err(err),
-			log.String("namespace", namespace),
+			log.String(fieldNamespace, namespace),
 			log.String(logFieldKeyName, key),
 			log.String(obsconstants.AttrKeyTenantID, scope.Tenant),
 		)
