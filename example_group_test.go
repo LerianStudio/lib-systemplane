@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log"
 
 	systemplane "github.com/LerianStudio/lib-systemplane/v4"
 )
@@ -29,7 +28,9 @@ func ExampleBind() {
 
 	client, err := systemplane.NewPostgres(db, "postgres://user:pass@host:5432/app")
 	if err != nil {
-		log.Fatal(err)
+		fmt.Println("creating the client:", err)
+
+		return
 	}
 
 	defer client.Close() //nolint:errcheck // example
@@ -46,7 +47,9 @@ func ExampleBind() {
 			return nil
 		})
 	if err != nil {
-		log.Fatal(err)
+		fmt.Println("binding the group:", err)
+
+		return
 	}
 
 	// Hot reload. Returning an error records that revision as rejected and
@@ -61,7 +64,9 @@ func ExampleBind() {
 		return nil
 	})
 	if err != nil {
-		log.Fatal(err)
+		fmt.Println("subscribing the applier:", err)
+
+		return
 	}
 
 	defer unsubscribe()
@@ -71,19 +76,25 @@ func ExampleBind() {
 	// Start hydrates every registered key and begins listening. The applier
 	// registered above has its first delivery here.
 	if err := client.Start(ctx); err != nil {
-		log.Fatal(err)
+		fmt.Println("starting the client:", err)
+
+		return
 	}
 
 	// Read the document in force, decoded into limits.
 	snapshot, err := group.Snapshot(ctx)
 	if err != nil {
-		log.Fatal(err)
+		fmt.Println("reading the document in force:", err)
+
+		return
 	}
 
 	fmt.Println("in force:", snapshot.Value.MaxConcurrent, "revision", snapshot.Revision)
 
 	// Write the whole document back, attributed to an actor.
 	if err := group.Set(ctx, limits{MaxConcurrent: 16, Debug: true}, "ops@lerian.io"); err != nil {
-		log.Fatal(err)
+		fmt.Println("writing the document back:", err)
+
+		return
 	}
 }

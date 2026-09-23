@@ -217,6 +217,10 @@ func TestCoordinatorApplierPanicIsRecordedLikeAnError(t *testing.T) {
 // hook was holding, routinely the decoded document with its endpoints and its
 // credentials. Status still reports the rejection; only the payload is gone.
 func TestCoordinatorApplierPanicIsRedactedInProductionMode(t *testing.T) {
+	// Process-global, so this test and TestCoordinatorApplierPanicIsRecordedLikeAnError
+	// depend on internal/group running sequentially: no test in the package calls
+	// t.Parallel(). The first one that does must move this toggle behind a
+	// serialized helper.
 	runtime.SetProductionMode(true)
 
 	defer runtime.SetProductionMode(false)
