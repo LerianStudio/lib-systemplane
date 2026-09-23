@@ -270,7 +270,10 @@ func (s *Store) resolveDB(ctx context.Context, scope store.Scope) (dbExecutor, e
 
 		// A nil handle with a nil error is a connector bug; refuse it here
 		// rather than hand back something that panics on the first query.
-		if db == nil {
+		// log.IsNil, not db == nil: a connector that returns its own concrete
+		// type as the interface hands over a TYPED nil, which is != nil and
+		// panics on the first method call.
+		if log.IsNil(db) {
 			return nil, fmt.Errorf("systemplane/postgres: resolve tenant %s: %w", scope.Tenant, store.ErrTenantConnectorMissing)
 		}
 
@@ -282,7 +285,7 @@ func (s *Store) resolveDB(ctx context.Context, scope store.Scope) (dbExecutor, e
 	}
 
 	db := tmcore.GetPGContext(ctx, s.cfg.Module)
-	if db == nil {
+	if log.IsNil(db) {
 		return nil, store.ErrTenantConnectionMissing
 	}
 
@@ -294,40 +297,50 @@ func (s *Store) resolveDB(ctx context.Context, scope store.Scope) (dbExecutor, e
 // dbresolver sends a statement to a replica unless it looks like a write, and
 // its default checker recognizes a write only by the string "RETURNING"
 // (dbresolver/v2 query.go). Set ends in RETURNING revision and Delete goes
-// through ExecContext, so both reach the primary — while the plain SELECTs in
+// through ExecContext, so both reach a primary — while the plain SELECTs in
 // Get and List would be served by a standby, and lib-commons registers a
 // replica for every tenant that declares one. A caller could then read back a
 // revision older than the one Set just returned, and older than the NOTIFY the
 // changefeed is reconciling against, since the feed LISTENs on the primary
-// DSN. Read-your-write and revision coherence are worth more than offloading a
-// five-column configuration table, so a resolver carrying replicas is pinned
-// to ONE primary. A resolver with no replicas is handed back untouched: it
-// already resolves everything to a primary, and keeping the wrapper costs
-// nothing.
+// DSN.
 //
 // The pin is the FIRST primary, always, and that is the whole claim: one
-// deterministic node, every standby excluded, no failover. lib-commons builds
-// every tenant resolver from exactly one primary and one replica
-// (commons/postgres createResolverFn), so the common case has only one primary
-// to pick. A connector of a consumer's own making may report several; picking
-// deterministically among them is what keeps a value Set returned readable by
-// the next Get, and it costs no allocation on a path every query crosses.
-// Handing those back inside a fresh resolver instead would buy nothing:
-// dbresolver retries only on a net.Error, and a dead pool reports
+// deterministic node, every standby excluded, no failover. Having no replica
+// is NOT a reason to hand the resolver back: dbresolver resolves ReadWrite()
+// AND, with no replica registered, ReadOnly() through its load balancer over
+// the primaries, which is round-robin by default (dbresolver/v2 db.go), so a
+// resolver reporting several primaries would land a Set on one node and the
+// next Get on another — read-your-writes (D4) broken with no replica in sight.
+// lib-commons builds every tenant resolver from exactly one primary and one
+// replica (commons/postgres createResolverFn), so the common case has only one
+// primary to pick; a connector of a consumer's own making may report several,
+// and picking deterministically among them is what keeps a value Set returned
+// readable by the next Get. It costs no allocation on a path every query
+// crosses: PrimaryDBs returns the resolver's own slice field.
+//
+// Handing several primaries back inside a fresh resolver instead would buy
+// nothing: dbresolver retries only on a net.Error, and a dead pool reports
 // "sql: database is closed", which is not one.
 func pinPrimary(db dbresolver.DB) dbExecutor {
-	if len(db.ReplicaDBs()) == 0 {
-		return db
+	if primaries := db.PrimaryDBs(); len(primaries) > 0 {
+		return primaries[0]
 	}
 
-	// A resolver with replicas but no primary is a connector bug; there is
-	// nothing better to fall back to than the resolver itself.
-	primaries := db.PrimaryDBs()
-	if len(primaries) == 0 {
-		return db
+	// A resolver with no primary at all is a connector bug; there is nothing
+	// better to fall back to than the resolver itself.
+	return db
+}
+
+// scopeAttrs names the tenant a CRUD span touched, when the call named one.
+// The tenant is a span attribute and never a metric label: a tenant id is
+// unbounded, so it belongs where a trace already costs one entry per call
+// rather than in a time series per tenant.
+func scopeAttrs(scope store.Scope, attrs ...attribute.KeyValue) []attribute.KeyValue {
+	if scope.Tenant == "" {
+		return attrs
 	}
 
-	return primaries[0]
+	return append(attrs, attribute.String("tenant", scope.Tenant))
 }
 
 // List returns every entry in the resolved database, ordered by (namespace, key).
@@ -341,7 +354,7 @@ func (s *Store) List(ctx context.Context, scope store.Scope) ([]store.Entry, err
 		return nil, err
 	}
 
-	ctx, span, finish := s.startSpan(ctx, "systemplane.postgres.list")
+	ctx, span, finish := s.startSpan(ctx, "systemplane.postgres.list", scopeAttrs(scope)...)
 	defer finish()
 
 	query := fmt.Sprintf( // #nosec G201 -- table validated as a Postgres identifier
@@ -391,10 +404,10 @@ func (s *Store) Get(ctx context.Context, scope store.Scope, namespace, key strin
 		return store.Entry{}, false, err
 	}
 
-	ctx, span, finish := s.startSpan(ctx, "systemplane.postgres.get",
+	ctx, span, finish := s.startSpan(ctx, "systemplane.postgres.get", scopeAttrs(scope,
 		attribute.String("namespace", namespace),
 		attribute.String("key", key),
-	)
+	)...)
 	defer finish()
 
 	query := fmt.Sprintf( // #nosec G201 -- table validated as a Postgres identifier
@@ -450,10 +463,10 @@ func (s *Store) Set(ctx context.Context, scope store.Scope, e store.Entry) (int6
 		return 0, err
 	}
 
-	ctx, span, finish := s.startSpan(ctx, "systemplane.postgres.set",
+	ctx, span, finish := s.startSpan(ctx, "systemplane.postgres.set", scopeAttrs(scope,
 		attribute.String("namespace", e.Namespace),
 		attribute.String("key", e.Key),
-	)
+	)...)
 	defer finish()
 
 	query := fmt.Sprintf( // #nosec G201 -- table validated as a Postgres identifier
@@ -504,10 +517,10 @@ func (s *Store) Delete(ctx context.Context, scope store.Scope, namespace, key, a
 	// Audit trails capture it via the updated_by column on writes.
 	_ = actor
 
-	ctx, span, finish := s.startSpan(ctx, "systemplane.postgres.delete",
+	ctx, span, finish := s.startSpan(ctx, "systemplane.postgres.delete", scopeAttrs(scope,
 		attribute.String("namespace", namespace),
 		attribute.String("key", key),
-	)
+	)...)
 	defer finish()
 
 	query := fmt.Sprintf( // #nosec G201 -- table validated as a Postgres identifier

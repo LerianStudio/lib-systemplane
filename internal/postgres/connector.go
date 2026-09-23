@@ -28,17 +28,27 @@ type Connector interface {
 	// their own scope, and the revision fence would act on them. Values never
 	// cross; notifications and revisions would.
 	//
-	// That constraint is enforced where it is decidable: the database is
-	// identified by what the SERVER reports on the open connection — its
-	// address, port and current_database() — not by the DSN text, so two
-	// spellings that reach one server over one route are refused with
-	// ErrSharedDatabaseUnsupported however differently they are written.
-	// Routes the server describes differently are NOT caught, and
-	// serverDatabaseKey names them: a Unix-socket route against a TCP one, and
-	// two distinct interface addresses of one host. Two processes sharing one
-	// database cannot see each other either, and neither can a search_path
-	// installed as a role or database default, so one database per scope
-	// remains the operator's responsibility beyond this one process.
+	// That constraint is checked WHEN A CHANGEFEED OPENS, and only then: a
+	// feed about to listen on a database another LIVE feed of the same Store
+	// already listens on is refused with ErrSharedDatabaseUnsupported. Reads
+	// and writes do not evaluate it — they resolve through ResolveDB and never
+	// compare databases — so a Store that only does CRUD and never subscribes
+	// (no Start, no Subscribe) never learns that two of its scopes share a
+	// database, and is not defended against it. Nothing is corrupted there
+	// either: values are keyed per database and never cross. What the check
+	// defends is the notification stream, which is why it lives where the
+	// stream is opened.
+	//
+	// The database is identified by what the SERVER reports on the open
+	// connection — its address, port and current_database() — not by the DSN
+	// text, so two spellings that reach one server over one route are refused
+	// however differently they are written. Routes the server describes
+	// differently are NOT caught, and serverDatabaseKey names them: a
+	// Unix-socket route against a TCP one, and two distinct interface
+	// addresses of one host. Two processes sharing one database cannot see
+	// each other either, and neither can a search_path installed as a role or
+	// database default, so one database per scope remains the operator's
+	// responsibility beyond this one process.
 	ResolveDSN(ctx context.Context, tenantID string) (string, error)
 }
 
@@ -58,6 +68,14 @@ var ErrPgMgrUnavailable = errors.New("systemplane/postgres: tenant-manager postg
 // engine's revision fence would treat a foreign revision as authoritative.
 // Refusing costs the second scope its changefeed; accepting silently corrupts
 // both.
+//
+// It is raised ONLY when a changefeed opens — Start for the zero scope, the
+// first Subscribe for a named tenant — because that is the moment a second
+// listener would start receiving the first's notifications. A Store that never
+// opens a feed never evaluates the rule: its reads and writes resolve straight
+// through the connector, so two scopes sharing one database go unnoticed there
+// and unpunished, since values are keyed per database and never mix. Such a
+// Store gets no warning, and starts failing the day it subscribes.
 //
 // The refusal is PERMANENT for as long as the two scopes resolve to one
 // database: the engine discards a failed activation and retries from scratch

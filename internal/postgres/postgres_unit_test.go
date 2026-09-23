@@ -11,9 +11,14 @@ import (
 	"testing"
 	"time"
 
+	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 	"github.com/bxcodec/dbresolver/v2"
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 )
 
 func TestNew_ConfigValidationAndDefaults(t *testing.T) {
@@ -331,6 +336,73 @@ func (nilHandleConnector) ResolveDSN(context.Context, string) (string, error) {
 	return "", nil
 }
 
+// typedNilDB is a dbresolver.DB carrying a nil pointer of a concrete type —
+// what a connector (or a middleware) hands over when it returns its own type
+// as the interface without checking it. It is NOT == nil, and every method
+// promoted from the embedded nil interface panics, so an untyped-nil guard
+// lets it through and the first query dies.
+type typedNilDB struct {
+	dbresolver.DB
+}
+
+// typedNilHandleConnector reports success while handing back a typed nil.
+type typedNilHandleConnector struct{}
+
+func (typedNilHandleConnector) ResolveDB(context.Context, string) (dbresolver.DB, error) {
+	return (*typedNilDB)(nil), nil
+}
+
+func (typedNilHandleConnector) ResolveDSN(context.Context, string) (string, error) {
+	return "", nil
+}
+
+// A typed-nil handle is refused on both resolution routes — the connector and
+// the tenant-manager context — rather than reaching pinPrimary and panicking
+// on the first read.
+func TestStore_TypedNilHandleIsRefused(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		cfg     Config
+		ctx     func() context.Context
+		scope   store.Scope
+		wantErr error
+	}{
+		{
+			name:    "connector hands back a typed nil",
+			cfg:     Config{MultiTenantEnabled: true, Connector: typedNilHandleConnector{}},
+			ctx:     context.Background,
+			scope:   store.Scope{Tenant: "t1"},
+			wantErr: store.ErrTenantConnectorMissing,
+		},
+		{
+			name: "tenant-manager context carries a typed nil",
+			cfg:  Config{MultiTenantEnabled: true},
+			ctx: func() context.Context {
+				return tmcore.ContextWithPG(context.Background(), (*typedNilDB)(nil), defaultModule)
+			},
+			scope:   store.Scope{},
+			wantErr: store.ErrTenantConnectionMissing,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			s, err := New(tt.cfg)
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+
+			if _, err := s.resolveDB(tt.ctx(), tt.scope); !errors.Is(err, tt.wantErr) {
+				t.Fatalf("resolveDB error = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 // A connector that returns a nil handle with a nil error is refused at
 // resolution time rather than passed through to panic on the first query.
 func TestStore_NamedTenantScopeNilHandleIsRefused(t *testing.T) {
@@ -505,14 +577,30 @@ func TestPostgresSubscribe_FailedFeedCreationFailsEveryWaiter(t *testing.T) {
 	}
 }
 
+// noPrimaryResolver is the connector-bug shape dbresolver.New refuses to
+// build: replicas and no primary at all. Only the two accessors pinPrimary
+// calls are implemented; the embedded nil interface panics on anything else,
+// which is the point — nothing else may be called.
+type noPrimaryResolver struct {
+	dbresolver.DB
+
+	replicas []*sql.DB
+}
+
+func (r *noPrimaryResolver) PrimaryDBs() []*sql.DB { return nil }
+
+func (r *noPrimaryResolver) ReplicaDBs() []*sql.DB { return r.replicas }
+
 // pinPrimary sits on the hot path of every Get, Set, Delete and List, so it
 // must pick ONE deterministic primary and allocate nothing doing it.
 //
 // The determinism is what a caller can reason about: reads and writes of a
 // tenant whose connector reports several writable nodes all land on the same
-// one, so a value Set returns is the value the next Get reads. Building a
-// fresh resolver per call gave neither — six allocations a query, and a fresh
-// round-robin counter that made every call pick the same index anyway.
+// one, so a value Set returns is the value the next Get reads. Handing the
+// resolver back instead gives neither — dbresolver round-robins ReadWrite()
+// over the primaries, so a Set lands on one node and the next Get reads
+// another, and a resolver with several primaries and no replica is exactly
+// the shape that used to slip through untouched.
 // Not parallel: testing.AllocsPerRun panics in a parallel test.
 func TestPinPrimary_PinsTheFirstPrimaryWithoutAllocating(t *testing.T) {
 	open := func() *sql.DB {
@@ -529,18 +617,200 @@ func TestPinPrimary_PinsTheFirstPrimaryWithoutAllocating(t *testing.T) {
 	}
 
 	primaries := []*sql.DB{open(), open(), open()}
-	resolver := dbresolver.New(
-		dbresolver.WithPrimaryDBs(primaries...),
-		dbresolver.WithReplicaDBs(open()),
-	)
+	replicas := []*sql.DB{open()}
 
-	for i := range 8 {
-		if got := pinPrimary(resolver); got != dbExecutor(primaries[0]) {
-			t.Fatalf("call #%d resolved to a handle other than the first primary", i+1)
+	tests := []struct {
+		name     string
+		resolver dbresolver.DB
+		want     func(dbresolver.DB) dbExecutor
+	}{
+		{
+			name:     "primaries only pins the first primary",
+			resolver: dbresolver.New(dbresolver.WithPrimaryDBs(primaries...)),
+			want:     func(dbresolver.DB) dbExecutor { return primaries[0] },
+		},
+		{
+			name: "primaries and replicas pins the first primary",
+			resolver: dbresolver.New(
+				dbresolver.WithPrimaryDBs(primaries...),
+				dbresolver.WithReplicaDBs(replicas...),
+			),
+			want: func(dbresolver.DB) dbExecutor { return primaries[0] },
+		},
+		{
+			// A resolver with no primary at all is a connector bug; there is
+			// nothing better to fall back to than the resolver itself.
+			// dbresolver.New panics on that shape, so the stub builds it.
+			name:     "no primary falls back to the resolver",
+			resolver: &noPrimaryResolver{replicas: replicas},
+			want:     func(r dbresolver.DB) dbExecutor { return r },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			want := tt.want(tt.resolver)
+
+			for i := range 8 {
+				if got := pinPrimary(tt.resolver); got != want {
+					t.Fatalf("call #%d resolved to a handle other than the expected one", i+1)
+				}
+			}
+
+			if want == dbExecutor(tt.resolver) {
+				return
+			}
+
+			if allocs := testing.AllocsPerRun(100, func() { _ = pinPrimary(tt.resolver) }); allocs != 0 {
+				t.Errorf("pinPrimary allocated %v objects per call, want 0 on the hot path", allocs)
+			}
+		})
+	}
+}
+
+// recordingTracer captures the attributes every span was STARTED with, which
+// is where this package puts them (startSpan passes trace.WithAttributes).
+type recordingTracer struct {
+	noop.Tracer
+
+	mu    sync.Mutex
+	spans map[string][]attribute.KeyValue
+}
+
+func (r *recordingTracer) Start(ctx context.Context, name string, opts ...trace.SpanStartOption) (context.Context, trace.Span) {
+	cfg := trace.NewSpanStartConfig(opts...)
+
+	r.mu.Lock()
+	// Non-nil even when empty: a nil entry means "never started", and a span
+	// legitimately carries no attributes.
+	r.spans[name] = append([]attribute.KeyValue{}, cfg.Attributes()...)
+	r.mu.Unlock()
+
+	return r.Tracer.Start(ctx, name, opts...)
+}
+
+func (r *recordingTracer) attrs(name string) []attribute.KeyValue {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.spans[name]
+}
+
+type recordingTelemetry struct {
+	tracer *recordingTracer
+}
+
+func (t recordingTelemetry) Tracer(string) (trace.Tracer, error) { return t.tracer, nil }
+
+func (t recordingTelemetry) Meter(string) (metric.Meter, error) {
+	return nil, errors.New("no meter in this test")
+}
+
+// deadResolverConnector resolves every tenant to a handle that never reaches a
+// server. Resolution succeeds, which is all these spans need: the span is
+// started before the query runs and the query's failure is irrelevant here.
+type deadResolverConnector struct {
+	db dbresolver.DB
+}
+
+func (c deadResolverConnector) ResolveDB(context.Context, string) (dbresolver.DB, error) {
+	return c.db, nil
+}
+
+func (c deadResolverConnector) ResolveDSN(context.Context, string) (string, error) {
+	return "postgres://u:p@127.0.0.1:1/db?sslmode=disable", nil
+}
+
+func hasTenantAttr(attrs []attribute.KeyValue, tenant string) bool {
+	for _, a := range attrs {
+		if a == attribute.String("tenant", tenant) {
+			return true
 		}
 	}
 
-	if allocs := testing.AllocsPerRun(100, func() { _ = pinPrimary(resolver) }); allocs != 0 {
-		t.Errorf("pinPrimary allocated %v objects per call, want 0 on the hot path", allocs)
+	return false
+}
+
+// Every Postgres CRUD span names the tenant whose data it touched, and the
+// single-tenant scope adds nothing — the same rule the MongoDB backend
+// applies, so a trace reads the same whichever backend produced it. The tenant
+// is a span attribute and never a metric label: a tenant id is unbounded.
+func TestPostgresCRUDSpans_NameTheTenant(t *testing.T) {
+	t.Parallel()
+
+	spanNames := []string{
+		"systemplane.postgres.list",
+		"systemplane.postgres.get",
+		"systemplane.postgres.set",
+		"systemplane.postgres.delete",
 	}
+
+	// exercise runs all four CRUD methods under scope and returns what each
+	// span was started with. Every call fails at the query — deliberately: the
+	// span is created first, and its attributes are the subject here.
+	exercise := func(t *testing.T, cfg Config, scope store.Scope) *recordingTracer {
+		t.Helper()
+
+		tracer := &recordingTracer{spans: map[string][]attribute.KeyValue{}}
+		cfg.Telemetry = recordingTelemetry{tracer: tracer}
+
+		s, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+
+		ctx := context.Background()
+
+		_, _ = s.List(ctx, scope)
+		_, _, _ = s.Get(ctx, scope, "ns", "k")
+		_, _ = s.Set(ctx, scope, store.Entry{Namespace: "ns", Key: "k", Value: []byte(`1`)})
+		_ = s.Delete(ctx, scope, "ns", "k", "actor")
+
+		for _, name := range spanNames {
+			if tracer.attrs(name) == nil {
+				t.Fatalf("span %q was never started", name)
+			}
+		}
+
+		return tracer
+	}
+
+	dead, err := sql.Open("pgx", "postgres://u:p@127.0.0.1:1/db?sslmode=disable")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+
+	t.Cleanup(func() { _ = dead.Close() })
+
+	t.Run("named tenant", func(t *testing.T) {
+		t.Parallel()
+
+		tracer := exercise(t, Config{
+			MultiTenantEnabled: true,
+			Connector:          deadResolverConnector{db: dbresolver.New(dbresolver.WithPrimaryDBs(dead))},
+		}, store.Scope{Tenant: "t1"})
+
+		for _, name := range spanNames {
+			if !hasTenantAttr(tracer.attrs(name), "t1") {
+				t.Errorf("span %q attributes = %#v, want tenant=t1", name, tracer.attrs(name))
+			}
+		}
+	})
+
+	t.Run("zero scope", func(t *testing.T) {
+		t.Parallel()
+
+		tracer := exercise(t, Config{
+			DB:        dead,
+			ListenDSN: "postgres://u:p@127.0.0.1:1/db?sslmode=disable",
+		}, store.Scope{})
+
+		for _, name := range spanNames {
+			for _, a := range tracer.attrs(name) {
+				if a.Key == "tenant" {
+					t.Errorf("span %q carries %v; the single-tenant scope names no tenant", name, a)
+				}
+			}
+		}
+	})
 }
