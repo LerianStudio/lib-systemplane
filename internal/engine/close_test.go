@@ -244,6 +244,48 @@ func TestPublishRacingCloseStartsNoWorker(t *testing.T) {
 	}
 }
 
+// TestRefreshRacingCloseNeverReachesTheStore pins the drop that keeps a
+// debounced re-read out of a store the Client is about to close. A timer that
+// has already fired cannot be canceled, so the fired-but-not-yet-running
+// re-read is the one straggler Close cannot revoke — it can only refuse to let
+// it join the drain, and a re-read that cannot join must not run at all.
+//
+// This is TestPublishRacingCloseStartsNoWorker's sibling for the other door
+// beginWork guards: without the guard, the re-read reaches Store.Get after
+// Close returned, and its unpaired dispatchWG.Done kills the process.
+func TestRefreshRacingCloseNeverReachesTheStore(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	e := storeEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, time.Millisecond, 2*time.Second)
+
+	fs.seed(scope, jsonRow(nk, 1, `"live"`, "ops"))
+
+	// The same door Close shuts, taken here alone so the re-read below lands
+	// squarely in the window between "Close shut the door" and "Close is
+	// inside Wait".
+	e.closeWorkers()
+
+	e.trackedRefresh(scope, nk)
+
+	if got := fs.getCount(); got != 0 {
+		t.Errorf("Store.Get called %d times by a re-read that lost the race to Close, want 0", got)
+	}
+
+	// Dropped whole, not merely dropped late: a re-read that took the
+	// WaitGroup and skipped the read would make Close wait for work nobody is
+	// doing, and one that skipped the read and released the WaitGroup anyway
+	// would panic on the unpaired Done.
+	drained := make(chan struct{})
+
+	go func() {
+		e.dispatchWG.Wait()
+		close(drained)
+	}()
+
+	mustReceive(t, drained, "the dispatch WaitGroup to be already drained")
+}
+
 // storeEngine builds the engine the way the Client will — through New — and
 // leaves Close to the test, because Close is the thing under test here and a
 // cleanup that canceled the lifecycle context would hide a Close that never
@@ -521,6 +563,35 @@ func TestResyncBurstCoalescesAndCloseWaitsForIt(t *testing.T) {
 	// a burst of six can never have listed more than twice.
 	if got := fs.listCount(); got > 2 {
 		t.Errorf("Store.List called %d times for a burst of six resyncs, want at most 2", got)
+	}
+}
+
+// TestResyncRacingCloseArmsNoReconcile pins the fences an OpResync takes back
+// out when shutdown wins the race. Arming happens on the changefeed goroutine
+// before anything can drain the mailbox, so a resync that arrives once the
+// door is shut leaves a window open and a reconcile queued for a goroutine
+// that will never start — and an open window silences the feed's own fence
+// bookkeeping for a scope nothing is reconciling.
+func TestResyncRacingCloseArmsNoReconcile(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	e := storeEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0, 2*time.Second)
+
+	e.closeWorkers()
+
+	e.onResync(scope)
+
+	if got := openWindows(e, scope); got != 0 {
+		t.Errorf("%d reconcile windows open after a resync that lost the race to Close, want 0", got)
+	}
+
+	if got := pendingReconciles(e, scope); got != 0 {
+		t.Errorf("%d reconciles queued after a resync that lost the race to Close, want 0", got)
+	}
+
+	if got := fs.listCount(); got != 0 {
+		t.Errorf("Store.List called %d times by a resync that lost the race to Close, want 0", got)
 	}
 }
 

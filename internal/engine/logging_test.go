@@ -351,6 +351,28 @@ func TestReconcileListFailureLevelsSplitOnShutdown(t *testing.T) {
 
 		requireLoggedAt(t, rec, log.LevelWarn, msg)
 	})
+
+	// The third case is the one the split gets wrong by accident: a
+	// context.Canceled that is NOT this engine shutting down — a connection
+	// pool aborting a checkout, a driver cancelling internally. Keying the
+	// level on the error alone would file it under "clean shutdown" and hide
+	// the one trace that a whole-scope reload failed on a live engine.
+	t.Run("canceled outside shutdown", func(t *testing.T) {
+		fs := newFakeStore()
+		e, rec := loggingEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs)
+
+		fs.onList(func(store.Scope) error {
+			return fmt.Errorf("pool checkout aborted: %w", context.Canceled)
+		})
+
+		e.onEvent(resyncEvent(scope))
+
+		if err := waitFirstReconcile(t, e, scope); !errors.Is(err, context.Canceled) {
+			t.Fatalf("first reconcile outcome: got %v, want a wrapped context.Canceled", err)
+		}
+
+		requireLoggedAt(t, rec, log.LevelWarn, msg)
+	})
 }
 
 // requireOneRecord returns the single entry whose message is msg, failing when
