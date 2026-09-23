@@ -22,8 +22,7 @@ import (
 // contract that Close completes without error and Subscribe behaves correctly
 // before and after.
 func TestIntegration_Postgres_ListenReaderCleansUpOnClose(t *testing.T) {
-	dsn, cleanup := startContainer(t)
-	t.Cleanup(cleanup)
+	dsn := startContainer(t)
 
 	admin := adminDSN(t, dsn)
 	defer admin.Close()

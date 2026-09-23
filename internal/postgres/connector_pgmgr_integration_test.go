@@ -6,7 +6,7 @@
 // dbresolver.DB without invoking the gRPC tenant-config client.
 //
 // This file is internal (package postgres) so the pgMgrConnector type stays
-// unexported.
+// unexported. The Postgres server is the package-wide shared one.
 package postgres
 
 import (
@@ -18,35 +18,7 @@ import (
 	tmpostgres "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/postgres"
 	"github.com/bxcodec/dbresolver/v2"
 	_ "github.com/jackc/pgx/v5/stdlib"
-	"github.com/testcontainers/testcontainers-go"
-	pgcontainer "github.com/testcontainers/testcontainers-go/modules/postgres"
 )
-
-func startPGForConnector(t *testing.T) (string, func()) {
-	t.Helper()
-
-	ctx := context.Background()
-
-	container, err := pgcontainer.Run(ctx, "postgres:16-alpine",
-		pgcontainer.WithDatabase("postgres"),
-		pgcontainer.WithUsername("postgres"),
-		pgcontainer.WithPassword("postgres"),
-		pgcontainer.BasicWaitStrategies(),
-	)
-	if err != nil {
-		t.Fatalf("start container: %v", err)
-	}
-
-	dsn, err := container.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		_ = testcontainers.TerminateContainer(container)
-		t.Fatalf("connection string: %v", err)
-	}
-
-	cleanup := func() { _ = testcontainers.TerminateContainer(container) }
-
-	return dsn, cleanup
-}
 
 // TestPgMgrConnector_SuccessPath drives both ResolveDB and ResolveDSN against
 // a live tmpostgres.Manager that has been pre-populated with a healthy
@@ -57,8 +29,7 @@ func startPGForConnector(t *testing.T) (string, func()) {
 //   - conn.GetDB() returns the live dbresolver.DB (ResolveDB success)
 //   - conn.ConnectionStringPrimary is non-empty (ResolveDSN success)
 func TestPgMgrConnector_SuccessPath(t *testing.T) {
-	baseDSN, cleanup := startPGForConnector(t)
-	t.Cleanup(cleanup)
+	baseDSN := SharedContainerDSN(t)
 
 	tenantSQL, err := sql.Open("pgx", baseDSN)
 	if err != nil {

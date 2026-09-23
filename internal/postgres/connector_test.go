@@ -71,10 +71,10 @@ func TestConfig_CarriesConnector(t *testing.T) {
 		t.Fatal("Config.Connector must survive construction")
 	}
 
-	// A configured connector is not yet enough to serve a named tenant: FC-3
-	// leaves scoped resolution to the storage lane. Every entry point must
-	// refuse the call rather than silently fall back to the zero scope, which
-	// would read one tenant's rows on another tenant's behalf.
+	// Every entry point resolves a named tenant THROUGH the connector: this
+	// connector wraps a nil manager, so each call must surface that connector's
+	// own failure, named with the tenant, rather than falling back to the zero
+	// scope — which would read one tenant's rows on another tenant's behalf.
 	ctx := context.Background()
 	scope := store.Scope{Tenant: "t1"}
 
@@ -92,14 +92,14 @@ func TestConfig_CarriesConnector(t *testing.T) {
 		{"Delete", delErr},
 		{"List", listErr},
 	} {
-		if !errors.Is(tc.err, store.ErrTenantConnectorMissing) {
-			t.Errorf("%s with a named tenant: got %v, want ErrTenantConnectorMissing", tc.op, tc.err)
+		if !errors.Is(tc.err, ErrPgMgrUnavailable) {
+			t.Errorf("%s with a named tenant: got %v, want the connector's own failure", tc.op, tc.err)
 
 			continue
 		}
 
-		if !strings.Contains(tc.err.Error(), "scoped resolution not implemented") {
-			t.Errorf("%s error %q must say scoped resolution is not implemented yet", tc.op, tc.err)
+		if !strings.Contains(tc.err.Error(), "resolve tenant t1") {
+			t.Errorf("%s error %q must name the tenant it failed to resolve", tc.op, tc.err)
 		}
 	}
 }
@@ -120,5 +120,93 @@ func TestNewTenantManagerConnector_WrapsSuppliedManager(t *testing.T) {
 
 	if c.mgr != mgr {
 		t.Fatal("connector must wrap the supplied tenant-manager Manager")
+	}
+}
+
+// TestFormatServerDatabaseKey pins the identity format serverDatabaseKey
+// produces once the server has answered, including the socket branch no
+// container test reaches: every test here connects over TCP, so the branch
+// that decides whether two feeds are one database would otherwise never run.
+func TestFormatServerDatabaseKey(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		database string
+		addr     string
+		port     int32
+		started  string
+		dsn      string
+		want     string
+		wantErr  bool
+	}{
+		{
+			name:     "tcp address reported by the server wins over the DSN text",
+			database: "app",
+			addr:     "10.0.0.5",
+			port:     5432,
+			started:  "1790000000.123456",
+			dsn:      "postgres://an-alias.example:5432/app",
+			want:     "started:1790000000.123456/tcp:10.0.0.5:5432/app",
+		},
+		{
+			name:     "another server (or a clone) with the same address, port and database starts at another time",
+			database: "app",
+			addr:     "10.0.0.5",
+			port:     5432,
+			started:  "1790000000.123457",
+			dsn:      "postgres://an-alias.example:5432/app",
+			want:     "started:1790000000.123457/tcp:10.0.0.5:5432/app",
+		},
+		{
+			name:     "the same server reached through another DSN spelling is the same key",
+			database: "app",
+			addr:     "10.0.0.5",
+			port:     5432,
+			started:  "1790000000.123456",
+			dsn:      "postgres://10.0.0.5:5432/app?options=-csearch_path%3Dtenant_b",
+			want:     "started:1790000000.123456/tcp:10.0.0.5:5432/app",
+		},
+		{
+			name:     "no address means a unix socket: the socket directory identifies it",
+			database: "app",
+			started:  "1790000000.123456",
+			dsn:      "postgres:///app?host=/var/run/postgresql",
+			want:     "started:1790000000.123456/unix:/var/run/postgresql/app",
+		},
+		{
+			name:     "no address and an unparseable DSN is an error, never a bare key",
+			database: "app",
+			dsn:      "postgres://%zz/app",
+			wantErr:  true,
+		},
+		{
+			name:     "no address with a TCP DSN falls back to the DSN host",
+			database: "app",
+			started:  "1790000000.123456",
+			dsn:      "postgres://localhost:5432/app?sslmode=disable",
+			want:     "started:1790000000.123456/unix:localhost/app",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := formatServerDatabaseKey(tc.database, tc.addr, tc.port, tc.started, tc.dsn)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("formatServerDatabaseKey = %q, want an error", got)
+				}
+
+				if !strings.Contains(err.Error(), "parse DSN for socket identity") {
+					t.Fatalf("error %q must name the parse step it failed in", err)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("formatServerDatabaseKey: %v", err)
+			}
+
+			if got != tc.want {
+				t.Fatalf("formatServerDatabaseKey = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

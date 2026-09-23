@@ -31,8 +31,8 @@ Read `index.md` § Frozen Contracts FC-2, FC-3, FC-8, FC-9 and decisions D2, D3,
 
 | Phase | Milestone | Epics | Status |
 |-------|-----------|-------|--------|
-| 1 | Postgres stores and returns revisions, resolves named tenants through the connector, runs one LISTEN feed per scope, and narrates loss and recovery with `OpDisconnect` / `OpResync`; DDL v4 and the v3→v4 migration ship and are proven idempotent on a container | 1.1, 1.2, 1.3, 1.4, 1.5 | Detailed |
-| 2 | MongoDB does the same: connector, revision via an atomic update pipeline, per-scope change streams that are open before `Subscribe` returns (closing a live event-loss bug), `OpDisconnect` on cursor death and `OpResync` on every re-open, polling fallback honouring both | 2.1, 2.2, 2.3 | Detailed |
+| 1 | Postgres stores and returns revisions, resolves named tenants through the connector, runs one LISTEN feed per scope, and narrates loss and recovery with `OpDisconnect` / `OpResync`; DDL v4 and the v3→v4 migration ship and are proven idempotent on a container | 1.1, 1.2, 1.3, 1.4, 1.5 | Complete |
+| 2 | MongoDB does the same: connector, revision via an atomic update pipeline, per-scope change streams that are open before `Subscribe` returns (closing a live event-loss bug), `OpDisconnect` on cursor death and `OpResync` on every re-open, polling fallback honouring both | 2.1, 2.2, 2.3 | Complete |
 | 3 | The contract suite asserts revision, scope, disconnect and resync unconditionally and runs against both backends in both modes; `DefaultSeedSQL` is gone | 3.1, 3.2 | Epic-level |
 
 ---
@@ -47,11 +47,11 @@ At the end of this phase Postgres alone satisfies FC-2. MongoDB still returns re
 **Scope:** `ddl/schema.sql`, `ddl/migrate_v3_to_v4.sql` (new), `ddl.go`, `ddl_test.go`, `internal/postgres/ddl_migration_integration_test.go` (new).
 **Dependencies:** none
 **Done when:** `SchemaSQL()` is byte-identical to FC-8; `MigrationV3ToV4SQL()` applied to a database provisioned with the v3 schema leaves `revision` present, the three v4 triggers installed, `systemplane_notify_v3()` dropped, and a subsequent `SchemaSQL()` application errors on nothing.
-**Status:** Pending
+**Status:** Done
 
 #### Task 1.1.1: Replace `ddl/schema.sql` with FC-8 and re-point the unit fragment test
 
-- [ ] Done
+- [x] Done
 
 **Context:** `ddl/schema.sql` is the v3 artifact: no `revision` column, a `systemplane_notify_v3()` function whose payload omits `revision`, and two triggers. `ddl.go:13` embeds it and `SchemaSQL()` returns it. `ddl_test.go:20-59` (`TestSchemaSQL_ContainsCanonicalStatements`) pins twenty v3 fragments and is the drift guard that fails the moment the file changes. The `internal/postgres` integration tests provision schema through `systemplane.SchemaSQL()` (`postgres_integration_test.go:85-91`), so this file is what every Postgres container test runs.
 
@@ -67,16 +67,16 @@ At the end of this phase Postgres alone satisfies FC-2. MongoDB still returns re
 diff \
   <(awk '/^### FC-8 /{f=1} f && /^```sql$/{c=1; next} c && /^```$/{exit} c' \
         docs/plans/2026-09-17-v4-unified-engine/index.md) \
-  <(sed -n '/^CREATE TABLE IF NOT EXISTS/,$p' ddl/schema.sql)
+  <(sed -n '/^DO \$\$/,$p' ddl/schema.sql)
 ~~~
 
-The markers, stated exactly so the command is reproducible: on the index side, start scanning at the heading line beginning `### FC-8 `, begin capturing after the opening fence line that is exactly ` ```sql `, and stop at the first following line that is exactly ` ``` `; on the artifact side, take `ddl/schema.sql` from the first line beginning `CREATE TABLE IF NOT EXISTS` to end of file, which drops only the free-text header comment. Against the current index this extracts 61 lines, from `CREATE TABLE IF NOT EXISTS systemplane_entries (` to `EXECUTE FUNCTION systemplane_notify_v4('systemplane_changes');`. Note that the plan file itself contains the string `### FC-8 ` nowhere, so the command is unambiguous when run against `index.md`.
+The markers, stated exactly so the command is reproducible: on the index side, start scanning at the heading line beginning `### FC-8 `, begin capturing after the opening fence line that is exactly ` ```sql `, and stop at the first following line that is exactly ` ``` `; on the artifact side, take `ddl/schema.sql` from the first line beginning `DO $$` (the fork guard that opens the SQL) to end of file, which drops only the free-text header comment. Against the current index this extracts 107 lines, from `DO $$` to `ALTER TABLE systemplane_entries ALTER COLUMN revision DROP DEFAULT;` (amended 2026-09-23: the block opens with the fork guard since 2026-09-18, so the artifact-side marker moved from `CREATE TABLE IF NOT EXISTS` to `DO $$`). Note that the plan file itself contains the string `### FC-8 ` nowhere, so the command is unambiguous when run against `index.md`.
 
 **Done when:** `SchemaSQL()` contains every v4 fragment, no v3 function definition, and the drift-guard test pins the new shape.
 
 #### Task 1.1.2: Add `ddl/migrate_v3_to_v4.sql` and `MigrationV3ToV4SQL()`
 
-- [ ] Done
+- [x] Done
 
 **Context:** Consumers on v3 (`plugin-br-pix-jd`, `billing-worker`, `finance-hub` per the consumer matrix) have a populated `systemplane_entries` with no `revision` column and the v3 trigger installed. They need one artifact that upgrades in place. `ddl.go` already shows the `//go:embed` + accessor pattern twice (`ddl.go:13-21`, `ddl.go:30-43`).
 
@@ -95,7 +95,7 @@ While in `ddl.go`, fix the two stale comments it carries, because both name file
 
 #### Task 1.1.3: Prove both artifacts apply idempotently on a Postgres container
 
-- [ ] Done
+- [x] Done
 
 **Context:** The index's Done-when for this lane requires `MigrationV3ToV4SQL()` applied to a v3 database to make `SchemaSQL()` idempotent on top. `ddl_test.go` is `//go:build unit` and cannot host a testcontainer test, and a new root-package integration file risks colliding with the `engine-core` lane's root-package tests (lane-cut rule 1). `internal/postgres` is fully owned by this lane and already carries the container harness: `startContainer`, `adminDSN`, `freshDB`, `dsnFor` in `internal/postgres/postgres_integration_test.go:28-115`, in the external test package `postgres_test`, which is allowed to import the root `systemplane` package (it already does, `postgres_integration_test.go:16`). The test therefore lives there.
 
@@ -116,11 +116,11 @@ While in `ddl.go`, fix the two stale comments it carries, because both name file
 **Scope:** `internal/postgres/postgres.go`, `internal/postgres/postgres_integration_test.go`.
 **Dependencies:** Epic 1.1 (the `revision` column and the bump trigger must exist before any query selects them).
 **Done when:** two writes of different values return strictly increasing revisions, two writes of the same value return the same revision, and a `Get` after either returns the revision the write reported.
-**Status:** Pending
+**Status:** Done
 
 #### Task 1.2.1: `Set` returns the stored revision
 
-- [ ] Done
+- [x] Done
 
 **Context:** `internal/postgres/postgres.go:306-349` (`Set`) runs an `INSERT ... ON CONFLICT DO UPDATE` with `ExecContext` and returns a hard-coded `0, nil` — the FC-2 shim. FC-2 now requires the revision actually stored. The v4 DDL does the arithmetic: `systemplane_bump_revision_trigger` is `BEFORE UPDATE ... WHEN (OLD.value IS DISTINCT FROM NEW.value)` and sets `NEW.revision := OLD.revision + 1`, so the row Postgres finally writes already carries the right number and `RETURNING` observes it post-trigger.
 
@@ -148,7 +148,7 @@ One cross-backend parity case belongs to this task, because it is only meaningfu
 
 #### Task 1.2.2: `Get` and `List` read `revision`
 
-- [ ] Done
+- [x] Done
 
 **Context:** `internal/postgres/postgres.go:218-265` (`List`) and `:268-303` (`Get`) select five columns and scan into `store.Entry` without touching `Revision`, so every read reports 0. FC-2's `Entry.Revision` is documented as "0 = unknown", which the engine treats as never-deduplicated — a read path stuck at 0 defeats revision dedupe entirely.
 
@@ -170,11 +170,11 @@ One cross-backend parity case belongs to this task, because it is only meaningfu
 **Scope:** `internal/postgres/postgres.go`, `internal/postgres/postgres_unit_test.go`, `internal/postgres/postgres_integration_test.go`.
 **Dependencies:** none (independent of Epics 1.1/1.2; sequence it after them only to keep one integration container per phase run).
 **Done when:** `Get`/`Set`/`Delete`/`List` with `Scope{Tenant: "t1"}` hit the database the connector returns for `t1`, `t2`'s data is invisible from `t1`'s scope, and a nil connector yields `store.ErrTenantConnectorMissing`.
-**Status:** Pending
+**Status:** Done
 
 #### Task 1.3.1: Resolve a named tenant through `Connector.ResolveDB`
 
-- [ ] Done
+- [x] Done
 
 **Context:** `internal/postgres/postgres.go:196-215` (`resolveDB`) is the single chokepoint every CRUD method already calls. Its named-tenant branch is the FC-2 shim: it returns `store.ErrTenantConnectorMissing` whether or not a connector is configured (`postgres.go:197-203`), with an explicit "scoped resolution not implemented" wrap. `Connector` is already defined and wired — `internal/postgres/connector.go` declares `ResolveDB(ctx, tenantID) (dbresolver.DB, error)` and `ResolveDSN`, `Config.Connector` exists (`postgres.go:122`), `pgMgrConnector` implements both over `*tmpostgres.Manager`, and `dbresolver.DB` is already asserted to satisfy `dbExecutor` (`postgres.go:79-82`), so the returned handle drops straight into the existing query helpers with no adapter. `postgres_unit_test.go:253` (`TestStore_NamedTenantScopeWithoutConnector`) pins the nil-connector refusal and must stay green.
 
@@ -198,11 +198,11 @@ For the tests, a fake connector is needed and belongs in `package postgres_test`
 **Scope:** `internal/postgres/postgres.go`, `internal/postgres/postgres_listen.go`, `internal/postgres/postgres_notify.go`, `internal/postgres/postgres_listen_test.go`, `internal/postgres/postgres_unit_test.go`, `internal/postgres/postgres_integration_test.go`.
 **Dependencies:** Epic 1.3 (named-tenant DSNs come from the same connector). `store.OpDisconnect` and `store.OpResync` are both already declared in the base code — the `contracts` lane landed them in wave 1; this lane emits them and never edits `internal/store/store.go`.
 **Done when:** the zero-scope feed behaves as today plus an `OpResync` on connect and reconnect and exactly one `OpDisconnect` per connection loss; `Subscribe(Scope{Tenant:"t1"})` opens a LISTEN on the DSN the connector returns for `t1`; two subscribed tenants never see each other's events; `pg_terminate_backend` on a feed's backend produces exactly one `OpDisconnect` then one `OpResync` then key events, in that order; the NOTIFY payload's `revision` reaches `Event.Revision`.
-**Status:** Pending
+**Status:** Done
 
 #### Task 1.4.1: Generalize the LISTEN loop into a per-scope feed
 
-- [ ] Done
+- [x] Done
 
 **Context:** `internal/postgres/postgres_listen.go` holds one hard-wired loop for one connection: `startListener` (`:78-121`) connects to `s.cfg.ListenDSN` and `LISTEN`s, `consumeAndReconnect` (`:147-173`) loops, `consumeUntilFailure` (`:175-208`) reads notifications, `reconnect` (`:210-265`) backs off. The subscriber registry lives flat on the Store (`postgres.go:132-137`: `listenerMu`, `subscribers`, `nextSubID`, `listenStop`, `listenDone`) and `dispatchEvent` (`postgres_notify.go:10-27`) fans out to all of them. There is exactly one connection and no notion of scope. The deleted `internal/manager/listen.go` solved the per-tenant case by copying this loop into the Manager with its own reconnect and backoff; D1 deletes that copy and this task must not recreate it — one loop, parameterized.
 
@@ -293,7 +293,7 @@ Rewire the zero scope onto this: `Start` (`postgres.go:147-157`) keeps its shape
 
 #### Task 1.4.2: A subscriber that joins a live feed gets its own `OpResync`
 
-- [ ] Done
+- [x] Done
 
 **Context:** Task 1.4.1 emits `OpResync` at connect time, to whoever is subscribed then. The engine subscribes *after* `Start` has already connected the zero-scope feed, so on that path it would never receive an initial resync, never reconcile, and stay `Stale` forever on a quiet scope — the engine's `OpResync` handler is its only route out of `Stale` (D2). A joining subscriber genuinely needs a resync anyway: it missed everything before it joined.
 
@@ -314,7 +314,7 @@ Named edge cases: joining while `connected` is false emits nothing and the next 
 
 #### Task 1.4.3: `Subscribe(Scope{Tenant})` opens a per-tenant feed
 
-- [ ] Done
+- [x] Done
 
 **Context:** `postgres_listen.go:50-52` refuses any named tenant with `store.ErrNotSupportedInMultiTenant`. FC-3 gives the connector `ResolveDSN(ctx, tenantID) (string, error)` for exactly this, and `pgMgrConnector.ResolveDSN` (`internal/postgres/connector.go:56-71`) returns the tenant's `ConnectionStringPrimary`. The `engine-tenants` lane later asserts "the store sees exactly one live subscription per activated tenant", so feeds must be shared and reference-counted, not one connection per `Subscribe` call.
 
@@ -346,7 +346,7 @@ Named edge cases, each decided here: `ResolveDSN` returning an empty string is a
 
 #### Task 1.4.4: Revision and scope on every NOTIFY-derived event, and the disconnect→resync sequence after a killed backend
 
-- [ ] Done
+- [x] Done
 
 **Context:** `parseNotifyPayload` (`internal/postgres/postgres_notify.go:29-46`) already decodes a `revision` field into `store.Event.Revision` — the `contracts` lane added it, and `notifyPayload` (`postgres_listen.go:32-37`) carries the tag — but nothing emits it yet because the v3 trigger's payload had no `revision`; Epic 1.1's `systemplane_notify_v4()` now does. The parser also leaves `Event.Scope` zero, so a tenant feed's events would arrive unattributed. The audit's headline defect is that a value written while the LISTEN connection was down is never observed: the reconnect happens, nothing is announced in either direction, and the cache stays stale-but-looks-fresh until someone writes again.
 
@@ -374,11 +374,11 @@ Named edge cases, each decided here: `ResolveDSN` returning an empty string is a
 **Scope:** `systemplanetest/contract.go`, `internal/postgres/postgres_integration_test.go`, `internal/mongodb/mongodb_integration_test.go`.
 **Dependencies:** Epics 1.2, 1.4.
 **Done when:** `systemplanetest.Run` asserts revision monotonicity, resync-first ordering, scope stamping and delete-revision-zero; the Postgres single-tenant run enables all of them; the MongoDB run opts out and stays green.
-**Status:** Pending
+**Status:** Done
 
 #### Task 1.5.1: Extend `Run` with the FC-2 assertions behind one opt-out
 
-- [ ] Done
+- [x] Done
 
 **Context:** `systemplanetest/contract.go` runs seven sub-tests against `store.Scope{}` hard-coded in every call (`setEntry` at `:122-135`, and the `Get`/`List`/`Delete`/`Subscribe` calls throughout). `RunOptions` (`:25-34`) already establishes the opt-out pattern with `SkipSubscribe`, used by multi-tenant runs. `setEntry` already returns the revision and only asserts `>= 0` — the deliberate shim tolerance. Both backends invoke `Run` from their integration files (`internal/postgres/postgres_integration_test.go:155`, `internal/mongodb/mongodb_integration_test.go:77`).
 
@@ -422,11 +422,11 @@ D6 makes MongoDB equal to Postgres, not a degraded fallback: the Console runs on
 **Scope:** `internal/mongodb/connector.go` (new), `internal/mongodb/mongodb.go`, `internal/mongodb/mongodb_config.go`, `internal/mongodb/mongodb_unit_test.go`, `internal/mongodb/mongodb_integration_test.go`.
 **Dependencies:** none
 **Done when:** `Connector` and `NewTenantManagerConnector(*tmmongo.Manager)` exist per FC-3 over the manager's `GetDatabaseForTenant`; `Config.Connector` is carried through construction; `resolveCollection` resolves a named tenant through it and returns `store.ErrTenantConnectorMissing` when none is configured; the lazy per-database collection bootstrap (`ensureSchema`, keyed `"<db>/<collection>"`) covers connector-resolved databases exactly as it covers ctx-resolved ones; `Get`/`Set`/`Delete`/`List` under `Scope{Tenant:"t1"}` hit `t1`'s database with a ctx carrying no tenant at all. The tenant-manager package must be imported aliased (`tmmongo`) because its package name collides with the driver's `mongo`.
-**Status:** Pending
+**Status:** Done
 
 #### Task 2.1.1: Land the MongoDB tenant connector over the tenant-manager Mongo Manager
 
-- [ ] Done
+- [x] Done
 
 **Context:** `internal/mongodb` has no connector at all. `resolveCollection` (`internal/mongodb/mongodb.go:196-219`) refuses every named tenant with `store.ErrTenantConnectorMissing` behind a comment that names this task ("MongoDB has no tenant connector yet; the storage lane adds one per FC-3"). The Postgres half of FC-3 is landed and is the template to mirror: `internal/postgres/connector.go` declares the `Connector` interface, the `ErrPgMgrUnavailable` sentinel, `NewTenantManagerConnector(*tmpostgres.Manager) Connector` and the unexported `pgMgrConnector` adapter, and `Config.Connector` sits on the Postgres `Config` (`internal/postgres/postgres.go:139`). The tenant-manager Mongo Manager is already a reachable dependency: `github.com/LerianStudio/lib-commons/v7` is a direct require in `go.mod` and its `commons/tenant-manager/mongo` package exposes `func (p *Manager) GetDatabaseForTenant(ctx context.Context, tenantID string) (*mongo.Database, error)`. No `go.mod` change is needed and none is permitted.
 
@@ -463,7 +463,7 @@ Unit tests in a new `internal/mongodb/connector_test.go` (`//go:build unit`, `pa
 
 #### Task 2.1.2: Resolve a named tenant collection through the connector
 
-- [ ] Done
+- [x] Done
 
 **Context:** `resolveCollection` (`internal/mongodb/mongodb.go:196-219`) is the single chokepoint every CRUD method already calls (`List` `:303`, `Get` `:347`, `Set` `:390`, `Delete` `:422`). Its named-tenant branch is the FC-2 shim: `if scope.Tenant != "" { return nil, store.ErrTenantConnectorMissing }`, whether or not a connector exists. The lazy per-database bootstrap it then performs for the ctx-resolved multi-tenant path — `ensureSchema(ctx, coll)` keyed by `"<db>/<collection>"` (`mongodb.go:221-295`, `schemaCacheKey` `:224`) — is already database-agnostic and will serve connector-resolved databases unchanged. `runSchema` (`internal/mongodb/mongodb_crud.go:34-57`) branches on `s.cfg.MultiTenantEnabled`: multi-tenant eagerly `CreateCollection`s (idempotent through `isNamespaceExists`), single-tenant only lists indexes. `internal/mongodb/mongodb_unit_test.go:224` (`TestStore_NamedTenantScopeIsRefused`) pins today's blanket refusal across all five methods. The Postgres counterpart to mirror is `resolveDB` (`internal/postgres/postgres.go:241-270`).
 
@@ -553,11 +553,11 @@ This is pinned by `TestIntegration_MongoDollarPrefixedStringsStoredVerbatim`: `S
 
 Race behaviour, stated because FC-9 warns about foreign writers: MongoDB guarantees single-document atomicity, so two concurrent `Set`s on the same `_id` serialize and each observes the other's revision — no lost bump, no read-modify-write window. The one race left is two concurrent upserts of a document that does not exist yet: both may attempt the insert and one receives a duplicate-key error on `_id`, which `Set` retries exactly once (`mongo.IsDuplicateKeyError`) — on the retry the document exists, so the pipeline takes the update path. A foreign writer that changes `value` without incrementing `revision` is out of the store's reach; D3 makes the engine compare value bytes as well, so such a write is observed, merely not deduplicated.
 
-**Status:** Pending
+**Status:** Done
 
 #### Task 2.2.1: Store and return a revision from a pipeline upsert
 
-- [ ] Done
+- [x] Done
 
 **Context:** `entryDoc` (`internal/mongodb/mongodb.go:93-101`) has no `revision` field and `toEntry` (`internal/mongodb/mongodb_config.go:10-18`) therefore leaves `store.Entry.Revision` at 0 on every read. `Set` (`internal/mongodb/mongodb.go:377-410`) calls the `upsert` helper (`internal/mongodb/mongodb_crud.go:60-80`) — a plain `$set` document through `UpdateOne` with `SetUpsert(true)` — and returns a hard-coded `0, nil`, the FC-2 shim. FC-2 documents `Entry.Revision == 0` as "the row carries no revision", which the engine never fences and never deduplicates, so a read path stuck at 0 defeats revision dedupe entirely. The Postgres counterpart landed in Epic 1.2: `Set` ends in `RETURNING revision` and `Get`/`List` select the column. MongoDB has no triggers and no sequences, so the arithmetic lives in the write itself (D11, FC-9). `fields.go:10-19` holds the BSON name constants; `mongo-driver/v2` v2.9.0 provides `options.FindOneAndUpdate().SetUpsert(true).SetReturnDocument(options.After)` and `mongo.IsDuplicateKeyError`.
 
@@ -588,7 +588,7 @@ Tests. Unit (`internal/mongodb/mongodb_unit_test.go`): extend `TestEntryDocToEnt
 
 #### Task 2.2.2: Replace Delete's removal with a tombstone rewrite
 
-- [ ] Done
+- [x] Done
 
 **Context:** `Delete` (`internal/mongodb/mongodb.go:413-448`) runs `coll.DeleteOne` on the compound `_id`, so the document and its revision vanish. D11 and FC-9 forbid that: without the row, `previous` is gone and a recreate falls back to the clock floor `$toLong($$NOW)`, which can land at or below the pre-delete revision (the `previous + 1` branch runs ahead of the clock by one per write inside a millisecond) — and D2's fence would then reject the recreated value until some later write happened to arrive, which for a knob nobody touches again is never. The contract suite already asserts the rule: `runRevisionMonotonic` (`systemplanetest/contract.go:452-478`) deletes and recreates and requires the recreate to be strictly above the deleted row's last revision. Mongo passes that suite today only because `TestIntegration_MongoDBSingleTenant` sets `SkipRevisionAndResync: true` (`internal/mongodb/mongodb_integration_test.go:77-81`). `Get` (`mongodb.go:342-374`) and `List` (`:297-339`) filter on `_id` and `bson.D{}` respectively and would happily return a tombstone. FC-9 was amended on 2026-09-18 (plan commit `f862dae`) after a review finding: a repeated `Delete` that rewrote `updated_at` on an existing tombstone emitted a change-stream update that the decoder maps to `OpDelete` at revision 0 — which the engine never deduplicates — so every subscriber received a duplicate delete. The filter below is what makes a repeat delete write nothing at all.
 
@@ -635,11 +635,11 @@ Tests this epic must name: `SubscribeThenImmediateWriteNeverLosesTheEvent` in `s
 
 Because the readiness fix removes a known flake, this epic's verification runs the Mongo suite repeatedly rather than once: `go test -tags=integration -count=5 -timeout 20m ./internal/mongodb/... -run 'TestIntegration_MongoDBSingleTenant'` must be green five times out of five. A single green run does not clear a defect that reproduced 3 times in 5.
 
-**Status:** Pending
+**Status:** Done
 
 #### Task 2.3.1: Open the single-tenant change stream before Start returns, on a per-scope feed
 
-- [ ] Done
+- [x] Done
 
 **Context:** This closes the live event-loss bug. `Subscribe` (`internal/mongodb/mongodb_changestream.go:37-91`) only inserts `fn` into a flat `s.subscribers` map and returns; the stream is opened by `startListener` (`:93-121`), which launches a goroutine and returns immediately, and `coll.Watch` is not reached until `watchOnce` runs inside it (`:205`). A change stream opened with no resume token attaches at the CURRENT oplog position, so a write landing before the attach is never delivered — not late, never. The contracts lane reproduced this on mordor: 3 failures in 5 runs of the suite's `SubscribeReceivesUpsert` / `SubscribeReceivesDelete`, where delivered events arrive in ~110ms and lost ones never arrive. Postgres does not flake because `startListener` there opens the connection and executes `LISTEN` synchronously before returning (`internal/postgres/postgres_listen.go:702-724`, `openListen` `:645-676`). The Postgres feed shape this task mirrors is `internal/postgres/postgres_listen.go:63-106` (`feed`), `:108-114` (`subscription`), `:149-191` (`beginDisconnect` / `beginResync`), `:238-252` (`broadcast`, `beginDispatch`/`endDispatch`), `:702-724` (`startListener`), `:732-792` (`stopFeeds`/`signalFeed`), `:844-878` (`runFeed`). The store-wide shutdown channel is `Store.closedCh` (`internal/postgres/postgres.go:166-172`), closed once inside `Close` (`:214`).
 
@@ -706,7 +706,7 @@ Tests. Unit (`internal/mongodb/mongodb_changestream_test.go`, `package mongodb`)
 
 #### Task 2.3.2: Give a joining subscriber its own marker
 
-- [ ] Done
+- [x] Done
 
 **Context:** After Task 2.3.1 a feed announces `OpResync` when its reader (re)connects, but the engine subscribes AFTER `Start` has already connected, so a subscriber joining a quiet scope would hear nothing and never reconcile. Postgres solved this in Task 1.4.2: `Subscribe` reads the feed's announced state in the SAME `f.mu` hold that adds the subscriber and emits the marker itself (`internal/postgres/postgres_listen.go:536-590`, with `joiningOpLocked` at `:201-210`). The suite already asserts it for every backend that does not opt out: `runSubscribeEmitsResyncFirst` (`systemplanetest/contract.go:478-514`) requires the very first event a new subscriber receives to be `OpResync` for its own scope, carrying no namespace, no key and revision 0.
 
@@ -731,7 +731,7 @@ Tests. Unit: `TestMongoSubscribe_JoinerIsToldTheFeedState`, mirroring `internal/
 
 #### Task 2.3.3: Open a per-tenant change stream on the first Subscribe
 
-- [ ] Done
+- [x] Done
 
 **Context:** `Subscribe` still refuses every named tenant with `store.ErrNotSupportedInMultiTenant` (`internal/mongodb/mongodb_changestream.go:42-44`), and `TestStore_NamedTenantWithoutConnector` (renamed in Task 2.1.2) still pins that. D6 makes MongoDB first class in multi-tenant mode: the Console runs on MongoDB only and is the first consumer of this path. The Postgres equivalent landed in Task 1.4.3 and is the template: `acquireFeed` (`internal/postgres/postgres_listen.go:302-350`), `awaitFeed` (`:359-374`), `createFeed` (`:379-405`), `publishFeed` (`:416-438`), `closeReadyLocked` (`:443-452`), `failLocked` (`:461-471`), `retractFeed` (`:475-484`), `releaseFeed` (`:492-507`). Its integration coverage is `TestIntegration_PostgresTwoTenantFeedsAreIsolated` (`internal/postgres/postgres_integration_test.go:975`), `..._TenantFeedTornDownOnLastUnsubscribe` (`:1036`), `..._ConcurrentFirstSubscribeOpensOneConnection` (`:1188`) and `..._CloseDuringFeedCreationLeavesNothingRunning` (`:1319`).
 
@@ -775,7 +775,7 @@ Tests. Unit: `TestMongoSubscribe_FailedFeedCreationFailsEveryWaiter` (a fake con
 
 #### Task 2.3.4: Carry revision and tombstones on every change event
 
-- [ ] Done
+- [x] Done
 
 **Context:** `changeEvent` (`internal/mongodb/mongodb_changestream.go:26-32`) decodes only `operationType` and `documentKey._id`, so `eventFromChange` (`internal/mongodb/mongodb_events.go:64-76`) produces events with `Revision` left at 0 on every upsert. FC-2 documents a store-surface revision of 0 as "unknown", never fenced and never deduplicated — correct for a delete, wasteful for every upsert. After Task 2.2.2 a `Delete` no longer produces a `delete` operation at all: it is an `update` whose full document carries `deleted: true`, and a change stream would report it as an upsert, publishing a tombstone as if it were a value. The suite pins both halves once the Mongo opt-out is gone: `runEventCarriesScopeAndRevision` (`systemplanetest/contract.go:519-560`) requires an upsert event's revision to equal what `Set` returned, and `runDeleteEventRevisionZero` (`:565-614`) requires a delete to arrive as `OpDelete` with revision 0.
 
@@ -814,7 +814,7 @@ Then the outage sequence tests, which need a deterministic way to sever the feed
 
 #### Task 2.3.5: Bring the polling fallback onto the feed, with a synchronous first round trip
 
-- [ ] Done
+- [x] Done
 
 **Context:** `pollForever` (`internal/mongodb/mongodb_changestream.go:255-297`) and `pollOnce` (`:313-412`) read `s.coll` directly, dispatch through the old flat `dispatchEvent`, synthesize `OpUpsert`/`OpDelete` with no revision (`:368-372`, `:402-406`), detect deletes by diffing the key set returned by `snapshotKeys` (`:417-457`), and on a failed round trip merely log and `continue` (`:284-289`) — so a poll outage is invisible to the engine. `Config.PollInterval` (`internal/mongodb/mongodb.go:67-70`) still documents polling as single-tenant only. The polling path carries the SAME event-loss bug the change stream had: the watermark is anchored at `time.Now()` when the loop starts, so a write landing between `Subscribe` and the first tick is swallowed by the `$gte` filter exactly the way a pre-attach write is swallowed by a change stream. Two integration tests call `s.pollOnce` directly with its current signature and pin the same-millisecond discrimination rule that a previous silent-skip bug produced: `TestIntegration_PollOnce_SameMsDifferentValue_EmitsBoth` (`internal/mongodb/mongodb_polling_integration_test.go:139`) and `TestIntegration_PollOnce_SameMsSameValue_EmitsOnce` (`:224`). Both MUST keep asserting exactly that after the signature change.
 
@@ -846,7 +846,7 @@ Tombstones in the incremental scan, decided here so the polling loop is not re-o
 
 #### Task 2.3.6: Assert subscribe readiness in the shared suite and drop the Mongo opt-out
 
-- [ ] Done
+- [x] Done
 
 **Context:** The readiness defect this phase fixes is loss, not latency: a write issued immediately after `Subscribe` returns was never delivered, 3 runs in 5 on mordor. Nothing in `systemplanetest/contract.go` asserts it — `runSubscribeUpsert` (`:291-316`) writes once after subscribing and would simply time out, indistinguishably from a slow backend. `RunOptions.SkipRevisionAndResync` (`systemplanetest/contract.go:39-42`) still gates `RevisionMonotonic`, `SubscribeEmitsResyncFirst`, `EventCarriesScopeAndRevision` and `DeleteEventRevisionZero` (`:107-137`), and `TestIntegration_MongoDBSingleTenant` sets it true (`internal/mongodb/mongodb_integration_test.go:77-81`) with the comment "Phase 2 of lane-storage turns this off". Phase 3 deletes the FIELD and adds the named-tenant suite configurations; this task only flips the Mongo call site.
 
@@ -893,6 +893,14 @@ Because this task closes a reproducible flake, its verification runs the Mongo s
 **Phase 3 exit gate:** `make test-unit` green, and `go test -tags=integration -count=1 -timeout 10m ./internal/postgres/... ./internal/mongodb/...` green across all four suite configurations.
 
 ---
+
+## Open deviations (Phases 1 and 2, recorded at PR time)
+
+- **Phase 3 is not in this PR.** Epics 3.1 (the suite runs unconditionally in four configurations, with the `Reconnect` hook) and 3.2 (`DefaultSeedSQL` removed) stay Epic-level and ship as a follow-up PR cut from `develop` after this one merges. The branch is already past 70 commits; splitting keeps the review tractable and gets the two backends into a beta the matcher pilot can pin.
+- **FC-8 re-frozen (0d32d21).** The HINT text of the schema's cross-schema guard grew during review to name both install layouts and `ErrSharedDatabaseUnsupported`; `index.md` was amended to the shipped artifact rather than the artifact reverted. The diff command in FC-8 returns 0.
+- **`Entry.Value` ownership stated on the contract (440e9f7).** The receiver owns the bytes a Store hands over; a backend never returns a view into a driver buffer. Pinned by `ValueBytesBelongToTheCaller` in the contract suite.
+- **Documented limits kept for v4.0:** the MongoDB schema memo carries no server identity, so a tenant database relocated to another cluster under the same name is re-bootstrapped only after a restart (polling mode loses its indexes until then; change-stream mode loses only the explicit CreateCollection); the primary pin forfeits no failover (dbresolver has none between primaries) and forfeits spreading only with several primaries, which no shipped connector builds.
+- **Panic posture (decided 2026-09-23):** every recovered panic in the lib will emit log + metric + span event; the storage loops still call the log-only helper and move in a chore PR after this merges.
 
 ## Audit traps this lane owns, and the test that pins each
 
