@@ -9,6 +9,7 @@ package mongodb
 import (
 	"context"
 	"errors"
+	"net"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +18,7 @@ import (
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.uber.org/goleak"
 )
 
@@ -926,68 +928,64 @@ func TestMongoSubscribe_ClosingStoreResolvesNoTenant(t *testing.T) {
 // release, then open outside every lock — so both callers opened a cursor, the
 // second startFeedReader overwrote the first reader's done channel, and from
 // then on two readers delivered every event and every marker twice while Close
-// waited on only one of them. Exactly one caller may own the open; the rest
-// wait for its outcome.
-func TestMongoStore_ReserveZeroFeedElectsOneOpener(t *testing.T) {
-	s := newSubscribeStore()
+// waited on only one of them. startMu makes the check and the open ONE
+// decision, so a Start that finds a reader running opens nothing.
+//
+// The store here can reach no server, which is what makes the assertion sharp:
+// any Start that did attempt a second open would fail loudly instead of
+// returning the no-op nil.
+func TestMongoStore_StartOpensNoSecondFeed(t *testing.T) {
+	s := unreachableChangeStreamStore(t)
 
-	defer func() { _ = s.Close() }()
+	f, err := s.zeroFeed()
+	if err != nil {
+		t.Fatalf("zeroFeed: %v", err)
+	}
+
+	// Stand in for a live reader: done is what marks a feed as running. It is
+	// closed already so the store's teardown does not wait on a goroutine that
+	// never existed.
+	done := make(chan struct{})
+	close(done)
+
+	f.mu.Lock()
+	f.done = done
+	f.mu.Unlock()
 
 	const callers = 16
 
 	var (
-		start   sync.WaitGroup
-		done    sync.WaitGroup
-		mu      sync.Mutex
-		openers int
-		waiters int
+		start sync.WaitGroup
+		wg    sync.WaitGroup
+		mu    sync.Mutex
+		opens int
 	)
 
 	start.Add(1)
-	done.Add(callers)
+	wg.Add(callers)
 
 	for range callers {
 		go func() {
-			defer done.Done()
+			defer wg.Done()
 
 			start.Wait()
 
-			f, ready, err := s.reserveZeroFeed()
-			if err != nil {
-				t.Errorf("reserveZeroFeed: %v", err)
-
-				return
-			}
-
-			if f == nil {
-				t.Error("reserveZeroFeed reported a running feed; no reader was ever launched")
-
-				return
-			}
-
-			mu.Lock()
-			defer mu.Unlock()
-
-			if ready == nil {
-				openers++
-			} else {
-				waiters++
+			if err := s.Start(context.Background()); err != nil {
+				mu.Lock()
+				opens++
+				mu.Unlock()
 			}
 		}()
 	}
 
 	start.Done()
-	done.Wait()
+	wg.Wait()
 
 	mu.Lock()
 	defer mu.Unlock()
 
-	if openers != 1 {
-		t.Fatalf("%d of %d concurrent Starts opened the zero-scope feed, want exactly 1", openers, callers)
-	}
-
-	if waiters != callers-1 {
-		t.Fatalf("%d callers waited on the reservation, want %d", waiters, callers-1)
+	if opens != 0 {
+		t.Fatalf("%d of %d concurrent Starts opened a second changefeed on the running zero-scope feed", opens, callers)
 	}
 }
 
@@ -1419,28 +1417,24 @@ func TestMongoZeroFeed_StartRetriesTheSameFeed(t *testing.T) {
 
 	t.Cleanup(unsub)
 
-	// A first Start reserves the slot and is refused.
-	first, ready, err := s.reserveZeroFeed()
+	// A first Start takes the slot and is refused.
+	first, err := s.zeroFeedForStart()
 	if err != nil {
-		t.Fatalf("first reserveZeroFeed: %v", err)
+		t.Fatalf("first zeroFeedForStart: %v", err)
 	}
 
-	if first != f || ready != nil {
-		t.Fatalf("the first Start did not own the open of the subscribers' feed (%p, ready=%v)", first, ready != nil)
+	if first != f {
+		t.Fatalf("the first Start did not take the open of the subscribers' feed (%p)", first)
 	}
 
 	if cause := s.retractFeed(f, errRefused); !errors.Is(cause, errRefused) {
 		t.Fatalf("retractFeed reported %v, want the refusal", cause)
 	}
 
-	// The retry owns the open again, on the very feed the subscriber holds.
-	retried, ready, err := s.reserveZeroFeed()
+	// The retry takes the open again, on the very feed the subscriber holds.
+	retried, err := s.zeroFeedForStart()
 	if err != nil {
 		t.Fatalf("a retried Start was refused by the previous attempt's failure: %v", err)
-	}
-
-	if ready != nil {
-		t.Fatal("a retried Start was told to wait on the failed attempt's reservation")
 	}
 
 	if retried != f {
@@ -1503,5 +1497,210 @@ func TestStreamWasUseful_OnlyAWorkingCursorClearsTheBackoff(t *testing.T) {
 				t.Fatalf("streamWasUseful(%v, %v) = %v, want %v", tc.consumed, tc.lifetime, got, tc.want)
 			}
 		})
+	}
+}
+
+// deadClient dials a closed local port, so every command fails fast and no
+// server is needed. An ephemeral listener closed immediately hands us an
+// address nothing is listening on, without guessing a port that might be in
+// use.
+func deadClient(t *testing.T) *mongo.Client {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	addr := ln.Addr().String()
+	_ = ln.Close()
+
+	client, err := mongo.Connect(options.Client().
+		ApplyURI("mongodb://" + addr).
+		SetDirect(true).
+		SetServerSelectionTimeout(100 * time.Millisecond))
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+
+	t.Cleanup(func() { _ = client.Disconnect(context.Background()) })
+
+	return client
+}
+
+// unreachableChangeStreamStore builds a change-stream store on that dead
+// client, so every open fails fast on the caller's goroutine. The collection bootstrap is stubbed through the
+// package's schemaRunner seam: it would otherwise fail first, on its own probe,
+// and the test would never reach the open it is about.
+func unreachableChangeStreamStore(t *testing.T) *Store {
+	t.Helper()
+
+	client := deadClient(t)
+
+	s, err := New(Config{Client: client, Database: "unreachable"})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	s.schemaRunner = func(context.Context, string) error { return nil }
+
+	t.Cleanup(func() { _ = s.Close() })
+
+	return s
+}
+
+// EVERY Start must learn that the open failed, however many run at once and
+// however often they retry. One that returned nil for a changefeed that never
+// opened leaves its caller believing the scope is live: nothing reconciles it
+// and no event will ever arrive, which is worse than the error it swallowed.
+//
+// The retry rounds are what make the concurrency meaningful. Callers retry a
+// failed Start, so attempts ARRIVE STAGGERED — a fresh attempt overlapping an
+// earlier one that is still working out what happened to it — which is exactly
+// the interleaving a single burst of simultaneous Starts never produces.
+func TestMongoStart_ConcurrentStartsAllReportTheFailedOpen(t *testing.T) {
+	s := unreachableChangeStreamStore(t)
+
+	const (
+		starters = 6
+		rounds   = 4
+	)
+
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		silent  int
+		attempt int
+	)
+
+	wg.Add(starters)
+
+	for i := 0; i < starters; i++ {
+		go func() {
+			defer wg.Done()
+
+			for r := 0; r < rounds; r++ {
+				err := s.Start(context.Background())
+
+				mu.Lock()
+				attempt++
+
+				if err == nil {
+					silent++
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	if silent > 0 {
+		t.Fatalf("%d of %d Starts returned nil; the change stream never opened", silent, attempt)
+	}
+}
+
+// dbPerTenantConnector hands each tenant the database the test mapped it to,
+// so two tenants can be pointed at one database on purpose.
+type dbPerTenantConnector struct {
+	dbs map[string]*mongo.Database
+}
+
+func (c dbPerTenantConnector) ResolveDatabase(_ context.Context, tenantID string) (*mongo.Database, error) {
+	db, ok := c.dbs[tenantID]
+	if !ok {
+		return nil, errors.New("mongodb test: no database for tenant " + tenantID)
+	}
+
+	return db, nil
+}
+
+// Two scopes resolved onto ONE collection must not both watch it. A change
+// stream is per collection, so each feed would receive the other scope's writes
+// stamped with its own scope — the tenant whose config the engine then publishes
+// is whichever wrote last. It is the same cross-scope bleed Postgres refuses,
+// and it is refused here for the same reason.
+func TestMongoFeed_TwoScopesOnOneCollectionAreRefused(t *testing.T) {
+	shared := deadClient(t).Database("shared")
+
+	s, err := New(Config{
+		MultiTenantEnabled: true,
+		Connector:          dbPerTenantConnector{dbs: map[string]*mongo.Database{"t1": shared, "t2": shared}},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	s.schemaRunner = func(context.Context, string) error { return nil }
+
+	t.Cleanup(func() { _ = s.Close() })
+
+	// t1 is already watching that collection.
+	live := newFeed(store.Scope{Tenant: "t1"}, nil)
+
+	s.feedsMu.Lock()
+	s.feeds["t1"] = live
+	live.refs = 1
+	s.feedsMu.Unlock()
+
+	if err := s.claimFeedColl(live, shared.Collection(defaultCollection)); err != nil {
+		t.Fatalf("the first feed was refused its own collection: %v", err)
+	}
+
+	_, err = s.Subscribe(context.Background(), store.Scope{Tenant: "t2"}, func(store.Event) {})
+	if !errors.Is(err, ErrSharedDatabaseUnsupported) {
+		t.Fatalf("second tenant Subscribe error = %v, want ErrSharedDatabaseUnsupported", err)
+	}
+
+	if total, refs := s.FeedsSnapshot("t2"); total != 1 || refs != 0 {
+		t.Fatalf("the refused tenant left %d feeds (refs=%d), want only the first tenant's", total, refs)
+	}
+
+	// The refusal is about a collection being WATCHED, not about the name: once
+	// the first feed is released, the second tenant is admitted and fails on the
+	// open itself, against a server it cannot reach.
+	s.releaseFeed(live)
+
+	_, err = s.Subscribe(context.Background(), store.Scope{Tenant: "t2"}, func(store.Event) {})
+	if errors.Is(err, ErrSharedDatabaseUnsupported) {
+		t.Fatal("the second tenant was still refused after the first feed was released")
+	}
+}
+
+// Two tenants on two databases of ONE client are the ordinary multi-tenant
+// shape and must stay admitted: their collections are distinct, so neither
+// stream can see the other's writes.
+func TestMongoFeed_TwoDatabasesOnOneClientAreAdmitted(t *testing.T) {
+	client := deadClient(t)
+
+	s, err := New(Config{
+		MultiTenantEnabled: true,
+		Connector: dbPerTenantConnector{dbs: map[string]*mongo.Database{
+			"t1": client.Database("t1db"),
+			"t2": client.Database("t2db"),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	s.schemaRunner = func(context.Context, string) error { return nil }
+
+	t.Cleanup(func() { _ = s.Close() })
+
+	live := newFeed(store.Scope{Tenant: "t1"}, nil)
+
+	s.feedsMu.Lock()
+	s.feeds["t1"] = live
+	live.refs = 1
+	s.feedsMu.Unlock()
+
+	if err := s.claimFeedColl(live, client.Database("t1db").Collection(defaultCollection)); err != nil {
+		t.Fatalf("the first feed was refused its own collection: %v", err)
+	}
+
+	_, err = s.Subscribe(context.Background(), store.Scope{Tenant: "t2"}, func(store.Event) {})
+	if errors.Is(err, ErrSharedDatabaseUnsupported) {
+		t.Fatal("a tenant on its own database was refused as sharing one")
 	}
 }

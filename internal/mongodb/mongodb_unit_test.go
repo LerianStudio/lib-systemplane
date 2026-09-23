@@ -530,28 +530,45 @@ func TestNotDeleted_MatchesMissingField(t *testing.T) {
 	}
 }
 
-// TestSchemaCacheKey_DistinguishesClients pins the bootstrap memo on the
-// CONNECTION, not just the name: two tenants on two clusters may both call
-// their database "systemplane", and a key that cannot tell them apart would
-// report the second tenant's collection as already materialized and never
-// create it.
-func TestSchemaCacheKey_DistinguishesClients(t *testing.T) {
+// TestSchemaCacheKey_DistinguishesTenants pins the bootstrap memo on STABLE
+// identity: the tenant the collection was resolved for, plus the database and
+// collection names. Two tenants on two clusters may both call their database
+// "systemplane", and a key that cannot tell them apart would report the second
+// tenant's collection as already materialized and never create it.
+//
+// The client handle is deliberately NOT part of the key. The tenant manager
+// disconnects a client when it evicts it, and the next client allocated can
+// land on the freed address — so a pointer-keyed memo could hand a brand-new
+// client the previous one's completed bootstrap and never materialize its
+// collection or indexes. Keying on the tenant makes that case moot by
+// construction rather than unlikely.
+func TestSchemaCacheKey_DistinguishesTenants(t *testing.T) {
 	t.Parallel()
 
 	clusterA := &mongo.Client{}
 	clusterB := &mongo.Client{}
 
-	same := schemaCacheKey(clusterA.Database("systemplane").Collection(defaultCollection))
-	if again := schemaCacheKey(clusterA.Database("systemplane").Collection(defaultCollection)); again != same {
-		t.Fatalf("two handles onto the same database key differently: %q vs %q", same, again)
+	same := schemaCacheKey("t1", clusterA.Database("systemplane").Collection(defaultCollection))
+	if again := schemaCacheKey("t1", clusterA.Database("systemplane").Collection(defaultCollection)); again != same {
+		t.Fatalf("two handles onto the same tenant database key differently: %q vs %q", same, again)
 	}
 
-	if other := schemaCacheKey(clusterB.Database("systemplane").Collection(defaultCollection)); other == same {
-		t.Fatalf("two clusters sharing a database name share the key %q", same)
+	if other := schemaCacheKey("t2", clusterB.Database("systemplane").Collection(defaultCollection)); other == same {
+		t.Fatalf("two tenants sharing a database name share the key %q", same)
 	}
 
-	if other := schemaCacheKey(clusterA.Database("systemplane").Collection("other")); other == same {
+	// The same tenant on a client it was re-resolved through keys the same: the
+	// bootstrap it already ran is its own, whatever handle reaches it now.
+	if moved := schemaCacheKey("t1", clusterB.Database("systemplane").Collection(defaultCollection)); moved != same {
+		t.Fatalf("one tenant keyed two ways across client handles: %q vs %q", same, moved)
+	}
+
+	if other := schemaCacheKey("t1", clusterA.Database("systemplane").Collection("other")); other == same {
 		t.Fatalf("two collections share the key %q", same)
+	}
+
+	if other := schemaCacheKey("t1", clusterA.Database("other").Collection(defaultCollection)); other == same {
+		t.Fatalf("two databases share the key %q", same)
 	}
 }
 

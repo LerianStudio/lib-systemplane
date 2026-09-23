@@ -149,6 +149,15 @@ type Store struct {
 	// creator rechecks it before publishing anything.
 	closing bool
 
+	// startMu serializes Start end to end. The zero-scope feed is shared, so
+	// the check for an existing reader, the open and the publish must be one
+	// decision: without it two concurrent Starts each open a change stream on
+	// the same feed and every event is delivered twice, and a Start that
+	// merely waited on another attempt's outcome could read that attempt's
+	// recorded cause after a THIRD Start had already cleared it for its own
+	// retry — returning nil for a changefeed that never opened.
+	startMu sync.Mutex
+
 	mu     sync.Mutex
 	closed bool
 
@@ -178,7 +187,7 @@ func (s *Store) Start(ctx context.Context) error {
 		return nil
 	}
 
-	if err := s.ensureSchema(ctx, s.coll, false); err != nil {
+	if err := s.ensureSchema(ctx, "", s.coll, false); err != nil {
 		return err
 	}
 
@@ -267,7 +276,7 @@ func (s *Store) resolveCollection(ctx context.Context, scope store.Scope) (*mong
 		}
 
 		coll := db.Collection(s.cfg.Collection)
-		if err := s.ensureSchema(ctx, coll, true); err != nil {
+		if err := s.ensureSchema(ctx, scope.Tenant, coll, true); err != nil {
 			return nil, err
 		}
 
@@ -283,8 +292,12 @@ func (s *Store) resolveCollection(ctx context.Context, scope store.Scope) (*mong
 		return nil, store.ErrTenantConnectionMissing
 	}
 
+	// The tenant the middleware resolved this database for names the memo, so
+	// two tenants on two clusters that both call their database "systemplane"
+	// each get their own bootstrap. An unset id leaves the names to identify
+	// it, as they do for the store's own database.
 	coll := db.Collection(s.cfg.Collection)
-	if err := s.ensureSchema(ctx, coll, true); err != nil {
+	if err := s.ensureSchema(ctx, tmcore.GetTenantIDContext(ctx), coll, true); err != nil {
 		return nil, err
 	}
 
@@ -292,23 +305,30 @@ func (s *Store) resolveCollection(ctx context.Context, scope store.Scope) (*mong
 }
 
 // schemaCacheKey returns the stable key used to memoize the per-database
-// schema bootstrap. The mongo-driver/v2 Collection handle is not guaranteed
-// to be reused across calls, so we key by the CONNECTION plus the names:
-// ("<client>/<db.Name()>/<collection>"). The client identity is load-bearing —
-// two tenants on two clusters may both call their database "systemplane", and
-// a name-only key would report the second one as already bootstrapped and
-// never materialize its collection.
-func schemaCacheKey(coll *mongo.Collection) string {
+// schema bootstrap: the tenant the collection was resolved for, plus the
+// database and collection names ("<tenant>/<db.Name()>/<collection>"). The
+// tenant is load-bearing — two tenants on two clusters may both call their
+// database "systemplane", and a name-only key would report the second one as
+// already bootstrapped and never materialize its collection. The zero scope
+// has no tenant id and needs none: its database is the store's own.
+//
+// The client HANDLE is deliberately absent. It is not stable identity: the
+// tenant manager disconnects a client when it evicts it, and the next client
+// allocated can land on the freed address — so a pointer-keyed memo could hand
+// a brand-new client the previous one's completed bootstrap and never create
+// its collection or indexes.
+func schemaCacheKey(tenant string, coll *mongo.Collection) string {
 	db := coll.Database()
 
-	return fmt.Sprintf("%p/%s/%s", db.Client(), db.Name(), coll.Name())
+	return tenant + "/" + db.Name() + "/" + coll.Name()
 }
 
-// ensureSchema memoizes the per-database bootstrap. tenantScoped marks a
-// collection that belongs to a tenant database — carried by ctx or resolved
-// through the connector — and is threaded into runSchema.
-func (s *Store) ensureSchema(ctx context.Context, coll *mongo.Collection, tenantScoped bool) error {
-	cacheKey := schemaCacheKey(coll)
+// ensureSchema memoizes the per-database bootstrap. tenant names the scope the
+// collection was resolved for and is empty for the store's own database.
+// tenantScoped marks a collection that belongs to a tenant database — carried
+// by ctx or resolved through the connector — and is threaded into runSchema.
+func (s *Store) ensureSchema(ctx context.Context, tenant string, coll *mongo.Collection, tenantScoped bool) error {
+	cacheKey := schemaCacheKey(tenant, coll)
 
 	return s.ensureSchemaByKey(ctx, cacheKey, func(ctx context.Context) error {
 		return s.runSchema(ctx, coll, tenantScoped)
@@ -324,7 +344,15 @@ func (s *Store) ensureSchemaByKey(ctx context.Context, cacheKey string, run func
 		run = func(ctx context.Context) error { return s.schemaRunner(ctx, cacheKey) }
 	}
 
-	onceVal, _ := s.schemaOnce.LoadOrStore(cacheKey, &sync.Once{})
+	// Load first: a bootstrapped database keeps its once entry, so the hot path
+	// — every read and write of an already-bootstrapped scope — allocates
+	// nothing. Only the first caller for a key, and a retry after a failure,
+	// reaches LoadOrStore.
+	onceVal, ok := s.schemaOnce.Load(cacheKey)
+	if !ok {
+		onceVal, _ = s.schemaOnce.LoadOrStore(cacheKey, &sync.Once{})
+	}
+
 	once, _ := onceVal.(*sync.Once)
 
 	// runErr captures the error produced by this Do invocation (if any). A

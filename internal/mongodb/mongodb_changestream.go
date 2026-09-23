@@ -97,6 +97,13 @@ type feed struct {
 	err         error
 	readyClosed bool
 
+	// collID names the collection this feed watches, guarded by Store.feedsMu:
+	// it is claimed there before the stream opens and re-claimed on every
+	// reopen, so no two live feeds of this Store can watch one collection.
+	// Separate from coll, which the reader goroutine owns and rewrites without
+	// a lock.
+	collID collIdentity
+
 	// refs counts the callers holding this feed, guarded by Store.feedsMu (NOT
 	// f.mu): the count decides the feed's lifetime and must be read and written
 	// in the same lock hold that publishes or removes the map slot. Meaningful
@@ -264,6 +271,77 @@ func (s *Store) zeroFeedLocked() (*feed, error) {
 	return f, nil
 }
 
+// collIdentity names the collection a feed watches: the client it is reached
+// through, plus the database and collection names. Comparable, so two feeds are
+// told apart — or found to be the same — with ==.
+//
+// The client POINTER is part of the identity because two tenants on two
+// clusters may both call their database "systemplane". A live feed holds that
+// pointer for as long as it is in the feeds map, so the address cannot be
+// recycled underneath the comparison.
+type collIdentity struct {
+	client *mongo.Client
+	db     string
+	coll   string
+}
+
+// collIdentityOf reads a collection's identity. A nil collection has none.
+func collIdentityOf(coll *mongo.Collection) collIdentity {
+	if coll == nil {
+		return collIdentity{}
+	}
+
+	db := coll.Database()
+
+	return collIdentity{client: db.Client(), db: db.Name(), coll: coll.Name()}
+}
+
+// claimFeedColl records the collection f is about to watch and REFUSES it when
+// a live feed of this Store already watches that very collection.
+//
+// A change stream is opened on one collection, so two scopes sharing one would
+// each receive the other's writes stamped with their OWN scope, and the
+// engine's revision fence would treat a foreign revision as authoritative: the
+// configuration a tenant reads becomes whichever tenant wrote last. Values are
+// keyed per collection and never mix; the event stream is what crosses, which
+// is why the check lives where a feed claims its collection.
+//
+// It is evaluated ONLY when a changefeed opens or reopens — reads and writes
+// resolve straight through the connector and never compare databases — so a
+// Store that never subscribes never learns that two of its scopes share a
+// collection, exactly as on the Postgres side.
+//
+// The claim is released by the feed leaving the feeds map: a creation that
+// fails retracts its slot, and the last subscriber to leave a tenant removes
+// it. The zero-scope slot never leaves, which is correct — it is the store's
+// own collection for as long as the store lives.
+func (s *Store) claimFeedColl(f *feed, coll *mongo.Collection) error {
+	id := collIdentityOf(coll)
+	if id == (collIdentity{}) {
+		return nil
+	}
+
+	s.feedsMu.Lock()
+	defer s.feedsMu.Unlock()
+
+	for _, other := range s.feeds {
+		// A feed that has not claimed a collection yet carries the zero
+		// identity and can never match a real one.
+		if other == f || other.collID != id {
+			continue
+		}
+
+		return fmt.Errorf(
+			"systemplane/mongodb: scope %q and scope %q both resolve to %s.%s: %w",
+			f.scope.Tenant, other.scope.Tenant, id.db, id.coll, ErrSharedDatabaseUnsupported,
+		)
+	}
+
+	f.collID = id
+
+	return nil
+}
+
 // acquireFeed returns the live feed for scope — creating it when this caller is
 // the first to ask for that tenant — and takes one reference on it, released by
 // releaseFeed. Feeds are SHARED: a scope has exactly one change stream no
@@ -373,9 +451,15 @@ func (s *Store) createFeed(ctx context.Context, f *feed) error {
 
 	coll := db.Collection(s.cfg.Collection)
 
+	// Refused before anything is created or opened: a collection another live
+	// scope already watches would deliver that scope's writes to this one too.
+	if err := s.claimFeedColl(f, coll); err != nil {
+		return s.retractFeed(f, err)
+	}
+
 	// A change stream attaches to a collection, so a tenant database that has
 	// never been written to needs its collection materialized first.
-	if err := s.ensureSchema(ctx, coll, true); err != nil {
+	if err := s.ensureSchema(ctx, tenant, coll, true); err != nil {
 		return s.retractFeed(f, err)
 	}
 
@@ -574,27 +658,39 @@ func (s *Store) Subscribe(ctx context.Context, scope store.Scope, fn func(store.
 // on this goroutine, and its reader is launched with a nil stream. A first
 // round trip that fails returns the error and retracts the slot, so Start
 // leaves no feed and no ticker behind.
-//
-// Two concurrent Starts open ONE stream between them: reserveZeroFeed picks the
-// opener under the feeds-map lock and the loser waits for its outcome here.
 func (s *Store) startListener(ctx context.Context) error {
-	f, ready, err := s.reserveZeroFeed()
+	// ONE Start at a time, end to end. The zero-scope feed is SHARED, so the
+	// "already running" check below and the reader launch inside publishFeed
+	// have to be one decision: two concurrent Starts that both saw no reader
+	// would each open a change stream on the same feed, the second
+	// startFeedReader would overwrite f.done, and from then on every event and
+	// every marker would be delivered twice by two readers while Close waited
+	// on only one of them. Each Start also reports the outcome of the open IT
+	// performed, never another attempt's record, which a later retry is free to
+	// clear. The open itself is bounded by watchTimeout (or pollRoundTimeout),
+	// so a second caller waits at most that long.
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
+
+	f, err := s.zeroFeedForStart()
 	if err != nil {
 		return err
 	}
 
+	f.mu.Lock()
+	running := f.done != nil
+	f.mu.Unlock()
+
 	// Already running: Start is idempotent.
-	if f == nil {
+	if running {
 		return nil
 	}
 
-	// Another Start reserved this feed and is opening it. Wait for its outcome
-	// rather than open a second stream; the opener is bounded by watchTimeout
-	// (or pollRoundTimeout), so this wait is bounded with it.
-	if ready != nil {
-		<-ready
-
-		return s.feedErr(f)
+	// The zero scope is held to the same one-collection rule as a tenant's: a
+	// Store that also serves named tenants must not watch a collection one of
+	// them watches, or every event would reach both feeds.
+	if err := s.claimFeedColl(f, s.coll); err != nil {
+		return s.retractFeed(f, err)
 	}
 
 	if s.cfg.PollInterval > 0 {
@@ -613,66 +709,23 @@ func (s *Store) startListener(ctx context.Context) error {
 	return s.publishFeed(ctx, f, stream)
 }
 
-// reserveZeroFeed decides, under the feeds-map lock, which of the concurrent
-// Starts opens the zero-scope feed.
-//
-// The check and the reservation are ONE interlock, and that is the whole point.
-// A Start that merely read "no reader yet", released the lock and then opened a
-// stream would open a second one behind a Start already opening the first: both
-// would publish, the second startFeedReader would overwrite f.done, and from
-// then on every document event and every marker would be delivered twice by two
-// readers while Close waited on only one of them.
-//
-// Returns (nil, nil, nil) when the feed already has a reader — Start is
-// idempotent. Returns (f, ready, nil) when another Start reserved it: the caller
-// waits on THAT channel and returns the reserving attempt's outcome. Returns
-// (f, nil, nil) to the one caller that owns the open; it publishes or retracts,
-// and either way closes ready.
-//
-// The channel is returned rather than re-read off the feed because a LATER
-// Start replaces it: a waiter reading f.ready after the reservation it waits on
-// has already failed would race that replacement.
-func (s *Store) reserveZeroFeed() (*feed, <-chan struct{}, error) {
+// zeroFeedForStart hands Start the zero-scope feed and clears the refusal a
+// PREVIOUS attempt recorded. Start retries the feed its subscribers are already
+// holding, so that record belongs to the attempt that produced it, not to the
+// feed forever. Callers must NOT hold feedsMu, and MUST hold startMu: clearing
+// the record is only safe while no other Start can be reading it.
+func (s *Store) zeroFeedForStart() (*feed, error) {
 	s.feedsMu.Lock()
 	defer s.feedsMu.Unlock()
 
 	f, err := s.zeroFeedSlotLocked()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	f.mu.Lock()
-	running := f.done != nil
-	f.mu.Unlock()
-
-	if running {
-		return nil, nil, nil
-	}
-
-	// A reservation still in flight: wait for its outcome rather than open a
-	// second stream.
-	if f.ready != nil && !f.readyClosed {
-		return f, f.ready, nil
-	}
-
-	// This caller owns the open. Start RETRIES the feed its subscribers already
-	// hold, so a previous attempt's refusal — and the ready channel it closed —
-	// belong to that attempt and not to the feed forever.
 	f.err = nil
-	f.ready = make(chan struct{})
-	f.readyClosed = false
 
-	return f, nil, nil
-}
-
-// feedErr reads a feed's recorded cause under the lock that writes it. The
-// zero-scope slot outlives the attempt that failed it and a later Start clears
-// the record, so an unsynchronized read is a race there.
-func (s *Store) feedErr(f *feed) error {
-	s.feedsMu.Lock()
-	defer s.feedsMu.Unlock()
-
-	return f.err
+	return f, nil
 }
 
 // openWatch opens one change stream on the feed's collection, bounded by
@@ -744,8 +797,9 @@ func (s *Store) publishFeed(ctx context.Context, f *feed, stream *mongo.ChangeSt
 }
 
 // closeReadyLocked wakes every waiter, exactly once. The caller MUST hold
-// Store.feedsMu. The zero-scope feed has no ready channel — Start owns it and
-// nobody waits on it.
+// Store.feedsMu. Only a NAMED tenant's feed has a ready channel: the zero-scope
+// feed is brought up by Start alone, under startMu, so nothing ever waits on it
+// and this is a no-op there.
 func (f *feed) closeReadyLocked() {
 	if f.ready == nil || f.readyClosed {
 		return
@@ -761,9 +815,13 @@ func (f *feed) closeReadyLocked() {
 // same hold: err is written BEFORE the close, so the close is the
 // happens-before edge that publishes it, and the slot is gone BEFORE the
 // waiters wake, so the next Subscribe for that tenant builds a fresh
-// placeholder instead of finding a corpse. The FIRST cause wins — once ready
-// is closed err is never written again, which is what keeps a waiter's read
-// race-free.
+// placeholder instead of finding a corpse. The FIRST cause wins, and a named
+// feed's slot is gone with it, so nothing writes that record again.
+//
+// The zero-scope record is the one that IS rewritten, by the next Start
+// (zeroFeedForStart clears it for its own attempt). That is safe only because
+// startMu makes Start the sole writer of it and no Start reads another
+// attempt's record: each one reports the outcome of the open it performed.
 func (s *Store) failLocked(f *feed, err error) error {
 	if f.err == nil {
 		f.err = err
@@ -1023,7 +1081,16 @@ func (s *Store) refreshFeedColl(ctx context.Context, f *feed) error {
 		return fmt.Errorf("systemplane/mongodb: resolve tenant %s: %w", f.scope.Tenant, store.ErrTenantConnectorMissing)
 	}
 
-	f.coll = db.Collection(s.cfg.Collection)
+	coll := db.Collection(s.cfg.Collection)
+
+	// The tenant may have been moved onto a collection another live scope
+	// watches; re-claiming keeps the identity the refusal is decided on honest
+	// through every reopen.
+	if err := s.claimFeedColl(f, coll); err != nil {
+		return err
+	}
+
+	f.coll = coll
 
 	return nil
 }
