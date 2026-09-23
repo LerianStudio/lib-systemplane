@@ -228,6 +228,40 @@ func TestClone(t *testing.T) {
 				}
 			},
 		},
+		{
+			// The JSON fast path's nil guard, pinned: a nil map must clone to
+			// a nil map and not to an allocated empty one. json.Unmarshal of
+			// `null` into a map-typed field produces exactly this, and a
+			// consumer that distinguishes "absent" from "empty" would silently
+			// start reading "empty" if the guard were dropped.
+			name:     "nil map clones to a nil map",
+			original: map[string]any(nil),
+			mutate: func(t *testing.T, clone any) {
+				cloned, ok := clone.(map[string]any)
+				if !ok {
+					t.Fatalf("nil map: got %T, want map[string]any", clone)
+				}
+
+				if cloned != nil {
+					t.Errorf("nil map: got an allocated map %v, want nil", cloned)
+				}
+			},
+		},
+		{
+			// The same guard on the array side of the fast path.
+			name:     "nil slice clones to a nil slice",
+			original: []any(nil),
+			mutate: func(t *testing.T, clone any) {
+				cloned, ok := clone.([]any)
+				if !ok {
+					t.Fatalf("nil slice: got %T, want []any", clone)
+				}
+
+				if cloned != nil {
+					t.Errorf("nil slice: got an allocated slice %v, want nil", cloned)
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {

@@ -173,6 +173,8 @@ func TestIngestClonesRegisteredDefault(t *testing.T) {
 // panic value in production mode. A validator that panics on the secret it was
 // handed must not be the thing that turns that secret into a log line.
 func TestIngestRejectsPanickingValidatorWithoutLeakingPanicValue(t *testing.T) {
+	// lib-observability's production mode is a process-global switch, which is why it is
+	// restored in t.Cleanup and why this test must never run in parallel with another.
 	runtime.SetProductionMode(true)
 	t.Cleanup(func() { runtime.SetProductionMode(false) })
 

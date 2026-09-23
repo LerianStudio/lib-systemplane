@@ -135,6 +135,22 @@ func TestCloseReportsTimeoutNamingStuckKey(t *testing.T) {
 		t.Error("publish after a timed-out Close was accepted, want dropped")
 	}
 
+	// The half TestCloseIsIdempotent cannot reach: it replays a nil outcome,
+	// where the outcome that matters is a timeout. A second Close must replay
+	// that timeout rather than report the clean shutdown that never happened —
+	// a consumer retrying Close on its way out would otherwise be told the
+	// stuck subscriber let go.
+	second := e.Close()
+	if !errors.Is(second, ErrCloseTimeout) {
+		t.Fatalf("second Close() = %v, want the first Close's ErrCloseTimeout replayed", second)
+	}
+
+	for _, want := range []string{"single-tenant", nk.Namespace, nk.Key} {
+		if !strings.Contains(second.Error(), want) {
+			t.Errorf("second Close() error %q does not name %q", second, want)
+		}
+	}
+
 	// Release the stuck callback and wait for it: a test that leaks on purpose
 	// fails the whole package under goleak.
 	close(release)

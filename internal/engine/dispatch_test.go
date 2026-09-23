@@ -15,9 +15,11 @@ import (
 )
 
 // dispatchEngine returns an Engine whose dispatch workers stop when the test
-// ends, so goleak sees no survivor. Engine.Close arrives with Task 1.3.2;
-// until then canceling the lifecycle context is what stops a worker, and
-// waiting on the dispatch WaitGroup is what proves it stopped.
+// ends, so goleak sees no survivor. It tears down with lifecycleCancel plus a
+// wait on the dispatch WaitGroup rather than with Close — which exists, and is
+// covered in close_test.go — because this engine is hand-built with no store,
+// no registry and no debouncer, and Close would exercise that wiring instead
+// of the dispatch behavior these tests are about.
 func dispatchEngine(t *testing.T) *Engine {
 	t.Helper()
 
