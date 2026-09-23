@@ -1600,107 +1600,155 @@ func TestMongoStart_ConcurrentStartsAllReportTheFailedOpen(t *testing.T) {
 	}
 }
 
-// dbPerTenantConnector hands each tenant the database the test mapped it to,
-// so two tenants can be pointed at one database on purpose.
-type dbPerTenantConnector struct {
-	dbs map[string]*mongo.Database
-}
+// The comparison every claim is decided on, exercised without a server: which
+// pair of scopes is refused and which is admitted. That real servers actually
+// produce these identities — two clients on one server, the shape lib-commons
+// hands out, colliding on one database — is proven end to end by
+// TestIntegration_MongoSharedCollectionIsRefusedAcrossClients.
+//
+// A change stream is per collection, so two scopes sharing one would each
+// receive the other's writes stamped with their own scope, and the tenant whose
+// config the engine then publishes is whichever wrote last. It is the same
+// cross-scope bleed Postgres refuses, and it is refused here for the same
+// reason.
+func TestMongoFeed_ClaimRefusesOnlyASharedCollection(t *testing.T) {
+	const (
+		oneServer     = "rs:rs0/mongo-a:27017,mongo-b:27017"
+		anotherServer = "proc:6ab3ebc6c112ecf032990511"
+	)
 
-func (c dbPerTenantConnector) ResolveDatabase(_ context.Context, tenantID string) (*mongo.Database, error) {
-	db, ok := c.dbs[tenantID]
-	if !ok {
-		return nil, errors.New("mongodb test: no database for tenant " + tenantID)
+	held := collIdentity{server: oneServer, db: "systemplane", coll: defaultCollection}
+
+	cases := []struct {
+		name    string
+		id      collIdentity
+		refused bool
+	}{
+		{"the same collection of the same database on the same server", held, true},
+		{"another database on the same server", collIdentity{server: oneServer, db: "other", coll: defaultCollection}, false},
+		{"another collection of the same database", collIdentity{server: oneServer, db: "systemplane", coll: "other"}, false},
+		{"the same database name on another server", collIdentity{server: anotherServer, db: "systemplane", coll: defaultCollection}, false},
+		{"a server that would not identify itself", collIdentity{}, false},
 	}
 
-	return db, nil
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newSubscribeStore()
+
+			live := newFeed(store.Scope{Tenant: "t1"}, nil)
+			live.collID = held
+			s.feeds["t1"] = live
+
+			joining := newFeed(store.Scope{Tenant: "t2"}, nil)
+
+			err := s.claimFeedIdentity(joining, tc.id)
+
+			if tc.refused {
+				if !errors.Is(err, ErrSharedDatabaseUnsupported) {
+					t.Fatalf("claim error = %v, want ErrSharedDatabaseUnsupported", err)
+				}
+
+				if !strings.Contains(err.Error(), "t1") || !strings.Contains(err.Error(), "t2") {
+					t.Errorf("refusal %q names neither scope; an operator cannot tell which two tenants collided", err)
+				}
+
+				if joining.collID != (collIdentity{}) {
+					t.Error("a refused feed kept a claim, so releasing it would free a collection it never watched")
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("claim was refused: %v", err)
+			}
+
+			if joining.collID != tc.id {
+				t.Errorf("admitted feed holds identity %+v, want %+v", joining.collID, tc.id)
+			}
+		})
+	}
 }
 
-// Two scopes resolved onto ONE collection must not both watch it. A change
-// stream is per collection, so each feed would receive the other scope's writes
-// stamped with its own scope — the tenant whose config the engine then publishes
-// is whichever wrote last. It is the same cross-scope bleed Postgres refuses,
-// and it is refused here for the same reason.
-func TestMongoFeed_TwoScopesOnOneCollectionAreRefused(t *testing.T) {
-	shared := deadClient(t).Database("shared")
+// The refusal is about a collection being WATCHED, not about its name: the
+// moment the holder leaves the feeds map its collection is free again.
+func TestMongoFeed_ReleasedCollectionIsClaimableAgain(t *testing.T) {
+	id := collIdentity{server: "rs:rs0/mongo-a:27017", db: "systemplane", coll: defaultCollection}
 
-	s, err := New(Config{
-		MultiTenantEnabled: true,
-		Connector:          dbPerTenantConnector{dbs: map[string]*mongo.Database{"t1": shared, "t2": shared}},
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
+	s := newSubscribeStore()
 
-	s.schemaRunner = func(context.Context, string) error { return nil }
-
-	t.Cleanup(func() { _ = s.Close() })
-
-	// t1 is already watching that collection.
 	live := newFeed(store.Scope{Tenant: "t1"}, nil)
-
-	s.feedsMu.Lock()
-	s.feeds["t1"] = live
 	live.refs = 1
-	s.feedsMu.Unlock()
 
-	if err := s.claimFeedColl(live, shared.Collection(defaultCollection)); err != nil {
+	s.feeds["t1"] = live
+
+	if err := s.claimFeedIdentity(live, id); err != nil {
 		t.Fatalf("the first feed was refused its own collection: %v", err)
 	}
 
-	_, err = s.Subscribe(context.Background(), store.Scope{Tenant: "t2"}, func(store.Event) {})
-	if !errors.Is(err, ErrSharedDatabaseUnsupported) {
-		t.Fatalf("second tenant Subscribe error = %v, want ErrSharedDatabaseUnsupported", err)
+	joining := newFeed(store.Scope{Tenant: "t2"}, nil)
+
+	if err := s.claimFeedIdentity(joining, id); !errors.Is(err, ErrSharedDatabaseUnsupported) {
+		t.Fatalf("second scope claim error = %v, want ErrSharedDatabaseUnsupported", err)
 	}
 
-	if total, refs := s.FeedsSnapshot("t2"); total != 1 || refs != 0 {
-		t.Fatalf("the refused tenant left %d feeds (refs=%d), want only the first tenant's", total, refs)
-	}
-
-	// The refusal is about a collection being WATCHED, not about the name: once
-	// the first feed is released, the second tenant is admitted and fails on the
-	// open itself, against a server it cannot reach.
 	s.releaseFeed(live)
 
-	_, err = s.Subscribe(context.Background(), store.Scope{Tenant: "t2"}, func(store.Event) {})
-	if errors.Is(err, ErrSharedDatabaseUnsupported) {
-		t.Fatal("the second tenant was still refused after the first feed was released")
+	if err := s.claimFeedIdentity(joining, id); err != nil {
+		t.Fatalf("the second scope was still refused after the first feed was released: %v", err)
 	}
 }
 
-// Two tenants on two databases of ONE client are the ordinary multi-tenant
-// shape and must stay admitted: their collections are distinct, so neither
-// stream can see the other's writes.
-func TestMongoFeed_TwoDatabasesOnOneClientAreAdmitted(t *testing.T) {
-	client := deadClient(t)
-
-	s, err := New(Config{
-		MultiTenantEnabled: true,
-		Connector: dbPerTenantConnector{dbs: map[string]*mongo.Database{
-			"t1": client.Database("t1db"),
-			"t2": client.Database("t2db"),
-		}},
-	})
+// serverKey is what makes the refusal see through the one-client-per-tenant
+// shape lib-commons produces, so the rules it encodes are pinned here rather
+// than left to the one integration test that can observe a real hello.
+func TestMongoServerKey(t *testing.T) {
+	proc, err := bson.ObjectIDFromHex("6ab3ebc6c112ecf032990511")
 	if err != nil {
-		t.Fatalf("New: %v", err)
+		t.Fatalf("parse process id: %v", err)
 	}
 
-	s.schemaRunner = func(context.Context, string) error { return nil }
-
-	t.Cleanup(func() { _ = s.Close() })
-
-	live := newFeed(store.Scope{Tenant: "t1"}, nil)
-
-	s.feedsMu.Lock()
-	s.feeds["t1"] = live
-	live.refs = 1
-	s.feedsMu.Unlock()
-
-	if err := s.claimFeedColl(live, client.Database("t1db").Collection(defaultCollection)); err != nil {
-		t.Fatalf("the first feed was refused its own collection: %v", err)
+	cases := []struct {
+		name    string
+		setName string
+		hosts   []string
+		proc    bson.ObjectID
+		want    string
+	}{
+		{
+			name:    "a replica set is keyed by name and members",
+			setName: "rs0",
+			hosts:   []string{"mongo-a:27017", "mongo-b:27017"},
+			proc:    proc,
+			want:    "rs:rs0/mongo-a:27017,mongo-b:27017",
+		},
+		{
+			// Two members of one set list the same hosts in whatever order
+			// they please; a key that kept the order would call one set two.
+			name:    "member order does not change the key",
+			setName: "rs0",
+			hosts:   []string{"mongo-b:27017", "mongo-a:27017"},
+			proc:    proc,
+			want:    "rs:rs0/mongo-a:27017,mongo-b:27017",
+		},
+		{
+			// A standalone reports no set and no hosts at all — only the
+			// process id, which is what tells two standalone servers apart.
+			name: "a standalone falls back to its process id",
+			proc: proc,
+			want: "proc:6ab3ebc6c112ecf032990511",
+		},
+		{
+			name: "a server that identifies itself with nothing is not keyed",
+			want: "",
+		},
 	}
 
-	_, err = s.Subscribe(context.Background(), store.Scope{Tenant: "t2"}, func(store.Event) {})
-	if errors.Is(err, ErrSharedDatabaseUnsupported) {
-		t.Fatal("a tenant on its own database was refused as sharing one")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := serverKey(tc.setName, tc.hosts, tc.proc); got != tc.want {
+				t.Fatalf("serverKey = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

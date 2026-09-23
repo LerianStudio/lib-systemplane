@@ -23,6 +23,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -271,29 +273,101 @@ func (s *Store) zeroFeedLocked() (*feed, error) {
 	return f, nil
 }
 
-// collIdentity names the collection a feed watches: the client it is reached
-// through, plus the database and collection names. Comparable, so two feeds are
-// told apart — or found to be the same — with ==.
+// collIdentity names the collection a feed watches: the SERVER that answers for
+// it, plus the database and collection names. Comparable, so two feeds are told
+// apart — or found to be the same — with ==.
 //
-// The client POINTER is part of the identity because two tenants on two
-// clusters may both call their database "systemplane". A live feed holds that
-// pointer for as long as it is in the feeds map, so the address cannot be
-// recycled underneath the comparison.
+// The server is identified by what it REPORTS, never by the *mongo.Client
+// handle it is reached through. lib-commons' tenant manager opens one client
+// per tenant id — commons/tenant-manager/mongo caches connections[tenantID]
+// and calls mongo.Connect once per entry — so two tenants misconfigured onto
+// one database arrive here as two distinct handles, and a pointer comparison
+// would admit both: the very misconfiguration this refusal exists to catch,
+// invisible on the only connector that ships. Mirrors serverDatabaseKey on the
+// Postgres side, which asks the server rather than trusting the DSN text.
 type collIdentity struct {
-	client *mongo.Client
+	server string
 	db     string
 	coll   string
 }
 
-// collIdentityOf reads a collection's identity. A nil collection has none.
-func collIdentityOf(coll *mongo.Collection) collIdentity {
+// serverKey turns a hello reply into the identity two feeds are compared on.
+//
+// A replica set is keyed by its name and its member list, both of which every
+// member reports identically, so two clients that landed on two members of one
+// set still compare equal. Anything else — a standalone, a mongos — reports no
+// set, and the per-process id in topologyVersion stands in: it is unique to a
+// running mongod/mongos process, so two standalone servers are told apart and
+// two clients of one are not.
+//
+// What this key CANNOT tell apart, stated rather than discovered:
+//
+//   - Two mongos routers fronting ONE sharded cluster. Each reports its own
+//     process id, so two tenants routed through different routers to the same
+//     database are admitted.
+//   - A server restarted between two claims. The new process reports a new id,
+//     so a feed that claimed before the restart no longer matches one claiming
+//     after it. Named feeds re-claim on every reopen, which closes the window
+//     they can actually reach.
+//
+// An empty key means the server said nothing that identifies it; the caller
+// admits the feed rather than refuse on a guess.
+func serverKey(setName string, hosts []string, processID bson.ObjectID) string {
+	if setName != "" {
+		members := slices.Clone(hosts)
+		slices.Sort(members)
+
+		return "rs:" + setName + "/" + strings.Join(members, ",")
+	}
+
+	if processID != bson.NilObjectID {
+		return "proc:" + processID.Hex()
+	}
+
+	return ""
+}
+
+// collIdentityOf asks the collection's server who it is and returns the
+// identity a claim is decided on.
+//
+// A server that cannot be reached, or that answers without identifying itself,
+// yields the ZERO identity, which claims nothing and refuses nothing. That is
+// deliberate: a server we cannot reach cannot be shown to be shared, and the
+// very next thing the caller does on that handle — materialize the collection,
+// open the change stream, run the first poll — fails against it anyway, so no
+// unidentified feed is ever admitted into service. Refusing here instead would
+// turn one unreachable moment into a cross-tenant misconfiguration report.
+func collIdentityOf(ctx context.Context, coll *mongo.Collection) collIdentity {
 	if coll == nil {
 		return collIdentity{}
 	}
 
 	db := coll.Database()
 
-	return collIdentity{client: db.Client(), db: db.Name(), coll: coll.Name()}
+	ctx, cancel := context.WithTimeout(ctx, watchTimeout)
+	defer cancel()
+
+	var reply struct {
+		SetName         string   `bson:"setName"`
+		Hosts           []string `bson:"hosts"`
+		TopologyVersion struct {
+			ProcessID bson.ObjectID `bson:"processId"`
+		} `bson:"topologyVersion"`
+	}
+
+	// hello is the driver's own handshake command: runnable on any database
+	// and answerable before authentication, so this costs one round trip and
+	// no privilege.
+	if err := db.RunCommand(ctx, bson.D{{Key: "hello", Value: 1}}).Decode(&reply); err != nil {
+		return collIdentity{}
+	}
+
+	key := serverKey(reply.SetName, reply.Hosts, reply.TopologyVersion.ProcessID)
+	if key == "" {
+		return collIdentity{}
+	}
+
+	return collIdentity{server: key, db: db.Name(), coll: coll.Name()}
 }
 
 // claimFeedColl records the collection f is about to watch and REFUSES it when
@@ -315,8 +389,14 @@ func collIdentityOf(coll *mongo.Collection) collIdentity {
 // fails retracts its slot, and the last subscriber to leave a tenant removes
 // it. The zero-scope slot never leaves, which is correct — it is the store's
 // own collection for as long as the store lives.
-func (s *Store) claimFeedColl(f *feed, coll *mongo.Collection) error {
-	id := collIdentityOf(coll)
+func (s *Store) claimFeedColl(ctx context.Context, f *feed, coll *mongo.Collection) error {
+	return s.claimFeedIdentity(f, collIdentityOf(ctx, coll))
+}
+
+// claimFeedIdentity is claimFeedColl's decision, with the round trip already
+// paid. Split out so the comparison — which pair of scopes is refused, which is
+// admitted — is exercised without a server.
+func (s *Store) claimFeedIdentity(f *feed, id collIdentity) error {
 	if id == (collIdentity{}) {
 		return nil
 	}
@@ -453,7 +533,7 @@ func (s *Store) createFeed(ctx context.Context, f *feed) error {
 
 	// Refused before anything is created or opened: a collection another live
 	// scope already watches would deliver that scope's writes to this one too.
-	if err := s.claimFeedColl(f, coll); err != nil {
+	if err := s.claimFeedColl(ctx, f, coll); err != nil {
 		return s.retractFeed(f, err)
 	}
 
@@ -694,7 +774,7 @@ func (s *Store) startListener(ctx context.Context) error {
 	// The zero scope is held to the same one-collection rule as a tenant's: a
 	// Store that also serves named tenants must not watch a collection one of
 	// them watches, or every event would reach both feeds.
-	if err := s.claimFeedColl(f, s.coll); err != nil {
+	if err := s.claimFeedColl(ctx, f, s.coll); err != nil {
 		return s.retractFeed(f, err)
 	}
 
@@ -1091,7 +1171,7 @@ func (s *Store) refreshFeedColl(ctx context.Context, f *feed) error {
 	// The tenant may have been moved onto a collection another live scope
 	// watches; re-claiming keeps the identity the refusal is decided on honest
 	// through every reopen.
-	if err := s.claimFeedColl(f, coll); err != nil {
+	if err := s.claimFeedColl(ctx, f, coll); err != nil {
 		return err
 	}
 

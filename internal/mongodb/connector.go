@@ -29,11 +29,17 @@ type Connector interface {
 	// serverDatabaseKey in internal/postgres/connector.go), so a DSN that
 	// merely pins a search_path is admitted; it is the shared DATABASE that is
 	// refused, with that package's ErrSharedDatabaseUnsupported. MongoDB
-	// applies the collection-level analogue: a feed whose (client, database,
+	// applies the collection-level analogue: a feed whose (server, database,
 	// collection) triple a live feed already watches is refused with this
-	// package's ErrSharedDatabaseUnsupported.
+	// package's ErrSharedDatabaseUnsupported. The SERVER, not the client
+	// handle: lib-commons' tenant manager opens one *mongo.Client per TENANT,
+	// so two handles are what a shared database looks like from here and the
+	// identity comes from what hello reports instead — see serverKey in
+	// internal/mongodb/mongodb_changestream.go for what that can and cannot
+	// tell apart (two mongos routers fronting one sharded cluster are NOT
+	// caught, and neither is a server restarted between two claims).
 	//
-	// Two tenants on two databases of ONE client stay admitted, and so do two
+	// Two tenants on two databases of ONE server stay admitted, and so do two
 	// tenants on two collections: the refusal is about a changefeed being
 	// SHARED, not about sharing a server.
 	ResolveDatabase(ctx context.Context, tenantID string) (*mongo.Database, error)
@@ -54,6 +60,11 @@ type Connector interface {
 // opens a feed never evaluates the rule: its reads and writes resolve straight
 // through the connector, so two scopes sharing one database go unnoticed there
 // and unpunished, since documents are keyed per collection and never mix.
+//
+// What counts as "the same server", and which shapes this cannot tell apart,
+// is serverKey's definition in mongodb_changestream.go. A server that cannot
+// be reached, or that answers without identifying itself, is admitted rather
+// than refused on a guess — it fails on the stream open a moment later anyway.
 //
 // The refusal stands for as long as the two scopes resolve to one collection:
 // the engine discards a failed activation and retries from scratch on the next

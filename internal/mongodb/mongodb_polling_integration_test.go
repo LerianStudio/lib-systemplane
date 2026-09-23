@@ -43,6 +43,28 @@ import (
 func startPollingContainer(t *testing.T) (*mongo.Client, func()) {
 	t.Helper()
 
+	uri, stop := startStandaloneURI(t)
+
+	client, err := mongo.Connect(options.Client().ApplyURI(uri).SetDirect(true))
+	if err != nil {
+		stop()
+
+		t.Fatalf("mongo connect: %v", err)
+	}
+
+	cleanup := func() {
+		_ = client.Disconnect(context.Background())
+		stop()
+	}
+
+	return client, cleanup
+}
+
+// startStandaloneURI brings up the standalone and returns its URI, so a test
+// that needs SEVERAL clients on one server can open them itself.
+func startStandaloneURI(t *testing.T) (string, func()) {
+	t.Helper()
+
 	ctx := context.Background()
 
 	container, err := mongocontainer.Run(ctx, "mongo:7")
@@ -50,26 +72,16 @@ func startPollingContainer(t *testing.T) (*mongo.Client, func()) {
 		t.Fatalf("start container: %v", err)
 	}
 
+	stop := func() { _ = testcontainers.TerminateContainer(container) }
+
 	uri, err := container.ConnectionString(ctx)
 	if err != nil {
-		_ = testcontainers.TerminateContainer(container)
+		stop()
 
 		t.Fatalf("connection string: %v", err)
 	}
 
-	client, err := mongo.Connect(options.Client().ApplyURI(uri).SetDirect(true))
-	if err != nil {
-		_ = testcontainers.TerminateContainer(container)
-
-		t.Fatalf("mongo connect: %v", err)
-	}
-
-	cleanup := func() {
-		_ = client.Disconnect(context.Background())
-		_ = testcontainers.TerminateContainer(container)
-	}
-
-	return client, cleanup
+	return uri, stop
 }
 
 // StartStandaloneContainer exposes the standalone container to the external
