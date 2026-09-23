@@ -335,7 +335,7 @@ func (c *Client) hydrate(ctx context.Context) error {
 		if !registered {
 			c.logWarn(ctx, "unregistered key in store, skipping",
 				log.String("namespace", entry.Namespace),
-				log.String("key", entry.Key),
+				log.String("keyname", entry.Key),
 			)
 
 			continue
@@ -355,7 +355,7 @@ func (c *Client) hydrate(ctx context.Context) error {
 		if err := json.Unmarshal(entry.Value, &decoded); err != nil {
 			c.logWarn(ctx, "failed to unmarshal stored value, keeping default",
 				log.String("namespace", entry.Namespace),
-				log.String("key", entry.Key),
+				log.String("keyname", entry.Key),
 				log.Err(err),
 			)
 
@@ -369,7 +369,7 @@ func (c *Client) hydrate(ctx context.Context) error {
 			// The error, never the value: a rejected value may be a secret.
 			c.logWarn(ctx, "stored value rejected by validator, keeping default",
 				log.String("namespace", entry.Namespace),
-				log.String("key", entry.Key),
+				log.String("keyname", entry.Key),
 				log.Err(err),
 			)
 
@@ -465,7 +465,7 @@ func (c *Client) refreshFromStore(nk nskey, op string) {
 	if !registered {
 		c.logWarn(context.Background(), "changefeed event for unregistered key, skipping",
 			log.String("namespace", nk.Namespace),
-			log.String("key", nk.Key),
+			log.String("keyname", nk.Key),
 		)
 
 		return
@@ -488,7 +488,7 @@ func (c *Client) refreshFromStore(nk nskey, op string) {
 		if err != nil {
 			c.logWarn(ctx, "refresh from store failed",
 				log.String("namespace", nk.Namespace),
-				log.String("key", nk.Key),
+				log.String("keyname", nk.Key),
 				log.Err(err),
 			)
 
@@ -503,7 +503,7 @@ func (c *Client) refreshFromStore(nk nskey, op string) {
 			// known-good value instead of resetting to the default.
 			c.logWarn(ctx, "refreshed key not found in store, keeping current value",
 				log.String("namespace", nk.Namespace),
-				log.String("key", nk.Key),
+				log.String("keyname", nk.Key),
 			)
 
 			return
@@ -513,7 +513,7 @@ func (c *Client) refreshFromStore(nk nskey, op string) {
 		if err := json.Unmarshal(entry.Value, &decoded); err != nil {
 			c.logWarn(ctx, "failed to unmarshal refreshed value, keeping current",
 				log.String("namespace", nk.Namespace),
-				log.String("key", nk.Key),
+				log.String("keyname", nk.Key),
 				log.Err(err),
 			)
 
@@ -526,7 +526,7 @@ func (c *Client) refreshFromStore(nk nskey, op string) {
 			// The error, never the value: a rejected value may be a secret.
 			c.logWarn(ctx, "refreshed value rejected by validator, keeping current value",
 				log.String("namespace", nk.Namespace),
-				log.String("key", nk.Key),
+				log.String("keyname", nk.Key),
 				log.Err(err),
 			)
 

@@ -98,7 +98,7 @@ func (c *Client) getEntry(ctx context.Context, namespace, key string) (Entry, bo
 	if err := json.Unmarshal(entry.Value, &decoded); err != nil {
 		c.logError(ctx, "failed to unmarshal stored value",
 			log.String("namespace", namespace),
-			log.String("key", key),
+			log.String("keyname", key),
 			log.Err(err),
 		)
 
@@ -340,7 +340,7 @@ func (c *Client) listFromStore(ctx context.Context, namespace string, keys []nsk
 			if err := json.Unmarshal(raw, &decoded); err != nil {
 				c.logError(ctx, "failed to unmarshal stored value",
 					log.String("namespace", namespace),
-					log.String("key", nk.Key),
+					log.String("keyname", nk.Key),
 					log.Err(err),
 				)
 
