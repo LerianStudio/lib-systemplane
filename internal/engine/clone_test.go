@@ -218,3 +218,25 @@ func TestValidateCloneSafeAcceptsPlainValues(t *testing.T) {
 		}
 	}
 }
+
+// BenchmarkCloneJSONMap pins the cost of the shape Clone actually sees on the
+// read path (one call per consumer read) and the delivery path (one per
+// subscriber per change): the map[string]any / []any tree json.Unmarshal
+// produces. It asserts nothing — a wall-clock threshold in a unit test is a
+// flake on a loaded box — but a regression back to the generic reflective walk
+// shows up here as several times the time and the allocations.
+func BenchmarkCloneJSONMap(b *testing.B) {
+	value := map[string]any{
+		"enabled":   true,
+		"limit":     float64(10),
+		"name":      "billing",
+		"threshold": float64(0.75),
+		"tiers":     []any{"bronze", float64(1), map[string]any{"silver": float64(2)}},
+	}
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		_ = Clone(value)
+	}
+}

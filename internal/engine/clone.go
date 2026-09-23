@@ -11,13 +11,66 @@ var timeType = reflect.TypeFor[time.Time]()
 // Clone returns a deep copy of v, so a subscriber may mutate what it receives
 // without reaching the engine's cache. A value reflection cannot copy, such as
 // a channel or a func, is returned unchanged.
+//
+// The type switch is the whole of the optimisation: Clone sits on the read
+// path (one call per consumer read) and on the delivery path (one per
+// subscriber per change), and every value arriving from a store is what
+// json.Unmarshal into `any` produces — nil, bool, float64, string,
+// map[string]any, []any and nothing else. The reflective walk below copies
+// those correctly but generically, at several times the cost. A registered
+// default is arbitrary Go, so it still falls through.
 func Clone(v any) any {
-	cloned, ok := cloneReflectValue(reflect.ValueOf(v))
-	if !ok {
+	switch value := v.(type) {
+	case nil, bool, string,
+		float32, float64,
+		int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64, uintptr:
+		// Immutable: a copy would alias nothing the caller can reach. json
+		// only ever produces bool, float64 and string here; the rest are the
+		// scalars a registered default may hold.
 		return v
+	case map[string]any:
+		return cloneJSONObject(value)
+	case []any:
+		return cloneJSONArray(value)
+	default:
+		cloned, ok := cloneReflectValue(reflect.ValueOf(v))
+		if !ok {
+			return v
+		}
+
+		return cloned.Interface()
+	}
+}
+
+// cloneJSONObject deep-copies a decoded JSON object. A nil map is returned as
+// a nil map, which is what the reflective walk does with one.
+func cloneJSONObject(m map[string]any) map[string]any {
+	if m == nil {
+		return nil
 	}
 
-	return cloned.Interface()
+	out := make(map[string]any, len(m))
+	for key, value := range m {
+		out[key] = Clone(value)
+	}
+
+	return out
+}
+
+// cloneJSONArray deep-copies a decoded JSON array. A nil slice is returned as
+// a nil slice, which is what the reflective walk does with one.
+func cloneJSONArray(s []any) []any {
+	if s == nil {
+		return nil
+	}
+
+	out := make([]any, len(s))
+	for i, value := range s {
+		out[i] = Clone(value)
+	}
+
+	return out
 }
 
 func cloneReflectValue(v reflect.Value) (reflect.Value, bool) {

@@ -15,8 +15,9 @@ type Registry interface {
 
 // KeyDef is the subset of a registered key the engine needs.
 type KeyDef struct {
-	// Default is the registered default value. The Registry returns a copy
-	// the engine may keep.
+	// Default is the registered default value. The engine never mutates what
+	// it receives and clones before caching or delivering; the Registry may
+	// return its stored default directly.
 	Default any
 	// Validate rejects a decoded value at ingress. nil accepts anything.
 	//
