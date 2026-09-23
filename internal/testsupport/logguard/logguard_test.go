@@ -59,6 +59,16 @@ func TestAssertNoneRedacted(t *testing.T) {
 			errs: []string{"source.go:8:", "source.go:12:"},
 		},
 		{
+			name: "a name passed to the variadic form is scanned",
+			dir:  "testdata/fields",
+			errs: []string{`field name "key"`},
+		},
+		{
+			name: "a name carried by a Field literal is scanned, spelled out or elided",
+			dir:  "testdata/fieldliteral",
+			errs: []string{`field name "key"`},
+		},
+		{
 			name: "a name the scan cannot read is skipped",
 			dir:  "testdata/nonliteral",
 		},
