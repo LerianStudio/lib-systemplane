@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,6 +27,10 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
+
+// changefeedCollection is the collection every feed watches, which the
+// Reconnect hooks below reach into by name because they run outside the store.
+const changefeedCollection = "systemplane_entries"
 
 func startContainer(t *testing.T) (*mongo.Client, func()) {
 	t.Helper()
@@ -118,6 +123,12 @@ func TestIntegration_MongoDBSingleTenant(t *testing.T) {
 	client, cleanup := startContainer(t)
 	t.Cleanup(cleanup)
 
+	// The database backing the store the most recent Factory call built, which
+	// is the one whose change-stream cursor Reconnect kills. Sub-tests run
+	// sequentially and the suite calls Reconnect from the same goroutine, so a
+	// plain variable needs no lock.
+	var lastDB string
+
 	factory := func(t *testing.T) (store.Store, func()) {
 		t.Helper()
 
@@ -131,6 +142,8 @@ func TestIntegration_MongoDBSingleTenant(t *testing.T) {
 			t.Fatalf("mongodb.New: %v", err)
 		}
 
+		lastDB = dbName
+
 		return s, func() {
 			_ = s.Close()
 			_ = client.Database(dbName).Drop(context.Background())
@@ -138,9 +151,208 @@ func TestIntegration_MongoDBSingleTenant(t *testing.T) {
 	}
 
 	systemplanetest.Run(t, factory, systemplanetest.RunOptions{
-		EventWait:             5 * time.Second,
-		SkipRevisionAndResync: false,
+		EventWait: 5 * time.Second,
+		Reconnect: killChangeStreamCursor(client, &lastDB),
 	})
+}
+
+// TestIntegration_MongoDBNamedTenant runs the same contract suite against a
+// store that owns no database of its own: every read, write and subscription
+// names a tenant and resolves through the connector. It is the stricter of the
+// two MongoDB configurations, because Start is a no-op here and the change
+// stream is therefore opened inside Subscribe itself rather than ahead of it.
+func TestIntegration_MongoDBNamedTenant(t *testing.T) {
+	client, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	var lastDB string
+
+	factory := func(t *testing.T) (store.Store, func()) {
+		t.Helper()
+
+		conn := newFakeConnector()
+		db := tenantDB(t, client, conn, "t1", "nt")
+
+		lastDB = db.Name()
+
+		s := tenantStore(t, conn)
+
+		// Closing and dropping here rather than leaning on the t.Cleanup
+		// tenantDB and tenantStore register: the suite calls one Factory per
+		// iteration inside SubscribeThenImmediateWriteNeverLosesTheEvent, and
+		// twenty live stores and databases queueing up for the end of that
+		// sub-test is a different test from the one it means to run.
+		return s, func() {
+			_ = s.Close()
+			_ = db.Drop(context.Background())
+		}
+	}
+
+	systemplanetest.Run(t, factory, systemplanetest.RunOptions{
+		EventWait: 5 * time.Second,
+		Scope:     store.Scope{Tenant: "t1"},
+		Reconnect: killChangeStreamCursor(client, &lastDB),
+	})
+}
+
+// TestIntegration_MongoDBPolling runs the same contract suite against the
+// polling fallback, which Config.PollInterval selects instead of a change
+// stream. It is a separate feed implementation with its own first-round-trip
+// readiness, its own OpResync and OpDisconnect edges and its own
+// tombstone-as-delete decoding, and it is the only feed a consumer on a
+// standalone MongoDB ever gets — so the contract has to hold on it too, not
+// only on the replica-set path.
+//
+// Zero scope only: the named-tenant polling path differs from this one solely
+// in how the collection is resolved, which
+// TestIntegration_MongoPollingIndexesCreatedForTenantCollection and
+// TestIntegration_MongoSubscribeReturnsErrorWhenFirstPollFails already pin.
+func TestIntegration_MongoDBPolling(t *testing.T) {
+	client, cleanup := mongodb.StartStandaloneContainer(t)
+	t.Cleanup(cleanup)
+
+	factory := func(t *testing.T) (store.Store, func()) {
+		t.Helper()
+
+		dbName := fmt.Sprintf("poll_%d", time.Now().UnixNano())
+
+		s, err := mongodb.New(mongodb.Config{
+			Client:       client,
+			Database:     dbName,
+			PollInterval: 50 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatalf("mongodb.New: %v", err)
+		}
+
+		return s, func() {
+			_ = s.Close()
+			_ = client.Database(dbName).Drop(context.Background())
+		}
+	}
+
+	// Reconnect stays nil, so ResyncAfterForcedReconnect skips: a poller holds
+	// no cursor to sever, and its outage narration is pinned backend-locally by
+	// TestIntegration_MongoPollingDisconnectAndResyncAroundFailedRound.
+	systemplanetest.Run(t, factory, systemplanetest.RunOptions{
+		EventWait: 5 * time.Second,
+	})
+}
+
+// killChangeStreamCursor builds the contract suite's Reconnect hook for
+// MongoDB: it finds the feed's own change-stream cursor from the server's own
+// operation census and kills it, which severs the feed with no production seam
+// — the alternative, reaching the live *mongo.ChangeStream, would mean
+// exposing it from the store purely for a test.
+//
+// The design depends on the kill landing on a getMore in flight: the reader
+// then gets CursorKilled (237) from the interrupted getMore, which the driver
+// does not resume, so the outage is narrated rather than swallowed. A cursor
+// killed while idle between getMores is different: the next getMore finds it
+// gone with CursorNotFound (43), which the driver treats as resumable whatever
+// the error labels say, resumes silently, and the feed announces nothing.
+// awaitSingleChangeStreamCursor therefore only ever returns a cursor with a
+// getMore in flight.
+//
+// dbName is read through a pointer rather than captured by value because the
+// hook runs inside a sub-test, against whichever database that sub-test's own
+// Factory call provisioned — which the suite records after Run was handed this
+// closure.
+func killChangeStreamCursor(client *mongo.Client, dbName *string) func(*testing.T) {
+	return func(t *testing.T) {
+		t.Helper()
+
+		id := awaitSingleChangeStreamCursor(t, client, *dbName)
+
+		var res struct {
+			CursorsKilled []int64 `bson:"cursorsKilled"`
+		}
+
+		err := client.Database(*dbName).RunCommand(context.Background(), bson.D{
+			{Key: "killCursors", Value: changefeedCollection},
+			{Key: "cursors", Value: bson.A{id}},
+		}).Decode(&res)
+		if err != nil {
+			t.Fatalf("killCursors %d on %s.%s: %v", id, *dbName, changefeedCollection, err)
+		}
+
+		if !slices.Contains(res.CursorsKilled, id) {
+			t.Fatalf("killCursors %d on %s.%s killed %v, want the cursor named", id, *dbName, changefeedCollection, res.CursorsKilled)
+		}
+	}
+}
+
+// awaitSingleChangeStreamCursor polls the server until exactly one cursor on
+// the feed's collection has a getMore in flight and returns its id.
+//
+// Polling rather than a single look: between two getMore round-trips the feed's
+// cursor is idle and absent from the census, and between a List and its
+// exhaustion a second cursor exists, so a single sample can legitimately see
+// zero or two. Exactly one in-flight getMore is the state the kill is
+// meaningful in (see killChangeStreamCursor), and it is the steady state of a
+// subscribed feed, whose awaitData getMore blocks server-side most of the time.
+func awaitSingleChangeStreamCursor(t *testing.T, client *mongo.Client, dbName string) int64 {
+	t.Helper()
+
+	deadline := time.Now().Add(30 * time.Second)
+
+	for {
+		ids := inFlightGetMoreCursorIDs(t, client, dbName)
+		if len(ids) == 1 {
+			return ids[0]
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("waiting for exactly one in-flight getMore on %s.%s: found cursors %v", dbName, changefeedCollection, ids)
+		}
+
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// inFlightGetMoreCursorIDs asks the server which cursors on the feed's
+// collection have a getMore running right now. Idle cursors are left out on
+// purpose (idleCursors stays off, and the match pins type "op" and op
+// "getmore"): killing one of those is resumed silently by the driver.
+func inFlightGetMoreCursorIDs(t *testing.T, client *mongo.Client, dbName string) []int64 {
+	t.Helper()
+
+	ctx := context.Background()
+
+	cur, err := client.Database("admin").Aggregate(ctx, mongo.Pipeline{
+		bson.D{{Key: "$currentOp", Value: bson.D{
+			{Key: "allUsers", Value: true},
+		}}},
+		bson.D{{Key: "$match", Value: bson.D{
+			{Key: "ns", Value: dbName + "." + changefeedCollection},
+			{Key: "type", Value: "op"},
+			{Key: "op", Value: "getmore"},
+			{Key: "cursor.cursorId", Value: bson.D{{Key: "$exists", Value: true}}},
+		}}},
+		bson.D{{Key: "$project", Value: bson.D{
+			{Key: "cursor.cursorId", Value: 1},
+		}}},
+	})
+	if err != nil {
+		t.Fatalf("$currentOp for %s.%s: %v", dbName, changefeedCollection, err)
+	}
+
+	var ops []struct {
+		Cursor struct {
+			ID int64 `bson:"cursorId"`
+		} `bson:"cursor"`
+	}
+
+	if err := cur.All(ctx, &ops); err != nil {
+		t.Fatalf("decode $currentOp for %s.%s: %v", dbName, changefeedCollection, err)
+	}
+
+	ids := make([]int64, 0, len(ops))
+	for _, op := range ops {
+		ids = append(ids, op.Cursor.ID)
+	}
+
+	return ids
 }
 
 func TestIntegration_MongoDBMultiTenantIsolation(t *testing.T) {
@@ -1867,14 +2079,16 @@ func TestIntegration_MongoDeleteThenRecreateConvergesToLiveValue(t *testing.T) {
 // tcpProxy forwards a local port to the container's MongoDB port so a test can
 // sever the store's connection and restore it on the same address.
 //
-// This is how an outage is produced deterministically. killCursors would also
-// work — a CursorKilled carries no ResumableChangeStreamError label, so the
-// driver does not resume it transparently — but obtaining the live cursor id
-// means exposing the feed's *mongo.ChangeStream from production code purely for
-// a test. Dropping the container is worse: a plain network error IS resumable,
-// the driver resumes it internally, and a short outage would announce nothing
-// at all. The same hazard applies here, which is why the store's client is
-// built with a 2s server-selection bound and every outage below outlasts it.
+// The proxy exists because it produces a sustained, restorable outage: the
+// address stays dead for as long as a test wants, longer than the store
+// client's 2s server-selection bound, so every reopen attempt fails until the
+// test restores it. TestIntegration_MongoRepeatedReopenFailuresEmitOneDisconnect
+// needs exactly that. A one-shot severance cannot provide it; that is what
+// killChangeStreamCursor does for the contract suite's Reconnect hook, and the
+// feed reopens at once behind it. Dropping the container instead is worse: a
+// plain network error IS resumable, the driver resumes it internally, and a
+// short outage would announce nothing at all — which is why every outage below
+// outlasts the server-selection bound.
 type tcpProxy struct {
 	target string
 	addr   string

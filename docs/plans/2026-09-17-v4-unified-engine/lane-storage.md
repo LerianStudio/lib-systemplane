@@ -33,7 +33,7 @@ Read `index.md` § Frozen Contracts FC-2, FC-3, FC-8, FC-9 and decisions D2, D3,
 |-------|-----------|-------|--------|
 | 1 | Postgres stores and returns revisions, resolves named tenants through the connector, runs one LISTEN feed per scope, and narrates loss and recovery with `OpDisconnect` / `OpResync`; DDL v4 and the v3→v4 migration ship and are proven idempotent on a container | 1.1, 1.2, 1.3, 1.4, 1.5 | Complete |
 | 2 | MongoDB does the same: connector, revision via an atomic update pipeline, per-scope change streams that are open before `Subscribe` returns (closing a live event-loss bug), `OpDisconnect` on cursor death and `OpResync` on every re-open, polling fallback honouring both | 2.1, 2.2, 2.3 | Complete |
-| 3 | The contract suite asserts revision, scope, disconnect and resync unconditionally and runs against both backends in both modes; `DefaultSeedSQL` is gone | 3.1, 3.2 | Epic-level |
+| 3 | The contract suite asserts revision, scope, disconnect and resync unconditionally and runs against both backends in both modes; `DefaultSeedSQL` is gone | 3.1, 3.2 | Complete (2026-09-23) |
 
 ---
 
@@ -124,7 +124,7 @@ While in `ddl.go`, fix the two stale comments it carries, because both name file
 
 **Context:** `internal/postgres/postgres.go:306-349` (`Set`) runs an `INSERT ... ON CONFLICT DO UPDATE` with `ExecContext` and returns a hard-coded `0, nil` — the FC-2 shim. FC-2 now requires the revision actually stored. The v4 DDL does the arithmetic: `systemplane_bump_revision_trigger` is `BEFORE UPDATE ... WHEN (OLD.value IS DISTINCT FROM NEW.value)` and sets `NEW.revision := OLD.revision + 1`, so the row Postgres finally writes already carries the right number and `RETURNING` observes it post-trigger.
 
-**Implementation vision:** Write the failing test first (`TestIntegration_PostgresSetReturnsRevision` in `postgres_integration_test.go`): insert → revision 1; update with a different value → 2; update with the SAME value → still 2. Then change the statement to end in `RETURNING revision` and swap `ExecContext` for `QueryRowContext(...).Scan(&revision)`:
+**Implementation vision:** Write the failing test first (`TestIntegration_PostgresSetReturnsRevision` in `postgres_integration_test.go`; deleted in Phase 3 once the suite's `RevisionMonotonic` covered it for both backends): insert → revision 1; update with a different value → 2; update with the SAME value → still 2. Then change the statement to end in `RETURNING revision` and swap `ExecContext` for `QueryRowContext(...).Scan(&revision)`:
 
 ```sql
 INSERT INTO %s (namespace, key, value, updated_at, updated_by)
@@ -879,8 +879,8 @@ Because this task closes a reproducible flake, its verification runs the Mongo s
 **Goal:** Every FC-2 assertion is mandatory, and each backend runs the suite in single-tenant and in named-tenant mode.
 **Scope:** `systemplanetest/contract.go`, `internal/postgres/postgres_integration_test.go`, `internal/mongodb/mongodb_integration_test.go`.
 **Dependencies:** Phases 1 and 2.
-**Done when:** `RunOptions.SkipRevisionAndResync` no longer exists and no call site references it; each backend calls `Run` twice — once with the zero `Scope` against a directly-constructed store, once with `Scope{Tenant:"t1"}` against a store built with a fake connector over a dedicated tenant database — and all four runs pass every sub-test including `SubscribeEmitsResyncFirst` and `SubscribeThenImmediateWriteNeverLosesTheEvent` (the named-tenant configurations open the feed inside `Subscribe` itself, so they are the strictest form of the readiness assertion Epic 2.3 introduced); the suite gains a `RunOptions.Reconnect func(t *testing.T)` hook (backend-supplied, because only the backend knows how to kill its own feed — `pg_terminate_backend` for Postgres, `killCursors` for Mongo) driving a `ResyncAfterForcedReconnect` sub-test that records the delivery sequence and asserts exactly one `OpDisconnect`, then one `OpResync`, then key events, with both markers carrying `opts.Scope`; the Postgres-local revision tests written in Task 1.2.1 that are now redundant with `RevisionMonotonic` are deleted rather than left duplicated, while the genuinely backend-specific ones (NOTIFY payload shape, connector DSN resolution, backend-pid termination, two-tenant feed isolation, clean-close-emits-no-disconnect) stay.
-**Status:** Pending
+**Done when:** `RunOptions.SkipRevisionAndResync` no longer exists and no call site references it; Postgres calls `Run` twice and MongoDB three times (change stream and polling fallback) — once with the zero `Scope` against a directly-constructed store, once with `Scope{Tenant:"t1"}` against a store built with a fake connector over a dedicated tenant database — and all four runs pass every sub-test including `SubscribeEmitsResyncFirst` and `SubscribeThenImmediateWriteNeverLosesTheEvent` (the named-tenant configurations open the feed inside `Subscribe` itself, so they are the strictest form of the readiness assertion Epic 2.3 introduced); the suite gains a `RunOptions.Reconnect func(t *testing.T)` hook (backend-supplied, because only the backend knows how to kill its own feed — `pg_terminate_backend` for Postgres, `killCursors` for Mongo) driving a `ResyncAfterForcedReconnect` sub-test that records the delivery sequence and asserts exactly one `OpDisconnect`, then one `OpResync`, then key events, with both markers carrying `opts.Scope`; the Postgres-local revision tests written in Task 1.2.1 that are now redundant with `RevisionMonotonic` are deleted rather than left duplicated, while the genuinely backend-specific ones (NOTIFY payload shape, connector DSN resolution, backend-pid termination, two-tenant feed isolation, clean-close-emits-no-disconnect) stay.
+**Status:** Done
 
 ### Epic 3.2: `DefaultSeedSQL` removed
 
@@ -888,7 +888,18 @@ Because this task closes a reproducible flake, its verification runs the Mongo s
 **Scope:** `ddl/default_seed.sql` (deleted), `ddl.go`, `ddl_test.go`.
 **Dependencies:** none
 **Done when:** `ddl/default_seed.sql` is deleted, `ddl.go` carries neither the `defaultSeedSQL` embed nor `DefaultSeedSQL()`, `TestDefaultSeedSQL_NonEmpty` and `TestDefaultSeedSQL_ContainsExpectedStatements` are gone from `ddl_test.go`, and `go build ./... && go test -tags=unit ./...` are green. The repo-wide absence check for `DefaultSeedSQL` is NOT this lane's to run — a lane cannot prove a negative while siblings are writing (lane-cut rule 4); the `integration` lane owns it, and `MIGRATION-v4.md` naming the affected consumers belongs to the `docs` lane.
-**Status:** Pending
+**Status:** Done
+
+### Phase 3 as built (2026-09-23, orchestrator close-out)
+
+Five units, one harness (five Ring reviewers, one contrarian per unit), PASS with no standing refutation; the review's one Medium and six Lows landed as follow-up commits on the same branch before the PR opened.
+
+- **Suite unconditional.** `RunOptions.SkipRevisionAndResync` is gone, and so is `RunOptions.SkipSubscribe`: it had no call site left, and its godoc ("multi-tenant backends pass true") was false in v4, where a named tenant scope subscribes normally and only the zero scope under `WithMultiTenantEnabled` is refused (the suite handles that refusal inline with a `t.Skip`).
+- **Five configurations, not four.** Postgres runs the suite twice (own database; named tenant through the connector). MongoDB runs it three times: change stream own database, change stream named tenant, and the polling fallback, a distinct feed implementation the suite had never run against (added at elaboration).
+- **Forced reconnect is proven.** The suite gained a backend-supplied `Reconnect` hook and `ResyncAfterForcedReconnect`: exactly one `OpDisconnect`, then one `OpResync`, both carrying the subscriber's scope, then key events. Postgres severs the LISTEN connection with `pg_terminate_backend` on the feed's backend PID; MongoDB kills the change-stream cursor through `$currentOp` + `killCursors`, and only a cursor with an in-flight `getMore` (the driver resumes a killed idle cursor silently, so killing one would burn the recovery wait). The Mongo-local outage tests keep the TCP proxy because it produces a sustained, restorable outage a one-shot cursor kill cannot.
+- **`TestIntegration_PostgresSetReturnsRevision` deleted.** The suite's `RevisionMonotonic` covers it for both backends; the audit-trap table below points at the suite.
+- **`DefaultSeedSQL()` and `ddl/default_seed.sql` removed** (breaking, `refactor(core)!`). README, CLAUDE.md and MIGRATION-v3.md prose no longer name it or the v3 trigger function; `examples/manager` and `internal/manager` still do in comments and are deleted whole by engine-core Phase 2, so they were left alone to avoid a modify/delete conflict.
+- **Handed to the docs lane:** `MIGRATION-v4.md` must tell a consumer whose migration pipeline ran the seed to delete that step (registered defaults cover every value it carried).
 
 **Phase 3 exit gate:** `make test-unit` green, and `go test -tags=integration -count=1 -timeout 10m ./internal/postgres/... ./internal/mongodb/...` green across all four suite configurations.
 
@@ -917,7 +928,7 @@ Because this task closes a reproducible flake, its verification runs the Mongo s
 | The Mongo polling fallback's first round-trip fails and `Subscribe` either blocks, or returns success over a loop that never started | `TestIntegration_MongoSubscribeReturnsErrorWhenFirstPollFails` | 2 |
 | A `$`-prefixed namespace, key or actor is evaluated as a field path by the Mongo pipeline and silently corrupts the document | `TestIntegration_MongoDollarPrefixedStringsStoredVerbatim` with the Postgres parity case `TestIntegration_PostgresDollarPrefixedStringsStoredVerbatim` | 1, 2 |
 | **A write issued right after `Subscribe` returns is lost because the Mongo change stream is not open yet** (live bug: 3 failures in 5 runs on mordor; a stream with no resume token attaches at the current oplog position, so a pre-attach write is never delivered) | suite `SubscribeThenImmediateWriteNeverLosesTheEvent` — 20 fresh-store iterations, zero losses, run by both backends and in all four configurations from Phase 3; plus `TestIntegration_MongoSubscribeReturnsErrorWhenWatchFails` for the failure path, and a `-count=5` gate on the Mongo suite | 2, 3 |
-| An identical rewrite burns a revision and forces a spurious callback | `TestIntegration_PostgresSetReturnsRevision` (pg) / `TestIntegration_MongoIdenticalWriteKeepsRevision` (mongo) / suite `RevisionMonotonic` | 1, 2, 3 |
+| An identical rewrite burns a revision and forces a spurious callback | suite `RevisionMonotonic` (both backends; the dedicated Postgres test was deleted in Phase 3) / `TestIntegration_MongoIdenticalWriteKeepsRevision` (mongo) | 1, 2, 3 |
 | A named tenant silently falls back to the process-wide handle when no connector is configured | `TestStore_NamedTenantScopeWithoutConnector` (pg, extended to every method incl. `Subscribe`) / `TestStore_NamedTenantWithoutConnector` (mongo) | 1, 2 |
 | Two tenants subscribed at once cross-deliver events | `TestIntegration_PostgresTwoTenantFeedsAreIsolated` / `TestIntegration_MongoTwoTenantFeedsAreIsolated` — each tenant receives only its own events, each preceded by its own scoped `OpResync` | 1, 2 |
 | A subscriber joining an already-connected feed never reconciles | `TestIntegration_PostgresSubscribeAfterStartGetsResyncFirst` / suite `SubscribeEmitsResyncFirst` | 1, 3 |
