@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -456,4 +457,86 @@ func TestValidatorErrorIsRedactedByKeyPolicy(t *testing.T) {
 			t.Errorf("the redacted line names no error type, so an operator cannot tell the rejections apart: %s", got)
 		}
 	})
+}
+
+// TestUndecodableValueIsRedactedByKeyPolicy pins the SECOND place a
+// configuration value reaches the log stream: the message of the decode error
+// itself. encoding/json reports an unparsable row as "invalid character 'h'
+// looking for beginning of value", quoting the offending byte — so a key
+// registered RedactFull whose row is a raw secret publishes that secret's
+// first byte at WARN, past every redaction the key was registered with.
+//
+// It is reachable rather than theoretical: the MongoDB backend stores value as
+// a BSON string it never validates as JSON, so a foreign writer or a
+// hand-edited document produces exactly this error.
+//
+// The error returned to the caller is unchanged in both cases; only the log
+// line is redacted.
+func TestUndecodableValueIsRedactedByKeyPolicy(t *testing.T) {
+	const (
+		secret = "hunter2-s3cret"
+		msg    = "failed to unmarshal stored value, keeping cached value"
+	)
+
+	visible := NSKey{Namespace: "billing", Key: "limits"}
+	sensitive := NSKey{Namespace: "billing", Key: "apitoken"}
+
+	t.Run("RedactNone keeps the decoder's own message", func(t *testing.T) {
+		e, rec := loggingEngine(t, map[NSKey]KeyDef{visible: {Default: "fallback"}}, newFakeStore())
+
+		ingestRow(e, jsonRow(visible, 1, secret, "ops"))
+
+		got := requireOneRecord(t, rec, msg)
+		requireNotRedacted(t, got)
+
+		if !strings.Contains(got.String(), "invalid character") {
+			t.Errorf("a key registered without redaction lost the decoder's message: %s", got)
+		}
+	})
+
+	t.Run("RedactFull withholds every byte of the value", func(t *testing.T) {
+		e, rec := loggingEngine(t, map[NSKey]KeyDef{
+			sensitive: {Default: "fallback", Redacted: true},
+		}, newFakeStore())
+
+		ingestRow(e, jsonRow(sensitive, 1, secret, "ops"))
+
+		got := requireOneRecord(t, rec, msg)
+		requireNotRedacted(t, got)
+
+		rendered := fmt.Sprint(got.fields())
+
+		// The first byte, the prefix it starts, the whole value and its
+		// length: a decode error that carries any of them tells a log reader
+		// something about the secret it was not entitled to.
+		for _, leak := range []string{secret, "hunter", "'h'", strconv.Itoa(len(secret))} {
+			if strings.Contains(rendered, leak) {
+				t.Errorf("the redacted decode line carries %q from the stored value: %s", leak, rendered)
+			}
+		}
+
+		if !strings.Contains(rendered, "json.SyntaxError") {
+			t.Errorf("the redacted line names no error type, so an operator cannot tell the failures apart: %s", rendered)
+		}
+	})
+}
+
+// TestReReadCanceledOutsideShutdownIsLoggedAtWarn is the companion of
+// TestReReadCanceledByCloseIsLoggedAtDebug: a store that surfaces a wrapped
+// context.Canceled for a reason that is NOT this engine shutting down — a
+// connection-pool checkout aborted, a driver-internal cancellation — is a real
+// read failure. The cache goes on serving a value nothing confirmed, so
+// logging it below WARN hides the one trace that it happened.
+func TestReReadCanceledOutsideShutdownIsLoggedAtWarn(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	fs := newFakeStore()
+	e, rec := loggingEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs)
+
+	fs.onGet(func(store.Scope, NSKey) error {
+		return fmt.Errorf("pool checkout aborted: %w", context.Canceled)
+	})
+
+	e.refreshKey(store.Scope{}, nk)
+
+	requireLogged(t, rec, log.LevelWarn, "changefeed re-read failed, keeping current value", nk)
 }

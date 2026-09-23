@@ -221,7 +221,7 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
 
 	se, found, err := e.store.Get(ctx, scope, nk.Namespace, nk.Key)
 	if err != nil {
-		if errors.Is(err, context.Canceled) {
+		if e.canceledByShutdown(err) {
 			e.logDebug(ctx, "changefeed re-read canceled during shutdown",
 				log.String("namespace", nk.Namespace),
 				log.String("keyname", nk.Key),
@@ -281,6 +281,25 @@ func (e *Engine) recordFeedOutcome(scope store.Scope, nk NSKey, usable bool) {
 	defer sc.reconcileMu.Unlock()
 
 	sc.record(nk, usable)
+}
+
+// canceledByShutdown reports whether err is nothing more than this engine
+// ending: a context.Canceled raised because Close canceled the lifecycle
+// context every store call derives from.
+//
+// Both halves are required, and it is the one predicate the re-read and the
+// reconcile both ask. A clean Close cancels whatever store calls are in
+// flight, so reporting those at WARN makes every shutdown look like an
+// incident. But a store may surface a wrapped context.Canceled for a reason
+// that is NOT this shutdown — a pool checkout aborted, a driver cancelling
+// internally — and that is a real read failure: the cache goes on serving a
+// value nothing confirmed, so it belongs at WARN like any other. The lifecycle
+// context is what tells the two apart.
+//
+// The bound that ends a hung store call is DeadlineExceeded, not Canceled, so
+// it is unaffected and stays at WARN.
+func (e *Engine) canceledByShutdown(err error) bool {
+	return errors.Is(err, context.Canceled) && e.dispatchContext().Err() != nil
 }
 
 // logDebug reports something that is expected rather than wrong — a re-read

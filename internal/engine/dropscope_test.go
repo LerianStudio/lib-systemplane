@@ -246,3 +246,49 @@ func TestPublishRacingDropScopeStartsNoWorker(t *testing.T) {
 		t.Fatalf("Close() = %v, want nil", err)
 	}
 }
+
+// TestReconcileForDroppedScopeDoesNotList mirrors onto the reconcile the guard
+// the changefeed re-read already has. The reconcile worker's select gives the
+// stop signal no priority over a resync already sitting in the mailbox, so a
+// scope dropped with work queued gets one more reconcile — a whole-scope
+// Store.List against a tenant database that tenant no longer has.
+//
+// The worker's exact state is reproduced rather than raced for: the mailbox
+// item is taken, the scope is dropped, and the reconcile then runs.
+func TestReconcileForDroppedScopeDoesNotList(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	fs := newFakeStore()
+	e := storeEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0, 2*time.Second)
+
+	bringUp(t, e, dropTenant)
+
+	sc := e.trackedScope(dropTenant)
+	if sc == nil {
+		t.Fatal("the tenant scope was not brought up")
+	}
+
+	sc.armReconcile()
+
+	pending, ok := sc.takeReconcile()
+	if !ok {
+		t.Fatal("arming a reconcile left the mailbox empty")
+	}
+
+	e.dropScope(dropTenant)
+
+	lists := fs.listCount()
+
+	e.runOneReconcile(e.dispatchContext(), sc, pending)
+
+	if got := fs.listCount(); got != lists {
+		t.Errorf("Store.List called %d times for a dropped scope, want %d", got, lists)
+	}
+
+	if tracked(e, dropTenant) {
+		t.Error("a queued reconcile re-created the dropped scope")
+	}
+
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close() = %v, want nil", err)
+	}
+}

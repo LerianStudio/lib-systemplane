@@ -232,6 +232,17 @@ func (e *Engine) reconcileScope(sc *scopeState, arm reconcileArming) {
 func (e *Engine) applyScope(sc *scopeState, arm reconcileArming) (superseded bool, err error) {
 	ctx := e.dispatchContext()
 
+	// The same guard the changefeed re-read takes before its store call, and
+	// for the same reason. The worker's select gives reconcileStop no priority
+	// over a resync already buffered in the mailbox, so a scope dropped with
+	// work queued gets one more reconcile: a whole-scope List against a tenant
+	// database that tenant no longer has, applied into state nothing tracks.
+	// Abandoned rather than failed — nothing is published, nothing is
+	// completed, and the drop is not a fault to warn about.
+	if e.scopeForEvent(sc.scope, NSKey{}) == nil {
+		return true, nil
+	}
+
 	entries, err := e.listSnapshot(ctx, sc.scope)
 	if err != nil {
 		const msg = "scope reconcile failed to list, keeping cached values"
@@ -240,10 +251,8 @@ func (e *Engine) applyScope(sc *scopeState, arm reconcileArming) (superseded boo
 
 		// Every ordinary Close with a reconcile in flight cancels its List, so
 		// reporting that at WARN makes a clean shutdown look like an incident
-		// and trains operators to ignore the channel a real failure uses. The
-		// reconcile timeout that ends a hung List is DeadlineExceeded, not
-		// Canceled, and stays at WARN like every other failure.
-		if errors.Is(err, context.Canceled) && ctx.Err() != nil {
+		// and trains operators to ignore the channel a real failure uses.
+		if e.canceledByShutdown(err) {
 			e.logDebug(ctx, msg, fields...)
 		} else {
 			e.logWarn(ctx, msg, fields...)

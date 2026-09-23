@@ -646,3 +646,69 @@ func TestCloseTimeoutInsideAStoreCallSaysSo(t *testing.T) {
 	release()
 	e.dispatchWG.Wait()
 }
+
+// TestSubscribeLosingTheRaceToCloseUnsubscribes closes a lifecycle leak that
+// only a losing race can reach. Close reads each tracked scope's unsubscribe
+// exactly once; a Start whose Store.Subscribe is still in flight at that
+// moment has none to be read, and the handle it stores microseconds later is
+// then held by nobody. The changefeed stays registered in the store's
+// subscriber list for the life of the store, keeping the whole Engine
+// reachable and — once a scope means a tenant — one live connection per
+// tenant whose Start lost the race.
+//
+// The race is driven rather than raced for: Subscribe is held open until Close
+// has marked the engine closed, which is exactly the window the leak needs.
+func TestSubscribeLosingTheRaceToCloseUnsubscribes(t *testing.T) {
+	fs := newFakeStore()
+	e := New(Config{Store: fs, Registry: fakeRegistry{}, CloseTimeout: 2 * time.Second})
+
+	t.Cleanup(func() { _ = e.Close() })
+
+	reached := make(chan struct{})
+	release := make(chan struct{})
+
+	fs.onSubscribe(func(store.Scope) error {
+		fs.onSubscribe(nil)
+		close(reached)
+		<-release
+
+		return nil
+	})
+
+	started := make(chan error, 1)
+
+	go func() { started <- e.Start(context.Background()) }()
+
+	mustReceive(t, reached, "Start to reach Store.Subscribe")
+
+	closed := closeInBackground(e)
+
+	waitFor(t, hangGuard, "Close to mark the engine closed", func() bool { return e.closed.Load() })
+
+	close(release)
+
+	mustCloseCleanly(t, closed)
+
+	select {
+	case err := <-started:
+		if !errors.Is(err, store.ErrClosed) {
+			t.Errorf("Start() = %v, want store.ErrClosed: a Start that lost the race to Close must not "+
+				"report a scope it cannot keep", err)
+		}
+	case <-time.After(hangGuard):
+		t.Fatal("Start never returned")
+	}
+
+	if got := fs.unsubscribeCount(); got != 1 {
+		t.Errorf("unsubscribe called %d times, want 1: the changefeed Start opened outlives the engine", got)
+	}
+
+	if got := fs.liveSubscriptions(); got != 0 {
+		t.Errorf("%d changefeeds still registered after Close, want 0: the engine stays reachable "+
+			"from the store's subscriber list forever", got)
+	}
+
+	if tracked(e, store.Scope{}) {
+		t.Error("the engine still tracks a scope whose bring-up lost the race to Close")
+	}
+}

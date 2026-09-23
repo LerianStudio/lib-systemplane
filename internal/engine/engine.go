@@ -154,7 +154,9 @@ func New(cfg Config) *Engine {
 // Three failures, three different outcomes:
 //
 //   - Subscribe fails: the scope is dropped entirely and the error returned. A
-//     tracked scope whose feed never opened would look fresh forever.
+//     tracked scope whose feed never opened would look fresh forever. A
+//     Subscribe that SUCCEEDS after Close began is rolled back the same way,
+//     releasing the changefeed it just opened.
 //   - ctx expires before the first reconcile completes: the ctx error is
 //     returned and the scope is left tracked and stale. A backend that never
 //     emits OpResync is broken, and failing loudly beats serving registered
@@ -248,6 +250,20 @@ func (e *Engine) bringUpScope(scope store.Scope) (*scopeState, error) {
 		e.dropScope(scope)
 
 		return nil, fmt.Errorf("systemplane: changefeed for %s failed to open: %w", scopeLabel(scope), err)
+	}
+
+	// Close reads each tracked scope's unsubscribe exactly once, and a Subscribe
+	// still in flight at that moment has none to be read. Storing the handle
+	// afterwards would leave it held by nobody: the callback stays registered in
+	// the store's subscriber list for the life of the store, keeping the whole
+	// Engine reachable and — once a scope is a tenant — one live connection per
+	// tenant whose bring-up lost this race. So the loser releases its own
+	// subscription and reports the scope it cannot keep.
+	if e.closed.Load() {
+		unsubscribe()
+		e.dropScope(scope)
+
+		return nil, store.ErrClosed
 	}
 
 	sc.mu.Lock()

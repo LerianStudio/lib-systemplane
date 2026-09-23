@@ -79,7 +79,7 @@ func (e *Engine) prepare(ctx context.Context, scope store.Scope, se store.Entry)
 		e.logWarn(ctx, "failed to unmarshal stored value, keeping cached value",
 			log.String("namespace", se.Namespace),
 			log.String("keyname", se.Key),
-			log.Err(err),
+			errorDetail(def.Redacted, "decode failed", err),
 		)
 
 		return publication{}, false
@@ -104,7 +104,8 @@ func (e *Engine) prepare(ctx context.Context, scope store.Scope, se store.Entry)
 }
 
 // logValidatorRejection reports a row the registered validator refused, with
-// the key's registered redaction policy applied to the ERROR TEXT.
+// the key's registered redaction policy applied to the ERROR TEXT by
+// errorDetail.
 //
 // The validator is consumer code and its message is a consumer-built string,
 // so it is the one place a configuration value reaches the log stream having
@@ -117,16 +118,35 @@ func (e *Engine) prepare(ctx context.Context, scope store.Scope, se store.Entry)
 // The error returned to the caller of Set is unchanged in both cases. This is
 // the log stream, not the API.
 func (e *Engine) logValidatorRejection(ctx context.Context, nk NSKey, redacted bool, err error) {
-	detail := log.Err(err)
-	if redacted {
-		detail = log.String("error", fmt.Sprintf("validation failed (%T)", err))
-	}
-
 	e.logWarn(ctx, "stored value rejected by validator, keeping cached value",
 		log.String("namespace", nk.Namespace),
 		log.String("keyname", nk.Key),
-		detail,
+		errorDetail(redacted, "validation failed", err),
 	)
+}
+
+// errorDetail renders a rejection's cause under the key's registered redaction
+// policy: the error itself for an ordinary key, and for a redacted one only
+// what refused it plus the error's dynamic type.
+//
+// Both rejections a stored row can produce carry the value in their message.
+// A validator is consumer code and may name what it refused — "token %q is too
+// short". encoding/json is worse, because it needs no help: an unparsable row
+// comes back as "invalid character 'h' looking for beginning of value", which
+// quotes the value's first byte and is reachable through any writer that does
+// not go through this library — the MongoDB backend stores value as a BSON
+// string nothing validates as JSON, so a hand-edited document lands here.
+//
+// The type alone is enough to tell two failures apart and can never carry a
+// byte of the value; the offset is withheld for the same reason, being a
+// measurement of the secret. What the caller of Set receives is unchanged in
+// both cases: this is the log stream, not the API.
+func errorDetail(redacted bool, what string, err error) log.Field {
+	if !redacted {
+		return log.Err(err)
+	}
+
+	return log.String("error", fmt.Sprintf("%s (%T)", what, err))
 }
 
 // ingestDefault is the ingress for the no-row case: a feed delete, or a
