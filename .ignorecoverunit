@@ -11,6 +11,9 @@ examples/*
 # Contract test harness exercised by backend integration suites.
 systemplanetest/*
 
+# Shared test-support helpers, exercised through the suites that import them.
+internal/testsupport/*
+
 # Backend live-I/O files are covered by integration tests; unit coverage keeps
 # pure adapter config/parsing/dispatch helpers in the denominator.
 internal/postgres/postgres.go

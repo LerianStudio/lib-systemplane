@@ -15,6 +15,7 @@ import (
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/runtime"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/debounce"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/engine"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/manager"
 	mongoDB "github.com/LerianStudio/lib-systemplane/v4/internal/mongodb"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/postgres"
@@ -220,7 +221,7 @@ func (c *Client) Start(ctx context.Context) error {
 		c.cacheMu.Lock()
 
 		for nk, def := range c.registry {
-			c.cache[nk] = cloneValue(def.defaultValue)
+			c.cache[nk] = engine.Clone(def.defaultValue)
 		}
 
 		c.cacheMu.Unlock()
@@ -334,7 +335,7 @@ func (c *Client) hydrate(ctx context.Context) error {
 		if !registered {
 			c.logWarn(ctx, "unregistered key in store, skipping",
 				log.String("namespace", entry.Namespace),
-				log.String("key", entry.Key),
+				log.String("keyname", entry.Key),
 			)
 
 			continue
@@ -354,7 +355,7 @@ func (c *Client) hydrate(ctx context.Context) error {
 		if err := json.Unmarshal(entry.Value, &decoded); err != nil {
 			c.logWarn(ctx, "failed to unmarshal stored value, keeping default",
 				log.String("namespace", entry.Namespace),
-				log.String("key", entry.Key),
+				log.String("keyname", entry.Key),
 				log.Err(err),
 			)
 
@@ -368,7 +369,7 @@ func (c *Client) hydrate(ctx context.Context) error {
 			// The error, never the value: a rejected value may be a secret.
 			c.logWarn(ctx, "stored value rejected by validator, keeping default",
 				log.String("namespace", entry.Namespace),
-				log.String("key", entry.Key),
+				log.String("keyname", entry.Key),
 				log.Err(err),
 			)
 
@@ -456,7 +457,43 @@ func (c *Client) onEvent(evt store.Event) {
 	})
 }
 
+// recoverRefresh reports a panic raised under a changefeed re-read, naming the
+// key it happened on.
+//
+// The debouncer's guard catches the panic either way, and this is what that
+// guard cannot say: runtime.RecoverAndLog logs source="debounce" and nothing
+// else, and in production mode the recovered value and the stack are redacted
+// out of that line, so an operator learns something under the debouncer blew up
+// and never which namespace or key. internal/engine.(*Engine).recoverRefresh is
+// the same guard on the v4 path.
+//
+// HandlePanicValue rather than a re-panic into that net because only it records
+// panic_recovered_total and the span event: RecoverAndLog takes no context and
+// records neither, so recovering here counts the panic once instead of not at
+// all. The recovered value stays out of the identity line — it is whatever the
+// panicking code was holding, and redacting it belongs with the handler.
+func (c *Client) recoverRefresh(nk nskey) {
+	recovered := recover()
+	if recovered == nil {
+		return
+	}
+
+	ctx := c.lifecycleCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	c.logError(ctx, "systemplane: changefeed re-read panicked",
+		log.String("namespace", nk.Namespace),
+		log.String("keyname", nk.Key),
+	)
+
+	runtime.HandlePanicValue(ctx, c.logger, recovered, "systemplane.client", "refresh")
+}
+
 func (c *Client) refreshFromStore(nk nskey, op string) {
+	defer c.recoverRefresh(nk)
+
 	c.registryMu.RLock()
 	def, registered := c.registry[nk]
 	c.registryMu.RUnlock()
@@ -464,7 +501,7 @@ func (c *Client) refreshFromStore(nk nskey, op string) {
 	if !registered {
 		c.logWarn(context.Background(), "changefeed event for unregistered key, skipping",
 			log.String("namespace", nk.Namespace),
-			log.String("key", nk.Key),
+			log.String("keyname", nk.Key),
 		)
 
 		return
@@ -480,14 +517,14 @@ func (c *Client) refreshFromStore(nk nskey, op string) {
 	ctx, cancel := context.WithTimeout(parent, refreshTimeout)
 	defer cancel()
 
-	newValue := cloneValue(def.defaultValue)
+	newValue := engine.Clone(def.defaultValue)
 
 	if op != store.OpDelete {
 		entry, found, err := c.store.Get(ctx, store.Scope{}, nk.Namespace, nk.Key)
 		if err != nil {
 			c.logWarn(ctx, "refresh from store failed",
 				log.String("namespace", nk.Namespace),
-				log.String("key", nk.Key),
+				log.String("keyname", nk.Key),
 				log.Err(err),
 			)
 
@@ -502,7 +539,7 @@ func (c *Client) refreshFromStore(nk nskey, op string) {
 			// known-good value instead of resetting to the default.
 			c.logWarn(ctx, "refreshed key not found in store, keeping current value",
 				log.String("namespace", nk.Namespace),
-				log.String("key", nk.Key),
+				log.String("keyname", nk.Key),
 			)
 
 			return
@@ -512,7 +549,7 @@ func (c *Client) refreshFromStore(nk nskey, op string) {
 		if err := json.Unmarshal(entry.Value, &decoded); err != nil {
 			c.logWarn(ctx, "failed to unmarshal refreshed value, keeping current",
 				log.String("namespace", nk.Namespace),
-				log.String("key", nk.Key),
+				log.String("keyname", nk.Key),
 				log.Err(err),
 			)
 
@@ -525,7 +562,7 @@ func (c *Client) refreshFromStore(nk nskey, op string) {
 			// The error, never the value: a rejected value may be a secret.
 			c.logWarn(ctx, "refreshed value rejected by validator, keeping current value",
 				log.String("namespace", nk.Namespace),
-				log.String("key", nk.Key),
+				log.String("keyname", nk.Key),
 				log.Err(err),
 			)
 
@@ -548,7 +585,7 @@ func (c *Client) refreshFromStore(nk nskey, op string) {
 	c.hydratingMu.Unlock()
 
 	c.cacheMu.Lock()
-	c.cache[nk] = cloneValue(newValue)
+	c.cache[nk] = engine.Clone(newValue)
 	c.cacheMu.Unlock()
 
 	// Fire subscribers with the lifecycle context (NOT the per-refresh timeout
@@ -558,7 +595,7 @@ func (c *Client) refreshFromStore(nk nskey, op string) {
 		dispatchCtx = context.Background()
 	}
 
-	c.fireSubscribers(dispatchCtx, nk, cloneValue(newValue))
+	c.fireSubscribers(dispatchCtx, nk, engine.Clone(newValue))
 }
 
 // fireSubscribers invokes all OnChange callbacks for a key with panic
@@ -576,7 +613,7 @@ func (c *Client) fireSubscribers(ctx context.Context, nk nskey, newValue any) {
 		func() {
 			defer runtime.RecoverAndLog(c.logger, "systemplane.onchange")
 
-			fn(ctx, cloneValue(newValue))
+			fn(ctx, engine.Clone(newValue))
 		}()
 	}
 }

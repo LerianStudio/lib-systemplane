@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/engine"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/manager"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
@@ -66,10 +67,10 @@ func (c *Client) getEntry(ctx context.Context, namespace, key string) (Entry, bo
 		c.cacheMu.RUnlock()
 
 		if inCache {
-			return Entry{Value: cloneValue(v)}, true, nil
+			return Entry{Value: engine.Clone(v)}, true, nil
 		}
 
-		return Entry{Value: cloneValue(def.defaultValue)}, true, nil
+		return Entry{Value: engine.Clone(def.defaultValue)}, true, nil
 	}
 
 	// Multi-tenant: try the bound Manager's per-tenant cache first; fall
@@ -80,7 +81,7 @@ func (c *Client) getEntry(ctx context.Context, namespace, key string) (Entry, bo
 	mgr := c.boundManager()
 	if mgr != nil && tenantID != "" {
 		if v, hit, lookupErr := mgr.Lookup(ctx, tenantID, namespace, key); lookupErr == nil && hit {
-			return Entry{Value: cloneValue(v)}, true, nil
+			return Entry{Value: engine.Clone(v)}, true, nil
 		}
 	}
 
@@ -90,14 +91,14 @@ func (c *Client) getEntry(ctx context.Context, namespace, key string) (Entry, bo
 	}
 
 	if !found {
-		return Entry{Value: cloneValue(def.defaultValue)}, true, nil
+		return Entry{Value: engine.Clone(def.defaultValue)}, true, nil
 	}
 
 	var decoded any
 	if err := json.Unmarshal(entry.Value, &decoded); err != nil {
 		c.logError(ctx, "failed to unmarshal stored value",
 			log.String("namespace", namespace),
-			log.String("key", key),
+			log.String("keyname", key),
 			log.Err(err),
 		)
 
@@ -298,7 +299,7 @@ func (c *Client) listFromCache(keys []nskey) []ListEntry {
 
 		entries = append(entries, ListEntry{
 			Key:         nk.Key,
-			Value:       cloneValue(val),
+			Value:       engine.Clone(val),
 			Description: desc,
 		})
 	}
@@ -332,14 +333,14 @@ func (c *Client) listFromStore(ctx context.Context, namespace string, keys []nsk
 
 	for _, nk := range keys {
 		def := c.registry[nk]
-		val := cloneValue(def.defaultValue)
+		val := engine.Clone(def.defaultValue)
 
 		if raw, ok := storedByKey[nk.Key]; ok {
 			var decoded any
 			if err := json.Unmarshal(raw, &decoded); err != nil {
 				c.logError(ctx, "failed to unmarshal stored value",
 					log.String("namespace", namespace),
-					log.String("key", nk.Key),
+					log.String("keyname", nk.Key),
 					log.Err(err),
 				)
 

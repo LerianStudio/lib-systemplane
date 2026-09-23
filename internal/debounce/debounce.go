@@ -9,7 +9,6 @@
 package debounce
 
 import (
-	"fmt"
 	"sync"
 	"time"
 
@@ -84,7 +83,7 @@ func (d *Debouncer[K]) Submit(key K, fn func()) {
 
 	// Zero/negative window: synchronous invocation with panic recovery.
 	if d.window <= 0 {
-		d.invokeWithRecover(key, fn)
+		d.invokeWithRecover(fn)
 		return
 	}
 
@@ -150,16 +149,26 @@ func (d *Debouncer[K]) fire(key K, generation uint64, fn func()) {
 
 	d.mu.Unlock()
 
-	d.invokeWithRecover(key, fn)
+	d.invokeWithRecover(fn)
 }
+
+// recoveryComponent is the component name every panic recovery in this
+// package reports. It is a constant on purpose: arguments to a deferred call
+// are evaluated at defer time, so rendering the key here charged a reflective
+// Sprintf to every debounced invocation whether or not anything panicked.
+//
+// It is also all the identity this guard can offer. RecoverAndLog logs
+// "panic recovered" with this name, and in production mode the recovered value
+// and the stack are redacted out of that line, so it says something under the
+// debouncer blew up and never which key. A caller whose submitted function
+// must be identifiable recovers first and logs its own identity, leaving this
+// as the outer net — see (*engine.Engine).recoverRefresh.
+const recoveryComponent = "debounce"
 
 // invokeWithRecover calls fn inside a deferred RecoverAndLog so that a
 // panicking callback cannot crash the process or break the debouncer.
-// The key is rendered with fmt.Sprint into the recovery component name
-// so crash logs identify which key's callback blew up regardless of
-// whether K is a string, struct, or something else.
-func (d *Debouncer[K]) invokeWithRecover(key K, fn func()) {
-	defer runtime.RecoverAndLog(d.logger, fmt.Sprintf("debounce:%v", key))
+func (d *Debouncer[K]) invokeWithRecover(fn func()) {
+	defer runtime.RecoverAndLog(d.logger, recoveryComponent)
 
 	fn()
 }

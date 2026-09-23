@@ -52,14 +52,19 @@ func (l *recordingLogger) Enabled(_ int) bool            { return true }
 func (l *recordingLogger) Sync(_ context.Context) error  { return nil }
 
 // warns returns the recorded WARN lines carrying msg.
-func (l *recordingLogger) warns(msg string) []logLine {
+func (l *recordingLogger) warns(msg string) []logLine { return l.at(log.LevelWarn, msg) }
+
+// errs returns the recorded ERROR lines carrying msg.
+func (l *recordingLogger) errs(msg string) []logLine { return l.at(log.LevelError, msg) }
+
+func (l *recordingLogger) at(level int, msg string) []logLine {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	var out []logLine
 
 	for _, line := range l.lines {
-		if line.level == log.LevelWarn && line.msg == msg {
+		if line.level == level && line.msg == msg {
 			out = append(out, line)
 		}
 	}

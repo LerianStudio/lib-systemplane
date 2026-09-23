@@ -24,7 +24,7 @@
 
 | Phase | Milestone | Epics | Status |
 |-------|-----------|-------|--------|
-| 1 | `internal/engine` exists and is fully unit-tested standalone against a fake store: scope state, ingress, publish fence, reconcile, coalescing dispatch, bounded `Close`. `internal/client` still runs its own cache; nothing user-visible changed, everything is green. | 1.1, 1.2, 1.3, 1.4 | Detailed |
+| 1 | `internal/engine` exists and is fully unit-tested standalone against a fake store: scope state, ingress, publish fence, reconcile, coalescing dispatch, bounded `Close`. `internal/client` still runs its own cache; the only user-visible changes are two corrections carried onto the shipping v3 path (the `key` log field renamed to `keyname`, and a named identity line for a panicking changefeed re-read), everything is green. | 1.1, 1.2, 1.3, 1.4 | Detailed |
 | 2 | The single-tenant `Client` reads, writes and dispatches through the engine; `internal/manager`, the root `Manager` API and `examples/manager/` are gone; `WithCloseTimeout` / `ErrCloseTimeout` are public. | 2.1, 2.2, 2.3 | Detailed |
 | 3 | The v4 breaking surface is cut: `WithTable`, `WithListenChannel`, `WithCollection` removed; canonical names only; boundary, vet, perf and coverage gates green on the reduced surface. | 3.1, 3.2 | Epic-level |
 
@@ -57,6 +57,8 @@ Only these paths. A task that appears to need anything else states what it needs
 - `internal/client/**`
 - `internal/manager/**` (deleted in Phase 2)
 - `internal/debounce/**`
+- `internal/testsupport/**` (new, added 2026-09-23 in the Phase 1 fix pass; test-only helpers shared
+  by `internal/engine`, `internal/client` and `internal/manager`. This lane owns it after merge)
 - Root: `api_boundary.go`, `api_client.go`, `api_change.go`, `api_constants.go`, `api_constructors.go`, `api_errors.go`, `api_testing.go`, `api_types.go` and their `_test.go` files, `boundary_test.go`, `manager.go`, `manager_methods.go`, `manager_methods_test.go`
 - `examples/manager/**` (deleted in Phase 2)
 
@@ -112,7 +114,7 @@ Named edge cases: `cloneValue` returns the input unchanged when reflection canno
 
 - [ ] Done
 
-**Context:** Today the single-tenant cache is `map[nskey]any` on the Client (`internal/client/client.go:55`) — it stores the value and nothing else, which is why `GetEntry` on a cache hit can only report zeros for revision and provenance (`internal/client/get.go:69`). The engine caches the **whole entry**. It also needs to read the Client's registry (default value, validator) without importing `internal/client`, so it declares the port and `internal/client` implements it.
+**Context:** Today the single-tenant cache is `map[nskey]any` on the Client (`Client.cache`, guarded by `Client.cacheMu`, `internal/client/client.go`) — it stores the value and nothing else, which is why `GetEntry` on a cache hit can only report zeros for revision and provenance (the `inCache` return inside `(*Client).getEntry`, `internal/client/get.go`). The engine caches the **whole entry**. It also needs to read the Client's registry (default value, validator) without importing `internal/client`, so it declares the port and `internal/client` implements it.
 
 **Implementation vision:** Two files. `internal/engine/registry.go` declares the port the Client will satisfy — this is the contract Tasks 1.2.1, 1.2.2 and 1.2.3 all publish against, so it is written verbatim here:
 
@@ -144,8 +146,10 @@ type NSKey struct {
 }
 ```
 
-Amended 2026-09-23: `Validate` widens to `func(context.Context, any) error` in Task 2.1.3, which states the
-per-ingress context contract; Phase 1 shipped the ctx-less form above.
+Amended 2026-09-23: the ctx-less form above is what Task 1.1.2 landed, and Phase 1 fix pass 3
+(commit `941e77a`) then widened `Validate` to `func(context.Context, any) error` — the shape
+`develop` already registers every validator in. So Phase 1 ships the WIDE form, not the one written
+above; Task 2.1.3 states the per-ingress context contract that widening carries.
 
 `internal/engine/scope.go` holds the per-scope state. The zero `store.Scope` is the single-tenant scope and is the only one this lane creates; the type is written so a non-empty `Scope.Tenant` is just another key in `Engine.scopes` and the wave-3 lane adds tenants without touching it:
 
@@ -198,7 +202,19 @@ type scopeState struct {
 }
 ```
 
-`Engine` itself gets its struct here too: a `store.Store`, a `Registry`, a logger, a `store.Telemetry`, `scopesMu sync.RWMutex` + `scopes map[store.Scope]*scopeState`, and the lifecycle context pair. Dispatch and debounce fields are added by Epic 1.3; leave them out rather than stubbing them.
+Amended in the fix pass (2026-09-17): `reconciling`, `touched` and `unusable` became `windows`, one `reconcileWindow` per reconcile in flight keyed by `reconcileGen`, so two overlapping reconciles never inherit each other's fences; `scopeState` also carries the reconcile mailbox (`resyncMu`, `resyncPending`, `resyncSignal`, `reconcileStop`, `stopOnce`, `workerStarted`) that gives each scope one reconcile goroutine instead of one per OpResync
+
+`Engine` itself gets its struct here too: a `store.Store`, a `Registry`, a logger, `scopesMu sync.RWMutex` + `scopes map[store.Scope]*scopeState`, and the lifecycle context pair. Dispatch and debounce fields are added by Epic 1.3; leave them out rather than stubbing them.
+
+Amended 2026-09-23: an earlier draft of that sentence also listed a `store.Telemetry` field. Phase 1
+ships none, and the landed `Engine` (`internal/engine/engine.go:27-96`) carries no telemetry of any
+kind. `index.md` FC-12 (Engine metrics, meter `systemplane.engine`) freezes the whole engine
+instrument set as the engine-tenants lane's deliverable, so the field arrives with its first
+producer rather than as a stub nothing writes. The engine emits no spans of its own either: the
+store reads (`refreshKey` in `internal/engine/feed.go`, `listSnapshot` in
+`internal/engine/reconcile.go`) and the subscriber callbacks all run under the bare lifecycle
+context, exactly as v3's `internal/client` `refreshFromStore` did. Putting a trace carrier on
+`store.Event` would change FC-2 and is out of this lane.
 
 Cache reads land here as `(*Engine).Lookup(scope store.Scope, nk NSKey) (Entry, bool)`: it returns the cached `entry` widened into the exported `Entry`, with `Value` passed through `Clone` so the caller owns it and `Stale` copied from the scope. On a scope that is not tracked, or a key not in its map, `ok` is false — the caller (the Client, in Phase 2) then falls back to the registered default. A new scope is created `stale: true`: until its first reconcile completes nothing has confirmed the cache against the store.
 
@@ -251,11 +267,24 @@ type publication struct {
 func (e *Engine) publish(pub publication) (notify bool)
 ```
 
-The whole function runs under the scope's write lock so two feed events for the same key cannot interleave a compare with a store. Creating the scope on demand is Task 1.4.1's job; `publish` into a scope that does not exist creates it lazily here, stale, which is what makes `Set` before the first reconcile work.
+The whole function runs under the scope's write lock so two feed events for the same key cannot interleave a compare with a store.
+
+Amended 2026-09-23: this paragraph used to end by saying `publish` into a scope that does not exist
+creates it lazily, stale, which is what makes `Set` before the first reconcile work. Phase 1 fix
+pass (commit `7dd9654`) inverted that, and the inversion is the contract now: **a publication never
+creates a scope, only bring-up does.** `Publish` resolves through `trackedScope`
+(`internal/engine/publish.go`), which never creates one, and drops a write addressed to an
+untracked scope at DEBUG (`(*Engine).Publish`, `internal/engine/engine.go`), because a scope with
+no changefeed behind it and no reconcile goroutine to confirm it would read as current forever. Runtime impact
+today is nil: `internal/client/set.go:27` refuses a pre-`Start` `Set` with `ErrNotStarted`, so no
+write reaches the engine before bring-up. `TestPublishRefusesAnUntrackedScope`
+(`internal/engine/publish_test.go`) pins it.
 
 Decisions the implementer does not re-litigate:
 
 - Revision 0 winning over any cached revision is deliberate, not a bug. A delete must always take effect, and a recreate always arrives with a fresh non-zero revision, so resetting the cached revision to 0 cannot swallow the recreate. The counter-case a reviewer will raise — a delete followed by a stale in-flight upsert echo at revision 4 resurrecting the value — is closed by the second fence (the touched set, Task 1.2.3) during a reconcile, and outside a reconcile by the debouncer collapsing a burst for one key to its last submission before the re-read runs.
+
+  **Amended 2026-09-23 (Phase 1 fix pass): the second half of that sentence was wrong, and a reviewer reproduced it.** The debouncer collapses PENDING TIMERS, not work already started: `Debouncer.fire` deletes the timer entry before it invokes `fn`, so a re-read already inside `Store.Get` when the delete arrives is collapsed by nothing. Under READ COMMITTED that reader holds a snapshot taken before the DELETE committed, comes back with the pre-delete row at revision 5, beats the 0 the delete left in the cache, and republishes a key an operator deleted — to the cache and to every subscriber. Outside a reconcile nothing repaired it, so on a connection that never drops it stood for the life of the process and two replicas of one consumer diverged. **Revision 0 still wins the fence; what changed is that a re-read now carries a delete fence across its store call.** `entry.Deletes` counts the deletes a key has taken in a scope, `refreshKey` reads it before `Store.Get` and hands it back afterwards, and a publication whose count no longer matches is dropped. The question is causal — "did a delete land while I was reading?" — not numeric, which is why it refuses the stale row while still accepting a recreate at ANY revision, including one below the deleted row's: `TestReconcileKeepsRecreatedValueOverListSnapshot` keeps its premise, and the engine leans on nothing D11 guarantees about revisions across lifetimes. It also covers the case a revision watermark could not, a key whose FIRST publication is the delete. FC-4/FC-5 are untouched. A reconcile that finds a key absent does not bump the counter: absence from a photograph is a conclusion about that photograph, and a re-read in flight may hold the fresher fact. `TestDeleteIsNotResurrectedByAnInFlightReRead` (`internal/engine/reconcile_test.go`) pins both cache states.
 - **The equal-revision case compares values before deciding.** D3 is explicit: Postgres bumps `revision` from a trigger, but MongoDB has no triggers, so a foreign writer (a Console process writing the collection directly) can change `value` and leave `revision` alone. Deduplicating purely on revision would make that write invisible forever. So an equal non-zero revision splits: values equal → refresh provenance only, `notify=false`; values differ → overwrite the value, refresh provenance, `notify=true`. Both branches resolve inside the one locked call; splitting it into "check then refresh" reopens the race it exists to close.
 - **Equality is `reflect.DeepEqual` on the decoded value, not on raw bytes.** Every value in the cache is in decoded-JSON shape because every path into `publish` goes through the ingress of Task 1.2.1 (`Set` included — see Task 1.4.1), so the comparison is well defined. Byte comparison would fire a spurious callback when a writer reformats JSON or reorders object keys without changing meaning; `DeepEqual` on the decoded form treats those as the no-op they are. The cost is a structural walk on a path that only runs for an equal-revision publication, which is the uncommon case.
 - `publish` does not clone. The caller owns producing a value the engine may keep — the ingress already decoded fresh JSON. Cloning again per publication would cost a reflection walk on the hot path for nothing.
@@ -264,7 +293,19 @@ Decisions the implementer does not re-litigate:
 - Create: `internal/engine/publish.go`
 - Create: `internal/engine/publish_test.go`
 
-**Verification:** `go test -tags=unit -race ./internal/engine/...` — `TestPublishAcceptsHigherRevision`, `TestPublishRejectsLowerRevision` (cached value and provenance both unchanged), `TestPublishRefreshesProvenanceWithoutNotify` (equal non-zero revision, **equal value**: `UpdatedAt` / `UpdatedBy` updated, value untouched, `notify` false), `TestPublishAcceptsSameRevisionWithChangedValue` (**D3's foreign-writer RED test** — cache holds revision 3 with value `"a"`; publish revision 3 with value `"b"`: the cache ends at `"b"`, provenance is refreshed, and `notify` is true; this is the MongoDB writer that changed `value` without `$inc` on `revision`), `TestPublishRevisionZeroAlwaysWinsAndResetsRevision`, `TestPublishCreatesScopeLazilyAsStale`, and `TestPublishIsSerializedUnderRace` (two goroutines publishing revisions 1..100 for one key end with the cache at 100 and never below a previously observed revision).
+**Verification:** `go test -tags=unit -race ./internal/engine/...`. Amended 2026-09-23 to the three
+tests that actually ship, in place of the six speculative names this line carried:
+`TestPublishFence` (`internal/engine/publish_test.go`) is a table with one subtest per fence
+outcome — an uncached key accepted, a higher revision accepted with its provenance, a lower revision
+rejected overwriting nothing, an equal revision with an equal value refreshing provenance only
+(including the identical-bytes and reordered-bytes spellings of "equal"), an equal revision with a
+changed value accepted (**D3's foreign writer**: the MongoDB process that changed `value` without
+`$inc` on `revision`), revision 0 winning over a cached revision and resetting the counter, a
+repeated revision 0 never deduplicated, and a recreate accepted over the reset counter;
+`TestPublishRefusesAnUntrackedScope` pins the amendment above — no publication creates a
+scope; and `TestPublishIsSerializedUnderRace` has two goroutines publish revisions 1..100
+for one key and asserts the cache ends at 100 and never drops below a previously observed
+revision.
 
 **Done when:** the four outcomes behave exactly as documented, including the equal-revision split on value equality; no code path outside `publish` writes `scopeState.entries`.
 
@@ -286,7 +327,8 @@ Decisions the implementer does not re-litigate:
 
 **Implementation vision:** `internal/engine/ingest.go` exposes one unexported method: given a scope and a `store.Entry`, it resolves the key in the `Registry`, decodes `Entry.Value` into `any` with `encoding/json`, runs `KeyDef.Validate` when non-nil, and calls `publish`. It returns the `notify` flag from `publish` so the caller decides whether to dispatch.
 
-Four rejection paths, each with a distinct outcome, all logged at WARN with `namespace`, `key` and — for the last two — the error:
+Four rejection paths, each with a distinct outcome, all logged at WARN with `namespace`, `keyname` and — for the last two — the error (the field is
+`keyname`, never `key`: see the guard named in **Files:** below):
 
 1. **Unregistered key.** Skip entirely: no publish, no callback. A store may legitimately hold rows this process never registered.
 2. **Undecodable JSON.** Skip. The cache keeps whatever it held; a corrupt byte sequence is not evidence the previous value is wrong.
@@ -298,6 +340,14 @@ A second, smaller entry point in the same file handles the "no row" case — del
 **Files:**
 - Create: `internal/engine/ingest.go`
 - Create: `internal/engine/ingest_test.go`
+- Create (added 2026-09-23, Phase 1 fix pass): `internal/testsupport/logguard/logguard.go`, its
+  `logguard_test.go` and the `testdata/` fixtures that test it — the shared source scan that fails
+  the build when `internal/engine`, `internal/client` or `internal/manager` names a configuration
+  key under a log field a redacting pipeline reads as a secret's label. It is the enforcement half
+  of the field spelling this task decides; see the `keyname` bullet under § Contract amendments
+  consumed, and open deviations
+- Modify (added 2026-09-23, Phase 1 fix pass): `.ignorecoverunit` — add `internal/testsupport/*`,
+  so a test-only helper package is not counted against unit coverage
 
 **Verification:** `go test -tags=unit ./internal/engine/...` — `TestIngestRejectsInvalidValueKeepingPrevious` (publish rev 1 = valid, then a rev 2 entry the validator rejects: `Lookup` still returns the rev-1 value and revision, `notify` false), `TestIngestSkipsUnregisteredKey`, `TestIngestSkipsUndecodableJSONKeepingPrevious`, `TestIngestDefaultPublishesAtRevisionZero`, `TestIngestClonesRegisteredDefault` (mutating the returned value leaves the `Registry`'s default intact).
 
@@ -307,18 +357,41 @@ A second, smaller entry point in the same file handles the "no row" case — del
 
 - [ ] Done
 
-**Context:** The feed callback runs on the backend's changefeed goroutine. Today `internal/client/client.go:373` debounces per `nskey` and then re-reads, which is right, and the multi-tenant twin does not, which is the data race the audit found. The engine keeps the debounce on the **ingress** side — collapsing a burst of NOTIFYs for one key into one store read — and puts the callback isolation somewhere else (Epic 1.3). The two are different jobs and folding them together either costs a store read per NOTIFY or delays every callback by the debounce window twice.
+**Context:** The feed callback runs on the backend's changefeed goroutine. Today `(*Client).onEvent`'s `debouncer.Submit` call (`internal/client/client.go`) debounces per `nskey` and then re-reads, which is right, and the multi-tenant twin does not, which is the data race the audit found. The engine keeps the debounce on the **ingress** side — collapsing a burst of NOTIFYs for one key into one store read — and puts the callback isolation somewhere else (Epic 1.3). The two are different jobs and folding them together either costs a store read per NOTIFY or delays every callback by the debounce window twice.
 
 **Implementation vision:** `internal/engine/feed.go` holds the `func(store.Event)` the engine hands to `Store.Subscribe`, plus the re-read it schedules.
 
-`internal/debounce` is reused unchanged — it is already generic over any comparable key. Re-key it from the Client's `nskey` to a struct carrying the scope, so the wave-3 lane gets per-tenant coalescing for free: `debounce.Debouncer[scopeNSKey]` where `scopeNSKey{Tenant, Namespace, Key}`. No file in `internal/debounce` changes.
+`internal/debounce` is reused — it is already generic over any comparable key. Re-key it from the Client's `nskey` to a struct carrying the scope, so the wave-3 lane gets per-tenant coalescing for free: `debounce.Debouncer[scopeNSKey]` where `scopeNSKey{Tenant, Namespace, Key}`.
+
+Amended 2026-09-23 (Phase 1 fix pass): this sentence ended "No file in `internal/debounce` changes", and two did. `Debouncer.invokeWithRecover` built its recovery component name as `fmt.Sprintf("debounce:%v", key)`, and because the arguments of a deferred call are evaluated when the `defer` runs, that reflective format ran on every debounced invocation whether or not anything panicked — a per-re-read cost paid to label a line that redacts the recovered value and the stack in production anyway, so an operator never learned more from it than "something under the debouncer blew up". The component name is now the package constant `recoveryComponent = "debounce"`, `fmt` leaves the package, and identity moves to the caller: `(*Engine).recoverRefresh` (`internal/engine/feed.go`) and `(*Client).recoverRefresh` (`internal/client/client.go`) recover first, log the namespace and key, and leave the debouncer as the outer net. `debounce_test.go` pins the constant from the outside: it hands the debouncer a recording logger through `WithLogger` and asserts the recovery's `source` field is `debounce`, so a component name that drifted back to a per-key string would fail rather than silently cost a `Sprintf` per invocation. It names `invokeWithRecover` nowhere — both call sites of the changed signature are in `debounce.go`.
+
+Amended 2026-09-23 (Phase 1 fix pass, the G1 finding): **an event for a key this process never
+registered is dropped at the feed callback, before the debouncer ever sees it** — the registry
+lookup at the top of the event handler in `internal/engine/feed.go`, logged once at DEBUG.
+`systemplane_entries` is one table per database and every consumer sharing it notifies on its own
+keys, so answering a foreign upsert used to cost a debounce timer, a goroutine `Close` waits for and
+a pooled connection, per foreign write. Outcomes are unchanged, which is what makes this a
+placement change and not a behavior change: `prepare` rejects the same rows on the upsert path and
+`ingestDefault` the same keys on the delete path, and a nil registry reports nothing registered so
+it still rejects everything. This is v3 parity — `(*Client).refreshFromStore`
+(`internal/client/client.go`) already refused an unregistered key before its store read; v4 moves the
+same refusal one step earlier, ahead of the debounce, and drops it to DEBUG because foreign traffic
+on a shared table is ordinary, not an incident. What makes the drop safe is the SETUP ORDER the
+facade documents, not a lock: registration and `Start` are sequential setup calls — `Register`, then
+`Start`, and a `Register` after `Start` is refused with `ErrRegisterAfterStart` — so within supported
+usage every key the process will ever register is in the registry before `bringUpScope` opens the
+feed. Nothing in `internal/engine` synchronizes against a registry write: the engine takes no lock
+the registry writer takes, and the feed reads through `Registry.Lookup` like any other caller. A
+`Register` that does land after the feed opened is therefore unsupported rather than handled, and
+its residual is bounded — the notifications dropped here leave that key on its registered default
+until the next reconcile reads its row, which is the whole-scope repair every `OpResync` drives.
 
 Dispatch on `Event.Op`:
 
 - `store.OpDisconnect` → mark the scope stale and do nothing else. No reconcile (there is no connection to read through), no publication, no callback. Reads keep serving the last published value; `Stale` is how a caller learns it is looking at a cache nobody is confirming.
 - `store.OpResync` → hand to the reconcile path (Task 1.2.3). It carries no namespace or key, so it is not debounced per key; it takes the scope's reconcile path directly.
 - `store.OpDelete` → publish the registered default at revision 0 through the ingress's no-row entry point, and record the key in the scope's touched set. No store read: a delete is self-describing.
-- `store.OpUpsert` (and anything unrecognised, treated as an upsert) → `Submit` to the debouncer; when the quiet window closes, `Store.Get(ctx, scope, ns, key)` under a 5s timeout derived from the engine's lifecycle context (the same bound `internal/client/client.go:25` uses today), then ingest the returned entry.
+- `store.OpUpsert` (and anything unrecognised, treated as an upsert) → `Submit` to the debouncer; when the quiet window closes, `Store.Get(ctx, scope, ns, key)` under a 5s timeout derived from the engine's lifecycle context (the same bound the `refreshTimeout` constant in `internal/client/client.go` gives today), then ingest the returned entry.
 
 The touched-set recording is the point of contact with fence (b). A feed publication records its key in `scopeState.touched` **only while `scopeState.reconciling` is true**, and records it *after* the publication has produced a usable value — if the re-read errored, reported not-found, or failed validation, nothing was published, so the reconcile's `List` snapshot is still the better answer for that key and must not be skipped. This is the `internal/client/client.go:461` rule, preserved deliberately.
 
@@ -332,6 +405,8 @@ Named edge cases: a re-read that reports **not found** keeps the current value a
 - Create: `internal/engine/feed.go`
 - Create: `internal/engine/feed_test.go`
 - Modify: `internal/engine/engine.go` (debouncer field and its construction)
+- Modify: `internal/debounce/debounce.go` (`invokeWithRecover`, the `recoveryComponent` constant) — see the amendment above
+- Modify: `internal/debounce/debounce_test.go` (the `recordingLogger` helper and the recovery-name assertion in `TestDebouncer_PanicInFnRecovered`)
 
 **Verification:** `go test -tags=unit -race ./internal/engine/...` — `TestDeleteEventPublishesDefaultAtRevisionZero` (cache holds the default, `Lookup` reports revision 0, one notification), `TestUpsertEventReReadsAndIngests`, `TestUpsertReReadNotFoundKeepsCurrentValue`, `TestFeedBurstForOneKeyCausesOneStoreRead` (five events inside the debounce window, the fake store counts one `Get`), `TestFeedRecordsTouchedOnlyWhileReconciling`, `TestDisconnectMarksScopeStaleWithoutPublishing` (emit `OpDisconnect`, then assert `Lookup` reports `Stale` true, the cached value and revision are untouched, and no subscriber fired), `TestRepeatedDisconnectIsIdempotent`.
 
@@ -426,11 +501,11 @@ Nothing else sets it. No heartbeat, no liveness probe, no timer, no "it has been
 
 - [ ] Done
 
-**Context:** Today the single-tenant path fires subscribers from the debouncer's `time.AfterFunc` goroutine (`internal/client/client.go:478` → `:484`), which gives each firing its own goroutine — so two consecutive publications of the same key can run their callbacks concurrently and land out of order. The multi-tenant twin is worse: it dispatches on the LISTEN goroutine, so one slow subscriber stalls the pump for every tenant and every key. FC-4 promises the opposite of both: serialized per (scope, key), coalesced to the newest revision, never reordered, and independent across keys.
+**Context:** Today the single-tenant path fires subscribers from the debouncer's `time.AfterFunc` goroutine: the timer callback runs `(*Client).refreshFromStore`, which ends by calling `(*Client).fireSubscribers` (`internal/client/client.go`). Each firing therefore gets its own goroutine, so two consecutive publications of the same key can run their callbacks concurrently and land out of order. The multi-tenant twin is worse: it dispatches on the LISTEN goroutine, so one slow subscriber stalls the pump for every tenant and every key. FC-4 promises the opposite of both: serialized per (scope, key), coalesced to the newest revision, never reordered, and independent across keys.
 
 **Implementation vision:** `internal/engine/dispatch.go`.
 
-The subscriber registry is keyed by `NSKey` only, not by scope: `OnChange(ns, key, fn)` subscribes to that key in **every** scope the engine tracks (FC-4), and `Change.Tenant` tells the callback which one. Registration returns an idempotent unsubscribe closure guarded by `sync.Once`, following the shape already at `internal/client/onchange.go:84`.
+The subscriber registry is keyed by `NSKey` only, not by scope: `OnChange(ns, key, fn)` subscribes to that key in **every** scope the engine tracks (FC-4), and `Change.Tenant` tells the callback which one. Registration returns an idempotent unsubscribe closure guarded by `sync.Once`, following the shape already at the tail of `(*Client).OnChange` (`internal/client/onchange.go`).
 
 The queue is one worker goroutine per (scope, key), created **lazily on the first notify-worthy publication for that pair** and living until `Close`. Eagerly starting a goroutine per registered key would cost a goroutine for every key that never changes; creating one per publication would lose the serialization. The worker owns a single-slot pending mailbox: `publish` returning `notify=true` writes the newest `Change` into the slot, overwriting whatever was there, and signals a 1-buffered channel non-blockingly. The worker wakes, takes the slot, and invokes every subscriber for that key serially. Anything published while it runs lands in the slot and is picked up on the next loop — that is the coalescing, and it is why a subscriber may skip intermediate revisions but always ends on the newest and never sees them out of order.
 
@@ -519,7 +594,7 @@ The `Set` path is `(*Engine).Publish(scope store.Scope, e store.Entry)`: the Cli
 
 FC-11 fires on that first reconcile: every registered key is announced to subscribers registered before `Start` returns, absent rows at Revision 0. The behavior and its test live in Task 1.2.3; `Start` owes it only the ordering — subscribe, then wait for the first reconcile to complete — so a subscriber registered before `Start` cannot miss the announcement and a caller reading after `Start` returns is looking at a confirmed cache.
 
-Named edge cases: a `Publish` whose revision the store reported as 0 (a backend that cannot report one) still takes effect, because revision 0 always wins — at the cost of the echo firing a second callback for that key. That is the correct trade: a value the caller just wrote must be readable. `Start` on a closed engine returns the closed sentinel. `Start` is idempotent: a second call returns nil without re-subscribing. `Publish` before `Start` creates the scope lazily and works, so a Client that writes before starting is not silently dropped.
+Named edge cases: a `Publish` whose revision the store reported as 0 (a backend that cannot report one) still takes effect, because revision 0 always wins — at the cost of the echo firing a second callback for that key. That is the correct trade: a value the caller just wrote must be readable. `Start` on a closed engine returns the closed sentinel. `Start` is idempotent: a second call returns nil without re-subscribing. `Publish` before `Start` is DROPPED, not served (amended 2026-09-23, commit `7dd9654`): a publication never creates a scope, only bring-up does, because a scope with no changefeed and no reconcile goroutine would read as current forever. `Publish` resolves through `trackedScope` and logs the dropped write at DEBUG (`(*Engine).Publish`, `internal/engine/engine.go`). Runtime impact today is nil — `internal/client/set.go:27` refuses a pre-`Start` `Set` with `ErrNotStarted` — so no Client write reaches the engine before bring-up; see Task 1.1.3 for the full rule.
 
 **Files:**
 - Modify: `internal/engine/engine.go` (`New`, `Config`, `Start`, `Publish`)
@@ -548,31 +623,33 @@ Phase 2 makes the engine the only cache in the library for the single-tenant sco
 
 - [ ] Done
 
-**Context:** `Engine.Start` (`internal/engine/engine.go:173-215`) creates the scope, calls
+**Context:** `Engine.Start` (`internal/engine/engine.go`) creates the scope, calls
 `Store.Subscribe`, and then **blocks** on `firstReconcileDone`. The only thing that closes that
 channel is a reconcile, and the only thing that starts one is a `store.OpResync` event
-(`internal/engine/feed.go:64` → `internal/engine/reconcile.go:62`). Every fake store in this
+(`(*Engine).onEvent`, `internal/engine/feed.go` → `(*Engine).onResync`,
+`internal/engine/reconcile.go`). Every fake store in this
 repository's unit suite returns from `Subscribe` without emitting anything, so the moment Task 2.1.3
 routes `Client.Start` through the engine, every single-tenant `Start(context.Background())` in the
-suite blocks forever. Seven fakes: `memStore` (`internal/client/client_test.go:123`),
-`facadeTestStore` (`internal/client/testing_facade_test.go:51`), `catalogSpyStore`
-(`internal/client/catalog_test.go:50`), `apiMemoryStore` (`api_client_test.go:64`),
-`apiCatalogStore` (`api_catalog_test.go:22`), `groupMemoryStore` (`api_group_test.go:103`),
-`fakeStore` (`admin/admin_test.go:174`).
+suite blocks forever. Seven fakes, each named here by the method to edit: `memStore.Subscribe`
+(`internal/client/client_test.go`), `facadeTestStore.Subscribe`
+(`internal/client/testing_facade_test.go`), `catalogSpyStore.Subscribe`
+(`internal/client/catalog_test.go`), `apiMemoryStore.Subscribe` (`api_client_test.go`),
+`apiCatalogStore.Subscribe` (`api_catalog_test.go`), `groupMemoryStore.Subscribe`
+(`api_group_test.go`), `fakeStore.Subscribe` (`admin/admin_test.go`).
 
-Two further gaps in the same fakes. First, `memStore.Set` (`internal/client/client_test.go:83`),
-`apiMemoryStore.Set` (`api_client_test.go:37`) and `facadeTestStore.Set`
-(`internal/client/testing_facade_test.go:35`) all return revision `0` and store whatever `Revision`
+Two further gaps in the same fakes. First, `memStore.Set` (`internal/client/client_test.go`),
+`apiMemoryStore.Set` (`api_client_test.go`) and `facadeTestStore.Set`
+(`internal/client/testing_facade_test.go`) all return revision `0` and store whatever `Revision`
 the caller passed, which is always `0`. FC-2 says `Set` returns the revision now stored; with `0`
 the write and its changefeed echo both arrive at revision 0, which the fence never deduplicates
-(`internal/engine/publish.go:42`), so every `Set` would fire two callbacks. Second, the engine reads
+(`(*Engine).publish`, `internal/engine/publish.go`), so every `Set` would fire two callbacks. Second, the engine reads
 the store from goroutines of its own (a reconcile goroutine per scope, a debounced re-read), so a
 fake with unsynchronised maps races under `-race`: `apiMemoryStore` and `facadeTestStore` have no
 mutex at all.
 
 **Implementation vision:** Three mechanical changes, no behaviour change to the library, so this task
-lands green on the current (still v3) Client — `Client.onEvent`
-(`internal/client/client.go:374`) turns an unrecognised op into a refresh for the empty
+lands green on the current (still v3) Client — `(*Client).onEvent`
+(`internal/client/client.go`) turns an unrecognised op into a refresh for the empty
 `(namespace, key)`, which is unregistered, logs a warning and returns.
 
 1. **Emit the resync.** In each of the seven `Subscribe` implementations, register the callback, then
@@ -580,7 +657,7 @@ lands green on the current (still v3) Client — `Client.onEvent`
    `Revision`, `Op: store.OpResync`. Emit it *synchronously inside* `Subscribe`, after releasing any
    lock the fake holds while storing the callback — `onResync` arms the reconcile window on the
    calling goroutine and hands the `List` to the scope's own goroutine
-   (`internal/engine/reconcile.go:62-82`), so a synchronous emit cannot deadlock and keeps every test
+   (`(*Engine).onResync`, `internal/engine/reconcile.go`), so a synchronous emit cannot deadlock and keeps every test
    deterministic. Never use a string literal: files already importing `internal/store` use
    `store.OpResync`; `api_group_test.go` (package `systemplane_test`) and `admin/admin_test.go`
    (package `admin_test`) add the import `github.com/LerianStudio/lib-systemplane/v4/internal/store`
@@ -599,22 +676,22 @@ lands green on the current (still v3) Client — `Client.onEvent`
 
 Named edge cases. `catalogSpyStore` counts `List` calls, and the resync now makes the engine call
 `List` once during `Start`; `TestCatalogDoesNotTouchStoreAfterStart`
-(`internal/client/catalog_test.go:182`) resets its counters *after* `Start`, so it still asserts
-zero. `TestNewForTestingAdapterAndOptions` (`internal/client/testing_facade_test.go:57`) subscribes a
+(`internal/client/catalog_test.go`) resets its counters *after* `Start`, so it still asserts
+zero. `TestNewForTestingAdapterAndOptions` (`internal/client/testing_facade_test.go`) subscribes a
 second time through `c.store.Subscribe` and asserts `subscribeFn` goes nil on unsubscribe; the extra
 resync fired by that second subscription lands in the test's own callback, which asserts on
 `evt.Namespace`/`evt.Key`/`evt.Op` — widen that callback to ignore a resync event rather than fail on
-it. `memStore.fire` (`internal/client/client_test.go:141`) is a no-op in multi-tenant mode and stays
+it. `memStore.fire` (`internal/client/client_test.go`) is a no-op in multi-tenant mode and stays
 that way: no multi-tenant test may receive a resync, because the Client opens no engine scope there.
 
 **Files:**
-- Modify: `internal/client/client_test.go` (lines 83-97 `Set`, 123-139 `Subscribe`, struct at 23-41)
-- Modify: `internal/client/testing_facade_test.go` (lines 14-54, and the callback at 107-110)
-- Modify: `internal/client/catalog_test.go` (lines 50-52)
-- Modify: `api_client_test.go` (lines 11-67)
-- Modify: `api_catalog_test.go` (lines 22-24)
-- Modify: `api_group_test.go` (lines 103-114) — **see DEVIATIONS, file owned by the `groups` lane**
-- Modify: `admin/admin_test.go` (lines 174-176) — **see DEVIATIONS, file owned by the `admin` lane**
+- Modify: `internal/client/client_test.go` — the `memStore` struct (add the `revision` field), `memStore.Set`, `memStore.Subscribe`
+- Modify: `internal/client/testing_facade_test.go` — the `facadeTestStore` struct (add the mutex and the `revision` field), `facadeTestStore.Set`, `facadeTestStore.Subscribe`, and the subscriber callback inside `TestNewForTestingAdapterAndOptions`
+- Modify: `internal/client/catalog_test.go` — `catalogSpyStore.Subscribe`
+- Modify: `api_client_test.go` — the `apiMemoryStore` struct (add the mutex and the `revision` field), `apiMemoryStore.Set`, `apiMemoryStore.Subscribe`
+- Modify: `api_catalog_test.go` — `apiCatalogStore.Subscribe`
+- Modify: `api_group_test.go` — the `groupMemoryStore` struct (add the `revision` field), `groupMemoryStore.Set`, `groupMemoryStore.Subscribe` — **see DEVIATIONS, file owned by the `groups` lane**
+- Modify: `admin/admin_test.go` — `fakeStore.Subscribe` — **see DEVIATIONS, file owned by the `admin` lane**
 
 **Verification:** `cd /srv/worktrees/v4-engine-core && go build ./... && go test -tags=unit -race
 -count=1 ./...` — the whole suite is green and unchanged in behaviour, because nothing consumes the
@@ -632,12 +709,12 @@ except the resync-tolerant callback in `testing_facade_test.go`.
 - [ ] Done
 
 **Context:** The Client needs two things from the engine that Phase 1 kept unexported. First,
-`Client.Delete` (`internal/client/set.go:80-114`) removes the key from its own cache before returning
+`Client.Delete` (`internal/client/set.go`) removes the key from its own cache before returning
 so a caller reading back after a delete sees the registered default; the engine has exactly that
-operation in `applyDelete` (`internal/engine/feed.go:148-160`) — publish the registered default at
+operation in `applyDelete` (`internal/engine/feed.go`) — publish the registered default at
 revision 0 under `reconcileMu`, recording the key as touched — but only the changefeed can reach it.
 Leaving `Delete` to the feed alone would make read-your-writes on a delete depend on a NOTIFY
-round-trip. Second, `Engine.Lookup` (`internal/engine/engine.go:376-411`) reports `ok=false` for a
+round-trip. Second, `Engine.Lookup` (`internal/engine/engine.go`) reports `ok=false` for a
 key the scope has not published, and the Client then serves the registered default with no way to
 know the scope is stale; FC-5 says `Entry.Stale` is true while the scope's changefeed is disconnected
 or not yet reconciled, so a `GetEntry` after a failed first reconcile would report `Stale: false`
@@ -647,7 +724,7 @@ over a default nobody confirmed.
 
 Rename `applyDelete` to `PublishDelete(scope store.Scope, nk NSKey)` and keep the body byte-identical
 — this is an export, not a rewrite, and the reviewer should be able to diff it as one. Update its one
-call site (`internal/engine/feed.go:76`) and extend the doc comment with the second caller: the
+call site (`(*Engine).onEvent`, `internal/engine/feed.go`) and extend the doc comment with the second caller: the
 Client's own `Delete`, which needs the same publication under the same fence for the same reason a
 feed delete does. Do **not** add a second method beside it; one operation, two callers.
 
@@ -661,14 +738,15 @@ read of entry and freshness. Do not add a separate `Engine.Stale` accessor: two 
 instants, and a feed can flip the flag between them. The Client stamps `Stale` from the `Entry`
 `Lookup` returns, on hits and on misses alike.
 
-Named edge cases: `Stale` must not create a scope. Use the `e.scopes` map read under `scopesMu.RLock`
-directly, as `Lookup` does at `internal/engine/engine.go:381-387`, never `scopeFor`, which creates
-one lazily (`internal/engine/publish.go:110`) — a `Stale` call from a multi-tenant read would
-otherwise conjure a permanently stale, permanently unfed scope on every request.
+Named edge cases: `Stale` must not create a scope. Resolve through `trackedScope`
+(`internal/engine/publish.go`), which reads the `e.scopes` map under `scopesMu.RLock` and never
+creates one, exactly as `Lookup` now does — never `scopeFor`, which creates one lazily
+(`internal/engine/publish.go`); a `Stale` call from a multi-tenant read would otherwise conjure a permanently stale, permanently unfed scope on every request.
 
 **Files:**
-- Modify: `internal/engine/feed.go` (lines 76 and 138-160)
-- Modify: `internal/engine/engine.go` (add `Stale` after `Lookup`, line 411)
+- Modify: `internal/engine/feed.go` (the `applyDelete` call site in `(*Engine).onEvent`, and
+  `applyDelete` itself)
+- Modify: `internal/engine/engine.go` (add `Stale` immediately after `(*Engine).Lookup`)
 - Modify: `internal/engine/feed_test.go` (nothing calls `applyDelete` by name today; confirm with
   `grep -rn applyDelete .` after the rename)
 - Modify: `internal/engine/engine_test.go` (the three `Stale` tests below)
@@ -691,15 +769,17 @@ goleak.
 - [ ] Done
 
 **Context:** This is the rewire the whole lane exists for. `internal/client` runs a second, weaker
-copy of everything `internal/engine` now does: a value-only cache (`internal/client/client.go:55-56`)
-which is why `GetEntry` on a cache hit can only report zeros for revision and provenance
-(`internal/client/get.go:69-73`); a hydrate pass that skips the registered validator
-(`internal/client/client.go:309-322`); a changefeed refresh that does the same
-(`internal/client/client.go:442-453`); a `hydrating`/`hydrationTouched` pair
-(`internal/client/client.go:64-70`) that is the engine's touched fence in miniature and that
-deliberately suppresses the callbacks FC-11 now requires; a `Set` that discards the revision the
-store returned (`internal/client/set.go:59-61`); and a dispatcher that fires subscribers from the
-debouncer's timer goroutine (`internal/client/client.go:479`), so two publications of one key can run
+copy of everything `internal/engine` now does: a value-only cache (the `cacheMu` / `cache` fields
+on `Client`, `internal/client/client.go`) which is why `GetEntry` on a cache hit can only report
+zeros for revision and provenance (the cache-hit return inside `(*Client).getEntry`,
+`internal/client/get.go`); a hydrate pass that skips the registered validator (`(*Client).hydrate`);
+a changefeed refresh that does the same (`(*Client).refreshFromStore`); a
+`hydrating`/`hydrationTouched` pair (the `hydratingMu` block on `Client`) that is the engine's
+touched fence in miniature and that deliberately suppresses the callbacks FC-11 now requires; a
+`Set` that discards the revision the store returned (the `c.store.Set` call in `(*Client).Set`,
+`internal/client/set.go`, whose comment says so in as many words); and a dispatcher that fires
+subscribers from the debouncer's timer goroutine (`(*Client).fireSubscribers`, invoked at the tail
+of `(*Client).refreshFromStore`), so two publications of one key can run
 their callbacks concurrently and land out of order. All of it is replaced by calls into the engine
 that landed in Phase 1. Multi-tenant behaviour must not move at all in this task: per-request reads
 keep resolving the tenant database from ctx, and `OnChange` keeps returning
@@ -707,44 +787,60 @@ keep resolving the tenant database from ctx, and `OnChange` keeps returning
 
 **Implementation vision:** One task, because the tree does not compile between half of these edits.
 
-**The engine is built in `newClient`** (`internal/client/client.go:149-180`), in both modes:
+**The engine is built in `newClient`** (`internal/client/client.go`), in both modes:
 `engine.New(engine.Config{Store: s, Registry: c, Logger: logger, Debounce: cfg.debounce,
 CloseTimeout: cfg.closeTimeout})`, assigned after the struct literal because `Registry` is the Client
 itself. `engine.New` opens no connection and starts no goroutine
-(`internal/engine/engine.go:107-140`), so building it in multi-tenant mode costs nothing and keeps
+(`internal/engine/engine.go`), so building it in multi-tenant mode costs nothing and keeps
 `Close` uniform; only `Start` creates a scope, and the Client starts the engine in single-tenant mode
 only. `cfg.closeTimeout` is zero until Task 2.1.4 adds the option, and the engine defaults a zero to
-30s. Delete the Client's own `debouncer` field and its construction
-(`internal/client/client.go:43`, `:175-177`): the engine owns debouncing now, keyed by scope as well
+30s. Delete the Client's own `debouncer` field and the `debounce.New` call in `newClient` that
+fills it (`internal/client/client.go`): the engine owns debouncing now, keyed by scope as well
 as key.
 
 **The Client implements `engine.Registry`** in a new file `internal/client/registry.go`.
 `Lookup(namespace, key string) (engine.KeyDef, bool)` takes `registryMu.RLock`, and returns
-`engine.KeyDef{Default: engine.Clone(def.defaultValue), Validate: def.validator}` — the clone is
-required by the port's own contract (`internal/engine/registry.go:16-18`) and is what stops a
-subscriber reaching the registry's own default object through the cache. `Keys() []engine.NSKey`
+`engine.KeyDef{Default: engine.Clone(def.defaultValue), Validate: def.validator,
+Redacted: def.redaction != RedactNone}`. Amended
+2026-09-23: that clone is OPTIONAL, not required — Phase 1 fix pass 2 (commit `db9babd`) relaxed the
+port's contract, which now says the engine never mutates what it receives and clones before caching
+or delivering (`KeyDef.Default`'s godoc in `internal/engine/registry.go`). Both of the engine's
+reads of `KeyDef.Default` keep that promise: `ingestDefault` clones before publishing
+(`internal/engine/ingest.go`) and `keepsCachedValue` only compares
+(`internal/engine/reconcile.go`). Keeping the clone here costs one copy per `Lookup` and buys
+nothing the engine does not already guarantee; dropping it is safe. **`Redacted` is not optional.**
+It is the only producer of the log-redaction gate Phase 1 fix pass 3 added
+(`KeyDef.Redacted`, `internal/engine/registry.go`, read by `prepare` for an undecodable
+row and by `logValidatorRejection` for a validator rejection, both `internal/engine/ingest.go`): the engine needs the fact, not the policy, so the
+adapter collapses `RedactMask` and `RedactFull` alike to true — masking and hiding are the same
+decision to a log stream, and the policy itself stays the Client's. Omit it and every key reaches
+the engine as `Redacted: false`, `errorDetail` takes the `log.Err` branch, and an undecodable row
+for a `RedactFull` key publishes `invalid character 'h' looking for beginning of value` — the
+secret's first byte — at WARN, reopening the leak commit `9d44ea9` closed. `Keys() []engine.NSKey`
 takes `registryMu.RLock` and returns every registered key. Neither name collides with an existing
 method, and neither reaches the public surface: `systemplane.Client` is a **defined type**
-(`api_types.go:16`), not an alias, so it inherits no methods and `boundary_test.go` is unaffected.
+(the `type Client internalclient.Client` declaration in `api_types.go`), not an alias, so it
+inherits no methods and `boundary_test.go` is unaffected.
 
 **The validator slot widens first (amended 2026-09-23).** `develop` now registers every key
 validator as `func(context.Context, any) error`: `WithContextValidator` (PR #79) sets it directly and
 `WithValidator` wraps a ctx-less function into that shape (`internal/client/options.go`). So before the
-adapter above is written, `engine.KeyDef.Validate` (`internal/engine/registry.go:20`) and
-`runValidator` (`internal/engine/ingest.go:181`) widen to the same signature, `runValidator` hands its
+adapter above is written, `engine.KeyDef.Validate` (`internal/engine/registry.go`) and
+`runValidator` (`internal/engine/ingest.go`) widen to the same signature, `runValidator` hands its
 own `ctx` to the validator, and every Phase 1 test that builds a `KeyDef{Validate: func(any) error}`
 is updated in the same commit. Which context each ingress passes is the contract, and it is the one
 `develop` already promises for v3 read-back (PR #84 and the `WithContextValidator` godoc):
 
 - A value that arrives through `Publish` is validated with the **writer's** context, the one the
   caller handed to `Set`, so a tenant-aware validator sees the tenant on the local write path
-  (`Publish` already carries it; `internal/engine/engine.go:395`).
+  (`Publish` already carries it; `(*Engine).Publish`, `internal/engine/engine.go`).
 - A value that arrives from the changefeed re-read or from a reconcile `List` is validated with the
   engine's dispatch context, which carries **no tenant and no request**. A validator that refuses
   whenever the context lacks a tenant therefore refuses every stored row: the last valid value stays
   in force, or the registered default when no row was ever accepted (Task 1.2.1's rule and D-G4), and
-  the rejection is logged once per key with namespace, key and the validator's error, never the
-  stored bytes.
+  the rejection is logged with namespace, key and, for a key registered `RedactNone`, the
+  validator's error, once per ingestion attempt — a redacted key logs only the error's dynamic
+  type — and never the stored bytes.
 - A validator that panics is a refusal on every ingress; `runValidator`'s recovery already does this.
 - Whether a **tenant scope's** read-back context should carry the tenant id (not its connection)
   through lib-commons tenant-manager core is decided at `engine-tenants` elaboration, not here;
@@ -758,16 +854,21 @@ once; the same test stamps a request marker on the ctx handed to `Start` and to 
 asserts the validator cannot observe it on either read-back path, since the engine dispatch context
 carries no request values), both under `-race`.
 
-**`Start`** (`internal/client/client.go:189-277`) keeps its guards and its `c.store.Start(ctx)` call,
+**`(*Client).Start`** (`internal/client/client.go`) keeps its guards and its `c.store.Start(ctx)` call,
 and then, in single-tenant mode, is exactly `if err := c.engine.Start(ctx); err != nil { return err }`.
-Delete the default seeding (`:218-228`), the hydrating flags (`:230-237`, `:243-247`, `:259-271`),
-the `Subscribe` call and `storeUnsubscribe` (`:239-251`), the `hydrate` call (`:253-265`) and the
-whole `hydrate` method (`:279-328`), plus the `refreshTimeout` constant (`:25-26`). The engine
+Delete, all inside `Start`'s `if !c.multiTenant` block: the registered-default seeding loop over
+`c.registry` into `c.cache`, every mutation of the `c.hydrating` / `c.hydrationTouched` pair
+(the arming before `Subscribe`, and both rollback sites — the failed `Subscribe` and the failed
+`hydrate` — plus the release after a successful one), the `c.store.Subscribe` call and the
+`c.storeUnsubscribe` field it fills, and the `c.hydrate(ctx)` call. Then delete the whole
+`(*Client).hydrate` method and the `refreshTimeout` constant. The engine
 subscribes before reconciling and rolls back a failed `Subscribe` itself
-(`internal/engine/engine.go:217-251`), so the ordering discipline the old code documented at `:239`
-is preserved, not dropped. Multi-tenant `Start` is untouched: mark started, nothing else.
+(`bringUpScope`, `internal/engine/engine.go`), so the ordering discipline the old code documented on
+its `Subscribe` call ("Subscribe BEFORE hydration so writes that land between List() and the change
+feed's first event are still observed") is preserved, not dropped. Multi-tenant `Start` is untouched:
+mark started, nothing else.
 
-**`Close`** (`internal/client/client.go:336-370`) keeps `closeOnce`, `startMu` and the `closed` flag,
+**`(*Client).Close`** (`internal/client/client.go`) keeps `closeOnce`, `startMu` and the `closed` flag,
 cancels `lifecycleCtx` as today (the Manager binding still reads it until Task 2.2.2), then closes
 the engine and only then the store:
 `closeErr = errors.Join(engineErr, storeErr)` where `storeErr` keeps the existing
@@ -778,62 +879,64 @@ both outcomes: `errors.Is(err, ErrCloseTimeout)` still answers true when a subsc
 stop, and a store failure is not swallowed by it; `errors.Join(nil, nil)` is nil, so the clean path
 is unchanged. Delete `storeUnsubscribe` and the `debouncer.Close()` call.
 
-**Delete the dispatch half of the Client outright:** `onEvent` (`:372-388`), `refreshFromStore`
-(`:390-480`), `fireSubscribers` (`:482-500`), the `subscription` type (`:34-37`), and the
+**Delete the dispatch half of the Client outright** (all in `internal/client/client.go`): the
+`onEvent`, `refreshFromStore` and `fireSubscribers` methods, the `subscription` type, and the
 `subsMu`/`subscribers`/`nextSubID`, `cacheMu`/`cache`, `hydratingMu`/`hydrating`/`hydrationTouched`
 fields. Keep `nskey` — it is still the registry's map key. Sweep the imports: `encoding/json`,
 `time`, `internal/debounce` and `lib-observability/v4/runtime` all become unused in `client.go`.
 
-**`getEntry`** (`internal/client/get.go:45-121`) keeps every guard and the registry check. Its
-single-tenant branch (`:64-74`) becomes: `if e, ok := c.engine.Lookup(store.Scope{},
+**`getEntry`** (`internal/client/get.go`) keeps every guard and the registry check. Its
+single-tenant branch — its `if !c.multiTenant` block — becomes: `if e, ok := c.engine.Lookup(store.Scope{},
 engine.NSKey{Namespace: namespace, Key: key}); ok { return e, true, nil }`, and on a miss
 `return Entry{Value: engine.Clone(def.defaultValue), Stale: c.engine.Stale(store.Scope{})}, true, nil`.
 `Entry` is an alias of `engine.Entry` (`internal/client/change.go`), so the engine's entry is returned
 verbatim — the value is already a private clone, the revision and provenance are the row's, and
 `Stale` is the scope's. The wave-1 zero-Entry shim FC-5 tolerated is gone. The miss path is reachable
 only before the first reconcile or after a failed one, which is exactly when `Stale` must be true.
-The multi-tenant branch (`:76-120`) is not touched in this task.
+The multi-tenant branch is not touched in this task.
 
-**`List`** (`internal/client/get.go:245-311`): rename `listFromCache` to `listFromEngine` and read
+**`List`** (`internal/client/get.go`): rename its `listFromCache` helper to `listFromEngine` and read
 each key through `c.engine.Lookup(store.Scope{}, nk)`, falling back to the registered default on a
 miss. Keep the existing sort, the description lookup and the `[]ListEntry` shape — FC-10 keeps
 `ListEntry` at `{Key, Value, Description}`, so nothing here grows a revision.
 
-**`Set`** (`internal/client/set.go:17-77`) keeps validation and marshalling, captures the revision the
+**`Set`** (`internal/client/set.go`) keeps validation and marshalling, captures the revision the
 store returns, and in single-tenant mode publishes the entry it just wrote:
 `entry.Revision = revision; c.engine.Publish(store.Scope{}, entry)`. Delete the `canonical`
-round-trip and the cache write (`:65-74`). `Engine.Publish` runs the same ingress as the feed
-(`internal/engine/engine.go:353-367`), which is what makes the cached shape canonical and lets the
-echo deduplicate by revision. The `UpdatedAt` the Client stamps at `:55` is its own clock, not the
+round-trip and the single-tenant cache write that follows it. `Engine.Publish` runs the same ingress as the feed
+(`internal/engine/engine.go`), which is what makes the cached shape canonical and lets the
+echo deduplicate by revision. The `UpdatedAt` the Client stamps into the `store.Entry` it builds is its own clock, not the
 row's; the echo arrives at the same revision with an equal value and refreshes provenance without a
 callback (`internal/engine/publish.go`), so the row's real `updated_at` lands one round-trip later.
 That is the designed behaviour — do not add a re-read here to "fix" it.
 
-**`Delete`** (`internal/client/set.go:80-114`): replace the cache delete with
+**`Delete`** (`internal/client/set.go`): replace the cache delete with
 `c.engine.PublishDelete(store.Scope{}, engine.NSKey{Namespace: namespace, Key: key})` in
 single-tenant mode. A fake store that fires its delete event synchronously will make a subscriber see
 the default twice — once from the feed, once from this publication — because revision 0 is never
 deduplicated (D3). That is within FC-4 and is the same trade-off Task 1.4.1 accepted for a `Publish`
 at revision 0; never assert an exact delivery count of 1 for a delete.
 
-**`OnChange`** (`internal/client/onchange.go:148-219`) keeps the `ErrClosed` and `ErrUnknownKey`
+**`(*Client).OnChange`** (`internal/client/onchange.go`) keeps the `ErrClosed` and `ErrUnknownKey`
 guards — the Client owns the registry, and the engine deliberately does not reject an unregistered
-key (`internal/engine/dispatch.go:88-95`) — and keeps returning `noop, nil` for a nil `fn`. Its
-single-tenant branch (`:187-218`) becomes
+key (`(*Engine).OnChange`, `internal/engine/dispatch.go`) — and keeps returning `noop, nil` for a nil `fn`. Its
+single-tenant branch (everything after the `if c.multiTenant` block: the `nextSubID` bump, the
+`c.subscribers[nk]` append and the `sync.Once`-guarded unsubscribe closure) becomes
 `return c.engine.OnChange(engine.NSKey{Namespace: namespace, Key: key}, fn), nil`. Pass `fn`
 straight through: the engine builds the whole `Change` including `Tenant` and `Revision` and hands
-each subscriber its own clone (`internal/engine/dispatch.go:143-175`, `:248-270`), so wrapping it
+each subscriber its own clone (`(*Engine).dispatch` and `(*Engine).deliver`,
+`internal/engine/dispatch.go`), so wrapping it
 would double-clone and drop the revision. The multi-tenant branch is untouched.
 
 Named edge cases. A Client whose `engine` is nil (hand-assembled in a future test) degrades to the
 registered default rather than panicking, because every `Engine` method is nil-receiver safe. Two
 root tests call `Start` without `Close` and would now leak the scope's reconcile goroutine — add
 `defer c.Close()` to `TestNewForTestingAdapterAndOptions`
-(`internal/client/testing_facade_test.go:57`, which `goleak.VerifyTestMain` in
+(`internal/client/testing_facade_test.go`, which `goleak.VerifyTestMain` in
 `internal/client/main_test.go` will otherwise fail) and to the `NewForTesting` client in
-`TestPublicConstructorsAndOptions` (`api_client_test.go:169`). One root test reads a callback's
+`TestPublicConstructorsAndOptions` (`api_client_test.go`). One root test reads a callback's
 result without synchronisation: `TestPublicClientFacadeRuntimeMethods`
-(`api_client_test.go:146-158`) assigns `changed = ch.Value` from the subscriber and reads it on the
+(`api_client_test.go`) assigns `changed = ch.Value` from the subscriber and reads it on the
 test goroutine — under the engine that callback runs on a dispatch worker, which is a data race under
 `-race` and a flaky assertion; replace the variable with a buffered channel and a
 `select`/`time.After(time.Second)`.
@@ -841,13 +944,23 @@ test goroutine — under the engine that callback runs on a dispatch worker, whi
 **Files:**
 - Create: `internal/client/registry.go`
 - Create: `internal/client/registry_test.go`
-- Modify: `internal/client/client.go` (delete 25-26, 34-37, 43, 53-70; rewrite 149-180, 189-277,
-  336-370; delete 279-328, 372-500)
-- Modify: `internal/client/get.go` (lines 64-74, 274-278, 281-311)
-- Modify: `internal/client/set.go` (lines 51-77, 103-113)
-- Modify: `internal/client/onchange.go` (lines 183-218)
-- Modify: `internal/client/testing_facade_test.go` (add `defer c.Close()` at 57)
-- Modify: `api_client_test.go` (channel-based OnChange assertion at 146-158; `defer c.Close()` at 169)
+- Modify: `internal/client/client.go` — delete the `refreshTimeout` constant, the `subscription`
+  type, and the `debouncer`, `cacheMu`/`cache`, `subsMu`/`subscribers`/`nextSubID`,
+  `storeUnsubscribe` and `hydratingMu`/`hydrating`/`hydrationTouched` fields of `Client`; rewrite
+  `newClient`, `(*Client).Start` and `(*Client).Close`; delete `(*Client).hydrate`,
+  `(*Client).onEvent`, `(*Client).refreshFromStore`, `(*Client).fireSubscribers` and the
+  `validateStored` helper that `(*Client).hydrate` and `(*Client).refreshFromStore` are the only
+  callers of — whose `errValidatorPanicked` sentinel in `internal/client/errors.go` goes with it
+- Modify: `internal/client/get.go` (the single-tenant branch of `(*Client).getEntry`; the
+  `listFromCache` call at the tail of `(*Client).List`; `(*Client).listFromCache` itself)
+- Modify: `internal/client/set.go` (the write-through tail of `(*Client).Set`, and the single-tenant
+  cache delete in `(*Client).Delete`)
+- Modify: `internal/client/onchange.go` (the single-tenant branch of `(*Client).OnChange`)
+- Modify: `internal/client/testing_facade_test.go` (add `defer c.Close()` in
+  `TestNewForTestingAdapterAndOptions`)
+- Modify: `api_client_test.go` (channel-based OnChange assertion in
+  `TestPublicClientFacadeRuntimeMethods`; `defer c.Close()` on the `NewForTesting` client in
+  `TestPublicConstructorsAndOptions`)
 
 **Verification:** `cd /srv/worktrees/v4-engine-core && go build ./... && go test -tags=unit -race
 -count=1 ./... && go vet -tags=unit ./... && go vet -tags=integration ./...`. These must pass with no
@@ -857,7 +970,7 @@ assertion rewritten beyond the two named above: `TestGetReturnsRegisteredDefault
 `TestHydrationDoesNotOverwriteFresherChangefeedState`,
 `TestRefreshKeepsCacheWhenReReadReportsNotFound`, `TestRefreshOnDeleteEventRestoresDefault`,
 `TestCatalogDoesNotTouchStoreAfterStart`, and the whole of `admin/` and `api_group_test.go`.
-`TestGetEntryPopulatesPublishedState` (`internal/client/client_test.go:1107`) and
+`TestGetEntryPopulatesPublishedState` (`internal/client/client_test.go`) and
 `TestGroupSnapshot*` on seeded bad rows are the two knowingly-broken groups — see DEVIATIONS; fix
 them here only to the extent the deviation resolution says.
 
@@ -866,8 +979,12 @@ no hydration flags; `grep -rn "hydrat\|fireSubscribers\|refreshFromStore\|c.cach
 returns nothing outside comments; `GetEntry` on a single-tenant cache hit returns the row's revision,
 `UpdatedAt` and `UpdatedBy`; `Set` then `Get` in one goroutine returns the new value with no feed
 event; `Client` satisfies `engine.Registry` (assert it with a compile-time
-`var _ engine.Registry = (*Client)(nil)` in `registry.go`); `go build ./...` and
-`go test -tags=unit -race -count=1 ./...` are green.
+`var _ engine.Registry = (*Client)(nil)` in `registry.go`); a key registered with
+`WithRedaction(RedactFull)` whose stored row is not decodable JSON logs no byte of that row
+through the Client — assert it in `internal/client` against a store seeded with a raw secret, the
+way `TestUndecodableValueIsRedactedByKeyPolicy` (`internal/engine/logging_test.go`) asserts it
+one layer down, so the adapter's `Redacted` mapping is pinned and not merely written; `go build
+./...` and `go test -tags=unit -race -count=1 ./...` are green.
 
 #### Task 2.1.4: Add WithCloseTimeout and the ErrCloseTimeout sentinel to the facade
 
@@ -876,18 +993,19 @@ event; `Client` satisfies `engine.Registry` (assert it with a compile-time
 **Context:** D10 makes `Close` a bounded wait: it cancels every in-flight callback's context and then
 waits up to a configurable bound for the dispatch workers, returning `ErrCloseTimeout` naming the
 (scope, key) still running when one ignores cancellation. The engine implements all of it
-(`internal/engine/engine.go:436-466`, `:497-519`, `internal/engine/errors.go:13`) and defaults the
-bound to 30s (`internal/engine/engine.go:21`), but nothing at the facade can set it and no consumer
+(`(*Engine).Close` and `waitForWorkers`, `internal/engine/engine.go`; `ErrCloseTimeout`,
+`internal/engine/errors.go`) and defaults the bound to 30s (`defaultCloseTimeout`,
+`internal/engine/engine.go`), but nothing at the facade can set it and no consumer
 can recognise the error: `internal/client/errors.go` has no such sentinel and
 `internal/client/options.go` no such option. FC-10 lists both as the only additions v4 makes to the
 client surface.
 
 **Implementation vision:** Four small edits and one test.
 
-`clientConfig` (`internal/client/options.go:12-24`) gains `closeTimeout time.Duration`, left at zero
+`clientConfig` (`internal/client/options.go`) gains `closeTimeout time.Duration`, left at zero
 in `defaultClientConfig` so the engine's own 30s default applies — do not restate 30s in two places.
 `WithCloseTimeout(d time.Duration) Option` sets it unconditionally, including a non-positive value,
-which the engine reads as "use the default" (`internal/engine/engine.go:119-122`); that is last-wins
+which the engine reads as "use the default" (`New`, `internal/engine/engine.go`); that is last-wins
 like every other option here and needs no guard of its own. Task 2.1.3 already passes
 `cfg.closeTimeout` into `engine.Config`.
 
@@ -908,10 +1026,11 @@ bound. `Close` still returns the store's own error joined with the engine's (Tas
 timeout and a store failure are both visible.
 
 **Files:**
-- Modify: `internal/client/options.go` (lines 12-34, and a new option beside `WithDebounce` at 80-86)
-- Modify: `internal/client/errors.go` (sentinel block, lines 8-35)
+- Modify: `internal/client/options.go` (`clientConfig`, `defaultClientConfig`, and a new option
+  beside `WithDebounce`)
+- Modify: `internal/client/errors.go` (the sentinel `var` block)
 - Modify: `api_errors.go` (sentinel block)
-- Modify: `api_constructors.go` (beside `WithDebounce`, line 257-258)
+- Modify: `api_constructors.go` (beside `WithDebounce`)
 - Modify: `api_client_test.go` (the new facade test)
 
 **Verification:** `cd /srv/worktrees/v4-engine-core && go test -tags=unit -race -count=1 ./... &&
@@ -942,8 +1061,9 @@ no goroutine is left behind.
 - [ ] Done
 
 **Context:** `Manager` exists because v1.5.0 needed a per-tenant cache and per-tenant LISTEN bolted
-onto a Client that had neither (`manager.go:1-11`). v4 has one engine that tracks N scopes, so the
-second surface is dead weight that would have to be kept consistent with the first forever. D1 and
+onto a Client that had neither (`manager.go`'s package doc comment). v4 has one engine that tracks
+N scopes, so the second surface is dead weight that would have to be kept consistent with the first
+forever. D1 and
 FC-10 remove it: `Manager`, `ManagerOption`, `NewManager`, `WithManagerLogger`,
 `WithManagerTelemetry`, `WithManagerAggregateTenantThreshold` and every `(*Manager)` method go, and
 `HandleTenantLifecycle` comes back on `Client` in the wave-3 `engine-tenants` lane (FC-6). The
@@ -956,7 +1076,8 @@ wave 3. `examples/manager/main.go` demonstrates the removed API and is the only 
 else at the root references them: `asInternalManager` is used only inside those two files, and
 `internal/client.BindManager` is reachable only from `NewManager`, so after this task the internal
 Manager is unreachable from outside the library and multi-tenant `OnChange` returns
-`ErrNotSupportedInMultiTenant` on every path (`internal/client/onchange.go:165-169`), which is
+`ErrNotSupportedInMultiTenant` on every path (the `mgr == nil` return inside `(*Client).OnChange`'s
+`if c.multiTenant` block, `internal/client/onchange.go`), which is
 exactly what Epic 2.2's Done-when requires. `internal/manager` still compiles and is still imported
 by `internal/client`; Task 2.2.2 removes it.
 
@@ -976,8 +1097,9 @@ WithAggregateTenantThreshold. MIGRATION-v4.md names the replacement per
 consumer.
 ```
 
-Named edge cases. `boundary_test.go:24-31` carries a comment justifying why `lib-commons` is not in
-`coupledModules`, and the justification is `NewManager` taking a `*tmpostgres.Manager`. The reason
+Named edge cases. The comment above `coupledModules` in `boundary_test.go` justifies why
+`lib-commons` is not in that list, and the justification is `NewManager` taking a
+`*tmpostgres.Manager`. The reason
 survives this task — the wave-3 `WithPostgresTenantManager` takes the same concrete handle — so
 update the comment to name the option instead of `NewManager` rather than changing the list. Do not
 add `lib-commons` to `coupledModules`: that would fail a gate on a shape nobody intends to change.
@@ -988,7 +1110,7 @@ add `lib-commons` to `coupledModules`: that would fail a gate on a shape nobody 
 **Files:**
 - Delete: `manager.go`, `manager_methods.go`, `manager_methods_test.go`, `examples/manager/main.go`
   (and the now-empty `examples/manager/` directory)
-- Modify: `boundary_test.go` (the `coupledModules` comment, lines 24-31)
+- Modify: `boundary_test.go` (the comment above `coupledModules`)
 
 **Verification:** `cd /srv/worktrees/v4-engine-core && go build ./... && go test -tags=unit -race
 -count=1 ./... && go test -tags=unit -run TestExportedBoundary ./...`; then
@@ -1005,9 +1127,10 @@ multi-tenant `OnChange` returns `ErrNotSupportedInMultiTenant` on every path; th
 
 **Context:** With the public surface gone (Task 2.2.1), `internal/manager` is reachable only from
 `internal/client`, which uses it in three places: the `manager` field and `managerMu`
-(`internal/client/client.go:84-87`), the multi-tenant read's cache lookup and populate
-(`internal/client/get.go:79-86`, `:111-113`, via `manager.TenantIDFromContext` at `:79`), and
-`managerCallback` (`internal/client/onchange.go:226-246`). All three are dead code the moment nothing
+(`internal/client/client.go`), the multi-tenant read's `boundManager` cache lookup and its
+`Populate` call, both inside `(*Client).getEntry` and both reached through
+`manager.TenantIDFromContext` (`internal/client/get.go`), and
+`(*Client).managerCallback` (`internal/client/onchange.go`). All three are dead code the moment nothing
 can bind a Manager: `boundManager()` can only ever return nil. D1 deletes the package. The
 multi-tenant per-request read must behave exactly as it does today for a consumer with no Manager
 bound — resolve the tenant database from ctx and read through — which is what remains once the
@@ -1017,58 +1140,77 @@ lookup and populate branches go.
 including `schema.go`, `listen.go`, `metrics.go`, `warmload.go` and their integration suites; the Files list below is the authoritative enumeration),
 `internal/client/manager_binding.go` and `internal/client/manager_binding_test.go`.
 
-In `internal/client/get.go`, the multi-tenant branch of `getEntry` (`:76-120`) loses the
-`TenantIDFromContext` call, the `boundManager` lookup (`:81-86`) and the `Populate` call (`:108-113`),
+In `internal/client/get.go`, the multi-tenant branch of `(*Client).getEntry` loses the
+`TenantIDFromContext` call, the `boundManager` lookup and the `Populate` call,
 leaving `store.Get` → `json.Unmarshal` → `Entry` with the row's revision and provenance, which is the
 no-Manager path that has always existed. Drop the `internal/manager` import.
 
 In `internal/client/onchange.go`, the multi-tenant branch collapses to
-`if c.multiTenant { return noop, ErrNotSupportedInMultiTenant }`, and `managerCallback`
-(`:226-246`) is deleted along with the `internal/manager` import. The doc comment loses its
+`if c.multiTenant { return noop, ErrNotSupportedInMultiTenant }`, and `(*Client).managerCallback`
+is deleted along with the `internal/manager` import. The doc comment loses its
 Manager paragraphs and its "wave-1 shim reports Revision 0" note, which describes a path that no
 longer exists; say instead that the wave-3 `engine-tenants` lane makes multi-tenant `OnChange` work
 on both backends.
 
-In `internal/client/client.go`, drop the `managerMu`/`manager` fields (`:84-87`), the
-`internal/manager` import, and — now that `clientHook.LifecycleContext`
-(`internal/client/manager_binding.go:85-90`) was its last reader — `lifecycleCtx`, `lifecycleCancel`
-(`:72-77`, `:160`, `:171-172`) and the `lifecycleCancel()` call in `Close`. The engine owns its own
+In `internal/client/client.go`, drop the `managerMu`/`manager` fields, the
+`internal/manager` import, and — now that `(*clientHook).LifecycleContext`
+(`internal/client/manager_binding.go`) was its last reader — the `lifecycleCtx` / `lifecycleCancel`
+fields, the `context.WithCancel` call in `newClient` and the two struct-literal assignments that
+fill them, and the `lifecycleCancel()` call in `Close`. The engine owns its own
 lifecycle context and cancels it in `Engine.Close`, which `Client.Close` already calls first.
 `context` stays imported for the method signatures.
 
-`.ignorecoverunit` loses the two `internal/manager/*` lines and the comment above them (lines 22-24).
+`.ignorecoverunit` loses its two `internal/manager/*` entries and the
+`# Manager LISTEN/schema paths ...` comment above them.
 Touch nothing else in that file: the `storage` lane may need its own backend lines and the
 orchestrator resolves any merge as a two-line diff.
 
-Also sweep the two stale comments that name deleted files inside this lane's own tree:
-`internal/client/client_test.go:15` imports `internal/manager` and `manager_methods_test.go:15`
-mentions `internal/manager/handle_lifecycle_test.go` (the latter file is deleted in Task 2.2.1).
-`ddl.go:9` and `ddl_test.go:26` also name `internal/manager/schema.go` in comments — those two files
+Also sweep the three stale comments that name deleted files inside this lane's own tree:
+`internal/client/client_test.go` imports `internal/manager`, `manager_methods_test.go`
+mentions `internal/manager/handle_lifecycle_test.go` (the latter file is deleted in Task 2.2.1),
+and the doc comment of `TestTenantIsLoggedUnderTheCanonicalKey` in
+`internal/engine/logging_test.go` contrasts this package's tenant label with `internal/manager`'s.
+The doc comments in `ddl.go` and `ddl_test.go` also name `internal/manager/schema.go` — those two files
 belong to the `storage` lane and are already recorded as that lane's sweep in
 `lane-engine-core.md` § Self-review; leave them alone.
 
-Named edge cases. `internal/client/client_test.go` imports `internal/manager` (`:15`) and
-`dbresolver` (`:18`) for `warmLoadFailsConnector` and the bound-Manager case of
-`TestGetEntryPopulatesPublishedState` (`:1167-1195`); that case and its helper go with the package —
+Named edge cases. `internal/client/client_test.go` imports `internal/manager` and
+`dbresolver` for `warmLoadFailsConnector` and the `"bound-Manager cache hit"` case of
+`TestGetEntryPopulatesPublishedState`; that case and its helper go with the package —
 Task 2.3.1 owns rewriting that test, so here just delete the case, the helper and the two imports so
-the package compiles. `internal/postgres` gained the tenant connector in the `contracts` lane
+the package compiles. Deleting that helper is what pulls in the second file: the whole of
+`internal/client/set_writethrough_test.go` is Manager-bound — `activatedManagerFor` constructs a
+`manager.Manager`, binds it and hands it `warmLoadFailsConnector{}` — and the invariant it pins is a
+per-tenant write-through cache that does not exist between this task and `engine-tenants`, so the
+file goes with the package rather than being rewritten here; Epic 2.3's Client-level
+`TestSetThenGetReturnsNewValue` is where the surviving single-tenant half of that invariant lands.
+The third reference is production, not test: `(*Client).Set` and `(*Client).Delete` each end their
+multi-tenant branch in `c.boundManager()` plus `manager.TenantIDFromContext(ctx)`, and `boundManager`
+is defined in the `manager_binding.go` this task deletes, so `internal/client` does not compile until
+those two branches go too. `internal/postgres` gained the tenant connector in the `contracts` lane
 (FC-3), so nothing the deleted package held is still needed by a backend.
 
 **Files:**
 - Delete: `internal/manager/**` (all 26 files), `internal/client/manager_binding.go`,
-  `internal/client/manager_binding_test.go`
-- Modify: `internal/client/client.go` (imports; delete 72-77, 84-87, 160, 171-172, and the
-  `lifecycleCancel()` call in `Close`)
-- Modify: `internal/client/get.go` (imports; multi-tenant branch 76-120)
-- Modify: `internal/client/onchange.go` (imports; 127-181 doc and branch, delete 221-246)
-- Modify: `internal/client/client_test.go` (imports at 13-18; delete the bound-Manager case and
-  `warmLoadFailsConnector`)
-- Modify: `.ignorecoverunit` (delete lines 22-24)
+  `internal/client/manager_binding_test.go`, `internal/client/set_writethrough_test.go`
+- Modify: `internal/client/client.go` (imports; delete the `lifecycleCtx` / `lifecycleCancel` and
+  `managerMu` / `manager` fields, the `context.WithCancel` call and its two assignments in
+  `newClient`, and the `lifecycleCancel()` call in `Close`)
+- Modify: `internal/client/get.go` (imports; the multi-tenant branch of `(*Client).getEntry`)
+- Modify: `internal/client/set.go` (imports; the multi-tenant `boundManager` tail of `(*Client).Set`
+  and of `(*Client).Delete`)
+- Modify: `internal/client/onchange.go` (imports; the doc comment and multi-tenant branch of
+  `(*Client).OnChange`, and delete `(*Client).managerCallback`)
+- Modify: `internal/client/client_test.go` (the `internal/manager` and `dbresolver` imports; delete
+  the `"bound-Manager cache hit"` case and `warmLoadFailsConnector`)
+- Modify: `internal/engine/logging_test.go` (the doc comment of
+  `TestTenantIsLoggedUnderTheCanonicalKey`)
+- Modify: `.ignorecoverunit` (delete the two `internal/manager/*` entries and their comment)
 
 **Verification:** `cd /srv/worktrees/v4-engine-core && go build ./... && go list -tags=unit -deps
 ./... | grep -c internal/manager` returns 0, and `go test -tags=unit -race -count=1 ./... &&
 go vet -tags=integration ./...` are green. `grep -rn "internal/manager" --include='*.go' .` returns
-only `ddl.go:9` and `ddl_test.go:26`, both comments owned by the `storage` lane.
+only the two `storage`-lane comments in `ddl.go` and `ddl_test.go`, which this lane leaves alone.
 
 **Done when:** `internal/manager` does not exist; nothing in the module imports it; multi-tenant
 reads resolve the tenant database from ctx exactly as they do today on both backends; multi-tenant
@@ -1082,7 +1224,7 @@ entry; `boundary_test.go` passes.
 **Goal:** The tests assert the v4 contract, not the v3 one, and the behaviors the audit found are pinned at the Client level as well as the engine level.
 **Scope:** `internal/client/client_test.go`, `catalog_test.go`, `testing_facade_test.go`, `main_test.go`; root `api_client_test.go`, `api_catalog_test.go`
 **Dependencies:** Epic 2.1, Epic 2.2
-**Done when:** the hydration-race test at `internal/client/client_test.go:878` and the not-found-refresh test at `:951` are expressed against the engine-backed Client and still pass; `TestGetEntryPopulatesPublishedState` asserts real provenance on a single-tenant cache hit; a Client-level `TestSetThenGetReturnsNewValue` and `TestDeletePublishesDefaultAtRevisionZero` exist; `make test-unit` is green and `make coverage-unit` does not regress against the Phase 1 baseline.
+**Done when:** `TestHydrationDoesNotOverwriteFresherChangefeedState` and `TestRefreshKeepsCacheWhenReReadReportsNotFound` (`internal/client/client_test.go`) are expressed against the engine-backed Client and still pass; `TestGetEntryPopulatesPublishedState` asserts real provenance on a single-tenant cache hit; a Client-level `TestSetThenGetReturnsNewValue` and `TestDeletePublishesDefaultAtRevisionZero` exist; `make test-unit` is green and `make coverage-unit` does not regress against the Phase 1 baseline.
 **Status:** Pending
 
 #### Task 2.3.1: Re-express the two pinned audit regressions against the engine-backed Client
@@ -1091,15 +1233,15 @@ entry; `boundary_test.go` passes.
 
 **Context:** Two tests in `internal/client/client_test.go` exist because the defect they describe was
 real, and both are written in the vocabulary of the engine that no longer exists.
-`TestHydrationDoesNotOverwriteFresherChangefeedState` (`:922`) blocks `List` through
+`TestHydrationDoesNotOverwriteFresherChangefeedState` blocks `List` through
 `memStore.listHook`, injects an upsert, and asserts the cache holds the changefeed value rather than
 the older snapshot — that is the touched fence, which now lives in the engine's reconcile window
-(`internal/engine/reconcile.go:26-41`) and is driven by `OpResync` instead of by `hydrate()`. Its
+(`reconcileWindow`, `internal/engine/reconcile.go`) and is driven by `OpResync` instead of by `hydrate()`. Its
 comments name `hydrate()` and "hydration", neither of which exists after Task 2.1.3.
-`TestRefreshKeepsCacheWhenReReadReportsNotFound` (`:995`) pins that a NOTIFY whose re-read reports
+`TestRefreshKeepsCacheWhenReReadReportsNotFound` pins that a NOTIFY whose re-read reports
 not-found keeps the last known-good value instead of resetting to the default — the engine keeps that
-rule at `internal/engine/feed.go:205-211`, recording the key in neither fence. A third case,
-`TestGetEntryPopulatesPublishedState`'s "bound-Manager cache hit" (`:1167`), tests a path Task 2.2.2
+rule in `refreshKey` (`internal/engine/feed.go`), recording the key in neither fence. A third case,
+`TestGetEntryPopulatesPublishedState`'s "bound-Manager cache hit" case tests a path Task 2.2.2
 deleted. Both surviving tests must keep passing at the Client level, because a Client-level
 regression is what a consumer actually experiences; the engine-level versions
 (`TestReconcileSkipsKeyTouchedByFeed`, `TestUpsertReReadNotFoundKeepsCurrentValue`) do not replace
@@ -1129,10 +1271,10 @@ assertion the engine makes possible: after the not-found re-read, `GetEntry` sti
 even if some later code path restored the value.
 
 Delete the "bound-Manager cache hit" case from `TestGetEntryPopulatesPublishedState` and retarget the
-"single-tenant cache hit" case (`:1119-1132`): its `want` becomes
+"single-tenant cache hit" case: its `want` becomes
 `Entry{Value: "from-cache", Revision: <the revision memStore assigned>, UpdatedAt: <the entry the
-Client wrote>, UpdatedBy: "actor"}`. Because `Set` stamps its own `UpdatedAt`
-(`internal/client/set.go:55`), assert the provenance fields are non-zero and `UpdatedBy == "actor"`
+Client wrote>, UpdatedBy: "actor"}`. Because `(*Client).Set` stamps its own `UpdatedAt` into the
+`store.Entry` it builds (`internal/client/set.go`), assert the provenance fields are non-zero and `UpdatedBy == "actor"`
 rather than pinning an exact timestamp, and assert `Revision` equals what the fake returned from
 `Set`. Rename the test's doc comment away from "caches hold only values, so a cached row reports
 Revision 0" — that limitation is what this task removes.
@@ -1144,7 +1286,8 @@ counting callbacks must account for the first; none of the three here counts. Th
 mandatory for all of them, because the injected event is now processed on engine goroutines.
 
 **Files:**
-- Modify: `internal/client/client_test.go` (lines 916-990, 991-1060, 1100-1240)
+- Modify: `internal/client/client_test.go` (`TestHydrationDoesNotOverwriteFresherChangefeedState`,
+  `TestRefreshKeepsCacheWhenReReadReportsNotFound`, `TestGetEntryPopulatesPublishedState`)
 
 **Verification:** `cd /srv/worktrees/v4-engine-core && go test -tags=unit -race -count=1 -run
 'TestReconcileDoesNotOverwriteFresherChangefeedState|TestRefreshKeepsCacheWhenReReadReportsNotFound|TestGetEntryPopulatesPublishedState'
@@ -1272,9 +1415,22 @@ the task; no explanatory note substitutes for it.
 Then run the full gate sweep this phase is responsible for, which is Phase 3's list minus the
 surface cut: `make test-unit`, `go vet -tags=unit ./...`, `go vet -tags=integration ./...`,
 `go test -tags=unit -run=^TestPerf_ ./...`, `go test -tags=unit -run TestExportedBoundary ./...`,
-`make lint`, `make check-tests`. Note that `TestPerf_` matches nothing in this repository, so that
-command passes vacuously; it is in the list because CI runs it and a new `internal/engine` or
-`internal/client` test accidentally named `TestPerf_*` would silently join a no-`-race` job.
+`make lint`, `make check-tests`. The `TestPerf_` command is no longer vacuous, and it now runs TWO
+gates with opposite failure modes — read which one went red before looking anywhere:
+
+- `TestPerf_CloneJSONMap` (`internal/engine/clone_perf_test.go`, build tags `unit && !race`, added
+  by commit `c3e74f1`) pins the allocation count of `Clone` over a decoded JSON tree. Red means
+  `Clone` left its JSON fast path and fell back onto the generic reflective walk — a cost paid on
+  every consumer read and every subscriber delivery. Fix the clone; do not raise the bound.
+- `TestPerf_ForeignEventDropAllocatesNothing` (`internal/engine/feed_perf_test.go`, same build tags,
+  added 2026-09-23 in the Phase 1 fix pass) pins at zero the allocations of dropping one foreign
+  changefeed event. Red means the feed's DEBUG drop line built its `log.Field` slice before asking
+  whether anyone would read it — a cost paid on every write by every OTHER consumer sharing the
+  `systemplane_entries` table, on a line that is off in production. Nothing to do with `Clone`.
+
+Run both without `-race`, which is why the files carry `!race` and why CI gives them their own job
+(`.github/workflows/go-combined-analysis.yml`): the race detector accounts allocations its own way,
+so the pinned numbers are meaningless under it.
 
 Named edge cases. `make coverage-unit` writes `./reports/unit_coverage.out` inside the worktree;
 `.gitignore` already covers `reports/`, but confirm nothing under it is staged. `make lint` may flag
@@ -1316,8 +1472,24 @@ every gate in the verification list exits 0 on the branch head.
 **Goal:** Every gate the repo runs is green against the lane's final shape, and the lane's own branch is mergeable.
 **Scope:** no new production code — verification only, plus whatever small fixes the gates demand inside owned files
 **Dependencies:** Epic 3.1
-**Done when:** `make test-unit`, `go vet -tags=unit ./...`, `go vet -tags=integration ./...`, `go test -tags=unit -run=^TestPerf_ ./...`, `go test -tags=unit -run TestExportedBoundary ./...` and `make lint` all pass; `make check-tests` reports coverage for `internal/engine`; the repo-wide absence checks (`internal/manager`, `WithTable`, `WithListenChannel`) are **not** asserted here — lane-cut rule 4 puts them in the integration lane, and this lane's branch cannot prove a negative while siblings are writing.
+**Done when:** `make test-unit`, `go vet -tags=unit ./...`, `go vet -tags=integration ./...`, `go test -tags=unit -run=^TestPerf_ ./...`, `go test -tags=unit -run TestExportedBoundary ./...` and `make lint` all pass; the anchor check below prints `0`; `make check-tests` reports coverage for `internal/engine`; the repo-wide absence checks (`internal/manager`, `WithTable`, `WithListenChannel`) are **not** asserted here — lane-cut rule 4 puts them in the integration lane, and this lane's branch cannot prove a negative while siblings are writing.
 **Status:** Pending
+
+**The anchor check** — runnable from the worktree root, and the only mechanical claim § Self-review
+makes about this document. It counts `file.go:N` line anchors anywhere after the `## Phase 2`
+heading, in a **Files:** list or in prose, and must print `0`:
+
+```bash
+P=docs/plans/2026-09-17-v4-unified-engine/lane-engine-core.md && \
+L=$(grep -n '^## Phase 2' $P | head -1 | cut -d: -f1) && \
+tail -n +$L $P | grep -nE '\b[A-Za-z_./-]+\.go:[0-9]+' ; \
+echo "anchors after Phase 2 heading: $(tail -n +$L $P | grep -cE '\b[A-Za-z_./-]+\.go:[0-9]+')"
+```
+
+It proves the absence of a line number. It does NOT prove that any construct named instead of one is
+correct; no grep can, and a reviewer reading the plan against the tree is still the check for that.
+It says nothing about Phase 1, whose prose carries line anchors deliberately, as the record of what
+the v3 code looked like when this lane was authored.
 
 ---
 
@@ -1358,7 +1530,7 @@ every gate in the verification list exits 0 on the branch head.
 | Trap | Test | Task |
 |---|---|---|
 | Lost update during a feed gap | `TestReconcileAppliesValueWrittenDuringFeedGap` | 1.2.3 |
-| Stale `List` row vs newer feed event | `TestReconcileSkipsKeyTouchedByFeed`, `TestPublishRejectsLowerRevision` | 1.2.3, 1.1.3 |
+| Stale `List` row vs newer feed event | `TestReconcileSkipsKeyTouchedByFeed`, `TestPublishFence`/"a lower revision is rejected and overwrites nothing" (`internal/engine/publish_test.go`) | 1.2.3, 1.1.3 |
 | Delete-then-recreate during reconcile | `TestReconcileKeepsRecreatedValueOverListSnapshot` | 1.2.3 |
 | Wrong-type external JSON keeps last valid | `TestIngestRejectsInvalidValueKeepingPrevious` | 1.2.1 |
 | Blocked subscriber on key A does not delay key B | `TestDispatchIsolatesKeys` | 1.3.1 |
@@ -1368,7 +1540,7 @@ every gate in the verification list exits 0 on the branch head.
 | `Close` with ctx-honoring vs ctx-ignoring callbacks | `TestCloseWaitsForCtxHonoringCallbacks`, `TestCloseReportsTimeoutNamingStuckKey` | 1.3.2 |
 | `Stale` true across the whole outage, false outside it | `TestStaleIsTrueBetweenDisconnectAndCompletedReconcile`, `TestDisconnectMarksScopeStaleWithoutPublishing` | 1.2.3, 1.2.2 |
 | First reconcile announces every registered key exactly once (FC-11) | `TestFirstReconcileAnnouncesEveryRegisteredKey` (counted per key), `TestStartRunsExactlyOneInitialReconcile` | 1.2.3, 1.4.1 |
-| Foreign writer changes `value` without bumping `revision` (D3, MongoDB) | `TestPublishAcceptsSameRevisionWithChangedValue` | 1.1.3 |
+| Foreign writer changes `value` without bumping `revision` (D3, MongoDB) | `TestPublishFence`/"an equal revision with a changed value is accepted" (`internal/engine/publish_test.go`) | 1.1.3 |
 | Failed feed reread + absent from `List` erases a valid cached value | `TestReconcileKeepsCachedValueWhenRereadWasUnusable`, `TestReconcileUnusableKeyStillAcceptsListRow` | 1.2.3 |
 | Reconcile spanning a new disconnect clears `stale` it should not | `TestStaleSurvivesDisconnectDuringReconcile` | 1.2.3 |
 | goleak clean | `TestMain` (`goleak.VerifyTestMain`) over every Phase 1 test | 1.1.1 |
@@ -1379,13 +1551,13 @@ Ran over all nine Phase 1 tasks for the "No vague tasks" red flags: no "appropri
 
 ### File disjointness
 
-This lane's `**Files:**` lists touch only `internal/engine/**`, `internal/client/**`, `internal/manager/**`, `internal/debounce/**`, `examples/manager/**`, `.ignorecoverunit`, and the root files named in § What this lane owns. Intersected against the other wave-2 lanes: `storage` owns `internal/postgres`, `internal/mongodb`, `ddl*`, `systemplanetest`; `groups` owns `api_group*.go` and `internal/group`. **The intersection is empty.** The one file needing a call-out, `.ignorecoverunit`, is edited in Epic 2.2 only to drop the two `internal/manager/*` lines; the `storage` lane may also need it for its own backend lines, so this lane touches nothing outside those two lines and the orchestrator resolves any conflict at merge as a two-line diff.
+This lane's `**Files:**` lists touch only `internal/engine/**`, `internal/client/**`, `internal/manager/**`, `internal/debounce/**`, `internal/testsupport/**`, `examples/manager/**`, `.ignorecoverunit`, and the root files named in § What this lane owns. Intersected against the other wave-2 lanes: `storage` owns `internal/postgres`, `internal/mongodb`, `ddl*`, `systemplanetest`; `groups` owns `api_group*.go` and `internal/group`. **The intersection is empty.** The one file needing a call-out, `.ignorecoverunit`, is edited TWICE by this lane, and the branch already carries the first: Phase 1's fix pass ADDED one line, `internal/testsupport/*`, with its comment, when it created the shared log-field guard; Epic 2.2 DROPS the two `internal/manager/*` lines with their comment. The `storage` lane may also need this file for its own backend lines, so this lane touches nothing outside those three lines, and the orchestrator resolves any conflict at merge as a three-line diff — one added near the top, two deleted further down.
 
 Verified by import graph rather than by grep: `internal/manager` is imported only by the root package (`manager.go`, `manager_methods_test.go`), by `internal/client`, and by itself — every one of them lane-owned. `ddl.go` and `ddl_test.go` name it in **comments only**, not imports, so deleting the package breaks no file this lane does not own.
 
 ### Contract amendments consumed, and open deviations
 
-This lane raised four deviations while authoring. All four are closed; none remains open against the orchestrator, and this plan is written against the amended contracts rather than around them.
+This lane raised four deviations while authoring. All four are closed against the orchestrator and this plan is written against the amended contracts rather than around them; the two deviations open today were raised later, in the Phase 1 fix pass, and neither is against the orchestrator — see § Open deviations below.
 
 **Closed by an `index.md` amendment the plan now consumes:**
 
@@ -1394,8 +1566,213 @@ This lane raised four deviations while authoring. All four are closed; none rema
 
 **Closed in `index.md` by the orchestrator, no action left for this lane:** the stale engine-core Done-when clause requiring `NewMongoDB(..., WithMultiTenantEnabled())` to error (superseded by the D6 rewrite), FC-2's "(MongoDB with a non-empty tenant)" parenthetical on `Store.Subscribe`, and `ddl.go`'s doc comment naming `internal/manager/schema.go` which Epic 2.2 deletes. The last one is a one-line fix in a file the `storage` lane owns.
 
-**Open deviations: none.**
+**Handoffs to other lanes (recorded 2026-09-23, Phase 1 fix pass).** Four bullets, counted: three
+to `engine-tenants` and one to `storage`. All are work another lane owns; none blocks this one.
+
+- **`engine-tenants` — bring-up is serialized engine-wide.** `bringUpScope`
+  (`internal/engine/engine.go`) holds the engine-global `startMu` across the whole `Store.Subscribe`
+  call, so bringing a scope up is serialized engine-wide at one changefeed round trip each. With
+  Phase 1's single zero scope that is free — there is never a second bring-up to wait behind — but the
+  moment N tenants activate lazily on first read (D7), tenant N waits behind N-1 subscribe round
+  trips. Moving that exclusion onto a per-`scopeState` mutex or a per-scope `sync.Once` belongs to the
+  lane that activates tenants, not to this one: the fix is only testable once concurrent bring-up
+  exists, and doing it here would ship an untested lock.
+- **`engine-tenants` — what the byte fence costs in memory.** The fence keeps `entry.Raw`
+  (`internal/engine/scope.go`), one copy of each key's row JSON, beside the decoded value, so the
+  cache can recognise the echo of a write with a `bytes.Equal` instead of a walk of the decoded
+  document. The bound is registered keys times tracked scopes. Single-tenant that is one scope and
+  the cost is noise; in wave 3 it is multiplied by every tenant the process has activated, so a
+  consumer with a large registry and thousands of live tenants holds its whole configuration table
+  twice — once decoded, once as text. The tenants lane decides whether that stays unconditional, is
+  capped by value size, or is dropped for non-zero scopes (which costs a decoded-value walk per
+  re-read instead). The godoc on `entry.Raw` states the tradeoff at the code.
+- **`storage` — `store.Entry.Value` must not alias a reusable buffer.** The fence RETAINS the slice
+  a `Store` hands back and compares it against every later publication of that key
+  (`entry.Raw` in `internal/engine/scope.go`, `publication.Raw` in `internal/engine/publish.go`,
+  both of which say so). `internal/store.Entry.Value`'s own godoc says only `// JSON-encoded`, so a
+  backend author reading the contract they implement is never told. Ask the storage lane for two
+  things: one sentence carried into that field's godoc — *the engine retains this slice and compares
+  it against every later publication; never hand back a buffer you will reuse: pgx `RawValues`,
+  `sql.RawBytes` and `bson.Raw` views all alias* — and one `systemplanetest` contract case that
+  returns a deliberately aliased slice, mutates it, and asserts a same-revision value change is still
+  delivered (D3's foreign writer). Today's backends satisfy the requirement by accident —
+  `database/sql` decodes into a fresh `[]byte` per row — so nothing is broken while this sits
+  unacted. If it is ignored and a backend later switches to a pooled or aliased read, the failure is
+  silent and permanent for that key: a real configuration change whose new text lands in the same
+  buffer is swallowed as an echo, never applied, never logged, and no `Stale` flag or callback tells
+  anyone.
+- **`engine-tenants` — in-flight debounced re-reads for one key are unbounded.** The debouncer
+  bounds PENDING TIMERS, one per (scope, key); it does not bound the work they start, because
+  `Debouncer.fire` deletes the timer entry before invoking the callback, so a notification arriving
+  while `trackedRefresh` is still inside `Store.Get` arms a fresh timer and the two overlap
+  (`trackedRefresh`, `internal/engine/feed.go`, whose godoc states this). Against a store slower
+  than the window, in-flight re-reads for a SINGLE key reach roughly `feedTimeout` divided by the
+  debounce window — about 50 at the 5s and 100ms defaults — and wave 3 multiplies that by every hot
+  key of every activated tenant, against a connection pool the consumer sized from the key count.
+  The fix is a per-(scope, key) single-flight or semaphore around the re-read, and it belongs to the
+  lane that activates tenants: with one scope the worst case is one degraded key, and the guard is
+  only testable under concurrent scopes. Note for whoever takes it: a naive "drop the notification
+  if a re-read is already in flight" is WRONG — it can lose the newest value, because the dropped
+  notification may be the only announcement of a write that landed after the in-flight `Get` read
+  its snapshot. It must coalesce instead: record that another notification arrived, and re-run the
+  read exactly once after the in-flight one returns.
+
+  Same lane, same class, deferred with it (recorded 2026-09-23, Phase 1 fix pass):
+  `applySnapshotRow` (`internal/engine/reconcile.go`) calls `prepare` — a JSON decode plus the
+  registered validator — for EVERY row of the snapshot on EVERY reconcile, including the rows whose
+  revision and bytes already equal what the cache holds, which after the first reconcile is nearly
+  all of them. With one scope that is a cost nobody can measure; with N tenants reconnecting
+  together it becomes registry size times tenant count of pure decode work, on the reconnect path,
+  which is exactly the re-read amplification the bullet above is about. The guard for whoever takes
+  it, from the reviewer who raised it: the revision-and-bytes comparison must be read under
+  `sc.reconcileMu` and AFTER the touched check, never outside the lock — read outside it, the
+  comparison races the feed publication that the touched check exists to defer to, and the reconcile
+  can skip a row on the strength of a cache entry that changed underneath it.
+
+**Declined in Phase 1, reopened as the wave-3 handoff above (amended 2026-09-23):** the reviewer's
+suggestion that `applySnapshotRow` (`internal/engine/reconcile.go`) skip `prepare` for a snapshot
+row whose revision and bytes already match the cache. The Phase 1 decline stands for Phase 1 and its
+reasoning is unchanged: it buys microseconds per key on the reconcile path, costs a second
+deduplication predicate beside the one in `publish` — the library's single dedup site by design —
+and would decide FC-11's announcement and the validator's per-ingestion-attempt semantics from a
+place that never decodes the row. What reopens it is not a new argument about dedup sites but wave
+3's multiplier: one scope makes the saving noise, thousands of activated tenants reconnecting
+together do not. Recorded as deferred, not as done.
+
+**Declined, and staying declined (recorded 2026-09-23, Phase 1 fix pass):** the reviewer's request
+that `prepare` (`internal/engine/ingest.go`) widen its `(publication, bool)` return into a tri-state
+— unregistered / unusable / usable — so `applySnapshotRow` stops asking the registry a second time
+for a row `prepare` already refused. What the second call actually costs is one read of a map the
+library itself owns, under `reconcileMu`, on the unusable branch only; it runs no consumer code and
+takes no store round trip, unlike the validator the same function deliberately runs outside the
+lock. What the tri-state buys is nothing behavioral: `applySnapshotRow` would branch on exactly the
+same three cases it branches on today, and the only difference is where the third one is read from.
+The cost is a wider ingress contract — three states every future caller must handle, and a
+`prepare` whose return type encodes a distinction that matters to one caller — in exchange for a map
+read. Declined on the same principle as the note above: the ingress reports usable or not, and a
+caller that needs a finer answer asks the registry, which is cheap and honest.
+
+**Corrective behaviour changes carried onto the shipping v3 path (recorded 2026-09-23, Phase 1 fix
+pass).** Phase 1's milestone said "nothing user-visible changed". Two things did, both corrections
+rather than features, so the milestone now names them instead of claiming a clean zero. Both land in
+`internal/client`, the single-tenant code consumers run today; the first also lands in
+`internal/manager`, the multi-tenant twin this lane owns until Epic 2.2 deletes it.
+
+- **The log field `key` is now `keyname`.** Ten renamed sites on the single-tenant Client — eight in
+  `internal/client/client.go`, two in `internal/client/get.go` — plus one site that is new rather
+  than renamed, the identity line `(*Client).recoverRefresh` adds (next bullet). Counted, not
+  asserted: `git diff origin/develop...HEAD -- internal/client | grep -c '^+.*log.String("keyname"'`
+  prints 11, and the matching count of REMOVED `log.String("key"` lines is 10. The rename also
+  landed on the v3 MULTI-TENANT path, which this lane owns until Epic 2.2 deletes it: three further
+  sites, the two warm-load lines and the LISTEN event line in `internal/manager` (`warmload.go`,
+  `events.go`), so a multi-tenant operator is not left reading `key=[REDACTED]` on the one path this
+  section does not otherwise touch. `key` is the field name a redacting logger and every downstream
+  log pipeline reads as a secret's label, so a line carrying a configuration key's NAME could be
+  scrubbed to `[REDACTED]` and the operator lose the one identifier that made the line useful.
+  `keyname` is the canonical spelling the engine uses, and a source scan in
+  `internal/testsupport/logguard` now fails the build for any of the three packages if the banned
+  spelling comes back. **No `BREAKING CHANGE` footer is carried for it**, deliberately: a log field
+  name is not one of this library's public API contracts — `boundary_test.go`, the gate that defines
+  what is, cannot see it — so semantic-release is right to ship it as a patch. The operator-visible
+  consequence is real and is recorded here rather than in a commit trailer: anyone grepping their
+  logs for `"key":` on a systemplane line changes the grep, and the v4 release notes carry that
+  sentence.
+- **A panicking changefeed re-read now names the key it blew up on.** `(*Client).recoverRefresh`
+  (`internal/client/client.go`) recovers before the debouncer's outer net does, logs the namespace
+  and the key at ERROR, and hands the value to `runtime.HandlePanicValue` so the panic is counted
+  once rather than not at all. Before, a store driver panicking under the re-read produced
+  `RecoverAndLog`'s anonymous line with the value and stack redacted in production: an operator
+  learned something under the debouncer failed and never which configuration key. No behaviour
+  changes for a store that does not panic.
+
+Known v3-only residual, recorded here and deliberately NOT corrected in Phase 1:
+
+- **A validator that panics with an error can put a `RedactFull` key's value in the log.**
+  `validateStored` (`internal/client/client.go`) hand-rolls its own `recover()` outside
+  `lib-observability`, and on an error-typed panic value it wraps that error verbatim
+  (`fmt.Errorf("%w: %w", errValidatorPanicked, panicked)`). Both of its callers — `(*Client).hydrate`
+  and `(*Client).refreshFromStore` — then log the result with `log.Err(err)`, which applies no
+  per-key redaction policy, so a validator written as `return fmt.Errorf("token %q is too short",
+  v)` and panicking on a nil field publishes that token at WARN even for a key registered
+  `RedactFull`. The panic is also never counted in `panic_recovered_total` and never recorded on the
+  span, because it never reaches the recovery pipeline. Phase 1 does not change it: the behaviour is
+  pinned by `TestPanickingValidatorIsARefusal` (`internal/client/hydrate_validator_test.go`), and
+  the fix pass's own rule forbids breaking a pinned test to make a correction the next phase deletes
+  anyway. **Phase 2 closes it by deletion**, not by patching: Task 2.1.3's **Files:** list removes
+  `validateStored` and its `errValidatorPanicked` sentinel with the rest of the Client's refresh
+  path, and every rejection then runs through the engine's `runValidator` plus `errorDetail`
+  (`internal/engine/ingest.go`), which report a panic as `store.ErrValidation: validator panicked`
+  with the value nowhere in the message and render a redacted key's cause as "what refused it plus
+  the error's dynamic type". That is the pattern already in the tree; nothing new has to be
+  designed for it.
+
+**Open deviations: two, both recorded 2026-09-23 in the Phase 1 fix pass.** Neither blocks this lane
+and neither bends a frozen contract.
+
+- **`lib-observability` — `universalShim.Enabled` answers for the shim, not for the logger it
+  wraps.** `(*Engine).debugEnabled` (`internal/engine/feed.go`) asks `Logger.Enabled(log.LevelDebug)`
+  before building the fields of a hot-path DEBUG line — the foreign-key drop on the feed callback and
+  the ingress's unregistered-key line — so those lines cost nothing when DEBUG is off. `log.Adapt`
+  wraps a logger that does not implement the full interface in `universalShim`, whose `Enabled`
+  returns `LevelValid(level)`: true for every defined level, whatever the wrapped logger would
+  actually emit. So the guard bites only for a logger that implements `Enabled(int) bool` itself;
+  behind the shim every guarded DEBUG line still pays for its fields and is dropped downstream. The
+  fix is upstream and small — delegate to the wrapped logger's own `Enabled(int) bool` when it has
+  one, keep `LevelValid` as the fallback — and the engine changes either way: the guard is right, the
+  answer it gets is optimistic.
+- **`applySnapshotRow` re-decodes and re-validates unchanged snapshot rows.** The work and its
+  concurrency guard are recorded in the `engine-tenants` single-flight handoff above; it is listed
+  here because it reverses a decision this section previously recorded as closed, and a reversal
+  should be findable from the deviations list rather than only from the handoff it moved into.
+
+**The anchor sweep, and the passes that called it finished early.** Five passes now, four of which
+called it done. `b455a78` and
+`05d4d4e` called the Phase 2 line-anchor sweep finished while the `**Files:**` lists and a dozen
+parentheticals still carried line numbers, several pointing at the wrong construct. `d0a34d9` called
+it finished while Task 2.1.1's `**Files:**` list still carried ranges, and argued they were safe
+because they name their construct beside the number; a reviewer then proved two of them wrong
+against the tree — `api_group_test.go` line 103 is the closing brace of `groupMemoryStore.List`, not
+its `Subscribe`, which is five lines further down, and `internal/client/client_test.go` "lines 83-97
+`Set`" spans `memStore.Set` AND `memStore.Delete`, a method this task does not touch. `932d5e1` called it
+finished a fourth time — in a sentence that claimed a verification command checked it mechanically,
+while three prose anchors stood after the Phase 2 heading and no such command existed anywhere in
+the document. Each pass removed real anchors and then over-claimed about the ones it had not looked
+at.
+
+This fifth pass removes the last three — `KeyDef.Default`'s godoc in `internal/engine/registry.go`,
+the `type Client internalclient.Client` declaration in `api_types.go`, and `manager.go`'s package
+doc comment — on the reasoning the wrong anchors themselves supply: a number is re-verified once and
+then rots at the next commit, while a type or method name does not. All three were accurate against
+the tree when they were written, which is the point: accuracy is what a line anchor has for one
+commit.
+
+It also stops asserting the sweep in prose. Exactly one mechanical claim is made about this
+document, it is the command written out in Epic 3.2, and it is narrow: **no `file.go:N` line anchor
+appears anywhere after the `## Phase 2` heading**, in a **Files:** list or in prose. That command
+was run against this file in the session that wrote this sentence and printed `0`. It proves nothing
+about Phase 1, which keeps its anchors as a record of the v3 code, and nothing about whether a
+construct named in place of an anchor resolves — that is a reviewer's job against the tree, not a
+grep's.
+
+The counts in this section were wrong the same way, and for the same reason: asserted rather than
+counted. "Neither note above" when there were two; then "five"; then "three handoffs" above four
+bullets; then "eight sites" for a rename the diff puts at ten.
+
+Every number in this section was counted with a command in the session that wrote it, and the
+command is written beside the number wherever one exists: four handoff bullets (three to
+`engine-tenants`, one to `storage`), two open deviations, two corrective changes, eleven `keyname`
+log lines added across `internal/client` against ten `key` lines removed, three more in
+`internal/manager`. The claim is about the numbers in THIS section and nothing wider — no sentence
+here asserts that some category elsewhere in the document is exhaustively swept, except the one
+mechanical anchor claim above, which names the command that checks it.
+
+The four handoffs are work another lane owns, each stating the failure mode if it is
+never done; the tri-state decline is a closed decision with its reasons written down, and the
+`applySnapshotRow` decline is closed for Phase 1 and reopened for wave 3, recorded as such in both
+places. Nothing in this lane is blocked on an answer, and no frozen contract is bent: the `storage` handoff asks for a godoc
+sentence and a contract test around `store.Entry.Value`, not a change to its shape, so FC-2 stands
+as frozen.
 
 ### Phase boundaries and verification plausibility
 
-Every phase ends green: Phase 1 adds a tested package beside the running one and changes no library behavior; Phase 2 swaps the engine in and removes the old one in the same phase, so the tree is never half-migrated; Phase 3 is the breaking-surface cut plus the gate sweep. Every verification command in Phase 1 targets a path this lane creates or a repo-level target that exists today (`make test-unit`, `go vet -tags=unit ./...`, `go vet -tags=integration ./...`, `go test -tags=unit -run=^TestPerf_ ./...`, `go test -tags=unit -run TestExportedBoundary ./...`). Note for the implementer: `TestPerf_` currently matches nothing in this repository, so that command passes vacuously — it is in the list because CI runs it and a new `internal/engine` test accidentally named `TestPerf_*` would silently join a no-`-race` job.
+Every phase ends green: Phase 1 adds a tested package beside the running one and changes no library behavior; Phase 2 swaps the engine in and removes the old one in the same phase, so the tree is never half-migrated; Phase 3 is the breaking-surface cut plus the gate sweep. Every verification command in Phase 1 targets a path this lane creates or a repo-level target that exists today (`make test-unit`, `go vet -tags=unit ./...`, `go vet -tags=integration ./...`, `go test -tags=unit -run=^TestPerf_ ./...`, `go test -tags=unit -run TestExportedBoundary ./...`). Note for the implementer: the `TestPerf_` command runs TWO gates, and which one is red says where to look. `TestPerf_CloneJSONMap` (`internal/engine/clone_perf_test.go`, build tags `unit && !race`, since commit `c3e74f1`) pins the allocation count of `Clone` over a decoded JSON tree; red means `Clone` fell off its JSON fast path back onto the generic reflective walk, on every read and every delivery — fix the clone, do not raise the bound. `TestPerf_ForeignEventDropAllocatesNothing` (`internal/engine/feed_perf_test.go`, same tags, added 2026-09-23 in the Phase 1 fix pass) pins at zero the allocations of dropping one foreign changefeed event; red means the feed's DEBUG drop line built its fields before asking whether anyone would read them — a cost paid on every write by every other consumer of the shared `systemplane_entries` table, and nothing to do with `Clone`. Run both without `-race`; the detector accounts allocations its own way and CI gives them a dedicated job for exactly that reason.

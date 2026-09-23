@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/LerianStudio/lib-systemplane/v4/internal/engine"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/manager"
 )
 
@@ -125,7 +126,7 @@ func (c *Client) managerCallback(fn func(ctx context.Context, ch Change)) manage
 			Namespace: ns,
 			Key:       k,
 			Revision:  revision,
-			Value:     cloneValue(newValue),
+			Value:     engine.Clone(newValue),
 		})
 	}
 }
