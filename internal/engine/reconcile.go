@@ -239,7 +239,17 @@ func (e *Engine) applyScope(sc *scopeState, arm reconcileArming) (superseded boo
 	// database that tenant no longer has, applied into state nothing tracks.
 	// Abandoned rather than failed — nothing is published, nothing is
 	// completed, and the drop is not a fault to warn about.
-	if e.scopeForEvent(sc.scope, NSKey{}) == nil {
+	//
+	// The scope is resolved by IDENTITY. A tenant dropped and re-activated is a
+	// new state under the same scope value, so a by-value lookup finds the live
+	// state and lets this dead one reload the whole scope — a List plus the
+	// consumer's validator on every row — publishing into a cache no reader can
+	// reach.
+	if e.trackedScope(sc.scope) != sc {
+		e.logDebug(ctx, "reconcile for a scope state the engine no longer tracks, abandoning",
+			log.String("tenant", sc.scope.Tenant),
+		)
+
 		return true, nil
 	}
 

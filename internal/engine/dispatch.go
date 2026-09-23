@@ -238,6 +238,10 @@ func (e *Engine) workerFor(sc *scopeState, nk NSKey) *dispatchWorker {
 // recovery on the way out of a panic and Close is never left waiting on a
 // goroutine that is already gone.
 func (e *Engine) runWorker(ctx context.Context, wk workerKey, w *dispatchWorker) {
+	// Boxed once per worker rather than once per delivery: converting the
+	// struct to an interface allocates, and the mark is written on every wake.
+	mark := any(wk)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -254,13 +258,17 @@ func (e *Engine) runWorker(ctx context.Context, wk workerKey, w *dispatchWorker)
 			// delivery that was about to start. A wake with an empty slot
 			// therefore marks the worker busy for the length of one
 			// mutex-guarded slot read, which no observer can be stuck behind.
-			e.running.Store(wk, struct{}{})
+			//
+			// Keyed by this worker, not by wk: a dropped scope's straggler and
+			// the re-activated scope's worker for the same key share wk, so
+			// clearing by wk would erase the other one's mark.
+			e.running.Store(w, mark)
 
 			if ch, ok := w.take(); ok {
 				e.deliver(ctx, wk.NSKey, ch)
 			}
 
-			e.running.Delete(wk)
+			e.running.Delete(w)
 		}
 	}
 }

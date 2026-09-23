@@ -701,10 +701,9 @@ func TestQuiesceNeverReturnsBeforeAPendingDelivery(t *testing.T) {
 	waitFor(t, hangGuard, "the worker's first delivery", func() bool { return rec.len() == 1 })
 	quiesce(t, e)
 
-	// running is still keyed by (scope, key): it is what a timed-out Close
-	// reads, and that message has to name the tenant.
-	wk := workerKey{NSKey: nk}
-
+	// running is keyed by the worker itself and carries its (scope, key) as the
+	// value: it is what a timed-out Close reads, and that message has to name
+	// the tenant.
 	w := scopeWorker(e, e.trackedScope(store.Scope{}), nk)
 	if w == nil {
 		t.Fatal("no dispatch worker for the key a delivery just went to")
@@ -732,7 +731,7 @@ func TestQuiesceNeverReturnsBeforeAPendingDelivery(t *testing.T) {
 	marked := false
 
 	for deadline := time.Now().Add(hangGuard); time.Now().Before(deadline); {
-		if _, busy := e.running.Load(wk); busy {
+		if _, busy := e.running.Load(w); busy {
 			marked = true
 
 			break

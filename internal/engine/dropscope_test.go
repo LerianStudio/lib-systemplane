@@ -4,6 +4,8 @@ package engine
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -428,4 +430,156 @@ func scopeWorkerCount(e *Engine, sc *scopeState) int {
 	defer e.workersMu.Unlock()
 
 	return len(sc.workers)
+}
+
+// TestReconcileForReactivatedScopeDoesNotListForTheDeadState is the other half
+// of the queued-reconcile guard. A scope dropped with work in its mailbox gets
+// one more reconcile; if the tenant was re-activated in between, resolving
+// that reconcile's scope by VALUE finds the new state and lets the dead one
+// run a whole-scope Store.List — plus the consumer's validator on every row —
+// on behalf of state nothing tracks, publishing into a cache no reader can
+// reach. Identity is what tells the two states apart.
+func TestReconcileForReactivatedScopeDoesNotListForTheDeadState(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	fs := newFakeStore()
+	e := storeEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0, 2*time.Second)
+
+	bringUp(t, e, dropTenant)
+
+	old := e.trackedScope(dropTenant)
+	if old == nil {
+		t.Fatal("the tenant scope was not brought up")
+	}
+
+	old.armReconcile()
+
+	pending, ok := old.takeReconcile()
+	if !ok {
+		t.Fatal("arming a reconcile left the mailbox empty")
+	}
+
+	e.dropScope(dropTenant)
+	bringUp(t, e, dropTenant)
+
+	if sc := e.trackedScope(dropTenant); sc == old {
+		t.Fatal("re-activation reused the dropped scope state")
+	}
+
+	lists := fs.listCount()
+
+	e.runOneReconcile(e.dispatchContext(), old, pending)
+
+	if got := fs.listCount(); got != lists {
+		t.Errorf("Store.List called %d times for a dropped scope state, want %d: the queued reconcile "+
+			"of the dead state reloaded the whole scope because it resolved its scope by value and "+
+			"found the re-activated tenant", got, lists)
+	}
+
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close() = %v, want nil", err)
+	}
+}
+
+// TestStragglerWorkerDoesNotEraseTheLiveMarker keys the stuck-worker markers by
+// worker identity rather than by scope value. Delivery workers belong to the
+// scope STATE, so a dropped tenant's worker still inside a subscriber callback
+// and the re-activated tenant's worker for the same key are two goroutines
+// sharing one (tenant, namespace, key) triple. Marked by that triple, the
+// straggler's clear-on-exit erases the live worker's marker — and a Close that
+// times out then blames the backend, telling whoever reads the message the
+// engine is stuck inside a store call while a subscriber is the one holding
+// shutdown open.
+func TestStragglerWorkerDoesNotEraseTheLiveMarker(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	fs := newFakeStore()
+	e := storeEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0, 100*time.Millisecond)
+
+	straggler, live := newDeliveryGate(), newDeliveryGate()
+	gates := make(chan *deliveryGate, 2)
+	gates <- straggler
+	gates <- live
+
+	unsub := e.OnChange(nk, func(context.Context, Change) {
+		g := <-gates
+		close(g.entered)
+		<-g.release // deliberately ignores ctx: the subscriber's own leak
+	})
+	defer unsub()
+
+	bringUp(t, e, dropTenant)
+
+	old := e.trackedScope(dropTenant)
+	if old == nil {
+		t.Fatal("the tenant scope was not brought up")
+	}
+
+	if notify := e.publish(old, publication{Scope: dropTenant, NSKey: nk, Revision: 1, Value: "before"}); !notify {
+		t.Fatal("the scope refused a first publication")
+	}
+
+	mustReceive(t, straggler.entered, "the dropped scope's worker to enter its callback")
+
+	e.dropScope(dropTenant)
+	bringUp(t, e, dropTenant)
+
+	sc := e.trackedScope(dropTenant)
+	if sc == nil || sc == old {
+		t.Fatal("the tenant was not re-activated into a new scope state")
+	}
+
+	if notify := e.publish(sc, publication{Scope: dropTenant, NSKey: nk, Revision: 2, Value: "after"}); !notify {
+		t.Fatal("the re-activated scope refused a first publication")
+	}
+
+	mustReceive(t, live.entered, "the re-activated scope's worker to enter its callback")
+
+	if got := runningCount(e); got != 2 {
+		t.Fatalf("%d worker(s) marked as inside a callback, want 2: the straggler of the dropped state "+
+			"shares the re-activated state's marker and erases it on the way out", got)
+	}
+
+	close(straggler.release)
+	waitFor(t, hangGuard, "the straggler to leave its callback", func() bool { return runningCount(e) == 1 })
+
+	err := e.Close()
+	if !errors.Is(err, ErrCloseTimeout) {
+		t.Fatalf("Close() = %v, want an error wrapping ErrCloseTimeout", err)
+	}
+
+	for _, want := range []string{dropTenant.Tenant, nk.Namespace, nk.Key} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Close() error %q does not name %q, so the operator is sent hunting for a "+
+				"backend fault while a subscriber holds shutdown open", err, want)
+		}
+	}
+
+	// Release the stuck callback and wait for it: a test that leaks on purpose
+	// fails the whole package under goleak.
+	close(live.release)
+	e.dispatchWG.Wait()
+}
+
+// deliveryGate holds one delivery open. entered closes when the subscriber is
+// inside the callback, release lets it return.
+type deliveryGate struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func newDeliveryGate() *deliveryGate {
+	return &deliveryGate{entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+// runningCount reports how many delivery workers are marked as inside a
+// subscriber callback — the set a timed-out Close names.
+func runningCount(e *Engine) int {
+	n := 0
+
+	e.running.Range(func(_, _ any) bool {
+		n++
+
+		return true
+	})
+
+	return n
 }

@@ -52,16 +52,22 @@ type Engine struct {
 	// workersMu guards every scope's worker map and refusal flag, so the lock
 	// that starts a delivery worker is the lock that sweeps one. The workers
 	// themselves live on the scope state that owns them; dispatchWG tracks all
-	// of them so shutdown can wait, and running holds the workerKey of every
-	// worker currently inside a subscriber callback, so a Close that times out
-	// names the real (scope, key) pairs it is stuck on instead of guessing.
+	// of them so shutdown can wait, and running names every worker currently
+	// inside a subscriber callback, so a Close that times out reports the real
+	// (scope, key) pairs it is stuck on instead of guessing.
+	//
+	// It is keyed by the WORKER, not by its (scope, key) triple: workers belong
+	// to the scope state, so a dropped tenant's straggler and the re-activated
+	// tenant's worker for the same key share that triple, and the straggler's
+	// clear-on-exit would erase the live worker's mark — leaving a timed-out
+	// Close blaming the backend for a subscriber that is holding it open.
 	//
 	// workersClosed is set under workersMu before Close waits on dispatchWG,
 	// which is what makes every Add to that WaitGroup happen-before its Wait.
 	workersMu     sync.Mutex
 	workersClosed bool
 	dispatchWG    sync.WaitGroup
-	running       sync.Map // workerKey -> struct{}
+	running       sync.Map // *dispatchWorker -> workerKey
 
 	// startMu serializes scope bring-up so two concurrent Starts open one
 	// subscription instead of two. It is held across Store.Subscribe and never
@@ -258,14 +264,26 @@ func (e *Engine) bringUpScope(scope store.Scope) (*scopeState, error) {
 	// Engine reachable and — once a scope is a tenant — one live connection per
 	// tenant whose bring-up lost this race. So the loser releases its own
 	// subscription and reports the scope it cannot keep.
+	//
+	// The check sits under the SAME lock Close reads the handle under, and that
+	// is what decides the race rather than leaving a window between them. Close
+	// stores closed before it acquires sc.mu, so a bring-up that takes the lock
+	// after Close released it is guaranteed to observe closed and release its
+	// own subscription; a bring-up that takes the lock first stores the handle,
+	// and Close then reads it and releases it. Checking outside the lock left
+	// the third interleaving open: the check reads false, Close runs its whole
+	// unsubscribe loop and finds nil, and the handle is stored into a scope
+	// nobody will ever read it from again.
+	sc.mu.Lock()
+
 	if e.closed.Load() {
+		sc.mu.Unlock()
 		unsubscribe()
 		e.dropScope(scope)
 
 		return nil, store.ErrClosed
 	}
 
-	sc.mu.Lock()
 	sc.unsubscribe = unsubscribe
 	sc.mu.Unlock()
 
@@ -624,8 +642,8 @@ func (e *Engine) waitForWorkers() error {
 func (e *Engine) stuckError(timeout time.Duration) error {
 	stuck := make([]string, 0, 1)
 
-	e.running.Range(func(key, _ any) bool {
-		wk, ok := key.(workerKey)
+	e.running.Range(func(_, value any) bool {
+		wk, ok := value.(workerKey)
 		if !ok {
 			return true
 		}
