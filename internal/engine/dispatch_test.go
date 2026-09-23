@@ -297,44 +297,58 @@ func TestDispatchDeliversInRevisionOrder(t *testing.T) {
 // from a single goroutine, which cannot produce that interleaving, and
 // TestPublishIsSerializedUnderRace watches Lookup, which stays monotonic
 // whatever order the mailboxes were written in.
+//
+// One run of the choreography catches that regression about one time in five:
+// the losing publication has to be descheduled between the unlock and the
+// mailbox write, and usually it is not. Rounds are what turn a coin flip into
+// a guard — at that rate 50 independent rounds miss only once in 10^5 — so
+// each round builds its own engine, subscriber and recorder, and a single
+// out-of-order delivery in any of them fails the test.
 func TestConcurrentPublishesDeliverInRevisionOrder(t *testing.T) {
-	const last = 200
+	const (
+		last   = 200
+		rounds = 50
+	)
 
-	e := dispatchEngine(t)
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 
-	var rec recorder
+	for round := range rounds {
+		e := dispatchEngine(t)
 
-	unsub := e.OnChange(nk, rec.record)
-	defer unsub()
+		var rec recorder
 
-	var wg sync.WaitGroup
+		unsub := e.OnChange(nk, rec.record)
 
-	for writer := range 2 {
-		wg.Add(1)
+		var wg sync.WaitGroup
 
-		go func() {
-			defer wg.Done()
+		for writer := range 2 {
+			wg.Add(1)
 
-			for rev := int64(1); rev <= last; rev++ {
-				e.publishInto(pub(nk, rev, fmt.Sprintf("writer%d-rev%d", writer, rev)))
-			}
-		}()
-	}
+			go func() {
+				defer wg.Done()
 
-	wg.Wait()
-
-	waitFor(t, hangGuard, "the newest revision to be delivered", func() bool {
-		revs := rec.revisions()
-
-		return len(revs) > 0 && revs[len(revs)-1] == last
-	})
-
-	revs := rec.revisions()
-	for i := 1; i < len(revs); i++ {
-		if revs[i] < revs[i-1] {
-			t.Fatalf("revisions delivered out of order at %d: %v", i, revs)
+				for rev := int64(1); rev <= last; rev++ {
+					e.publishInto(pub(nk, rev, fmt.Sprintf("writer%d-rev%d", writer, rev)))
+				}
+			}()
 		}
+
+		wg.Wait()
+
+		waitFor(t, hangGuard, "the newest revision to be delivered", func() bool {
+			revs := rec.revisions()
+
+			return len(revs) > 0 && revs[len(revs)-1] == last
+		})
+
+		revs := rec.revisions()
+		for i := 1; i < len(revs); i++ {
+			if revs[i] < revs[i-1] {
+				t.Fatalf("round %d: revisions delivered out of order at %d: %v", round, i, revs)
+			}
+		}
+
+		unsub()
 	}
 }
 
