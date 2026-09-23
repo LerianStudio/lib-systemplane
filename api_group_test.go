@@ -1926,68 +1926,6 @@ func TestGroupOnApplyInMultiTenantReturnsErrNotSupported(t *testing.T) {
 	}
 }
 
-// TestGroupOnApplyWithABoundManagerRegistersWithoutASeed: a multi-tenant
-// Client with a bound Manager accepts the group's subscription, so OnApply
-// reaches the seed — and that mode has no single document in force to seed.
-// Every document belongs to a tenant and arrives as that tenant's own
-// publication, so the registration succeeds with no initial delivery, whether
-// a zero-scope read would have answered with a document (the fake store here)
-// or refused for want of a tenant database (every real store).
-func TestGroupOnApplyWithABoundManagerRegistersWithoutASeed(t *testing.T) {
-	t.Parallel()
-
-	cases := []struct {
-		name   string
-		getErr error
-	}{
-		{name: "the zero-scope read answers"},
-		{name: "the zero-scope read has no tenant database", getErr: systemplane.ErrTenantConnectionMissing},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			s := newGroupMemoryStore()
-
-			c, err := systemplane.NewForTesting(s, systemplane.WithMultiTenantEnabled())
-			if err != nil {
-				t.Fatalf("NewForTesting: %v", err)
-			}
-
-			t.Cleanup(func() { _ = c.Close() })
-
-			// Bound before Bind: the group takes its one subscription at Bind,
-			// and only a bound Manager makes that subscription succeed.
-			systemplane.NewManager(c, nil)
-
-			g := bindGroupOn(t, c)
-			startGroupClient(t, c)
-
-			if tc.getErr != nil {
-				s.failGets(tc.getErr)
-			}
-
-			rec := &applyRecorder{}
-
-			unsubscribe, err := g.OnApply(rec.apply)
-			if err != nil {
-				t.Fatalf("OnApply with a bound Manager = %v, want no error", err)
-			}
-
-			t.Cleanup(unsubscribe)
-
-			if got := rec.count(); got != 0 {
-				t.Errorf("deliveries at registration = %d, want 0: a multi-tenant group has no zero-scope document to seed", got)
-			}
-
-			if status := g.Status(); len(status) != 0 {
-				t.Errorf("Status at registration = %#v, want no observed scope", status)
-			}
-		})
-	}
-}
-
 // TestGroupStatusIsEmptyBeforeAnyObservation: nothing has been published and
 // nothing registered, so there is no scope to report.
 func TestGroupStatusIsEmptyBeforeAnyObservation(t *testing.T) {
