@@ -195,6 +195,50 @@ func TestIntegration_MongoDBNamedTenant(t *testing.T) {
 	})
 }
 
+// TestIntegration_MongoDBPolling runs the same contract suite against the
+// polling fallback, which Config.PollInterval selects instead of a change
+// stream. It is a separate feed implementation with its own first-round-trip
+// readiness, its own OpResync and OpDisconnect edges and its own
+// tombstone-as-delete decoding, and it is the only feed a consumer on a
+// standalone MongoDB ever gets — so the contract has to hold on it too, not
+// only on the replica-set path.
+//
+// Zero scope only: the named-tenant polling path differs from this one solely
+// in how the collection is resolved, which
+// TestIntegration_MongoPollingIndexesCreatedForTenantCollection and
+// TestIntegration_MongoSubscribeReturnsErrorWhenFirstPollFails already pin.
+func TestIntegration_MongoDBPolling(t *testing.T) {
+	client, cleanup := mongodb.StartStandaloneContainer(t)
+	t.Cleanup(cleanup)
+
+	factory := func(t *testing.T) (store.Store, func()) {
+		t.Helper()
+
+		dbName := fmt.Sprintf("poll_%d", time.Now().UnixNano())
+
+		s, err := mongodb.New(mongodb.Config{
+			Client:       client,
+			Database:     dbName,
+			PollInterval: 50 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatalf("mongodb.New: %v", err)
+		}
+
+		return s, func() {
+			_ = s.Close()
+			_ = client.Database(dbName).Drop(context.Background())
+		}
+	}
+
+	// Reconnect stays nil, so ResyncAfterForcedReconnect skips: a poller holds
+	// no cursor to sever, and its outage narration is pinned backend-locally by
+	// TestIntegration_MongoPollingDisconnectAndResyncAroundFailedRound.
+	systemplanetest.Run(t, factory, systemplanetest.RunOptions{
+		EventWait: 5 * time.Second,
+	})
+}
+
 // killChangeStreamCursor builds the contract suite's Reconnect hook for
 // MongoDB: it finds the feed's own change-stream cursor from the server's own
 // operation census and kills it, which severs the feed with no production seam
