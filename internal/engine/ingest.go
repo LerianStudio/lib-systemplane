@@ -161,6 +161,15 @@ func errorDetail(redacted bool, what string, err error) log.Field {
 //
 // sc is the caller's own scope state, for the reason publish takes one.
 func (e *Engine) ingestDefault(ctx context.Context, sc *scopeState, nk NSKey) (notify bool) {
+	// Unreachable from either production caller since the feed gained its
+	// registry filter: the feed drops an unregistered key before applyDelete
+	// can ask, and a reconcile only ever asks about keys it took from
+	// Registry.Keys. It is kept as a deliberate invariant check, so a future
+	// caller that does reach here publishes nothing rather than a nil default.
+	// TestIngestDefaultPublishesAtRevisionZero in ingest_test.go pins it, and
+	// asserts only that notify is false — no test asserts the level of the
+	// line below, which is a judgement about foreign traffic on a shared table
+	// rather than a contract.
 	def, registered := e.lookup(nk.Namespace, nk.Key)
 	if !registered {
 		e.logDebug(ctx, "no-row event for unregistered key, skipping",

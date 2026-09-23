@@ -83,12 +83,25 @@ func (e *Engine) onEvent(evt store.Event) {
 	// one line per window and now reports one per write — which is why the
 	// fields below are built only when DEBUG is actually enabled.
 	//
-	// The registry is final by the time any event can arrive: Register after
-	// Start returns ErrRegisterAfterStart, and Start opens the changefeed only
-	// after that door has shut. Outcomes are unchanged — prepare rejects the
-	// same rows on the upsert path, ingestDefault the same keys on the delete
-	// path, and a nil registry still reports nothing registered, so it rejects
-	// everything exactly as before.
+	// The registry is final before the feed opens, and the LOCK is what makes
+	// it so — not the started flag, which is set after the changefeed is
+	// already live. (*Client).Start holds startMu across Subscribe and
+	// Register takes that same lock, so a Register racing Start blocks until
+	// Start returns and is then refused with ErrRegisterAfterStart.
+	//
+	// One window survives, and it is the retry path rather than a race: a
+	// Start whose first reconcile fails returns the error with the
+	// subscription deliberately kept open (bringUpScope) and started never
+	// set, so a Register after that failed Start succeeds while the feed is
+	// live. Its residual is bounded — notifications for that key that arrived
+	// before the Register landed were dropped here, so the key holds its
+	// registered default until the next reconcile reads its row, which is what
+	// the retained subscription exists to deliver.
+	//
+	// Outcomes are unchanged — prepare rejects the same rows on the upsert
+	// path, ingestDefault the same keys on the delete path, and a nil registry
+	// still reports nothing registered, so it rejects everything exactly as
+	// before.
 	if _, registered := e.lookup(nk.Namespace, nk.Key); !registered {
 		if e.debugEnabled() {
 			e.logDebug(e.dispatchContext(), "changefeed event for unregistered key, skipping",
@@ -124,6 +137,12 @@ func (e *Engine) onEvent(evt store.Event) {
 	// in the WaitGroup would make Close wait on the goroutine it is
 	// unsubscribing.
 	//
+	// What that mode costs is head-of-line blocking, and it is the documented
+	// trade of WithDebounce(0) rather than an oversight: the inline re-read
+	// occupies the scope's single changefeed goroutine for a Store.Get bounded
+	// by feedTimeout PLUS the consumer's validator, which is bounded by
+	// nothing, and every other key's notification waits behind it.
+	//
 	// Exactly one closure is built, in the branch that wants it. Building the
 	// inline one up front and overwriting it here cost one discarded heap
 	// allocation on every upsert event the feed delivers.
@@ -147,12 +166,19 @@ func (e *Engine) onEvent(evt store.Event) {
 // the Client is about to close.
 //
 // These re-reads run concurrently, one goroutine per key whose quiet window
-// closed, and their number is bounded by the registered keys of the tracked
-// scopes: the feed drops a notification for an unregistered key before it ever
-// reaches the debouncer, and the debouncer holds at most one timer per (scope,
-// key). There is no semaphore, so a consumer sizing its *sql.DB pool should
-// read that product — registered keys times tracked scopes — as the engine's
-// worst-case simultaneous demand on the store.
+// closed, and nothing bounds how many are in flight at once. What the
+// debouncer bounds is PENDING TIMERS — at most one per (scope, key), the feed
+// having dropped unregistered keys before the debouncer ever sees them. It
+// does not bound the work those timers start: Debouncer.fire deletes the timer
+// entry BEFORE it invokes fn, so a notification arriving while the re-read is
+// still inside Store.Get arms a fresh timer and the two overlap. Under
+// sustained notifications on one key against a store slower than the window,
+// in-flight re-reads for that single key grow to roughly feedTimeout divided
+// by the window — about 50 at the 5s and 100ms defaults.
+//
+// There is no semaphore. A consumer sizing its *sql.DB pool should read
+// registered keys times tracked scopes as the floor, and add that per-key
+// overlap for as many keys as a degraded store can be hot on at once.
 func (e *Engine) trackedRefresh(scope store.Scope, nk NSKey) {
 	if !e.beginWork() {
 		return
