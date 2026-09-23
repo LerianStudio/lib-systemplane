@@ -173,7 +173,8 @@ func TestDebouncer_PanicInFnRecovered(t *testing.T) {
 	// The recovery component is a constant, never the key. Arguments to a
 	// deferred call are evaluated at defer time, so rendering the key into it
 	// would charge a Sprintf to every debounced invocation, panic or not.
-	// What that costs in identity, and who pays it back, is debounce.go:160-165:
+	// What that costs in identity, and who pays it back, is the recoveryComponent
+	// constant's godoc in debounce.go:
 	// RecoverAndLog captures no context, so it records neither the panic metric
 	// nor a span event, and in production mode its line carries source and a
 	// redacted value and no stack at all. A caller whose submitted function

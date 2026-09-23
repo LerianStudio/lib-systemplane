@@ -61,6 +61,7 @@ import (
 // clears it the moment the publication lands. This is the same order the two
 // re-read failure paths take (recoverRefresh, and the store error in
 // refreshKey), for the same reason.
+//
 // fence is armed only by a changefeed re-read, which spends a whole store round
 // trip outside every lock and can come back holding a row a delete has since
 // removed. A publication it no longer covers is dropped, not published: the

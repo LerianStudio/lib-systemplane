@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -312,8 +313,11 @@ func TestReReadErrorIsLoggedAtWarn(t *testing.T) {
 // warnings for whatever re-reads were in flight.
 func TestReReadCanceledByCloseIsLoggedAtDebug(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{Tenant: "acme"}
 	fs := newFakeStore()
 	e, rec := loggingEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs)
+
+	track(t, e, scope)
 
 	if err := e.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -321,9 +325,9 @@ func TestReReadCanceledByCloseIsLoggedAtDebug(t *testing.T) {
 
 	// The re-read a debounce timer already fired, reaching the store after
 	// Close canceled the lifecycle context.
-	e.refreshKey(store.Scope{}, nk)
+	e.refreshKey(scope, nk)
 
-	requireLogged(t, rec, log.LevelDebug, "changefeed re-read canceled during shutdown", store.Scope{}, nk)
+	requireLogged(t, rec, log.LevelDebug, "changefeed re-read canceled during shutdown", scope, nk)
 }
 
 // TestLogLevelReReadWithNoRowIsDebug pins the re-read that finds nothing. The
@@ -333,11 +337,14 @@ func TestReReadCanceledByCloseIsLoggedAtDebug(t *testing.T) {
 // would reach an operator as a fault.
 func TestLogLevelReReadWithNoRowIsDebug(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{Tenant: "acme"}
 	e, rec := loggingEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, newFakeStore())
 
-	e.refreshKey(store.Scope{}, nk)
+	track(t, e, scope)
 
-	requireLogged(t, rec, log.LevelDebug, "changefeed re-read found no row, keeping current value", store.Scope{}, nk)
+	e.refreshKey(scope, nk)
+
+	requireLogged(t, rec, log.LevelDebug, "changefeed re-read found no row, keeping current value", scope, nk)
 }
 
 // TestLogLevelUnregisteredFeedEventIsDebug pins the feed's registry filter for
@@ -346,20 +353,22 @@ func TestLogLevelReReadWithNoRowIsDebug(t *testing.T) {
 // would bury the rejections that matter, once per foreign write.
 func TestLogLevelUnregisteredFeedEventIsDebug(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "unknown"}
+	scope := store.Scope{Tenant: "acme"}
 
 	for _, tc := range []struct {
 		name string
 		evt  store.Event
 	}{
-		{name: "upsert", evt: upsertEvent(store.Scope{}, nk, 1)},
-		{name: "delete", evt: deleteEvent(store.Scope{}, nk)},
+		{name: "upsert", evt: upsertEvent(scope, nk, 1)},
+		{name: "delete", evt: deleteEvent(scope, nk)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e, rec := loggingEngine(t, map[NSKey]KeyDef{}, newFakeStore())
 
+			track(t, e, scope)
 			e.onEvent(tc.evt)
 
-			requireLogged(t, rec, log.LevelDebug, "changefeed event for unregistered key, skipping", store.Scope{}, nk)
+			requireLogged(t, rec, log.LevelDebug, "changefeed event for unregistered key, skipping", scope, nk)
 		})
 	}
 }
@@ -704,10 +713,11 @@ func requireNotLogged(t *testing.T, r *recordingLogger, msg string) {
 // it missing for a key the snapshot plainly carried.
 func TestReconcileLogsAnUnregisteredSnapshotRowOnce(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "unknown"}
-	scope := store.Scope{}
+	scope := store.Scope{Tenant: "acme"}
 	fs := newFakeStore()
 	e, rec := loggingEngine(t, map[NSKey]KeyDef{}, fs)
 
+	track(t, e, scope)
 	fs.seed(scope, jsonRow(nk, 1, `"v"`, "ops"))
 
 	e.onEvent(resyncEvent(scope))
@@ -896,7 +906,12 @@ func TestReReadPanicNamesTheKey(t *testing.T) {
 			})
 			track(t, e, scope)
 
-			t.Cleanup(func() { _ = e.Close() })
+			t.Cleanup(func() {
+				if err := e.Close(); err != nil {
+					t.Errorf("Close after a panicking re-read: %v, want nil: one exploding "+
+						"store call must not strand shutdown", err)
+				}
+			})
 
 			fs.onGet(func(store.Scope, NSKey) error { panic("the store driver exploded") })
 
@@ -1128,7 +1143,7 @@ func (h *hookLogger) Log(ctx context.Context, level int, msg string, fields ...a
 // running on the same goroutine before the line is ever built.
 func TestFailedRereadFencesTheKeyBeforeLogging(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
-	scope := store.Scope{}
+	scope := store.Scope{Tenant: "acme"}
 
 	tests := []struct {
 		name    string
@@ -1218,24 +1233,135 @@ func TestFailedRereadFencesTheKeyBeforeLogging(t *testing.T) {
 	}
 }
 
+// TestAcceptedReReadIsFencedThroughTheValidator is the pre-fence on the path
+// that ends well. The four cases above pin it where the re-read learned
+// nothing; this one pins the benefit it exists for, which no failure case can
+// show: a re-read that DID come back with the row, held inside the consumer's
+// own validator while a reconcile decides the key.
+//
+// The validator is unbounded consumer code running before the publication can
+// land, and the snapshot the reconcile holds predates the row. With no fence
+// the reconcile reads the key as absent, announces the registered default at
+// revision 0 over the live value, and the row lands a moment later: every
+// subscriber sees the knob reset to its default and then set again, for a
+// value that was in the store the whole time. With the fence the reconcile
+// keeps what is cached and the key changes exactly once, to the row.
+func TestAcceptedReReadIsFencedThroughTheValidator(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{Tenant: "acme"}
+	fs := newFakeStore()
+
+	var (
+		holding  atomic.Bool
+		announce sync.Once
+	)
+
+	entered := make(chan struct{})
+	accept := make(chan struct{})
+
+	e := New(Config{
+		Store: fs,
+		Registry: fakeRegistry{defs: map[NSKey]KeyDef{nk: {
+			Default: "fallback",
+			// Held only for the re-read under test, so bringing the scope up
+			// on its first value does not block on a gate the test has not
+			// opened yet.
+			Validate: func(context.Context, any) error {
+				if holding.Load() {
+					announce.Do(func() { close(entered) })
+					<-accept
+				}
+
+				return nil
+			},
+		}}},
+	})
+
+	t.Cleanup(func() {
+		if err := e.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+
+	fs.seed(scope, jsonRow(nk, 2, `"live"`, "ops"))
+	settled(t, e, scope)
+
+	var sub recorder
+
+	unsub := e.OnChange(nk, sub.record)
+	defer unsub()
+
+	fs.seed(scope, jsonRow(nk, 5, `"newer"`, "ops"))
+	e.onEvent(disconnectEvent(scope))
+
+	// The snapshot is frozen empty while the row stays readable, which is the
+	// ordinary race the fence is for: the List was answered before the write
+	// became visible to it, and the notification for that write is already in
+	// flight.
+	release := heldList(fs)
+
+	fs.freezeNextList(nil)
+	e.onEvent(resyncEvent(scope))
+
+	holding.Store(true)
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		e.onEvent(upsertEvent(scope, nk, 5))
+	}()
+
+	<-entered
+
+	release()
+	waitReconcileIdle(t, e, scope)
+
+	close(accept)
+	<-done
+
+	waitFor(t, hangGuard, "the re-read to publish the row", func() bool { return sub.len() > 0 })
+
+	// The first delivery is the whole assertion: the reconcile ran to
+	// completion above, so an unfenced announcement of the default would
+	// already be queued ahead of this one on the key's own worker.
+	got := sub.changes()
+	if got[0].Value != "newer" || got[0].Revision != 5 {
+		t.Fatalf("first delivery (%v, rev %d), want (%q, rev 5): the reconcile announced the "+
+			"registered default over a key whose re-read was still inside the consumer's validator",
+			got[0].Value, got[0].Revision, "newer")
+	}
+
+	if n := sub.len(); n != 1 {
+		t.Errorf("deliveries: got %d (%v), want 1", n, sub.changes())
+	}
+}
+
 // TestPanicUnderReReadCannotResetALiveValue is the failure that order prevents,
-// end to end and on the clock: a key whose re-read panics while a reconcile
-// applies a snapshot taken after the row was removed, with a consumer logger
-// slow enough — 50ms, what shipping a line to a remote sink costs — for the
-// whole reconcile to run inside the panic report.
+// end to end: a key whose re-read panics while a reconcile applies a snapshot
+// taken after the row was removed, with the consumer's logger held open for
+// exactly as long as the reconcile takes — what shipping a line to a remote
+// sink can cost.
+//
+// The logger is held on a channel rather than a sleep so the window cannot
+// close early on a loaded runner: the reconcile is observed to have applied
+// before the panic report is allowed to return, so the test either exercises
+// the race it exists for or hangs on its guard, never passes without it.
 func TestPanicUnderReReadCannotResetALiveValue(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 	scope := store.Scope{}
 	fs := newFakeStore()
 	rec := &recordingLogger{Logger: log.NewNop()}
 	logging := make(chan struct{})
+	reconciled := make(chan struct{})
 
 	e := New(Config{
 		Store:    fs,
 		Registry: fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: "fallback"}}},
 		Logger: &hookLogger{recordingLogger: rec, msg: rereadPanicMsg, fn: func() {
 			close(logging)
-			time.Sleep(50 * time.Millisecond)
+			<-reconciled
 		}},
 	})
 
@@ -1277,6 +1403,7 @@ func TestPanicUnderReReadCannotResetALiveValue(t *testing.T) {
 
 	release()
 	waitReconcileIdle(t, e, scope)
+	close(reconciled)
 
 	got, ok := e.Lookup(scope, nk)
 	if !ok {

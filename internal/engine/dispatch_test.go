@@ -578,6 +578,10 @@ func quiesce(t *testing.T, e *Engine) {
 		})
 	}
 
+	// Not dead: dispatchEngine hand-builds an Engine with no debouncer (the
+	// dispatch tests are not about the feed), and Submit is nil-receiver safe,
+	// so routing the sentinel through it unconditionally would drop it in
+	// silence and hang every quiesce in this file.
 	if e.debouncer == nil {
 		fire()
 	} else {
