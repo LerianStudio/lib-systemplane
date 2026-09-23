@@ -57,6 +57,8 @@ Only these paths. A task that appears to need anything else states what it needs
 - `internal/client/**`
 - `internal/manager/**` (deleted in Phase 2)
 - `internal/debounce/**`
+- `internal/testsupport/**` (new, added 2026-09-23 in the Phase 1 fix pass; test-only helpers shared
+  by `internal/engine`, `internal/client` and `internal/manager`. This lane owns it after merge)
 - Root: `api_boundary.go`, `api_client.go`, `api_change.go`, `api_constants.go`, `api_constructors.go`, `api_errors.go`, `api_testing.go`, `api_types.go` and their `_test.go` files, `boundary_test.go`, `manager.go`, `manager_methods.go`, `manager_methods_test.go`
 - `examples/manager/**` (deleted in Phase 2)
 
@@ -325,7 +327,8 @@ revision.
 
 **Implementation vision:** `internal/engine/ingest.go` exposes one unexported method: given a scope and a `store.Entry`, it resolves the key in the `Registry`, decodes `Entry.Value` into `any` with `encoding/json`, runs `KeyDef.Validate` when non-nil, and calls `publish`. It returns the `notify` flag from `publish` so the caller decides whether to dispatch.
 
-Four rejection paths, each with a distinct outcome, all logged at WARN with `namespace`, `key` and — for the last two — the error:
+Four rejection paths, each with a distinct outcome, all logged at WARN with `namespace`, `keyname` and — for the last two — the error (the field is
+`keyname`, never `key`: see the guard named in **Files:** below):
 
 1. **Unregistered key.** Skip entirely: no publish, no callback. A store may legitimately hold rows this process never registered.
 2. **Undecodable JSON.** Skip. The cache keeps whatever it held; a corrupt byte sequence is not evidence the previous value is wrong.
@@ -337,6 +340,14 @@ A second, smaller entry point in the same file handles the "no row" case — del
 **Files:**
 - Create: `internal/engine/ingest.go`
 - Create: `internal/engine/ingest_test.go`
+- Create (added 2026-09-23, Phase 1 fix pass): `internal/testsupport/logguard/logguard.go`, its
+  `logguard_test.go` and the `testdata/` fixtures that test it — the shared source scan that fails
+  the build when `internal/engine`, `internal/client` or `internal/manager` names a configuration
+  key under a log field a redacting pipeline reads as a secret's label. It is the enforcement half
+  of the field spelling this task decides; see the `keyname` bullet under § Contract amendments
+  consumed, and open deviations
+- Modify (added 2026-09-23, Phase 1 fix pass): `.ignorecoverunit` — add `internal/testsupport/*`,
+  so a test-only helper package is not counted against unit coverage
 
 **Verification:** `go test -tags=unit ./internal/engine/...` — `TestIngestRejectsInvalidValueKeepingPrevious` (publish rev 1 = valid, then a rev 2 entry the validator rejects: `Lookup` still returns the rev-1 value and revision, `notify` false), `TestIngestSkipsUnregisteredKey`, `TestIngestSkipsUndecodableJSONKeepingPrevious`, `TestIngestDefaultPublishesAtRevisionZero`, `TestIngestClonesRegisteredDefault` (mutating the returned value leaves the `Registry`'s default intact).
 
@@ -346,7 +357,7 @@ A second, smaller entry point in the same file handles the "no row" case — del
 
 - [ ] Done
 
-**Context:** The feed callback runs on the backend's changefeed goroutine. Today `internal/client/client.go:373` debounces per `nskey` and then re-reads, which is right, and the multi-tenant twin does not, which is the data race the audit found. The engine keeps the debounce on the **ingress** side — collapsing a burst of NOTIFYs for one key into one store read — and puts the callback isolation somewhere else (Epic 1.3). The two are different jobs and folding them together either costs a store read per NOTIFY or delays every callback by the debounce window twice.
+**Context:** The feed callback runs on the backend's changefeed goroutine. Today `(*Client).onEvent`'s `debouncer.Submit` call (`internal/client/client.go`) debounces per `nskey` and then re-reads, which is right, and the multi-tenant twin does not, which is the data race the audit found. The engine keeps the debounce on the **ingress** side — collapsing a burst of NOTIFYs for one key into one store read — and puts the callback isolation somewhere else (Epic 1.3). The two are different jobs and folding them together either costs a store read per NOTIFY or delays every callback by the debounce window twice.
 
 **Implementation vision:** `internal/engine/feed.go` holds the `func(store.Event)` the engine hands to `Store.Subscribe`, plus the re-read it schedules.
 
@@ -380,7 +391,7 @@ Dispatch on `Event.Op`:
 - `store.OpDisconnect` → mark the scope stale and do nothing else. No reconcile (there is no connection to read through), no publication, no callback. Reads keep serving the last published value; `Stale` is how a caller learns it is looking at a cache nobody is confirming.
 - `store.OpResync` → hand to the reconcile path (Task 1.2.3). It carries no namespace or key, so it is not debounced per key; it takes the scope's reconcile path directly.
 - `store.OpDelete` → publish the registered default at revision 0 through the ingress's no-row entry point, and record the key in the scope's touched set. No store read: a delete is self-describing.
-- `store.OpUpsert` (and anything unrecognised, treated as an upsert) → `Submit` to the debouncer; when the quiet window closes, `Store.Get(ctx, scope, ns, key)` under a 5s timeout derived from the engine's lifecycle context (the same bound `internal/client/client.go:25` uses today), then ingest the returned entry.
+- `store.OpUpsert` (and anything unrecognised, treated as an upsert) → `Submit` to the debouncer; when the quiet window closes, `Store.Get(ctx, scope, ns, key)` under a 5s timeout derived from the engine's lifecycle context (the same bound the `refreshTimeout` constant in `internal/client/client.go` gives today), then ingest the returned entry.
 
 The touched-set recording is the point of contact with fence (b). A feed publication records its key in `scopeState.touched` **only while `scopeState.reconciling` is true**, and records it *after* the publication has produced a usable value — if the re-read errored, reported not-found, or failed validation, nothing was published, so the reconcile's `List` snapshot is still the better answer for that key and must not be skipped. This is the `internal/client/client.go:461` rule, preserved deliberately.
 
@@ -793,8 +804,8 @@ as key.
 Redacted: def.redaction != RedactNone}`. Amended
 2026-09-23: that clone is OPTIONAL, not required — Phase 1 fix pass 2 (commit `db9babd`) relaxed the
 port's contract, which now says the engine never mutates what it receives and clones before caching
-or delivering (`internal/engine/registry.go:18-21`). Both of the engine's reads of `KeyDef.Default`
-keep that promise: `ingestDefault` clones before publishing
+or delivering (`KeyDef.Default`'s godoc in `internal/engine/registry.go`). Both of the engine's
+reads of `KeyDef.Default` keep that promise: `ingestDefault` clones before publishing
 (`internal/engine/ingest.go`) and `keepsCachedValue` only compares
 (`internal/engine/reconcile.go`). Keeping the clone here costs one copy per `Lookup` and buys
 nothing the engine does not already guarantee; dropping it is safe. **`Redacted` is not optional.**
@@ -808,7 +819,8 @@ for a `RedactFull` key publishes `invalid character 'h' looking for beginning of
 secret's first byte — at WARN, reopening the leak commit `9d44ea9` closed. `Keys() []engine.NSKey`
 takes `registryMu.RLock` and returns every registered key. Neither name collides with an existing
 method, and neither reaches the public surface: `systemplane.Client` is a **defined type**
-(`api_types.go:16`), not an alias, so it inherits no methods and `boundary_test.go` is unaffected.
+(the `type Client internalclient.Client` declaration in `api_types.go`), not an alias, so it
+inherits no methods and `boundary_test.go` is unaffected.
 
 **The validator slot widens first (amended 2026-09-23).** `develop` now registers every key
 validator as `func(context.Context, any) error`: `WithContextValidator` (PR #79) sets it directly and
@@ -1049,8 +1061,9 @@ no goroutine is left behind.
 - [ ] Done
 
 **Context:** `Manager` exists because v1.5.0 needed a per-tenant cache and per-tenant LISTEN bolted
-onto a Client that had neither (`manager.go:1-11`). v4 has one engine that tracks N scopes, so the
-second surface is dead weight that would have to be kept consistent with the first forever. D1 and
+onto a Client that had neither (`manager.go`'s package doc comment). v4 has one engine that tracks
+N scopes, so the second surface is dead weight that would have to be kept consistent with the first
+forever. D1 and
 FC-10 remove it: `Manager`, `ManagerOption`, `NewManager`, `WithManagerLogger`,
 `WithManagerTelemetry`, `WithManagerAggregateTenantThreshold` and every `(*Manager)` method go, and
 `HandleTenantLifecycle` comes back on `Client` in the wave-3 `engine-tenants` lane (FC-6). The
@@ -1402,13 +1415,22 @@ the task; no explanatory note substitutes for it.
 Then run the full gate sweep this phase is responsible for, which is Phase 3's list minus the
 surface cut: `make test-unit`, `go vet -tags=unit ./...`, `go vet -tags=integration ./...`,
 `go test -tags=unit -run=^TestPerf_ ./...`, `go test -tags=unit -run TestExportedBoundary ./...`,
-`make lint`, `make check-tests`. The `TestPerf_` command is no longer vacuous: since commit `c3e74f1`
-it runs `TestPerf_CloneJSONMap` (`internal/engine/clone_perf_test.go`, build tags `unit && !race`),
-which pins the allocation count of `Clone` over a decoded JSON tree. A failure means `Clone` left its
-JSON fast path and fell back onto the generic reflective walk — a cost paid on every consumer read
-and every subscriber delivery, not a threshold to relax. Run it without `-race`, which is why the
-file carries `!race` and why CI gives it its own job (`.github/workflows/go-combined-analysis.yml`):
-the race detector accounts allocations its own way, so the pinned number is meaningless under it.
+`make lint`, `make check-tests`. The `TestPerf_` command is no longer vacuous, and it now runs TWO
+gates with opposite failure modes — read which one went red before looking anywhere:
+
+- `TestPerf_CloneJSONMap` (`internal/engine/clone_perf_test.go`, build tags `unit && !race`, added
+  by commit `c3e74f1`) pins the allocation count of `Clone` over a decoded JSON tree. Red means
+  `Clone` left its JSON fast path and fell back onto the generic reflective walk — a cost paid on
+  every consumer read and every subscriber delivery. Fix the clone; do not raise the bound.
+- `TestPerf_ForeignEventDropAllocatesNothing` (`internal/engine/feed_perf_test.go`, same build tags,
+  added 2026-09-23 in the Phase 1 fix pass) pins at zero the allocations of dropping one foreign
+  changefeed event. Red means the feed's DEBUG drop line built its `log.Field` slice before asking
+  whether anyone would read it — a cost paid on every write by every OTHER consumer sharing the
+  `systemplane_entries` table, on a line that is off in production. Nothing to do with `Clone`.
+
+Run both without `-race`, which is why the files carry `!race` and why CI gives them their own job
+(`.github/workflows/go-combined-analysis.yml`): the race detector accounts allocations its own way,
+so the pinned numbers are meaningless under it.
 
 Named edge cases. `make coverage-unit` writes `./reports/unit_coverage.out` inside the worktree;
 `.gitignore` already covers `reports/`, but confirm nothing under it is staged. `make lint` may flag
@@ -1450,8 +1472,24 @@ every gate in the verification list exits 0 on the branch head.
 **Goal:** Every gate the repo runs is green against the lane's final shape, and the lane's own branch is mergeable.
 **Scope:** no new production code — verification only, plus whatever small fixes the gates demand inside owned files
 **Dependencies:** Epic 3.1
-**Done when:** `make test-unit`, `go vet -tags=unit ./...`, `go vet -tags=integration ./...`, `go test -tags=unit -run=^TestPerf_ ./...`, `go test -tags=unit -run TestExportedBoundary ./...` and `make lint` all pass; `make check-tests` reports coverage for `internal/engine`; the repo-wide absence checks (`internal/manager`, `WithTable`, `WithListenChannel`) are **not** asserted here — lane-cut rule 4 puts them in the integration lane, and this lane's branch cannot prove a negative while siblings are writing.
+**Done when:** `make test-unit`, `go vet -tags=unit ./...`, `go vet -tags=integration ./...`, `go test -tags=unit -run=^TestPerf_ ./...`, `go test -tags=unit -run TestExportedBoundary ./...` and `make lint` all pass; the anchor check below prints `0`; `make check-tests` reports coverage for `internal/engine`; the repo-wide absence checks (`internal/manager`, `WithTable`, `WithListenChannel`) are **not** asserted here — lane-cut rule 4 puts them in the integration lane, and this lane's branch cannot prove a negative while siblings are writing.
 **Status:** Pending
+
+**The anchor check** — runnable from the worktree root, and the only mechanical claim § Self-review
+makes about this document. It counts `file.go:N` line anchors anywhere after the `## Phase 2`
+heading, in a **Files:** list or in prose, and must print `0`:
+
+```bash
+P=docs/plans/2026-09-17-v4-unified-engine/lane-engine-core.md && \
+L=$(grep -n '^## Phase 2' $P | head -1 | cut -d: -f1) && \
+tail -n +$L $P | grep -nE '\b[A-Za-z_./-]+\.go:[0-9]+' ; \
+echo "anchors after Phase 2 heading: $(tail -n +$L $P | grep -cE '\b[A-Za-z_./-]+\.go:[0-9]+')"
+```
+
+It proves the absence of a line number. It does NOT prove that any construct named instead of one is
+correct; no grep can, and a reviewer reading the plan against the tree is still the check for that.
+It says nothing about Phase 1, whose prose carries line anchors deliberately, as the record of what
+the v3 code looked like when this lane was authored.
 
 ---
 
@@ -1513,7 +1551,7 @@ Ran over all nine Phase 1 tasks for the "No vague tasks" red flags: no "appropri
 
 ### File disjointness
 
-This lane's `**Files:**` lists touch only `internal/engine/**`, `internal/client/**`, `internal/manager/**`, `internal/debounce/**`, `examples/manager/**`, `.ignorecoverunit`, and the root files named in § What this lane owns. Intersected against the other wave-2 lanes: `storage` owns `internal/postgres`, `internal/mongodb`, `ddl*`, `systemplanetest`; `groups` owns `api_group*.go` and `internal/group`. **The intersection is empty.** The one file needing a call-out, `.ignorecoverunit`, is edited in Epic 2.2 only to drop the two `internal/manager/*` lines; the `storage` lane may also need it for its own backend lines, so this lane touches nothing outside those two lines and the orchestrator resolves any conflict at merge as a two-line diff.
+This lane's `**Files:**` lists touch only `internal/engine/**`, `internal/client/**`, `internal/manager/**`, `internal/debounce/**`, `internal/testsupport/**`, `examples/manager/**`, `.ignorecoverunit`, and the root files named in § What this lane owns. Intersected against the other wave-2 lanes: `storage` owns `internal/postgres`, `internal/mongodb`, `ddl*`, `systemplanetest`; `groups` owns `api_group*.go` and `internal/group`. **The intersection is empty.** The one file needing a call-out, `.ignorecoverunit`, is edited TWICE by this lane, and the branch already carries the first: Phase 1's fix pass ADDED one line, `internal/testsupport/*`, with its comment, when it created the shared log-field guard; Epic 2.2 DROPS the two `internal/manager/*` lines with their comment. The `storage` lane may also need this file for its own backend lines, so this lane touches nothing outside those three lines, and the orchestrator resolves any conflict at merge as a three-line diff — one added near the top, two deleted further down.
 
 Verified by import graph rather than by grep: `internal/manager` is imported only by the root package (`manager.go`, `manager_methods_test.go`), by `internal/client`, and by itself — every one of them lane-owned. `ddl.go` and `ddl_test.go` name it in **comments only**, not imports, so deleting the package breaks no file this lane does not own.
 
@@ -1615,17 +1653,30 @@ read. Declined on the same principle as the note above: the ingress reports usab
 caller that needs a finer answer asks the registry, which is cheap and honest.
 
 **Corrective behaviour changes carried onto the shipping v3 path (recorded 2026-09-23, Phase 1 fix
-pass).** Phase 1's milestone said "nothing user-visible changed". Two things did, both in
-`internal/client`, which is the code consumers run today, and both corrections rather than features
-— so the milestone now names them instead of claiming a clean zero.
+pass).** Phase 1's milestone said "nothing user-visible changed". Two things did, both corrections
+rather than features, so the milestone now names them instead of claiming a clean zero. Both land in
+`internal/client`, the single-tenant code consumers run today; the first also lands in
+`internal/manager`, the multi-tenant twin this lane owns until Epic 2.2 deletes it.
 
-- **The log field `key` is now `keyname`.** Eight sites across `internal/client/client.go` and
-  `internal/client/get.go`. `key` is the field name a redacting logger and every downstream log
-  pipeline reads as a secret's label, so a line carrying a configuration key's NAME could be
+- **The log field `key` is now `keyname`.** Ten renamed sites on the single-tenant Client — eight in
+  `internal/client/client.go`, two in `internal/client/get.go` — plus one site that is new rather
+  than renamed, the identity line `(*Client).recoverRefresh` adds (next bullet). Counted, not
+  asserted: `git diff origin/develop...HEAD -- internal/client | grep -c '^+.*log.String("keyname"'`
+  prints 11, and the matching count of REMOVED `log.String("key"` lines is 10. The rename also
+  landed on the v3 MULTI-TENANT path, which this lane owns until Epic 2.2 deletes it: three further
+  sites, the two warm-load lines and the LISTEN event line in `internal/manager` (`warmload.go`,
+  `events.go`), so a multi-tenant operator is not left reading `key=[REDACTED]` on the one path this
+  section does not otherwise touch. `key` is the field name a redacting logger and every downstream
+  log pipeline reads as a secret's label, so a line carrying a configuration key's NAME could be
   scrubbed to `[REDACTED]` and the operator lose the one identifier that made the line useful.
   `keyname` is the canonical spelling the engine uses, and a source scan in
-  `internal/testsupport/logguard` now fails the build for either package if the banned spelling
-  comes back. Anyone grepping their logs for `"key":` on a systemplane line changes the grep.
+  `internal/testsupport/logguard` now fails the build for any of the three packages if the banned
+  spelling comes back. **No `BREAKING CHANGE` footer is carried for it**, deliberately: a log field
+  name is not one of this library's public API contracts — `boundary_test.go`, the gate that defines
+  what is, cannot see it — so semantic-release is right to ship it as a patch. The operator-visible
+  consequence is real and is recorded here rather than in a commit trailer: anyone grepping their
+  logs for `"key":` on a systemplane line changes the grep, and the v4 release notes carry that
+  sentence.
 - **A panicking changefeed re-read now names the key it blew up on.** `(*Client).recoverRefresh`
   (`internal/client/client.go`) recovers before the debouncer's outer net does, logs the namespace
   and the key at ERROR, and hands the value to `runtime.HandlePanicValue` so the panic is counted
@@ -1633,6 +1684,27 @@ pass).** Phase 1's milestone said "nothing user-visible changed". Two things did
   `RecoverAndLog`'s anonymous line with the value and stack redacted in production: an operator
   learned something under the debouncer failed and never which configuration key. No behaviour
   changes for a store that does not panic.
+
+Known v3-only residual, recorded here and deliberately NOT corrected in Phase 1:
+
+- **A validator that panics with an error can put a `RedactFull` key's value in the log.**
+  `validateStored` (`internal/client/client.go`) hand-rolls its own `recover()` outside
+  `lib-observability`, and on an error-typed panic value it wraps that error verbatim
+  (`fmt.Errorf("%w: %w", errValidatorPanicked, panicked)`). Both of its callers — `(*Client).hydrate`
+  and `(*Client).refreshFromStore` — then log the result with `log.Err(err)`, which applies no
+  per-key redaction policy, so a validator written as `return fmt.Errorf("token %q is too short",
+  v)` and panicking on a nil field publishes that token at WARN even for a key registered
+  `RedactFull`. The panic is also never counted in `panic_recovered_total` and never recorded on the
+  span, because it never reaches the recovery pipeline. Phase 1 does not change it: the behaviour is
+  pinned by `TestPanickingValidatorIsARefusal` (`internal/client/hydrate_validator_test.go`), and
+  the fix pass's own rule forbids breaking a pinned test to make a correction the next phase deletes
+  anyway. **Phase 2 closes it by deletion**, not by patching: Task 2.1.3's **Files:** list removes
+  `validateStored` and its `errValidatorPanicked` sentinel with the rest of the Client's refresh
+  path, and every rejection then runs through the engine's `runValidator` plus `errorDetail`
+  (`internal/engine/ingest.go`), which report a panic as `store.ErrValidation: validator panicked`
+  with the value nowhere in the message and render a redacted key's cause as "what refused it plus
+  the error's dynamic type". That is the pattern already in the tree; nothing new has to be
+  designed for it.
 
 **Open deviations: two, both recorded 2026-09-23 in the Phase 1 fix pass.** Neither blocks this lane
 and neither bends a frozen contract.
@@ -1653,23 +1725,46 @@ and neither bends a frozen contract.
   here because it reverses a decision this section previously recorded as closed, and a reversal
   should be findable from the deviations list rather than only from the handoff it moved into.
 
-**The anchor sweep, and the passes that called it finished early.** Four passes now. `b455a78` and
+**The anchor sweep, and the passes that called it finished early.** Five passes now, four of which
+called it done. `b455a78` and
 `05d4d4e` called the Phase 2 line-anchor sweep finished while the `**Files:**` lists and a dozen
 parentheticals still carried line numbers, several pointing at the wrong construct. `d0a34d9` called
 it finished while Task 2.1.1's `**Files:**` list still carried ranges, and argued they were safe
 because they name their construct beside the number; a reviewer then proved two of them wrong
 against the tree — `api_group_test.go` line 103 is the closing brace of `groupMemoryStore.List`, not
 its `Subscribe`, which is five lines further down, and `internal/client/client_test.go` "lines 83-97
-`Set`" spans `memStore.Set` AND `memStore.Delete`, a method this task does not touch. This pass
-removes them rather than re-verifying them, on the reasoning the wrong anchors themselves supply: a
-number is re-verified once and then rots at the next commit, while a type or method name does not.
-One claim is made here, and the lane's verification command checks it mechanically — everything
-after the Phase 2 heading, `**Files:**` lists and prose alike, names the type, method or callback to
-edit and carries no line number, so the grep for the four anchor shapes prints nothing.
+`Set`" spans `memStore.Set` AND `memStore.Delete`, a method this task does not touch. `932d5e1` called it
+finished a fourth time — in a sentence that claimed a verification command checked it mechanically,
+while three prose anchors stood after the Phase 2 heading and no such command existed anywhere in
+the document. Each pass removed real anchors and then over-claimed about the ones it had not looked
+at.
+
+This fifth pass removes the last three — `KeyDef.Default`'s godoc in `internal/engine/registry.go`,
+the `type Client internalclient.Client` declaration in `api_types.go`, and `manager.go`'s package
+doc comment — on the reasoning the wrong anchors themselves supply: a number is re-verified once and
+then rots at the next commit, while a type or method name does not. All three were accurate against
+the tree when they were written, which is the point: accuracy is what a line anchor has for one
+commit.
+
+It also stops asserting the sweep in prose. Exactly one mechanical claim is made about this
+document, it is the command written out in Epic 3.2, and it is narrow: **no `file.go:N` line anchor
+appears anywhere after the `## Phase 2` heading**, in a **Files:** list or in prose. That command
+was run against this file in the session that wrote this sentence and printed `0`. It proves nothing
+about Phase 1, which keeps its anchors as a record of the v3 code, and nothing about whether a
+construct named in place of an anchor resolves — that is a reviewer's job against the tree, not a
+grep's.
 
 The counts in this section were wrong the same way, and for the same reason: asserted rather than
 counted. "Neither note above" when there were two; then "five"; then "three handoffs" above four
-bullets. Every count here is now counted.
+bullets; then "eight sites" for a rename the diff puts at ten.
+
+Every number in this section was counted with a command in the session that wrote it, and the
+command is written beside the number wherever one exists: four handoff bullets (three to
+`engine-tenants`, one to `storage`), two open deviations, two corrective changes, eleven `keyname`
+log lines added across `internal/client` against ten `key` lines removed, three more in
+`internal/manager`. The claim is about the numbers in THIS section and nothing wider — no sentence
+here asserts that some category elsewhere in the document is exhaustively swept, except the one
+mechanical anchor claim above, which names the command that checks it.
 
 The four handoffs are work another lane owns, each stating the failure mode if it is
 never done; the tri-state decline is a closed decision with its reasons written down, and the
@@ -1680,4 +1775,4 @@ as frozen.
 
 ### Phase boundaries and verification plausibility
 
-Every phase ends green: Phase 1 adds a tested package beside the running one and changes no library behavior; Phase 2 swaps the engine in and removes the old one in the same phase, so the tree is never half-migrated; Phase 3 is the breaking-surface cut plus the gate sweep. Every verification command in Phase 1 targets a path this lane creates or a repo-level target that exists today (`make test-unit`, `go vet -tags=unit ./...`, `go vet -tags=integration ./...`, `go test -tags=unit -run=^TestPerf_ ./...`, `go test -tags=unit -run TestExportedBoundary ./...`). Note for the implementer: since commit `c3e74f1` the `TestPerf_` command runs `TestPerf_CloneJSONMap` (`internal/engine/clone_perf_test.go`, build tags `unit && !race`), which pins the allocation count of `Clone` over a decoded JSON tree. A failure means `Clone` fell off its JSON fast path back onto the generic reflective walk, on every read and every delivery — fix the clone, do not raise the bound. Run it without `-race`; the detector accounts allocations its own way and CI gives it a dedicated job for exactly that reason.
+Every phase ends green: Phase 1 adds a tested package beside the running one and changes no library behavior; Phase 2 swaps the engine in and removes the old one in the same phase, so the tree is never half-migrated; Phase 3 is the breaking-surface cut plus the gate sweep. Every verification command in Phase 1 targets a path this lane creates or a repo-level target that exists today (`make test-unit`, `go vet -tags=unit ./...`, `go vet -tags=integration ./...`, `go test -tags=unit -run=^TestPerf_ ./...`, `go test -tags=unit -run TestExportedBoundary ./...`). Note for the implementer: the `TestPerf_` command runs TWO gates, and which one is red says where to look. `TestPerf_CloneJSONMap` (`internal/engine/clone_perf_test.go`, build tags `unit && !race`, since commit `c3e74f1`) pins the allocation count of `Clone` over a decoded JSON tree; red means `Clone` fell off its JSON fast path back onto the generic reflective walk, on every read and every delivery — fix the clone, do not raise the bound. `TestPerf_ForeignEventDropAllocatesNothing` (`internal/engine/feed_perf_test.go`, same tags, added 2026-09-23 in the Phase 1 fix pass) pins at zero the allocations of dropping one foreign changefeed event; red means the feed's DEBUG drop line built its fields before asking whether anyone would read them — a cost paid on every write by every other consumer of the shared `systemplane_entries` table, and nothing to do with `Clone`. Run both without `-race`; the detector accounts allocations its own way and CI gives them a dedicated job for exactly that reason.
