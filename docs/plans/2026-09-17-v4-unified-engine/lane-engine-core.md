@@ -724,14 +724,23 @@ as key.
 
 **The Client implements `engine.Registry`** in a new file `internal/client/registry.go`.
 `Lookup(namespace, key string) (engine.KeyDef, bool)` takes `registryMu.RLock`, and returns
-`engine.KeyDef{Default: engine.Clone(def.defaultValue), Validate: def.validator}`. Amended
+`engine.KeyDef{Default: engine.Clone(def.defaultValue), Validate: def.validator,
+Redacted: def.redaction != RedactNone}`. Amended
 2026-09-23: that clone is OPTIONAL, not required — Phase 1 fix pass 2 (commit `db9babd`) relaxed the
 port's contract, which now says the engine never mutates what it receives and clones before caching
 or delivering (`internal/engine/registry.go:18-21`). Both of the engine's reads of `KeyDef.Default`
 keep that promise: `ingestDefault` clones before publishing
 (`internal/engine/ingest.go:177`) and `keepsCachedValue` only compares
 (`internal/engine/reconcile.go:451`). Keeping the clone here costs one copy per `Lookup` and buys
-nothing the engine does not already guarantee; dropping it is safe. `Keys() []engine.NSKey`
+nothing the engine does not already guarantee; dropping it is safe. **`Redacted` is not optional.**
+It is the only producer of the log-redaction gate Phase 1 fix pass 3 added
+(`internal/engine/registry.go:37-42`, read at `internal/engine/ingest.go:82` for an undecodable
+row and at `:124` for a validator rejection): the engine needs the fact, not the policy, so the
+adapter collapses `RedactMask` and `RedactFull` alike to true — masking and hiding are the same
+decision to a log stream, and the policy itself stays the Client's. Omit it and every key reaches
+the engine as `Redacted: false`, `errorDetail` takes the `log.Err` branch, and an undecodable row
+for a `RedactFull` key publishes `invalid character 'h' looking for beginning of value` — the
+secret's first byte — at WARN, reopening the leak commit `9d44ea9` closed. `Keys() []engine.NSKey`
 takes `registryMu.RLock` and returns every registered key. Neither name collides with an existing
 method, and neither reaches the public surface: `systemplane.Client` is a **defined type**
 (`api_types.go:16`), not an alias, so it inherits no methods and `boundary_test.go` is unaffected.
@@ -875,8 +884,12 @@ no hydration flags; `grep -rn "hydrat\|fireSubscribers\|refreshFromStore\|c.cach
 returns nothing outside comments; `GetEntry` on a single-tenant cache hit returns the row's revision,
 `UpdatedAt` and `UpdatedBy`; `Set` then `Get` in one goroutine returns the new value with no feed
 event; `Client` satisfies `engine.Registry` (assert it with a compile-time
-`var _ engine.Registry = (*Client)(nil)` in `registry.go`); `go build ./...` and
-`go test -tags=unit -race -count=1 ./...` are green.
+`var _ engine.Registry = (*Client)(nil)` in `registry.go`); a key registered with
+`WithRedaction(RedactFull)` whose stored row is not decodable JSON logs no byte of that row
+through the Client — assert it in `internal/client` against a store seeded with a raw secret, the
+way `TestUndecodableValueIsRedactedByKeyPolicy` (`internal/engine/logging_test.go:475`) asserts it
+one layer down, so the adapter's `Redacted` mapping is pinned and not merely written; `go build
+./...` and `go test -tags=unit -race -count=1 ./...` are green.
 
 #### Task 2.1.4: Add WithCloseTimeout and the ErrCloseTimeout sentinel to the facade
 
