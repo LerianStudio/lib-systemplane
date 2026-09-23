@@ -118,6 +118,7 @@ func assertSequenceLivesInTheTableSchema(t *testing.T, artifact, sql string) {
 	wantFragments := []string{
 		"SELECT n.nspname INTO tbl_schema",
 		"WHERE c.oid = 'systemplane_entries'::regclass;",
+		"EXECUTE format('LOCK TABLE %I.systemplane_entries IN SHARE ROW EXCLUSIVE MODE', tbl_schema);",
 		"EXECUTE format('CREATE SEQUENCE IF NOT EXISTS %I.systemplane_revision_seq AS BIGINT', tbl_schema);",
 		"'SELECT setval(%L::regclass, GREATEST((SELECT COALESCE(MAX(revision), 1) FROM %I.systemplane_entries), (SELECT last_value FROM %I.systemplane_revision_seq)))',",
 		"format('%I.systemplane_revision_seq', tbl_schema), tbl_schema, tbl_schema);",

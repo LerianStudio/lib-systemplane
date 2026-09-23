@@ -120,6 +120,9 @@ BEGIN
 	JOIN pg_namespace n ON n.oid = c.relnamespace
 	WHERE c.oid = 'systemplane_entries'::regclass;
 
+	-- SHARE ROW EXCLUSIVE conflicts with ROW EXCLUSIVE, so no INSERT/UPDATE can draw
+	-- a revision between the read and the setval until this block's transaction ends.
+	EXECUTE format('LOCK TABLE %I.systemplane_entries IN SHARE ROW EXCLUSIVE MODE', tbl_schema);
 	EXECUTE format('CREATE SEQUENCE IF NOT EXISTS %I.systemplane_revision_seq AS BIGINT', tbl_schema);
 	EXECUTE format(
 		'SELECT setval(%L::regclass, GREATEST((SELECT COALESCE(MAX(revision), 1) FROM %I.systemplane_entries), (SELECT last_value FROM %I.systemplane_revision_seq)))',
