@@ -1439,3 +1439,343 @@ func TestCloseOnAnUnstartedClientClosesTheEngine(t *testing.T) {
 		t.Fatalf("second close: %v", err)
 	}
 }
+
+// TestSetThenGetReturnsNewValue pins read-your-writes at the Client surface
+// (D4): the caller's own next read sees its write without waiting for the
+// changefeed to echo it, and GetEntry reports the revision the store assigned
+// plus the actor that wrote it. A facade that wrote through and let the feed
+// repair the cache would leave the writer reading its own stale value for as
+// long as the round trip takes — which for a knob a request handler just
+// changed is the whole request.
+func TestSetThenGetReturnsNewValue(t *testing.T) {
+	s := newMemStore(false)
+	c := newSingleTenantClient(t, s)
+
+	defer func() { _ = c.Close() }()
+
+	if err := c.Register("ns", "k", "default"); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	if err := c.Set(context.Background(), "ns", "k", "written", "actor"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	// The revision the fake assigned to that write, read from the fake rather
+	// than assumed, so the assertion pins the hand-off and not a literal.
+	s.mu.Lock()
+	wantRevision := s.revision
+	s.mu.Unlock()
+
+	got, ok, err := c.Get(context.Background(), "ns", "k")
+	if err != nil || !ok {
+		t.Fatalf("Get after Set: got (%v, %v)", ok, err)
+	}
+
+	if got != "written" {
+		t.Errorf("value: got %v, want %q — a writer must see its own write without waiting for the feed", got, "written")
+	}
+
+	entry, ok, err := c.GetEntry(context.Background(), "ns", "k")
+	if err != nil || !ok {
+		t.Fatalf("GetEntry after Set: got (%v, %v)", ok, err)
+	}
+
+	if entry.Revision != wantRevision {
+		t.Errorf("revision: got %d, want %d — Set must publish with the revision the store returned", entry.Revision, wantRevision)
+	}
+
+	if entry.UpdatedBy != "actor" {
+		t.Errorf("UpdatedBy: got %q, want %q", entry.UpdatedBy, "actor")
+	}
+}
+
+// TestDeletePublishesDefaultAtRevisionZero pins what a delete means to a
+// reader and to a subscriber: the registered default comes back into force at
+// Revision 0 with no provenance, and a subscriber is told so rather than being
+// left on the deleted value.
+//
+// The delivery count is deliberately a floor and not an exact number: the fake
+// fires its OpDelete synchronously inside store.Delete and the Client
+// publishes the same delete itself, and Revision 0 is never deduplicated (D3),
+// so one or two deliveries are both within FC-4.
+func TestDeletePublishesDefaultAtRevisionZero(t *testing.T) {
+	s := newMemStore(false)
+	c := newSingleTenantClient(t, s)
+
+	defer func() { _ = c.Close() }()
+
+	if err := c.Register("ns", "k", "default"); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	if err := c.Set(context.Background(), "ns", "k", "written", "actor"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	rec := &changeRecorder{}
+
+	unsub, err := c.OnChange("ns", "k", rec.record)
+	if err != nil {
+		t.Fatalf("OnChange: %v", err)
+	}
+
+	defer unsub()
+
+	if err := c.Delete(context.Background(), "ns", "k", "actor"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	got, ok, err := c.Get(context.Background(), "ns", "k")
+	if err != nil || !ok {
+		t.Fatalf("Get after Delete: got (%v, %v)", ok, err)
+	}
+
+	if got != "default" {
+		t.Errorf("value after Delete: got %v, want the registered default", got)
+	}
+
+	entry, ok, err := c.GetEntry(context.Background(), "ns", "k")
+	if err != nil || !ok {
+		t.Fatalf("GetEntry after Delete: got (%v, %v)", ok, err)
+	}
+
+	if entry.Revision != 0 {
+		t.Errorf("revision after Delete: got %d, want 0 — no row exists, so the default is in force", entry.Revision)
+	}
+
+	if !entry.UpdatedAt.IsZero() {
+		t.Errorf("UpdatedAt after Delete: got %v, want the zero time — there is no row to have provenance", entry.UpdatedAt)
+	}
+
+	if entry.UpdatedBy != "" {
+		t.Errorf("UpdatedBy after Delete: got %q, want empty", entry.UpdatedBy)
+	}
+
+	waitFor(t, func() bool {
+		for _, ch := range rec.all() {
+			if ch.Revision == 0 && ch.Value == "default" {
+				return true
+			}
+		}
+
+		return false
+	}, "no subscriber delivery carried the registered default at revision 0 — a delete must be announced, not merely applied to the cache")
+}
+
+// TestSubscriberRegisteredBeforeStartIsAnnouncedOnce pins FC-11 across several
+// keys at the Client surface: every registered key is announced exactly once
+// during Start, the seeded key at its stored revision and the absent ones at
+// Revision 0 carrying their registered defaults.
+//
+// Exactly once is the whole point. v3 suppressed these callbacks entirely, so
+// a consumer that wires its reload in OnChange (br-sfn registers 17 of them
+// before Start) ran on defaults until the first write; a fix that announces
+// twice instead re-runs every one of those reloads on boot.
+func TestSubscriberRegisteredBeforeStartIsAnnouncedOnce(t *testing.T) {
+	s := newMemStore(false)
+	seedEntryAt(t, s, "ns", "seeded", "stored", 11)
+
+	c := newSingleTenantClient(t, s)
+
+	defer func() { _ = c.Close() }()
+
+	defaults := map[string]string{"seeded": "seeded-default", "absent-a": "default-a", "absent-b": "default-b"}
+	recorders := make(map[string]*changeRecorder, len(defaults))
+
+	for key, def := range defaults {
+		if err := c.Register("ns", key, def); err != nil {
+			t.Fatalf("Register %s: %v", key, err)
+		}
+
+		rec := &changeRecorder{}
+		recorders[key] = rec
+
+		unsub, err := c.OnChange("ns", key, rec.record)
+		if err != nil {
+			t.Fatalf("OnChange %s: %v", key, err)
+		}
+
+		defer unsub()
+	}
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	waitFor(t, func() bool {
+		for _, rec := range recorders {
+			if rec.count() < 1 {
+				return false
+			}
+		}
+
+		return true
+	}, "a key registered before Start was never announced")
+
+	// Nothing else happens to the store, so any further delivery is a repeat.
+	time.Sleep(200 * time.Millisecond)
+
+	for key, rec := range recorders {
+		got := rec.all()
+		if len(got) != 1 {
+			t.Fatalf("%s: got %d deliveries %v, want exactly 1 — the announcement must not repeat", key, len(got), got)
+		}
+
+		wantValue, wantRevision := any(defaults[key]), int64(0)
+		if key == "seeded" {
+			wantValue, wantRevision = "stored", int64(11)
+		}
+
+		if got[0].Value != wantValue {
+			t.Errorf("%s: value %v, want %v", key, got[0].Value, wantValue)
+		}
+
+		if got[0].Revision != wantRevision {
+			t.Errorf("%s: revision %d, want %d", key, got[0].Revision, wantRevision)
+		}
+
+		if got[0].Namespace != "ns" || got[0].Key != key {
+			t.Errorf("%s: identity ns=%s key=%s, want ns/%s", key, got[0].Namespace, got[0].Key, key)
+		}
+	}
+}
+
+// TestGetEntryReportsStaleUntilTheFirstReconcile pins FC-5's Stale flag at the
+// Client surface. A reconciled scope reports Stale false; the moment the
+// changefeed reports itself disconnected, every read of that scope says so
+// while still serving the last value it published — reads never block and
+// never erase. Until this test the flag was only asserted inside the engine,
+// and admin's `stale` field rendered a constant false.
+func TestGetEntryReportsStaleUntilTheFirstReconcile(t *testing.T) {
+	s := newMemStore(false)
+	seedEntryAt(t, s, "ns", "k", "stored", 6)
+
+	c := newSingleTenantClient(t, s)
+
+	defer func() { _ = c.Close() }()
+
+	if err := c.Register("ns", "k", "default"); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	before, ok, err := c.GetEntry(context.Background(), "ns", "k")
+	if err != nil || !ok {
+		t.Fatalf("GetEntry after Start: got (%v, %v)", ok, err)
+	}
+
+	if before.Stale {
+		t.Fatal("Stale after Start: got true, want false — the scope reconciled")
+	}
+
+	// markStale runs inline on the goroutine that fires the event, so the
+	// next read observes it without waiting.
+	s.fire(store.Event{Op: store.OpDisconnect})
+
+	after, ok, err := c.GetEntry(context.Background(), "ns", "k")
+	if err != nil || !ok {
+		t.Fatalf("GetEntry after OpDisconnect: got (%v, %v)", ok, err)
+	}
+
+	if !after.Stale {
+		t.Error("Stale after OpDisconnect: got false, want true — nobody is confirming the value any more")
+	}
+
+	if after.Value != before.Value {
+		t.Errorf("value after OpDisconnect: got %v, want %v — a disconnect must not erase what is in force", after.Value, before.Value)
+	}
+
+	if after.Revision != before.Revision {
+		t.Errorf("revision after OpDisconnect: got %d, want %d", after.Revision, before.Revision)
+	}
+}
+
+// TestSubscriberMutationDoesNotReachALaterGet pins that the Client hands the
+// subscriber a copy and not the cached object. The engine clones per
+// subscriber; this asserts the facade does not undo that by publishing the
+// same decoded map into both the Change and the cache, which would let one
+// consumer's callback silently rewrite the configuration every other reader
+// sees.
+func TestSubscriberMutationDoesNotReachALaterGet(t *testing.T) {
+	s := newMemStore(false)
+	c := newSingleTenantClient(t, s)
+
+	defer func() { _ = c.Close() }()
+
+	if err := c.Register("ns", "k", map[string]any{}); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	var (
+		mu       sync.Mutex
+		mutated  bool
+		mutateAt = "injected-by-the-subscriber"
+	)
+
+	unsub, err := c.OnChange("ns", "k", func(_ context.Context, ch Change) {
+		doc, isMap := ch.Value.(map[string]any)
+		if !isMap {
+			return
+		}
+
+		if _, written := doc["timeout"]; !written {
+			return
+		}
+
+		doc[mutateAt] = true
+
+		mu.Lock()
+		mutated = true
+		mu.Unlock()
+	})
+	if err != nil {
+		t.Fatalf("OnChange: %v", err)
+	}
+
+	defer unsub()
+
+	if err := c.Set(context.Background(), "ns", "k", map[string]any{"timeout": "30s"}, "actor"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	waitFor(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+
+		return mutated
+	}, "the subscriber never received the written document, so nothing was mutated to test")
+
+	got, ok, err := c.Get(context.Background(), "ns", "k")
+	if err != nil || !ok {
+		t.Fatalf("Get after the subscriber mutated its copy: got (%v, %v)", ok, err)
+	}
+
+	doc, isMap := got.(map[string]any)
+	if !isMap {
+		t.Fatalf("value: got %T, want a decoded JSON object", got)
+	}
+
+	if _, leaked := doc[mutateAt]; leaked {
+		t.Errorf("a subscriber's mutation reached a later read: %v", doc)
+	}
+
+	if doc["timeout"] != "30s" {
+		t.Errorf("value: got %v, want the written document intact", doc)
+	}
+}
