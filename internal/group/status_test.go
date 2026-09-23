@@ -355,6 +355,50 @@ func TestCoordinatorDecodeFailureIsRecordedAndNeverDelivered(t *testing.T) {
 	}
 }
 
+// TestCoordinatorNullValueIsRejectedByTheCodecAndNeverDelivered pins the
+// coordinator half of the typed group's null rule: a published null reaches
+// the codec as a nil value, and a codec that refuses it (which is what the
+// group's own decodePublished does for a struct-shaped document) turns that
+// publication into a recorded rejection rather than a blank document handed to
+// an applier. The coordinator itself never special-cases nil.
+func TestCoordinatorNullValueIsRejectedByTheCodecAndNeverDelivered(t *testing.T) {
+	refuseNull := func(value any) (coordDoc, error) {
+		if value == nil {
+			return coordDoc{}, errors.New("decode: null document")
+		}
+
+		return Decode[coordDoc](value)
+	}
+
+	c := NewCoordinator[coordDoc](newRecordingLogger(), refuseNull, nil)
+	ctx := context.Background()
+
+	var rec recorder
+
+	unsubscribe := mustRegister(t, c, rec.apply)
+	defer unsubscribe()
+
+	c.Publish(ctx, publication("t1", 1, "good"))
+	c.Publish(ctx, Publication{Tenant: "t1", Revision: 2, Value: nil})
+
+	if got := rec.names(); len(got) != 1 || got[0] != "good" {
+		t.Errorf("deliveries = %v, want only the decodable document: a null must never reach an applier", got)
+	}
+
+	got := statusOf(t, c, "t1")
+	if got.Desired != 2 {
+		t.Errorf("Desired = %d, want 2: a null rejected at decode still advances Desired", got.Desired)
+	}
+
+	if got.Applied != 1 {
+		t.Errorf("Applied = %d, want 1: the last good revision stays applied", got.Applied)
+	}
+
+	if got.LastErr == nil {
+		t.Error("LastErr = nil, want the refused null document")
+	}
+}
+
 func TestCoordinatorAppliedIsTheMinimumAcrossAppliers(t *testing.T) {
 	c := newCoordinator(t)
 	ctx := context.Background()

@@ -2029,13 +2029,17 @@ func TestGroupOnApplyReceivesTheDefaultAfterADelete(t *testing.T) {
 	}
 }
 
-// TestGroupOnApplyRefusesAPublishedNullDocument pins the only thing standing
-// between a stored JSON null and a hot-reload applier: without it the applier
-// is handed a wholly blank document — empty name, zero retries, no hosts — and
-// applies it as if an operator had written it, while Status reports the scope
-// converged and error-free. The seed path reaches the guard, so this is live
-// behaviour rather than defensive dead code.
-func TestGroupOnApplyRefusesAPublishedNullDocument(t *testing.T) {
+// TestGroupOnApplyNeverSeesANullRowRefusedAtHydrate pins where a stored JSON
+// null dies: at the Client, not at the group. Since PR #84 the client grades
+// the stored row while hydrating at Start, so a null is refused there — one
+// WARN naming namespace, key and error, registered defaults left in force —
+// and the applier is handed those defaults instead of a wholly blank document
+// (empty name, zero retries, no hosts) applied as if an operator had written
+// it. The group's own null guard in decodePublished is now unreachable through
+// this facade and stays as a defensive check; the coordinator half of that
+// rule is pinned by
+// TestCoordinatorNullValueIsRejectedByTheCodecAndNeverDelivered.
+func TestGroupOnApplyNeverSeesANullRowRefusedAtHydrate(t *testing.T) {
 	t.Parallel()
 
 	s := newGroupMemoryStore()
@@ -2054,21 +2058,29 @@ func TestGroupOnApplyRefusesAPublishedNullDocument(t *testing.T) {
 
 	t.Cleanup(unsubscribe)
 
-	var blank groupConfig
-
-	for i, a := range rec.all() {
-		if reflect.DeepEqual(a.Value, blank) {
-			t.Fatalf("delivery %d handed the applier the blank document %#v: a stored null must never reach an applier", i, a.Value)
-		}
+	delivered := rec.all()
+	if len(delivered) != 1 {
+		t.Fatalf("the applier ran %d times, want exactly 1: the seeded delivery of what is in force", len(delivered))
 	}
 
-	// The refusal is the whole point, so it must be readable: no applier ever
-	// accepted the null, and the scope says so even though both revisions read
-	// 0 on the wave-1 facade.
-	for _, st := range g.Status() {
-		if st.LastErr == nil {
-			t.Errorf("Status entry = %#v, want the refused null document visible in LastErr", st)
-		}
+	if want := groupDefaults(); !reflect.DeepEqual(delivered[0].Value, want) {
+		t.Errorf("delivered document = %#v, want the registered defaults %#v: the stored null never reaches an applier", delivered[0].Value, want)
+	}
+
+	// Nothing was rejected at group level, because nothing invalid ever got
+	// there: the scope reads converged on revision 0, the absence of a usable
+	// row, with no error to report.
+	status := g.Status()
+	if len(status) != 1 {
+		t.Fatalf("Status() = %#v, want exactly one scope entry", status)
+	}
+
+	if status[0].LastErr != nil {
+		t.Errorf("LastErr = %v, want nil: the client refused the null row before the group saw it", status[0].LastErr)
+	}
+
+	if status[0].Desired != 0 || status[0].Applied != 0 {
+		t.Errorf("Status entry = %#v, want Desired and Applied both 0: the defaults are in force, no row is", status[0])
 	}
 }
 
