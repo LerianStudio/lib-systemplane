@@ -1912,7 +1912,12 @@ func TestMongoReopenWatch_FirstFailureWarnsThenGoesQuiet(t *testing.T) {
 func offlineCollection(t *testing.T, database string) *mongo.Collection {
 	t.Helper()
 
-	cl, err := mongo.Connect(options.Client().ApplyURI("mongodb://127.0.0.1:1/"))
+	// A short server-selection timeout so a command that does reach for the
+	// server — the hello of collIdentityOf, a Watch, a poll Find — fails in
+	// milliseconds instead of waiting out the driver's 30s default.
+	cl, err := mongo.Connect(options.Client().
+		ApplyURI("mongodb://127.0.0.1:1/").
+		SetServerSelectionTimeout(10 * time.Millisecond))
 	if err != nil {
 		t.Fatalf("mongo.Connect: %v", err)
 	}
@@ -1979,4 +1984,197 @@ func TestEnsureSchema_NamedTenantKeepsMemo(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("bootstrap ran %d times, want 1 (the memo must still hold)", calls)
 	}
+}
+
+// The WARN that opens a reopen streak must not depend on the BACKOFF counter.
+// attempt is only cleared by a cursor that did some work, so after a single
+// unproductive cycle — the stream opens and dies before delivering one event —
+// every later loss enters reopenWatch with attempt > 0. Gating the loud line on
+// attempt == 0 then silenced the cause for the life of the feed, while the
+// engine kept serving the scope it last reconciled as if it were fresh. The log
+// streak is one entry into reopenWatch, whatever the backoff counter carries.
+func TestMongoReopenWatch_WarnsAfterAnUnproductiveCycle(t *testing.T) {
+	conn := &stubConnector{resolve: func(int) (*mongo.Database, error) {
+		return nil, errors.New("tenant manager is down")
+	}}
+
+	logger := &captureLogger{}
+
+	s := newSubscribeStore()
+	s.cfg.MultiTenantEnabled = true
+	s.cfg.Connector = conn
+	s.cfg.Logger = logger
+
+	defer func() { _ = s.Close() }()
+
+	f := newFeed(store.Scope{Tenant: "t1"}, nil)
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		// A backoff sequence that a useful cursor never reset.
+		attempt := 1
+
+		_, _ = s.reopenWatch(f, &attempt)
+	}()
+
+	entry := logger.waitFor(t, log.LevelWarn, "tenant re-resolve before reopen failed")
+
+	logger.waitFor(t, log.LevelDebug, "tenant re-resolve before reopen failed")
+
+	close(f.stop)
+	<-done
+
+	if got := entry.field(t, obsconstants.AttrKeyTenantID); got != "t1" {
+		t.Errorf("first failure logged tenant %v, want t1", got)
+	}
+
+	if cause, ok := entry.field(t, "error").(error); !ok || cause == nil {
+		t.Fatalf("first failure logged error field %v, want the cause", entry.field(t, "error"))
+	}
+}
+
+// One streak, two causes, two warnings. A streak that opens on a tenant that
+// will not resolve and then turns into a stream that will not open is reporting
+// a DIFFERENT failure, and an operator who only ever sees the first one reads
+// the outage as a tenant-manager problem long after it became a MongoDB one.
+// Each distinct cause gets exactly one loud line per streak; repeats go quiet.
+func TestMongoReopenWatch_EachCauseWarnsOnceInAStreak(t *testing.T) {
+	tenantDB := offlineCollection(t, "tenantdb").Database()
+
+	// Call 1 refuses, so the streak opens on the re-resolve cause. Every later
+	// call hands back a database whose server never answers, so the reopen
+	// itself becomes the cause.
+	conn := &stubConnector{resolve: func(call int) (*mongo.Database, error) {
+		if call == 1 {
+			return nil, errors.New("tenant manager is down")
+		}
+
+		return tenantDB, nil
+	}}
+
+	logger := &captureLogger{}
+
+	s := newSubscribeStore()
+	s.cfg.MultiTenantEnabled = true
+	s.cfg.Connector = conn
+	s.cfg.Logger = logger
+
+	defer func() { _ = s.Close() }()
+
+	f := newFeed(store.Scope{Tenant: "t1"}, nil)
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		attempt := 0
+
+		_, _ = s.reopenWatch(f, &attempt)
+	}()
+
+	logger.waitFor(t, log.LevelWarn, "tenant re-resolve before reopen failed")
+
+	// A cause nobody has announced yet in this streak is still loud, even
+	// though the streak is several attempts old by now.
+	entry := logger.waitFor(t, log.LevelWarn, "change stream reopen failed")
+
+	// The same cause a second time is not.
+	logger.waitFor(t, log.LevelDebug, "change stream reopen failed")
+
+	close(f.stop)
+	<-done
+
+	if got := entry.field(t, obsconstants.AttrKeyTenantID); got != "t1" {
+		t.Errorf("reopen failure logged tenant %v, want t1", got)
+	}
+
+	if cause, ok := entry.field(t, "error").(error); !ok || cause == nil {
+		t.Fatalf("reopen failure logged error field %v, want the cause", entry.field(t, "error"))
+	}
+}
+
+// The polling fallback narrates a streak the same way the change stream does:
+// one loud line per cause, then quiet. Without it a standalone MongoDB that
+// stops answering is one WARN followed by silence at a production Info level,
+// with the scope stale behind it.
+func TestMongoPollForever_FirstFailureWarnsThenGoesQuiet(t *testing.T) {
+	t.Run("a round trip that keeps failing", func(t *testing.T) {
+		logger := &captureLogger{}
+
+		s := newSubscribeStore()
+		s.cfg.PollInterval = 5 * time.Millisecond
+		s.cfg.Logger = logger
+
+		// No connector, so the re-resolve after a failed round trip is a no-op
+		// and the round trip is the only cause on the line.
+		f := newFeed(store.Scope{Tenant: "t1"}, offlineCollection(t, "systemplane"))
+
+		done := make(chan struct{})
+
+		go func() {
+			defer close(done)
+
+			s.pollForever(f, newPollState())
+		}()
+
+		entry := logger.waitFor(t, log.LevelWarn, "poll round trip failed")
+
+		logger.waitFor(t, log.LevelDebug, "poll round trip failed")
+
+		close(f.stop)
+		<-done
+
+		if got := entry.field(t, obsconstants.AttrKeyTenantID); got != "t1" {
+			t.Errorf("first failed round trip logged tenant %v, want t1", got)
+		}
+
+		if cause, ok := entry.field(t, "error").(error); !ok || cause == nil {
+			t.Fatalf("first failed round trip logged error field %v, want the cause", entry.field(t, "error"))
+		}
+	})
+
+	t.Run("a tenant that stops resolving between round trips", func(t *testing.T) {
+		conn := &stubConnector{resolve: func(int) (*mongo.Database, error) {
+			return nil, errors.New("tenant manager is down")
+		}}
+
+		logger := &captureLogger{}
+
+		s := newSubscribeStore()
+		s.cfg.MultiTenantEnabled = true
+		s.cfg.PollInterval = 5 * time.Millisecond
+		s.cfg.Connector = conn
+		s.cfg.Logger = logger
+
+		defer func() { _ = s.Close() }()
+
+		f := newFeed(store.Scope{Tenant: "t1"}, offlineCollection(t, "systemplane"))
+
+		done := make(chan struct{})
+
+		go func() {
+			defer close(done)
+
+			s.pollForever(f, newPollState())
+		}()
+
+		entry := logger.waitFor(t, log.LevelWarn, "tenant re-resolve after a failed poll failed")
+
+		logger.waitFor(t, log.LevelDebug, "tenant re-resolve after a failed poll failed")
+
+		close(f.stop)
+		<-done
+
+		if got := entry.field(t, obsconstants.AttrKeyTenantID); got != "t1" {
+			t.Errorf("first failed re-resolve logged tenant %v, want t1", got)
+		}
+
+		if cause, ok := entry.field(t, "error").(error); !ok || cause == nil {
+			t.Fatalf("first failed re-resolve logged error field %v, want the cause", entry.field(t, "error"))
+		}
+	})
 }

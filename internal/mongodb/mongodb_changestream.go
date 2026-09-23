@@ -1116,16 +1116,21 @@ func (s *Store) reopenWatch(f *feed, attempt *int) (*mongo.ChangeStream, error) 
 		log.String(obsconstants.AttrKeyTenantID, f.scope.Tenant),
 	)
 
+	// The LOG streak, one bool per distinct cause, scoped to this entry into
+	// reopenWatch — that is, to one stream loss. Kept apart from attempt, whose
+	// counter only a useful cursor clears: after one unproductive cycle it
+	// never returns to zero, and a loud line gated on it would go silent for
+	// the life of the feed. Per cause, so a streak that opens on a tenant that
+	// will not resolve is still loud when it becomes a stream that will not
+	// open — a different outage, told once.
+	var warnedResolveFailed, warnedReopenFailed bool
+
 	for {
 		select {
 		case <-f.stop:
 			return nil, errFeedStopped
 		default:
 		}
-
-		// Read before the increment: attempt 0 is the opening attempt of this
-		// backoff streak, and its failure is the one that gets to be loud.
-		firstOfStreak := *attempt == 0
 
 		delay := reconnectDelay(*attempt)
 		*attempt++
@@ -1137,7 +1142,7 @@ func (s *Store) reopenWatch(f *feed, attempt *int) (*mongo.ChangeStream, error) 
 		}
 
 		if err := s.refreshFeedColl(context.Background(), f); err != nil {
-			s.logStreakFailure(firstOfStreak, "tenant re-resolve before reopen failed",
+			s.logStreakFailure(&warnedResolveFailed, "tenant re-resolve before reopen failed",
 				log.Err(err),
 				log.String(obsconstants.AttrKeyTenantID, f.scope.Tenant),
 			)
@@ -1147,7 +1152,7 @@ func (s *Store) reopenWatch(f *feed, attempt *int) (*mongo.ChangeStream, error) 
 
 		stream, err := s.openWatch(context.Background(), f)
 		if err != nil {
-			s.logStreakFailure(firstOfStreak, "change stream reopen failed",
+			s.logStreakFailure(&warnedReopenFailed, "change stream reopen failed",
 				log.Err(err),
 				log.String(obsconstants.AttrKeyTenantID, f.scope.Tenant),
 			)
@@ -1430,6 +1435,11 @@ func (s *Store) pollForever(f *feed, st pollState) {
 
 	attempt := 0
 
+	// The LOG streak, one bool per distinct cause, cleared by the round trip
+	// that ends the streak — the same edge that clears attempt, kept as its own
+	// state so the two never have to mean the same thing.
+	var warnedPollFailed, warnedResolveFailed bool
+
 	for {
 		select {
 		case <-f.stop:
@@ -1437,9 +1447,7 @@ func (s *Store) pollForever(f *feed, st pollState) {
 		case <-ticker.C:
 			next, err := s.pollOnce(context.Background(), f, st, s.pollEmitter(f))
 			if err != nil {
-				// attempt is still the pre-increment value pollBackoff will
-				// advance below, so 0 is the opening failure of this streak.
-				s.logStreakFailure(attempt == 0, "poll round trip failed",
+				s.logStreakFailure(&warnedPollFailed, "poll round trip failed",
 					log.Err(err),
 					log.String(obsconstants.AttrKeyTenantID, f.scope.Tenant),
 				)
@@ -1456,7 +1464,7 @@ func (s *Store) pollForever(f *feed, st pollState) {
 				// f.coll, in which case every later round trip fails on the
 				// dead handle forever. Re-resolve before the next tick.
 				if err := s.refreshFeedColl(context.Background(), f); err != nil {
-					s.logWarn(context.Background(), "tenant re-resolve after a failed poll failed",
+					s.logStreakFailure(&warnedResolveFailed, "tenant re-resolve after a failed poll failed",
 						log.Err(err),
 						log.String(obsconstants.AttrKeyTenantID, f.scope.Tenant),
 					)
@@ -1468,6 +1476,7 @@ func (s *Store) pollForever(f *feed, st pollState) {
 			}
 
 			attempt = 0
+			warnedPollFailed, warnedResolveFailed = false, false
 
 			// The recovery announcement for a round trip that read no key
 			// event: pollEmitter never ran, so there was nothing to precede.

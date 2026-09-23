@@ -1745,3 +1745,45 @@ func TestPostgresReconnect_AttemptFailureIsLoggedWithItsCause(t *testing.T) {
 		t.Errorf("failed attempt logged %q; the cause must name the stage so a refused LISTEN reads differently from a refused dial", cause)
 	}
 }
+
+// The WARN that opens a reconnect streak must not depend on the BACKOFF
+// counter. attempt is only cleared by a connection that was useful, so after a
+// single unproductive cycle — dial and LISTEN both succeed, the connection dies
+// before carrying one notification — every later loss enters reconnect with
+// attempt > 0. Gating the loud line on attempt == 0 then silenced the cause for
+// the life of the feed: the operator saw "LISTEN connection lost" and never
+// learned that every attempt since was refused, while the cache kept serving
+// stale configuration. The log streak is one entry into reconnect, whatever the
+// backoff counter happens to be carrying.
+func TestPostgresReconnect_WarnsAfterAnUnproductiveCycle(t *testing.T) {
+	shrinkTimeouts(t, 250*time.Millisecond)
+
+	s, logger := loggingStore()
+	f := newFeed(store.Scope{Tenant: "t1"}, unreachableDSN)
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		// A backoff sequence that a useful connection never reset.
+		retry := reconnectBackoff{attempt: 1}
+
+		_, _ = s.reconnect(f, &retry)
+	}()
+
+	entry := logger.waitFor(t, log.LevelWarn, "reconnect attempt failed")
+
+	logger.waitFor(t, log.LevelDebug, "reconnect attempt failed")
+
+	close(f.stop)
+	<-done
+
+	if entry.field(t, obsconstants.AttrKeyTenantID) != "t1" {
+		t.Errorf("failed attempt logged tenant %v, want t1", entry.field(t, obsconstants.AttrKeyTenantID))
+	}
+
+	if cause, ok := entry.field(t, "error").(error); !ok || cause == nil {
+		t.Fatalf("failed attempt logged error field %v, want the cause", entry.field(t, "error"))
+	}
+}

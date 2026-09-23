@@ -1128,16 +1128,19 @@ func (s *Store) reconnect(f *feed, retry *reconnectBackoff) (*pgx.Conn, error) {
 		log.String(obsconstants.AttrKeyTenantID, f.scope.Tenant),
 	)
 
+	// The LOG streak, one bool per distinct cause, scoped to this entry into
+	// reconnect — that is, to one connection loss. Kept apart from retry, whose
+	// counter only a useful connection clears: after one unproductive cycle it
+	// never returns to zero, and a loud line gated on it would go silent for
+	// the life of the feed.
+	var warnedAttemptFailed bool
+
 	for {
 		select {
 		case <-f.stop:
 			return nil, errFeedStopped
 		default:
 		}
-
-		// Read before next() advances it: attempt 0 is the opening attempt of
-		// this backoff streak, and its failure is the one that gets to be loud.
-		firstOfStreak := retry.attempt == 0
 
 		select {
 		case <-f.stop:
@@ -1154,7 +1157,7 @@ func (s *Store) reconnect(f *feed, retry *reconnectBackoff) (*pgx.Conn, error) {
 
 		conn, err := s.dialAndListen(f)
 		if err != nil {
-			s.logStreakFailure(firstOfStreak, "reconnect attempt failed",
+			s.logStreakFailure(&warnedAttemptFailed, "reconnect attempt failed",
 				log.Err(err),
 				log.String(obsconstants.AttrKeyTenantID, f.scope.Tenant),
 			)

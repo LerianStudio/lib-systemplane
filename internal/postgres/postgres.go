@@ -591,16 +591,27 @@ func (s *Store) logDebug(ctx context.Context, msg string, fields ...log.Field) {
 	}
 }
 
-// logStreakFailure narrates a retry loop: the FIRST failure of a backoff
-// streak at WARN, every later one at DEBUG. A failure class that never
-// resolves on its own — a feed that dials fine but can never re-install LISTEN
-// (pgbouncer in transaction pooling, a revoked grant) — is otherwise invisible
-// at a production Info level, because the one WARN emitted when the connection
-// was lost says nothing about why every attempt since has failed, and the
-// cache keeps serving stale configuration in the silence. Dropping the rest of
-// the streak to DEBUG keeps that signal at one line per outage.
-func (s *Store) logStreakFailure(first bool, msg string, fields ...log.Field) {
-	if first {
+// logStreakFailure narrates a retry loop: the first failure of each DISTINCT
+// cause at WARN, every later one of that same cause at DEBUG. A failure class
+// that never resolves on its own — a feed that dials fine but can never
+// re-install LISTEN (pgbouncer in transaction pooling, a revoked grant) — is
+// otherwise invisible at a production Info level, because the one WARN emitted
+// when the connection was lost says nothing about why every attempt since has
+// failed, and the cache keeps serving stale configuration in the silence.
+// Dropping the repeats to DEBUG keeps that signal at one line per cause per
+// outage.
+//
+// warned is the caller's per-cause flag, and this is the only writer of it:
+// the caller declares one bool per message inside the loop it narrates, so the
+// LOG streak is one entry into that loop and nothing else. It deliberately does
+// NOT read the backoff counter. That counter is only cleared by a connection
+// that was useful, so one unproductive cycle — dial and LISTEN both succeed,
+// the connection dies before carrying a notification — leaves it non-zero for
+// the life of the feed, and a loud line gated on it would never fire again.
+func (s *Store) logStreakFailure(warned *bool, msg string, fields ...log.Field) {
+	if !*warned {
+		*warned = true
+
 		s.logWarn(context.Background(), msg, fields...)
 
 		return

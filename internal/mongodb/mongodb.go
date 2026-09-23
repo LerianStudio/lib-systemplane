@@ -717,16 +717,27 @@ func (s *Store) logDebug(ctx context.Context, msg string, fields ...log.Field) {
 	s.cfg.Logger.Log(ctx, log.LevelDebug, msg, fields)
 }
 
-// logStreakFailure narrates a retry loop: the FIRST failure of a backoff
-// streak at WARN, every later one at DEBUG. A failure class that never
-// resolves on its own — a change stream that can never reopen, a tenant that
-// no longer resolves — is otherwise invisible at a production Info level,
-// because the one WARN emitted when the stream was lost says nothing about why
-// every attempt since has failed, and the engine keeps serving the scope it
-// last reconciled in the silence. Dropping the rest of the streak to DEBUG
-// keeps that signal at one line per outage.
-func (s *Store) logStreakFailure(first bool, msg string, fields ...log.Field) {
-	if first {
+// logStreakFailure narrates a retry loop: the first failure of each DISTINCT
+// cause at WARN, every later one of that same cause at DEBUG. A failure class
+// that never resolves on its own — a change stream that can never reopen, a
+// tenant that no longer resolves — is otherwise invisible at a production Info
+// level, because the one WARN emitted when the stream was lost says nothing
+// about why every attempt since has failed, and the engine keeps serving the
+// scope it last reconciled in the silence. Dropping the repeats to DEBUG keeps
+// that signal at one line per cause per outage.
+//
+// warned is the caller's per-cause flag, and this is the only writer of it:
+// the caller declares one bool per message inside the loop it narrates, so a
+// streak that opens on a tenant that will not resolve is still loud when it
+// turns into a stream that will not open. It deliberately does NOT read the
+// backoff counter. That counter is only cleared by a cursor that did some work,
+// so one unproductive cycle — the stream opens and dies before delivering an
+// event — leaves it non-zero for the life of the feed, and a loud line gated on
+// it would never fire again.
+func (s *Store) logStreakFailure(warned *bool, msg string, fields ...log.Field) {
+	if !*warned {
+		*warned = true
+
 		s.logWarn(context.Background(), msg, fields...)
 
 		return
