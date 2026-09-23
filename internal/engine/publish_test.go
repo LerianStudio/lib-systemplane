@@ -4,6 +4,7 @@ package engine
 
 import (
 	"fmt"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -56,156 +57,149 @@ func (e *Engine) publishInto(pub publication) (notify bool) {
 	return e.publish(sc, pub)
 }
 
-func TestPublishAcceptsHigherRevision(t *testing.T) {
-	nk := NSKey{Namespace: "billing", Key: "limits"}
-	e := emptyEngine()
-
-	if notify := e.publishInto(publication{NSKey: nk, Revision: 1, Value: "a", UpdatedBy: "ops"}); !notify {
-		t.Error("first publication of a key: notify is false, want true")
-	}
-
-	at := time.Date(2026, time.September, 17, 12, 0, 0, 0, time.UTC)
-	if notify := e.publishInto(publication{NSKey: nk, Revision: 2, Value: "b", UpdatedAt: at, UpdatedBy: "console"}); !notify {
-		t.Error("higher revision: notify is false, want true")
-	}
-
-	got := cachedEntry(t, e, store.Scope{}, nk)
-	if got.Value != "b" || got.Revision != 2 {
-		t.Errorf("cached: got (%v, rev %d), want (\"b\", rev 2)", got.Value, got.Revision)
-	}
-
-	if !got.UpdatedAt.Equal(at) || got.UpdatedBy != "console" {
-		t.Errorf("provenance: got (%s, %q), want (%s, %q)", got.UpdatedAt, got.UpdatedBy, at, "console")
-	}
-}
-
-func TestPublishRejectsLowerRevision(t *testing.T) {
-	nk := NSKey{Namespace: "billing", Key: "limits"}
-	at := time.Date(2026, time.September, 17, 12, 0, 0, 0, time.UTC)
-
-	e := emptyEngine()
-	e.publishInto(publication{NSKey: nk, Revision: 5, Value: "current", UpdatedAt: at, UpdatedBy: "ops"})
-
-	stale := time.Date(2026, time.September, 17, 11, 0, 0, 0, time.UTC)
-	if notify := e.publishInto(publication{NSKey: nk, Revision: 4, Value: "old", UpdatedAt: stale, UpdatedBy: "snapshot"}); notify {
-		t.Error("lower revision: notify is true, want false")
-	}
-
-	got := cachedEntry(t, e, store.Scope{}, nk)
-	if got.Value != "current" || got.Revision != 5 {
-		t.Errorf("cached: got (%v, rev %d), want (\"current\", rev 5)", got.Value, got.Revision)
-	}
-
-	if !got.UpdatedAt.Equal(at) || got.UpdatedBy != "ops" {
-		t.Errorf("a rejected publication overwrote provenance: got (%s, %q), want (%s, %q)", got.UpdatedAt, got.UpdatedBy, at, "ops")
-	}
-}
-
-func TestPublishRefreshesProvenanceWithoutNotify(t *testing.T) {
+// TestPublishFence walks the four fence outcomes of publish, one subtest per
+// case: accepted (a first publication, a higher revision, an equal revision
+// with a changed value, any revision 0), refreshed without a notification (an
+// equal revision with an equal value) and rejected (a lower revision).
+func TestPublishFence(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 	first := time.Date(2026, time.September, 17, 12, 0, 0, 0, time.UTC)
-
-	e := emptyEngine()
-	e.publishInto(publication{
-		NSKey:     nk,
-		Revision:  3,
-		Value:     map[string]any{"limit": float64(10)},
-		UpdatedAt: first,
-		UpdatedBy: "ops",
-	})
-
-	// The same row read again: equal revision, and a value that is a distinct
-	// object but deeply equal, which is exactly what a re-read of unchanged
-	// JSON produces.
 	second := time.Date(2026, time.September, 17, 13, 0, 0, 0, time.UTC)
-	if notify := e.publishInto(publication{
-		NSKey:     nk,
-		Revision:  3,
-		Value:     map[string]any{"limit": float64(10)},
-		UpdatedAt: second,
-		UpdatedBy: "console",
-	}); notify {
-		t.Error("equal revision with an equal value: notify is true, want false")
+	older := time.Date(2026, time.September, 17, 11, 0, 0, 0, time.UTC)
+
+	type provenance struct {
+		UpdatedAt time.Time
+		UpdatedBy string
 	}
 
-	got := cachedEntry(t, e, store.Scope{}, nk)
-	if !got.UpdatedAt.Equal(second) || got.UpdatedBy != "console" {
-		t.Errorf("provenance was not refreshed: got (%s, %q), want (%s, %q)", got.UpdatedAt, got.UpdatedBy, second, "console")
+	tests := []struct {
+		name string
+		// seed is published before the candidate and builds the cached state
+		// the fence decides against.
+		seed           []publication
+		candidate      publication
+		wantNotify     bool
+		wantValue      any
+		wantRevision   int64
+		wantProvenance provenance
+	}{
+		{
+			name:           "a key that is not cached yet is accepted",
+			candidate:      publication{NSKey: nk, Revision: 1, Value: "a", UpdatedBy: "ops"},
+			wantNotify:     true,
+			wantValue:      "a",
+			wantRevision:   1,
+			wantProvenance: provenance{UpdatedBy: "ops"},
+		},
+		{
+			name:           "a higher revision is accepted and carries its provenance",
+			seed:           []publication{{NSKey: nk, Revision: 1, Value: "a", UpdatedBy: "ops"}},
+			candidate:      publication{NSKey: nk, Revision: 2, Value: "b", UpdatedAt: first, UpdatedBy: "console"},
+			wantNotify:     true,
+			wantValue:      "b",
+			wantRevision:   2,
+			wantProvenance: provenance{UpdatedAt: first, UpdatedBy: "console"},
+		},
+		{
+			name:           "a lower revision is rejected and overwrites nothing",
+			seed:           []publication{{NSKey: nk, Revision: 5, Value: "current", UpdatedAt: first, UpdatedBy: "ops"}},
+			candidate:      publication{NSKey: nk, Revision: 4, Value: "old", UpdatedAt: older, UpdatedBy: "snapshot"},
+			wantValue:      "current",
+			wantRevision:   5,
+			wantProvenance: provenance{UpdatedAt: first, UpdatedBy: "ops"},
+		},
+		{
+			// The same row read again: equal revision, and a value that is a
+			// distinct object but deeply equal, which is exactly what a re-read
+			// of unchanged JSON produces.
+			name: "an equal revision with an equal value refreshes provenance only",
+			seed: []publication{{
+				NSKey: nk, Revision: 3, Value: map[string]any{"limit": float64(10)},
+				UpdatedAt: first, UpdatedBy: "ops",
+			}},
+			candidate: publication{
+				NSKey: nk, Revision: 3, Value: map[string]any{"limit": float64(10)},
+				UpdatedAt: second, UpdatedBy: "console",
+			},
+			wantValue:      map[string]any{"limit": float64(10)},
+			wantRevision:   3,
+			wantProvenance: provenance{UpdatedAt: second, UpdatedBy: "console"},
+		},
+		{
+			// D3's foreign-writer rule: MongoDB has no triggers, so a Console
+			// process writing the collection directly can change value and
+			// leave revision alone. Deduplicating on revision alone would make
+			// that write invisible forever.
+			name:           "an equal revision with a changed value is accepted",
+			seed:           []publication{{NSKey: nk, Revision: 3, Value: "a", UpdatedAt: first, UpdatedBy: "ops"}},
+			candidate:      publication{NSKey: nk, Revision: 3, Value: "b", UpdatedAt: second, UpdatedBy: "console"},
+			wantNotify:     true,
+			wantValue:      "b",
+			wantRevision:   3,
+			wantProvenance: provenance{UpdatedAt: second, UpdatedBy: "console"},
+		},
+		{
+			name:         "revision 0 wins over a cached revision and resets the counter",
+			seed:         []publication{{NSKey: nk, Revision: 9, Value: "persisted", UpdatedAt: first, UpdatedBy: "ops"}},
+			candidate:    publication{NSKey: nk, Revision: 0, Value: "default"},
+			wantNotify:   true,
+			wantValue:    "default",
+			wantRevision: 0,
+		},
+		{
+			name: "a repeated revision 0 is never deduplicated",
+			seed: []publication{
+				{NSKey: nk, Revision: 9, Value: "persisted", UpdatedAt: first, UpdatedBy: "ops"},
+				{NSKey: nk, Revision: 0, Value: "default"},
+			},
+			candidate:    publication{NSKey: nk, Revision: 0, Value: "default"},
+			wantNotify:   true,
+			wantValue:    "default",
+			wantRevision: 0,
+		},
+		{
+			// A recreate always arrives with a fresh non-zero revision, which
+			// is why resetting the cached counter on a delete cannot swallow
+			// one.
+			name: "a recreate after a delete is accepted over the reset counter",
+			seed: []publication{
+				{NSKey: nk, Revision: 9, Value: "persisted", UpdatedAt: first, UpdatedBy: "ops"},
+				{NSKey: nk, Revision: 0, Value: "default"},
+			},
+			candidate:    publication{NSKey: nk, Revision: 1, Value: "recreated"},
+			wantNotify:   true,
+			wantValue:    "recreated",
+			wantRevision: 1,
+		},
 	}
 
-	if got.Revision != 3 {
-		t.Errorf("revision: got %d, want 3", got.Revision)
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := emptyEngine()
 
-	if limit := got.Value.(map[string]any)["limit"]; limit != float64(10) {
-		t.Errorf("value: got %v, want 10", limit)
-	}
-}
+			for _, seed := range tt.seed {
+				e.publishInto(seed)
+			}
 
-// TestPublishAcceptsSameRevisionWithChangedValue is D3's foreign-writer rule:
-// MongoDB has no triggers, so a Console process writing the collection
-// directly can change value and leave revision alone. Deduplicating on
-// revision alone would make that write invisible forever.
-func TestPublishAcceptsSameRevisionWithChangedValue(t *testing.T) {
-	nk := NSKey{Namespace: "billing", Key: "limits"}
-	first := time.Date(2026, time.September, 17, 12, 0, 0, 0, time.UTC)
+			if notify := e.publishInto(tt.candidate); notify != tt.wantNotify {
+				t.Errorf("notify: got %t, want %t", notify, tt.wantNotify)
+			}
 
-	e := emptyEngine()
-	e.publishInto(publication{NSKey: nk, Revision: 3, Value: "a", UpdatedAt: first, UpdatedBy: "ops"})
+			got := cachedEntry(t, e, tt.candidate.Scope, nk)
 
-	second := time.Date(2026, time.September, 17, 13, 0, 0, 0, time.UTC)
-	if notify := e.publishInto(publication{NSKey: nk, Revision: 3, Value: "b", UpdatedAt: second, UpdatedBy: "console"}); !notify {
-		t.Error("equal revision with a changed value: notify is false, want true")
-	}
+			if !reflect.DeepEqual(got.Value, tt.wantValue) {
+				t.Errorf("cached value: got %v, want %v", got.Value, tt.wantValue)
+			}
 
-	got := cachedEntry(t, e, store.Scope{}, nk)
-	if got.Value != "b" || got.Revision != 3 {
-		t.Errorf("cached: got (%v, rev %d), want (\"b\", rev 3)", got.Value, got.Revision)
-	}
+			if got.Revision != tt.wantRevision {
+				t.Errorf("cached revision: got %d, want %d", got.Revision, tt.wantRevision)
+			}
 
-	if !got.UpdatedAt.Equal(second) || got.UpdatedBy != "console" {
-		t.Errorf("provenance: got (%s, %q), want (%s, %q)", got.UpdatedAt, got.UpdatedBy, second, "console")
-	}
-}
-
-func TestPublishRevisionZeroAlwaysWinsAndResetsRevision(t *testing.T) {
-	nk := NSKey{Namespace: "billing", Key: "limits"}
-
-	e := emptyEngine()
-	e.publishInto(publication{
-		NSKey:     nk,
-		Revision:  9,
-		Value:     "persisted",
-		UpdatedAt: time.Date(2026, time.September, 17, 12, 0, 0, 0, time.UTC),
-		UpdatedBy: "ops",
-	})
-
-	if notify := e.publishInto(publication{NSKey: nk, Revision: 0, Value: "default"}); !notify {
-		t.Error("revision 0 over a cached revision 9: notify is false, want true")
-	}
-
-	got := cachedEntry(t, e, store.Scope{}, nk)
-	if got.Value != "default" || got.Revision != 0 {
-		t.Errorf("cached: got (%v, rev %d), want (\"default\", rev 0)", got.Value, got.Revision)
-	}
-
-	if !got.UpdatedAt.IsZero() || got.UpdatedBy != "" {
-		t.Errorf("a no-row publication kept provenance: got (%s, %q), want (zero, \"\")", got.UpdatedAt, got.UpdatedBy)
-	}
-
-	// Revision 0 is never deduplicated: a second delete still notifies.
-	if notify := e.publishInto(publication{NSKey: nk, Revision: 0, Value: "default"}); !notify {
-		t.Error("a repeated revision 0 with an equal value: notify is false, want true")
-	}
-
-	// A recreate arrives with a fresh non-zero revision and is accepted over
-	// the reset counter, which is why resetting it cannot swallow one.
-	if notify := e.publishInto(publication{NSKey: nk, Revision: 1, Value: "recreated"}); !notify {
-		t.Error("recreate at revision 1 after a delete: notify is false, want true")
-	}
-
-	if got := cachedEntry(t, e, store.Scope{}, nk); got.Value != "recreated" || got.Revision != 1 {
-		t.Errorf("cached after recreate: got (%v, rev %d), want (\"recreated\", rev 1)", got.Value, got.Revision)
+			if !got.UpdatedAt.Equal(tt.wantProvenance.UpdatedAt) || got.UpdatedBy != tt.wantProvenance.UpdatedBy {
+				t.Errorf("provenance: got (%s, %q), want (%s, %q)",
+					got.UpdatedAt, got.UpdatedBy, tt.wantProvenance.UpdatedAt, tt.wantProvenance.UpdatedBy)
+			}
+		})
 	}
 }
 

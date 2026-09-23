@@ -18,16 +18,21 @@ import (
 // closeEngine returns an Engine ready to be closed by the test itself: no
 // t.Cleanup cancels the lifecycle context here, because Close is the thing
 // under test and a cleanup that canceled it would hide a Close that did not.
+//
+// It is built through New, exactly as storeEngine below and as the Client
+// will, so timeout arrives the way a consumer's WithCloseTimeout does — as a
+// Config field New has to honour. Hand-building an Engine with closeTimeout
+// already set would test the field rather than the option, and an engine that
+// ignored the configured value and waited the 30s default would still return
+// ErrCloseTimeout eventually, leaving every assertion here green.
 func closeEngine(t *testing.T, timeout time.Duration) *Engine {
 	t.Helper()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	e := &Engine{
-		scopes:          map[store.Scope]*scopeState{},
-		lifecycleCtx:    ctx,
-		lifecycleCancel: cancel,
-		closeTimeout:    timeout,
-	}
+	e := New(Config{
+		Store:        newFakeStore(),
+		Registry:     fakeRegistry{},
+		CloseTimeout: timeout,
+	})
 
 	track(t, e, store.Scope{})
 
@@ -103,9 +108,20 @@ func TestCloseReportsTimeoutNamingStuckKey(t *testing.T) {
 	e.publishInto(pub(nk, 1, "v1"))
 	mustReceive(t, entered, "the subscriber to start running")
 
+	start := time.Now()
+
 	err := e.Close()
 	if !errors.Is(err, ErrCloseTimeout) {
 		t.Fatalf("Close() = %v, want an error wrapping ErrCloseTimeout", err)
+	}
+
+	// The bound itself, not just the error. An engine that dropped the
+	// configured 100ms and waited the 30s default still returns ErrCloseTimeout
+	// naming the same key, so only the clock can tell that WithCloseTimeout was
+	// honoured — and a consumer that sets 1s and silently waits 30s is long
+	// past a Kubernetes termination grace period by the time it gives up.
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("Close() took %s for a 100ms close timeout, want it far below 5s", elapsed)
 	}
 
 	for _, want := range []string{"single-tenant", nk.Namespace, nk.Key} {

@@ -9,70 +9,6 @@ import (
 	"time"
 )
 
-func TestCloneMapIsIndependentOfTheOriginal(t *testing.T) {
-	original := map[string]any{
-		"flag":   true,
-		"nested": map[string]any{"limit": 10},
-		"list":   []any{1, 2},
-	}
-
-	cloned, ok := Clone(original).(map[string]any)
-	if !ok {
-		t.Fatalf("clone: got %T, want map[string]any", Clone(original))
-	}
-
-	cloned["flag"] = false
-	cloned["nested"].(map[string]any)["limit"] = 99
-	cloned["list"].([]any)[0] = 42
-
-	if original["flag"] != true {
-		t.Errorf("top-level mutation leaked: got %v, want true", original["flag"])
-	}
-
-	if got := original["nested"].(map[string]any)["limit"]; got != 10 {
-		t.Errorf("nested map mutation leaked: got %v, want 10", got)
-	}
-
-	if got := original["list"].([]any)[0]; got != 1 {
-		t.Errorf("nested slice mutation leaked: got %v, want 1", got)
-	}
-}
-
-func TestCloneSliceIsIndependentOfTheOriginal(t *testing.T) {
-	original := []any{map[string]any{"a": 1}, "two"}
-
-	cloned, ok := Clone(original).([]any)
-	if !ok {
-		t.Fatalf("clone: got %T, want []any", Clone(original))
-	}
-
-	cloned[0].(map[string]any)["a"] = 2
-	cloned[1] = "changed"
-
-	if got := original[0].(map[string]any)["a"]; got != 1 {
-		t.Errorf("element mutation leaked: got %v, want 1", got)
-	}
-
-	if original[1] != "two" {
-		t.Errorf("slot mutation leaked: got %v, want two", original[1])
-	}
-}
-
-func TestCloneArrayIsIndependentOfTheOriginal(t *testing.T) {
-	original := [2]map[string]any{{"a": 1}, {"b": 2}}
-
-	cloned, ok := Clone(original).([2]map[string]any)
-	if !ok {
-		t.Fatalf("clone: got %T, want [2]map[string]any", Clone(original))
-	}
-
-	cloned[0]["a"] = 99
-
-	if original[0]["a"] != 1 {
-		t.Errorf("array element mutation leaked: got %v, want 1", original[0]["a"])
-	}
-}
-
 type cloneSettings struct {
 	Name    string
 	Limits  map[string]int
@@ -80,142 +16,299 @@ type cloneSettings struct {
 	Updated time.Time
 }
 
-func TestCloneStructCopiesExportedReferenceFields(t *testing.T) {
-	updated := time.Date(2026, time.September, 17, 12, 0, 0, 0, time.UTC)
-	original := cloneSettings{
-		Name:    "primary",
-		Limits:  map[string]int{"rps": 100},
-		Tags:    []string{"a"},
-		Updated: updated,
-	}
-
-	cloned, ok := Clone(original).(cloneSettings)
-	if !ok {
-		t.Fatalf("clone: got %T, want cloneSettings", Clone(original))
-	}
-
-	cloned.Limits["rps"] = 1
-	cloned.Tags[0] = "b"
-
-	if original.Limits["rps"] != 100 {
-		t.Errorf("map field mutation leaked: got %v, want 100", original.Limits["rps"])
-	}
-
-	if original.Tags[0] != "a" {
-		t.Errorf("slice field mutation leaked: got %v, want a", original.Tags[0])
-	}
-
-	if !cloned.Updated.Equal(updated) {
-		t.Errorf("time field: got %v, want %v", cloned.Updated, updated)
-	}
-}
-
-func TestClonePointerCopiesPointee(t *testing.T) {
-	original := &cloneSettings{Name: "primary", Limits: map[string]int{"rps": 100}}
-
-	cloned, ok := Clone(original).(*cloneSettings)
-	if !ok {
-		t.Fatalf("clone: got %T, want *cloneSettings", Clone(original))
-	}
-
-	if cloned == original {
-		t.Fatal("clone returned the same pointer")
-	}
-
-	cloned.Name = "secondary"
-	cloned.Limits["rps"] = 1
-
-	if original.Name != "primary" {
-		t.Errorf("pointee field mutation leaked: got %v, want primary", original.Name)
-	}
-
-	if original.Limits["rps"] != 100 {
-		t.Errorf("pointee map mutation leaked: got %v, want 100", original.Limits["rps"])
-	}
-}
-
-func TestCloneTimeReturnsAnEqualInstant(t *testing.T) {
-	now := time.Date(2026, time.September, 17, 8, 30, 0, 0, time.UTC)
-
-	cloned, ok := Clone(now).(time.Time)
-	if !ok {
-		t.Fatalf("clone: got %T, want time.Time", Clone(now))
-	}
-
-	if !cloned.Equal(now) {
-		t.Errorf("clone: got %v, want %v", cloned, now)
-	}
-}
-
-func TestCloneReturnsUncloneableValuesUnchanged(t *testing.T) {
-	ch := make(chan int)
-	if got := Clone(ch); got != any(ch) {
-		t.Errorf("channel: got %v, want the same channel", got)
-	}
-
-	fn := func() {}
-	gotFn, ok := Clone(fn).(func())
-	if !ok {
-		t.Fatalf("func: got %T, want func()", Clone(fn))
-	}
-
-	if reflect.ValueOf(gotFn).Pointer() != reflect.ValueOf(fn).Pointer() {
-		t.Error("func: got a different func, want the same one")
-	}
-
-	if got := Clone(nil); got != nil {
-		t.Errorf("nil: got %v, want nil", got)
-	}
-}
-
 type hiddenMutable struct {
 	Name   string
 	hidden map[string]int
-}
-
-func TestValidateCloneSafeRejectsUnexportedMutableField(t *testing.T) {
-	err := ValidateCloneSafe(hiddenMutable{Name: "x", hidden: map[string]int{"a": 1}})
-	if err == nil {
-		t.Fatal("got nil, want an unexported mutable field error")
-	}
-
-	if want := "value.hidden has unexported mutable field"; err.Error() != want {
-		t.Errorf("got %q, want %q", err.Error(), want)
-	}
 }
 
 type cloneNode struct {
 	Next *cloneNode
 }
 
-func TestValidateCloneSafeRejectsCyclicReference(t *testing.T) {
-	node := &cloneNode{}
-	node.Next = node
+// TestClone walks every shape Clone has to handle, one subtest per shape. Each
+// case clones its original, writes through the clone, and then asserts nothing
+// that write did reached the original — which is the whole promise Clone makes
+// to a subscriber holding a delivered value. The shapes reflection cannot copy
+// (a channel, a func, nil) assert the opposite: the clone IS the original, a
+// behavior this package preserves rather than fixes.
+func TestClone(t *testing.T) {
+	updated := time.Date(2026, time.September, 17, 12, 0, 0, 0, time.UTC)
+	instant := time.Date(2026, time.September, 17, 8, 30, 0, 0, time.UTC)
+	pointer := &cloneSettings{Name: "primary", Limits: map[string]int{"rps": 100}}
+	channel := make(chan int)
+	function := func() {}
 
-	err := ValidateCloneSafe(node)
-	if err == nil {
-		t.Fatal("got nil, want a cyclic reference error")
+	tests := []struct {
+		name     string
+		original any
+		// mutate writes through the clone, and for an uncloneable value
+		// asserts the clone is the original instead.
+		mutate func(t *testing.T, clone any)
+		// wantUnchanged asserts the original survived that write intact.
+		wantUnchanged func(t *testing.T, original any)
+	}{
+		{
+			name: "map",
+			original: map[string]any{
+				"flag":   true,
+				"nested": map[string]any{"limit": 10},
+				"list":   []any{1, 2},
+			},
+			mutate: func(t *testing.T, clone any) {
+				cloned, ok := clone.(map[string]any)
+				if !ok {
+					t.Fatalf("clone: got %T, want map[string]any", clone)
+				}
+
+				cloned["flag"] = false
+				cloned["nested"].(map[string]any)["limit"] = 99
+				cloned["list"].([]any)[0] = 42
+			},
+			wantUnchanged: func(t *testing.T, original any) {
+				got := original.(map[string]any)
+
+				if got["flag"] != true {
+					t.Errorf("top-level mutation leaked: got %v, want true", got["flag"])
+				}
+
+				if limit := got["nested"].(map[string]any)["limit"]; limit != 10 {
+					t.Errorf("nested map mutation leaked: got %v, want 10", limit)
+				}
+
+				if head := got["list"].([]any)[0]; head != 1 {
+					t.Errorf("nested slice mutation leaked: got %v, want 1", head)
+				}
+			},
+		},
+		{
+			name:     "slice",
+			original: []any{map[string]any{"a": 1}, "two"},
+			mutate: func(t *testing.T, clone any) {
+				cloned, ok := clone.([]any)
+				if !ok {
+					t.Fatalf("clone: got %T, want []any", clone)
+				}
+
+				cloned[0].(map[string]any)["a"] = 2
+				cloned[1] = "changed"
+			},
+			wantUnchanged: func(t *testing.T, original any) {
+				got := original.([]any)
+
+				if a := got[0].(map[string]any)["a"]; a != 1 {
+					t.Errorf("element mutation leaked: got %v, want 1", a)
+				}
+
+				if got[1] != "two" {
+					t.Errorf("slot mutation leaked: got %v, want two", got[1])
+				}
+			},
+		},
+		{
+			name:     "array",
+			original: [2]map[string]any{{"a": 1}, {"b": 2}},
+			mutate: func(t *testing.T, clone any) {
+				cloned, ok := clone.([2]map[string]any)
+				if !ok {
+					t.Fatalf("clone: got %T, want [2]map[string]any", clone)
+				}
+
+				cloned[0]["a"] = 99
+			},
+			wantUnchanged: func(t *testing.T, original any) {
+				if got := original.([2]map[string]any)[0]["a"]; got != 1 {
+					t.Errorf("array element mutation leaked: got %v, want 1", got)
+				}
+			},
+		},
+		{
+			name: "struct with exported reference fields",
+			original: cloneSettings{
+				Name:    "primary",
+				Limits:  map[string]int{"rps": 100},
+				Tags:    []string{"a"},
+				Updated: updated,
+			},
+			mutate: func(t *testing.T, clone any) {
+				cloned, ok := clone.(cloneSettings)
+				if !ok {
+					t.Fatalf("clone: got %T, want cloneSettings", clone)
+				}
+
+				cloned.Limits["rps"] = 1
+				cloned.Tags[0] = "b"
+
+				if !cloned.Updated.Equal(updated) {
+					t.Errorf("time field: got %v, want %v", cloned.Updated, updated)
+				}
+			},
+			wantUnchanged: func(t *testing.T, original any) {
+				got := original.(cloneSettings)
+
+				if got.Limits["rps"] != 100 {
+					t.Errorf("map field mutation leaked: got %v, want 100", got.Limits["rps"])
+				}
+
+				if got.Tags[0] != "a" {
+					t.Errorf("slice field mutation leaked: got %v, want a", got.Tags[0])
+				}
+			},
+		},
+		{
+			name:     "pointer",
+			original: pointer,
+			mutate: func(t *testing.T, clone any) {
+				cloned, ok := clone.(*cloneSettings)
+				if !ok {
+					t.Fatalf("clone: got %T, want *cloneSettings", clone)
+				}
+
+				if cloned == pointer {
+					t.Fatal("clone returned the same pointer")
+				}
+
+				cloned.Name = "secondary"
+				cloned.Limits["rps"] = 1
+			},
+			wantUnchanged: func(t *testing.T, original any) {
+				got := original.(*cloneSettings)
+
+				if got.Name != "primary" {
+					t.Errorf("pointee field mutation leaked: got %v, want primary", got.Name)
+				}
+
+				if got.Limits["rps"] != 100 {
+					t.Errorf("pointee map mutation leaked: got %v, want 100", got.Limits["rps"])
+				}
+			},
+		},
+		{
+			name:     "time",
+			original: instant,
+			mutate: func(t *testing.T, clone any) {
+				cloned, ok := clone.(time.Time)
+				if !ok {
+					t.Fatalf("clone: got %T, want time.Time", clone)
+				}
+
+				if !cloned.Equal(instant) {
+					t.Errorf("clone: got %v, want %v", cloned, instant)
+				}
+			},
+		},
+		{
+			name:     "channel is returned unchanged",
+			original: channel,
+			mutate: func(t *testing.T, clone any) {
+				if clone != any(channel) {
+					t.Errorf("channel: got %v, want the same channel", clone)
+				}
+			},
+		},
+		{
+			name:     "func is returned unchanged",
+			original: function,
+			mutate: func(t *testing.T, clone any) {
+				cloned, ok := clone.(func())
+				if !ok {
+					t.Fatalf("func: got %T, want func()", clone)
+				}
+
+				if reflect.ValueOf(cloned).Pointer() != reflect.ValueOf(function).Pointer() {
+					t.Error("func: got a different func, want the same one")
+				}
+			},
+		},
+		{
+			name:     "nil is returned unchanged",
+			original: nil,
+			mutate: func(t *testing.T, clone any) {
+				if clone != nil {
+					t.Errorf("nil: got %v, want nil", clone)
+				}
+			},
+		},
 	}
 
-	if !strings.Contains(err.Error(), "contains cyclic reference") {
-		t.Errorf("got %q, want it to report a cyclic reference", err.Error())
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clone := Clone(tt.original)
+
+			tt.mutate(t, clone)
+
+			if tt.wantUnchanged != nil {
+				tt.wantUnchanged(t, tt.original)
+			}
+		})
 	}
 }
 
-func TestValidateCloneSafeAcceptsPlainValues(t *testing.T) {
-	values := []any{
-		nil,
-		42,
-		"text",
-		time.Now(),
-		map[string]any{"list": []any{1, "two", map[string]any{"deep": true}}},
-		&cloneSettings{Limits: map[string]int{"rps": 1}},
+// TestValidateCloneSafe covers what Register refuses to accept as a default —
+// a value Clone could not copy without sharing state or looping forever — and
+// the plain shapes it must accept.
+func TestValidateCloneSafe(t *testing.T) {
+	cyclic := &cloneNode{}
+	cyclic.Next = cyclic
+
+	tests := []struct {
+		name  string
+		value any
+		// wantErr is the whole error text; wantErrContains a fragment of it.
+		// Both empty means the value must be accepted.
+		wantErr         string
+		wantErrContains string
+	}{
+		{
+			name:    "unexported mutable field is rejected",
+			value:   hiddenMutable{Name: "x", hidden: map[string]int{"a": 1}},
+			wantErr: "value.hidden has unexported mutable field",
+		},
+		{
+			name:            "cyclic reference is rejected",
+			value:           cyclic,
+			wantErrContains: "contains cyclic reference",
+		},
+		{name: "nil is accepted", value: nil},
+		{name: "int is accepted", value: 42},
+		{name: "string is accepted", value: "text"},
+		{name: "time is accepted", value: time.Now()},
+		{
+			name:  "nested json shape is accepted",
+			value: map[string]any{"list": []any{1, "two", map[string]any{"deep": true}}},
+		},
+		{
+			name:  "pointer to a struct with a map field is accepted",
+			value: &cloneSettings{Limits: map[string]int{"rps": 1}},
+		},
 	}
 
-	for _, v := range values {
-		if err := ValidateCloneSafe(v); err != nil {
-			t.Errorf("ValidateCloneSafe(%T): got %v, want nil", v, err)
-		}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateCloneSafe(tt.value)
+
+			switch {
+			case tt.wantErr != "":
+				if err == nil {
+					t.Fatalf("got nil, want %q", tt.wantErr)
+				}
+
+				if err.Error() != tt.wantErr {
+					t.Errorf("got %q, want %q", err.Error(), tt.wantErr)
+				}
+			case tt.wantErrContains != "":
+				if err == nil {
+					t.Fatalf("got nil, want an error reporting %q", tt.wantErrContains)
+				}
+
+				if !strings.Contains(err.Error(), tt.wantErrContains) {
+					t.Errorf("got %q, want it to report %q", err.Error(), tt.wantErrContains)
+				}
+			default:
+				if err != nil {
+					t.Errorf("ValidateCloneSafe(%T): got %v, want nil", tt.value, err)
+				}
+			}
+		})
 	}
 }
 

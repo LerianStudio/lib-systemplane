@@ -285,6 +285,59 @@ func TestDispatchDeliversInRevisionOrder(t *testing.T) {
 	}
 }
 
+// TestConcurrentPublishesDeliverInRevisionOrder pins the one thing that keeps
+// deliveries in revision order when several goroutines publish the same key:
+// dispatch's mailbox write happens under the same acquisition of the scope's
+// write lock that made the fence decision. Move e.dispatch out of that
+// critical section and a publication that LOST the fence can overtake the
+// winner on the way to the slot, so a subscriber is handed an older revision
+// after a newer one.
+//
+// Neither neighbour covers it. TestDispatchDeliversInRevisionOrder publishes
+// from a single goroutine, which cannot produce that interleaving, and
+// TestPublishIsSerializedUnderRace watches Lookup, which stays monotonic
+// whatever order the mailboxes were written in.
+func TestConcurrentPublishesDeliverInRevisionOrder(t *testing.T) {
+	const last = 200
+
+	e := dispatchEngine(t)
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+
+	var rec recorder
+
+	unsub := e.OnChange(nk, rec.record)
+	defer unsub()
+
+	var wg sync.WaitGroup
+
+	for writer := range 2 {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			for rev := int64(1); rev <= last; rev++ {
+				e.publishInto(pub(nk, rev, fmt.Sprintf("writer%d-rev%d", writer, rev)))
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	waitFor(t, hangGuard, "the newest revision to be delivered", func() bool {
+		revs := rec.revisions()
+
+		return len(revs) > 0 && revs[len(revs)-1] == last
+	})
+
+	revs := rec.revisions()
+	for i := 1; i < len(revs); i++ {
+		if revs[i] < revs[i-1] {
+			t.Fatalf("revisions delivered out of order at %d: %v", i, revs)
+		}
+	}
+}
+
 func TestPanickingSubscriberDoesNotStopLaterDeliveries(t *testing.T) {
 	e := dispatchEngine(t)
 	nk := NSKey{Namespace: "billing", Key: "limits"}
