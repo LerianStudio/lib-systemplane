@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -94,6 +95,100 @@ func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool)
 	}
 
 	t.Fatalf("timed out after %s waiting for %s", timeout, what)
+}
+
+// panicLogger is a consumer logger that blows up once: on the next entry after
+// it is armed, and never again.
+//
+// It models the one thing that still ends a delivery worker's goroutine in
+// production. A panicking subscriber alone does not — deliver recovers it per
+// callback — but that recovery hands the panic to the CONSUMER's logger, and a
+// logger that panics too takes the whole goroutine out through
+// lib-observability's net at the top of it.
+//
+// Disarming as it fires is not tidiness: that net logs as well, and a logger
+// that panicked a second time would escape it and kill the process.
+type panicLogger struct {
+	log.Logger
+
+	armed atomic.Bool
+}
+
+func (l *panicLogger) Enabled(int) bool { return true }
+
+func (l *panicLogger) Log(context.Context, int, string, ...any) {
+	if l.armed.CompareAndSwap(true, false) {
+		panic("the consumer's logger blew up")
+	}
+}
+
+// currentWorker reads the worker a scope would hand the next publication of
+// nk, under the lock that starts and sweeps one.
+func currentWorker(e *Engine, sc *scopeState, nk NSKey) *dispatchWorker {
+	e.workersMu.Lock()
+	defer e.workersMu.Unlock()
+
+	return sc.workers[nk]
+}
+
+// TestDispatchReplacesAWorkerWhosePanicEndedIt closes the last way a key can
+// go silent with nothing saying so.
+//
+// A panic that escapes runWorker ends that goroutine — the launcher's policy
+// is KeepRunning, which recovers and returns rather than restarting — while
+// the worker stayed in its scope's map and its marker in running. Every later
+// publication for that (scope, key) is then handed to a mailbox nobody drains
+// and lost silently until the scope is dropped or the engine closes, and a
+// Close that times out names a subscriber that has not been running since.
+//
+// Neither sweep covers it: a scope drop and a Close both end workers they can
+// see, and this one ended itself.
+func TestDispatchReplacesAWorkerWhosePanicEndedIt(t *testing.T) {
+	e := dispatchEngine(t)
+	lg := &panicLogger{Logger: log.NewNop()}
+	e.logger = lg
+
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	sc := e.scopeFor(store.Scope{})
+
+	var delivered recorder
+
+	unsub := e.OnChange(nk, func(ctx context.Context, ch Change) {
+		if ch.Revision == 1 {
+			lg.armed.Store(true)
+
+			panic("the subscriber blew up")
+		}
+
+		delivered.record(ctx, ch)
+	})
+	defer unsub()
+
+	e.dispatch(sc, pub(nk, 1, "one"))
+
+	dead := currentWorker(e, sc, nk)
+	if dead == nil {
+		t.Fatal("no worker was started for a subscribed key")
+	}
+
+	waitFor(t, hangGuard, "the scope to forget the worker whose goroutine the panic ended", func() bool {
+		return currentWorker(e, sc, nk) != dead
+	})
+
+	if got := runningCount(e); got != 0 {
+		t.Errorf("%d worker(s) still marked as inside a subscriber callback after the panic ended the "+
+			"goroutine, want 0: a Close that timed out would report a delivery nobody is running", got)
+	}
+
+	e.dispatch(sc, pub(nk, 2, "two"))
+
+	waitFor(t, hangGuard, "a replacement worker to deliver the next Change", func() bool {
+		return delivered.len() == 1
+	})
+
+	if got := delivered.changes()[0].Revision; got != 2 {
+		t.Errorf("the replacement worker delivered revision %d, want 2", got)
+	}
 }
 
 func pub(nk NSKey, revision int64, value any) publication {

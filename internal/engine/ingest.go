@@ -26,7 +26,7 @@ import (
 // no newer than the cached one: the first means the engine learned nothing
 // about the key, the second means the cache is already current.
 //
-// Four rejections, each with its own outcome:
+// Five rejections, each with its own outcome:
 //
 //  1. Unregistered key — skipped entirely, nothing published. A store may
 //     legitimately hold rows this process never registered, so this is
@@ -37,7 +37,10 @@ import (
 //     It deliberately does NOT fall back to the registered default: silently
 //     reverting a key because an operator typo'd a row is a worse failure than
 //     keeping the last value that passed.
-//  4. Fence rejection — publish already decided; the value was still usable.
+//  4. Revision fence — publish already decided; the value was still usable.
+//  5. Delete fence — a re-read armed before a delete of the key is refused
+//     and recorded unusable, so a concurrent reconcile applies its snapshot
+//     row.
 //
 // The ingress runs in two halves and the split is load-bearing. prepare —
 // decode, and the CONSUMER's registered validator — runs OUTSIDE the scope's

@@ -221,6 +221,17 @@ func (e *Engine) trackedRefresh(scope store.Scope, nk NSKey) {
 // every frame between here and the panic have already run by the time this
 // one does, so the scope's reconcile mutex is free to take.
 //
+// That record goes into the state the re-read was armed on, which is why the
+// caller hands this a POINTER to its own resolution rather than the scope
+// value: the recovery is deferred before the scope is resolved, and resolving
+// one of its own afterwards would find whatever is live now. A tenant dropped
+// and brought back up during the store call is a new state, and fencing ITS
+// window with what the dead state's read failed to learn makes the
+// re-activation's own reconcile keep a cached value instead of repairing the
+// key. Nothing is recorded while the pointer is still nil — a panic raised
+// before the scope was resolved fences nobody — and recordFeedOutcome drops
+// the write when the state is no longer the tracked one.
+//
 // That fence is written FIRST, before any consumer code can run. Everything
 // below it is the consumer's — its logger, and whatever lib-observability's
 // handler calls into — and nothing bounds how long it holds this goroutine. A
@@ -233,7 +244,7 @@ func (e *Engine) trackedRefresh(scope store.Scope, nk NSKey) {
 // context and records neither. The recovered value stays out of the identity
 // line — it is whatever the panicking code was holding, and redacting it
 // belongs with the handler.
-func (e *Engine) recoverRefresh(scope store.Scope, nk NSKey) {
+func (e *Engine) recoverRefresh(scope store.Scope, nk NSKey, state **scopeState) {
 	recovered := recover()
 	if recovered == nil {
 		return
@@ -241,7 +252,9 @@ func (e *Engine) recoverRefresh(scope store.Scope, nk NSKey) {
 
 	ctx := e.dispatchContext()
 
-	e.recordFeedOutcome(scope, nk, false)
+	if state != nil {
+		e.recordFeedOutcome(*state, nk, false)
+	}
 
 	e.logError(ctx, "systemplane.engine: changefeed re-read panicked",
 		log.String(constants.AttrKeyTenantID, scope.Tenant),
@@ -271,15 +284,29 @@ func (e *Engine) scopeForEvent(scope store.Scope, nk NSKey) *scopeState {
 		return sc
 	}
 
-	if e.debugEnabled() {
-		e.logDebug(e.dispatchContext(), "changefeed work for an untracked scope, dropping",
-			log.String(constants.AttrKeyTenantID, scope.Tenant),
-			log.String("namespace", nk.Namespace),
-			log.String("keyname", nk.Key),
-		)
-	}
+	e.logUntrackedDrop(scope, nk)
 
 	return nil
+}
+
+// logUntrackedDrop reports work the engine is dropping because the scope it
+// addresses is no longer the one being tracked — gone, or replaced by the
+// state a re-activation created.
+//
+// DEBUG, because it is the ordinary end of a subscription rather than a fault.
+// The level guard is inside rather than at the two call sites: this line runs
+// per event, not per failure, and the fields are built by the variadic before
+// the call, so asking first is what actually skips the work.
+func (e *Engine) logUntrackedDrop(scope store.Scope, nk NSKey) {
+	if !e.debugEnabled() {
+		return
+	}
+
+	e.logDebug(e.dispatchContext(), "changefeed work for an untracked scope, dropping",
+		log.String(constants.AttrKeyTenantID, scope.Tenant),
+		log.String("namespace", nk.Namespace),
+		log.String("keyname", nk.Key),
+	)
 }
 
 // markStale records that the scope's changefeed is down. The generation is
@@ -364,13 +391,25 @@ func (e *Engine) PublishDelete(scope store.Scope, nk NSKey) {
 // through, so an exploding store call names its key whether the re-read was
 // tracked or inline. A validator that panics never reaches it — runValidator
 // turns that into an ordinary rejection.
+//
+// All three of this function's writes into a scope — the publication, the
+// store error's fence, and the recovery's — are addressed by IDENTITY to the
+// state resolved before the store call, never by scope value. A tenant dropped
+// and brought back up during that round trip is a live state under the same
+// scope value, and both a publication and a fence written into it are wrong in
+// the same way: the row was read under an entitlement this process no longer
+// holds, and the new state's own reconcile is the only thing entitled to
+// decide the key. That is why sc is declared before the recovery is deferred
+// and handed to it by pointer.
 func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
-	defer e.recoverRefresh(scope, nk)
+	var sc *scopeState
+
+	defer e.recoverRefresh(scope, nk, &sc)
 
 	// Checked before the store call, not only after it: a re-read for a
 	// dropped tenant would otherwise open a connection to a database that
 	// tenant no longer has, to publish into a scope nothing tracks.
-	sc := e.scopeForEvent(scope, nk)
+	sc = e.scopeForEvent(scope, nk)
 	if sc == nil {
 		return
 	}
@@ -385,7 +424,7 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
 
 	se, found, err := e.store.Get(ctx, scope, nk.Namespace, nk.Key)
 	if err != nil {
-		e.recordFeedOutcome(scope, nk, false)
+		e.recordFeedOutcome(sc, nk, false)
 
 		if e.canceledByShutdown(err) {
 			e.logDebug(ctx, "changefeed re-read canceled during shutdown",
@@ -431,23 +470,41 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
 	// counter starts at zero, so for the ordinary key that has never been
 	// deleted it compares zero against zero and lets the row through. The new
 	// state reconciles the key from the store itself.
-	if e.scopeForEvent(scope, nk) != sc {
+	if live := e.scopeForEvent(scope, nk); live != sc {
+		// scopeForEvent already reported the scope that is simply gone. This
+		// line is the other half: a state that IS tracked, under the same
+		// scope value, whose row this re-read is not entitled to hand over.
+		// Both are drops, and a drop nothing says a word about is one an
+		// operator chasing a key that never updated cannot see.
+		if live != nil {
+			e.logUntrackedDrop(scope, nk)
+		}
+
 		return
 	}
 
 	e.ingest(ctx, sc, se, fence)
 }
 
-// recordFeedOutcome tells every reconcile in flight what the feed learned
-// about nk, and is a no-op otherwise: the fences only exist for the window
-// between a reconcile's List and its application.
+// recordFeedOutcome tells every reconcile in flight ON sc what the feed
+// learned about nk, and is a no-op otherwise: the fences only exist for the
+// window between a reconcile's List and its application.
 //
-// It is for outcomes with no publication of their own — a re-read that
-// errored. Anything that DOES publish holds reconcileMu across the pair and
+// It is for outcomes with no publication of their own — a re-read that errored
+// or panicked. Anything that DOES publish holds reconcileMu across the pair and
 // calls record directly, so the two are indivisible to a reconcile.
-func (e *Engine) recordFeedOutcome(scope store.Scope, nk NSKey, usable bool) {
-	sc := e.scopeForEvent(scope, nk)
-	if sc == nil {
+//
+// The caller passes the state its re-read was armed on, and the write is
+// dropped unless that state is still the one being tracked. Resolving the
+// scope by VALUE here was the hole: a tenant dropped and brought back up
+// inside Store.Get is a new state under the same scope value, and recording
+// "unusable" into ITS window makes the re-activation's own reconcile keep a
+// cached value for a key the snapshot no longer carries — a tenant left on a
+// configuration the store does not have, reporting itself fresh, until some
+// later reconnect. The publishing path refuses the same state by the same
+// identity; this closes the two paths that publish nothing.
+func (e *Engine) recordFeedOutcome(sc *scopeState, nk NSKey, usable bool) {
+	if sc == nil || e.trackedScope(sc.scope) != sc {
 		return
 	}
 

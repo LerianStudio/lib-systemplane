@@ -13,6 +13,15 @@ import (
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
+// errRereadFailed is what the store hands a changefeed re-read that fails
+// after its tenant was dropped.
+var errRereadFailed = errors.New("the store connection dropped")
+
+// reactivatedValue is what a tenant brought back up inside Store.Get has in
+// its cache: the row as its OWN bring-up read it, which has moved on from the
+// one the refused re-read is carrying.
+const reactivatedValue = "eight"
+
 // dropTenant is the scope every test in this file drops. A tenant rather than
 // the single-tenant scope because that is who gets dropped in production: a
 // tenant suspended, deleted or rotated while the process keeps running.
@@ -627,40 +636,54 @@ func TestRereadRefusesAScopeDroppedDuringTheStoreCall(t *testing.T) {
 
 	for _, tc := range []struct {
 		name string
-		// hook runs inside Store.Get, after the scope has been dropped.
-		hook func(t *testing.T, e *Engine)
+		// getErr fails the store call once the drop has happened, which is the
+		// one outcome that teaches the engine nothing about the key and must
+		// therefore be recorded somewhere — the question being whose window.
+		getErr error
 		// panics says the re-read unwinds instead of returning a row, which
 		// takes the recovery — and its own scope resolution — down the same
 		// untracked path.
 		panics bool
-		// reactivates says the hook brought the tenant back up, so the scope
-		// is tracked again by the time the row comes back — a NEW state, under
-		// the same scope value, that this row still has no business reaching.
+		// reactivates says the tenant is brought back up from inside
+		// Store.Get, so the scope is tracked again by the time the row comes
+		// back — a NEW state, under the same scope value, that this row still
+		// has no business reaching.
 		reactivates bool
 	}{
 		{
 			name: "the row comes back after the tenant is gone",
-			hook: func(*testing.T, *Engine) {},
 		},
 		{
 			// The recovery resolves the scope of its own to fence the key as
 			// unusable, so a panic raised after the drop is the one path that
 			// reaches that resolution with nothing to resolve.
 			name:   "the store explodes after the tenant is gone",
-			hook:   func(*testing.T, *Engine) { panic("the store driver exploded") },
 			panics: true,
 		},
 		{
 			// The re-activation opens a reconcile window of its own, which is
 			// how production brings a tenant back: subscribe, then reconcile.
 			// That window is what the refused row must not be recorded into.
-			name: "the tenant is dropped and brought back up during the read",
-			hook: func(t *testing.T, e *Engine) {
-				t.Helper()
-
-				bringUp(t, e, dropTenant)
-				armWindow(e.scopeFor(dropTenant))
-			},
+			name:        "the tenant is dropped and brought back up during the read",
+			reactivates: true,
+		},
+		{
+			// The publishing path refuses the re-activated state by identity,
+			// but a re-read that FAILS publishes nothing and still has an
+			// outcome to record — and resolving the scope for that record by
+			// value hands it to the live state's window. The key sits there as
+			// unusable, and the re-activation's own reconcile then keeps a
+			// value the store no longer has.
+			name:        "the tenant is dropped and brought back up, then the store errors",
+			getErr:      errRereadFailed,
+			reactivates: true,
+		},
+		{
+			// Same write, reached from the recovery instead of the error path:
+			// it resolves the scope after the stack has unwound, when the
+			// tenant it is fencing may already be a different state.
+			name:        "the tenant is dropped and brought back up, then the store panics",
+			panics:      true,
 			reactivates: true,
 		},
 	} {
@@ -691,11 +714,37 @@ func TestRereadRefusesAScopeDroppedDuringTheStoreCall(t *testing.T) {
 			unsub := e.OnChange(nk, delivered.record)
 			defer unsub()
 
+			// arm names the reconcile window the RE-ACTIVATED state opens.
+			// The refused re-read must write nothing into it, and the very
+			// same reconcile then decides the key, so the fence and its
+			// consequence are one assertion apart.
+			var arm reconcileArming
+
 			fs.onGet(func(scope store.Scope, _ NSKey) error {
 				e.dropScope(scope)
-				tc.hook(t, e)
 
-				return nil
+				if tc.reactivates {
+					bringUp(t, e, dropTenant)
+
+					live := e.scopeFor(dropTenant)
+
+					// What the re-activation's own reconcile leaves behind:
+					// the tenant's row as it stands now, read under the
+					// entitlement this process still holds. The re-read is
+					// carrying an older one, and nothing it learned may unseat
+					// this or fence it.
+					live.mu.Lock()
+					live.entries[nk] = entry{Value: reactivatedValue, Revision: 8}
+					live.mu.Unlock()
+
+					arm = armWindow(live)
+				}
+
+				if tc.panics {
+					panic("the store driver exploded")
+				}
+
+				return tc.getErr
 			})
 
 			// A zero quiet window runs the re-read inline on this goroutine,
@@ -704,12 +753,26 @@ func TestRereadRefusesAScopeDroppedDuringTheStoreCall(t *testing.T) {
 			e.onEvent(upsertEvent(dropTenant, nk, 7))
 
 			if tracked(e, dropTenant) != tc.reactivates {
-				t.Error("the re-read re-created the tenant scope after it was dropped mid-Get: " +
-					"it has no changefeed and no reconcile goroutine, and reads would report it as current")
+				if tc.reactivates {
+					t.Error("the tenant brought back up inside Store.Get was not tracked when the " +
+						"re-read returned, so this case no longer exercises the identity check")
+				} else {
+					t.Error("the re-read re-created the tenant scope after it was dropped mid-Get: " +
+						"it has no changefeed and no reconcile goroutine, and reads would report it as current")
+				}
 			}
 
-			if _, ok := e.Lookup(dropTenant, nk); ok {
-				t.Error("a row read for a dropped tenant became readable")
+			cached, readable := e.Lookup(dropTenant, nk)
+
+			switch {
+			case !tc.reactivates:
+				if readable {
+					t.Error("a row read for a dropped tenant became readable")
+				}
+			case cached.Value != reactivatedValue:
+				t.Errorf("the re-activated tenant reads %v (present=%t), want %q: the row the re-read "+
+					"held under the DROPPED state reached a tenant it was no longer entitled to",
+					cached.Value, readable, reactivatedValue)
 			}
 
 			if got := delivered.len(); got != 0 {
@@ -723,10 +786,29 @@ func TestRereadRefusesAScopeDroppedDuringTheStoreCall(t *testing.T) {
 			}
 
 			if tc.reactivates {
-				if touched, _ := recordedSets(e, dropTenant); len(touched) != 0 {
-					t.Errorf("the re-activated scope recorded %v as answered by the feed: the row was "+
-						"read under the dropped state, so the new state's own reconcile is the only "+
-						"thing that may decide the key, and it skips every key the feed touched", touched)
+				touched, unusable := recordedSets(e, dropTenant)
+				if len(touched) != 0 || len(unusable) != 0 {
+					t.Errorf("the re-activated scope recorded %v as answered by the feed and %v as "+
+						"unusable: the re-read ran against the DROPPED state, so the new state's own "+
+						"reconcile is the only thing that may decide the key, and it skips every key "+
+						"the feed touched and keeps every key it could not read", touched, unusable)
+				}
+
+				// End to end, which is what the fence costs when it lands in
+				// the wrong window: the row is gone from the store, so the
+				// window armed above photographs a scope without the key, and
+				// a key the feed could not read is KEPT rather than reset —
+				// leaving the tenant on a value the store no longer holds,
+				// reporting itself fresh.
+				fs.remove(dropTenant, nk)
+
+				e.reconcileScope(e.scopeFor(dropTenant), arm)
+
+				got, ok := e.Lookup(dropTenant, nk)
+				if !ok || got.Revision != 0 || got.Value != "fallback" {
+					t.Errorf("after a reconcile whose snapshot lacks the key the re-activated tenant "+
+						"reads %v at revision %d (present=%t), want the registered default at "+
+						"revision 0", got.Value, got.Revision, ok)
 				}
 			}
 

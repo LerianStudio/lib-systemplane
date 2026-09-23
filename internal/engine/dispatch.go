@@ -206,6 +206,9 @@ func (e *Engine) dispatch(sc *scopeState, pub publication) {
 // same reason: the sweep that ended the scope's workers marked its state, so a
 // publisher that slipped past publish's refusal cannot start a replacement the
 // drop will never come back to stop. The caller discards the publication.
+//
+// A worker whose goroutine ends reaps itself out of the map on the way out, so
+// what this hands back is never a worker nobody is draining.
 func (e *Engine) workerFor(sc *scopeState, nk NSKey) *dispatchWorker {
 	e.workersMu.Lock()
 	defer e.workersMu.Unlock()
@@ -229,11 +232,45 @@ func (e *Engine) workerFor(sc *scopeState, nk NSKey) *dispatchWorker {
 		"systemplane.engine", "dispatch", runtime.KeepRunning,
 		func(ctx context.Context) {
 			defer e.dispatchWG.Done()
+			defer e.reapWorker(sc, nk, w)
 
 			e.runWorker(ctx, wk, w)
 		})
 
 	return w
+}
+
+// reapWorker forgets a worker whose goroutine has ended, so the next
+// publication for its (scope, key) starts a replacement instead of filling a
+// mailbox nobody drains.
+//
+// Every ordinary exit leaves nothing to repair — the scope's stop and the
+// engine's both sweep the map and refuse replacements under this same lock —
+// so this exists for the one exit neither can see: a panic that escaped
+// runWorker. The launcher's policy recovers it and returns without restarting,
+// and the reachable trigger is a consumer logger that panics inside the
+// per-callback recovery in deliver. Left in place, that dead worker goes on
+// being handed every later Change for its key, silently, until the scope is
+// dropped or the engine closes, and its marker makes a timed-out Close name a
+// subscriber that has not been running since.
+//
+// The map entry goes only when it is still THIS worker. A scope dropped and
+// brought back up, or a worker already swept and replaced, owns the slot now,
+// and reaping by key alone would take a live worker's mailbox with it.
+//
+// It is deferred INSIDE the launch closure, registered after the WaitGroup
+// release so it runs before it: a Close waiting on that WaitGroup must not be
+// released while this worker is still named in running, or it reports a
+// delivery nobody is running.
+func (e *Engine) reapWorker(sc *scopeState, nk NSKey, w *dispatchWorker) {
+	e.running.Delete(w)
+
+	e.workersMu.Lock()
+	defer e.workersMu.Unlock()
+
+	if sc.workers[nk] == w {
+		delete(sc.workers, nk)
+	}
 }
 
 // runWorker is the one goroutine that invokes subscribers of wk. It exits when
@@ -284,15 +321,12 @@ func (e *Engine) runWorker(ctx context.Context, wk workerKey, w *dispatchWorker)
 			// this it would hand a dropped scope's Change to subscribers after
 			// dropScope returned, or start a callback after Close began. The
 			// mark stays up across the check so the window it closes above
-			// does not reopen here.
+			// does not reopen here, and the deferred reap clears it on the way
+			// out — these two exits need no clear of their own.
 			select {
 			case <-ctx.Done():
-				e.running.Delete(w)
-
 				return
 			case <-w.done:
-				e.running.Delete(w)
-
 				return
 			default:
 			}
