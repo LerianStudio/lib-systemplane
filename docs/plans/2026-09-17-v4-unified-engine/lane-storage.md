@@ -67,10 +67,10 @@ At the end of this phase Postgres alone satisfies FC-2. MongoDB still returns re
 diff \
   <(awk '/^### FC-8 /{f=1} f && /^```sql$/{c=1; next} c && /^```$/{exit} c' \
         docs/plans/2026-09-17-v4-unified-engine/index.md) \
-  <(sed -n '/^CREATE TABLE IF NOT EXISTS/,$p' ddl/schema.sql)
+  <(sed -n '/^DO \$\$/,$p' ddl/schema.sql)
 ~~~
 
-The markers, stated exactly so the command is reproducible: on the index side, start scanning at the heading line beginning `### FC-8 `, begin capturing after the opening fence line that is exactly ` ```sql `, and stop at the first following line that is exactly ` ``` `; on the artifact side, take `ddl/schema.sql` from the first line beginning `CREATE TABLE IF NOT EXISTS` to end of file, which drops only the free-text header comment. Against the current index this extracts 61 lines, from `CREATE TABLE IF NOT EXISTS systemplane_entries (` to `EXECUTE FUNCTION systemplane_notify_v4('systemplane_changes');`. Note that the plan file itself contains the string `### FC-8 ` nowhere, so the command is unambiguous when run against `index.md`.
+The markers, stated exactly so the command is reproducible: on the index side, start scanning at the heading line beginning `### FC-8 `, begin capturing after the opening fence line that is exactly ` ```sql `, and stop at the first following line that is exactly ` ``` `; on the artifact side, take `ddl/schema.sql` from the first line beginning `DO $$` (the fork guard that opens the SQL) to end of file, which drops only the free-text header comment. Against the current index this extracts 107 lines, from `DO $$` to `ALTER TABLE systemplane_entries ALTER COLUMN revision DROP DEFAULT;` (amended 2026-09-23: the block opens with the fork guard since 2026-09-18, so the artifact-side marker moved from `CREATE TABLE IF NOT EXISTS` to `DO $$`). Note that the plan file itself contains the string `### FC-8 ` nowhere, so the command is unambiguous when run against `index.md`.
 
 **Done when:** `SchemaSQL()` contains every v4 fragment, no v3 function definition, and the drift-guard test pins the new shape.
 
