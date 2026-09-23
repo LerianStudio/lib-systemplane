@@ -53,16 +53,38 @@ func TestMongoLogFieldNames_SurviveRedaction(t *testing.T) {
 	}
 }
 
+// obsLogImportPath is the canonical logger this package emits through. The
+// walk below matches the IMPORT PATH, not the identifier `log`: an alias, or a
+// different package that happens to be named log, would otherwise be read as
+// this one.
+const obsLogImportPath = "github.com/LerianStudio/lib-observability/v4/log"
+
+// logFieldsCtor is the variadic constructor; every other name in ctors below
+// takes the field name as its first argument.
+const logFieldsCtor = "Fields"
+
 // logFieldNameLiterals parses this package's non-test sources and returns the
-// string literal handed as the field name to every log.<Field>(name, value)
-// constructor. Test files are excluded: a field name a test invents is not one
-// the package ships.
+// string literal handed as the field name to every field constructor
+// lib-observability/v4/log exports. Test files are excluded: a field name a
+// test invents is not one the package ships.
+//
+// Two shapes are invisible to it, by construction rather than by oversight: a
+// name that arrives through an identifier (listed by hand at the call site
+// above), and a log.Field{Key: "...", Value: ...} composite literal, which
+// names no constructor for the walk to key on. Neither is used in this
+// package today; a composite literal would need a case here.
+//
+// This helper is DUPLICATED verbatim in internal/postgres/postgres_obs_test.go
+// — the two packages share no test code — so a change here has to be made
+// there too.
 func logFieldNameLiterals(t *testing.T) []string {
 	t.Helper()
 
+	// Exactly what lib-observability/v4/log exports as a named field
+	// constructor. Err takes no name, so it is absent; Fields is variadic and
+	// handled separately below.
 	ctors := map[string]bool{
-		"String": true, "Any": true, "Int": true, "Int64": true,
-		"Bool": true, "Duration": true, "Float64": true, "Strings": true,
+		"Any": true, "String": true, "Int": true, "Bool": true,
 	}
 
 	entries, err := os.ReadDir(".")
@@ -85,6 +107,11 @@ func logFieldNameLiterals(t *testing.T) []string {
 			t.Fatalf("parse %s: %v", file, err)
 		}
 
+		logPkg, ok := logPackageIdent(parsed)
+		if !ok {
+			continue
+		}
+
 		ast.Inspect(parsed, func(n ast.Node) bool {
 			call, ok := n.(*ast.CallExpr)
 			if !ok || len(call.Args) == 0 {
@@ -92,31 +119,81 @@ func logFieldNameLiterals(t *testing.T) []string {
 			}
 
 			sel, ok := call.Fun.(*ast.SelectorExpr)
-			if !ok || !ctors[sel.Sel.Name] {
+			if !ok {
 				return true
 			}
 
-			if pkg, ok := sel.X.(*ast.Ident); !ok || pkg.Name != "log" {
+			if pkg, ok := sel.X.(*ast.Ident); !ok || pkg.Name != logPkg {
 				return true
 			}
 
-			lit, ok := call.Args[0].(*ast.BasicLit)
-			if !ok || lit.Kind != token.STRING {
-				return true
-			}
+			switch {
+			case ctors[sel.Sel.Name]:
+				names = append(names, stringLiteralArgs(t, file, call.Args[:1])...)
+			case sel.Sel.Name == logFieldsCtor:
+				// log.Fields alternates name, value, so an even-indexed
+				// string literal is a field name. A Field or []Field argument
+				// consumes one slot and shifts the rest, which this cannot
+				// see — the cost of a walk without type information, and the
+				// reason an odd-indexed literal is never read as a name.
+				var even []ast.Expr
 
-			name, err := strconv.Unquote(lit.Value)
-			if err != nil {
-				t.Fatalf("%s: unquote field name %s: %v", file, lit.Value, err)
-			}
+				for i := 0; i < len(call.Args); i += 2 {
+					even = append(even, call.Args[i])
+				}
 
-			names = append(names, name)
+				names = append(names, stringLiteralArgs(t, file, even)...)
+			}
 
 			return true
 		})
 	}
 
 	return names
+}
+
+// logPackageIdent returns the identifier this file refers to obsLogImportPath
+// by — its alias when it has one, "log" otherwise — and false when the file
+// does not import it.
+func logPackageIdent(file *ast.File) (string, bool) {
+	for _, imp := range file.Imports {
+		path, err := strconv.Unquote(imp.Path.Value)
+		if err != nil || path != obsLogImportPath {
+			continue
+		}
+
+		if imp.Name != nil {
+			return imp.Name.Name, true
+		}
+
+		return "log", true
+	}
+
+	return "", false
+}
+
+// stringLiteralArgs unquotes every argument that is a string literal and drops
+// the rest.
+func stringLiteralArgs(t *testing.T, file string, args []ast.Expr) []string {
+	t.Helper()
+
+	var out []string
+
+	for _, arg := range args {
+		lit, ok := arg.(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			continue
+		}
+
+		name, err := strconv.Unquote(lit.Value)
+		if err != nil {
+			t.Fatalf("%s: unquote field name %s: %v", file, lit.Value, err)
+		}
+
+		out = append(out, name)
+	}
+
+	return out
 }
 
 // The configuration key a document-level warning names reaches the logger

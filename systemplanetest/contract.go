@@ -2,6 +2,13 @@
 // backend implementation of internal/store.Store. Backends call Run(t, factory,
 // RunOptions{...}) inside their integration test files to exercise the
 // behaviors documented on the Store interface.
+//
+// One of those behaviors catches backend authors out often enough to name
+// here: the bytes in an Entry.Value belong to the CALLER from the moment the
+// Store returns them, so a backend that hands out a view into a driver buffer
+// the driver later reuses — pgx RawValues, sql.RawBytes, bson.Raw — fails the
+// ValueBytesBelongToTheCaller case below. The rule and the fix (copy at the
+// boundary) are written out on store.Entry.Value's godoc.
 package systemplanetest
 
 import (

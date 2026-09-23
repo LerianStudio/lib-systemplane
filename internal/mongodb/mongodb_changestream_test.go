@@ -1940,6 +1940,26 @@ func (c *captureLogger) waitFor(t *testing.T, level int, msg string) captureEntr
 	}
 }
 
+// warnCount reports how many WARN entries carry msg. waitFor only proves that
+// at least one was logged, which is not the claim a streak test makes: the
+// point of the streak is that the SECOND failure of the same cause is quiet.
+// Callers take the count after the goroutine under test has exited, so it is
+// final.
+func (c *captureLogger) warnCount(msg string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var n int
+
+	for _, e := range c.entries {
+		if e.level == log.LevelWarn && e.msg == msg {
+			n++
+		}
+	}
+
+	return n
+}
+
 // field returns the value of the named field, failing when it is absent.
 func (e captureEntry) field(t *testing.T, key string) any {
 	t.Helper()
@@ -1996,6 +2016,10 @@ func TestMongoReopenWatch_FirstFailureWarnsThenGoesQuiet(t *testing.T) {
 
 	close(f.stop)
 	<-done
+
+	if n := logger.warnCount("tenant re-resolve before reopen failed"); n != 1 {
+		t.Errorf("logged %d WARNs for %q, want exactly 1: the streak is one loud line per cause", n, "tenant re-resolve before reopen failed")
+	}
 
 	if got := entry.field(t, obsconstants.AttrKeyTenantID); got != "t1" {
 		t.Errorf("first failure logged tenant %v, want t1: a process carrying dozens of feeds cannot tell which one is down", got)
@@ -2112,18 +2136,7 @@ func TestEnsureSchema_CtxTenantWithoutIDWarnsOnce(t *testing.T) {
 		}
 	}
 
-	logger.mu.Lock()
-	defer logger.mu.Unlock()
-
-	var warns int
-
-	for _, e := range logger.entries {
-		if e.level == log.LevelWarn && e.msg == warnSchemaWithoutTenantID {
-			warns++
-		}
-	}
-
-	if warns != 1 {
+	if warns := logger.warnCount(warnSchemaWithoutTenantID); warns != 1 {
 		t.Fatalf("logged the no-tenant-id warning %d times, want exactly 1 per store", warns)
 	}
 }
@@ -2195,6 +2208,10 @@ func TestMongoReopenWatch_WarnsAfterAnUnproductiveCycle(t *testing.T) {
 	close(f.stop)
 	<-done
 
+	if n := logger.warnCount("tenant re-resolve before reopen failed"); n != 1 {
+		t.Errorf("logged %d WARNs for %q, want exactly 1: the streak is one loud line per cause", n, "tenant re-resolve before reopen failed")
+	}
+
 	if got := entry.field(t, obsconstants.AttrKeyTenantID); got != "t1" {
 		t.Errorf("first failure logged tenant %v, want t1", got)
 	}
@@ -2257,6 +2274,14 @@ func TestMongoReopenWatch_EachCauseWarnsOnceInAStreak(t *testing.T) {
 	close(f.stop)
 	<-done
 
+	if n := logger.warnCount("tenant re-resolve before reopen failed"); n != 1 {
+		t.Errorf("logged %d WARNs for %q, want exactly 1: the streak is one loud line per cause", n, "tenant re-resolve before reopen failed")
+	}
+
+	if n := logger.warnCount("change stream reopen failed"); n != 1 {
+		t.Errorf("logged %d WARNs for %q, want exactly 1: the streak is one loud line per cause", n, "change stream reopen failed")
+	}
+
 	if got := entry.field(t, obsconstants.AttrKeyTenantID); got != "t1" {
 		t.Errorf("reopen failure logged tenant %v, want t1", got)
 	}
@@ -2296,6 +2321,10 @@ func TestMongoPollForever_FirstFailureWarnsThenGoesQuiet(t *testing.T) {
 
 		close(f.stop)
 		<-done
+
+		if n := logger.warnCount("poll round trip failed"); n != 1 {
+			t.Errorf("logged %d WARNs for %q, want exactly 1: the streak is one loud line per cause", n, "poll round trip failed")
+		}
 
 		if got := entry.field(t, obsconstants.AttrKeyTenantID); got != "t1" {
 			t.Errorf("first failed round trip logged tenant %v, want t1", got)
@@ -2337,6 +2366,10 @@ func TestMongoPollForever_FirstFailureWarnsThenGoesQuiet(t *testing.T) {
 
 		close(f.stop)
 		<-done
+
+		if n := logger.warnCount("tenant re-resolve after a failed poll failed"); n != 1 {
+			t.Errorf("logged %d WARNs for %q, want exactly 1: the streak is one loud line per cause", n, "tenant re-resolve after a failed poll failed")
+		}
 
 		if got := entry.field(t, obsconstants.AttrKeyTenantID); got != "t1" {
 			t.Errorf("first failed re-resolve logged tenant %v, want t1", got)

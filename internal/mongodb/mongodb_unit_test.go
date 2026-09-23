@@ -657,8 +657,13 @@ func TestNew_NilTracerKeepsTheNoopTracer(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	if _, _, err := s.Get(context.Background(), store.Scope{}, "ns", "k"); err == nil {
-		t.Fatal("Get error = nil, want the driver's unconfigured-deployment error")
+	// The point of the call is that CRUD REACHES the driver instead of dying
+	// at tracer.Start, so the assertion names the error the driver actually
+	// returns for a client that was never connected. A bare non-nil check
+	// would pass on the nil-tracer panic being turned into any error at all.
+	_, _, err = s.Get(context.Background(), store.Scope{}, "ns", "k")
+	if err == nil || !strings.Contains(err.Error(), "must have a Deployment set") {
+		t.Fatalf("Get error = %v, want the driver's unconfigured-deployment error", err)
 	}
 
 	if _, span := s.tracer.Start(context.Background(), "probe"); span.IsRecording() {
