@@ -35,10 +35,15 @@ type Snapshot[T any] struct {
 // Bind registers (namespace, key) with defaults as the value in force when no
 // row exists. validate (may be nil) becomes the key's registered validator: the
 // client runs it on the default at Bind, on every Set, and on every other
-// ingress the client validates. A row already in the store is decoded on read
-// and never re-validated by the group, so a row that entered the store without
-// passing the registered validator surfaces from [Group.Snapshot] as a decode
-// error at worst, not as a validated document. Must be called before c.Start.
+// ingress the client validates. In single-tenant mode that includes the row
+// already in the store: the client grades it while hydrating at Start, so a row
+// that entered the store without passing the registered validator never becomes
+// the group's document — the registered defaults stay in force and
+// [Group.Snapshot] returns them with no error. In multi-tenant mode there is no
+// hydration: a tenant row is read through on every Snapshot without being
+// re-validated, and one that entered the store without passing the registered
+// validator surfaces as a decode error at worst, not as a validated document.
+// Must be called before c.Start.
 //
 // The value registered is not defaults itself but its canonical JSON document:
 // defaults marshaled and unmarshaled back into an any. A stored row, a Set
@@ -143,9 +148,10 @@ func Bind[T any](c *Client, namespace, key string, defaults T, validate func(T) 
 // Snapshot does NOT run the consumer's validate: whatever is in force already
 // passed it on ingress, so a second call would be a callback per read that can
 // never fail. A document that cannot decode into T returns an error wrapping
-// [ErrValidation] and a zero Value — never a half-filled T. Through an
-// engine-backed Client that path is unreachable, because a document that fails
-// to decode cannot pass the registered validator either.
+// [ErrValidation] and a zero Value — never a half-filled T. In single-tenant
+// mode that path is unreachable: a document that fails to decode cannot pass
+// the group's ingress, which hydration runs over the stored row. It is reachable
+// in multi-tenant mode, where the tenant row is read through ungraded.
 //
 // A row holding a JSON null is refused the same way, unless the zero T is
 // itself nil — in which case the null IS the document and Snapshot returns that
@@ -174,7 +180,9 @@ func (g *Group[T]) Snapshot(ctx context.Context) (Snapshot[T], error) {
 	// Defence in depth behind the ingress guard: a row holding a null predates
 	// it (an older binary, another writer, a hand-edited row), and Decode turns
 	// a null into the zero T by design (D-G2). Returning that would report a
-	// wholly blank configuration as the one in force.
+	// wholly blank configuration as the one in force. Single-tenant hydration
+	// refuses such a row before it reaches a reader; a multi-tenant read
+	// through to the tenant row arrives here.
 	if entry.Value == nil && !g.nullIsDocument {
 		var zero T
 

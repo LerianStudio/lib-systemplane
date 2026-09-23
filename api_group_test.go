@@ -1246,3 +1246,59 @@ func TestGroupNullIsADocumentForANilableType(t *testing.T) {
 		t.Fatalf("Snapshot.Value = %#v, want nil", snap.Value)
 	}
 }
+
+// TestGroupSnapshotOverAnUngradedTenantRow is the multi-tenant half of the two
+// tests above. Single-tenant hydration grades a stored row through the group's
+// own ingress, so an undecodable or null row never reaches a reader there.
+// Multi-tenant mode has no hydration: the tenant row is read through on every
+// Snapshot, ungraded, and the decode guard is what stands between it and a
+// half-filled or wholly blank document reported as the one in force.
+func TestGroupSnapshotOverAnUngradedTenantRow(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		row  any
+	}{
+		{name: "undecodable", row: "not-a-document"},
+		{name: "partial", row: map[string]any{"name": "ingest", "retries": 3, "hosts": "a-string-not-a-list"}},
+		{name: "null", row: nil},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := newGroupMemoryStore()
+
+			c, err := systemplane.NewForTesting(s, systemplane.WithMultiTenantEnabled())
+			if err != nil {
+				t.Fatalf("NewForTesting: %v", err)
+			}
+
+			t.Cleanup(func() { _ = c.Close() })
+
+			g, err := systemplane.Bind(c, "runtime", "ingest", groupDefaults(), nil)
+			if err != nil {
+				t.Fatalf("Bind: %v", err)
+			}
+
+			ctx := context.Background()
+			if err := c.Start(ctx); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+
+			s.seed(t, "runtime", "ingest", tc.row)
+
+			snap, err := g.Snapshot(ctx)
+			if !errors.Is(err, systemplane.ErrValidation) {
+				t.Fatalf("Snapshot of an ungraded %s tenant row = %v, want ErrValidation", tc.name, err)
+			}
+
+			var zero groupConfig
+			if !reflect.DeepEqual(snap.Value, zero) {
+				t.Fatalf("Snapshot.Value = %#v, want the zero value — never a half-filled document", snap.Value)
+			}
+		})
+	}
+}
