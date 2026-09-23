@@ -30,12 +30,11 @@ import (
 type Factory func(t *testing.T) (store.Store, func())
 
 // RunOptions tunes the contract suite for backend-specific quirks.
+//
+// There is no opt-out for the Subscribe sub-tests: a store that refuses
+// Subscribe in the configured Scope with store.ErrNotSupportedInMultiTenant
+// (the zero scope under multi-tenant mode) makes each of them skip itself.
 type RunOptions struct {
-	// SkipSubscribe skips every Subscribe-based assertion. Multi-tenant
-	// backends pass true because store.Subscribe returns
-	// ErrNotSupportedInMultiTenant in that mode.
-	SkipSubscribe bool
-
 	// EventWait is the upper bound the suite waits for changefeed echoes
 	// to arrive. Defaults to 2s when zero.
 	EventWait time.Duration
@@ -113,57 +112,55 @@ func Run(t *testing.T, f Factory, opts RunOptions) {
 		runRevisionMonotonic(t, s, opts)
 	})
 
-	if !opts.SkipSubscribe {
-		t.Run("SubscribeReceivesUpsert", func(t *testing.T) {
-			s, cleanup := f(t)
-			t.Cleanup(cleanup)
+	t.Run("SubscribeReceivesUpsert", func(t *testing.T) {
+		s, cleanup := f(t)
+		t.Cleanup(cleanup)
 
-			runSubscribeUpsert(t, s, opts)
-		})
+		runSubscribeUpsert(t, s, opts)
+	})
 
-		t.Run("SubscribeReceivesDelete", func(t *testing.T) {
-			s, cleanup := f(t)
-			t.Cleanup(cleanup)
+	t.Run("SubscribeReceivesDelete", func(t *testing.T) {
+		s, cleanup := f(t)
+		t.Cleanup(cleanup)
 
-			runSubscribeDelete(t, s, opts)
-		})
+		runSubscribeDelete(t, s, opts)
+	})
 
-		t.Run("UnsubscribeStopsDelivery", func(t *testing.T) {
-			s, cleanup := f(t)
-			t.Cleanup(cleanup)
+	t.Run("UnsubscribeStopsDelivery", func(t *testing.T) {
+		s, cleanup := f(t)
+		t.Cleanup(cleanup)
 
-			runUnsubscribeStops(t, s, opts)
-		})
+		runUnsubscribeStops(t, s, opts)
+	})
 
-		t.Run("SubscribeEmitsResyncFirst", func(t *testing.T) {
-			s, cleanup := f(t)
-			t.Cleanup(cleanup)
+	t.Run("SubscribeEmitsResyncFirst", func(t *testing.T) {
+		s, cleanup := f(t)
+		t.Cleanup(cleanup)
 
-			runSubscribeEmitsResyncFirst(t, s, opts)
-		})
+		runSubscribeEmitsResyncFirst(t, s, opts)
+	})
 
-		t.Run("EventCarriesScopeAndRevision", func(t *testing.T) {
-			s, cleanup := f(t)
-			t.Cleanup(cleanup)
+	t.Run("EventCarriesScopeAndRevision", func(t *testing.T) {
+		s, cleanup := f(t)
+		t.Cleanup(cleanup)
 
-			runEventCarriesScopeAndRevision(t, s, opts)
-		})
+		runEventCarriesScopeAndRevision(t, s, opts)
+	})
 
-		t.Run("DeleteEventRevisionZero", func(t *testing.T) {
-			s, cleanup := f(t)
-			t.Cleanup(cleanup)
+	t.Run("DeleteEventRevisionZero", func(t *testing.T) {
+		s, cleanup := f(t)
+		t.Cleanup(cleanup)
 
-			runDeleteEventRevisionZero(t, s, opts)
-		})
+		runDeleteEventRevisionZero(t, s, opts)
+	})
 
-		t.Run("SubscribeThenImmediateWriteNeverLosesTheEvent", func(t *testing.T) {
-			runSubscribeThenImmediateWrite(t, f, opts)
-		})
+	t.Run("SubscribeThenImmediateWriteNeverLosesTheEvent", func(t *testing.T) {
+		runSubscribeThenImmediateWrite(t, f, opts)
+	})
 
-		t.Run("ResyncAfterForcedReconnect", func(t *testing.T) {
-			runResyncAfterForcedReconnect(t, f, opts)
-		})
-	}
+	t.Run("ResyncAfterForcedReconnect", func(t *testing.T) {
+		runResyncAfterForcedReconnect(t, f, opts)
+	})
 }
 
 func startStore(t *testing.T, s store.Store) {
