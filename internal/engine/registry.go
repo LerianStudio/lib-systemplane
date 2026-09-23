@@ -32,7 +32,9 @@ type KeyDef struct {
 	// whenever the context lacks a tenant therefore refuses every stored row,
 	// and the ingress contract decides what follows — the last value that
 	// passed stays in force, or the registered default at Revision 0 when no
-	// row was ever accepted, and the rejection is logged once per key.
+	// row was ever accepted, and the rejection is logged once per ingestion
+	// attempt — so a flapping changefeed repeats that WARN once per
+	// registered key per resync, rather than once for the life of the key.
 	Validate func(context.Context, any) error
 	// Redacted reports that the key was registered with a redaction policy
 	// other than "none": its value is sensitive and must never reach a log

@@ -202,7 +202,17 @@ type scopeState struct {
 
 Amended in the fix pass (2026-09-17): `reconciling`, `touched` and `unusable` became `windows`, one `reconcileWindow` per reconcile in flight keyed by `reconcileGen`, so two overlapping reconciles never inherit each other's fences; `scopeState` also carries the reconcile mailbox (`resyncMu`, `resyncPending`, `resyncSignal`, `reconcileStop`, `stopOnce`, `workerStarted`) that gives each scope one reconcile goroutine instead of one per OpResync
 
-`Engine` itself gets its struct here too: a `store.Store`, a `Registry`, a logger, a `store.Telemetry`, `scopesMu sync.RWMutex` + `scopes map[store.Scope]*scopeState`, and the lifecycle context pair. Dispatch and debounce fields are added by Epic 1.3; leave them out rather than stubbing them.
+`Engine` itself gets its struct here too: a `store.Store`, a `Registry`, a logger, `scopesMu sync.RWMutex` + `scopes map[store.Scope]*scopeState`, and the lifecycle context pair. Dispatch and debounce fields are added by Epic 1.3; leave them out rather than stubbing them.
+
+Amended 2026-09-23: an earlier draft of that sentence also listed a `store.Telemetry` field. Phase 1
+ships none, and the landed `Engine` (`internal/engine/engine.go:27-88`) carries no telemetry of any
+kind. `index.md` FC-12 (Engine metrics, meter `systemplane.engine`) freezes the whole engine
+instrument set as the engine-tenants lane's deliverable, so the field arrives with its first
+producer rather than as a stub nothing writes. The engine emits no spans of its own either: the
+store reads (`refreshKey` in `internal/engine/feed.go`, `listSnapshot` in
+`internal/engine/reconcile.go`) and the subscriber callbacks all run under the bare lifecycle
+context, exactly as v3's `internal/client` `refreshFromStore` did. Putting a trace carrier on
+`store.Event` would change FC-2 and is out of this lane.
 
 Cache reads land here as `(*Engine).Lookup(scope store.Scope, nk NSKey) (Entry, bool)`: it returns the cached `entry` widened into the exported `Entry`, with `Value` passed through `Clone` so the caller owns it and `Stale` copied from the scope. On a scope that is not tracked, or a key not in its map, `ok` is false — the caller (the Client, in Phase 2) then falls back to the registered default. A new scope is created `stale: true`: until its first reconcile completes nothing has confirmed the cache against the store.
 
@@ -255,7 +265,18 @@ type publication struct {
 func (e *Engine) publish(pub publication) (notify bool)
 ```
 
-The whole function runs under the scope's write lock so two feed events for the same key cannot interleave a compare with a store. Creating the scope on demand is Task 1.4.1's job; `publish` into a scope that does not exist creates it lazily here, stale, which is what makes `Set` before the first reconcile work.
+The whole function runs under the scope's write lock so two feed events for the same key cannot interleave a compare with a store.
+
+Amended 2026-09-23: this paragraph used to end by saying `publish` into a scope that does not exist
+creates it lazily, stale, which is what makes `Set` before the first reconcile work. Phase 1 fix
+pass (commit `7dd9654`) inverted that, and the inversion is the contract now: **a publication never
+creates a scope, only bring-up does.** `Publish` resolves through `trackedScope`
+(`internal/engine/publish.go:148`, which never creates one) and drops a write addressed to an
+untracked scope at DEBUG (`internal/engine/engine.go:455-465`), because a scope with no changefeed
+behind it and no reconcile goroutine to confirm it would read as current forever. Runtime impact
+today is nil: `internal/client/set.go:27` refuses a pre-`Start` `Set` with `ErrNotStarted`, so no
+write reaches the engine before bring-up. `TestPublishRefusesAnUntrackedScope`
+(`internal/engine/publish_test.go:251`) pins it.
 
 Decisions the implementer does not re-litigate:
 
@@ -268,7 +289,19 @@ Decisions the implementer does not re-litigate:
 - Create: `internal/engine/publish.go`
 - Create: `internal/engine/publish_test.go`
 
-**Verification:** `go test -tags=unit -race ./internal/engine/...` — `TestPublishAcceptsHigherRevision`, `TestPublishRejectsLowerRevision` (cached value and provenance both unchanged), `TestPublishRefreshesProvenanceWithoutNotify` (equal non-zero revision, **equal value**: `UpdatedAt` / `UpdatedBy` updated, value untouched, `notify` false), `TestPublishAcceptsSameRevisionWithChangedValue` (**D3's foreign-writer RED test** — cache holds revision 3 with value `"a"`; publish revision 3 with value `"b"`: the cache ends at `"b"`, provenance is refreshed, and `notify` is true; this is the MongoDB writer that changed `value` without `$inc` on `revision`), `TestPublishRevisionZeroAlwaysWinsAndResetsRevision`, `TestPublishCreatesScopeLazilyAsStale`, and `TestPublishIsSerializedUnderRace` (two goroutines publishing revisions 1..100 for one key end with the cache at 100 and never below a previously observed revision).
+**Verification:** `go test -tags=unit -race ./internal/engine/...`. Amended 2026-09-23 to the three
+tests that actually ship, in place of the six speculative names this line carried:
+`TestPublishFence` (`internal/engine/publish_test.go:64`) is a table with one subtest per fence
+outcome — an uncached key accepted, a higher revision accepted with its provenance, a lower revision
+rejected overwriting nothing, an equal revision with an equal value refreshing provenance only
+(including the identical-bytes and reordered-bytes spellings of "equal"), an equal revision with a
+changed value accepted (**D3's foreign writer**: the MongoDB process that changed `value` without
+`$inc` on `revision`), revision 0 winning over a cached revision and resetting the counter, a
+repeated revision 0 never deduplicated, and a recreate accepted over the reset counter;
+`TestPublishRefusesAnUntrackedScope` (`:251`) pins the amendment above — no publication creates a
+scope; and `TestPublishIsSerializedUnderRace` (`:276`) has two goroutines publish revisions 1..100
+for one key and asserts the cache ends at 100 and never drops below a previously observed
+revision.
 
 **Done when:** the four outcomes behave exactly as documented, including the equal-revision split on value equality; no code path outside `publish` writes `scopeState.entries`.
 
@@ -523,7 +556,7 @@ The `Set` path is `(*Engine).Publish(scope store.Scope, e store.Entry)`: the Cli
 
 FC-11 fires on that first reconcile: every registered key is announced to subscribers registered before `Start` returns, absent rows at Revision 0. The behavior and its test live in Task 1.2.3; `Start` owes it only the ordering — subscribe, then wait for the first reconcile to complete — so a subscriber registered before `Start` cannot miss the announcement and a caller reading after `Start` returns is looking at a confirmed cache.
 
-Named edge cases: a `Publish` whose revision the store reported as 0 (a backend that cannot report one) still takes effect, because revision 0 always wins — at the cost of the echo firing a second callback for that key. That is the correct trade: a value the caller just wrote must be readable. `Start` on a closed engine returns the closed sentinel. `Start` is idempotent: a second call returns nil without re-subscribing. `Publish` before `Start` creates the scope lazily and works, so a Client that writes before starting is not silently dropped.
+Named edge cases: a `Publish` whose revision the store reported as 0 (a backend that cannot report one) still takes effect, because revision 0 always wins — at the cost of the echo firing a second callback for that key. That is the correct trade: a value the caller just wrote must be readable. `Start` on a closed engine returns the closed sentinel. `Start` is idempotent: a second call returns nil without re-subscribing. `Publish` before `Start` is DROPPED, not served (amended 2026-09-23, commit `7dd9654`): a publication never creates a scope, only bring-up does, because a scope with no changefeed and no reconcile goroutine would read as current forever. `Publish` resolves through `trackedScope` and logs the dropped write at DEBUG (`internal/engine/engine.go:455-465`). Runtime impact today is nil — `internal/client/set.go:27` refuses a pre-`Start` `Set` with `ErrNotStarted` — so no Client write reaches the engine before bring-up; see Task 1.1.3 for the full rule.
 
 **Files:**
 - Modify: `internal/engine/engine.go` (`New`, `Config`, `Start`, `Publish`)
@@ -667,7 +700,7 @@ instants, and a feed can flip the flag between them. The Client stamps `Stale` f
 
 Named edge cases: `Stale` must not create a scope. Use the `e.scopes` map read under `scopesMu.RLock`
 directly, as `Lookup` does at `internal/engine/engine.go:381-387`, never `scopeFor`, which creates
-one lazily (`internal/engine/publish.go:110`) — a `Stale` call from a multi-tenant read would
+one lazily (`internal/engine/publish.go:165`) — a `Stale` call from a multi-tenant read would
 otherwise conjure a permanently stale, permanently unfed scope on every request.
 
 **Files:**
