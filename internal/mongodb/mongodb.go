@@ -144,10 +144,12 @@ type Store struct {
 	// collIdentityFor falls back to collIdentityOf in that case.
 	identityProbe func(ctx context.Context, coll *mongo.Collection) collIdentity
 
-	// noTenantIDWarn bounds warnSchemaWithoutTenantID to one line per process.
+	// noTenantIDWarn bounds warnSchemaWithoutTenantID to one line per Store.
 	// The path it narrates is on every read and write, so a per-call line
 	// would be a line per request; the condition is a wiring mistake that is
-	// either there for the life of the process or not there at all.
+	// either there for the life of the store or not there at all. Per store
+	// and not per process on purpose: two Stores are two consumers or two
+	// configurations, and each is entitled to say it once.
 	noTenantIDWarn sync.Once
 
 	// feedsMu guards feeds, the changefeeds keyed by scope.Tenant ("" is the
@@ -357,9 +359,9 @@ func schemaCacheKey(tenant string, coll *mongo.Collection) string {
 	return tenant + "/" + db.Name() + "/" + coll.Name()
 }
 
-// warnSchemaWithoutTenantID is emitted once per process, without fields: the
-// message is the whole signal, and the tenant it would name is precisely what
-// is missing.
+// warnSchemaWithoutTenantID is emitted once per Store (noTenantIDWarn bounds
+// it), without fields: the message is the whole signal, and the tenant it
+// would name is precisely what is missing.
 const warnSchemaWithoutTenantID = "tenant-scoped collection arrived without a tenant id; " +
 	"re-running the collection bootstrap on every call because the memo key would be ambiguous. " +
 	"The tenant-manager middleware sets both context keys"
@@ -381,7 +383,7 @@ const warnSchemaWithoutTenantID = "tenant-scoped collection arrived without a te
 // is a no-op on existing indexes), so the cost is one extra round trip per
 // call, two in polling mode — runSchema issues CreateCollection and, when
 // PollInterval > 0, an index CreateMany. No shipped connector takes this path
-// (the tenant-manager middleware sets both keys), so it warns once per process
+// (the tenant-manager middleware sets both keys), so it warns once per Store
 // rather than staying silent about what it is paying for.
 func (s *Store) ensureSchema(ctx context.Context, tenant string, coll *mongo.Collection, tenantScoped bool) error {
 	cacheKey := schemaCacheKey(tenant, coll)

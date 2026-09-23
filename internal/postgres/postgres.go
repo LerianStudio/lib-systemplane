@@ -326,16 +326,23 @@ func (s *Store) resolveDB(ctx context.Context, scope store.Scope) (dbExecutor, e
 // readable by the next Get. It costs no allocation on a path every query
 // crosses: PrimaryDBs returns the resolver's own slice field.
 //
-// What the pin gives up, stated rather than glossed: nothing. dbresolver has
-// no failover for a write — ExecContext, and every statement its checker reads
-// as a write, goes to ReadWrite() once and is never retried (dbresolver/v2
-// db.go), so an unreachable primary fails a Set or a Delete with or without
-// the pin. Its ONE retry is a READ: a read whose error is a net.Error falls
-// back from ReadOnly() to ReadWrite(), gated on !writeFlag (db.go,
-// QueryContext and QueryRowContext). The pin therefore forfeits only that
-// standby-to-primary read retry, and makes it moot in the same stroke —
-// pinning every call to one primary means no read ever reaches a standby to
-// need rescuing off one. Deterministic read-your-writes (D4) at no cost.
+// What the pin gives up, stated rather than glossed: spreading, and only on a
+// resolver that reports more than one primary. ReadWrite() is not "the
+// primary" — it is loadBalancer.Resolve(db.primaries) (dbresolver/v2 db.go),
+// so unpinned writes rotate across primaries and pinned ones all land on
+// primaries[0]. No shipped connector pays that, because lib-commons registers
+// exactly one primary and there is no second node to rotate onto.
+//
+// Failover is NOT among the losses: dbresolver never had any between
+// primaries. ExecContext, and every statement its checker reads as a write,
+// goes to ReadWrite() once and is never retried (db.go), so an unreachable
+// primary fails a Set or a Delete with or without the pin. Its ONE retry is a
+// READ: a read whose error is a net.Error falls back from ReadOnly() to
+// ReadWrite(), gated on !writeFlag (db.go, QueryContext and QueryRowContext).
+// The pin makes that rescue moot rather than removing it — no pinned read ever
+// reaches a standby to need rescuing off one. Deterministic read-your-writes
+// (D4) for the price of one node's share of a multi-primary resolver nobody
+// ships today.
 func pinPrimary(db dbresolver.DB) dbExecutor {
 	if primaries := db.PrimaryDBs(); len(primaries) > 0 {
 		return primaries[0]

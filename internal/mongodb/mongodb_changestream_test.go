@@ -2066,12 +2066,14 @@ func TestEnsureSchema_CtxTenantWithoutIDSkipsMemo(t *testing.T) {
 				return tc.runErr
 			}
 
-			// Same database name, two different clusters — exactly the
-			// collision. Both calls therefore arrive under ONE memo key, and
-			// running twice under one key is only possible because the memo
-			// is skipped. The unmemoized path must also propagate the
-			// bootstrap failure: swallowing it reports a tenant whose
-			// collection was never materialized as ready.
+			// Two distinct client handles onto the same database name. The
+			// memo key is tenant/db/collection and never names the server, so
+			// this reproduces the collision a second cluster would cause
+			// without standing one up. Both calls therefore arrive under ONE
+			// memo key, and running twice under one key is only possible
+			// because the memo is skipped. The unmemoized path must also
+			// propagate the bootstrap failure: swallowing it reports a tenant
+			// whose collection was never materialized as ready.
 			for _, coll := range []*mongo.Collection{
 				offlineCollection(t, "systemplane"),
 				offlineCollection(t, "systemplane"),
@@ -2093,7 +2095,7 @@ func TestEnsureSchema_CtxTenantWithoutIDSkipsMemo(t *testing.T) {
 }
 
 // The unmemoized path pays a round trip on every read and write, so it says so
-// once — a line per call would be a line per request. One WARN per process,
+// once — a line per call would be a line per request. One WARN per store,
 // naming what is missing and who normally supplies it.
 func TestEnsureSchema_CtxTenantWithoutIDWarnsOnce(t *testing.T) {
 	logger := &captureLogger{}
@@ -2122,7 +2124,7 @@ func TestEnsureSchema_CtxTenantWithoutIDWarnsOnce(t *testing.T) {
 	}
 
 	if warns != 1 {
-		t.Fatalf("logged the no-tenant-id warning %d times, want exactly 1 per process", warns)
+		t.Fatalf("logged the no-tenant-id warning %d times, want exactly 1 per store", warns)
 	}
 }
 
