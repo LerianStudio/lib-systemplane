@@ -88,8 +88,20 @@ var (
 type Entry struct {
 	Namespace string
 	Key       string
-	Value     []byte // JSON-encoded
-	Revision  int64  // monotonic per (namespace, key); 0 = unknown
+
+	// Value is the JSON-encoded value, and it belongs to the RECEIVER from
+	// the moment a Store hands it over: the engine retains the slice in its
+	// snapshots and in the changes it publishes, and reads it long after the
+	// call that produced it returned. A Store must therefore never reuse,
+	// re-slice or mutate that memory afterwards, and must never hand out a
+	// view into a driver buffer the driver reuses on its next read — pgx
+	// RawValues and sql.RawBytes on Postgres, bson.Raw and bson.RawValue
+	// views on MongoDB all alias such buffers. A backend that cannot return
+	// memory of its own copies at the boundary (bytes.Clone). The contract
+	// suite pins this for every backend as ValueBytesBelongToTheCaller.
+	Value []byte
+
+	Revision  int64 // monotonic per (namespace, key); 0 = unknown
 	UpdatedAt time.Time
 	UpdatedBy string
 }

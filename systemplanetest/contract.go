@@ -5,6 +5,7 @@
 package systemplanetest
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -69,6 +70,13 @@ func Run(t *testing.T, f Factory, opts RunOptions) {
 		t.Cleanup(cleanup)
 
 		runUpsert(t, s, opts)
+	})
+
+	t.Run("ValueBytesBelongToTheCaller", func(t *testing.T) {
+		s, cleanup := f(t)
+		t.Cleanup(cleanup)
+
+		runValueOwnership(t, s, opts)
 	})
 
 	t.Run("StartIsIdempotent", func(t *testing.T) {
@@ -297,6 +305,121 @@ func runUpsert(t *testing.T, s store.Store, opts RunOptions) {
 	if n, _ := v.(float64); n != 2 {
 		t.Errorf("expected k=2 after upsert, got %v", v)
 	}
+}
+
+// runValueOwnership pins store.Entry.Value ownership: the slice a backend
+// returns is the caller's from that moment on. The engine keeps it in its
+// snapshots and in the changes it publishes and reads it much later, so a
+// backend that returned a view into a buffer it reuses — pgx RawValues,
+// sql.RawBytes, a bson.Raw view — would corrupt published state on its next
+// read, silently and long after the call that leaked the buffer. The case
+// therefore holds one slice from the very first read all the way to the end,
+// across every later read and write, which is what a reused buffer breaks.
+func runValueOwnership(t *testing.T, s store.Store, opts RunOptions) {
+	startStore(t, s)
+
+	ctx := context.Background()
+
+	const (
+		ns  = "ns"
+		key = "owned"
+	)
+
+	first := entry(ns, key, "first")
+	wantFirst := bytes.Clone(first.Value)
+
+	setEntry(ctx, t, s, opts.Scope, first)
+
+	// Held, untouched, until the end of the case.
+	kept := getValue(ctx, t, s, opts.Scope, ns, key)
+	if !bytes.Equal(kept, wantFirst) {
+		t.Fatalf("get value = %q, want %q", kept, wantFirst)
+	}
+
+	// Writing through a returned slice reaches neither the stored value nor
+	// any slice another read handed out.
+	scribble(getValue(ctx, t, s, opts.Scope, ns, key))
+
+	if got := getValue(ctx, t, s, opts.Scope, ns, key); !bytes.Equal(got, wantFirst) {
+		t.Errorf("mutating the slice Get returned changed the stored value: %q, want %q", got, wantFirst)
+	}
+
+	if !bytes.Equal(kept, wantFirst) {
+		t.Errorf("mutating one Get result changed a slice an earlier Get returned: %q, want %q", kept, wantFirst)
+	}
+
+	second := entry(ns, key, "second")
+	wantSecond := bytes.Clone(second.Value)
+
+	setEntry(ctx, t, s, opts.Scope, second)
+
+	if !bytes.Equal(kept, wantFirst) {
+		t.Errorf("a slice retained from Get changed after a later Set: %q, want %q", kept, wantFirst)
+	}
+
+	// List hands out the same ownership.
+	keptFromList := listedValue(ctx, t, s, opts.Scope, ns, key)
+	if !bytes.Equal(keptFromList, wantSecond) {
+		t.Fatalf("listed value = %q, want %q", keptFromList, wantSecond)
+	}
+
+	scribble(listedValue(ctx, t, s, opts.Scope, ns, key))
+
+	if got := listedValue(ctx, t, s, opts.Scope, ns, key); !bytes.Equal(got, wantSecond) {
+		t.Errorf("mutating the slice List returned changed the stored value: %q, want %q", got, wantSecond)
+	}
+
+	setEntry(ctx, t, s, opts.Scope, entry(ns, key, "third"))
+
+	if !bytes.Equal(keptFromList, wantSecond) {
+		t.Errorf("a slice retained from List changed after later reads and a Set: %q, want %q", keptFromList, wantSecond)
+	}
+
+	// The very first slice, across every read and write since.
+	if !bytes.Equal(kept, wantFirst) {
+		t.Errorf("the slice the first Get returned changed by the end of the case: %q, want %q", kept, wantFirst)
+	}
+}
+
+// scribble overwrites b in place with bytes that are neither valid JSON nor
+// any value this suite stores, so a leak shows up as this pattern.
+func scribble(b []byte) {
+	for i := range b {
+		b[i] = '#'
+	}
+}
+
+// getValue returns the value Get reports for ns/key.
+func getValue(ctx context.Context, t *testing.T, s store.Store, scope store.Scope, ns, key string) []byte {
+	t.Helper()
+
+	e, found, err := s.Get(ctx, scope, ns, key)
+	if err != nil {
+		t.Fatalf("get %s/%s: %v", ns, key, err)
+	}
+
+	if !found {
+		t.Fatalf("get %s/%s: not found", ns, key)
+	}
+
+	return e.Value
+}
+
+// listedValue returns the value List reports for ns/key.
+func listedValue(ctx context.Context, t *testing.T, s store.Store, scope store.Scope, ns, key string) []byte {
+	t.Helper()
+
+	entries, err := s.List(ctx, scope)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	e, ok := findEntry(entries, ns, key)
+	if !ok {
+		t.Fatalf("list: %s/%s missing", ns, key)
+	}
+
+	return e.Value
 }
 
 func runStartIdempotent(t *testing.T, s store.Store) {
