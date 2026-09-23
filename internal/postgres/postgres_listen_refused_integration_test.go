@@ -50,6 +50,18 @@ func refusedListenDB(t *testing.T, name string) (admin *sql.DB, dsn string) {
 		t.Fatalf("create database %s: %v", name, err)
 	}
 
+	// The name carries a timestamp, so without this every -count=N run leaves
+	// N more databases on the server the whole package shares. FORCE (13+, the
+	// shared container is 16) terminates whatever backend the test under
+	// examination failed to close, so a leak still fails its own assertion
+	// instead of jamming the cleanup. Registered after the admin.Close above
+	// and therefore, LIFO, runs before it.
+	t.Cleanup(func() {
+		if _, err := admin.Exec(fmt.Sprintf(`DROP DATABASE IF EXISTS %s WITH (FORCE)`, name)); err != nil {
+			t.Errorf("drop database %s: %v", name, err)
+		}
+	})
+
 	// testcontainers hands out postgres://user:pass@host:port/postgres?opts;
 	// swap the database segment and keep everything after it.
 	slash := strings.LastIndexByte(base, '/')

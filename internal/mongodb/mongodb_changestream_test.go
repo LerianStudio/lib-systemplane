@@ -1113,44 +1113,60 @@ func assertOpSequence(t *testing.T, got []store.Event, what string, want ...stri
 // reconnectDelay is what keeps a backend that is down from costing one round
 // trip per tick — and, for a named tenant, one tenant-manager resolution on top
 // of each.
+//
+// Full jitter: every wait is drawn from [0, bound), and the bound is the
+// exponential until it passes the cap and the cap after that. Strictly under
+// the exponential is what makes a streak's waits grow with it; strictly under
+// the CAP is the case a composition that jitters before capping gets wrong,
+// and it only shows up once the outage is long enough to matter — at which
+// point every feed in the process would reopen on the same tick, each cycle
+// costing a tenant re-resolve, a watch aggregate and an OpResync.
 func TestReconnectDelayIsJitteredAndCapped(t *testing.T) {
-	for attempt := range 41 {
-		if d := reconnectDelay(attempt); d < 0 || d > reconnectMaxDelay {
-			t.Fatalf("reconnectDelay(%d) = %s, want a non-negative delay no larger than %s", attempt, d, reconnectMaxDelay)
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		attempt        int
+		wantUpperBound time.Duration
+	}{
+		{"the first retry waits under one base delay", 0, reconnectBaseDelay},
+		{"a two-failure streak waits under two base delays", 1, reconnectBaseDelay << 1},
+		{"a three-failure streak waits under four", 2, reconnectBaseDelay << 2},
+		{"a four-failure streak waits under eight", 3, reconnectBaseDelay << 3},
+		{"a five-failure streak waits under sixteen", 4, reconnectBaseDelay << 4},
+		{"a six-failure streak waits under thirty-two", 5, reconnectBaseDelay << 5},
+		{"the attempt where the exponential first passes the cap waits under the cap", 6, reconnectMaxDelay},
+		{"a long outage waits under the cap, not at it", 20, reconnectMaxDelay},
+		{"an absurd streak still waits under the cap", 40, reconnectMaxDelay},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			for range 32 {
+				if d := reconnectDelay(tt.attempt); d < 0 || d >= tt.wantUpperBound {
+					t.Fatalf("reconnectDelay(%d) = %s, want a delay drawn from [0, %s)", tt.attempt, d, tt.wantUpperBound)
+				}
+			}
+		})
+	}
+
+	t.Run("20 draws at a capped attempt are not all equal", func(t *testing.T) {
+		t.Parallel()
+
+		const capped = 20
+
+		draws := make(map[time.Duration]struct{})
+
+		for range 20 {
+			draws[reconnectDelay(capped)] = struct{}{}
 		}
-	}
 
-	// Full jitter: strictly under the exponential bound, which is what makes a
-	// streak's waits grow with it.
-	for attempt := range 6 {
-		bound := reconnectBaseDelay << attempt
-		if d := reconnectDelay(attempt); d >= bound {
-			t.Fatalf("reconnectDelay(%d) = %s, want strictly under the exponential bound %s", attempt, d, bound)
+		if len(draws) == 1 {
+			t.Fatalf("20 draws of reconnectDelay(%d) all returned %v; past the cap the jitter is gone and every feed of one outage reopens in lockstep", capped, reconnectMaxDelay)
 		}
-	}
-
-	// The loop above only reaches attempts where the exponential is still below
-	// the cap, so it passes for a composition that jitters BEFORE capping —
-	// which collapses onto the cap exactly once the outage is long enough to
-	// matter, and then every feed in the process reopens on the same tick, each
-	// cycle costing a tenant re-resolve, a watch aggregate and an OpResync. The
-	// delay must stay DRAWN at a capped attempt too.
-	const capped = 20
-
-	draws := make(map[time.Duration]struct{})
-
-	for range 20 {
-		d := reconnectDelay(capped)
-		if d < 0 || d >= reconnectMaxDelay {
-			t.Fatalf("reconnectDelay(%d) = %s, want a delay drawn from [0, %s)", capped, d, reconnectMaxDelay)
-		}
-
-		draws[d] = struct{}{}
-	}
-
-	if len(draws) == 1 {
-		t.Fatalf("20 draws of reconnectDelay(%d) all returned %v; past the cap the jitter is gone and every feed of one outage reopens in lockstep", capped, reconnectMaxDelay)
-	}
+	})
 }
 
 // TestPollBackoffAdvancesTheStreakAndStopsWithTheFeed pins both halves of the
