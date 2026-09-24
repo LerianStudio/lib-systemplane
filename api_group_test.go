@@ -1518,6 +1518,27 @@ func awaitScopes(t *testing.T, g *systemplane.Group[groupConfig], n int) []syste
 	}
 }
 
+// awaitStatus polls Status until want accepts it. A delivery reaches the
+// applier before the coordinator records its outcome, so Status read right
+// after a delivery can still be stale.
+func awaitStatus(t *testing.T, g *systemplane.Group[groupConfig], want func([]systemplane.ApplyStatus) bool) []systemplane.ApplyStatus {
+	t.Helper()
+
+	deadline := time.After(5 * time.Second)
+
+	for {
+		if status := g.Status(); want(status) {
+			return status
+		}
+
+		select {
+		case <-deadline:
+			t.Fatalf("Status never reached the wanted state after 5s: %#v", g.Status())
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
 // bindGroupOn binds the standard group over c and fails the test if it cannot.
 func bindGroupOn(t *testing.T, c *systemplane.Client) *systemplane.Group[groupConfig] {
 	t.Helper()
@@ -2096,10 +2117,9 @@ func TestGroupOnApplyBeforeStartReceivesTheStoredDocumentFromStart(t *testing.T)
 	last := rec.awaitLast(t, "the applier never received the stored document the first reconcile published",
 		func(a systemplane.Applied[groupConfig]) bool { return reflect.DeepEqual(a.Value, stored) })
 
-	status := awaitScopes(t, g, 1)
-	if len(status) != 1 {
-		t.Fatalf("Status() = %#v, want exactly one scope entry", status)
-	}
+	status := awaitStatus(t, g, func(st []systemplane.ApplyStatus) bool {
+		return len(st) == 1 && st[0].Applied == last.Revision
+	})
 
 	if status[0].Desired != last.Revision || status[0].Applied != last.Revision {
 		t.Errorf("Status entry = %#v, want the stored document's revision %d desired and applied", status[0], last.Revision)
@@ -2360,10 +2380,9 @@ func TestGroupOnApplyReceivesTheDefaultAfterADelete(t *testing.T) {
 		t.Errorf("Previous on the delete delivery = %#v, want the deleted document %#v", prev, rolled)
 	}
 
-	status := awaitScopes(t, g, 1)
-	if len(status) != 1 {
-		t.Fatalf("Status entries = %d, want 1", len(status))
-	}
+	status := awaitStatus(t, g, func(st []systemplane.ApplyStatus) bool {
+		return len(st) == 1 && st[0].Applied == 0
+	})
 
 	if status[0].Desired != 0 || status[0].Applied != 0 {
 		t.Errorf("Status after the delete = Desired %d, Applied %d, want 0 and 0: a delete publishes Revision 0 and that is convergence", status[0].Desired, status[0].Applied)
