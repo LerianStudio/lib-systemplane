@@ -70,7 +70,7 @@ func panickingApply(t *testing.T, redacted bool) (*recordingLogger, *recordingSp
 	logger := newRecordingLogger()
 	span := &recordingSpan{}
 
-	c := NewCoordinator[coordDoc](logger, redacted, Decode[coordDoc], nil)
+	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, redacted, Decode[coordDoc], nil)
 
 	unsubscribe := mustRegister(t, c, func(_ context.Context, current Decoded[coordDoc], _ *Decoded[coordDoc]) error {
 		panic(fmt.Sprintf("cannot apply %+v", current.Value))
@@ -110,6 +110,10 @@ func TestApplierPanicOnARedactedGroupWithholdsTheDocument(t *testing.T) {
 			t.Errorf("the span carries the document of a redacted group: %s", written)
 		}
 	}
+
+	// The document is withheld, so these two fields are all that is left to
+	// say which group stopped being applied.
+	assertNamesTheGroup(t, logger.lineContaining(t, "apply function panicked"), coordNamespace, coordKey)
 
 	reported := logger.lineContaining(t, "panic recovered")
 

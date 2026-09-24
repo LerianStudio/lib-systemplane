@@ -101,6 +101,33 @@ func assertPanicScopeLine(t *testing.T, logger *recordingLogger, tenant string, 
 	}
 }
 
+// coordNamespace and coordKey are the group every unit coordinator in this
+// package is built for. They are distinctive so an assertion that reads them
+// back out of a log line is reading what NewCoordinator was handed.
+const (
+	coordNamespace = "grpns"
+	coordKey       = "grpkey"
+)
+
+// assertNamesTheGroup pins the two fields that say WHICH group a coordinator
+// report is about. Without them a redacted group's report names only the
+// tenant and the revision — "apply function panicked tenant.id=t1 revision=0"
+// — and an operator has nothing to act on, because the document that would
+// have identified the group is exactly what redaction withheld. "keyname", not
+// "key": the latter is an exact entry in lib-observability's sensitive-field
+// list, and it is the same field name the engine's twin reports emit.
+func assertNamesTheGroup(t *testing.T, line logLine, namespace, key string) {
+	t.Helper()
+
+	if got := line.fields["namespace"]; got != namespace {
+		t.Errorf("namespace = %v, want %q: the report must name the group", got, namespace)
+	}
+
+	if got := line.fields["keyname"]; got != key {
+		t.Errorf("keyname = %v, want %q: the report must name the group", got, key)
+	}
+}
+
 func newRecordingLogger() *recordingLogger {
 	return &recordingLogger{NopLogger: &log.NopLogger{}}
 }
@@ -163,7 +190,7 @@ func TestCoordinatorApplierErrorRecordsARejection(t *testing.T) {
 
 func TestCoordinatorApplierPanicIsRecordedLikeAnError(t *testing.T) {
 	logger := newRecordingLogger()
-	c := NewCoordinator[coordDoc](logger, false, Decode[coordDoc], nil)
+	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, false, Decode[coordDoc], nil)
 	ctx := context.Background()
 
 	unsubscribe := mustRegister(t, c, func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
@@ -227,7 +254,7 @@ func TestCoordinatorApplierPanicIsRedactedInProductionMode(t *testing.T) {
 	defer runtime.SetProductionMode(false)
 
 	logger := newRecordingLogger()
-	c := NewCoordinator[coordDoc](logger, false, Decode[coordDoc], nil)
+	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, false, Decode[coordDoc], nil)
 
 	unsubscribe := mustRegister(t, c, func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
 		panic("boom")
@@ -297,7 +324,7 @@ func TestCoordinatorAPanickingLoggerStillRecordsThePanic(t *testing.T) {
 
 	defer runtime.ResetPanicMetrics()
 
-	c := NewCoordinator[coordDoc](&alwaysPanickingLogger{NopLogger: &log.NopLogger{}}, false, Decode[coordDoc], nil)
+	c := NewCoordinator[coordDoc](&alwaysPanickingLogger{NopLogger: &log.NopLogger{}}, coordNamespace, coordKey, false, Decode[coordDoc], nil)
 
 	unsubscribe := mustRegister(t, c, func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
 		panic("the apply function exploded")
@@ -321,7 +348,7 @@ func TestCoordinatorAPanickingLoggerStillRecordsThePanic(t *testing.T) {
 // revision and the error.
 func TestCoordinatorApplierErrorIsLogged(t *testing.T) {
 	logger := newRecordingLogger()
-	c := NewCoordinator[coordDoc](logger, false, Decode[coordDoc], nil)
+	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, false, Decode[coordDoc], nil)
 
 	unsubscribe := mustRegister(t, c, func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
 		return errRejected
@@ -413,7 +440,7 @@ func TestCoordinatorRejectionIsNeverRetried(t *testing.T) {
 
 func TestCoordinatorDecodeFailureIsRecordedAndNeverDelivered(t *testing.T) {
 	logger := newRecordingLogger()
-	c := NewCoordinator[coordDoc](logger, false, rejectingDecode("bad"), nil)
+	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, false, rejectingDecode("bad"), nil)
 	ctx := context.Background()
 
 	var rec recorder
@@ -440,6 +467,8 @@ func TestCoordinatorDecodeFailureIsRecordedAndNeverDelivered(t *testing.T) {
 	if got.LastErr == nil {
 		t.Error("LastErr = nil, want the decode failure")
 	}
+
+	assertNamesTheGroup(t, logger.lineContaining(t, "failed to decode"), coordNamespace, coordKey)
 
 	// The last good publication must stay replayable for a later Register.
 	var late recorder
@@ -495,7 +524,7 @@ func TestCoordinatorSupersededDecodeFailureIsStillLogged(t *testing.T) {
 		return doc, nil
 	}
 
-	c := NewCoordinator[coordDoc](logger, false, decode, nil)
+	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, false, decode, nil)
 	ctx := context.Background()
 
 	var rec recorder
@@ -557,7 +586,7 @@ func TestCoordinatorDecodeFailureOnAFreshScopeIsObserved(t *testing.T) {
 		return Publication{}, false, nil
 	}
 
-	c := NewCoordinator[coordDoc](newRecordingLogger(), false, rejectingDecode("bad"), seed)
+	c := NewCoordinator[coordDoc](newRecordingLogger(), coordNamespace, coordKey, false, rejectingDecode("bad"), seed)
 
 	c.Publish(context.Background(), publication("t1", 4, "bad"))
 
@@ -620,7 +649,7 @@ func TestCoordinatorNullValueIsRejectedByTheCodecAndNeverDelivered(t *testing.T)
 		return Decode[coordDoc](value)
 	}
 
-	c := NewCoordinator[coordDoc](newRecordingLogger(), false, refuseNull, nil)
+	c := NewCoordinator[coordDoc](newRecordingLogger(), coordNamespace, coordKey, false, refuseNull, nil)
 	ctx := context.Background()
 
 	var rec recorder
@@ -790,7 +819,7 @@ func TestCoordinatorUnsubscribeStopsDeliveryAndReleasesStatus(t *testing.T) {
 // nobody is applying is healthy. LastErr clears when an applier ACCEPTS, and
 // leaving is not accepting.
 func TestCoordinatorUnsubscribingTheLastApplierKeepsTheRejection(t *testing.T) {
-	c := NewCoordinator[coordDoc](newRecordingLogger(), false, rejectingDecode("bad"), nil)
+	c := NewCoordinator[coordDoc](newRecordingLogger(), coordNamespace, coordKey, false, rejectingDecode("bad"), nil)
 
 	c.Publish(context.Background(), publication("t1", 4, "bad"))
 
@@ -976,7 +1005,7 @@ func TestCoordinatorLastApplierRejectingAndLeavingKeepsTheRejection(t *testing.T
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			c := NewCoordinator[coordDoc](tc.logger, false, Decode[coordDoc], nil)
+			c := NewCoordinator[coordDoc](tc.logger, coordNamespace, coordKey, false, Decode[coordDoc], nil)
 
 			var (
 				unsubscribe func()

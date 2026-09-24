@@ -179,7 +179,7 @@ func Bind[T any](c *Client, namespace, key string, defaults T, validate func(T) 
 	// applier's document is withheld from the panic report either way.
 	redacted := c.KeyRedaction(namespace, key) != RedactNone
 
-	g.coordinator = group.NewCoordinator[T](c.Logger(), redacted, g.decodePublished, g.seedCurrentEntry)
+	g.coordinator = group.NewCoordinator[T](c.Logger(), g.namespace, g.key, redacted, g.decodePublished, g.seedCurrentEntry)
 
 	// The group's one subscription, taken here — before Start, and therefore
 	// before any publication can exist. That is the structural half of FC-7's

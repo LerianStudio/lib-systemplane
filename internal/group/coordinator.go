@@ -172,6 +172,14 @@ type delivery[T any] struct {
 // returns nil.
 type Coordinator[T any] struct {
 	logger log.Logger
+	// namespace and key name the group every report below is about. They are
+	// carried rather than derived because a redacted group's report withholds
+	// the document, which would otherwise have been the only thing saying
+	// which group stopped being applied. Same two field names the engine's
+	// twin reports emit: "namespace" and "keyname" — never "key", which is an
+	// exact entry in lib-observability's sensitive-field list.
+	namespace string
+	key       string
 	// redacted is the group key's registration speaking: true when the key
 	// carries any redaction policy, and the only reason this package knows
 	// anything about redaction at all. A panicking applier is routinely
@@ -195,16 +203,19 @@ type Coordinator[T any] struct {
 // NewCoordinator builds a coordinator. logger (may be nil) receives decode
 // failures and applier panics, and is guarded here so every site that logs
 // through it — including lib-observability's panic handler, which logs before
-// it counts — is safe from a consumer logger that panics; redacted says the
-// group's key is registered with a redaction policy, which withholds a
-// panicking applier's value from the report; decode converts a published
-// document into T; seed reads the group's current entry through the Client and
-// reports ok=false when the Client does not yet track the scope. A seed that
-// cannot read at all returns its error instead, and Register hands that error
-// to the registrant. seed is consulted only by a Register that finds no
-// observed publication at all.
+// it counts — is safe from a consumer logger that panics; namespace and key
+// name the group, and every line this package writes carries them, because a
+// redacted group withholds the document that would otherwise have identified
+// it; redacted says the group's key is registered with a redaction policy,
+// which withholds a panicking applier's value from the report; decode
+// converts a published document into T; seed reads the group's current entry
+// through the Client and reports ok=false when the Client does not yet track
+// the scope. A seed that cannot read at all returns its error instead, and
+// Register hands that error to the registrant. seed is consulted only by a
+// Register that finds no observed publication at all.
 func NewCoordinator[T any](
 	logger log.Logger,
+	namespace, key string,
 	redacted bool,
 	decode func(any) (T, error),
 	seed func() (Publication, bool, error),
@@ -215,11 +226,13 @@ func NewCoordinator[T any](
 		// package writes runs either on a publishing goroutine the consumer
 		// cannot recover on or inside an applier's recovery. Guard answers nil
 		// with a no-op logger, so the field is never nil below.
-		logger:   safelog.Guard(logger),
-		redacted: redacted,
-		decode:   decode,
-		seed:     seed,
-		scopes:   map[string]*scope[T]{},
+		logger:    safelog.Guard(logger),
+		namespace: namespace,
+		key:       key,
+		redacted:  redacted,
+		decode:    decode,
+		seed:      seed,
+		scopes:    map[string]*scope[T]{},
 	}
 }
 
@@ -257,7 +270,9 @@ func (c *Coordinator[T]) Publish(ctx context.Context, pub Publication) {
 	if err != nil {
 		c.logError(ctx, "systemplane.group: published document failed to decode",
 			safelog.ErrorDetail(c.redacted, "decode failed", err),
-			log.String(constants.AttrKeyTenantID, pub.Tenant), log.Any("revision", pub.Revision))
+			log.String(constants.AttrKeyTenantID, pub.Tenant),
+			log.String("namespace", c.namespace), log.String("keyname", c.key),
+			log.Any("revision", pub.Revision))
 
 		return
 	}
@@ -411,6 +426,7 @@ func (c *Coordinator[T]) Register(fn ApplyFunc[T]) (func(), error) {
 		c.logError(ctx, "systemplane.group: seeded document failed to decode",
 			safelog.ErrorDetail(c.redacted, "decode failed", seeded.decodeErr),
 			log.String(constants.AttrKeyTenantID, seeded.pub.Tenant),
+			log.String("namespace", c.namespace), log.String("keyname", c.key),
 			log.Any("revision", seeded.pub.Revision))
 	}
 
@@ -813,6 +829,7 @@ func (c *Coordinator[T]) invoke(
 			// handler.
 			c.logError(ctx, "systemplane.group: apply function panicked",
 				log.String(constants.AttrKeyTenantID, current.Tenant),
+				log.String("namespace", c.namespace), log.String("keyname", c.key),
 				log.Any("revision", current.Revision))
 
 			c.reportPanic(ctx, recovered)
@@ -824,6 +841,7 @@ func (c *Coordinator[T]) invoke(
 		c.logError(ctx, "systemplane.group: apply function rejected the published document",
 			safelog.ErrorDetail(c.redacted, "apply rejected the document", err),
 			log.String(constants.AttrKeyTenantID, current.Tenant),
+			log.String("namespace", c.namespace), log.String("keyname", c.key),
 			log.Any("revision", current.Revision))
 	}
 

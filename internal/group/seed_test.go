@@ -33,7 +33,7 @@ func (s *seeder) read() (Publication, bool, error) {
 func newSeedingCoordinator(t *testing.T, seed *seeder) *Coordinator[coordDoc] {
 	t.Helper()
 
-	return NewCoordinator[coordDoc](nil, false, Decode[coordDoc], seed.read)
+	return NewCoordinator[coordDoc](nil, coordNamespace, coordKey, false, Decode[coordDoc], seed.read)
 }
 
 func TestCoordinatorSeedsWhenNothingWasObserved(t *testing.T) {
@@ -216,7 +216,7 @@ func TestCoordinatorNeverSeedsAScopeItAlreadyObserved(t *testing.T) {
 func TestCoordinatorSeedThatFailsToDecodeIsRecorded(t *testing.T) {
 	seed := &seeder{pub: publication("t1", 7, "bad"), ok: true}
 	logger := newRecordingLogger()
-	c := NewCoordinator[coordDoc](logger, false, rejectingDecode("bad"), seed.read)
+	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, false, rejectingDecode("bad"), seed.read)
 
 	var rec recorder
 
@@ -236,6 +236,8 @@ func TestCoordinatorSeedThatFailsToDecodeIsRecorded(t *testing.T) {
 	if len(lines) != 1 || !strings.Contains(lines[0].msg, "failed to decode") {
 		t.Fatalf("logged = %v, want the decode failure at error level", lines)
 	}
+
+	assertNamesTheGroup(t, lines[0], coordNamespace, coordKey)
 
 	// A6 parity with the published-document branch: the rejection IS an
 	// observation, so the observed flag and not just the spent-seed flag says
@@ -350,7 +352,7 @@ func TestCoordinatorDeliversAfterASeedItCannotProveIdentical(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			seed := &seeder{pub: Publication{Tenant: "t1", Revision: 1, Value: tc.seeded}, ok: true}
-			c := NewCoordinator[coordDoc](nil, false, decodeRefusing, seed.read)
+			c := NewCoordinator[coordDoc](nil, coordNamespace, coordKey, false, decodeRefusing, seed.read)
 
 			var rec recorder
 
