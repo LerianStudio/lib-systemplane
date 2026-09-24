@@ -424,27 +424,40 @@ func (c *Client) refreshFromStore(nk nskey, op string) {
 			return
 		}
 
-		if found {
-			var decoded any
-			if err := json.Unmarshal(entry.Value, &decoded); err != nil {
-				c.logWarn(ctx, "failed to unmarshal refreshed value, keeping current",
-					log.String("namespace", nk.Namespace),
-					log.String("key", nk.Key),
-					log.Err(err),
-				)
+		if !found {
+			// The change notification and this re-read are separate
+			// operations: the write may simply not be visible to this reader
+			// yet. A real removal arrives as store.OpDelete and is handled
+			// above, so a miss here is a non-answer — keep the last
+			// known-good value instead of resetting to the default.
+			c.logWarn(ctx, "refreshed key not found in store, keeping current value",
+				log.String("namespace", nk.Namespace),
+				log.String("key", nk.Key),
+			)
 
-				return
-			}
-
-			newValue = decoded
+			return
 		}
+
+		var decoded any
+		if err := json.Unmarshal(entry.Value, &decoded); err != nil {
+			c.logWarn(ctx, "failed to unmarshal refreshed value, keeping current",
+				log.String("namespace", nk.Namespace),
+				log.String("key", nk.Key),
+				log.Err(err),
+			)
+
+			return
+		}
+
+		newValue = decoded
 	}
 
 	// Record that hydration's later List() pass MUST NOT overwrite this key:
 	// the changefeed has just delivered a fresher value (or a delete event).
-	// We set this AFTER the refresh has produced a usable value — if Get or
-	// the JSON decode failed, we return above without touching the cache, so
-	// hydrate()'s List() snapshot remains the correct source of truth.
+	// We set this AFTER the refresh has produced a usable value — if Get
+	// failed, reported not-found, or the JSON decode failed, we return above
+	// without touching the cache, so hydrate()'s List() snapshot remains the
+	// correct source of truth.
 	c.hydratingMu.Lock()
 	if c.hydrating && c.hydrationTouched != nil {
 		c.hydrationTouched[nk] = struct{}{}

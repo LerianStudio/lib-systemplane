@@ -29,6 +29,11 @@ type memStore struct {
 	// listHook is invoked at the top of List(), allowing tests to block
 	// hydration to inject race conditions deterministically. nil disables it.
 	listHook func()
+
+	// getHook is consulted at the top of Get(). When it reports handled, its
+	// (entry, found) result is returned instead of the stored one, letting a
+	// test simulate a read that does not yet see a row that exists.
+	getHook func(ns, key string) (entry store.Entry, found, handled bool)
 }
 
 func newMemStore(multiTenant bool) *memStore {
@@ -52,6 +57,17 @@ func (m *memStore) Start(_ context.Context) error { return nil }
 func (m *memStore) Close() error                  { return nil }
 
 func (m *memStore) Get(_ context.Context, ns, key string) (store.Entry, bool, error) {
+	// Capture the hook outside the lock so it may touch m.* without deadlock.
+	m.mu.Lock()
+	hook := m.getHook
+	m.mu.Unlock()
+
+	if hook != nil {
+		if entry, found, handled := hook(ns, key); handled {
+			return entry, found, nil
+		}
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -922,5 +938,119 @@ func TestHydrationDoesNotOverwriteFresherChangefeedState(t *testing.T) {
 
 	if v.(string) != "new-from-changefeed" {
 		t.Errorf("cache holds %q — hydration overwrote fresher changefeed state", v)
+	}
+}
+
+// TestRefreshKeepsCacheWhenReReadReportsNotFound pins the behavior for a
+// changefeed event whose follow-up read does not see the row: the
+// notification and the re-read are separate operations, so "not found" is a
+// non-answer (the write may not be visible to the reader yet), not evidence
+// the row is gone. Removal has its own path (store.OpDelete). The cache must
+// keep its last known-good value instead of being reset to the registered
+// default.
+func TestRefreshKeepsCacheWhenReReadReportsNotFound(t *testing.T) {
+	m := newMemStore(false)
+	c := newSingleTenantClient(t, m)
+
+	if err := c.Register("ns", "k", "default"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	raw, _ := json.Marshal("known-good")
+	if err := m.Set(context.Background(), store.Entry{Namespace: "ns", Key: "k", Value: raw}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	defer c.Close()
+
+	if v, ok, err := c.Get(context.Background(), "ns", "k"); err != nil || !ok || v.(string) != "known-good" {
+		t.Fatalf("pre-condition get = (%v, %v, %v); want (known-good, true, nil)", v, ok, err)
+	}
+
+	// From here on the re-read reports not-found for this key, while the row
+	// stays in the store.
+	gotGet := make(chan struct{}, 1)
+
+	m.mu.Lock()
+	m.getHook = func(ns, key string) (store.Entry, bool, bool) {
+		if ns != "ns" || key != "k" {
+			return store.Entry{}, false, false
+		}
+
+		select {
+		case gotGet <- struct{}{}:
+		default:
+		}
+
+		return store.Entry{}, false, true
+	}
+	m.mu.Unlock()
+
+	m.fire(store.Event{Namespace: "ns", Key: "k", Op: store.OpUpsert})
+
+	select {
+	case <-gotGet:
+	case <-time.After(2 * time.Second):
+		t.Fatal("refresh never re-read the store")
+	}
+
+	// Let the refresh finish after the read returned.
+	time.Sleep(50 * time.Millisecond)
+
+	// Drop the hook so the assertion reads the cache, not the hook.
+	m.mu.Lock()
+	m.getHook = nil
+	m.mu.Unlock()
+
+	v, ok, err := c.Get(context.Background(), "ns", "k")
+	if err != nil || !ok {
+		t.Fatalf("post-refresh get: ok=%v err=%v", ok, err)
+	}
+
+	if v.(string) != "known-good" {
+		t.Errorf("cache holds %v — a not-found re-read erased the cached value", v)
+	}
+}
+
+// TestRefreshOnDeleteEventRestoresDefault is the counterpart: a delete event
+// IS a real removal, so the refresh must still write the registered default.
+func TestRefreshOnDeleteEventRestoresDefault(t *testing.T) {
+	m := newMemStore(false)
+	c := newSingleTenantClient(t, m)
+
+	if err := c.Register("ns", "k", "default"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	raw, _ := json.Marshal("known-good")
+	if err := m.Set(context.Background(), store.Entry{Namespace: "ns", Key: "k", Value: raw}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	defer c.Close()
+
+	m.mu.Lock()
+	delete(m.entries, memKey("ns", "k"))
+	m.mu.Unlock()
+
+	m.fire(store.Event{Namespace: "ns", Key: "k", Op: store.OpDelete})
+
+	time.Sleep(100 * time.Millisecond)
+
+	v, ok, err := c.Get(context.Background(), "ns", "k")
+	if err != nil || !ok {
+		t.Fatalf("post-delete get: ok=%v err=%v", ok, err)
+	}
+
+	if v.(string) != "default" {
+		t.Errorf("post-delete value = %v, want default", v)
 	}
 }
