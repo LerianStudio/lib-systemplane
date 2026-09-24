@@ -68,6 +68,8 @@ func TestAPanickingConsumerLoggerNeverKillsTheEngine(t *testing.T) {
 	})
 	track(t, e, scope)
 
+	noDeliveryOutlivesTheTest(t, e)
+
 	t.Cleanup(func() {
 		if err := e.Close(); err != nil {
 			t.Errorf("Close: %v, want nil", err)
@@ -172,6 +174,8 @@ func TestRecoverRefreshRetriesBeforeReportingThePanic(t *testing.T) {
 	})
 	track(t, e, scope)
 
+	noDeliveryOutlivesTheTest(t, e)
+
 	t.Cleanup(func() {
 		if err := e.Close(); err != nil {
 			t.Errorf("Close: %v, want nil", err)
@@ -231,6 +235,8 @@ func TestARetryReportingIntoAPanickingLoggerNeverKillsTheProcess(t *testing.T) {
 		Debounce: 0,
 	})
 	track(t, e, scope)
+
+	noDeliveryOutlivesTheTest(t, e)
 
 	t.Cleanup(func() {
 		if err := e.Close(); err != nil {
@@ -327,6 +333,8 @@ func TestAPanickingMetricsRecorderNeverKillsTheEngine(t *testing.T) {
 		Debounce: 0,
 	})
 	track(t, e, scope)
+
+	noDeliveryOutlivesTheTest(t, e)
 
 	t.Cleanup(func() {
 		if err := e.Close(); err != nil {

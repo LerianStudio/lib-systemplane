@@ -33,6 +33,8 @@ func dispatchEngine(t *testing.T) *Engine {
 
 	track(t, e, store.Scope{})
 
+	noDeliveryOutlivesTheTest(t, e)
+
 	t.Cleanup(func() {
 		cancel()
 		e.dispatchWG.Wait()

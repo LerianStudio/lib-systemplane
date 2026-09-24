@@ -5,6 +5,8 @@ package engine
 import (
 	"context"
 	"errors"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -23,6 +25,8 @@ func startEngine(t *testing.T, defs map[NSKey]KeyDef, fs *fakeStore) *Engine {
 	e := New(Config{Store: fs, Registry: fakeRegistry{defs: defs}})
 
 	track(t, e, store.Scope{})
+
+	noDeliveryOutlivesTheTest(t, e)
 
 	t.Cleanup(func() {
 		if err := e.Close(); err != nil {
@@ -603,5 +607,105 @@ func TestStartRetryKeepsSubscriptions(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("the subscriber registered before the failed Start never heard the retry's announcement")
+	}
+}
+
+// runningDelivery reports the delivery still inside a subscriber callback,
+// waiting up to grace for the last one to leave and returning nil once none
+// is. The description comes from stuckError, the same set a timed-out Close
+// names, so the report carries the (tenant, namespace, key) whose callback is
+// running rather than a bare "something leaked".
+//
+// A worker parked between deliveries is not in that set, and neither is one
+// whose goroutine is unwinding: this asks only whether consumer code is still
+// executing, which is the survivor that has outlived a test here.
+func runningDelivery(e *Engine, grace time.Duration) error {
+	deadline := time.Now().Add(grace)
+
+	for runningCount(e) > 0 {
+		if time.Now().After(deadline) {
+			return e.stuckError(grace)
+		}
+
+		time.Sleep(time.Millisecond)
+	}
+
+	return nil
+}
+
+// noDeliveryOutlivesTheTest fails t, BY NAME, when one of e's dispatch workers
+// is still inside a subscriber callback once the test has torn its engine
+// down.
+//
+// goleak already catches that goroutine, but it runs from TestMain once the
+// whole package is over, so its report names a stack and no test — which is
+// how one such survivor stayed unattributable through every attempt to
+// reproduce it. A per-test goleak.VerifyNone would name the test too, but it
+// would have to be retrofitted into every test that subscribes and would then
+// police goroutines this package does not own, trading one flake for another;
+// this reads the engine's own marker, so it fires on exactly the survivor and
+// nothing else, and it goes on the shared helper rather than on the test.
+//
+// It is registered BEFORE the helper's own teardown so LIFO runs it last:
+// after Close, after the test's own releases, after every unsubscribe. An
+// engine built inline in a test rather than through a helper needs its own
+// call.
+func noDeliveryOutlivesTheTest(t *testing.T, e *Engine) {
+	t.Helper()
+
+	const grace = 2 * time.Second
+
+	t.Cleanup(func() {
+		if err := runningDelivery(e, grace); err != nil {
+			t.Errorf("a subscriber callback is still running %s after this test tore its engine "+
+				"down: %v. TestMain's goleak check reports that goroutine without naming a test, "+
+				"so release the callback and wait for it here", grace, err)
+		}
+	})
+}
+
+// TestRunningDeliveryNamesTheCallbackStillInside is the check on the guard
+// every engine helper in this package now ends with. A guard that reported a
+// drained engine while a subscriber was still running would put the intermittent
+// survivor it exists to attribute straight back where it came from: TestMain's
+// goleak report, which names a stack and no test.
+func TestRunningDeliveryNamesTheCallbackStillInside(t *testing.T) {
+	e := dispatchEngine(t)
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+
+	inside, gate := make(chan struct{}), make(chan struct{})
+
+	// Released on every exit path, a failed assertion included: a test that
+	// left its own callback parked would hang the package run instead of
+	// failing, which is the very shape this guard exists to make visible.
+	release := sync.OnceFunc(func() { close(gate) })
+	defer release()
+
+	unsub := e.OnChange(nk, func(context.Context, Change) {
+		close(inside)
+		<-gate // deliberately ignores ctx, the way the survivor this guard chases does
+	})
+	defer unsub()
+
+	e.publishInto(pub(nk, 1, "v1"))
+	mustReceive(t, inside, "the subscriber to start running")
+
+	err := runningDelivery(e, 20*time.Millisecond)
+	if err == nil {
+		t.Fatal("runningDelivery reported a drained engine while a subscriber callback was still " +
+			"inside it: the guard would let an unattributable leak through")
+	}
+
+	for _, want := range []string{"single-tenant", nk.Namespace, nk.Key} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("runningDelivery reported %q, which does not name %q: a guard that fires "+
+				"without saying which delivery is stuck sends the next reader hunting", err, want)
+		}
+	}
+
+	release()
+
+	if err := runningDelivery(e, hangGuard); err != nil {
+		t.Errorf("runningDelivery still reports %v once the callback has returned", err)
 	}
 }

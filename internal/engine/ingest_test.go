@@ -415,6 +415,8 @@ func refusalEngine(t *testing.T, reg Registry) *Engine {
 	e := New(Config{Store: newFakeStore(), Registry: reg, Logger: log.NewNop()})
 	track(t, e, store.Scope{})
 
+	noDeliveryOutlivesTheTest(t, e)
+
 	t.Cleanup(func() {
 		if err := e.Close(); err != nil {
 			t.Errorf("Close: %v", err)

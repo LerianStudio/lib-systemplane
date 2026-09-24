@@ -39,6 +39,8 @@ func registryEngine(t *testing.T, reg Registry, fs *fakeStore, window time.Durat
 
 	track(t, e, store.Scope{})
 
+	noDeliveryOutlivesTheTest(t, e)
+
 	t.Cleanup(func() {
 		e.debouncer.Close()
 		e.lifecycleCancel()
@@ -827,6 +829,8 @@ func untrackedEngine(t *testing.T, defs map[NSKey]KeyDef, fs *fakeStore) *Engine
 	t.Helper()
 
 	e := New(Config{Store: fs, Registry: fakeRegistry{defs: defs}, Debounce: 0})
+
+	noDeliveryOutlivesTheTest(t, e)
 
 	t.Cleanup(func() {
 		e.debouncer.Close()

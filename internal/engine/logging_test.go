@@ -210,6 +210,8 @@ func loggingEngineWith(t *testing.T, defs map[NSKey]KeyDef, fs *fakeStore, rec *
 
 	track(t, e, store.Scope{})
 
+	noDeliveryOutlivesTheTest(t, e)
+
 	t.Cleanup(func() {
 		if err := e.Close(); err != nil {
 			t.Errorf("Close: %v", err)
@@ -921,6 +923,8 @@ func TestReReadPanicNamesTheKey(t *testing.T) {
 			})
 			track(t, e, scope)
 
+			noDeliveryOutlivesTheTest(t, e)
+
 			t.Cleanup(func() {
 				if err := e.Close(); err != nil {
 					t.Errorf("Close after a panicking re-read: %v, want nil: one exploding "+
@@ -1309,6 +1313,8 @@ func TestAcceptedReReadIsFencedThroughTheValidator(t *testing.T) {
 		}}},
 	})
 
+	noDeliveryOutlivesTheTest(t, e)
+
 	t.Cleanup(func() {
 		if err := e.Close(); err != nil {
 			t.Errorf("Close: %v", err)
@@ -1396,6 +1402,8 @@ func TestPanicUnderReReadCannotResetALiveValue(t *testing.T) {
 			<-reconciled
 		}},
 	})
+
+	noDeliveryOutlivesTheTest(t, e)
 
 	t.Cleanup(func() {
 		if err := e.Close(); err != nil {

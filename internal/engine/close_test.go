@@ -36,6 +36,8 @@ func closeEngine(t *testing.T, timeout time.Duration) *Engine {
 
 	track(t, e, store.Scope{})
 
+	noDeliveryOutlivesTheTest(t, e)
+
 	return e
 }
 
@@ -318,6 +320,8 @@ func storeEngine(t *testing.T, defs map[NSKey]KeyDef, fs *fakeStore, window, tim
 	})
 
 	track(t, e, store.Scope{})
+
+	noDeliveryOutlivesTheTest(t, e)
 
 	t.Cleanup(func() { _ = e.Close() })
 
