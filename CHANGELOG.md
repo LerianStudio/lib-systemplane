@@ -1,5 +1,16 @@
 # Lib-systemplane Changelog
 
+## [3.0.1](https://github.com/LerianStudio/lib-systemplane/releases/tag/v3.0.1)
+
+Fixes:
+
+- Addressed an issue where the cached value is retained when a refresh operation results in a not-found status, ensuring consistent data retrieval. (@jeffersonrodrigues92, @fredcamaral)
+- Updated dependencies to bump OpenTelemetry OTLP exporters, resolving vulnerabilities `CVE-2026-81870` and `CVE-2026-81871`. (@fredcamaral)
+
+[Compare changes](https://github.com/LerianStudio/lib-systemplane/compare/v3.0.0...v3.0.1)
+
+---
+
 ## [2.1.0](https://github.com/LerianStudio/lib-systemplane/releases/tag/v2.1.0)
 
 Features:
