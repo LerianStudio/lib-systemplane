@@ -1718,7 +1718,7 @@ blocks this lane.
   document. The same lane renders `Group.Snapshot`'s decode cause for a redacted group through
   `safelog.ErrorDetail` (parked, § Phase 2 deviations, Orchestrator resolutions).
 - **`groups`: review the constructor this lane changed.** `NewCoordinator` now takes `(logger,
-  namespace, key, redacted, decode, seed)`; the coordinator's own `safeLogger` copy was replaced by
+  namespace, key, redacted, multiTenant, decode, seed)`; the coordinator's own `safeLogger` copy was replaced by
   the engine's `GuardLogger` in fix pass 3 (`fix(core): swallow a panicking recorder, guard the
   consumer logger once`) and by `safelog.Guard` in fix pass 4, when the guard moved into the leaf and
   `internal/group` stopped importing `internal/engine`. All of it is a groups-owned file edited under
