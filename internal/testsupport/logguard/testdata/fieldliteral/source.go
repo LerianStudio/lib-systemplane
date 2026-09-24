@@ -4,7 +4,7 @@ import "github.com/LerianStudio/lib-observability/v4/log"
 
 // spelled names its field through a composite literal that spells its type.
 func spelled() log.Field {
-	return log.Field{Key: "namespace", Value: "ns"}
+	return log.Field{Key: "key", Value: "k"}
 }
 
 // elided names its field through a composite literal inside a slice that

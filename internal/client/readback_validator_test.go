@@ -288,7 +288,7 @@ func TestRefreshRunsTheValidatorOnRefreshedValues(t *testing.T) {
 	})
 
 	t.Run("does not claim the key against the first reconcile", func(t *testing.T) {
-		m := newMemStoreWithListHook(false)
+		m := newMemStore(false)
 		logger := &recordingLogger{}
 		c := newSingleTenantClientWithLogger(t, m, logger)
 
@@ -324,7 +324,13 @@ func TestRefreshRunsTheValidatorOnRefreshedValues(t *testing.T) {
 			startDone <- c.Start(context.Background())
 		}()
 
-		<-listReady
+		// Never a bare receive: a hook the reconcile never reaches has to fail
+		// by name here rather than as a package timeout with no diagnosis.
+		select {
+		case <-listReady:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the first reconcile never reached List()")
+		}
 
 		// A changefeed event mid-reconcile carrying a value the validator
 		// refuses. Marking the key touched here would make the reconcile skip
@@ -654,7 +660,13 @@ func TestReconcileYieldsToARefreshThatLandedDuringValidation(t *testing.T) {
 		startDone <- c.Start(context.Background())
 	}()
 
-	<-reconciling
+	// Never a bare receive: a validator the reconcile never reaches has to
+	// fail by name here rather than as a package timeout with no diagnosis.
+	select {
+	case <-reconciling:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first reconcile never ran the validator over the stored row")
+	}
 
 	// The whole refresh runs inline on this goroutine (the debounce window is
 	// zero), so when fire returns the changefeed value is cached and the key is

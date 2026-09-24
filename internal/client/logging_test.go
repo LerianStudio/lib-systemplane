@@ -30,12 +30,19 @@ func (l logLine) structured() []log.Field {
 	return out
 }
 
-// TestLogLinesNameTheKeyUnderKeyname pins the field name the client publishes
-// the configuration key under. "key" is an exact entry in lib-observability's
-// default sensitive-field list, so log.String("key", ...) renders as
-// key=[REDACTED] and the line reaches the operator naming the namespace and
-// withholding the one thing it exists to publish. internal/engine already uses
-// "keyname" for the same value; this guard keeps the client from drifting back.
+// TestLogLinesNameTheKeyUnderKeyname drives one rejection end to end: a stored
+// value the consumer's validator refuses, read back by the engine during the
+// first reconcile, reaching the operator through the logger the consumer handed
+// the Client — and naming the refused configuration key under "keyname".
+//
+// The name is the subject. "key" is an exact entry in lib-observability's
+// default sensitive-field list, so the same line under that name renders as
+// key=[REDACTED]: the operator is told a row was rejected and never which one.
+//
+// One line is all this test drives, so it is not the guarantee that no OTHER
+// line drifted back to "key". That is TestNoLoggedFieldNameIsRedacted below,
+// which reads every call site in this package rather than the ones a suite
+// happens to reach.
 func TestLogLinesNameTheKeyUnderKeyname(t *testing.T) {
 	if redaction.IsSensitiveField("keyname") {
 		t.Fatal(`lib-observability now redacts "keyname" too: every line below ships its key as [REDACTED]`)

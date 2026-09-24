@@ -164,3 +164,74 @@ func TestMultiTenantDecodeFailureHonorsTheKeyRedaction(t *testing.T) {
 		}
 	})
 }
+
+// TestSingleTenantDecodeFailureWithholdsTheRedactedRow is the Client-level end
+// of the redaction port. Task 2.1.3 pinned the mapping alone — RedactFull on
+// Register becomes Redacted on the engine's KeyDef — and nothing proved the
+// policy survived the rest of the way: a key the consumer registered as
+// redacted, whose stored row is not JSON at all, must leave no fragment of that
+// row in the line the operator reads, and the read must still answer with the
+// registered default rather than with an error the consumer cannot act on.
+func TestSingleTenantDecodeFailureWithholdsTheRedactedRow(t *testing.T) {
+	raw := []byte(rejectedSecret)
+	leak := decodeErrText(t, raw)
+
+	m := newMemStore(false)
+	logger := &recordingLogger{}
+	c := newSingleTenantClientWithLogger(t, m, logger)
+
+	if err := c.Register("ns", "k", "default", WithRedaction(RedactFull)); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	seedRaw(m, "ns", "k", raw)
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	t.Cleanup(func() { _ = c.Close() })
+
+	lines := logger.warns("failed to unmarshal stored value, keeping cached value")
+	if len(lines) != 1 {
+		t.Fatalf("got %d WARN lines for the undecodable row, want exactly 1: %s", len(lines), logger.rendered())
+	}
+
+	// Not merely the whole row: any run of it is a fragment of a secret handed
+	// to whatever ships the logs, and the json error quotes the row byte by
+	// byte rather than wholesale.
+	rendered := logger.rendered()
+
+	for i := 0; i+4 <= len(rejectedSecret); i++ {
+		if fragment := rejectedSecret[i : i+4]; strings.Contains(rendered, fragment) {
+			t.Fatalf("the log carries %q, a fragment of the stored row of a redacted key: %s", fragment, rendered)
+		}
+	}
+
+	if strings.Contains(rendered, leak) {
+		t.Errorf("the log carries the json error text, which quotes the row's bytes: %s", rendered)
+	}
+
+	var detail string
+
+	for _, f := range lines[0].structured() {
+		if f.Key == "error" {
+			detail, _ = f.Value.(string)
+		}
+	}
+
+	if !strings.Contains(detail, "decode failed") || !strings.Contains(detail, "json.SyntaxError") {
+		t.Errorf(`the line carries error = %q; a redacted key must still say WHAT failed and its type`, detail)
+	}
+
+	// The row is unusable, so the key falls back to what the consumer
+	// registered instead of reporting a miss.
+	v, ok, err := c.Get(context.Background(), "ns", "k")
+	if err != nil || !ok {
+		t.Fatalf("get: value=%v ok=%v err=%v", v, ok, err)
+	}
+
+	if v != "default" {
+		t.Errorf("value in force = %v, want the registered default", v)
+	}
+}

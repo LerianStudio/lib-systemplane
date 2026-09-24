@@ -57,6 +57,33 @@ type memStore struct {
 	// changefeed, standing in for a backend whose connection never comes up.
 	// Start then waits for a resync that has to be fired by hand.
 	silent bool
+
+	// closed is set by Close(), and afterClose collects every read that
+	// reached the store once it was. The Client promises the backend is closed
+	// last, with nothing still reading through it; an empty afterClose is the
+	// only evidence of that promise.
+	closed     bool
+	afterClose []string
+}
+
+// noteStoreCall records a read that reached the store after Close() had
+// already been called on it.
+func (m *memStore) noteStoreCall(what string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.closed {
+		m.afterClose = append(m.afterClose, what)
+	}
+}
+
+// callsAfterClose reports the reads that reached the store after it was
+// closed, in arrival order.
+func (m *memStore) callsAfterClose() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return append([]string(nil), m.afterClose...)
 }
 
 // failListOnce makes the next List fail, so a test can drive a first reconcile
@@ -85,17 +112,17 @@ func newMemStore(multiTenant bool) *memStore {
 	}
 }
 
-// newMemStoreWithListHook returns a memStore whose List() pauses at the
-// listHook callback set by the test. Used to deterministically inject a
-// changefeed event while a reconcile is in flight.
-func newMemStoreWithListHook(multiTenant bool) *memStore {
-	return newMemStore(multiTenant)
-}
-
 func memKey(ns, key string) string { return ns + "\x00" + key }
 
 func (m *memStore) Start(_ context.Context) error { return nil }
-func (m *memStore) Close() error                  { return m.closeErr }
+
+func (m *memStore) Close() error {
+	m.mu.Lock()
+	m.closed = true
+	m.mu.Unlock()
+
+	return m.closeErr
+}
 
 func (m *memStore) Get(_ context.Context, _ store.Scope, ns, key string) (store.Entry, bool, error) {
 	// Capture the hook outside the lock so it may touch m.* without deadlock.
@@ -103,10 +130,24 @@ func (m *memStore) Get(_ context.Context, _ store.Scope, ns, key string) (store.
 	hook := m.getHook
 	m.mu.Unlock()
 
+	var (
+		hooked  store.Entry
+		found   bool
+		handled bool
+	)
+
 	if hook != nil {
-		if entry, found, handled := hook(ns, key); handled {
-			return entry, found, nil
-		}
+		hooked, found, handled = hook(ns, key)
+	}
+
+	// Recorded once the hook has RETURNED, which is when the call actually
+	// reaches the store: a re-read parked inside the hook has touched nothing
+	// yet, and whether it lands before or after Close is the whole subject of
+	// TestCloseDrainsTheStoreBeforeClosingIt.
+	m.noteStoreCall("Get " + memKey(ns, key))
+
+	if handled {
+		return hooked, found, nil
 	}
 
 	m.mu.Lock()
@@ -148,6 +189,8 @@ func (m *memStore) List(_ context.Context, _ store.Scope) ([]store.Entry, error)
 	if hook != nil {
 		hook()
 	}
+
+	m.noteStoreCall("List")
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -706,6 +749,140 @@ func TestListInSingleTenantOrdersByKey(t *testing.T) {
 	}
 }
 
+// TestListAfterStartServesPublishedValues pins that single-tenant List reports
+// the values in force rather than the registry's defaults. The ordering test
+// above only reads keys, so a List that answered every registered key with its
+// registered default would keep it — and every other test in the package —
+// green, while the admin surface served defaults over stored rows.
+//
+// Two ingresses reach List, and the test covers both: a row the store already
+// held when the Client came up, put in force by the first reconcile, and a
+// value written through the Client afterwards. The third key is the control:
+// nothing ever wrote it, so its default is the right answer.
+func TestListAfterStartServesPublishedValues(t *testing.T) {
+	m := newMemStore(false)
+	c := newSingleTenantClient(t, m)
+
+	for _, k := range []string{"seeded", "untouched", "written"} {
+		if err := c.Register("ns", k, "default-"+k); err != nil {
+			t.Fatalf("register %s: %v", k, err)
+		}
+	}
+
+	seedEntry(t, m, "ns", "seeded", "from-store")
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	defer c.Close()
+
+	if err := c.Set(context.Background(), "ns", "written", "from-set", "actor"); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+
+	entries, err := c.List(context.Background(), "ns")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	want := map[string]any{
+		"seeded":    "from-store",
+		"untouched": "default-untouched",
+		"written":   "from-set",
+	}
+
+	if len(entries) != len(want) {
+		t.Fatalf("want %d entries, got %d: %#v", len(want), len(entries), entries)
+	}
+
+	for _, entry := range entries {
+		expected, registered := want[entry.Key]
+		if !registered {
+			t.Fatalf("List reported %q, which was never registered", entry.Key)
+		}
+
+		if entry.Value != expected {
+			t.Errorf("%s = %v, want %v: List served the registered default over the value in force",
+				entry.Key, entry.Value, expected)
+		}
+	}
+}
+
+// TestCloseDrainsTheStoreBeforeClosingIt pins the order inside Client.Close.
+// The engine is closed first so that no debounced re-read is still inside the
+// backend when the backend goes away; swapping the two statements leaves every
+// other test in the repository green, so this one parks a re-read inside the
+// store, runs Close around it, and asserts no read reached the store after it
+// was closed.
+func TestCloseDrainsTheStoreBeforeClosingIt(t *testing.T) {
+	m := newMemStore(false)
+
+	// A real quiet window is required: at zero the re-read runs inline on the
+	// changefeed goroutine, which Close unsubscribes rather than waits for, so
+	// there is no in-flight store call to order anything against.
+	c := newSingleTenantClientWithDebounce(t, m, 20*time.Millisecond)
+
+	if err := c.Register("ns", "k", "default"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	inGet := make(chan struct{})
+	release := make(chan struct{})
+	entered := sync.OnceFunc(func() { close(inGet) })
+
+	m.mu.Lock()
+	m.getHook = func(string, string) (store.Entry, bool, bool) {
+		entered()
+		<-release
+
+		return store.Entry{}, false, true
+	}
+	m.mu.Unlock()
+
+	m.fire(store.Event{Namespace: "ns", Key: "k", Op: store.OpUpsert})
+
+	select {
+	case <-inGet:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the changefeed event never reached a store re-read")
+	}
+
+	closeDone := make(chan error, 1)
+
+	go func() { closeDone <- c.Close() }()
+
+	// Close has to WAIT for the parked re-read. Returning here would mean the
+	// backend was closed with a goroutine still reading through it, which is
+	// the failure the ordering exists to prevent.
+	select {
+	case err := <-closeDone:
+		close(release)
+		t.Fatalf("Close returned while a re-read was still inside the store: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(release)
+
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("close: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close never returned after the parked re-read was released")
+	}
+
+	if late := m.callsAfterClose(); len(late) != 0 {
+		t.Errorf("reads reached the store after it was closed (%v): Close closed the backend "+
+			"with the engine still reading through it", late)
+	}
+}
+
 func TestConstructorRejectsNilDB(t *testing.T) {
 	_, err := NewPostgres(nil, "dsn")
 	if !errors.Is(err, store.ErrNilBackend) {
@@ -1047,7 +1224,7 @@ func TestListReturnsErrorOnCorruptedJSON(t *testing.T) {
 // before a delete is exactly a List that still reports the row. The delete is
 // observed through a subscriber registered before Start rather than slept on.
 func TestReconcileDoesNotOverwriteFresherChangefeedState(t *testing.T) {
-	m := newMemStoreWithListHook(false)
+	m := newMemStore(false)
 	c := newSingleTenantClient(t, m)
 
 	if err := c.Register("ns", "k", "default"); err != nil {

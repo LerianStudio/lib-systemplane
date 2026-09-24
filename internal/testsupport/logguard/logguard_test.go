@@ -64,9 +64,12 @@ func TestAssertNoneRedacted(t *testing.T) {
 			errs: []string{`field name "key"`},
 		},
 		{
+			// Both shapes carry the SAME name, so each branch of the composite
+			// reader needs its own line: one want entry would keep passing with
+			// either branch deleted.
 			name: "a name carried by a Field literal is scanned, spelled out or elided",
 			dir:  "testdata/fieldliteral",
-			errs: []string{`field name "key"`},
+			errs: []string{"source.go:7:", "source.go:14:"},
 		},
 		{
 			name: "a name the scan cannot read is skipped",

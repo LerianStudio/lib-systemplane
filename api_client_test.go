@@ -45,6 +45,17 @@ func (s *apiMemoryStore) Close() error {
 	return nil
 }
 
+// isClosed reports whether Client.Close reached the store it was handed. The
+// Client owns the backend's lifetime once NewForTesting accepts it, and a
+// Close that returned nil having closed nothing leaks the connection pool of
+// every consumer that trusted it.
+func (s *apiMemoryStore) isClosed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.closed
+}
+
 // seed writes a row straight into the fake, under the same lock its methods
 // take.
 func (s *apiMemoryStore) seed(e TestEntry) {
@@ -402,7 +413,9 @@ func TestPublicCloseTimeoutNamesTheStuckKey(t *testing.T) {
 func TestPublicCloseReturnsNilWhenTheSubscriberHonoursCancellation(t *testing.T) {
 	t.Parallel()
 
-	c, err := NewForTesting(newAPIMemoryStore(), WithCloseTimeout(5*time.Second))
+	backend := newAPIMemoryStore()
+
+	c, err := NewForTesting(backend, WithCloseTimeout(5*time.Second))
 	if err != nil {
 		t.Fatalf("NewForTesting: %v", err)
 	}
@@ -441,6 +454,10 @@ func TestPublicCloseReturnsNilWhenTheSubscriberHonoursCancellation(t *testing.T)
 
 	if err := c.Close(); err != nil {
 		t.Fatalf("Close() = %v, want nil for a callback that honours cancellation", err)
+	}
+
+	if !backend.isClosed() {
+		t.Error("Close() returned nil without closing the store it was handed")
 	}
 
 	select {

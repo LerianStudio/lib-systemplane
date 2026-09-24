@@ -106,8 +106,6 @@ func (s *facadeTestStore) subscriber() func(TestEvent) {
 }
 
 func TestNewForTestingAdapterAndOptions(t *testing.T) {
-	t.Parallel()
-
 	backend := &facadeTestStore{entries: []TestEntry{{
 		Namespace: "ns",
 		Key:       "k",
@@ -180,8 +178,6 @@ func TestNewForTestingAdapterAndOptions(t *testing.T) {
 }
 
 func TestNewForTestingRejectsNilStores(t *testing.T) {
-	t.Parallel()
-
 	if _, err := NewForTesting(nil); !errors.Is(err, store.ErrNilBackend) {
 		t.Fatalf("nil interface store error = %v, want ErrNilBackend", err)
 	}
@@ -193,8 +189,6 @@ func TestNewForTestingRejectsNilStores(t *testing.T) {
 }
 
 func TestRedactionHelpers(t *testing.T) {
-	t.Parallel()
-
 	if got := ApplyRedaction("visible", RedactNone); got != "visible" {
 		t.Fatalf("ApplyRedaction none = %#v", got)
 	}
