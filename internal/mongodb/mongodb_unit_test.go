@@ -320,8 +320,7 @@ func TestStore_ClosedAndNilPaths(t *testing.T) {
 // missing either half of its identifier is dropped, and fan-out is the one
 // place an event learns its scope. The classification rules themselves live in
 // TestChangeEventDecodesTombstoneAsDelete.
-// Not parallel: the panicking subscriber below is counted on the process-wide
-// panic counter, which this test installs and reads.
+// Not parallel: see panicmetric.
 func TestChangeEventAndDispatch(t *testing.T) {
 
 	for _, ce := range []changeEvent{

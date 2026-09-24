@@ -196,8 +196,7 @@ func TestStore_ClosedAndNilPaths(t *testing.T) {
 	}
 }
 
-// Not parallel: the panicking subscriber below is counted on the process-wide
-// panic counter, which this test installs and reads.
+// Not parallel: see panicmetric.
 func TestNotifyPayloadParsingAndDispatch(t *testing.T) {
 
 	valid, ok := parseNotifyPayload(`{"namespace":"ns","key":"k","op":"upsert"}`)

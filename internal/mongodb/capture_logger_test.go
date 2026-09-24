@@ -103,31 +103,43 @@ func (e captureEntry) field(t *testing.T, key string) any {
 	return nil
 }
 
-// requirePanicReported asserts the whole report of the one panic recovered so
-// far: a single ERROR line, "panic recovered", naming source, and one increment
-// of the panic counter under this package's component and that same source.
-// The line alone is not enough — the bare recovery the store used before logged
-// it too, and counted nothing.
-func requirePanicReported(t *testing.T, logger *captureLogger, counter *panicmetric.Recorder, source string) {
+// only returns the single entry logged at level, failing when the count is not
+// exactly one.
+func (c *captureLogger) only(t *testing.T, level int, what string) captureEntry {
 	t.Helper()
 
-	logger.mu.Lock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	var errs []captureEntry
+	var found []captureEntry
 
-	for _, e := range logger.entries {
-		if e.level == log.LevelError {
-			errs = append(errs, e)
+	for _, e := range c.entries {
+		if e.level == level {
+			found = append(found, e)
 		}
 	}
 
-	logger.mu.Unlock()
-
-	if len(errs) != 1 || errs[0].msg != "panic recovered" {
-		t.Fatalf("ERROR entries = %+v, want exactly one %q", errs, "panic recovered")
+	if len(found) != 1 {
+		t.Fatalf("%s: logged %d entries at level %d, want exactly 1 (%+v)", what, len(found), level, c.entries)
 	}
 
-	if got := errs[0].field(t, "source"); got != source {
+	return found[0]
+}
+
+// requirePanicReported asserts the whole report of the one panic recovered so
+// far: the ERROR "panic recovered" line naming source, and one increment of the
+// panic counter under this package's component and that same source. The line
+// alone is not enough — the bare recovery the store used before logged it too,
+// and counted nothing.
+func requirePanicReported(t *testing.T, logger *captureLogger, counter *panicmetric.Recorder, source string) {
+	t.Helper()
+
+	e := logger.only(t, log.LevelError, "recovered panic")
+	if e.msg != "panic recovered" {
+		t.Errorf("ERROR line = %q, want %q", e.msg, "panic recovered")
+	}
+
+	if got := e.field(t, "source"); got != source {
 		t.Errorf("panic line source = %v, want %q", got, source)
 	}
 

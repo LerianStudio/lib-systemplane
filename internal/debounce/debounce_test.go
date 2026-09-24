@@ -150,8 +150,7 @@ func TestDebouncer_NilReceiverSafe(t *testing.T) {
 	d.Close()
 }
 
-// Not parallel: the panic is counted on the process-wide panic counter, which
-// this test installs and reads.
+// Not parallel: see panicmetric.
 func TestDebouncer_PanicInFnRecovered(t *testing.T) {
 	rec := &recordingLogger{Logger: log.NewNop()}
 	d := New[string](testWindow, WithLogger[string](rec))
