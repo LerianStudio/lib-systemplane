@@ -509,6 +509,14 @@ func (sc *scopeState) closeWindow(arm reconcileArming) {
 // never reaches it, so stale survives even when both generations are
 // unchanged.
 //
+// It clears the CONNECTION's flag and nothing else. The scope's unconfirmed
+// keys are deliberately untouched: a reconcile whose window already carried a
+// key as touched skipped that key's snapshot row, so it decided nothing about
+// it, and clearing the record here reported a row nobody could re-read as
+// confirmed by a reconcile that never looked at it. A snapshot row this
+// reconcile did apply clears its own key, through publish, like every other
+// ingress.
+//
 // The check and the write are ONE acquisition of reconcileMu, the lock
 // armReconcile holds across arming. Split in two, an OpResync arriving
 // between them marked the scope stale and armed its window, and this reconcile

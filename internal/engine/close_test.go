@@ -282,7 +282,7 @@ func TestRefreshRacingCloseNeverReachesTheStore(t *testing.T) {
 	// inside Wait".
 	e.closeWorkers()
 
-	e.trackedRefresh(scope, nk, false, false)
+	e.trackedRefresh(scope, nk, false)
 
 	if got := fs.getCount(); got != 0 {
 		t.Errorf("Store.Get called %d times by a re-read that lost the race to Close, want 0", got)

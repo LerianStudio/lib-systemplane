@@ -165,7 +165,33 @@ type scopeState struct {
 	// see keyFence. Entries are never removed: the count is bounded by the
 	// registered keys of this scope.
 	fences map[NSKey]keyFence
-	stale  bool
+	// stale is the scope-wide flag: the changefeed is disconnected, or the
+	// scope has not been reconciled since it (re)connected. It is set by a
+	// disconnect and by every arming, and cleared only by a reconcile that
+	// applied a snapshot under unmoved generations.
+	//
+	// It is no longer the whole of what a caller sees as Stale. A re-read that
+	// failed twice belongs to ONE key, and raising a scope-wide flag for it
+	// put the repair in the hands of whatever happened to clear the flag next:
+	// a reconcile already in flight cleared it without ever having decided
+	// that key, and on a connection that never drops nothing cleared it at
+	// all, so the scope reported every converged value as unconfirmed for the
+	// life of the process. unconfirmed carries that half instead.
+	stale bool
+	// unconfirmed holds the keys whose last change the engine could not read
+	// back: a changefeed re-read that failed twice. Entries are added by
+	// retryRefresh's terminal branch and removed by any later ingress that
+	// DECIDED the key — a re-read, a reconcile snapshot row, a Set echo, a
+	// delete publication — which is every path through publish.
+	//
+	// Lookup reports Stale while this set is non-empty, so one key nobody
+	// could re-read makes the scope's reads say so, and converging that key
+	// alone is what takes it back. clearStale never touches it: a reconcile
+	// that skipped the key decided nothing about it.
+	//
+	// Guarded by mu, alongside stale. Created lazily: most scopes never have
+	// one.
+	unconfirmed map[NSKey]struct{}
 	// disconnectGen is bumped on every OpDisconnect. A reconcile records it
 	// when it starts and clears stale only if it is unchanged at completion,
 	// so a reconcile that spans a new disconnect cannot clear the flag that
@@ -260,6 +286,22 @@ func newScopeState(scope store.Scope) *scopeState {
 		resyncSignal:       make(chan struct{}, 1),
 		reconcileStop:      make(chan struct{}),
 	}
+}
+
+// markUnconfirmed records that nk's last change could not be read back, so the
+// scope's reads report Stale until some later ingress decides the key.
+//
+// It is per key rather than scope-wide because that is the size of what was
+// actually lost: one row nobody could re-read. See the unconfirmed field.
+func (sc *scopeState) markUnconfirmed(nk NSKey) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	if sc.unconfirmed == nil {
+		sc.unconfirmed = make(map[NSKey]struct{}, 1)
+	}
+
+	sc.unconfirmed[nk] = struct{}{}
 }
 
 // armReconcile opens a reconcile window and puts it in the scope's single-slot

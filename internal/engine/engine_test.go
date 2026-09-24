@@ -97,6 +97,27 @@ func scopeStale(t *testing.T, e *Engine, scope store.Scope) bool {
 	return sc.stale
 }
 
+// scopeUnconfirmed reports how many keys of scope could not be read back after
+// their last change. Tests read it to synchronize on the SECOND failure of a
+// re-read, which the store's call counter cannot see: Get counts on entry, so
+// two calls is not two failures recorded.
+func scopeUnconfirmed(t *testing.T, e *Engine, scope store.Scope) int {
+	t.Helper()
+
+	e.scopesMu.RLock()
+	sc := e.scopes[scope]
+	e.scopesMu.RUnlock()
+
+	if sc == nil {
+		t.Fatalf("the engine does not track scope %+v", scope)
+	}
+
+	sc.mu.RLock()
+	defer sc.mu.RUnlock()
+
+	return len(sc.unconfirmed)
+}
+
 func firstReconcileOutcome(t *testing.T, e *Engine, scope store.Scope) error {
 	t.Helper()
 

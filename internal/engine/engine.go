@@ -597,9 +597,14 @@ func (e *Engine) Publish(ctx context.Context, scope store.Scope, se store.Entry)
 //
 // ok is false for a scope the engine does not track and for a key that scope
 // has not published yet; the caller then falls back to the registered
-// default. Value is a deep copy the caller owns, and Stale reports whether the
-// scope's changefeed is disconnected or has not been reconciled yet. A nil
-// Engine reports a miss instead of panicking.
+// default. Value is a deep copy the caller owns. A nil Engine reports a miss
+// instead of panicking.
+//
+// Stale reports that nothing is currently confirming the scope, which is two
+// facts read as one: the changefeed is disconnected or has not been reconciled
+// since it connected, OR at least one key could not be re-read after its last
+// change (see scopeState.unconfirmed). Both are read under the same lock as
+// the entry, so one Lookup is an atomic read of value and freshness.
 //
 // A miss inside a tracked scope still carries that scope's Stale flag, and
 // only the scope the engine does not track at all reports the zero Entry.
@@ -620,7 +625,7 @@ func (e *Engine) Lookup(scope store.Scope, nk NSKey) (Entry, bool) {
 
 	sc.mu.RLock()
 	cached, ok := sc.entries[nk]
-	stale := sc.stale
+	stale := sc.stale || len(sc.unconfirmed) > 0
 	sc.mu.RUnlock()
 
 	if !ok {

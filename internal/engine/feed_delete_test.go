@@ -409,4 +409,242 @@ func TestFailedRereadIsRetriedThenReportsStale(t *testing.T) {
 				got.Value, got.Revision, got.Stale, ok)
 		}
 	})
+
+	// A reconcile whose List was taken BEFORE the delete never decides this
+	// key — the feed recorded it as touched at event arrival, so the snapshot
+	// skips it — yet it used to clear the scope-wide flag the twice-failed
+	// re-read had raised. The deleted row then went on being served, at its
+	// old revision, reported as confirmed by a reconcile that had said nothing
+	// about it.
+	forEachWindow(t, func(t *testing.T, window time.Duration) {
+		fs := newFakeStore()
+		e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, window)
+
+		fs.seed(scope, jsonRow(nk, 5, `"five"`, "ops"))
+		settled(t, e, scope)
+
+		// The reconcile is armed and its photograph is not taken yet, so
+		// everything below happens while it is in flight.
+		// Released on cleanup as well as below: a failed assertion between the
+		// two would otherwise leave the reconcile goroutine parked on the gate
+		// forever, and the engine's own drain would hang the package run
+		// instead of reporting the failure.
+		release := heldList(fs)
+		t.Cleanup(release)
+
+		e.onEvent(resyncEvent(scope))
+		waitFor(t, hangGuard, "the reconcile to reach its List", func() bool {
+			return fs.listCount() >= 2
+		})
+
+		fs.remove(scope, nk)
+		fs.onGet(func(store.Scope, NSKey) error { return errors.New("pool exhausted") })
+
+		e.onEvent(deleteEvent(scope, nk))
+
+		waitFor(t, hangGuard, "both re-reads to fail and record the key unconfirmed", func() bool {
+			return scopeUnconfirmed(t, e, scope) == 1
+		})
+
+		fs.onGet(nil)
+		release()
+		waitReconcileIdle(t, e, scope)
+
+		if got, _ := e.Lookup(scope, nk); got.Stale != true {
+			t.Error("a reconcile that skipped the key cleared the flag its failed re-read raised: " +
+				"the deleted row is served as confirmed")
+		}
+	})
+}
+
+// forEachWindow runs fn at the two quiet windows the feed behaves differently
+// at: a real one, where a re-read runs on a debouncer timer goroutine, and
+// WithDebounce(0), where Submit runs it inline on the changefeed goroutine.
+// Every claim in this file about a re-read's outcome must hold at both.
+func forEachWindow(t *testing.T, fn func(t *testing.T, window time.Duration)) {
+	t.Helper()
+
+	for _, tc := range []struct {
+		name   string
+		window time.Duration
+	}{
+		{name: "a real quiet window", window: deleteWindow},
+		{name: "WithDebounce(0)", window: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) { fn(t, tc.window) })
+	}
+}
+
+// TestRecoveredKeyClearsUnconfirmedWithoutAResync pins the other half: nothing
+// on a CONNECTED changefeed ever emits OpResync, so a scope-wide flag raised
+// by one failed re-read had no writer left to clear it. Five successful
+// upserts later the key held the newest value and every read still reported it
+// unconfirmed, for the life of the process.
+func TestRecoveredKeyClearsUnconfirmedWithoutAResync(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+
+	forEachWindow(t, func(t *testing.T, window time.Duration) {
+		fs := newFakeStore()
+		e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, window)
+
+		fs.seed(scope, jsonRow(nk, 3, `"three"`, "ops"))
+		settled(t, e, scope)
+
+		fs.onGet(func(store.Scope, NSKey) error { return errors.New("pool exhausted") })
+		e.onEvent(upsertEvent(scope, nk, 4))
+
+		waitFor(t, hangGuard, "the scope to report itself unconfirmed", func() bool {
+			got, _ := e.Lookup(scope, nk)
+
+			return got.Stale
+		})
+
+		// The store recovers. No disconnect, so no OpResync will ever arrive:
+		// the re-read of the next notification is the only thing that can
+		// confirm this key again.
+		fs.onGet(nil)
+		fs.seed(scope, jsonRow(nk, 7, `"seven"`, "ops"))
+		e.onEvent(upsertEvent(scope, nk, 7))
+
+		waitFor(t, hangGuard, "the recovered key to report itself confirmed", func() bool {
+			got, ok := e.Lookup(scope, nk)
+
+			return ok && got.Value == "seven" && got.Revision == 7 && !got.Stale
+		})
+
+		if got := fs.listCount(); got != 1 {
+			t.Errorf("List called %d times, want 1: the recovery must not need an OpResync", got)
+		}
+	})
+}
+
+// TestUnconfirmedIsPerKey pins the granularity. One key nobody could re-read
+// makes the scope report Stale; a second key converging normally does not
+// clear it; and the scope goes back to confirmed when the FIRST key converges,
+// not when any key does.
+func TestUnconfirmedIsPerKey(t *testing.T) {
+	a := NSKey{Namespace: "billing", Key: "limits"}
+	b := NSKey{Namespace: "billing", Key: "retries"}
+	scope := store.Scope{}
+
+	forEachWindow(t, func(t *testing.T, window time.Duration) {
+		fs := newFakeStore()
+		e := feedEngine(t, map[NSKey]KeyDef{a: {Default: "fallback-a"}, b: {Default: "fallback-b"}}, fs, window)
+
+		fs.seed(scope, jsonRow(a, 1, `"a1"`, "ops"))
+		fs.seed(scope, jsonRow(b, 1, `"b1"`, "ops"))
+		settled(t, e, scope)
+
+		fs.onGet(func(_ store.Scope, nk NSKey) error {
+			if nk == a {
+				return errors.New("pool exhausted")
+			}
+
+			return nil
+		})
+
+		e.onEvent(upsertEvent(scope, a, 2))
+
+		waitFor(t, hangGuard, "key A to be recorded unconfirmed", func() bool {
+			return scopeUnconfirmed(t, e, scope) == 1
+		})
+
+		// B converges while A is unconfirmed, and that must not answer for A.
+		fs.seed(scope, jsonRow(b, 2, `"b2"`, "ops"))
+		e.onEvent(upsertEvent(scope, b, 2))
+
+		waitFor(t, hangGuard, "key B to take its new value", func() bool {
+			got, ok := e.Lookup(scope, b)
+
+			return ok && got.Value == "b2"
+		})
+
+		if got, _ := e.Lookup(scope, b); !got.Stale {
+			t.Error("the scope reports itself confirmed while key A could not be read back")
+		}
+
+		fs.onGet(nil)
+		fs.seed(scope, jsonRow(a, 3, `"a3"`, "ops"))
+		e.onEvent(upsertEvent(scope, a, 3))
+
+		waitFor(t, hangGuard, "the scope to report itself confirmed once A converged", func() bool {
+			got, ok := e.Lookup(scope, a)
+
+			return ok && got.Value == "a3" && !got.Stale
+		})
+	})
+}
+
+// TestRetryAfterCloseNeverReachesTheStore pins that the retry is engine work
+// Close accounts for: it waits out its delay on the lifecycle context, so a
+// Close during that delay ends it without a store call and without a survivor
+// for goleak to find.
+func TestRetryAfterCloseNeverReachesTheStore(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+
+	forEachWindow(t, func(t *testing.T, window time.Duration) {
+		fs := newFakeStore()
+		e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, window)
+
+		fs.seed(scope, jsonRow(nk, 1, `"one"`, "ops"))
+		settled(t, e, scope)
+
+		fs.onGet(func(store.Scope, NSKey) error { return errors.New("pool exhausted") })
+		e.onEvent(upsertEvent(scope, nk, 2))
+
+		waitFor(t, hangGuard, "the first re-read to fail", func() bool {
+			return fs.getCount() >= 1
+		})
+
+		if err := e.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+
+		after := fs.getCount()
+
+		// Well past the retry delay: the delay IS what this test is about.
+		time.Sleep(2 * retryDelay)
+
+		if got := fs.getCount(); got != after {
+			t.Errorf("Store.Get called %d times after Close, want the %d already counted", got, after)
+		}
+	})
+}
+
+// TestZeroWindowRetryDoesNotHoldTheFeedGoroutine pins the head-of-line cost of
+// WithDebounce(0). Submit runs the re-read inline on the scope's single
+// changefeed goroutine, so a retry submitted the same way doubled the outage
+// every other key waited through: two store calls, back to back, on the
+// goroutine that delivers every notification of the scope.
+//
+// The retry runs off that goroutine now, so one failing event costs one store
+// call of head-of-line time, not two.
+func TestZeroWindowRetryDoesNotHoldTheFeedGoroutine(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+
+	const stall = 200 * time.Millisecond
+
+	fs := newFakeStore()
+	e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0)
+
+	fs.seed(scope, jsonRow(nk, 1, `"one"`, "ops"))
+	settled(t, e, scope)
+
+	fs.onGet(func(store.Scope, NSKey) error {
+		time.Sleep(stall)
+
+		return errors.New("pool exhausted")
+	})
+
+	start := time.Now()
+
+	e.onEvent(upsertEvent(scope, nk, 2))
+
+	if elapsed := time.Since(start); elapsed > 2*stall-stall/4 {
+		t.Errorf("onEvent held the changefeed goroutine for %s, want about one %s store call: "+
+			"the retry is running inline behind the first read", elapsed, stall)
+	}
 }

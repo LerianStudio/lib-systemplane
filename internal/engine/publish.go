@@ -96,6 +96,15 @@ func (e *Engine) publish(sc *scopeState, pub publication) (notify bool, err erro
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 
+	// The key is decided from here on, whichever way the fence below goes: the
+	// store answered for it, so a re-read that failed twice is no longer what
+	// the cache is standing on. This is the ONE place every ingress converges
+	// — a changefeed re-read, a reconcile snapshot row, a caller's Set, a
+	// delete publication — so clearing the record here covers all four
+	// without a second hook on any of them. A rejected publication clears it
+	// too: a revision below the cached one still means somebody read the row.
+	delete(sc.unconfirmed, pub.NSKey)
+
 	cached, ok := sc.entries[pub.NSKey]
 
 	switch {
