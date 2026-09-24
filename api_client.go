@@ -46,6 +46,10 @@ func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOp
 // A Start that fails is retryable: the Client stays usable, subscriptions
 // registered before it survive, and the next Start reconciles from nothing.
 //
+// The Client counts as started from the moment that reconcile begins, so a
+// [Client.Set] racing Start writes its row and then reports [ErrNotStarted]
+// rather than being refused before the store is touched.
+//
 // In multi-tenant mode it is a no-op beyond marking the Client started —
 // every read resolves a fresh tenant database.
 func (c *Client) Start(ctx context.Context) error {
@@ -103,6 +107,10 @@ func (c *Client) GetDuration(ctx context.Context, namespace, key string) (time.D
 }
 
 // Set persists a new value for namespace/key.
+//
+// A Set racing [Client.Start] can persist its row and still report
+// [ErrNotStarted], because the Client counts as started before its first
+// reconcile has brought the scope up.
 func (c *Client) Set(ctx context.Context, namespace, key string, value any, actor string) error {
 	return asInternalClient(c).Set(ctx, namespace, key, value, actor)
 }

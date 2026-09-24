@@ -144,6 +144,12 @@ func newClient(s store.Store, cfg clientConfig) *Client {
 // started; schema bootstrap and reads run lazily against the per-request
 // tenant DB.
 //
+// The Client counts as started from the moment that first reconcile begins
+// rather than from when it ends, so a [Client.Set] racing Start inside that
+// window persists its row and then reports [ErrNotStarted] because no scope
+// exists yet to publish into — where before it refused the write outright and
+// wrote nothing.
+//
 // Start and Close are mutually exclusive: both take startMu for the duration
 // of their work, and Start re-checks `closed` under the lock so a concurrent
 // Close that arrived first cannot be interleaved with Start's wiring.

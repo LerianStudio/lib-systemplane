@@ -538,9 +538,14 @@ func scopeLabel(scope store.Scope) string {
 // AFTER the guards above have passed — the engine closed under this write, and
 // the scope torn down under it. Every one of them means the row is persisted
 // and the next read will not serve it, which is exactly what a caller of Set
-// needs to be told. A nil error means the cache holds this write or something
-// newer; a publication the revision fence refused is not a refusal in that
-// sense, because the cache then holds something newer already.
+// needs to be told.
+//
+// A nil error means exactly one thing: the next Lookup of this key in this
+// scope serves this write or something newer. It does not mean subscribers
+// have seen it — an accepted publication is queued on the key's delivery
+// worker, whose callbacks run after this returns — and it does not mean the
+// value was cached, because the fence refusing a write the cache already
+// holds at a higher revision is a nil error too.
 //
 // A write whose revision the store could not report (0) still takes effect,
 // because revision 0 always wins the fence — at the cost of the echo

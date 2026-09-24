@@ -524,8 +524,14 @@ func (e *Engine) recordFeedDelete(scope store.Scope, nk NSKey) {
 // registered, and a publication the engine or the scope went away under. All
 // of them mean the row is deleted in the store and the caller's next read in
 // this process still serves the value it removed — which is precisely what
-// Client.Delete must pass on rather than swallow. A nil error means the
-// registered default is in force for the key.
+// Client.Delete must pass on rather than swallow.
+//
+// A nil error means exactly one thing: the next Lookup of this key in this
+// scope serves the registered default at revision 0, or something newer
+// published since. It does not mean subscribers have seen the removal — the
+// announcement is queued on the key's delivery worker, whose callbacks run
+// after this returns. Unlike Publish it carries no fence outcome, because
+// revision 0 never loses the fence.
 func (e *Engine) PublishDelete(scope store.Scope, nk NSKey) error {
 	// Exported, so this runs on the consumer's goroutine: the same guard
 	// Publish takes, for the same reason. The feed's own callers can never

@@ -190,8 +190,12 @@ func (e *Engine) publish(sc *scopeState, pub publication) (notify bool, err erro
 	// after the unlock, a publication that won the fence could be overtaken on
 	// the way to the worker's mailbox by one that lost it, and the subscriber
 	// would see the older revision last. No callback runs here — the worker
-	// goroutine does that — so the lock is held for a mutex and a
-	// non-blocking channel send.
+	// goroutine does that — so the lock usually costs a mutex and a
+	// non-blocking channel send. It costs one more thing on a subscribed key's
+	// FIRST published change, which starts that key's delivery goroutine under
+	// this lock. Workers are bounded at one per subscribed key per scope, so
+	// this is a one-off per key, and FC-11 concentrates almost every launch in
+	// the first reconcile at Start, where it publishes every registered key.
 	e.dispatch(sc, pub)
 
 	return true, nil

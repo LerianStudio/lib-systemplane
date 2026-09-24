@@ -37,6 +37,11 @@ import (
 // row already persisted. A write the engine could not publish because it holds
 // no live scope for it matches [ErrNotStarted]; one that met a closing Client
 // is [ErrClosed].
+//
+// [ErrNotStarted] with the row already persisted is reachable by racing Start
+// as well: the Client marks itself started before its first reconcile brings
+// the scope up, so a Set landing in that window is written and then refused,
+// where an unstarted Client refuses before touching the store.
 func (c *Client) Set(ctx context.Context, namespace, key string, value any, actor string) error {
 	if c == nil || c.closed.Load() {
 		return ErrClosed

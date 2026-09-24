@@ -153,8 +153,12 @@ func (e *Engine) OnChange(nk NSKey, fn func(ctx context.Context, ch Change)) (un
 // It is called by publish while the scope's write lock is held, which is what
 // keeps deliveries in revision order: the fence decision and the mailbox write
 // are one atomic step, so a publication that lost the fence can never overtake
-// the winner on the way to the slot. Nothing here runs a callback, so holding
-// the lock costs a mutex and a non-blocking channel send.
+// the winner on the way to the slot. Nothing here runs a callback, so the lock
+// usually costs a mutex and a non-blocking channel send — plus, on a
+// subscribed key's first published change, the launch of that key's worker
+// goroutine in workerFor. Workers are bounded at one per subscribed key per
+// scope, so that launch is a one-off per key, and FC-11 puts almost every one
+// of them in the first reconcile at Start.
 //
 // A key nobody subscribes to starts no worker: the delivery would have nowhere
 // to go, and a process registering hundreds of keys should not pay a goroutine
