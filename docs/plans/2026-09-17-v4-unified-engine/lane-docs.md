@@ -149,7 +149,7 @@ grep -nE 'internal/safelog|safelog\.Guard|RecoverAndLog|changes an import line a
 
 #### Task 1.1.1: Create `MIGRATION-v4.md` — framing, surface diff, module hop
 
-- [ ] Done
+- [x] Done
 
 **Context:** No v4 migration document exists; `MIGRATION-v3.md` (225 lines) is the shape to copy: why the major exists, a from/to table, the consumer diff. Verified generations: v1.6.1 = unsuffixed path, `lib-commons/v5`, `lib-observability v1.1.0`, `gofiber/fiber/v2`, `admin.WithAuthorizer(func(*fiber.Ctx, string) error)` (`git show v1.6.1:go.mod`, `v1.6.1:admin/admin.go:85`); v1.6.0 = lib-commons v5.3.0, lib-observability v1.0.0. v2.0.0 = `/v2`, Fiber v3, `lib-commons/v6`, `lib-observability/v2 v2.0.0`. **v3.0.0 = `/v3`, `lib-commons/v7 v7.0.0`, `lib-observability/v4 v4.0.1`** (`git show v3.0.0:go.mod`, PR #58); v3.0.0-beta.2 is already on v7 too. `develop` = `/v4`, `lib-commons/v7`, `lib-observability/v4` (`go.mod:1,6,7`). Surface verified with `go doc -short .`: removed `Manager` and its API (existed at `v3.0.0:manager.go:36-72`, `v3.0.0:manager_methods.go:31-94`) and `DefaultSeedSQL` (gone from `ddl.go`); added `WithCloseTimeout` (`api_constructors.go:76`), `ErrCloseTimeout` (`api_errors.go:56-63`), `GetEntry`/`Entry` (`api_client.go:84`, `api_change.go:9`), `Bind`, `Group[T]`, `Snapshot[T]`, `Applied[T]`, `ApplyStatus`, `Group.OnApply`, `Group.Status`, `ErrApplyPanicked` (`api_group.go:12-14,108,495,527`), `MigrationV3ToV4SQL()` (`ddl.go:130`). `OnChange` was `func(ctx, ns, key string, newValue any)` at `v3.0.0:api_client.go:113`; it is `func(ctx context.Context, ch Change)` now (`api_client.go:184`). `.releaserc.yml:5-16` maps breaking → minor, guarded by `admin/release_policy_test.go`; the v4.0.0 cut rule is `index.md` § Merge Order step 4 (a dry-run decides; hand tag only if it computes `3.1.0`).
 
@@ -194,7 +194,7 @@ plus both § Phase 1 checks (no output) and § The link check over `MIGRATION-v4
 
 #### Task 1.1.2a: Write § Behaviour changes — reads, writes and validation
 
-- [ ] Done
+- [x] Done
 
 **Context:** Sources: `index.md` § "Behaviour changes MIGRATION-v4.md must name" and the verified list below. Every item is single-tenant fact on `develop` unless it carries a marker.
 
@@ -240,7 +240,7 @@ grep -c 'NOT-YET(' MIGRATION-v4.md   # expected: 4 (3 from Task 1.1.1 + 1)
 
 #### Task 1.1.2b: Write § Behaviour changes — callbacks, lifecycle, freshness and panics
 
-- [ ] Done
+- [x] Done
 
 **Context:**
 
@@ -294,7 +294,7 @@ grep -c 'NOT-YET(' MIGRATION-v4.md   # expected: 7
 
 #### Task 1.1.3: Write § The database and operator contract
 
-- [ ] Done
+- [x] Done
 
 **Context:** Storage is merged (PR #90, #91). Verified: `revision BIGINT NOT NULL` from `systemplane_revision_seq` via a SECURITY DEFINER `BEFORE INSERT OR UPDATE` trigger, runtime role DML only (`ddl/schema.sql:105,126,133-143,172-175`, `ddl.go:43-49`); `MigrationV3ToV4SQL()` (`ddl.go:86-132`, `ddl/migrate_v3_to_v4.sql`) adds the column, seeds the sequence, replaces `systemplane_notify_v3()` with `systemplane_bump_revision_v4()` + `systemplane_notify_v4()`, keeps trigger names `systemplane_notify_trigger` / `systemplane_notify_update_trigger` and adds `systemplane_bump_revision_trigger`; payload `{namespace, key, op, revision}`, revision 0 on delete (`ddl/schema.sql:145-185`); the migration's own guard refuses when `systemplane_entries` is not on `search_path` or exists in a second schema (`ddl/migrate_v3_to_v4.sql:73-88`); the `SchemaSQL()` guard fires when any non-system schema other than `current_schema()` holds the table (`ddl/schema.sql:84-97`, RAISE text at `:95`); one database per tenant, NOTIFY database-wide, `DROP FUNCTION` resolves through `search_path` (`ddl.go:36-41`); revisions opaque, may skip, start at 2 (`ddl.go:50-53`, `ddl/schema.sql:128`); an identical re-set keeps the revision (`ddl/schema.sql:135-139`) and the engine dedupes the NOTIFY. MongoDB: tombstone delete (`internal/mongodb/mongodb.go:696-700`, `internal/mongodb/mongodb_crud.go:135-169`, `$ne` because pre-v4 documents lack the field), never purged, change streams need a replica set, `WithPollInterval` fallback (`api_constructors.go:65-66`), a resolved tenant database needs `createCollection` (`internal/mongodb/mongodb_crud.go:32-60`). Both backends refuse two scopes on one database (Postgres) or one database+collection (MongoDB) at feed open (`internal/postgres/connector.go:60-84`, `internal/mongodb/connector.go:48-73`), but no public path reaches a tenant feed today (`internal/client/client.go:110-121` wires no connector) and the root alias does not exist (`api_errors.go`).
 
@@ -330,7 +330,7 @@ grep -c 'NOT-YET(' MIGRATION-v4.md   # expected: 10
 
 #### Task 1.1.4: Write the per-consumer sections for the seven Client-only consumers
 
-- [ ] Done
+- [x] Done
 
 **Context:** Facts come from `index.md` § Consumer matrix and the tags in this repository; this lane does not open the consumers' repositories. Verified: matcher, billing-worker, br-consignado-gw, go-boilerplate-ddd are on v2.0.0 (`lib-commons/v6`, `lib-observability/v2`); finance-hub on v1.6.0; `DefaultSeedSQL` is gone; `WithListenChannel` is still exported (`api_constructors.go:62-63`); plain `WithMultiTenantEnabled()` keeps the v3 per-request path (`internal/client/options.go:134-149`) and refuses `OnChange` (`api_client.go:179-183`, FC-4). Every v2 consumer is hit by the canonical-shape change and by `Set`/`Delete` returning errors (Task 1.1.2a items 2 and 3).
 
@@ -394,11 +394,11 @@ grep -c 'NOT-YET(' MIGRATION-v4.md    # expected: 16
 **Scope:** `CLAUDE.md`, `docs/PROJECT_RULES.md`, `doc.go`.
 **Dependencies:** none (parallel with Epic 1.1).
 **Done when:** all three describe v4 as merged; the absence grep over each returns nothing; `go build ./...` and `go vet ./...` pass.
-**Status:** Pending
+**Status:** Done
 
 #### Task 1.2.1: Finish `CLAUDE.md` against the merged facade and engine
 
-- [ ] Done
+- [x] Done
 
 **Context:** engine-core already did most of this (commits 59e859b, 3d4d82e, and the `Start` sentence at `CLAUDE.md:65`): `/v4` (`CLAUDE.md:7,25,54`), `lib-commons/v7` (`:10`), `internal/engine` (`:33-36`), revision / sequence / `notify_v4` storage shape (`:70-81`), `WithCloseTimeout` and `ErrCloseTimeout` (`:90-93`), FC-4 `OnChange` with `ErrUnknownKey` (`:88`). The absence grep over `CLAUDE.md` already returns zero. Still true and to keep: the two-mode description with "No in-process cache. No LISTEN/NOTIFY. `OnChange` returns `ErrNotSupportedInMultiTenant`" (`:66`, true until engine-tenants), the name-override options in the client-options list (`:90`, true until engine-core Phase 3), the observability-boundary bullet (`:11`, enforced by `boundary_test.go`). Missing: `internal/group`, `internal/testsupport`, `internal/safelog` in § Repository shape (`:30-40`); `GetEntry`/`Entry`, `Bind`/`Group[T]`/`OnApply`/`Status`/`ErrApplyPanicked`, `MigrationV3ToV4SQL`, `admin.MountCatalog` in § API invariants (`:84-95`); `KeyRedaction` fail-closed (`api_client.go:193-199`); a `MIGRATION-v4.md` pointer beside the `MIGRATION-v3.md` one (`:11`). Stale: the "current observability migration is an approved breaking change" objective (`:16`).
 
@@ -428,7 +428,7 @@ and § The link check over `CLAUDE.md` (exit 0).
 
 #### Task 1.2.2: Correct `docs/PROJECT_RULES.md` to the API that actually ships
 
-- [ ] Done
+- [x] Done
 
 **Context:** § API Invariants (`docs/PROJECT_RULES.md:480-497`) describes a tenant-scoped-keys API that no Go file has (`RegisterTenantScoped`, `GetForTenant`, `SetForTenant`, `DeleteForTenant`, `ListTenantsForKey`, `OnTenantChange`, `WithTenantAuthorizer`, `WithTenantSchemaEnabled`, six admin routes, four tenant sentinels, a `tenant_id` column, a three-part Mongo `_id`); the grep in the Verification returns nothing over `--include='*.go'`. Also stale: header "tenant-scoped overrides" (`:3`), module `/v3` (`:65`), `lib-commons/v6` (`:325`), `lib-systemplane/v3` (`:327`), package structure missing `internal/engine`, `internal/group`, `internal/safelog`, `internal/testsupport`, and `internal/client` described as "subscribers, tenant APIs" (`:22-34`), and the subscription row citing `runtime.RecoverAndLog` (`:485`) — `OnChange` panics go through `runtime.HandlePanicValue`, component `systemplane.engine`, name `onchange` (`internal/engine/dispatch.go:386-393`, `internal/engine/ingest.go:464-468`). Keep: the naming-table `Manager` example (`:54`), the ToC (`:9-16`), every generic section. Absence-grep baseline for this file: 8 lines.
 
@@ -460,7 +460,7 @@ and § The link check over `docs/PROJECT_RULES.md` (exit 0; it guards the ToC an
 
 #### Task 1.2.3: Rewrite the root package doc
 
-- [ ] Done
+- [x] Done
 
 **Context:** `doc.go` (18 lines) still says "Reads are low-contention (read-locked) … LISTEN/NOTIFY change-feed … change-streams" (`doc.go:7-9`), and its lifecycle sentence stops at `OnChange` (`doc.go:11-14`); the closing bootstrap paragraph (`doc.go:16-17`) is correct. Every link target exists: `NewPostgres`, `NewMongoDB`, `Client.Register`, `Bind` (`api_group.go:108`), `Client.Start`, `Group.Snapshot`, `Client.OnChange`, `Group.OnApply` (`api_group.go:495`), `Client.Close`, `Client.GetEntry` (`api_client.go:84`). `example_group_test.go` belongs to the groups lane.
 
