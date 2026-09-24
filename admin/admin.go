@@ -39,7 +39,7 @@ import (
 
 	commonshttp "github.com/LerianStudio/lib-commons/v7/commons/net/http"
 	"github.com/LerianStudio/lib-observability/v4/log"
-	systemplane "github.com/LerianStudio/lib-systemplane/v3"
+	systemplane "github.com/LerianStudio/lib-systemplane/v4"
 	"github.com/gofiber/fiber/v3"
 )
 
@@ -228,14 +228,37 @@ func handleList(client *systemplane.Client) fiber.Handler {
 			Entries:   make([]entryResponse, 0, len(entries)),
 		}
 
+		// List is used only to enumerate the namespace's registered keys, in
+		// its already-sorted order; the value it returned is deliberately
+		// discarded. Value, revision, provenance and freshness all come from
+		// one GetEntry read per key, so an entry can never publish a value
+		// next to a revision that does not describe it.
+		//
+		// ponytail: N reads per listing, on an operator-facing route at
+		// roughly 50 registered keys. Upgrade path is a revision-carrying
+		// ListEntry from the engine, if a consumer ever registers enough keys
+		// for it to matter.
 		for _, e := range entries {
+			entry, ok, readErr := client.GetEntry(c.Context(), namespace, e.Key)
+			if readErr != nil {
+				return mapSentinelErr(c, readErr)
+			}
+
+			if !ok {
+				continue
+			}
+
 			policy := client.KeyRedaction(namespace, e.Key)
-			redacted := systemplane.ApplyRedaction(e.Value, policy)
+			redacted := systemplane.ApplyRedaction(entry.Value, policy)
 
 			resp.Entries = append(resp.Entries, entryResponse{
 				Key:         e.Key,
 				Value:       redacted,
 				Description: e.Description,
+				Revision:    entry.Revision,
+				UpdatedAt:   nilIfZeroTime(entry.UpdatedAt),
+				UpdatedBy:   entry.UpdatedBy,
+				Stale:       entry.Stale,
 			})
 		}
 
@@ -354,7 +377,7 @@ func handleGetOne(client *systemplane.Client) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		namespace, key := registeredPathParams(client, c)
 
-		value, ok, err := client.Get(c.Context(), namespace, key)
+		e, ok, err := client.GetEntry(c.Context(), namespace, key)
 		if err != nil {
 			return mapSentinelErr(c, err)
 		}
@@ -364,13 +387,17 @@ func handleGetOne(client *systemplane.Client) fiber.Handler {
 		}
 
 		policy := client.KeyRedaction(namespace, key)
-		redacted := systemplane.ApplyRedaction(value, policy)
+		redacted := systemplane.ApplyRedaction(e.Value, policy)
 
 		return c.Status(fiber.StatusOK).JSON(getResponse{
 			Namespace:   namespace,
 			Key:         key,
 			Value:       redacted,
 			Description: client.KeyDescription(namespace, key),
+			Revision:    e.Revision,
+			UpdatedAt:   nilIfZeroTime(e.UpdatedAt),
+			UpdatedBy:   e.UpdatedBy,
+			Stale:       e.Stale,
 		})
 	}
 }

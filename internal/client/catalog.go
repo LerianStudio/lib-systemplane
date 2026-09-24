@@ -1,9 +1,12 @@
 package client
 
 import (
+	"fmt"
 	"reflect"
 	"sort"
 	"time"
+
+	"github.com/LerianStudio/lib-systemplane/v4/internal/engine"
 )
 
 const catalogKindUnknown = "unknown"
@@ -149,7 +152,7 @@ func (c *Client) catalogDetail(nk nskey, def keyDef) CatalogKeyDetail {
 
 	return CatalogKeyDetail{
 		CatalogKeySummary: c.catalogSummary(nk, def),
-		DefaultValue:      cloneValue(def.defaultValue),
+		DefaultValue:      engine.Clone(def.catalogDefault),
 		Schema:            meta.Schema,
 		Rules:             meta.Rules,
 		Examples:          meta.Examples,
@@ -174,7 +177,7 @@ func catalogKind(def keyDef) string {
 		return def.catalog.Kind
 	}
 
-	return inferCatalogKind(def.defaultValue)
+	return inferCatalogKind(def.catalogDefault)
 }
 
 func inferCatalogKind(value any) string {
@@ -241,7 +244,7 @@ func cloneCatalogSchema(schema map[string]any) map[string]any {
 		return nil
 	}
 
-	cloned, ok := cloneValue(schema).(map[string]any)
+	cloned, ok := engine.Clone(schema).(map[string]any)
 	if !ok {
 		return nil
 	}
@@ -258,9 +261,26 @@ func cloneCatalogExamples(examples []CatalogExample) []CatalogExample {
 	for i, example := range examples {
 		out[i] = CatalogExample{
 			Name:  example.Name,
-			Value: cloneValue(example.Value),
+			Value: engine.Clone(example.Value),
 		}
 	}
 
 	return out
+}
+
+// validateCatalogCloneSafe rejects catalog metadata Clone cannot deep-copy.
+// It stays in this package because it names CatalogKeyMetadata; the walk
+// itself belongs to the engine.
+func validateCatalogCloneSafe(meta CatalogKeyMetadata) error {
+	if err := engine.ValidateCloneSafe(meta.Schema); err != nil {
+		return fmt.Errorf("schema: %w", err)
+	}
+
+	for i, example := range meta.Examples {
+		if err := engine.ValidateCloneSafe(example.Value); err != nil {
+			return fmt.Errorf("examples[%d].value: %w", i, err)
+		}
+	}
+
+	return nil
 }

@@ -4,44 +4,38 @@ package client
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
-	"github.com/LerianStudio/lib-observability/v4/runtime"
-	"github.com/LerianStudio/lib-systemplane/v3/internal/debounce"
-	"github.com/LerianStudio/lib-systemplane/v3/internal/manager"
-	mongoDB "github.com/LerianStudio/lib-systemplane/v3/internal/mongodb"
-	"github.com/LerianStudio/lib-systemplane/v3/internal/postgres"
-	"github.com/LerianStudio/lib-systemplane/v3/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/engine"
+	mongoDB "github.com/LerianStudio/lib-systemplane/v4/internal/mongodb"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/postgres"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
-// refreshTimeout bounds Get calls made by the changefeed-driven refresh loop.
-const refreshTimeout = 5 * time.Second
-
-// nskey is the composite map key for registry/cache/subscriber lookups.
+// nskey is the composite map key for registry lookups.
 type nskey struct {
 	Namespace string
 	Key       string
 }
 
-type subscription struct {
-	id uint64
-	fn func(ctx context.Context, newValue any)
-}
-
 // Client is the runtime-config handle. Read methods are nil-receiver safe,
 // returning zero values when the Client is nil or not yet started.
 type Client struct {
-	store     store.Store
-	debouncer *debounce.Debouncer[nskey]
-	logger    log.Logger
-	telemetry store.Telemetry
+	store  store.Store
+	engine *engine.Engine
+	// logger is the consumer's own, unwrapped, because Logger() hands it back.
+	// Nothing in this package logs through it: guarded is what every line goes
+	// out on, so a consumer logger that panics cannot unwind out of a library
+	// call — logError runs on the CALLER's goroutine in multi-tenant mode, so
+	// an unguarded one took a Get or a List down with it.
+	logger  log.Logger
+	guarded log.Logger
 
 	multiTenant    bool
 	catalogService string
@@ -49,41 +43,17 @@ type Client struct {
 	registryMu sync.RWMutex
 	registry   map[nskey]keyDef
 
-	// cache is only populated in single-tenant mode. Multi-tenant mode reads
-	// directly from the resolved tenant DB.
-	cacheMu sync.RWMutex
-	cache   map[nskey]any
-
-	subsMu      sync.RWMutex
-	subscribers map[nskey][]subscription
-	nextSubID   atomic.Uint64
-
-	storeUnsubscribe func()
-
-	// hydratingMu guards hydrating / hydrationTouched. The changefeed
-	// callback consults these to record which keys it observed during
-	// hydration so hydrate() can skip those keys (the changefeed already has
-	// fresher values for them).
-	hydratingMu      sync.Mutex
-	hydrating        bool
-	hydrationTouched map[nskey]struct{}
-
-	// lifecycleCtx is the Client's process-wide context. It is derived in
-	// newClient() and canceled by Close(). Dispatch paths (changefeed
-	// callbacks, OnChange subscribers) thread this through so subscribers see
-	// cancellation when the Client shuts down.
-	lifecycleCtx    context.Context
-	lifecycleCancel context.CancelFunc
-
-	startMu   sync.Mutex
-	started   atomic.Bool
-	closeOnce sync.Once
-	closed    atomic.Bool
-
-	// managerMu guards manager. The Manager is opt-in (BindManager) and
-	// nil for every caller that does not migrate to v1.5.0 explicitly.
-	managerMu sync.RWMutex
-	manager   *manager.Manager
+	startMu sync.Mutex
+	started atomic.Bool
+	// registryFrozen keeps Register refused after a Start that timed out with
+	// its first reconcile pending: the next Start waits on that reconcile, which
+	// may already have read the registry. Guarded by startMu.
+	registryFrozen bool
+	closeOnce      sync.Once
+	closed         atomic.Bool
+	// closeErr is the first Close's outcome, replayed by every later Close
+	// the way the engine replays its own.
+	closeErr error
 }
 
 // NewPostgres creates a Client backed by Postgres.
@@ -99,16 +69,7 @@ func NewPostgres(db *sql.DB, listenDSN string, opts ...Option) (*Client, error) 
 		return nil, store.ErrNilBackend
 	}
 
-	pgStore, err := postgres.New(postgres.Config{
-		DB:                 db,
-		ListenDSN:          listenDSN,
-		Channel:            cfg.listenChannel,
-		Table:              cfg.table,
-		Logger:             cfg.logger,
-		Telemetry:          cfg.telemetry,
-		MultiTenantEnabled: cfg.multiTenantEnabled,
-		Module:             cfg.module,
-	})
+	pgStore, err := postgres.New(postgresConfig(db, listenDSN, cfg))
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +89,41 @@ func NewMongoDB(client *mongo.Client, database string, opts ...Option) (*Client,
 		return nil, store.ErrNilBackend
 	}
 
-	mStore, err := mongoDB.New(mongoDB.Config{
+	mStore, err := mongoDB.New(mongoConfig(client, database, cfg))
+	if err != nil {
+		return nil, err
+	}
+
+	return newClient(mStore, cfg), nil
+}
+
+// postgresConfig builds the Postgres backend's configuration from the
+// Client's own. It and mongoConfig below exist for one field.
+//
+// cfg.logger is the GUARDED logger — the backends log from their changefeed
+// goroutines, where a consumer logger that panics takes the process down — and
+// cfg.consumerLogger, the raw one Logger() hands back, sits beside it in the
+// same struct. Inline in the constructors the choice between them was a
+// literal nobody could hold: swapping it compiled and left the suite green,
+// because no unit test runs a live changefeed. Named, it is one value a test
+// can assert is already guarded.
+func postgresConfig(db *sql.DB, listenDSN string, cfg clientConfig) postgres.Config {
+	return postgres.Config{
+		DB:                 db,
+		ListenDSN:          listenDSN,
+		Channel:            cfg.listenChannel,
+		Table:              cfg.table,
+		Logger:             cfg.logger,
+		Telemetry:          cfg.telemetry,
+		MultiTenantEnabled: cfg.multiTenantEnabled,
+		Module:             cfg.module,
+	}
+}
+
+// mongoConfig is postgresConfig's twin for the MongoDB backend, and carries
+// the same guarded logger for the same reason.
+func mongoConfig(client *mongo.Client, database string, cfg clientConfig) mongoDB.Config {
+	return mongoDB.Config{
 		Client:             client,
 		Database:           database,
 		Collection:         cfg.collection,
@@ -137,50 +132,66 @@ func NewMongoDB(client *mongo.Client, database string, opts ...Option) (*Client,
 		Telemetry:          cfg.telemetry,
 		MultiTenantEnabled: cfg.multiTenantEnabled,
 		Module:             cfg.module,
-	})
-	if err != nil {
-		return nil, err
 	}
-
-	return newClient(mStore, cfg), nil
 }
 
 func newClient(s store.Store, cfg clientConfig) *Client {
-	logger := cfg.logger
-	if logger == nil {
-		logger = log.NewNop()
+	// cfg.logger is guarded by applyClientOptions; the Client's own field
+	// keeps the consumer's logger unwrapped, because Logger() hands it back.
+	// A config built by hand — every test that skips applyClientOptions — has
+	// neither, so both normalise to a no-op here.
+	guarded := cfg.logger
+	if log.IsNil(guarded) {
+		guarded = log.NewNop()
 	}
 
-	// cancel is intentionally stored on the Client (lifecycleCancel) and
-	// invoked from Close() to terminate dispatch goroutines and subscribers.
-	// gosec G118 flags WithCancel calls whose cancel is not invoked via defer;
-	// that heuristic is wrong for a long-lived lifecycle context that Close()
-	// drives explicitly. Keep the directive — without it lint fails.
-	ctx, cancel := context.WithCancel(context.Background())
+	own := cfg.consumerLogger
+	if log.IsNil(own) {
+		own = log.NewNop()
+	}
 
 	c := &Client{
-		store:           s,
-		logger:          logger,
-		telemetry:       cfg.telemetry,
-		multiTenant:     cfg.multiTenantEnabled,
-		catalogService:  cfg.catalogService,
-		registry:        make(map[nskey]keyDef),
-		cache:           make(map[nskey]any),
-		subscribers:     make(map[nskey][]subscription),
-		lifecycleCtx:    ctx,
-		lifecycleCancel: cancel,
+		store:          s,
+		logger:         own,
+		guarded:        guarded,
+		multiTenant:    cfg.multiTenantEnabled,
+		catalogService: cfg.catalogService,
+		registry:       make(map[nskey]keyDef),
 	}
 
-	if !cfg.multiTenantEnabled {
-		c.debouncer = debounce.New[nskey](cfg.debounce, debounce.WithLogger[nskey](logger))
-	}
+	// Built in both modes so Close stays uniform: engine.New opens no
+	// connection and starts no goroutine, and only Start creates a scope.
+	// Registry is the Client itself, which is why this cannot be a field of
+	// the literal above.
+	c.engine = engine.New(engine.Config{
+		Store:    s,
+		Registry: c,
+		Logger:   guarded,
+		Debounce: cfg.debounce,
+
+		// Left zero when the caller set no WithCloseTimeout, so the engine's
+		// own default is the single place that names a duration.
+		CloseTimeout: cfg.closeTimeout,
+	})
 
 	return c
 }
 
-// Start performs backend bootstrap and (in single-tenant mode) hydrates the
-// in-process cache. In multi-tenant mode it only marks the Client started;
-// schema bootstrap and reads run lazily against the per-request tenant DB.
+// Start performs backend bootstrap and, in single-tenant mode, starts the
+// engine: it opens the changefeed and returns once the first reconcile has
+// confirmed every registered key against the store, so every read taken after
+// it serves what is stored rather than the registered default. That reconcile
+// also queues the FC-11 announcement for every subscriber registered
+// beforehand; the delivery runs on the key's own goroutine, so it may land
+// just after Start returns. In multi-tenant mode it only marks the Client
+// started; schema bootstrap and reads run lazily against the per-request
+// tenant DB.
+//
+// The Client counts as started from the moment that first reconcile begins
+// rather than from when it ends, so a [Client.Set] racing Start inside that
+// window persists its row and then reports [ErrNotStarted] because no scope
+// exists yet to publish into — where before it refused the write outright and
+// wrote nothing.
 //
 // Start and Close are mutually exclusive: both take startMu for the duration
 // of their work, and Start re-checks `closed` under the lock so a concurrent
@@ -214,114 +225,28 @@ func (c *Client) Start(ctx context.Context) error {
 		return err
 	}
 
-	// Seed cache with registered defaults in single-tenant mode.
-	if !c.multiTenant {
-		c.registryMu.RLock()
-		c.cacheMu.Lock()
-
-		for nk, def := range c.registry {
-			c.cache[nk] = cloneValue(def.defaultValue)
-		}
-
-		c.cacheMu.Unlock()
-		c.registryMu.RUnlock()
-
-		// Mark hydration in progress BEFORE Subscribe so the changefeed
-		// callback knows to record which keys it touched. hydrate() then
-		// skips those keys to avoid overwriting fresh changefeed state with
-		// the older List() snapshot.
-		c.hydratingMu.Lock()
-		c.hydrating = true
-		c.hydrationTouched = make(map[nskey]struct{})
-		c.hydratingMu.Unlock()
-
-		// Subscribe BEFORE hydration so writes that land between List() and
-		// the change feed's first event are still observed.
-		unsub, err := c.store.Subscribe(ctx, c.onEvent)
-		if err != nil {
-			c.hydratingMu.Lock()
-			c.hydrating = false
-			c.hydrationTouched = nil
-			c.hydratingMu.Unlock()
-
-			return err
-		}
-
-		c.storeUnsubscribe = unsub
-
-		if err := c.hydrate(ctx); err != nil {
-			if c.storeUnsubscribe != nil {
-				c.storeUnsubscribe()
-				c.storeUnsubscribe = nil
-			}
-
-			c.hydratingMu.Lock()
-			c.hydrating = false
-			c.hydrationTouched = nil
-			c.hydratingMu.Unlock()
-
-			return err
-		}
-
-		// Hydration done — release the touched set.
-		c.hydratingMu.Lock()
-		c.hydrating = false
-		c.hydrationTouched = nil
-		c.hydratingMu.Unlock()
-	}
-
+	// Marked started BEFORE the first reconcile, because that reconcile is
+	// what delivers the FC-11 announcement: a subscriber registered before
+	// Start is called while Start is still on the stack, and a callback that
+	// answers the announcement by writing must not be refused for a Client the
+	// consumer considers running. The scope exists by then and the write is
+	// fenced by the reconcile window exactly like a feed publication, so
+	// read-your-writes holds. Rolled back below when the engine never comes
+	// up, so a failed Start leaves the flag exactly as it found it.
 	c.started.Store(true)
 
-	return nil
-}
+	// The engine subscribes before it reconciles and rolls a failed Subscribe
+	// back itself, so a write landing between the snapshot and the first feed
+	// event is still observed. A failed Start leaves the Client usable: a
+	// failed reconcile is retried from nothing, a ctx expiry is waited on again.
+	if !c.multiTenant {
+		if err := c.engine.Start(ctx); err != nil {
+			c.started.Store(false)
+			c.registryFrozen = ctx.Err() != nil
 
-func (c *Client) hydrate(ctx context.Context) error {
-	entries, err := c.store.List(ctx)
-	if err != nil {
-		return err
+			return err
+		}
 	}
-
-	c.registryMu.RLock()
-
-	for _, entry := range entries {
-		nk := nskey{Namespace: entry.Namespace, Key: entry.Key}
-
-		if _, registered := c.registry[nk]; !registered {
-			c.logWarn(ctx, "unregistered key in store, skipping",
-				log.String("namespace", entry.Namespace),
-				log.String("key", entry.Key),
-			)
-
-			continue
-		}
-
-		// Skip keys the changefeed already wrote during hydration — those
-		// values are by definition fresher than this List() snapshot.
-		c.hydratingMu.Lock()
-		_, touched := c.hydrationTouched[nk]
-		c.hydratingMu.Unlock()
-
-		if touched {
-			continue
-		}
-
-		var decoded any
-		if err := json.Unmarshal(entry.Value, &decoded); err != nil {
-			c.logWarn(ctx, "failed to unmarshal stored value, keeping default",
-				log.String("namespace", entry.Namespace),
-				log.String("key", entry.Key),
-				log.Err(err),
-			)
-
-			continue
-		}
-
-		c.cacheMu.Lock()
-		c.cache[nk] = decoded
-		c.cacheMu.Unlock()
-	}
-
-	c.registryMu.RUnlock()
 
 	return nil
 }
@@ -337,163 +262,30 @@ func (c *Client) Close() error {
 		return nil
 	}
 
-	var closeErr error
-
 	c.closeOnce.Do(func() {
 		c.startMu.Lock()
 		defer c.startMu.Unlock()
 
 		c.closed.Store(true)
 
-		if c.lifecycleCancel != nil {
-			c.lifecycleCancel()
-		}
+		// Engine first, store second, and the order is load-bearing: the
+		// engine cancels its lifecycle, unsubscribes every scope, drops
+		// pending re-reads and drains its dispatch workers before returning,
+		// so the store is closed with nothing still reading through it.
+		engineErr := c.engine.Close()
 
-		if c.storeUnsubscribe != nil {
-			c.storeUnsubscribe()
-			c.storeUnsubscribe = nil
-		}
-
-		if c.debouncer != nil {
-			c.debouncer.Close()
-		}
+		var storeErr error
 
 		if c.store != nil {
 			if err := c.store.Close(); err != nil {
-				closeErr = fmt.Errorf("systemplane: close store: %w", err)
+				storeErr = fmt.Errorf("systemplane: close store: %w", err)
 			}
 		}
+
+		// errors.Join(nil, nil) is nil, so the clean path is unchanged, and a
+		// subscriber that refused to stop does not swallow a store failure.
+		c.closeErr = errors.Join(engineErr, storeErr)
 	})
 
-	return closeErr
-}
-
-// onEvent debounces a backend event by (namespace, key) and refreshes the
-// cache when the debounce window closes. Single-tenant mode only.
-func (c *Client) onEvent(evt store.Event) {
-	nk := nskey{Namespace: evt.Namespace, Key: evt.Key}
-
-	if c.debouncer == nil {
-		c.refreshFromStore(nk, evt.Op)
-
-		return
-	}
-
-	op := evt.Op
-
-	c.debouncer.Submit(nk, func() {
-		c.refreshFromStore(nk, op)
-	})
-}
-
-func (c *Client) refreshFromStore(nk nskey, op string) {
-	c.registryMu.RLock()
-	def, registered := c.registry[nk]
-	c.registryMu.RUnlock()
-
-	if !registered {
-		c.logWarn(context.Background(), "changefeed event for unregistered key, skipping",
-			log.String("namespace", nk.Namespace),
-			log.String("key", nk.Key),
-		)
-
-		return
-	}
-
-	// Use the Client's lifecycle context as the parent so a Close() cancels
-	// the refresh and all downstream subscriber invocations.
-	parent := c.lifecycleCtx
-	if parent == nil {
-		parent = context.Background()
-	}
-
-	ctx, cancel := context.WithTimeout(parent, refreshTimeout)
-	defer cancel()
-
-	newValue := cloneValue(def.defaultValue)
-
-	if op != store.OpDelete {
-		entry, found, err := c.store.Get(ctx, nk.Namespace, nk.Key)
-		if err != nil {
-			c.logWarn(ctx, "refresh from store failed",
-				log.String("namespace", nk.Namespace),
-				log.String("key", nk.Key),
-				log.Err(err),
-			)
-
-			return
-		}
-
-		if !found {
-			// The change notification and this re-read are separate
-			// operations: the write may simply not be visible to this reader
-			// yet. A real removal arrives as store.OpDelete and is handled
-			// above, so a miss here is a non-answer — keep the last
-			// known-good value instead of resetting to the default.
-			c.logWarn(ctx, "refreshed key not found in store, keeping current value",
-				log.String("namespace", nk.Namespace),
-				log.String("key", nk.Key),
-			)
-
-			return
-		}
-
-		var decoded any
-		if err := json.Unmarshal(entry.Value, &decoded); err != nil {
-			c.logWarn(ctx, "failed to unmarshal refreshed value, keeping current",
-				log.String("namespace", nk.Namespace),
-				log.String("key", nk.Key),
-				log.Err(err),
-			)
-
-			return
-		}
-
-		newValue = decoded
-	}
-
-	// Record that hydration's later List() pass MUST NOT overwrite this key:
-	// the changefeed has just delivered a fresher value (or a delete event).
-	// We set this AFTER the refresh has produced a usable value — if Get
-	// failed, reported not-found, or the JSON decode failed, we return above
-	// without touching the cache, so hydrate()'s List() snapshot remains the
-	// correct source of truth.
-	c.hydratingMu.Lock()
-	if c.hydrating && c.hydrationTouched != nil {
-		c.hydrationTouched[nk] = struct{}{}
-	}
-	c.hydratingMu.Unlock()
-
-	c.cacheMu.Lock()
-	c.cache[nk] = cloneValue(newValue)
-	c.cacheMu.Unlock()
-
-	// Fire subscribers with the lifecycle context (NOT the per-refresh timeout
-	// context); subscribers may outlive the Get call's bounded timeout.
-	dispatchCtx := c.lifecycleCtx
-	if dispatchCtx == nil {
-		dispatchCtx = context.Background()
-	}
-
-	c.fireSubscribers(dispatchCtx, nk, cloneValue(newValue))
-}
-
-// fireSubscribers invokes all OnChange callbacks for a key with panic
-// recovery. ctx is derived from the Client's lifecycle so subscribers receive
-// cancellation when the Client shuts down.
-func (c *Client) fireSubscribers(ctx context.Context, nk nskey, newValue any) {
-	c.subsMu.RLock()
-	subs := make([]subscription, len(c.subscribers[nk]))
-	copy(subs, c.subscribers[nk])
-	c.subsMu.RUnlock()
-
-	for _, sub := range subs {
-		fn := sub.fn
-
-		func() {
-			defer runtime.RecoverAndLog(c.logger, "systemplane.onchange")
-
-			fn(ctx, cloneValue(newValue))
-		}()
-	}
+	return c.closeErr
 }

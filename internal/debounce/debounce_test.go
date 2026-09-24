@@ -1,10 +1,60 @@
 package debounce
 
 import (
+	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/LerianStudio/lib-observability/v4/log"
 )
+
+// recordingLogger captures the fields lib-observability's panic recovery
+// emits, so a test can read the component name the debouncer handed it.
+type recordingLogger struct {
+	log.Logger
+
+	mu     sync.Mutex
+	fields []log.Field
+}
+
+func (r *recordingLogger) Log(_ context.Context, _ int, _ string, fields ...any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for _, arg := range fields {
+		switch v := arg.(type) {
+		case []log.Field:
+			r.fields = append(r.fields, v...)
+		case log.Field:
+			r.fields = append(r.fields, v)
+		}
+	}
+}
+
+// snapshot copies the captured fields under the lock. A timer goroutine can
+// still be inside Log while a test renders a failure, so formatting the slice
+// itself is a data race the race detector fails the run on.
+func (r *recordingLogger) snapshot() []log.Field {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return append([]log.Field(nil), r.fields...)
+}
+
+func (r *recordingLogger) field(key string) (log.Field, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for _, f := range r.fields {
+		if f.Key == key {
+			return f, true
+		}
+	}
+
+	return log.Field{}, false
+}
 
 const (
 	testWindow = 50 * time.Millisecond
@@ -102,7 +152,8 @@ func TestDebouncer_NilReceiverSafe(t *testing.T) {
 func TestDebouncer_PanicInFnRecovered(t *testing.T) {
 	t.Parallel()
 
-	d := New[string](testWindow)
+	rec := &recordingLogger{Logger: log.NewNop()}
+	d := New[string](testWindow, WithLogger[string](rec))
 	t.Cleanup(d.Close)
 
 	var secondFired atomic.Int32
@@ -117,6 +168,24 @@ func TestDebouncer_PanicInFnRecovered(t *testing.T) {
 
 	if secondFired.Load() != 1 {
 		t.Fatal("debouncer broke after panic; second submit did not fire")
+	}
+
+	// The recovery component is a constant, never the key. Arguments to a
+	// deferred call are evaluated at defer time, so rendering the key into it
+	// would charge a Sprintf to every debounced invocation, panic or not.
+	// What that costs in identity, and who pays it back, is the recoveryComponent
+	// constant's godoc in debounce.go:
+	// RecoverAndLog captures no context, so it records neither the panic metric
+	// nor a span event, and in production mode its line carries source and a
+	// redacted value and no stack at all. A caller whose submitted function
+	// must be identifiable recovers first and logs its own identity.
+	source, ok := rec.field("source")
+	if !ok {
+		t.Fatalf("panic recovery logged no source field: %v", rec.snapshot())
+	}
+
+	if source.Value != "debounce" {
+		t.Errorf("panic recovery source: got %v, want %q", source.Value, "debounce")
 	}
 }
 

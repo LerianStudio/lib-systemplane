@@ -1,6 +1,6 @@
 package systemplane
 
-import internalclient "github.com/LerianStudio/lib-systemplane/v3/internal/client"
+import internalclient "github.com/LerianStudio/lib-systemplane/v4/internal/client"
 
 // Sentinel errors returned by Client methods.
 var (
@@ -30,6 +30,15 @@ var (
 	// ErrNotSupportedInMultiTenant is returned by OnChange in multi-tenant
 	// mode — there is no shared process-wide changefeed.
 	ErrNotSupportedInMultiTenant = internalclient.ErrNotSupportedInMultiTenant
+
+	// ErrCloseTimeout is returned by Close when a subscriber callback was
+	// still running after the WithCloseTimeout bound elapsed: it ignored the
+	// context Close canceled. The message names every scope and key still
+	// running, and that goroutine is the subscriber's leak, made visible
+	// rather than hidden. An empty set of keys means no callback was running
+	// and the engine was still inside the store — a reconcile's List or a
+	// debounced re-read that had not answered.
+	ErrCloseTimeout = internalclient.ErrCloseTimeout
 
 	// ErrTenantConnectionMissing is returned when a method runs in
 	// multi-tenant mode and the caller's context carries no tenant database

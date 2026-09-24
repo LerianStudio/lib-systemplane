@@ -2,11 +2,14 @@
 
 package systemplane
 
-import internalclient "github.com/LerianStudio/lib-systemplane/v3/internal/client"
+import internalclient "github.com/LerianStudio/lib-systemplane/v4/internal/client"
 
 // TestStore is the public mirror of the internal store.Store interface,
 // exposed solely for [NewForTesting].
 type TestStore = internalclient.TestStore
+
+// TestScope is the public mirror of internal store.Scope.
+type TestScope = internalclient.TestScope
 
 // TestEntry is the public mirror of internal store.Entry.
 type TestEntry = internalclient.TestEntry

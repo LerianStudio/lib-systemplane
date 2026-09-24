@@ -33,3 +33,27 @@ func TestMain(m *testing.M) {
 		goleak.IgnoreAnyFunction("net/http.(*persistConn).writeLoop"),
 	)
 }
+
+// FeedsSnapshot exposes the feeds map to the external mongodb_test package:
+// how many changefeed slots the store holds, and how many callers are parked
+// on tenant's slot. Test-only — this file never enters a production build.
+func (s *Store) FeedsSnapshot(tenant string) (total, refs int) {
+	s.feedsMu.Lock()
+	defer s.feedsMu.Unlock()
+
+	if f, ok := s.feeds[tenant]; ok {
+		refs = f.refs
+	}
+
+	return len(s.feeds), refs
+}
+
+// zeroFeed returns the zero-scope feed, creating it when the test needs one
+// without going through Start. Test-only: production reaches the same slot
+// through zeroFeedForStart (Start, under startMu) or through acquireFeed.
+func (s *Store) zeroFeed() (*feed, error) {
+	s.feedsMu.Lock()
+	defer s.feedsMu.Unlock()
+
+	return s.zeroFeedLocked()
+}
