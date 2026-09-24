@@ -560,7 +560,7 @@ func (s *Store) createFeed(ctx context.Context, f *feed) error {
 		return s.retractFeed(f, fmt.Errorf("systemplane/mongodb: resolve tenant %s: %w", tenant, store.ErrTenantConnectorMissing))
 	}
 
-	coll := db.Collection(s.cfg.Collection)
+	coll := db.Collection(collectionName)
 
 	// Refused before anything is created or opened: a collection another live
 	// scope already watches would deliver that scope's writes to this one too.
@@ -876,7 +876,7 @@ func (s *Store) openWatch(ctx context.Context, f *feed) (*mongo.ChangeStream, er
 	}
 
 	s.logInfo(ctx, "change stream established",
-		log.String("collection", s.cfg.Collection),
+		log.String("collection", collectionName),
 		log.String(obsconstants.AttrKeyTenantID, f.scope.Tenant),
 	)
 
@@ -1232,7 +1232,7 @@ func (s *Store) refreshFeedColl(ctx context.Context, f *feed) error {
 		return fmt.Errorf("systemplane/mongodb: resolve tenant %s: %w", f.scope.Tenant, store.ErrTenantConnectorMissing)
 	}
 
-	coll := db.Collection(s.cfg.Collection)
+	coll := db.Collection(collectionName)
 
 	// The tenant may have been moved onto a collection another live scope
 	// watches; re-claiming keeps the identity the refusal is decided on honest

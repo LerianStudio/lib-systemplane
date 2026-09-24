@@ -223,3 +223,7 @@ them, so nothing propagates.
 `*tmpostgres.Manager`, a concrete connection-pool handle with no interface to
 stand in for it, so that library's major is part of this contract by
 construction. Breaking it is a separate change, not a silent one.
+
+## Removed in v4
+
+`WithTable`, `WithListenChannel` and `WithCollection` no longer exist. The Postgres table is always `systemplane_entries`, its NOTIFY channel always `systemplane_changes`, and the MongoDB collection always `systemplane_entries`.

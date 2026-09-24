@@ -19,7 +19,7 @@ type Connector interface {
 	// is read.
 	//
 	// The database, not the collection: the collection name is the store's
-	// own configuration (Config.Collection) and a connector must never need
+	// own constant (collectionName) and a connector must never need
 	// to know it.
 	//
 	// The database MUST be one no other scope of the same Store resolves to.

@@ -115,11 +115,8 @@ func TestNewForTestingAdapterAndOptions(t *testing.T) {
 	}}}
 
 	c, err := NewForTesting(backend,
-		WithListenChannel("custom_channel"),
 		WithPollInterval(time.Second),
 		WithDebounce(time.Millisecond),
-		WithCollection("custom_collection"),
-		WithTable("custom_table"),
 		WithModule("custom_module"),
 		WithCatalogService("custom_service"),
 	)

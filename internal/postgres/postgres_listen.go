@@ -777,12 +777,12 @@ func (s *Store) openListen(ctx context.Context, f *feed) (*pgx.Conn, string, err
 	listenCtx, cancelListen := context.WithTimeout(ctx, listenTimeout)
 	defer cancelListen()
 
-	if _, err := conn.Exec(listenCtx, "LISTEN "+quoteIdentifier(s.cfg.Channel)); err != nil {
+	if _, err := conn.Exec(listenCtx, "LISTEN "+channelName); err != nil {
 		return abort(fmt.Errorf("systemplane/postgres: listen%s: %w", f.label(), err))
 	}
 
 	s.logInfo(ctx, "LISTEN connection established",
-		log.String("channel", s.cfg.Channel),
+		log.String("channel", channelName),
 		log.String(obsconstants.AttrKeyTenantID, f.scope.Tenant),
 		log.String("database", dbKey),
 	)
@@ -1190,7 +1190,7 @@ func (s *Store) dialAndListen(f *feed) (*pgx.Conn, error) {
 	listenCtx, cancelListen := context.WithTimeout(context.Background(), listenTimeout)
 	defer cancelListen()
 
-	if _, err := conn.Exec(listenCtx, "LISTEN "+quoteIdentifier(s.cfg.Channel)); err != nil {
+	if _, err := conn.Exec(listenCtx, "LISTEN "+channelName); err != nil {
 		closeCtx, cancelClose := context.WithTimeout(context.Background(), closeTimeout)
 		defer cancelClose()
 
