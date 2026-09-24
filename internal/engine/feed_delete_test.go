@@ -11,10 +11,21 @@ import (
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
-// deleteWindow is the quiet window every test in this file runs at. A real one
-// is the point: with WithDebounce(0) the feed's re-read runs inline on the
-// changefeed goroutine, which serialises everything these tests are about and
-// hides the four regressions they pin.
+// deleteWindow is the real quiet window this file's tests run at, and the one
+// forEachWindow pairs with WithDebounce(0). A real window is what separates
+// the two behaviours: at zero the feed's re-read runs inline on the changefeed
+// goroutine, which serialises everything these tests are about, so a test that
+// only ever ran at zero would pin none of the regressions below.
+//
+// Every test whose claim is about a re-read's OUTCOME runs at both windows,
+// through forEachWindow. The two that hold Store.Get open with a gate —
+// TestFeedDeleteFencesAnInFlightReReadOnArrival and
+// TestFeedDeleteDoesNotRevertAWritePublishedDuringItsReRead — cannot: at zero
+// the goroutine their gate blocks inside Store.Get IS the changefeed
+// goroutine, so the very event they need to deliver while the read is in
+// flight can never arrive, and the test would deadlock rather than fail. They
+// stay pinned at the real window, which is the only one where the race they
+// describe exists.
 const deleteWindow = 20 * time.Millisecond
 
 // noRevision fails the test when any Change delivered carries revision, naming
@@ -108,52 +119,55 @@ func TestFeedDeleteFencesAnInFlightReReadOnArrival(t *testing.T) {
 func TestFeedDeleteRePublishesTheRowAWriteLeftBehind(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 	scope := store.Scope{}
-	fs := newFakeStore()
-	e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, deleteWindow)
 
-	var rec recorder
+	forEachWindow(t, func(t *testing.T, window time.Duration) {
+		fs := newFakeStore()
+		e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, window)
 
-	unsub := e.OnChange(nk, rec.record)
-	defer unsub()
+		var rec recorder
 
-	// The caller's own Delete, then its own Set, each published as it returned.
-	if err := e.PublishDelete(scope, nk); err != nil {
-		t.Fatalf("PublishDelete: %v", err)
-	}
+		unsub := e.OnChange(nk, rec.record)
+		defer unsub()
 
-	row := jsonRow(nk, 9, `"rewritten"`, "actor")
-	fs.seed(scope, row)
-	e.Publish(context.Background(), scope, row)
-
-	waitFor(t, time.Second, "the write's delivery", func() bool {
-		revs := rec.revisions()
-
-		return len(revs) > 0 && revs[len(revs)-1] == 9
-	})
-
-	delivered := rec.len()
-	readsBefore := fs.getCount()
-
-	// The delete's echo, arriving after the write is already in force.
-	e.onEvent(deleteEvent(scope, nk))
-
-	waitFor(t, time.Second, "the delete's re-read", func() bool { return fs.getCount() > readsBefore })
-	quiesce(t, e)
-
-	got, ok := e.Lookup(scope, nk)
-	if !ok || got.Value != "rewritten" || got.Revision != 9 {
-		t.Errorf("after the delete echo: got (%v, rev %d, cached %t), want (\"rewritten\", rev 9): "+
-			"the echo of a delete reverted the write made after it", got.Value, got.Revision, ok)
-	}
-
-	for _, ch := range rec.changes()[delivered:] {
-		if ch.Revision == 0 {
-			t.Errorf("delivered revisions %v: subscribers were handed the registered default for a key "+
-				"the caller had just written", rec.revisions())
-
-			break
+		// The caller's own Delete, then its own Set, each published as it returned.
+		if err := e.PublishDelete(scope, nk); err != nil {
+			t.Fatalf("PublishDelete: %v", err)
 		}
-	}
+
+		row := jsonRow(nk, 9, `"rewritten"`, "actor")
+		fs.seed(scope, row)
+		e.Publish(context.Background(), scope, row)
+
+		waitFor(t, time.Second, "the write's delivery", func() bool {
+			revs := rec.revisions()
+
+			return len(revs) > 0 && revs[len(revs)-1] == 9
+		})
+
+		delivered := rec.len()
+		readsBefore := fs.getCount()
+
+		// The delete's echo, arriving after the write is already in force.
+		e.onEvent(deleteEvent(scope, nk))
+
+		waitFor(t, time.Second, "the delete's re-read", func() bool { return fs.getCount() > readsBefore })
+		quiesce(t, e)
+
+		got, ok := e.Lookup(scope, nk)
+		if !ok || got.Value != "rewritten" || got.Revision != 9 {
+			t.Errorf("after the delete echo: got (%v, rev %d, cached %t), want (\"rewritten\", rev 9): "+
+				"the echo of a delete reverted the write made after it", got.Value, got.Revision, ok)
+		}
+
+		for _, ch := range rec.changes()[delivered:] {
+			if ch.Revision == 0 {
+				t.Errorf("delivered revisions %v: subscribers were handed the registered default for a key "+
+					"the caller had just written", rec.revisions())
+
+				break
+			}
+		}
+	})
 }
 
 // TestFeedDeleteDoesNotRevertAWritePublishedDuringItsReRead pins the fence on
@@ -226,39 +240,44 @@ func TestFeedDeleteDoesNotRevertAWritePublishedDuringItsReRead(t *testing.T) {
 func TestFeedDeleteAfterARecreatePublishesTheRecreatedRow(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 	scope := store.Scope{}
-	fs := newFakeStore()
-	e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, deleteWindow)
 
-	var rec recorder
+	forEachWindow(t, func(t *testing.T, window time.Duration) {
+		fs := newFakeStore()
+		e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, window)
 
-	unsub := e.OnChange(nk, rec.record)
-	defer unsub()
+		var rec recorder
 
-	fs.seed(scope, jsonRow(nk, 9, `"recreated"`, "actor"))
-	e.onEvent(upsertEvent(scope, nk, 9))
+		unsub := e.OnChange(nk, rec.record)
+		defer unsub()
 
-	waitFor(t, time.Second, "the recreate's delivery", func() bool {
-		revs := rec.revisions()
+		fs.seed(scope, jsonRow(nk, 9, `"recreated"`, "actor"))
+		e.onEvent(upsertEvent(scope, nk, 9))
 
-		return len(revs) > 0 && revs[len(revs)-1] == 9
+		waitFor(t, time.Second, "the recreate's delivery", func() bool {
+			revs := rec.revisions()
+
+			return len(revs) > 0 && revs[len(revs)-1] == 9
+		})
+
+		readsBefore := fs.getCount()
+
+		// More than one window after the upsert echo, so nothing coalesces
+		// these two. At WithDebounce(0) there is no window to coalesce in at
+		// all and the sleep is a no-op, which is the same starting state.
+		time.Sleep(2 * window)
+		e.onEvent(deleteEvent(scope, nk))
+
+		waitFor(t, time.Second, "the delete's re-read", func() bool { return fs.getCount() > readsBefore })
+		quiesce(t, e)
+
+		got, ok := e.Lookup(scope, nk)
+		if !ok || got.Value != "recreated" || got.Revision != 9 {
+			t.Errorf("after a delete echo whose row is present: got (%v, rev %d, cached %t), want "+
+				"(\"recreated\", rev 9)", got.Value, got.Revision, ok)
+		}
+
+		noRevision(t, &rec, 0, "a delete echo reverted a recreated row to the registered default")
 	})
-
-	readsBefore := fs.getCount()
-
-	// More than one window after the upsert echo: nothing coalesces these two.
-	time.Sleep(2 * deleteWindow)
-	e.onEvent(deleteEvent(scope, nk))
-
-	waitFor(t, time.Second, "the delete's re-read", func() bool { return fs.getCount() > readsBefore })
-	quiesce(t, e)
-
-	got, ok := e.Lookup(scope, nk)
-	if !ok || got.Value != "recreated" || got.Revision != 9 {
-		t.Errorf("after a delete echo whose row is present: got (%v, rev %d, cached %t), want "+
-			"(\"recreated\", rev 9)", got.Value, got.Revision, ok)
-	}
-
-	noRevision(t, &rec, 0, "a delete echo reverted a recreated row to the registered default")
 }
 
 // TestFeedDeleteOfAMissingRowPublishesTheDefaultOnce is the ordinary delete:
@@ -267,37 +286,40 @@ func TestFeedDeleteAfterARecreatePublishesTheRecreatedRow(t *testing.T) {
 func TestFeedDeleteOfAMissingRowPublishesTheDefaultOnce(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 	scope := store.Scope{}
-	fs := newFakeStore()
-	e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, deleteWindow)
 
-	var rec recorder
+	forEachWindow(t, func(t *testing.T, window time.Duration) {
+		fs := newFakeStore()
+		e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, window)
 
-	unsub := e.OnChange(nk, rec.record)
-	defer unsub()
+		var rec recorder
 
-	fs.seed(scope, jsonRow(nk, 3, `"live"`, "ops"))
-	e.onEvent(upsertEvent(scope, nk, 3))
-	waitFor(t, time.Second, "the upsert delivery", func() bool { return rec.len() == 1 })
+		unsub := e.OnChange(nk, rec.record)
+		defer unsub()
 
-	fs.remove(scope, nk)
-	e.onEvent(deleteEvent(scope, nk))
+		fs.seed(scope, jsonRow(nk, 3, `"live"`, "ops"))
+		e.onEvent(upsertEvent(scope, nk, 3))
+		waitFor(t, time.Second, "the upsert delivery", func() bool { return rec.len() == 1 })
 
-	waitFor(t, time.Second, "the delete delivery", func() bool { return rec.len() == 2 })
-	quiesce(t, e)
+		fs.remove(scope, nk)
+		e.onEvent(deleteEvent(scope, nk))
 
-	got, ok := e.Lookup(scope, nk)
-	if !ok || got.Value != "fallback" || got.Revision != 0 {
-		t.Errorf("after the delete: got (%v, rev %d, cached %t), want the registered default at rev 0",
-			got.Value, got.Revision, ok)
-	}
+		waitFor(t, time.Second, "the delete delivery", func() bool { return rec.len() == 2 })
+		quiesce(t, e)
 
-	if !got.UpdatedAt.IsZero() || got.UpdatedBy != "" {
-		t.Errorf("provenance after delete: got (%s, %q), want (zero time, \"\")", got.UpdatedAt, got.UpdatedBy)
-	}
+		got, ok := e.Lookup(scope, nk)
+		if !ok || got.Value != "fallback" || got.Revision != 0 {
+			t.Errorf("after the delete: got (%v, rev %d, cached %t), want the registered default at rev 0",
+				got.Value, got.Revision, ok)
+		}
 
-	if revs := rec.revisions(); len(revs) != 2 || revs[1] != 0 {
-		t.Errorf("delivered revisions: got %v, want exactly two, the second at revision 0", revs)
-	}
+		if !got.UpdatedAt.IsZero() || got.UpdatedBy != "" {
+			t.Errorf("provenance after delete: got (%s, %q), want (zero time, \"\")", got.UpdatedAt, got.UpdatedBy)
+		}
+
+		if revs := rec.revisions(); len(revs) != 2 || revs[1] != 0 {
+			t.Errorf("delivered revisions: got %v, want exactly two, the second at revision 0", revs)
+		}
+	})
 }
 
 // TestPendingDeleteReReadAfterCloseNeverReachesTheStore is the delete twin of

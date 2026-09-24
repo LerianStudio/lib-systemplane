@@ -643,3 +643,113 @@ func TestPublishDeleteReportsEveryRefusalItCanStillMake(t *testing.T) {
 		})
 	}
 }
+
+// TestRunValidator pins the exported door the Client grades through.
+//
+// Register and Set are the two places in the library that hand a validator a
+// value without going through an ingress, so this wrapper is the only thing
+// between a consumer's panicking validator and the consumer's own process. All
+// four outcomes matter to a caller: a nil engine still grades (the Client
+// reaches here before anything confirms an engine exists), no validator
+// accepts, a returned error comes back untouched so the caller can match its
+// own sentinel, and a panic comes back as a refusal that names the panic and
+// never the value it panicked on — a configuration row is exactly where a
+// secret lives.
+func TestRunValidator(t *testing.T) {
+	// lib-observability's production mode is a process-global switch: without
+	// it the recovery pipeline prints the recovered value, which is the one
+	// thing the panic case asserts is absent.
+	runtime.SetProductionMode(true)
+	t.Cleanup(func() { runtime.SetProductionMode(false) })
+
+	const secret = "run-validator-panic-sentinel-Wq4Nb"
+
+	refused := errors.New("the scheme is not allowed")
+
+	for _, tc := range []struct {
+		name      string
+		nilEngine bool
+		validate  func(context.Context, any) error
+		check     func(t *testing.T, err error, logger *recordingLogger)
+	}{
+		{
+			name:      "a nil engine grades and survives a panic",
+			nilEngine: true,
+			validate:  func(context.Context, any) error { panic(secret) },
+			check: func(t *testing.T, err error, _ *recordingLogger) {
+				requireValidatorPanic(t, err)
+			},
+		},
+		{
+			name:     "no validator accepts every value",
+			validate: nil,
+			check: func(t *testing.T, err error, _ *recordingLogger) {
+				if err != nil {
+					t.Errorf("err = %v, want nil: an unvalidated key refuses nothing", err)
+				}
+			},
+		},
+		{
+			name:     "a returned error comes back verbatim",
+			validate: func(context.Context, any) error { return refused },
+			check: func(t *testing.T, err error, _ *recordingLogger) {
+				if !errors.Is(err, refused) {
+					t.Errorf("err = %v, want the validator's own error", err)
+				}
+
+				if err != refused { //nolint:errorlint // verbatim is the contract: no wrapping.
+					t.Errorf("err = %#v, want the validator's error unwrapped", err)
+				}
+			},
+		},
+		{
+			name:     "a panic becomes a validation refusal that never names the value",
+			validate: func(context.Context, any) error { panic(secret) },
+			check: func(t *testing.T, err error, logger *recordingLogger) {
+				requireValidatorPanic(t, err)
+
+				recovered := false
+
+				for _, entry := range logger.all() {
+					if strings.Contains(entry, "panic recovered") {
+						recovered = true
+					}
+
+					if strings.Contains(entry, secret) {
+						t.Errorf("a log entry carries the panic value: %s", entry)
+					}
+				}
+
+				if !recovered {
+					t.Errorf("no panic-recovery entry was logged, got %v", logger.all())
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logger := &recordingLogger{Logger: log.NewNop()}
+
+			var e *Engine
+			if !tc.nilEngine {
+				e = engineWithRegistry(fakeRegistry{defs: map[NSKey]KeyDef{}})
+				e.logger = logger
+			}
+
+			tc.check(t, e.RunValidator(context.Background(), tc.validate, secret), logger)
+		})
+	}
+}
+
+// requireValidatorPanic asserts the one shape a recovered validator panic ever
+// comes back as.
+func requireValidatorPanic(t *testing.T, err error) {
+	t.Helper()
+
+	if !errors.Is(err, store.ErrValidation) {
+		t.Fatalf("err = %v, want store.ErrValidation", err)
+	}
+
+	if !strings.Contains(err.Error(), "validator panicked") {
+		t.Errorf("err = %q, want it to name the panic", err)
+	}
+}

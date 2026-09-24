@@ -210,9 +210,11 @@ func (c *Client) GetFloat64(ctx context.Context, namespace, key string) (float64
 
 // GetDuration returns the value as a time.Duration.
 //
-// Accepts time.Duration, parseable duration string (e.g. "30s"), and integer
-// float64 nanoseconds. All other shapes — including unparseable strings —
-// return (0, false, ErrValidation).
+// Accepts a parseable duration string (e.g. "30s") and float64 nanoseconds,
+// which are the only two shapes a value ever reaches a reader in: every value
+// in force has been through JSON, whether it came from a store row or from the
+// registered default Register canonicalises. All other shapes — including
+// unparseable strings — return (0, false, ErrValidation).
 func (c *Client) GetDuration(ctx context.Context, namespace, key string) (time.Duration, bool, error) {
 	v, ok, err := c.Get(ctx, namespace, key)
 	if err != nil || !ok {
@@ -220,8 +222,6 @@ func (c *Client) GetDuration(ctx context.Context, namespace, key string) (time.D
 	}
 
 	switch d := v.(type) {
-	case time.Duration:
-		return d, true, nil
 	case string:
 		parsed, parseErr := time.ParseDuration(d)
 		if parseErr != nil {

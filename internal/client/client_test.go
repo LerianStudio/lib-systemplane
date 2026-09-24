@@ -2280,3 +2280,116 @@ func TestLoggerNeverReturnsNil(t *testing.T) {
 		t.Error("Logger on a nil Client: got nil, want a no-op logger")
 	}
 }
+
+// TestTypedGettersServeTheCanonicalRegisteredDefault pins every typed getter
+// and List against a key that has no row: what they serve is the registered
+// default in the CANONICAL shape (Register's contract, FC-5), not the Go value
+// the consumer passed.
+//
+// That distinction is the whole test. A consumer registers 30*time.Second and
+// reads it back with GetDuration; between the two the default went through
+// JSON, so what the getter is handed is float64(3e10), and the conversion that
+// turns it back into 30s is the only thing standing between a boot with no row
+// and a duration of zero. The same holds for an int (float64 on the way back)
+// and for List, which reports the canonical number rather than the Duration.
+func TestTypedGettersServeTheCanonicalRegisteredDefault(t *testing.T) {
+	m := newMemStore(false)
+	c := newSingleTenantClient(t, m)
+
+	registered := []struct {
+		key string
+		def any
+	}{
+		{key: "timeout", def: 30 * time.Second},
+		{key: "retries", def: 5},
+		{key: "ratio", def: 2.5},
+		{key: "enabled", def: true},
+		{key: "mode", def: "strict"},
+	}
+
+	for _, r := range registered {
+		if err := c.Register("ns", r.key, r.def); err != nil {
+			t.Fatalf("register %s: %v", r.key, err)
+		}
+	}
+
+	// No row is ever written: every read below is answered by the default the
+	// first reconcile published (FC-11).
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	t.Cleanup(func() { _ = c.Close() })
+
+	listed := make(map[string]any)
+
+	entries, err := c.List(context.Background(), "ns")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	for _, e := range entries {
+		listed[e.Key] = e.Value
+	}
+
+	for _, tc := range []struct {
+		name     string
+		key      string
+		read     func(context.Context) (any, bool, error)
+		want     any
+		wantList any
+	}{
+		{
+			name: "GetDuration over a registered time.Duration",
+			key:  "timeout",
+			read: func(ctx context.Context) (any, bool, error) { return c.GetDuration(ctx, "ns", "timeout") },
+			want: 30 * time.Second,
+			// JSON has one number type: the Duration comes back as its
+			// nanosecond count, and List reports exactly that.
+			wantList: float64(30 * time.Second),
+		},
+		{
+			name:     "GetInt over a registered int",
+			key:      "retries",
+			read:     func(ctx context.Context) (any, bool, error) { return c.GetInt(ctx, "ns", "retries") },
+			want:     int64(5),
+			wantList: float64(5),
+		},
+		{
+			name:     "GetFloat64 over a registered float64",
+			key:      "ratio",
+			read:     func(ctx context.Context) (any, bool, error) { return c.GetFloat64(ctx, "ns", "ratio") },
+			want:     2.5,
+			wantList: 2.5,
+		},
+		{
+			name:     "GetBool over a registered bool",
+			key:      "enabled",
+			read:     func(ctx context.Context) (any, bool, error) { return c.GetBool(ctx, "ns", "enabled") },
+			want:     true,
+			wantList: true,
+		},
+		{
+			name:     "GetString over a registered string",
+			key:      "mode",
+			read:     func(ctx context.Context) (any, bool, error) { return c.GetString(ctx, "ns", "mode") },
+			want:     "strict",
+			wantList: "strict",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok, err := tc.read(context.Background())
+			if err != nil || !ok {
+				t.Fatalf("read %s: value=%v ok=%v err=%v", tc.key, got, ok, err)
+			}
+
+			if got != tc.want {
+				t.Errorf("%s = %#v, want %#v: the canonical default did not convert back", tc.key, got, tc.want)
+			}
+
+			if listed[tc.key] != tc.wantList {
+				t.Errorf("List reports %s as %#v, want %#v", tc.key, listed[tc.key], tc.wantList)
+			}
+		})
+	}
+}

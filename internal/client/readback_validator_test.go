@@ -338,7 +338,12 @@ func TestRefreshRunsTheValidatorOnRefreshedValues(t *testing.T) {
 		seedEntry(t, m, "ns", "k", rejectedSecret)
 		m.fire(store.Event{Namespace: "ns", Key: "k", Op: store.OpUpsert})
 
-		time.Sleep(50 * time.Millisecond)
+		// Wait on the refusal itself, not on a slice of wall clock: the race
+		// this test describes only exists once the refresh has run AND been
+		// rejected, and its WARN line is the only thing that says so.
+		waitFor(t, func() bool {
+			return len(logger.warns("stored value rejected by validator, keeping cached value")) > 0
+		}, "the refresh never rejected the value the changefeed carried")
 
 		// Restore the value List() is about to read, so the reconcile sees the
 		// acceptable snapshot the changefeed raced.
