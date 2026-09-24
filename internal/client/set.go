@@ -34,7 +34,9 @@ import (
 // or something newer. Every refusal the publication can still make — a Client
 // closing under the write, a scope with no changefeed behind it, bytes that do
 // not survive the round trip — comes back as an error naming the key, with the
-// row already persisted.
+// row already persisted. A write the engine could not publish because it holds
+// no live scope for it matches [ErrNotStarted]; one that met a closing Client
+// is [ErrClosed].
 func (c *Client) Set(ctx context.Context, namespace, key string, value any, actor string) error {
 	if c == nil || c.closed.Load() {
 		return ErrClosed
@@ -107,6 +109,12 @@ func (c *Client) Set(ctx context.Context, namespace, key string, value any, acto
 			// the publication. The row is persisted; nothing in this process
 			// will ever serve it.
 			return ErrClosed
+		case errors.Is(err, engine.ErrScopeNotTracked):
+			// The engine holds no live scope for this write: Start never brought
+			// one up, or it was dropped under the write. The Client is not
+			// running for that scope, which is what ErrNotStarted means —
+			// reported with the row already persisted, so the message says so.
+			return fmt.Errorf("%w: %s/%s was written but not published: %w", ErrNotStarted, namespace, key, err)
 		default:
 			return fmt.Errorf("systemplane: %s/%s was written but not published: %w", namespace, key, err)
 		}
@@ -117,7 +125,16 @@ func (c *Client) Set(ctx context.Context, namespace, key string, value any, acto
 	return nil
 }
 
-// Delete removes a single (namespace, key) row.
+// Delete removes a single (namespace, key) row, then publishes the registered
+// default at revision 0 so the caller's own next read stops serving the value
+// it just removed (D4).
+//
+// A nil return means the next read in this process serves the registered
+// default or something newer. Every refusal the publication can still make —
+// a Client closing under the removal, a scope with no changefeed behind it —
+// comes back as an error naming the key, with the row already gone from the
+// store; the scope case also matches [ErrNotStarted], since the engine holds
+// no live scope to publish into.
 func (c *Client) Delete(ctx context.Context, namespace, key, actor string) error {
 	if c == nil || c.closed.Load() {
 		return ErrClosed
@@ -148,7 +165,18 @@ func (c *Client) Delete(ctx context.Context, namespace, key, actor string) error
 	if !c.multiTenant {
 		// The registered default at revision 0, under the engine's delete
 		// fence, so a re-read already in flight cannot resurrect the row.
-		c.engine.PublishDelete(store.Scope{}, engine.NSKey{Namespace: namespace, Key: key})
+		// Every refusal it can still make is passed on for the reason Set
+		// passes its own: the row is gone from the store and the next read in
+		// this process still serves the value the caller just removed.
+		switch err := c.engine.PublishDelete(store.Scope{}, engine.NSKey{Namespace: namespace, Key: key}); {
+		case err == nil:
+		case errors.Is(err, engine.ErrClosed):
+			return ErrClosed
+		case errors.Is(err, engine.ErrScopeNotTracked):
+			return fmt.Errorf("%w: %s/%s was deleted but not published: %w", ErrNotStarted, namespace, key, err)
+		default:
+			return fmt.Errorf("systemplane: %s/%s was deleted but not published: %w", namespace, key, err)
+		}
 	}
 
 	return nil

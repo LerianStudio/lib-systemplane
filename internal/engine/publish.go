@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bytes"
+	"fmt"
 	"reflect"
 	"time"
 
@@ -36,7 +37,14 @@ type publication struct {
 }
 
 // publish applies pub to its scope's cache under the revision fence and
-// reports whether subscribers must be notified.
+// reports whether subscribers must be notified, and separately whether the
+// publication was DROPPED — which is not the same thing. A fence that refuses
+// a publication has decided the cache already holds this value or something
+// newer, so the caller's write is readable and notify=false is the whole
+// answer. The two drops below decide nothing: they cache nothing, deliver
+// nothing, and leave the key exactly as it was. A caller waiting to be told
+// whether its write is readable needs them spelled as an error, or Set returns
+// nil for a row no read in this process will ever serve.
 //
 //   - accepted (notify=true): pub.Revision > cached.Revision, the key is not
 //     cached yet, or pub.Revision == 0 (a delete or a reconcile-absent; never
@@ -65,12 +73,13 @@ type publication struct {
 // It does not clone. The caller owns producing a value the engine may keep —
 // the ingress already decoded fresh JSON, and cloning again per publication
 // would cost a reflective walk on the hot path for nothing.
-func (e *Engine) publish(sc *scopeState, pub publication) (notify bool) {
+func (e *Engine) publish(sc *scopeState, pub publication) (notify bool, err error) {
 	// A closed engine takes no publication: its workers are gone or going, so
 	// caching a value nobody can be told about only resurrects a scope during
-	// shutdown.
+	// shutdown. Reached AFTER Publish's own guard, by a write that was still
+	// inside the ingress when the Client closed under it.
 	if e.closed.Load() {
-		return false
+		return false, ErrClosed
 	}
 
 	// The caller's state, refused once its scope has been dropped. publish no
@@ -80,7 +89,7 @@ func (e *Engine) publish(sc *scopeState, pub publication) (notify bool) {
 	// delivery worker nothing will ever stop before Close.
 	select {
 	case <-sc.reconcileStop:
-		return false
+		return false, fmt.Errorf("%w: %s", ErrScopeNotTracked, scopeLabel(sc.scope))
 	default:
 	}
 
@@ -95,7 +104,7 @@ func (e *Engine) publish(sc *scopeState, pub publication) (notify bool) {
 		// reconcile-absent, which always wins and resets the counter), or a
 		// newer row. All three fall through to the store below.
 	case pub.Revision < cached.Revision:
-		return false
+		return false, nil
 	case len(pub.Raw) > 0 && bytes.Equal(pub.Raw, cached.Raw):
 		// The same row read twice: bytes the store itself handed over last
 		// time, which is what a changefeed re-read and a reconcile snapshot
@@ -113,7 +122,7 @@ func (e *Engine) publish(sc *scopeState, pub publication) (notify bool) {
 		cached.UpdatedBy = pub.UpdatedBy
 		sc.entries[pub.NSKey] = cached
 
-		return false
+		return false, nil
 	case reflect.DeepEqual(pub.Value, cached.Value):
 		// Equal non-zero revision, different bytes, same meaning: a writer
 		// reformatted the JSON or reordered object keys, or a Set echo is
@@ -139,7 +148,7 @@ func (e *Engine) publish(sc *scopeState, pub publication) (notify bool) {
 		cached.UpdatedBy = pub.UpdatedBy
 		sc.entries[pub.NSKey] = cached
 
-		return false
+		return false, nil
 	default:
 		// Equal non-zero revision carrying a different value: D3's foreign
 		// writer, which changed value without bumping revision. Observed.
@@ -176,7 +185,7 @@ func (e *Engine) publish(sc *scopeState, pub publication) (notify bool) {
 	// non-blocking channel send.
 	e.dispatch(sc, pub)
 
-	return true
+	return true, nil
 }
 
 // trackedScope returns scope's state, or nil when the engine is not tracking

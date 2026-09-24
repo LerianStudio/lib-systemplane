@@ -817,8 +817,17 @@ func TestSetReportsAPublicationTheEngineRefused(t *testing.T) {
 		t.Errorf("Set error does not name the key that was written but not published: %v", setErr)
 	}
 
-	if cause := errors.Unwrap(setErr); cause == nil || !strings.Contains(cause.Error(), "does not track") {
-		t.Errorf("Set error does not wrap the engine's own reason: %v", setErr)
+	// The engine's own reason is carried, and the refusal is matchable rather
+	// than only readable: a write the engine holds no live scope for is the
+	// Client not running for that scope. errors.Unwrap cannot see it — the
+	// message wraps both that sentinel and the engine's error — so the chain is
+	// asserted through errors.Is.
+	if !errors.Is(setErr, ErrNotStarted) {
+		t.Errorf("Set error does not match ErrNotStarted for a write into an untracked scope: %v", setErr)
+	}
+
+	if !strings.Contains(setErr.Error(), "does not track") {
+		t.Errorf("Set error does not carry the engine's own reason: %v", setErr)
 	}
 
 	if readBack != "default" {
@@ -832,6 +841,71 @@ func TestSetReportsAPublicationTheEngineRefused(t *testing.T) {
 
 	if !stored {
 		t.Error("the row never reached the store, so this test is pinning the wrong refusal")
+	}
+}
+
+// TestDeleteReportsAPublicationTheEngineRefused is the removal's half of the
+// same promise. Delete persisted the removal and then published the registered
+// default so the caller's own next read stops serving the value it just
+// removed (D4) — but it threw the publication's outcome away, so a removal the
+// engine could not publish came back as a clean nil while the next read in
+// this process still served the deleted value.
+func TestDeleteReportsAPublicationTheEngineRefused(t *testing.T) {
+	s := newMemStore(false)
+	c := newSingleTenantClient(t, s)
+
+	defer func() { _ = c.Close() }()
+
+	if err := c.Register("ns", "key", "default"); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	// The scope comes up and its first reconcile fails, which is what makes
+	// the next Start drop it — the window a removal can land in.
+	s.failListOnce(errors.New("list failed"))
+
+	if err := c.Start(context.Background()); err == nil {
+		t.Fatal("Start: got nil, want the first reconcile's failure")
+	}
+
+	var (
+		fired  bool
+		delErr error
+	)
+
+	s.mu.Lock()
+	s.unsubHook = func() {
+		fired = true
+		delErr = c.Delete(context.Background(), "ns", "key", "actor")
+	}
+	s.mu.Unlock()
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("second Start: %v", err)
+	}
+
+	if !fired {
+		t.Fatal("the second Start never dropped the failed scope, so no removal met an untracked engine")
+	}
+
+	if delErr == nil {
+		t.Fatal("Delete: got nil for a removal nothing published")
+	}
+
+	if errors.Is(delErr, ErrClosed) {
+		t.Errorf("Delete: got ErrClosed, want the refusal named: %v", delErr)
+	}
+
+	if !strings.Contains(delErr.Error(), "ns/key was deleted but not published") {
+		t.Errorf("Delete error does not name the key that was deleted but not published: %v", delErr)
+	}
+
+	if !errors.Is(delErr, ErrNotStarted) {
+		t.Errorf("Delete error does not match ErrNotStarted for a removal into an untracked scope: %v", delErr)
+	}
+
+	if !strings.Contains(delErr.Error(), "does not track") {
+		t.Errorf("Delete error does not carry the engine's own reason: %v", delErr)
 	}
 }
 

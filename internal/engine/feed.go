@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/LerianStudio/lib-observability/v4/constants"
@@ -467,26 +468,41 @@ func (e *Engine) recordFeedDelete(scope store.Scope, nk NSKey) {
 // what the key holds now, and answering it without asking the store reverted
 // whatever the caller wrote next; the feed counts its delete at arrival and
 // re-reads instead (onEvent, refreshKey).
-func (e *Engine) PublishDelete(scope store.Scope, nk NSKey) {
+//
+// Every refusal it can make is REPORTED, exactly as Publish reports a write's:
+// a nil or closed engine, a scope the engine does not track, a key nothing
+// registered, and a publication the engine or the scope went away under. All
+// of them mean the row is deleted in the store and the caller's next read in
+// this process still serves the value it removed — which is precisely what
+// Client.Delete must pass on rather than swallow. A nil error means the
+// registered default is in force for the key.
+func (e *Engine) PublishDelete(scope store.Scope, nk NSKey) error {
 	// Exported, so this runs on the consumer's goroutine: the same guard
 	// Publish takes, for the same reason. The feed's own callers can never
 	// reach a nil or closed engine; a Client built by a path that never
 	// reached New can.
 	if e == nil || e.closed.Load() {
-		return
+		return ErrClosed
 	}
 
 	sc := e.scopeForEvent(scope, nk)
 	if sc == nil {
-		return
+		return fmt.Errorf("%w: %s", ErrScopeNotTracked, scopeLabel(scope))
 	}
 
 	sc.reconcileMu.Lock()
 	defer sc.reconcileMu.Unlock()
 
-	if e.ingestDefault(e.dispatchContext(), sc, nk, true) {
+	notify, err := e.ingestDefault(e.dispatchContext(), sc, nk, true)
+	if err != nil {
+		return err
+	}
+
+	if notify {
 		sc.record(nk, true)
 	}
+
+	return nil
 }
 
 // refreshKey re-reads one key and puts the row through the ingress. It is what
@@ -672,7 +688,10 @@ func (e *Engine) publishAbsentDelete(ctx context.Context, sc *scopeState, scope 
 		return
 	}
 
-	if e.ingestDefault(ctx, sc, nk, false) {
+	// The feed's own ingress: nothing is waiting to be told, and the only
+	// errors ingestDefault reports here are a scope going away and a key the
+	// caller already confirmed registered.
+	if notify, _ := e.ingestDefault(ctx, sc, nk, false); notify {
 		sc.record(nk, true)
 	}
 }

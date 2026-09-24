@@ -107,7 +107,7 @@ func (c *Client) getEntry(ctx context.Context, namespace, key string) (Entry, bo
 			errorDetail(def.redaction != RedactNone, "decode failed", err),
 		)
 
-		return Entry{}, false, fmt.Errorf("systemplane: decode value for %s/%s: %w", namespace, key, err)
+		return Entry{}, false, decodeErr(ctx, namespace, key, err)
 	}
 
 	return Entry{
@@ -346,7 +346,7 @@ func (c *Client) listFromStore(ctx context.Context, namespace string, keys []reg
 					errorDetail(rk.def.redaction != RedactNone, "decode failed", err),
 				)
 
-				return nil, fmt.Errorf("systemplane: decode value for %s/%s: %w", namespace, rk.Key, err)
+				return nil, decodeErr(ctx, namespace, rk.Key, err)
 			}
 
 			val = decoded

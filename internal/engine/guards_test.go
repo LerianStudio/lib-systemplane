@@ -41,11 +41,13 @@ func TestNilEngineIsInert(t *testing.T) {
 			},
 		},
 		{
-			name: "PublishDelete is dropped",
+			name: "PublishDelete reports ErrClosed",
 			call: func(t *testing.T) {
 				var e *Engine
 
-				e.PublishDelete(store.Scope{}, nk)
+				if err := e.PublishDelete(store.Scope{}, nk); !errors.Is(err, ErrClosed) {
+					t.Errorf("PublishDelete: got %v, want %v", err, ErrClosed)
+				}
 			},
 		},
 		{

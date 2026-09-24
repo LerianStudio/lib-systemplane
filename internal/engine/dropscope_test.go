@@ -194,8 +194,10 @@ func TestPublishIntoAlreadyDroppedStateIsRefused(t *testing.T) {
 	e.OnChange(nk, func(context.Context, Change) {})
 	e.dropScope(dropTenant)
 
-	if notify := e.publish(sc, publication{Scope: dropTenant, NSKey: nk, Revision: 9, Value: "late"}); notify {
+	if notify, err := e.publish(sc, publication{Scope: dropTenant, NSKey: nk, Revision: 9, Value: "late"}); notify {
 		t.Error("publish into a dropped scope state: notify is true, want false")
+	} else if !errors.Is(err, ErrScopeNotTracked) {
+		t.Errorf("publish into a dropped scope state: got %v, want errors.Is ErrScopeNotTracked", err)
 	}
 
 	if _, ok := e.Lookup(dropTenant, nk); ok {
@@ -339,7 +341,7 @@ func TestDropSweepDoesNotStopAReactivatedScopesWorkers(t *testing.T) {
 	unsub := e.OnChange(nk, func(context.Context, Change) {})
 	defer unsub()
 
-	if notify := e.publish(sc, publication{Scope: dropTenant, NSKey: nk, Revision: 9, Value: "back"}); !notify {
+	if notify, _ := e.publish(sc, publication{Scope: dropTenant, NSKey: nk, Revision: 9, Value: "back"}); !notify {
 		t.Fatal("the re-activated scope refused a first publication")
 	}
 
@@ -403,7 +405,7 @@ func TestScopeBroughtUpAfterADropDeliversAgain(t *testing.T) {
 	unsub := e.OnChange(nk, rec.record)
 	defer unsub()
 
-	if notify := e.publish(sc, publication{Scope: dropTenant, NSKey: nk, Revision: 4, Value: "retried"}); !notify {
+	if notify, _ := e.publish(sc, publication{Scope: dropTenant, NSKey: nk, Revision: 4, Value: "retried"}); !notify {
 		t.Fatal("the scope brought up after a drop refused a first publication")
 	}
 
@@ -523,7 +525,7 @@ func TestStragglerWorkerDoesNotEraseTheLiveMarker(t *testing.T) {
 		t.Fatal("the tenant scope was not brought up")
 	}
 
-	if notify := e.publish(old, publication{Scope: dropTenant, NSKey: nk, Revision: 1, Value: "before"}); !notify {
+	if notify, _ := e.publish(old, publication{Scope: dropTenant, NSKey: nk, Revision: 1, Value: "before"}); !notify {
 		t.Fatal("the scope refused a first publication")
 	}
 
@@ -537,7 +539,7 @@ func TestStragglerWorkerDoesNotEraseTheLiveMarker(t *testing.T) {
 		t.Fatal("the tenant was not re-activated into a new scope state")
 	}
 
-	if notify := e.publish(sc, publication{Scope: dropTenant, NSKey: nk, Revision: 2, Value: "after"}); !notify {
+	if notify, _ := e.publish(sc, publication{Scope: dropTenant, NSKey: nk, Revision: 2, Value: "after"}); !notify {
 		t.Fatal("the re-activated scope refused a first publication")
 	}
 

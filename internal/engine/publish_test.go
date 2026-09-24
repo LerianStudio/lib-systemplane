@@ -55,7 +55,9 @@ func (e *Engine) publishInto(pub publication) (notify bool) {
 		return false
 	}
 
-	return e.publish(sc, pub)
+	notify, _ = e.publish(sc, pub)
+
+	return notify
 }
 
 // TestPublishFence walks the four fence outcomes of publish, one subtest per

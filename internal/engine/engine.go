@@ -534,10 +534,13 @@ func scopeLabel(scope store.Scope) string {
 //
 // What Publish can still refuse it REPORTS, and Client.Set passes that error
 // on: a closed or nil engine, a scope it does not track, a key nothing
-// registered, and bytes that do not decode. Every one of them means the row is
-// persisted and the next read will not serve it, which is exactly what a
-// caller of Set needs to be told. A nil error means the cache holds this write
-// or something newer.
+// registered, bytes that do not decode, and the two the ingress meets only
+// AFTER the guards above have passed — the engine closed under this write, and
+// the scope torn down under it. Every one of them means the row is persisted
+// and the next read will not serve it, which is exactly what a caller of Set
+// needs to be told. A nil error means the cache holds this write or something
+// newer; a publication the revision fence refused is not a refusal in that
+// sense, because the cache then holds something newer already.
 //
 // A write whose revision the store could not report (0) still takes effect,
 // because revision 0 always wins the fence — at the cost of the echo
@@ -584,7 +587,7 @@ func (e *Engine) Publish(ctx context.Context, scope store.Scope, se store.Entry)
 			log.String("keyname", se.Key),
 		)
 
-		return fmt.Errorf("systemplane: the engine does not track %s", scopeLabel(scope))
+		return fmt.Errorf("%w: %s", ErrScopeNotTracked, scopeLabel(scope))
 	}
 
 	return e.ingest(ctx, sc, se, feedFence{}, true)

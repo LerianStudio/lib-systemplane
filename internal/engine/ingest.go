@@ -33,14 +33,17 @@ import (
 //
 // Dispatch is not the caller's business: an accepted publication is handed to
 // the key's delivery worker inside publish, so ingest reports only whether the
-// value was usable — decoded, and graded unless the caller had graded it
-// already. That is what the changefeed needs to tell a value it could not read
-// from a value the fence merely found no newer than the cached one: the first
-// means the engine learned nothing about the key, the second means the cache
-// is already current. The error is the same fact spelled for the write path,
-// where a caller is waiting to be told whether its write is readable.
+// value was usable — decoded, graded unless the caller had graded it already,
+// and, for a pregraded local write, actually taken by the cache. That is what
+// the changefeed needs to tell a value it could not read from a value the
+// fence merely found no newer than the cached one: the first means the engine
+// learned nothing about the key, the second means the cache is already
+// current. The error is the same fact spelled for the write path, where a
+// caller is waiting to be told whether its write is readable — and publish's
+// own two drops, which cache nothing and decide nothing, are part of that
+// answer rather than of the fence's.
 //
-// Five rejections, each with its own outcome:
+// Six rejections, each with its own outcome:
 //
 //  1. Unregistered key — skipped entirely, nothing published. A store may
 //     legitimately hold rows this process never registered, so this is
@@ -57,6 +60,11 @@ import (
 //     row. Only the delete counter is consulted here: a row this read really
 //     did see is ordered against every other publication by the revision
 //     fence, and only a delete — which publishes revision 0 — escapes it.
+//  6. Dropped publication — the engine closed, or the scope was torn down,
+//     after this ingress had already passed its caller's guard. Nothing is
+//     cached and nothing is decided, so the key is recorded unusable, and a
+//     pregraded local write is TOLD: its caller is waiting to learn what the
+//     next read serves, and the answer is "not this".
 //
 // The ingress runs in two halves and the split is load-bearing. prepare —
 // decode, and the CONSUMER's registered validator — runs OUTSIDE the scope's
@@ -111,7 +119,21 @@ func (e *Engine) ingest(ctx context.Context, sc *scopeState, se store.Entry, fen
 
 	publishable := err == nil && !sc.supersededByDelete(nk, fence)
 	if publishable {
-		e.publish(sc, pub)
+		// publish has two refusals of its own that decide nothing and cache
+		// nothing: the engine closed under this ingress, and the scope torn
+		// down under it. The key was not answered, so the outcome recorded is
+		// the same "unusable" every other rejection records — and for a
+		// pregraded local write the caller is still waiting to hear whether
+		// its row is readable, so the drop is its answer. Feed and reconcile
+		// ingress has no such caller: the scope is going away, and the drop is
+		// the ordinary end of its traffic.
+		if _, dropped := e.publish(sc, pub); dropped != nil {
+			publishable = false
+
+			if pregraded {
+				err = dropped
+			}
+		}
 	}
 
 	sc.record(nk, publishable)
@@ -245,7 +267,13 @@ func errorDetail(redacted bool, what string, err error) log.Field {
 // conclusion about that photograph, not a removal, so it passes false too.
 //
 // sc is the caller's own scope state, for the reason publish takes one.
-func (e *Engine) ingestDefault(ctx context.Context, sc *scopeState, nk NSKey, deleted bool) (notify bool) {
+//
+// A nil error means the default is in force for nk: published, and delivered
+// when notify says so. The two errors are the ones no caller can decide for
+// itself — a key nothing registered, and a publication publish dropped because
+// the engine or the scope went away under it — and only Client.Delete, whose
+// caller is waiting to be told what its next read serves, acts on them.
+func (e *Engine) ingestDefault(ctx context.Context, sc *scopeState, nk NSKey, deleted bool) (notify bool, err error) {
 	// Unreachable from all four production callers, each behind a guard of
 	// its own: PublishDelete and publishAbsentDelete, because the feed drops
 	// an unregistered key before either is reached and the Client only deletes
@@ -267,7 +295,7 @@ func (e *Engine) ingestDefault(ctx context.Context, sc *scopeState, nk NSKey, de
 			log.String("keyname", nk.Key),
 		)
 
-		return false
+		return false, fmt.Errorf("systemplane: %s/%s is not a registered key", nk.Namespace, nk.Key)
 	}
 
 	return e.publish(sc, publication{

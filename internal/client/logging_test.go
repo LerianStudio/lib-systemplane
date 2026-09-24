@@ -4,8 +4,11 @@ package client
 
 import (
 	"context"
+	"strings"
 	"testing"
 
+	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
+	"github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/redaction"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
@@ -194,5 +197,57 @@ func TestRefreshPanicNamesTheKey(t *testing.T) {
 
 	if source != "refresh" {
 		t.Errorf("the accounting line carries source = %v, want \"refresh\": the panic was counted under another site, or reported without being counted", source)
+	}
+}
+
+// TestMultiTenantDecodeFailureNamesTheTenant pins the one identifier a
+// multi-tenant read-through failure used to withhold. The line named the
+// namespace and the key, which on a multi-tenant deployment is the same
+// namespace and the same key for every tenant in the fleet: an operator
+// reading it learned that SOMEBODY's row was unreadable and had no way to tell
+// whose. The tenant travels on the caller's context, so it is stamped centrally
+// on every ERROR the Client logs in multi-tenant mode, and named in the error
+// the caller receives beside the namespace and key.
+func TestMultiTenantDecodeFailureNamesTheTenant(t *testing.T) {
+	m := newMemStore(true)
+	logger := &recordingLogger{}
+	c := newMultiTenantClientWithLogger(t, m, logger)
+
+	if err := c.Register("ns", "k", "default"); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	t.Cleanup(func() { _ = c.Close() })
+
+	seedRaw(m, "ns", "k", []byte(`{not json`))
+
+	ctx := tmcore.ContextWithTenantID(context.Background(), "acme")
+
+	if _, _, err := c.Get(ctx, "ns", "k"); err == nil {
+		t.Fatal("Get: want a decode error, got nil")
+	} else if !strings.Contains(err.Error(), "acme") {
+		t.Errorf("the decode error does not name the tenant whose row failed: %v", err)
+	}
+
+	lines := logger.errs("failed to unmarshal stored value")
+	if len(lines) != 1 {
+		t.Fatalf("got %d ERROR lines for the undecodable row, want exactly 1: %s", len(lines), logger.rendered())
+	}
+
+	var tenant string
+
+	for _, f := range lines[0].structured() {
+		if f.Key == constants.AttrKeyTenantID {
+			tenant, _ = f.Value.(string)
+		}
+	}
+
+	if tenant != "acme" {
+		t.Errorf("the line carries %s = %q, so an operator cannot tell whose row is broken: %s",
+			constants.AttrKeyTenantID, tenant, logger.rendered())
 	}
 }

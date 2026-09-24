@@ -373,7 +373,9 @@ func (e *Engine) applySnapshotRow(ctx context.Context, sc *scopeState, arm recon
 	}
 
 	if usable {
-		e.publish(sc, pub)
+		// The reconcile's own ingress: a drop means the scope is going away
+		// under it, and there is no caller to tell.
+		_, _ = e.publish(sc, pub)
 
 		return false
 	}
@@ -404,7 +406,7 @@ func (e *Engine) applySnapshotRow(ctx context.Context, sc *scopeState, arm recon
 	// failed to list — it completed, with an error, and the row it never saw
 	// was never announced by any reconcile after it.
 	if _, isCached := sc.cached(nk); !isCached {
-		e.ingestDefault(ctx, sc, nk, false)
+		_, _ = e.ingestDefault(ctx, sc, nk, false)
 	}
 
 	return false
@@ -429,7 +431,7 @@ func (e *Engine) applyAbsentKey(ctx context.Context, sc *scopeState, arm reconci
 		return false
 	}
 
-	e.ingestDefault(ctx, sc, nk, false)
+	_, _ = e.ingestDefault(ctx, sc, nk, false)
 
 	return false
 }

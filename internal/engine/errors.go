@@ -38,3 +38,16 @@ var ErrNilRegistry = errors.New("systemplane: engine built without a registry")
 // returning nil there reported a write as landed that no reader would ever
 // see.
 var ErrClosed = errors.New("systemplane: engine is closed")
+
+// ErrScopeNotTracked is returned by Publish and PublishDelete for a change
+// addressed to a scope the engine holds no state for: one that was never
+// brought up (before Start), one that was dropped (a suspended, deleted or
+// rotated tenant), and the scope that is torn down while the call is already
+// inside the engine.
+//
+// Caching into such a scope would rebuild it around one value with no
+// changefeed behind it and no reconcile goroutine to confirm it — readable
+// forever as though it were current — so the change is dropped instead. The
+// row is persisted and nothing in this process will serve it, which is what
+// the caller of Set or Delete is told. The wrapped message names the scope.
+var ErrScopeNotTracked = errors.New("systemplane: the engine does not track that scope")

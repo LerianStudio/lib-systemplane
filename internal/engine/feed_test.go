@@ -199,7 +199,9 @@ func TestFeedDeleteDoesNotRevertTheWriteThatFollowedIt(t *testing.T) {
 	defer unsub()
 
 	// The caller's own Delete, then its own Set, each published as it returned.
-	e.PublishDelete(scope, nk)
+	if err := e.PublishDelete(scope, nk); err != nil {
+		t.Fatalf("PublishDelete: %v", err)
+	}
 
 	row := jsonRow(nk, 7, `"written"`, "actor")
 	fs.seed(scope, row)
@@ -805,7 +807,9 @@ func TestPublishDeleteOnUntrackedScopeCreatesNoScope(t *testing.T) {
 	fs := newFakeStore()
 	e := untrackedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs)
 
-	e.PublishDelete(store.Scope{}, nk)
+	if err := e.PublishDelete(store.Scope{}, nk); !errors.Is(err, ErrScopeNotTracked) {
+		t.Errorf("PublishDelete into an untracked scope: got %v, want errors.Is ErrScopeNotTracked", err)
+	}
 
 	if got := scopeCount(e); got != 0 {
 		t.Errorf("scopes tracked after PublishDelete: got %d, want 0", got)
@@ -861,7 +865,10 @@ func TestPublishDeleteRecordsTheKeyAsTouched(t *testing.T) {
 	waitFor(t, hangGuard, "the reconcile to reach its List", func() bool { return fs.listCount() >= 2 })
 
 	fs.remove(scope, nk)
-	e.PublishDelete(scope, nk)
+
+	if err := e.PublishDelete(scope, nk); err != nil {
+		t.Fatalf("PublishDelete: %v", err)
+	}
 
 	release()
 	waitReconcileIdle(t, e, scope)

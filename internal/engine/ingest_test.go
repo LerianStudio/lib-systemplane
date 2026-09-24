@@ -127,8 +127,8 @@ func TestIngestDefaultPublishesAtRevisionZero(t *testing.T) {
 	seeded := store.Entry{Namespace: nk.Namespace, Key: nk.Key, Value: []byte(`"a"`), Revision: 7, UpdatedBy: "ops"}
 	ingestRow(e, seeded)
 
-	if notify := e.ingestDefault(context.Background(), e.scopeFor(store.Scope{}), nk, true); !notify {
-		t.Error("no-row publication: notify is false, want true")
+	if notify, err := e.ingestDefault(context.Background(), e.scopeFor(store.Scope{}), nk, true); !notify || err != nil {
+		t.Errorf("no-row publication: (notify %t, err %v), want (true, nil)", notify, err)
 	}
 
 	got := cachedEntry(t, e, store.Scope{}, nk)
@@ -140,8 +140,9 @@ func TestIngestDefaultPublishesAtRevisionZero(t *testing.T) {
 		t.Errorf("provenance: got (%s, %q), want (zero time, \"\")", got.UpdatedAt, got.UpdatedBy)
 	}
 
-	if notify := e.ingestDefault(context.Background(), e.scopeFor(store.Scope{}), NSKey{Namespace: "billing", Key: "unknown"}, true); notify {
-		t.Error("no-row publication for an unregistered key: notify is true, want false")
+	if notify, err := e.ingestDefault(context.Background(), e.scopeFor(store.Scope{}),
+		NSKey{Namespace: "billing", Key: "unknown"}, true); notify || err == nil {
+		t.Errorf("no-row publication for an unregistered key: (notify %t, err %v), want (false, an error)", notify, err)
 	}
 }
 
@@ -150,8 +151,8 @@ func TestIngestClonesRegisteredDefault(t *testing.T) {
 	registered := map[string]any{"limit": float64(10)}
 	e := engineWithRegistry(fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: registered}}})
 
-	if notify := e.ingestDefault(context.Background(), e.scopeFor(store.Scope{}), nk, true); !notify {
-		t.Fatal("no-row publication: notify is false, want true")
+	if notify, err := e.ingestDefault(context.Background(), e.scopeFor(store.Scope{}), nk, true); !notify || err != nil {
+		t.Fatalf("no-row publication: (notify %t, err %v), want (true, nil)", notify, err)
 	}
 
 	cached, isMap := cachedEntry(t, e, store.Scope{}, nk).Value.(map[string]any)
@@ -387,66 +388,258 @@ func TestIngestValidatorGetsNoTenantOnFeedAndReconcile(t *testing.T) {
 	})
 }
 
+// refusalEngine builds an engine tracking the single-tenant scope over a
+// registry the case may hook, the way the Client leaves it after Start.
+func refusalEngine(t *testing.T, reg Registry) *Engine {
+	t.Helper()
+
+	e := New(Config{Store: newFakeStore(), Registry: reg, Logger: log.NewNop()})
+	track(t, e, store.Scope{})
+
+	t.Cleanup(func() {
+		if err := e.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+
+	return e
+}
+
+// requireRefusal grades one write path's return value against what the next
+// read will serve: nil only when the cache holds the write or something newer,
+// and otherwise an error an operator can both match and read.
+func requireRefusal(t *testing.T, what string, err error, wantErr error, wantText string) {
+	t.Helper()
+
+	if wantErr == nil && wantText == "" {
+		if err != nil {
+			t.Fatalf("%s: %v, want nil", what, err)
+		}
+
+		return
+	}
+
+	if err == nil {
+		t.Fatalf("%s reported success for a change the next read cannot serve", what)
+	}
+
+	if wantErr != nil && !errors.Is(err, wantErr) {
+		t.Errorf("%s: got %v, want errors.Is %v", what, err, wantErr)
+	}
+
+	if wantText != "" && !strings.Contains(err.Error(), wantText) {
+		t.Errorf("%s: %v does not name %q", what, err, wantText)
+	}
+}
+
+// closeUnderTheCall and stopScopeUnderTheCall are the two seams that reach the
+// drops publish makes AFTER the exported guard has already passed. Registry
+// lookup is consumer code and runs between the two, which is exactly the
+// window a Client's Close or a dropped scope lands in.
+func closeUnderTheCall(e *Engine) func(NSKey) {
+	return func(NSKey) { e.closed.Store(true) }
+}
+
+func stopScopeUnderTheCall(e *Engine) func(NSKey) {
+	return func(NSKey) { e.trackedScope(store.Scope{}).stopReconcileWorker() }
+}
+
 // TestPublishReportsEveryRefusalItCanStillMake pins the write path's return
 // value to what the next read will serve. A local write is graded by the
 // Client before the store sees it, so the engine grades it no second time —
 // but it can still refuse the publication, and a refusal it swallowed left the
 // Client returning nil for a write nobody could read back.
+//
+// One table rather than a subtest each, with a string every refusal must carry:
+// a refusal added without a row here fails the build of nothing, but a refusal
+// added without a MESSAGE fails this test, which is the drift that matters.
 func TestPublishReportsEveryRefusalItCanStillMake(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
+	foreign := NSKey{Namespace: "billing", Key: "unregistered"}
 	defs := map[NSKey]KeyDef{nk: {Default: "fallback"}}
 
-	t.Run("an accepted write reports nothing", func(t *testing.T) {
-		e, _ := loggingEngine(t, defs, newFakeStore())
+	cases := []struct {
+		name     string
+		engine   func(t *testing.T, reg *hookedRegistry) *Engine
+		scope    store.Scope
+		row      store.Entry
+		wantErr  error
+		wantText string
+	}{
+		{
+			name:   "an accepted write reports nothing",
+			engine: func(t *testing.T, reg *hookedRegistry) *Engine { return refusalEngine(t, reg) },
+			row:    jsonRow(nk, 1, `"written"`, "ops"),
+		},
+		{
+			name:     "a nil engine reports ErrClosed",
+			engine:   func(*testing.T, *hookedRegistry) *Engine { return nil },
+			row:      jsonRow(nk, 1, `"written"`, "ops"),
+			wantErr:  ErrClosed,
+			wantText: "engine is closed",
+		},
+		{
+			name: "a closed engine reports ErrClosed",
+			engine: func(t *testing.T, reg *hookedRegistry) *Engine {
+				e := refusalEngine(t, reg)
+				if err := e.Close(); err != nil {
+					t.Fatalf("Close: %v", err)
+				}
 
-		if err := e.Publish(context.Background(), store.Scope{}, jsonRow(nk, 1, `"written"`, "ops")); err != nil {
-			t.Fatalf("Publish: %v, want nil", err)
-		}
-	})
+				return e
+			},
+			row:      jsonRow(nk, 1, `"written"`, "ops"),
+			wantErr:  ErrClosed,
+			wantText: "engine is closed",
+		},
+		{
+			name: "an engine closed under the write reports ErrClosed",
+			engine: func(t *testing.T, reg *hookedRegistry) *Engine {
+				e := refusalEngine(t, reg)
+				reg.hookLookup(closeUnderTheCall(e))
 
-	t.Run("a closed engine reports ErrClosed", func(t *testing.T) {
-		e, _ := loggingEngine(t, defs, newFakeStore())
+				return e
+			},
+			row:      jsonRow(nk, 1, `"written"`, "ops"),
+			wantErr:  ErrClosed,
+			wantText: "engine is closed",
+		},
+		{
+			name: "a scope stopped under the write reports the drop",
+			engine: func(t *testing.T, reg *hookedRegistry) *Engine {
+				e := refusalEngine(t, reg)
+				reg.hookLookup(stopScopeUnderTheCall(e))
 
-		if err := e.Close(); err != nil {
-			t.Fatalf("Close: %v", err)
-		}
+				return e
+			},
+			row:      jsonRow(nk, 1, `"written"`, "ops"),
+			wantErr:  ErrScopeNotTracked,
+			wantText: "does not track",
+		},
+		{
+			name:     "an untracked scope reports the drop",
+			engine:   func(t *testing.T, reg *hookedRegistry) *Engine { return refusalEngine(t, reg) },
+			scope:    store.Scope{Tenant: "acme"},
+			row:      jsonRow(nk, 1, `"written"`, "ops"),
+			wantErr:  ErrScopeNotTracked,
+			wantText: "tenant acme",
+		},
+		{
+			name:     "an unregistered key reports the skip",
+			engine:   func(t *testing.T, reg *hookedRegistry) *Engine { return refusalEngine(t, reg) },
+			row:      jsonRow(foreign, 1, `"written"`, "ops"),
+			wantText: "billing/unregistered",
+		},
+		{
+			name:     "undecodable bytes report the decode failure",
+			engine:   func(t *testing.T, reg *hookedRegistry) *Engine { return refusalEngine(t, reg) },
+			row:      jsonRow(nk, 1, `{not json`, "ops"),
+			wantText: "billing/limits",
+		},
+	}
 
-		if err := e.Publish(context.Background(), store.Scope{}, jsonRow(nk, 1, `"written"`, "ops")); !errors.Is(err, ErrClosed) {
-			t.Errorf("Publish on a closed engine: got %v, want ErrClosed", err)
-		}
-	})
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := &hookedRegistry{Registry: fakeRegistry{defs: defs}}
 
-	t.Run("a nil engine reports ErrClosed", func(t *testing.T) {
-		var e *Engine
+			err := tc.engine(t, reg).Publish(context.Background(), tc.scope, tc.row)
 
-		if err := e.Publish(context.Background(), store.Scope{}, jsonRow(nk, 1, `"written"`, "ops")); !errors.Is(err, ErrClosed) {
-			t.Errorf("Publish on a nil engine: got %v, want ErrClosed", err)
-		}
-	})
+			requireRefusal(t, "Publish", err, tc.wantErr, tc.wantText)
+		})
+	}
+}
 
-	t.Run("an untracked scope reports the drop", func(t *testing.T) {
-		e, _ := loggingEngine(t, defs, newFakeStore())
+// TestPublishDeleteReportsEveryRefusalItCanStillMake is the removal's half of
+// the table above, and exists for the same reason: Client.Delete removes the
+// row and then publishes the registered default so the caller's next read
+// stops serving what it deleted, and a drop it never heard about left that
+// read serving the deleted value behind a nil error.
+func TestPublishDeleteReportsEveryRefusalItCanStillMake(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	foreign := NSKey{Namespace: "billing", Key: "unregistered"}
+	defs := map[NSKey]KeyDef{nk: {Default: "fallback"}}
 
-		if err := e.Publish(context.Background(), store.Scope{Tenant: "acme"}, jsonRow(nk, 1, `"written"`, "ops")); err == nil {
-			t.Error("Publish into an untracked scope reported success for a write nothing cached")
-		}
-	})
+	cases := []struct {
+		name     string
+		engine   func(t *testing.T, reg *hookedRegistry) *Engine
+		scope    store.Scope
+		nk       NSKey
+		wantErr  error
+		wantText string
+	}{
+		{
+			name:   "an accepted delete reports nothing",
+			engine: func(t *testing.T, reg *hookedRegistry) *Engine { return refusalEngine(t, reg) },
+			nk:     nk,
+		},
+		{
+			name:     "a nil engine reports ErrClosed",
+			engine:   func(*testing.T, *hookedRegistry) *Engine { return nil },
+			nk:       nk,
+			wantErr:  ErrClosed,
+			wantText: "engine is closed",
+		},
+		{
+			name: "a closed engine reports ErrClosed",
+			engine: func(t *testing.T, reg *hookedRegistry) *Engine {
+				e := refusalEngine(t, reg)
+				if err := e.Close(); err != nil {
+					t.Fatalf("Close: %v", err)
+				}
 
-	t.Run("an unregistered key reports the skip", func(t *testing.T) {
-		e, _ := loggingEngine(t, defs, newFakeStore())
+				return e
+			},
+			nk:       nk,
+			wantErr:  ErrClosed,
+			wantText: "engine is closed",
+		},
+		{
+			name: "an engine closed under the delete reports ErrClosed",
+			engine: func(t *testing.T, reg *hookedRegistry) *Engine {
+				e := refusalEngine(t, reg)
+				reg.hookLookup(closeUnderTheCall(e))
 
-		foreign := NSKey{Namespace: "billing", Key: "unregistered"}
+				return e
+			},
+			nk:       nk,
+			wantErr:  ErrClosed,
+			wantText: "engine is closed",
+		},
+		{
+			name: "a scope stopped under the delete reports the drop",
+			engine: func(t *testing.T, reg *hookedRegistry) *Engine {
+				e := refusalEngine(t, reg)
+				reg.hookLookup(stopScopeUnderTheCall(e))
 
-		if err := e.Publish(context.Background(), store.Scope{}, jsonRow(foreign, 1, `"written"`, "ops")); err == nil {
-			t.Error("Publish of an unregistered key reported success")
-		}
-	})
+				return e
+			},
+			nk:       nk,
+			wantErr:  ErrScopeNotTracked,
+			wantText: "does not track",
+		},
+		{
+			name:     "an untracked scope reports the drop",
+			engine:   func(t *testing.T, reg *hookedRegistry) *Engine { return refusalEngine(t, reg) },
+			scope:    store.Scope{Tenant: "acme"},
+			nk:       nk,
+			wantErr:  ErrScopeNotTracked,
+			wantText: "tenant acme",
+		},
+		{
+			name:     "an unregistered key reports the skip",
+			engine:   func(t *testing.T, reg *hookedRegistry) *Engine { return refusalEngine(t, reg) },
+			nk:       foreign,
+			wantText: "billing/unregistered",
+		},
+	}
 
-	t.Run("undecodable bytes report the decode failure", func(t *testing.T) {
-		e, _ := loggingEngine(t, defs, newFakeStore())
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := &hookedRegistry{Registry: fakeRegistry{defs: defs}}
 
-		if err := e.Publish(context.Background(), store.Scope{}, jsonRow(nk, 1, `{not json`, "ops")); err == nil {
-			t.Error("Publish of an undecodable value reported success for a write nothing cached")
-		}
-	})
+			err := tc.engine(t, reg).PublishDelete(tc.scope, tc.nk)
+
+			requireRefusal(t, "PublishDelete", err, tc.wantErr, tc.wantText)
+		})
+	}
 }

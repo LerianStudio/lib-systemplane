@@ -117,7 +117,9 @@ func TestFeedDeleteRePublishesTheRowAWriteLeftBehind(t *testing.T) {
 	defer unsub()
 
 	// The caller's own Delete, then its own Set, each published as it returned.
-	e.PublishDelete(scope, nk)
+	if err := e.PublishDelete(scope, nk); err != nil {
+		t.Fatalf("PublishDelete: %v", err)
+	}
 
 	row := jsonRow(nk, 9, `"rewritten"`, "actor")
 	fs.seed(scope, row)
