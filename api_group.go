@@ -248,10 +248,11 @@ func (g *Group[T]) decodePublished(value any) (T, error) {
 // The question the gate actually asks is "is this Client multi-tenant".
 // CatalogKey answers it only because TenantScoped is a catalog PRESENTATION
 // field that reports the Client's mode verbatim, and it pays a deep clone of
-// the registered default to return one bool. This lane may not edit
-// internal/client, so the indirection stays: replace it with a direct probe of
-// the Client's mode when engine-core reopens that package, and revisit it with
-// FC-13's Phase 3, which reworks the catalog.
+// the registered default to return one bool. The indirection stays anyway: the
+// gate is correct today, because the only known=false case is a closed Client,
+// and the GetEntry below then fails with ErrClosed and that travels back to the
+// registrant. FC-13's Phase 3 reworks the catalog, and the groups-redaction
+// lane replaces this with a direct probe of the Client's mode then.
 func (g *Group[T]) seedCurrentEntry() (group.Publication, bool, error) {
 	if detail, known := g.client.CatalogKey(g.namespace, g.key); known && detail.TenantScoped {
 		return group.Publication{}, false, nil

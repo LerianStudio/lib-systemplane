@@ -456,11 +456,10 @@ func (e *Engine) recoverRefresh(scope store.Scope, nk NSKey, deleted, retried bo
 		e.recordFeedOutcome(sc, nk, false)
 	}
 
-	// Deferred rather than called last, which is where it used to sit. It
-	// still RUNS last, after the reporting below; registering it first is
-	// what keeps the repair this function promises independent of the
-	// reporting surviving. Both
-	// lines below end up inside the consumer's logger, and the guard this
+	// Deferred rather than called last, which is where it used to sit. It still
+	// RUNS last, after the reporting below; registering it first is what keeps
+	// the repair this function promises independent of the reporting surviving.
+	// Both lines below end up inside the consumer's logger, and the guard this
 	// engine puts under that logger covers the one it holds, not whatever
 	// lib-observability's handler reaches on its way to a sink.
 	var fence feedFence
