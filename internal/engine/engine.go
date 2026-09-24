@@ -154,6 +154,28 @@ func (l safeLogger) Enabled(level int) bool {
 	return l.Logger.Enabled(level)
 }
 
+// GuardLogger wraps a consumer's logger so a panic raised inside it cannot
+// unwind into the caller, and returns a no-op logger for nil. It is what New
+// puts under the whole engine, exported so the pieces the Client builds
+// AROUND the engine — the store, whose changefeed goroutines log from their
+// own recoveries and from the listener loop — run under the same guard. A
+// consumer logger that panics kills the process from any of them, and the
+// engine's wrap covers only the copy the engine holds.
+//
+// Idempotent: a logger already guarded is handed back as it is, so a caller
+// that guards early and a New that guards again cost one wrapper, not two.
+func GuardLogger(l log.Logger) log.Logger {
+	if l == nil {
+		return log.NewNop()
+	}
+
+	if _, guarded := l.(safeLogger); guarded {
+		return l
+	}
+
+	return safeLogger{l}
+}
+
 // swallowPanic discards a panic raised by the consumer's own observability
 // code. There is nowhere left to report it — the logger is what panicked — and
 // the alternative is unwinding an engine goroutine over a log line.
@@ -173,10 +195,7 @@ func swallowPanic() {
 // It opens no connection and starts no goroutine — Start does that — so a
 // Client that is constructed and never started leaves nothing behind.
 func New(cfg Config) *Engine {
-	logger := safeLogger{log.NewNop()}
-	if cfg.Logger != nil {
-		logger = safeLogger{cfg.Logger}
-	}
+	logger := GuardLogger(cfg.Logger)
 
 	closeTimeout := cfg.CloseTimeout
 	if closeTimeout <= 0 {

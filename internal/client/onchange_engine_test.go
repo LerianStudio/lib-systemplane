@@ -844,6 +844,55 @@ func TestSetReportsAPublicationTheEngineRefused(t *testing.T) {
 	}
 }
 
+// TestDeleteReportsAnEngineClosedUnderTheRemoval is to Delete what
+// TestSetReportsAnEngineClosedUnderTheWrite is to Set.
+//
+// Delete reads the closed flag once, on the way in, and Close runs under a
+// lock Delete never takes, so a Close can land between that guard and the
+// publication. The row is gone from the store by then and every read in this
+// process still serves the value the caller removed, which is the one outcome
+// a nil return must never describe.
+func TestDeleteReportsAnEngineClosedUnderTheRemoval(t *testing.T) {
+	s := newMemStore(false)
+	c := newSingleTenantClient(t, s)
+
+	defer func() { _ = c.Close() }()
+
+	if err := c.Register("ns", "key", "default"); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// A row to remove, so the assertion below can tell a refusal that happened
+	// AFTER the removal from one that happened before it.
+	if err := c.Set(context.Background(), "ns", "key", "written", "actor"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	// Exactly the state that race leaves behind: the Client's own guards see
+	// nothing wrong — c.closed is false, c.started is true — and the engine
+	// can no longer publish anything.
+	if err := c.engine.Close(); err != nil {
+		t.Fatalf("closing the engine under the Client: %v", err)
+	}
+
+	if err := c.Delete(context.Background(), "ns", "key", "actor"); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Delete: got %v, want ErrClosed", err)
+	}
+
+	s.mu.Lock()
+	_, stored := s.entries[memKey("ns", "key")]
+	s.mu.Unlock()
+
+	if stored {
+		t.Error("the row is still in the store, so this test is pinning a refusal that happened " +
+			"before the removal rather than after it")
+	}
+}
+
 // TestDeleteReportsAPublicationTheEngineRefused is the removal's half of the
 // same promise. Delete persisted the removal and then published the registered
 // default so the caller's own next read stops serving the value it just

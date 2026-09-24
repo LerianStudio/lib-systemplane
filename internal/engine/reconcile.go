@@ -427,7 +427,18 @@ func (e *Engine) applyAbsentKey(ctx context.Context, sc *scopeState, arm reconci
 		return true
 	}
 
-	if e.keepsCachedValue(sc, arm, nk) {
+	if keep, agreed := e.keepsCachedValue(sc, arm, nk); keep {
+		// The snapshot read this key back and found exactly what the cache
+		// holds, so the reconcile DID decide it — and a key a failed re-read
+		// left unconfirmed is confirmed by that, the same as by a
+		// publication. Nothing else would ever take the record back: no
+		// changefeed event arrives for a row that does not exist, and every
+		// later reconcile takes this same early return, so the scope reported
+		// Stale over a converged value for the life of the process.
+		if agreed {
+			sc.markConfirmed(nk)
+		}
+
 		return false
 	}
 
@@ -454,25 +465,31 @@ func (e *Engine) applyAbsentKey(ctx context.Context, sc *scopeState, arm reconci
 //     behind it. Revision 0 never loses the fence, so republishing it would
 //     deliver a second Change for a key that never changed.
 //
+// agreed separates the last reason from the first two, and only it means the
+// snapshot decided the key: absence agrees with what the cache holds, which is
+// a read of the key, where the other two are the feed holding a fact this
+// snapshot does not have. The caller confirms the key on that, and only that.
+//
 // The caller holds sc.reconcileMu: the answer and the publication it gates are
 // one atomic step against the feed.
-func (e *Engine) keepsCachedValue(sc *scopeState, arm reconcileArming, nk NSKey) bool {
+func (e *Engine) keepsCachedValue(sc *scopeState, arm reconcileArming, nk NSKey) (keep, agreed bool) {
 	if _, touched := arm.window.touched[nk]; touched {
-		return true
+		return true, false
 	}
 
 	cached, isCached := sc.cached(nk)
 	if !isCached {
-		return false
+		return false, false
 	}
 
 	if _, unusable := arm.window.unusable[nk]; unusable {
-		return true
+		return true, false
 	}
 
 	def, registered := e.lookup(nk.Namespace, nk.Key)
+	agreed = registered && cached.Revision == 0 && reflect.DeepEqual(cached.Value, def.Default)
 
-	return registered && cached.Revision == 0 && reflect.DeepEqual(cached.Value, def.Default)
+	return agreed, agreed
 }
 
 // superseded reports whether a newer OpResync has taken the window this

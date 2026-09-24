@@ -182,7 +182,9 @@ type scopeState struct {
 	// back: a changefeed re-read that failed twice. Entries are added by
 	// retryRefresh's terminal branch and removed by any later ingress that
 	// DECIDED the key — a re-read, a reconcile snapshot row, a Set echo, a
-	// delete publication — which is every path through publish.
+	// delete publication — which is every path through publish, plus the one
+	// reconcile outcome that decides a key without publishing: a snapshot
+	// that finds it absent and agreeing with the cache (markConfirmed).
 	//
 	// Lookup reports Stale while this set is non-empty, so one key nobody
 	// could re-read makes the scope's reads say so, and converging that key
@@ -302,6 +304,17 @@ func (sc *scopeState) markUnconfirmed(nk NSKey) {
 	}
 
 	sc.unconfirmed[nk] = struct{}{}
+}
+
+// markConfirmed takes back what markUnconfirmed recorded, for an ingress that
+// decided nk without publishing anything: a reconcile whose snapshot found the
+// key absent and agreeing with the cache. Every ingress that DOES publish
+// clears the record inside publish itself.
+func (sc *scopeState) markConfirmed(nk NSKey) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	delete(sc.unconfirmed, nk)
 }
 
 // armReconcile opens a reconcile window and puts it in the scope's single-slot

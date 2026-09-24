@@ -5,6 +5,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -620,8 +621,18 @@ func TestRetryAfterCloseNeverReachesTheStore(t *testing.T) {
 			return fs.getCount() >= 1
 		})
 
+		start := time.Now()
+
 		if err := e.Close(); err != nil {
 			t.Fatalf("Close: %v", err)
+		}
+
+		// Close accounts for the retry, so it can only return this fast by
+		// ENDING it: a retry that merely waits out its delay makes Close block
+		// for retryDelay before the WaitGroup drops.
+		if waited := time.Since(start); waited >= retryDelay {
+			t.Errorf("Close blocked for %s, want well under %s: the retry is waiting out its "+
+				"delay instead of ending on the lifecycle context", waited, retryDelay)
 		}
 
 		after := fs.getCount()
@@ -669,4 +680,137 @@ func TestZeroWindowRetryDoesNotHoldTheFeedGoroutine(t *testing.T) {
 		t.Errorf("onEvent held the changefeed goroutine for %s, want about one %s store call: "+
 			"the retry is running inline behind the first read", elapsed, stall)
 	}
+}
+
+// TestRetryAfterAConvergenceLeavesTheKeyConfirmed pins the half of the
+// unconfirmed record that no fence used to guard: WHEN the retry's failure is
+// allowed to raise it.
+//
+// The retry runs a quarter of a second after the read it repeats, and a
+// changefeed does not stop delivering meanwhile. A fresh notification whose
+// re-read succeeds converges the key inside that pause, and the retry then
+// wakes into a key something else already decided. Recording it unconfirmed
+// there is the same permanent false alarm the per-key set was built to remove:
+// the value in force is correct and current, nothing on a connected feed ever
+// emits an OpResync, and no later event arrives for a key nobody writes again,
+// so every read of the scope reports Stale for the life of the process.
+//
+// The store answers exactly one of the three reads, so which read converges
+// the key does not depend on timing.
+func TestRetryAfterAConvergenceLeavesTheKeyConfirmed(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+
+	forEachWindow(t, func(t *testing.T, window time.Duration) {
+		fs := newFakeStore()
+		e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, window)
+
+		fs.seed(scope, jsonRow(nk, 1, `"one"`, "ops"))
+		settled(t, e, scope)
+
+		fs.seed(scope, jsonRow(nk, 2, `"two"`, "ops"))
+
+		var reads atomic.Int64
+
+		fs.onGet(func(store.Scope, NSKey) error {
+			if reads.Add(1) == 2 {
+				return nil
+			}
+
+			return errors.New("pool exhausted")
+		})
+
+		// Read 1: the first attempt fails and arms the retry.
+		e.onEvent(upsertEvent(scope, nk, 2))
+
+		waitFor(t, hangGuard, "the first re-read to fail", func() bool {
+			return reads.Load() >= 1
+		})
+
+		// Read 2: a fresh notification lands while the retry is still waiting
+		// out its delay, and converges the key on the row the failed read was
+		// sent for.
+		e.onEvent(upsertEvent(scope, nk, 2))
+
+		waitFor(t, hangGuard, "the key to converge on the new row", func() bool {
+			got, ok := e.Lookup(scope, nk)
+
+			return ok && got.Value == "two" && !got.Stale
+		})
+
+		// Read 3: the retry wakes and fails, which is the terminal branch
+		// running over a key a later ingress already decided.
+		waitFor(t, hangGuard, "the retry to run and fail", func() bool {
+			return reads.Load() >= 3
+		})
+
+		got, _ := e.Lookup(scope, nk)
+		if got.Stale {
+			t.Error("a retry that failed after the key had already converged recorded it unconfirmed: " +
+				"nothing will ever clear that on a connected feed, so every read of the scope reports " +
+				"Stale for the life of the process over a value that is correct")
+		}
+
+		if got.Value != "two" || got.Revision != 2 {
+			t.Errorf("value in force = (%v, rev %d), want (%q, rev 2)", got.Value, got.Revision, "two")
+		}
+	})
+}
+
+// TestReconcileAgreeingWithTheCacheConfirmsTheKey pins the one reconcile
+// outcome that decides a key without publishing anything.
+//
+// A deleted key sits at its registered default with no row behind it, which is
+// the ordinary post-delete state. A later event for it whose re-read fails
+// twice records it unconfirmed. The whole-scope reconcile that follows READS
+// THAT KEY BACK and finds it absent — agreeing exactly with what the cache
+// holds — and so returns early, publishing nothing, because republishing
+// revision 0 would deliver a second Change for a key that never changed.
+//
+// Early is not the same as undecided. Without the confirmation on that branch
+// nothing can ever take the record back: no changefeed event arrives for a row
+// that does not exist, and every later reconcile takes this same return, so
+// the whole scope reports Stale forever over a converged value.
+func TestReconcileAgreeingWithTheCacheConfirmsTheKey(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+
+	forEachWindow(t, func(t *testing.T, window time.Duration) {
+		fs := newFakeStore()
+		e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, window)
+
+		fs.seed(scope, jsonRow(nk, 5, `"five"`, "ops"))
+		settled(t, e, scope)
+
+		fs.remove(scope, nk)
+		e.onEvent(deleteEvent(scope, nk))
+
+		waitFor(t, hangGuard, "the delete to put the registered default in force", func() bool {
+			got, ok := e.Lookup(scope, nk)
+
+			return ok && got.Value == "fallback" && got.Revision == 0
+		})
+
+		fs.onGet(func(store.Scope, NSKey) error { return errors.New("pool exhausted") })
+		e.onEvent(upsertEvent(scope, nk, 6))
+
+		waitFor(t, hangGuard, "both re-reads to fail and record the key unconfirmed", func() bool {
+			return scopeUnconfirmed(t, e, scope) == 1
+		})
+
+		fs.onGet(nil)
+		e.onEvent(resyncEvent(scope))
+		waitReconcileIdle(t, e, scope)
+
+		got, ok := e.Lookup(scope, nk)
+		if !ok || got.Stale {
+			t.Errorf("after a reconcile that read the key back: (cached %t, stale %t), want confirmed",
+				ok, got.Stale)
+		}
+
+		if got.Value != "fallback" || got.Revision != 0 {
+			t.Errorf("value in force = (%v, rev %d), want the registered default at rev 0",
+				got.Value, got.Revision)
+		}
+	})
 }

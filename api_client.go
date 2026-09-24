@@ -74,9 +74,10 @@ func (c *Client) Get(ctx context.Context, namespace, key string) (any, bool, err
 // GetEntry resolves the caller's scope like Get. ok is false for an
 // unregistered key. Revision, UpdatedAt and UpdatedBy describe the persisted
 // row behind the value, and are zero when the registered default is in force
-// because no row exists or the stored one was refused. Stale is true while the
-// value has not been reconciled with the store — before [Client.Start], and
-// while the changefeed is disconnected.
+// because no row exists or the stored one was refused. Stale is true while
+// nothing is confirming the value: before [Client.Start], while the changefeed
+// is disconnected or has not been reconciled since it connected, and while any
+// key of the scope could not be re-read after its last change.
 func (c *Client) GetEntry(ctx context.Context, namespace, key string) (e Entry, ok bool, err error) {
 	return asInternalClient(c).GetEntry(ctx, namespace, key)
 }

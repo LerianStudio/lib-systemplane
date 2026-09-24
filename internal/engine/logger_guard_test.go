@@ -29,8 +29,11 @@ func (deadLogger) Sync(context.Context) error { return nil }
 
 // TestAPanickingConsumerLoggerNeverKillsTheEngine covers the three
 // engine-owned goroutines that hand a recovered panic to the consumer's
-// logger: the reconcile worker, the debounced changefeed re-read, and a
-// delivery worker.
+// logger — the reconcile worker, the debounced changefeed re-read, and a
+// delivery worker — and the one question the engine asks that logger OUTSIDE
+// every recovery: the DEBUG level check the changefeed goroutine runs per
+// event for an unregistered key. Nothing but safeLogger.Enabled stands
+// between that check and the process.
 //
 // Each of them recovers consumer code — a registered validator, a subscriber
 // callback — and then REPORTS that recovery through the logger the consumer
@@ -109,6 +112,12 @@ func TestAPanickingConsumerLoggerNeverKillsTheEngine(t *testing.T) {
 		return delivered.len() == 1
 	})
 
+	// The level check: an unregistered key is dropped by the feed, and the
+	// line that says so asks the panicking logger whether DEBUG is on, on the
+	// changefeed goroutine, inside no recovery at all. The assertions below
+	// are what proves the engine came through it.
+	e.onEvent(upsertEvent(scope, NSKey{Namespace: "billing", Key: "foreign"}, 1))
+
 	if got := deliveries(&delivered)[0]; got.Revision != 3 || got.Value != "after" {
 		t.Errorf("delivered (rev %d, %v), want (rev 3, %q): the panicking delivery must be "+
 			"dropped, not retried, and the next one must still arrive",
@@ -186,4 +195,91 @@ func TestRecoverRefreshRetriesBeforeReportingThePanic(t *testing.T) {
 	})
 
 	requireValue(t, e, scope, nk, "live")
+}
+
+// TestARetryReportingIntoAPanickingLoggerNeverKillsTheProcess covers the one
+// engine goroutine that has no outer net.
+//
+// A debounced re-read runs inside the debouncer, whose own recovery catches
+// whatever escapes it. The retry deliberately does not: it is launched bare so
+// its delay can be canceled by the lifecycle context, so the only thing
+// between a panic raised while REPORTING a recovered panic and the process is
+// the guard recoverRefresh puts over its own reporting.
+//
+// The report is the consumer's code twice over — its logger, and the raw
+// logger and metrics recorder lib-observability's handler reaches through
+// InitPanicMetrics, neither of which this engine wraps — which is why the
+// panicking logger is installed raw here, after New has taken its guarded
+// copy.
+//
+// Surviving is half the assertion. The other half is that the repair the
+// recovery promises still completed on the way out: the key whose re-read
+// could not answer twice is recorded unconfirmed, so the scope's reads say so.
+func TestARetryReportingIntoAPanickingLoggerNeverKillsTheProcess(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+
+	fs := newFakeStore()
+	lg := &panicLogger{Logger: log.NewNop()}
+
+	e := New(Config{
+		Store:    fs,
+		Registry: fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: "fallback"}}},
+		Logger:   lg,
+		Debounce: 0,
+	})
+	track(t, e, scope)
+
+	t.Cleanup(func() {
+		if err := e.Close(); err != nil {
+			t.Errorf("Close: %v, want nil", err)
+		}
+	})
+
+	fs.seed(scope, jsonRow(nk, 1, `"live"`, "ops"))
+
+	// Every re-read explodes, and arms the logger to explode on the report of
+	// that explosion — so the second attempt, the one that runs on a goroutine
+	// of its own, meets the same pair the first one did.
+	fs.onGet(func(store.Scope, NSKey) error {
+		lg.armed.Store(true)
+
+		panic("the store driver exploded")
+	})
+
+	e.logger = lg
+
+	e.onEvent(upsertEvent(scope, nk, 1))
+
+	waitFor(t, hangGuard, "the retry to run and explode", func() bool {
+		return fs.getCount() == 2
+	})
+
+	waitFor(t, hangGuard, "the key nobody could re-read to be recorded unconfirmed", func() bool {
+		return scopeUnconfirmed(t, e, scope) == 1
+	})
+}
+
+// TestGuardLoggerIsIdempotentAndSwallows pins the two properties the Client
+// leans on when it hands the same consumer logger to a backend: the backend's
+// own changefeed goroutines, which log from their recoveries and from their
+// listener loop, run under the same guard the engine does; and guarding a
+// logger New will guard again costs one wrapper rather than two.
+func TestGuardLoggerIsIdempotentAndSwallows(t *testing.T) {
+	guarded := GuardLogger(deadLogger{})
+
+	// Both of the consumer's panics, neither reaching this frame.
+	guarded.Log(context.Background(), log.LevelError, "a line the consumer's logger explodes on")
+
+	if guarded.Enabled(log.LevelDebug) {
+		t.Error("Enabled reported true for a logger that panics on its level check")
+	}
+
+	if again := GuardLogger(guarded); again != guarded {
+		t.Error("GuardLogger wrapped an already-guarded logger a second time")
+	}
+
+	if GuardLogger(nil) == nil {
+		t.Error("GuardLogger(nil) returned nil, want a no-op logger")
+	}
 }

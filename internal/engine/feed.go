@@ -197,7 +197,7 @@ func (e *Engine) submitRefresh(scope store.Scope, nk NSKey, deleted bool) {
 	if e.debounceAsync {
 		work = func() { e.trackedRefresh(scope, nk, deleted) }
 	} else {
-		work = func() { e.refreshKey(scope, nk, deleted, false) }
+		work = func() { e.refreshKey(scope, nk, feedFence{}, deleted, false) }
 	}
 
 	e.debouncer.Submit(scopeNSKey{Tenant: scope.Tenant, Namespace: nk.Namespace, Key: nk.Key}, work)
@@ -241,18 +241,37 @@ func (e *Engine) submitRefresh(scope store.Scope, nk NSKey, deleted bool) {
 // for the life of the process. Neither the disconnect generation nor the stale
 // flag is touched here: those belong to the connection, and this is one row.
 //
+// Unless a later ingress already decided the key. The fence answering that is
+// the one the FIRST attempt armed, carried down into the retry: a re-read, a
+// reconcile row, a Set echo or a delete that landed while the retry was
+// waiting out its delay has already confirmed the key, and the retry's own
+// arming happens after it and cannot see it. Recording the key unconfirmed
+// on top of that convergence puts the scope back on a Stale nothing will ever
+// clear — on a connection that never drops, for the life of the process, over
+// a value that is correct.
+//
 // Both outcomes are addressed to the state the re-read was armed on, by
 // IDENTITY, for the reason recordFeedOutcome states: a tenant dropped and
 // brought back up during the store call is a new state under the same scope
 // value, and neither a retry read under an entitlement this process no longer
 // holds nor an unconfirmed record raised by the dead state's failure belongs
 // to it.
-func (e *Engine) retryRefresh(sc *scopeState, nk NSKey, deleted, retried bool) {
+func (e *Engine) retryRefresh(sc *scopeState, nk NSKey, fence feedFence, deleted, retried bool) {
 	if sc == nil || e.trackedScope(sc.scope) != sc {
 		return
 	}
 
 	if retried {
+		// Under reconcileMu, so the question and the record it gates are one
+		// step against the feed — the lock every other reader of a fence
+		// holds for the same reason.
+		sc.reconcileMu.Lock()
+		defer sc.reconcileMu.Unlock()
+
+		if sc.supersededByPublication(nk, fence) {
+			return
+		}
+
 		sc.markUnconfirmed(nk)
 
 		return
@@ -274,7 +293,7 @@ func (e *Engine) retryRefresh(sc *scopeState, nk NSKey, deleted, retried bool) {
 			return
 		}
 
-		e.refreshKey(sc.scope, nk, deleted, true)
+		e.refreshKey(sc.scope, nk, fence, deleted, true)
 	}()
 }
 
@@ -316,7 +335,7 @@ func (e *Engine) trackedRefresh(scope store.Scope, nk NSKey, deleted bool) {
 
 	defer e.dispatchWG.Done()
 
-	e.refreshKey(scope, nk, deleted, false)
+	e.refreshKey(scope, nk, feedFence{}, deleted, false)
 }
 
 // recoverRefresh reports a panic raised under a changefeed re-read, naming the
@@ -370,7 +389,19 @@ func (e *Engine) trackedRefresh(scope store.Scope, nk NSKey, deleted bool) {
 // context and records neither. The recovered value stays out of the identity
 // line — it is whatever the panicking code was holding, and redacting it
 // belongs with the handler.
-func (e *Engine) recoverRefresh(scope store.Scope, nk NSKey, deleted, retried bool, state **scopeState) {
+func (e *Engine) recoverRefresh(scope store.Scope, nk NSKey, deleted, retried bool, state **scopeState, origin *feedFence) {
+	// The two lines at the bottom are the CONSUMER's observability: its
+	// logger, and whatever lib-observability's handler reaches through
+	// InitPanicMetrics — a metrics recorder, and the raw logger the consumer
+	// handed that call, neither of which this engine wraps. A panic raised in
+	// there unwinds out of this recovery, and the retry goroutine is launched
+	// bare so its delay can be canceled by the lifecycle context, so on that
+	// path nothing outside would catch it and the process dies over a broken
+	// log line. Same guard, same reason, as internal/group's own panic
+	// handler. It is registered FIRST so it runs LAST: the repair below still
+	// runs on the way out.
+	defer swallowPanic()
+
 	recovered := recover()
 	if recovered == nil {
 		return
@@ -393,7 +424,12 @@ func (e *Engine) recoverRefresh(scope store.Scope, nk NSKey, deleted, retried bo
 	// lines below end up inside the consumer's logger, and the guard this
 	// engine puts under that logger covers the one it holds, not whatever
 	// lib-observability's handler reaches on its way to a sink.
-	defer e.retryRefresh(sc, nk, deleted, retried)
+	var fence feedFence
+	if origin != nil {
+		fence = *origin
+	}
+
+	defer e.retryRefresh(sc, nk, fence, deleted, retried)
 
 	e.logError(ctx, "systemplane.engine: changefeed re-read panicked",
 		log.String(constants.AttrKeyTenantID, scope.Tenant),
@@ -600,10 +636,17 @@ func (e *Engine) PublishDelete(scope store.Scope, nk NSKey) error {
 // holds, and the new state's own reconcile is the only thing entitled to
 // decide the key. That is why sc is declared before the recovery is deferred
 // and handed to it by pointer.
-func (e *Engine) refreshKey(scope store.Scope, nk NSKey, deleted, retried bool) {
+func (e *Engine) refreshKey(scope store.Scope, nk NSKey, origin feedFence, deleted, retried bool) {
 	var sc *scopeState
 
-	defer e.recoverRefresh(scope, nk, deleted, retried, &sc)
+	// origin, not the arming below, is what the retry bookkeeping is graded
+	// on: it is the fence the FIRST attempt of this repair armed, handed down
+	// by the goroutine running the retry, so a convergence that landed while
+	// that goroutine was waiting out its delay is still visible to the
+	// terminal branch. A first attempt arrives with it unarmed and adopts its
+	// own. The recovery is handed a pointer for the same reason it is handed
+	// one for the scope: both are established below it.
+	defer e.recoverRefresh(scope, nk, deleted, retried, &sc, &origin)
 
 	// Checked before the store call, not only after it: a re-read for a
 	// dropped tenant would otherwise open a connection to a database that
@@ -620,6 +663,10 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey, deleted, retried bool) 
 	// the registered default it would publish wins the revision fence
 	// unconditionally.
 	fence := sc.fenceFor(nk)
+
+	if !origin.armed {
+		origin = fence
+	}
 
 	ctx, cancel := context.WithTimeout(e.dispatchContext(), feedTimeout)
 	defer cancel()
@@ -647,7 +694,7 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey, deleted, retried bool) 
 			log.Err(err),
 		)
 
-		e.retryRefresh(sc, nk, deleted, retried)
+		e.retryRefresh(sc, nk, origin, deleted, retried)
 
 		return
 	}

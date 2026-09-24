@@ -17,5 +17,5 @@ type Entry struct {
 	Revision  int64     // 0 when no row exists (default in force)
 	UpdatedAt time.Time // zero when no row exists
 	UpdatedBy string
-	Stale     bool // true while the scope's changefeed is disconnected or not yet reconciled
+	Stale     bool // true while the scope's changefeed is disconnected or not yet reconciled, and while any key of the scope could not be re-read after its last change
 }

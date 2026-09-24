@@ -306,7 +306,7 @@ func TestReReadErrorIsLoggedAtWarn(t *testing.T) {
 	// counts. A first attempt logs the same line and then submits itself once
 	// more (retryRefresh), which is behavior TestFailedRereadIsRetriedOnce
 	// owns rather than a second spelling of this assertion.
-	e.refreshKey(store.Scope{}, nk, false, true)
+	e.refreshKey(store.Scope{}, nk, feedFence{}, false, true)
 
 	requireLogged(t, rec, log.LevelWarn, "changefeed re-read failed, keeping current value", store.Scope{}, nk)
 }
@@ -329,7 +329,7 @@ func TestReReadCanceledByCloseIsLoggedAtDebug(t *testing.T) {
 
 	// The re-read a debounce timer already fired, reaching the store after
 	// Close canceled the lifecycle context.
-	e.refreshKey(scope, nk, false, false)
+	e.refreshKey(scope, nk, feedFence{}, false, false)
 
 	requireLogged(t, rec, log.LevelDebug, "changefeed re-read canceled during shutdown", scope, nk)
 }
@@ -346,7 +346,7 @@ func TestLogLevelReReadWithNoRowIsDebug(t *testing.T) {
 
 	track(t, e, scope)
 
-	e.refreshKey(scope, nk, false, false)
+	e.refreshKey(scope, nk, feedFence{}, false, false)
 
 	requireLogged(t, rec, log.LevelDebug, "changefeed re-read found no row, keeping current value", scope, nk)
 }
@@ -693,7 +693,7 @@ func TestReReadCanceledOutsideShutdownIsLoggedAtWarn(t *testing.T) {
 	})
 
 	// The retry, for the reason TestReReadErrorIsLoggedAtWarn states.
-	e.refreshKey(store.Scope{}, nk, false, true)
+	e.refreshKey(store.Scope{}, nk, feedFence{}, false, true)
 
 	requireLogged(t, rec, log.LevelWarn, "changefeed re-read failed, keeping current value", store.Scope{}, nk)
 }
