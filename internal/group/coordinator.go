@@ -189,8 +189,13 @@ type Coordinator[T any] struct {
 	// error and the two decode failures name the document as freely as a panic
 	// does, so all four withhold it together or the gate is decorative.
 	redacted bool
-	decode   func(any) (T, error)
-	seed     func() (Publication, bool, error)
+	// multiTenant is the Client's mode, and decides the tenant stamp on every
+	// report: a single-tenant scope has no tenant, so its reports carry no
+	// tenant field; a multi-tenant one names the publication's tenant, or
+	// safelog.UnresolvedTenant when the publication carries none.
+	multiTenant bool
+	decode      func(any) (T, error)
+	seed        func() (Publication, bool, error)
 
 	mu        sync.Mutex
 	seq       uint64
@@ -207,7 +212,8 @@ type Coordinator[T any] struct {
 // name the group, and every line this package writes carries them, because a
 // redacted group withholds the document that would otherwise have identified
 // it; redacted says the group's key is registered with a redaction policy,
-// which withholds a panicking applier's value from the report; decode
+// which withholds a panicking applier's value from the report; multiTenant is
+// the Client's mode, which decides whether a report names a tenant; decode
 // converts a published document into T; seed reads the group's current entry
 // through the Client and reports ok=false when the Client does not yet track
 // the scope. A seed that cannot read at all returns its error instead, and
@@ -216,7 +222,7 @@ type Coordinator[T any] struct {
 func NewCoordinator[T any](
 	logger log.Logger,
 	namespace, key string,
-	redacted bool,
+	redacted, multiTenant bool,
 	decode func(any) (T, error),
 	seed func() (Publication, bool, error),
 ) *Coordinator[T] {
@@ -226,13 +232,14 @@ func NewCoordinator[T any](
 		// package writes runs either on a publishing goroutine the consumer
 		// cannot recover on or inside an applier's recovery. Guard answers nil
 		// with a no-op logger, so the field is never nil below.
-		logger:    safelog.Guard(logger),
-		namespace: namespace,
-		key:       key,
-		redacted:  redacted,
-		decode:    decode,
-		seed:      seed,
-		scopes:    map[string]*scope[T]{},
+		logger:      safelog.Guard(logger),
+		namespace:   namespace,
+		key:         key,
+		redacted:    redacted,
+		multiTenant: multiTenant,
+		decode:      decode,
+		seed:        seed,
+		scopes:      map[string]*scope[T]{},
 	}
 }
 
@@ -268,9 +275,8 @@ func (c *Coordinator[T]) Publish(ctx context.Context, pub Publication) {
 	// so the log line is the only place it is ever named. Every document that
 	// cannot be parsed is named exactly once.
 	if err != nil {
-		c.logError(ctx, "systemplane.group: published document failed to decode",
+		c.logError(ctx, "systemplane.group: published document failed to decode", pub.Tenant,
 			safelog.ErrorDetail(c.redacted, "decode failed", err),
-			log.String(constants.AttrKeyTenantID, pub.Tenant),
 			log.String("namespace", c.namespace), log.String("keyname", c.key),
 			log.Any("revision", pub.Revision))
 
@@ -423,9 +429,8 @@ func (c *Coordinator[T]) Register(fn ApplyFunc[T]) (func(), error) {
 
 	id, observed, seeded := c.add(fn)
 	if seeded.decodeErr != nil {
-		c.logError(ctx, "systemplane.group: seeded document failed to decode",
+		c.logError(ctx, "systemplane.group: seeded document failed to decode", seeded.pub.Tenant,
 			safelog.ErrorDetail(c.redacted, "decode failed", seeded.decodeErr),
-			log.String(constants.AttrKeyTenantID, seeded.pub.Tenant),
 			log.String("namespace", c.namespace), log.String("keyname", c.key),
 			log.Any("revision", seeded.pub.Revision))
 	}
@@ -827,8 +832,7 @@ func (c *Coordinator[T]) invoke(
 			// something panicked and never says what stopped being applied.
 			// The recovered value stays out of it — redaction lives with the
 			// handler.
-			c.logError(ctx, "systemplane.group: apply function panicked",
-				log.String(constants.AttrKeyTenantID, current.Tenant),
+			c.logError(ctx, "systemplane.group: apply function panicked", current.Tenant,
 				log.String("namespace", c.namespace), log.String("keyname", c.key),
 				log.Any("revision", current.Revision))
 
@@ -838,9 +842,8 @@ func (c *Coordinator[T]) invoke(
 
 	err = fn(ctx, current, previous)
 	if err != nil {
-		c.logError(ctx, "systemplane.group: apply function rejected the published document",
+		c.logError(ctx, "systemplane.group: apply function rejected the published document", current.Tenant,
 			safelog.ErrorDetail(c.redacted, "apply rejected the document", err),
-			log.String(constants.AttrKeyTenantID, current.Tenant),
 			log.String("namespace", c.namespace), log.String("keyname", c.key),
 			log.Any("revision", current.Revision))
 	}
@@ -884,8 +887,20 @@ func (c *Coordinator[T]) reportPanic(ctx context.Context, recovered any) {
 // logError writes one line through the guarded logger. The guard makes the
 // recover here belt-and-braces rather than the only net, and makes a nil
 // consumer logger a no-op rather than a branch.
-func (c *Coordinator[T]) logError(ctx context.Context, msg string, fields ...log.Field) {
+//
+// tenant is the scope the report is about. A single-tenant report carries no
+// tenant field, and a multi-tenant one whose publication named no tenant
+// carries safelog.UnresolvedTenant, so neither renders an empty tenant.id.
+func (c *Coordinator[T]) logError(ctx context.Context, msg, tenant string, fields ...log.Field) {
 	defer safelog.Swallow()
+
+	if c.multiTenant {
+		if tenant == "" {
+			tenant = safelog.UnresolvedTenant
+		}
+
+		fields = append(fields, log.String(constants.AttrKeyTenantID, tenant))
+	}
 
 	c.logger.Log(ctx, log.LevelError, msg, fields)
 }

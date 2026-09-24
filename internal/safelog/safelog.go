@@ -17,6 +17,14 @@ import (
 	"github.com/LerianStudio/lib-observability/v4/log"
 )
 
+// UnresolvedTenant is the tenant.id a multi-tenant line carries when it has
+// no tenant id to name: the Client's read-through errors when the tenant
+// database resolved but ctx carries no tenant id (the two ride independent
+// context keys), and the group coordinator's reports about a publication that
+// names no tenant. An empty tenant.id there would read exactly like a
+// single-tenant line, which carries no tenant field at all.
+const UnresolvedTenant = "unresolved"
+
 // guardedLogger is the consumer's logger with a net under it: neither an entry
 // nor a level check can unwind into the library.
 //

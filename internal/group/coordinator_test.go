@@ -32,7 +32,7 @@ func publication(tenant string, revision int64, name string) Publication {
 func newCoordinator(t *testing.T) *Coordinator[coordDoc] {
 	t.Helper()
 
-	return NewCoordinator[coordDoc](nil, coordNamespace, coordKey, false, Decode[coordDoc], nil)
+	return NewCoordinator[coordDoc](nil, coordNamespace, coordKey, false, false, Decode[coordDoc], nil)
 }
 
 type received struct {
@@ -809,7 +809,7 @@ func stillResponsive(t *testing.T, c *Coordinator[coordDoc]) {
 // watermark does on a publication, and the seed read itself.
 func TestCoordinatorPanicUnderTheStateMutexDoesNotWedgeTheGroup(t *testing.T) {
 	t.Run("publish", func(t *testing.T) {
-		c := NewCoordinator[coordDoc](nil, coordNamespace, coordKey, false, constantDecode, seedOf(publication("", 1, "seeded")))
+		c := NewCoordinator[coordDoc](nil, coordNamespace, coordKey, false, false, constantDecode, seedOf(publication("", 1, "seeded")))
 
 		unsubscribe := mustRegister(t, c, noopApply)
 		defer unsubscribe()
@@ -824,7 +824,7 @@ func TestCoordinatorPanicUnderTheStateMutexDoesNotWedgeTheGroup(t *testing.T) {
 	})
 
 	t.Run("register", func(t *testing.T) {
-		c := NewCoordinator[coordDoc](nil, coordNamespace, coordKey, false, constantDecode, func() (Publication, bool, error) {
+		c := NewCoordinator[coordDoc](nil, coordNamespace, coordKey, false, false, constantDecode, func() (Publication, bool, error) {
 			panic("the seed read exploded")
 		})
 
@@ -860,7 +860,7 @@ func publishWithoutPanicking(t *testing.T, c *Coordinator[coordDoc], pub Publica
 }
 
 func TestCoordinatorAPanickingLoggerDoesNotWedgeTheScope(t *testing.T) {
-	c := NewCoordinator[coordDoc](&alwaysPanickingLogger{NopLogger: &log.NopLogger{}}, coordNamespace, coordKey, false, Decode[coordDoc], nil)
+	c := NewCoordinator[coordDoc](&alwaysPanickingLogger{NopLogger: &log.NopLogger{}}, coordNamespace, coordKey, false, false, Decode[coordDoc], nil)
 
 	var (
 		mu       sync.Mutex
@@ -987,7 +987,7 @@ func TestCoordinatorDiscardsAPublicationThatDecodedAfterANewerOne(t *testing.T) 
 		return doc, nil
 	}
 
-	c := NewCoordinator[coordDoc](nil, coordNamespace, coordKey, false, slowDecode, nil)
+	c := NewCoordinator[coordDoc](nil, coordNamespace, coordKey, false, false, slowDecode, nil)
 
 	var rec recorder
 
@@ -1107,7 +1107,7 @@ func TestCoordinatorReplayDoesNotRunUnderADeadPublisherContext(t *testing.T) {
 // seed would stay registered with no way to remove it and receive every later
 // delivery.
 func TestCoordinatorRegisterWhoseSeedPanicsRegistersNothing(t *testing.T) {
-	c := NewCoordinator[coordDoc](nil, coordNamespace, coordKey, false, constantDecode, func() (Publication, bool, error) {
+	c := NewCoordinator[coordDoc](nil, coordNamespace, coordKey, false, false, constantDecode, func() (Publication, bool, error) {
 		panic("the seed read exploded")
 	})
 
@@ -1199,7 +1199,7 @@ func TestCoordinatorRegisterWhoseSeedPanicsKeepsTheSeedRetryable(t *testing.T) {
 					return Decode[coordDoc](v)
 				}
 
-				return NewCoordinator[coordDoc](nil, coordNamespace, coordKey, false, decode, seedOf(publication("", 1, "seeded")))
+				return NewCoordinator[coordDoc](nil, coordNamespace, coordKey, false, false, decode, seedOf(publication("", 1, "seeded")))
 			},
 		},
 		{
@@ -1215,7 +1215,7 @@ func TestCoordinatorRegisterWhoseSeedPanicsKeepsTheSeedRetryable(t *testing.T) {
 					return publication("", 1, "seeded"), true, nil
 				}
 
-				return NewCoordinator[coordDoc](nil, coordNamespace, coordKey, false, constantDecode, seed)
+				return NewCoordinator[coordDoc](nil, coordNamespace, coordKey, false, false, constantDecode, seed)
 			},
 		},
 	}

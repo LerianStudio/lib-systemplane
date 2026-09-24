@@ -72,7 +72,7 @@ func panickingApply(t *testing.T, redacted bool) (*recordingLogger, *recordingSp
 	logger := newRecordingLogger()
 	span := &recordingSpan{}
 
-	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, redacted, Decode[coordDoc], nil)
+	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, redacted, false, Decode[coordDoc], nil)
 
 	unsubscribe := mustRegister(t, c, func(_ context.Context, current Decoded[coordDoc], _ *Decoded[coordDoc]) error {
 		panic(fmt.Sprintf("cannot apply %+v", current.Value))

@@ -181,7 +181,13 @@ func Bind[T any](c *Client, namespace, key string, defaults T, validate func(T) 
 	// accessor, it widens this gate with `|| <field-level redaction present>` (FC-13).
 	redacted := c.KeyRedaction(namespace, key) != RedactNone
 
-	g.coordinator = group.NewCoordinator[T](c.Logger(), g.namespace, g.key, redacted, g.decodePublished, g.seedCurrentEntry)
+	// The Client's mode decides the tenant stamp on the coordinator's reports.
+	// Register above succeeded, so CatalogKey knows the key and TenantScoped
+	// reports the mode verbatim.
+	detail, _ := c.CatalogKey(namespace, key)
+
+	g.coordinator = group.NewCoordinator[T](c.Logger(), g.namespace, g.key, redacted, detail.TenantScoped,
+		g.decodePublished, g.seedCurrentEntry)
 
 	// The group's one subscription, taken here — before Start, and therefore
 	// before any publication can exist. That is the structural half of FC-7's

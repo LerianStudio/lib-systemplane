@@ -294,7 +294,7 @@ func TestCoordinatorApplierErrorRecordsARejection(t *testing.T) {
 
 func TestCoordinatorApplierPanicIsRecordedLikeAnError(t *testing.T) {
 	logger := newRecordingLogger()
-	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, false, Decode[coordDoc], nil)
+	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, false, true, Decode[coordDoc], nil)
 	ctx := context.Background()
 
 	unsubscribe := mustRegister(t, c, func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
@@ -358,7 +358,7 @@ func TestCoordinatorApplierPanicIsRedactedInProductionMode(t *testing.T) {
 	defer runtime.SetProductionMode(false)
 
 	logger := newRecordingLogger()
-	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, false, Decode[coordDoc], nil)
+	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, false, true, Decode[coordDoc], nil)
 
 	unsubscribe := mustRegister(t, c, func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
 		panic("boom")
@@ -429,7 +429,7 @@ func TestCoordinatorAPanickingLoggerStillRecordsThePanic(t *testing.T) {
 
 	defer runtime.ResetPanicMetrics()
 
-	c := NewCoordinator[coordDoc](&alwaysPanickingLogger{NopLogger: &log.NopLogger{}}, coordNamespace, coordKey, false, Decode[coordDoc], nil)
+	c := NewCoordinator[coordDoc](&alwaysPanickingLogger{NopLogger: &log.NopLogger{}}, coordNamespace, coordKey, false, false, Decode[coordDoc], nil)
 
 	unsubscribe := mustRegister(t, c, func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
 		panic("the apply function exploded")
@@ -463,7 +463,7 @@ func TestCoordinatorApplierErrorIsLogged(t *testing.T) {
 	for _, tc := range decodeRedactionCases {
 		t.Run(tc.name, func(t *testing.T) {
 			logger := newRecordingLogger()
-			c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, tc.redacted, Decode[coordDoc], nil)
+			c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, tc.redacted, true, Decode[coordDoc], nil)
 
 			// The applier names what it refused, which is what a consumer's
 			// apply hook does when it wants the log to be actionable.
@@ -607,7 +607,7 @@ func TestCoordinatorDecodeFailureIsRecordedAndNeverDelivered(t *testing.T) {
 	for _, tc := range decodeRedactionCases {
 		t.Run(tc.name, func(t *testing.T) {
 			logger := newRecordingLogger()
-			c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, tc.redacted, rejectingDecode(redactionMarker), nil)
+			c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, tc.redacted, false, rejectingDecode(redactionMarker), nil)
 			ctx := context.Background()
 
 			var rec recorder
@@ -693,7 +693,7 @@ func TestCoordinatorSupersededDecodeFailureIsStillLogged(t *testing.T) {
 		return doc, nil
 	}
 
-	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, false, decode, nil)
+	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, false, true, decode, nil)
 	ctx := context.Background()
 
 	var rec recorder
@@ -755,7 +755,7 @@ func TestCoordinatorDecodeFailureOnAFreshScopeIsObserved(t *testing.T) {
 		return Publication{}, false, nil
 	}
 
-	c := NewCoordinator[coordDoc](newRecordingLogger(), coordNamespace, coordKey, false, rejectingDecode("bad"), seed)
+	c := NewCoordinator[coordDoc](newRecordingLogger(), coordNamespace, coordKey, false, false, rejectingDecode("bad"), seed)
 
 	c.Publish(context.Background(), publication("t1", 4, "bad"))
 
@@ -818,7 +818,7 @@ func TestCoordinatorNullValueIsRejectedByTheCodecAndNeverDelivered(t *testing.T)
 		return Decode[coordDoc](value)
 	}
 
-	c := NewCoordinator[coordDoc](newRecordingLogger(), coordNamespace, coordKey, false, refuseNull, nil)
+	c := NewCoordinator[coordDoc](newRecordingLogger(), coordNamespace, coordKey, false, false, refuseNull, nil)
 	ctx := context.Background()
 
 	var rec recorder
@@ -988,7 +988,7 @@ func TestCoordinatorUnsubscribeStopsDeliveryAndReleasesStatus(t *testing.T) {
 // nobody is applying is healthy. LastErr clears when an applier ACCEPTS, and
 // leaving is not accepting.
 func TestCoordinatorUnsubscribingTheLastApplierKeepsTheRejection(t *testing.T) {
-	c := NewCoordinator[coordDoc](newRecordingLogger(), coordNamespace, coordKey, false, rejectingDecode("bad"), nil)
+	c := NewCoordinator[coordDoc](newRecordingLogger(), coordNamespace, coordKey, false, false, rejectingDecode("bad"), nil)
 
 	c.Publish(context.Background(), publication("t1", 4, "bad"))
 
@@ -1174,7 +1174,7 @@ func TestCoordinatorLastApplierRejectingAndLeavingKeepsTheRejection(t *testing.T
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			c := NewCoordinator[coordDoc](tc.logger, coordNamespace, coordKey, false, Decode[coordDoc], nil)
+			c := NewCoordinator[coordDoc](tc.logger, coordNamespace, coordKey, false, false, Decode[coordDoc], nil)
 
 			var (
 				unsubscribe func()
@@ -1199,5 +1199,84 @@ func TestCoordinatorLastApplierRejectingAndLeavingKeepsTheRejection(t *testing.T
 				t.Errorf("LastErr = %q, want the panic value kept out of it: a panicking hook is routinely holding the decoded document with its endpoints and credentials", got.LastErr)
 			}
 		})
+	}
+}
+
+// groupReportMessages are the four report lines a coordinator writes about a
+// scope: two decode failures, an apply rejection and an apply panic.
+var groupReportMessages = []string{
+	"systemplane.group: seeded document failed to decode",
+	"systemplane.group: published document failed to decode",
+	"systemplane.group: apply function rejected the published document",
+	"systemplane.group: apply function panicked",
+}
+
+// driveEveryGroupReport makes c write each of groupReportMessages once, every
+// one about tenant: a seeded document that fails to decode, then a published
+// one, then a document the applier rejects and one it panics on.
+func driveEveryGroupReport(t *testing.T, c *Coordinator[coordDoc], tenant string) {
+	t.Helper()
+
+	unsubscribe := mustRegister(t, c, func(_ context.Context, current Decoded[coordDoc], _ *Decoded[coordDoc]) error {
+		switch current.Value.Name {
+		case "boom":
+			panic("boom")
+		case "no":
+			return errors.New("refused")
+		}
+
+		return nil
+	})
+	defer unsubscribe()
+
+	ctx := context.Background()
+	c.Publish(ctx, publication(tenant, 2, "bad"))
+	c.Publish(ctx, publication(tenant, 3, "no"))
+	c.Publish(ctx, publication(tenant, 4, "boom"))
+}
+
+// TestMultiTenantGroupReportsNameTheTenant pins the multi-tenant half: every
+// report names the publication's tenant, and a publication that names none is
+// stamped unresolved rather than rendering an empty tenant.id that reads like a
+// single-tenant line.
+func TestMultiTenantGroupReportsNameTheTenant(t *testing.T) {
+	for _, tc := range []struct {
+		name, tenant, want string
+	}{
+		{name: "resolved", tenant: "acme", want: "acme"},
+		{name: "unresolved", tenant: "", want: "unresolved"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logger := newRecordingLogger()
+			c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, false, true, rejectingDecode("bad"),
+				seedOf(publication(tc.tenant, 1, "bad")))
+
+			driveEveryGroupReport(t, c, tc.tenant)
+
+			for _, msg := range groupReportMessages {
+				line := logger.lineContaining(t, msg)
+				if got := line.fields[constants.AttrKeyTenantID]; got != tc.want {
+					t.Errorf("%q carries %s = %v, want %q", msg, constants.AttrKeyTenantID, got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+// TestSingleTenantGroupReportsCarryNoTenant pins the single-tenant half of the
+// tenant stamp: a single-tenant scope has no tenant, so an empty tenant.id on
+// its reports reads like a value that went missing. None of the four reports
+// may carry the key at all.
+func TestSingleTenantGroupReportsCarryNoTenant(t *testing.T) {
+	logger := newRecordingLogger()
+	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, false, false, rejectingDecode("bad"), seedOf(publication("", 1, "bad")))
+
+	driveEveryGroupReport(t, c, "")
+
+	for _, msg := range groupReportMessages {
+		line := logger.lineContaining(t, msg)
+		if got, ok := line.fields[constants.AttrKeyTenantID]; ok {
+			t.Errorf("%q carries %s = %q, want no tenant field on a single-tenant report", msg, constants.AttrKeyTenantID, got)
+		}
 	}
 }

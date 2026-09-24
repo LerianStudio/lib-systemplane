@@ -8,6 +8,7 @@ import (
 	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
 	"github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/safelog"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -33,7 +34,7 @@ func (c *Client) logError(ctx context.Context, msg string, fields ...log.Field) 
 	if c.multiTenant {
 		tenant, ok := tenantOf(ctx)
 		if !ok {
-			tenant = unresolvedTenant
+			tenant = safelog.UnresolvedTenant
 		}
 
 		fields = append(fields, log.String(constants.AttrKeyTenantID, tenant))
@@ -41,12 +42,6 @@ func (c *Client) logError(ctx context.Context, msg string, fields ...log.Field) 
 
 	c.guarded.Log(ctx, log.LevelError, msg, fields)
 }
-
-// unresolvedTenant is the tenant.id a multi-tenant line carries when ctx holds
-// no tenant id. The tenant database and the tenant id ride independent context
-// keys, so a read can resolve a database with no id; an empty value there
-// would read exactly like a single-tenant line.
-const unresolvedTenant = "unresolved"
 
 // tenantOf returns the tenant id ctx carries and whether it carries one.
 func tenantOf(ctx context.Context) (string, bool) {
