@@ -1190,3 +1190,202 @@ func TestRetryAbandonsAScopeDroppedDuringItsDelay(t *testing.T) {
 			"retry reported its own failure against a tenant that had just read the row", got)
 	}
 }
+
+// retryPending reports how many repairs the scope currently holds a slot for.
+func retryPending(t *testing.T, e *Engine, scope store.Scope) int {
+	t.Helper()
+
+	sc := e.scopeFor(scope)
+
+	sc.mu.RLock()
+	defer sc.mu.RUnlock()
+
+	return len(sc.retrying)
+}
+
+// upsertThenFailedDelete drives the one ordering a repair slot keyed by the
+// key alone loses: an upsert's failed re-read claims the slot, and a DELETE
+// for the same key then fails its own re-read while that slot is still held.
+//
+// Both first attempts are held inside Store.Get and released in order, so the
+// upsert's claim is settled before the delete's read fails. Every later read —
+// the repairs themselves — is held too, which is what keeps the upsert's
+// repair holding its slot across the delete's failure instead of finishing
+// first and handing the delete the slot this choreography is about.
+//
+// repairFails decides the second half: the store either recovers for the
+// repairs, or stays down so the repair is the last read the key gets.
+func upsertThenFailedDelete(t *testing.T, window time.Duration, repairFails bool) (*Engine, store.Scope, NSKey) {
+	t.Helper()
+
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+
+	fs := newFakeStore()
+	e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, window)
+
+	fs.seed(scope, jsonRow(nk, 5, `"five"`, "ops"))
+	settled(t, e, scope)
+
+	firstUpsert, releaseUpsert := gate()
+	firstDelete, releaseDelete := gate()
+	repairs, releaseRepairs := gate()
+
+	t.Cleanup(releaseUpsert)
+	t.Cleanup(releaseDelete)
+	t.Cleanup(releaseRepairs)
+
+	var reads atomic.Int64
+
+	fs.onGet(func(store.Scope, NSKey) error {
+		switch reads.Add(1) {
+		case 1:
+			<-firstUpsert
+		case 2:
+			<-firstDelete
+		default:
+			<-repairs
+
+			if !repairFails {
+				return nil
+			}
+		}
+
+		return errors.New("pool exhausted")
+	})
+
+	// At WithDebounce(0) the re-read runs inline on the caller's goroutine, so
+	// the events have to be delivered off this one or the gates block the test
+	// itself.
+	var feeding sync.WaitGroup
+
+	feeding.Add(2)
+
+	go func() {
+		defer feeding.Done()
+
+		e.onEvent(upsertEvent(scope, nk, 6))
+	}()
+
+	waitFor(t, hangGuard, "the upsert's re-read to reach the store", func() bool {
+		return reads.Load() >= 1
+	})
+
+	// The row really is gone from here on, so every read that gets past the
+	// hook finds nothing — which is the answer a delete's repair concludes
+	// from and an upsert's does not.
+	fs.remove(scope, nk)
+
+	go func() {
+		defer feeding.Done()
+
+		e.onEvent(deleteEvent(scope, nk))
+	}()
+
+	waitFor(t, hangGuard, "the delete's re-read to reach the store", func() bool {
+		return reads.Load() >= 2
+	})
+
+	releaseUpsert()
+
+	waitFor(t, hangGuard, "the upsert's repair to claim its slot", func() bool {
+		return retryPending(t, e, scope) >= 1
+	})
+
+	releaseDelete()
+	feeding.Wait()
+	releaseRepairs()
+
+	return e, scope, nk
+}
+
+// TestAFailedDeleteRereadGetsARepairOfItsOwn is the regression for a repair
+// slot keyed by the key alone.
+//
+// An upsert's failed re-read claimed the key's single slot, so the DELETE that
+// followed — whose own re-read failed too — was refused a repair entirely. The
+// pending repair then ran as the UPSERT it was armed for: its empty read took
+// the keep-current-value branch instead of publishing the registered default,
+// and the removed row stayed in force at its old revision, reported as
+// confirmed. On a connection that never drops nothing asks the store again,
+// so an operator's delete was undone for the life of the process.
+func TestAFailedDeleteRereadGetsARepairOfItsOwn(t *testing.T) {
+	forEachWindow(t, func(t *testing.T, window time.Duration) {
+		e, scope, nk := upsertThenFailedDelete(t, window, false)
+
+		waitFor(t, 5*time.Second, "the delete's own repair to put the registered default in force", func() bool {
+			got, ok := e.Lookup(scope, nk)
+
+			return ok && got.Revision == 0 && got.Value == "fallback"
+		})
+		quiesce(t, e)
+
+		got, ok := e.Lookup(scope, nk)
+		if !ok || got.Value != "fallback" || got.Revision != 0 {
+			t.Errorf("after the delete: got (%v, rev %d, cached %t), want the registered default at rev 0: "+
+				"the delete was refused a repair because an upsert already held the key's slot",
+				got.Value, got.Revision, ok)
+		}
+
+		if got.Stale {
+			t.Error("the repaired delete reports the key unconfirmed: a repair that converged the " +
+				"key should have taken the record back")
+		}
+	})
+}
+
+// TestADeleteRepairThatFailsAgainLeavesTheKeyUnconfirmed is the other half.
+//
+// A delete denied its own repair has no second read to be terminal, so nothing
+// recorded the key as unconfirmed either: the removed row was served at its
+// old revision AND reported as confirmed. With a repair of its own the second
+// failure is the end of the line, and the scope says so.
+func TestADeleteRepairThatFailsAgainLeavesTheKeyUnconfirmed(t *testing.T) {
+	forEachWindow(t, func(t *testing.T, window time.Duration) {
+		e, scope, nk := upsertThenFailedDelete(t, window, true)
+
+		waitFor(t, 5*time.Second, "the twice-failed delete to report the key unconfirmed", func() bool {
+			got, _ := e.Lookup(scope, nk)
+
+			return got.Stale
+		})
+
+		if got, _ := e.Lookup(scope, nk); !got.Stale {
+			t.Error("a delete whose re-read failed twice reports the key confirmed: the removed row " +
+				"is served at its old revision with nothing left to ask")
+		}
+	})
+}
+
+// TestRetryWaitIsFlooredAndJittered pins both ends of the pause a repair
+// takes.
+//
+// The ceiling is what retryDelay's godoc promises — a store in real trouble is
+// not hammered per key — and drawing the whole wait from
+// backoff.FullJitter(retryDelay) left nothing underneath: a uniform
+// [0, retryDelay) re-reads immediately often enough that the promise was not
+// one. The floor makes it true, and the jitter above it is what keeps the
+// repairs a scope-wide failure armed from landing in the same instant.
+func TestRetryWaitIsFlooredAndJittered(t *testing.T) {
+	const samples = 1000
+
+	floor, ceiling := retryDelay/2, retryDelay
+	seen := make(map[time.Duration]struct{}, samples)
+
+	for range samples {
+		got := retryWait()
+
+		if got < floor || got >= ceiling {
+			t.Fatalf("retryWait() = %s, want [%s, %s): a repair that waits less than the floor "+
+				"re-reads against the pool whose scarcity refused the first read", got, floor, ceiling)
+		}
+
+		seen[got] = struct{}{}
+	}
+
+	if len(seen) < 2 {
+		t.Errorf("retryWait() returned %d distinct value(s) over %d samples, want many: a fixed "+
+			"pause fires every repair a scope-wide failure armed at the same instant",
+			len(seen), samples)
+	}
+}

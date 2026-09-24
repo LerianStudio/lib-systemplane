@@ -34,10 +34,24 @@ const defaultReconcileTimeout = 15 * time.Second
 //
 // Short enough that a pool that blinked is repaired before an operator can
 // look, long enough that a store in real trouble is not hammered per key. It
-// is the CEILING of the wait, not the wait: retryRefresh draws each attempt
-// from backoff.FullJitter(retryDelay), so the retries a scope-wide failure
-// armed do not all land in the same instant.
+// is the CEILING of the wait, not the wait: retryWait draws each attempt from
+// [retryDelay/2, retryDelay), so the repairs a scope-wide failure armed do not
+// all land in the same instant, and none of them lands in no time at all.
 const retryDelay = 250 * time.Millisecond
+
+// retryWait is how long one repair pauses before it re-reads: half of
+// retryDelay flat, plus a jittered half.
+//
+// The floor is what makes the constant's promise true. Drawing the whole wait
+// from backoff.FullJitter(retryDelay) spreads the repairs a scope-wide failure
+// armed, but it spreads them over [0, retryDelay) with nothing underneath — so
+// a repair can re-read with no pause at all against the pool whose scarcity
+// refused the first read, which is the per-key hammering the constant exists
+// to rule out. Half the window flat keeps every repair off the store for at
+// least retryDelay/2; the jittered half keeps them from arriving together.
+func retryWait() time.Duration {
+	return retryDelay/2 + backoff.FullJitter(retryDelay/2)
+}
 
 // scopeNSKey is the debouncer's key: one quiet window per key per scope, so a
 // burst of notifications for one tenant's key never collapses another tenant's
@@ -245,10 +259,16 @@ func (e *Engine) submitRefresh(scope store.Scope, nk NSKey, deleted bool) {
 // for the life of the process. Neither the disconnect generation nor the stale
 // flag is touched here: those belong to the connection, and this is one row.
 //
-// At most ONE retry is pending per key, claimed through beginRetry: a key the
-// feed is hot on while the store is degraded would otherwise schedule a second
-// store call per failed read, doubling its pool checkouts exactly while the
-// pool is scarce.
+// At most ONE retry is pending per key AND op, claimed through beginRetry: a
+// key the feed is hot on while the store is degraded would otherwise schedule
+// a second store call per failed read, doubling its pool checkouts exactly
+// while the pool is scarce. Two upserts still coalesce onto one repair, which
+// is what that bound is for. A DELETE owns a repair of its own, because the
+// two ops conclude opposite things from the same empty read: keyed by the key
+// alone, an upsert's pending repair refused the delete one, then ran as the
+// upsert it was armed for and kept the removed row in force at its old
+// revision — confirmed, with nothing left to ask on a connection that never
+// drops.
 //
 // Both outcomes are addressed to the state the re-read was armed on, by
 // IDENTITY, for the reason recordFeedOutcome states: a tenant dropped and
@@ -269,7 +289,9 @@ func (e *Engine) retryRefresh(sc *scopeState, nk NSKey, fence feedFence, deleted
 		return
 	}
 
-	if !sc.beginRetry(nk) {
+	rk := retryKey{nk: nk, deleted: deleted}
+
+	if !sc.beginRetry(rk) {
 		return
 	}
 
@@ -277,7 +299,7 @@ func (e *Engine) retryRefresh(sc *scopeState, nk NSKey, fence feedFence, deleted
 		// The door is shut and no goroutine will run, so the slot goes back:
 		// leaving it claimed would refuse every later retry of this key on a
 		// scope that outlived the race.
-		sc.endRetry(nk)
+		sc.endRetry(rk)
 
 		return
 	}
@@ -286,15 +308,15 @@ func (e *Engine) retryRefresh(sc *scopeState, nk NSKey, fence feedFence, deleted
 		"systemplane.engine", "retry", runtime.KeepRunning,
 		func(ctx context.Context) {
 			defer e.dispatchWG.Done()
-			defer sc.endRetry(nk)
+			defer sc.endRetry(rk)
 
-			// Jittered, through the same primitive both backends reconnect
-			// with. A scope-wide read failure arms one retry per key, and a
-			// fixed constant fires every one of them at the same instant
-			// against the pool whose scarcity refused them — the engine's own
-			// reason for the first failure. FullJitter spreads the single
-			// attempt over [0, retryDelay) instead.
-			if err := backoff.WaitContext(ctx, backoff.FullJitter(retryDelay)); err != nil {
+			// Floored and jittered, through the same primitive both backends
+			// reconnect with. A scope-wide read failure arms one repair per
+			// key and op, and a fixed constant fires every one of them at the
+			// same instant against the pool whose scarcity refused them — the
+			// engine's own reason for the first failure. retryWait spreads the
+			// single attempt over [retryDelay/2, retryDelay) instead.
+			if err := backoff.WaitContext(ctx, retryWait()); err != nil {
 				return
 			}
 

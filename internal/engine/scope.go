@@ -201,21 +201,29 @@ type scopeState struct {
 	// Guarded by mu, alongside stale. Created lazily: most scopes never have
 	// one.
 	unconfirmed map[NSKey]struct{}
-	// retrying holds the keys with a retry already pending, so a failed
-	// re-read arms at most ONE. Without it every failed read of a key the
-	// feed is hot on scheduled a second store call a quarter of a second
-	// later, with nothing deduplicating them: the pool checkouts for that key
-	// doubled exactly while the pool was scarce, which is what made the reads
-	// fail to begin with. With it the in-flight reads for one key stay capped
-	// at two — a first attempt and the one repair it asked for.
+	// retrying holds the repairs already pending, so a failed re-read arms at
+	// most ONE per key and op. Without it every failed read of a key the feed
+	// is hot on scheduled a second store call a quarter of a second later,
+	// with nothing deduplicating them: the pool checkouts for that key doubled
+	// exactly while the pool was scarce, which is what made the reads fail to
+	// begin with. With it the in-flight reads for one key stay capped at
+	// THREE — a first attempt, the one repair an upsert asks for, and the one
+	// a delete asks for.
 	//
-	// A key is entered before the retry goroutine is launched and removed by
+	// The op is half the key because it is half the answer: an empty read
+	// means "not visible yet, keep the value" after an upsert and "the row is
+	// gone" after a delete. Keyed by NSKey alone, an upsert's pending repair
+	// refused the delete that followed it one of its own, and then answered
+	// for it as an upsert — leaving the deleted row in force. Two upserts
+	// still share one repair, which is the bound this field exists for.
+	//
+	// An entry is made before the retry goroutine is launched and removed by
 	// that goroutine's own defer, so a launch that loses the race to Close
 	// takes the entry back too and the next failure may still retry.
 	//
 	// Guarded by mu, alongside unconfirmed, and created lazily for the same
 	// reason.
-	retrying map[NSKey]struct{}
+	retrying map[retryKey]struct{}
 	// disconnectGen is bumped on every OpDisconnect. A reconcile records it
 	// when it starts and clears stale only if it is unchanged at completion,
 	// so a reconcile that spans a new disconnect cannot clear the flag that
@@ -367,32 +375,39 @@ func (sc *scopeState) recordUnconfirmed(nk NSKey, fence feedFence) {
 	sc.markUnconfirmed(nk)
 }
 
-// beginRetry claims the single retry slot nk has, reporting false when one is
+// retryKey is one repair slot: a key and the op whose answer the repair is
+// carrying. See the retrying field for why the op belongs in the key.
+type retryKey struct {
+	nk      NSKey
+	deleted bool
+}
+
+// beginRetry claims the single retry slot rk has, reporting false when one is
 // already pending. See the retrying field.
-func (sc *scopeState) beginRetry(nk NSKey) bool {
+func (sc *scopeState) beginRetry(rk retryKey) bool {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 
-	if _, pending := sc.retrying[nk]; pending {
+	if _, pending := sc.retrying[rk]; pending {
 		return false
 	}
 
 	if sc.retrying == nil {
-		sc.retrying = make(map[NSKey]struct{}, 1)
+		sc.retrying = make(map[retryKey]struct{}, 1)
 	}
 
-	sc.retrying[nk] = struct{}{}
+	sc.retrying[rk] = struct{}{}
 
 	return true
 }
 
-// endRetry releases nk's retry slot, so the next failed re-read of the key may
-// arm one again.
-func (sc *scopeState) endRetry(nk NSKey) {
+// endRetry releases rk's retry slot, so the next failed re-read of that key
+// and op may arm one again.
+func (sc *scopeState) endRetry(rk retryKey) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 
-	delete(sc.retrying, nk)
+	delete(sc.retrying, rk)
 }
 
 // armReconcile opens a reconcile window and puts it in the scope's single-slot
