@@ -25,9 +25,11 @@ type publication struct {
 	Raw []byte
 	// Deleted marks the one publication that is a row's REMOVAL rather than a
 	// value: it bumps the key's delete counter, which is what a changefeed
-	// re-read still inside its store call is fenced against. A reconcile
-	// publishing the default for a key its photograph did not carry is not a
-	// delete — see entry.Deletes.
+	// re-read still inside its store call is fenced against. Only a caller's
+	// own Delete sets it — the changefeed counts its delete at event arrival
+	// instead, before the re-read that answers it. A reconcile publishing the
+	// default for a key its photograph did not carry is not a delete either —
+	// see keyFence.
 	Deleted   bool
 	UpdatedAt time.Time
 	UpdatedBy string
@@ -143,19 +145,27 @@ func (e *Engine) publish(sc *scopeState, pub publication) (notify bool) {
 		// writer, which changed value without bumping revision. Observed.
 	}
 
-	deletes := cached.Deletes
-	if pub.Deleted {
-		deletes++
-	}
-
 	sc.entries[pub.NSKey] = entry{
 		Value:     pub.Value,
 		Raw:       pub.Raw,
 		Revision:  pub.Revision,
-		Deletes:   deletes,
 		UpdatedAt: pub.UpdatedAt,
 		UpdatedBy: pub.UpdatedBy,
 	}
+
+	// The counters a changefeed re-read is graded against, bumped under the
+	// same acquisition that stored the value so a re-read can never observe
+	// the pair half-applied. publications rises on every accepted publication;
+	// deletes only for a caller's own Delete, the feed having already counted
+	// its own at event arrival. See keyFence.
+	fence := sc.fences[pub.NSKey]
+	fence.publications++
+
+	if pub.Deleted {
+		fence.deletes++
+	}
+
+	sc.fences[pub.NSKey] = fence
 
 	// Still under the scope's write lock, on purpose: queueing a notification
 	// is what keeps deliveries in revision order. If the queueing happened

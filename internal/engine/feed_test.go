@@ -144,6 +144,9 @@ func TestDeleteEventPublishesDefaultAtRevisionZero(t *testing.T) {
 
 	readsBeforeDelete := fs.getCount()
 
+	// The DELETE committed, so the row is gone before its notification is
+	// delivered. What the re-read finds is what decides the key.
+	fs.remove(store.Scope{}, nk)
 	e.onEvent(deleteEvent(store.Scope{}, nk))
 	waitFor(t, time.Second, "the delete delivery", func() bool { return rec.len() == 2 })
 
@@ -164,8 +167,9 @@ func TestDeleteEventPublishesDefaultAtRevisionZero(t *testing.T) {
 		t.Errorf("delivered revisions: got %v, want the second to be 0", revs)
 	}
 
-	if after := fs.getCount(); after != readsBeforeDelete {
-		t.Errorf("delete triggered %d store read(s), want 0: a delete is self-describing", after-readsBeforeDelete)
+	if after := fs.getCount(); after != readsBeforeDelete+1 {
+		t.Errorf("delete triggered %d store read(s), want 1: a delete says a row is gone, not what the "+
+			"key holds now", after-readsBeforeDelete)
 	}
 }
 

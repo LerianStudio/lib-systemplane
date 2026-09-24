@@ -201,7 +201,9 @@ func TestReconcileKeepsRecreatedValueOverListSnapshot(t *testing.T) {
 
 	// A delete and a recreate reach the feed while the snapshot is held. The
 	// recreated row carries revision 1, lower than the snapshot's revision 5,
-	// so only the touched fence can keep it.
+	// so only the touched fence can keep it. The row is removed before the
+	// delete's notification, because its re-read is what decides the key.
+	fs.remove(scope, nk)
 	e.onEvent(deleteEvent(scope, nk))
 	fs.seed(scope, jsonRow(nk, 1, `"recreated"`, "ops"))
 	e.onEvent(upsertEvent(scope, nk, 1))
@@ -1401,8 +1403,11 @@ func TestConcurrentFeedDeleteIsNotResurrected(t *testing.T) {
 // on a stable connection, never, and two processes of one consumer then
 // disagree about a key an operator deleted.
 //
-// The row deliberately stays in the store double. A reader whose snapshot
-// predates the commit still sees it, and that reader is the whole hazard.
+// The row is removed from the store double when the DELETE commits, and the
+// double answers every Get from the row as it stood when that call STARTED. So
+// the held reader still sees the row it began on, while a read that starts
+// after the commit finds nothing — which is the pair of facts the fence has to
+// tell apart.
 func TestDeleteIsNotResurrectedByAnInFlightReRead(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 	scope := store.Scope{}
@@ -1465,6 +1470,7 @@ func TestDeleteIsNotResurrectedByAnInFlightReRead(t *testing.T) {
 
 			<-inGet
 
+			fs.remove(scope, nk)
 			e.onEvent(deleteEvent(scope, nk))
 
 			releaseGet()

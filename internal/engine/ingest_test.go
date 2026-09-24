@@ -52,7 +52,7 @@ func engineWithRegistry(reg Registry) *Engine {
 // it made of the row is asserted where it is visible: the cache it did or did
 // not change, and the line it logged.
 func ingestRow(e *Engine, se store.Entry) {
-	e.ingest(context.Background(), e.scopeFor(store.Scope{}), se, deleteFence{})
+	e.ingest(context.Background(), e.scopeFor(store.Scope{}), se, feedFence{})
 }
 
 func TestIngestRejectsInvalidValueKeepingPrevious(t *testing.T) {

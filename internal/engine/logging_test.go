@@ -302,7 +302,7 @@ func TestReReadErrorIsLoggedAtWarn(t *testing.T) {
 
 	fs.onGet(func(store.Scope, NSKey) error { return errors.New("connection reset") })
 
-	e.refreshKey(store.Scope{}, nk)
+	e.refreshKey(store.Scope{}, nk, false)
 
 	requireLogged(t, rec, log.LevelWarn, "changefeed re-read failed, keeping current value", store.Scope{}, nk)
 }
@@ -325,7 +325,7 @@ func TestReReadCanceledByCloseIsLoggedAtDebug(t *testing.T) {
 
 	// The re-read a debounce timer already fired, reaching the store after
 	// Close canceled the lifecycle context.
-	e.refreshKey(scope, nk)
+	e.refreshKey(scope, nk, false)
 
 	requireLogged(t, rec, log.LevelDebug, "changefeed re-read canceled during shutdown", scope, nk)
 }
@@ -342,7 +342,7 @@ func TestLogLevelReReadWithNoRowIsDebug(t *testing.T) {
 
 	track(t, e, scope)
 
-	e.refreshKey(scope, nk)
+	e.refreshKey(scope, nk, false)
 
 	requireLogged(t, rec, log.LevelDebug, "changefeed re-read found no row, keeping current value", scope, nk)
 }
@@ -684,7 +684,7 @@ func TestReReadCanceledOutsideShutdownIsLoggedAtWarn(t *testing.T) {
 		return fmt.Errorf("pool checkout aborted: %w", context.Canceled)
 	})
 
-	e.refreshKey(store.Scope{}, nk)
+	e.refreshKey(store.Scope{}, nk, false)
 
 	requireLogged(t, rec, log.LevelWarn, "changefeed re-read failed, keeping current value", store.Scope{}, nk)
 }

@@ -1104,7 +1104,14 @@ func TestReconcileDoesNotOverwriteFresherChangefeedState(t *testing.T) {
 	}
 
 	// The changefeed reports the row gone while the reconcile is still holding
-	// a photograph that carries it.
+	// a photograph that carries it. A delete is answered by re-reading the
+	// store, so the read a reader starting NOW would get — nothing — is what
+	// the hook returns; the held List goes on photographing the row it began
+	// with, which is the pair of facts this test is about.
+	m.mu.Lock()
+	m.getHook = func(string, string) (store.Entry, bool, bool) { return store.Entry{}, false, true }
+	m.mu.Unlock()
+
 	m.fire(store.Event{Namespace: "ns", Key: "k", Op: store.OpDelete})
 
 	// Release List() only once the delete has actually been published, so the

@@ -47,13 +47,16 @@ type scopeNSKey struct {
 //     reloaded, so it is neither debounced per key nor re-read as an upsert:
 //     it arms the scope's reconcile window here, synchronously, and the reload
 //     itself runs on its own goroutine.
-//   - OpDelete publishes the registered default at revision 0 with no store
-//     read at all: a delete is self-describing. It is still queued behind the
-//     key's quiet window, like an upsert, so that a delete immediately
-//     followed by a write coalesces into the write instead of reverting it;
-//     the reconcile fence it needs is recorded here, synchronously.
+//   - OpDelete is fenced here, synchronously, and then re-read like an upsert:
+//     the store is the only thing that can say what the key holds NOW, and a
+//     delete that published blind reverted whatever the caller wrote after it.
+//     What the re-read finds decides the outcome — a row (the key was
+//     recreated) goes through the ingress at its own revision, an empty read
+//     puts the registered default in force at revision 0.
 //   - anything else is treated as an upsert: the store is re-read once the
-//     key's quiet window closes, and the row goes through the ingress.
+//     key's quiet window closes, and the row goes through the ingress. An
+//     empty read is then a non-answer rather than a removal, and the key keeps
+//     the value it holds.
 func (e *Engine) onEvent(evt store.Event) {
 	// An event that arrives while Close is running is dropped whole: there is
 	// nobody left to deliver it to, and answering it would create a scope or
@@ -121,12 +124,16 @@ func (e *Engine) onEvent(evt store.Event) {
 		return
 	}
 
-	// A delete is fenced against every reconcile in flight the MOMENT it
-	// arrives, before the publication below waits for the key's quiet window.
-	// From here on the feed holds the fresher fact about this key, and a
-	// snapshot taken before the delete must never be applied over it — which
-	// is what the publication used to record for itself when it ran inline.
-	if evt.Op == store.OpDelete {
+	// A delete is counted the MOMENT it arrives, before the re-read below
+	// waits for the key's quiet window, and that is the half of a delete that
+	// cannot be deferred. Every revision beats the 0 a delete publishes, so a
+	// re-read already inside Store.Get when the DELETE commits comes back —
+	// under READ COMMITTED — holding the removed row and wins the publish
+	// fence with it. Counting the delete here refuses that reader from this
+	// instant; recording the key as touched does the same for a reconcile
+	// whose List was taken before the delete.
+	deleted := evt.Op == store.OpDelete
+	if deleted {
 		e.recordFeedDelete(evt.Scope, nk)
 	}
 
@@ -144,32 +151,26 @@ func (e *Engine) onEvent(evt store.Event) {
 	// by feedTimeout PLUS the consumer's validator, which is bounded by
 	// nothing, and every other key's notification waits behind it.
 	//
-	// A delete takes the SAME per-key quiet window as an upsert, and that is
-	// the whole fix for the inversion a self-describing delete used to cause:
-	// the echo of a Delete and the echo of the Set that followed it arrive on
-	// the feed as close together as the two writes were, so the upsert's
-	// re-read replaces the pending delete instead of the delete reverting the
-	// write to the registered default for a window. Revision 0 always wins the
-	// publish fence, so nothing downstream could have ordered those two — only
-	// the feed's own order can, and coalescing is how the engine reads it.
+	// A delete takes the same per-key quiet window AND the same store read as
+	// an upsert; the op it carries only decides what an EMPTY read means. That
+	// is what fixed the inversion a self-describing delete used to cause: the
+	// echo of a Delete and the echo of the Set that followed it arrive on the
+	// feed in that order, and re-reading the store answers the delete with the
+	// row the write left behind instead of reverting the key to its registered
+	// default. Coalescing alone could not — it orders only the echoes that
+	// land inside one window, and a busy feed delivers most pairs further
+	// apart than that.
 	//
-	// It needs no WaitGroup registration of its own: a delete makes no store
-	// call, so a timer that fires after Close has returned publishes into a
-	// closed engine and is refused there, rather than reaching a store the
-	// Client is about to close under it.
-	//
-	// Exactly one closure is built, in the branch that wants it. Building the
-	// inline one up front and overwriting it here cost one discarded heap
-	// allocation on every upsert event the feed delivers.
+	// Exactly one closure is built, in the branch that wants it: the two
+	// differ only in whether the re-read registers itself as work Close waits
+	// for, and building both would cost one discarded heap allocation on every
+	// event the feed delivers.
 	var work func()
 
-	switch {
-	case evt.Op == store.OpDelete:
-		work = func() { e.PublishDelete(evt.Scope, nk) }
-	case e.debounceAsync:
-		work = func() { e.trackedRefresh(evt.Scope, nk) }
-	default:
-		work = func() { e.refreshKey(evt.Scope, nk) }
+	if e.debounceAsync {
+		work = func() { e.trackedRefresh(evt.Scope, nk, deleted) }
+	} else {
+		work = func() { e.refreshKey(evt.Scope, nk, deleted) }
 	}
 
 	e.debouncer.Submit(scopeNSKey{Tenant: evt.Scope.Tenant, Namespace: nk.Namespace, Key: nk.Key}, work)
@@ -206,14 +207,14 @@ func (e *Engine) onEvent(evt store.Event) {
 // can be hot on at once, while the validator's share adds goroutines and the
 // values they hold rather than connections — a slow validator therefore shows
 // up as goroutine growth under a flapping feed, not as pool exhaustion.
-func (e *Engine) trackedRefresh(scope store.Scope, nk NSKey) {
+func (e *Engine) trackedRefresh(scope store.Scope, nk NSKey, deleted bool) {
 	if !e.beginWork() {
 		return
 	}
 
 	defer e.dispatchWG.Done()
 
-	e.refreshKey(scope, nk)
+	e.refreshKey(scope, nk, deleted)
 }
 
 // recoverRefresh reports a panic raised under a changefeed re-read, naming the
@@ -349,17 +350,25 @@ func (e *Engine) markStale(scope store.Scope) {
 	sc.disconnectGen++
 }
 
-// recordFeedDelete fences nk against every reconcile in flight, at the instant
-// the changefeed reports the row removed.
+// recordFeedDelete fences nk against everything already in flight, at the
+// instant the changefeed reports the row removed. It publishes nothing: what
+// goes in force is decided by the re-read the event schedules.
 //
-// The publication itself waits for the key's quiet window, so this is the half
-// that cannot wait: a reconcile whose List was taken before the delete still
-// carries the row, and every revision beats the revision 0 a delete publishes,
-// so without this record the photograph resurrects the key for as long as the
-// window lasts. Recording the key as touched is not a guess — the feed really
-// does hold the fresher fact about it from here on, and a reconcile that skips
-// it keeps the cached value until the delete (or the write that coalesced over
-// it) lands.
+// Two fences, because two kinds of reader can be holding the pre-delete row.
+// A changefeed re-read already inside Store.Get is refused by the delete
+// counter, which it captured before its call and compares afterwards. A
+// reconcile whose List was taken before the delete is refused by the touched
+// record, since every revision in its photograph beats the revision 0 a delete
+// leads to. Both are the half that cannot wait for the key's quiet window:
+// until the re-read runs, these two are the only things that could publish the
+// removed row back over the removal.
+//
+// Recording the key as touched is not a guess — the feed really does hold the
+// fresher fact about it from here on, and a reconcile that skips it keeps the
+// cached value until the re-read lands.
+//
+// The two locks are taken in the engine's standing order, reconcileMu then mu,
+// which is the order publish takes them under the ingress.
 func (e *Engine) recordFeedDelete(scope store.Scope, nk NSKey) {
 	sc := e.scopeForEvent(scope, nk)
 	if sc == nil {
@@ -370,6 +379,7 @@ func (e *Engine) recordFeedDelete(scope store.Scope, nk NSKey) {
 	defer sc.reconcileMu.Unlock()
 
 	sc.record(nk, true)
+	sc.bumpDeletes(nk)
 }
 
 // PublishDelete publishes the registered default at revision 0 for a deleted
@@ -382,14 +392,17 @@ func (e *Engine) recordFeedDelete(scope store.Scope, nk NSKey) {
 // read an empty fence, wait, and then republish a snapshot row that predates
 // this delete — which is exactly how a deleted key came back to life.
 //
-// Two callers share this one operation: the changefeed, when the store reports
-// a row removed, and the Client's own Delete, which needs the same publication
-// under the same fence for the same reason. Leaving Delete to the feed alone
+// The Client's own Delete is its one caller. Leaving Delete to the feed alone
 // would make read-your-writes on a delete wait for a NOTIFY round trip, so the
 // caller's next read could still be answered by the value it just removed
-// (D4). A Client Delete therefore also bumps the key's delete counter, and a
-// changefeed re-read that was already in flight when the caller deleted is
-// refused exactly as it is for a feed delete.
+// (D4). It bumps the key's delete counter through publish, so a changefeed
+// re-read that was already in flight when the caller deleted is refused
+// exactly as it is for a delete the feed reports.
+//
+// The feed does NOT come through here. A notification says a row is gone, not
+// what the key holds now, and answering it without asking the store reverted
+// whatever the caller wrote next; the feed counts its delete at arrival and
+// re-reads instead (onEvent, refreshKey).
 func (e *Engine) PublishDelete(scope store.Scope, nk NSKey) {
 	// Exported, so this runs on the consumer's goroutine: the same guard
 	// Publish takes, for the same reason. The feed's own callers can never
@@ -415,7 +428,7 @@ func (e *Engine) PublishDelete(scope store.Scope, nk NSKey) {
 // refreshKey re-reads one key and puts the row through the ingress. It is what
 // the debouncer invokes when a key's quiet window closes.
 //
-// Three outcomes that are not a publication, each deliberately different:
+// Three outcomes that are not the ordinary row, each deliberately different:
 //
 //   - a store error teaches the engine nothing, so the key is recorded as
 //     unusable and the cached value stands. The fence is written before the
@@ -423,11 +436,13 @@ func (e *Engine) PublishDelete(scope store.Scope, nk NSKey) {
 //     and a reconcile must never reach the key while it is still unfenced. An
 //     error that is the lifecycle context being canceled is a shutdown, not an
 //     incident, and logs at DEBUG.
-//   - not found keeps the current value and publishes nothing: the write may
-//     simply not be visible to this reader yet, and a real removal arrives as
-//     OpDelete, so this is expected rather than wrong and logs at DEBUG. It is
-//     recorded in neither set, so a concurrent reconcile's snapshot decides
-//     the key.
+//   - not found means different things for the two ops, which is the whole of
+//     what deleted decides. After an upsert the write may simply not be
+//     visible to this reader yet, so the current value stands and nothing is
+//     published: expected rather than wrong, logged at DEBUG, and recorded in
+//     neither set so a concurrent reconcile's snapshot decides the key. After
+//     a DELETE the row really is gone, and publishAbsentDelete puts the
+//     registered default in force at revision 0.
 //   - a row the ingress rejects (undecodable or refused by the validator) is
 //     recorded as unusable, so a concurrent reconcile keeps the cached value
 //     instead of concluding the key is absent.
@@ -447,7 +462,7 @@ func (e *Engine) PublishDelete(scope store.Scope, nk NSKey) {
 // holds, and the new state's own reconcile is the only thing entitled to
 // decide the key. That is why sc is declared before the recovery is deferred
 // and handed to it by pointer.
-func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
+func (e *Engine) refreshKey(scope store.Scope, nk NSKey, deleted bool) {
 	var sc *scopeState
 
 	defer e.recoverRefresh(scope, nk, &sc)
@@ -462,8 +477,11 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
 
 	// Armed BEFORE the store call, because the whole question is what happened
 	// during it. A delete that lands while this read is in flight makes the row
-	// it comes back with older than the cache, however high its revision.
-	fence := sc.deleteFenceFor(nk)
+	// it comes back with older than the cache, however high its revision — and
+	// for a read that comes back empty, so does any publication at all, since
+	// the registered default it would publish wins the revision fence
+	// unconditionally.
+	fence := sc.fenceFor(nk)
 
 	ctx, cancel := context.WithTimeout(e.dispatchContext(), feedTimeout)
 	defer cancel()
@@ -490,7 +508,40 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
 		return
 	}
 
+	// The scope is resolved again because it can be dropped during the store
+	// round trip, and nothing this read learned may bring it back. It is
+	// compared by IDENTITY, exactly as applyScope compares before applying a
+	// snapshot: a tenant dropped and brought back up meanwhile is a NEW state
+	// under the same scope value, so a by-value check finds a live scope and
+	// publishes a row read under an entitlement this process no longer holds.
+	// The delete fence cannot stand in for that — it counts deletes, and a
+	// fresh state's counter starts at zero, so for the ordinary key that has
+	// never been deleted it compares zero against zero and lets the row
+	// through. The new state reconciles the key from the store itself.
+	//
+	// It gates BOTH conclusions, not only the row: the registered default a
+	// delete's empty read publishes is as much a decision about the key as a
+	// value is, and the dropped state is entitled to neither.
+	if live := e.scopeForEvent(scope, nk); live != sc {
+		// scopeForEvent already reported the scope that is simply gone. This
+		// line is the other half: a state that IS tracked, under the same
+		// scope value, whose row this re-read is not entitled to hand over.
+		// Both are drops, and a drop nothing says a word about is one an
+		// operator chasing a key that never updated cannot see.
+		if live != nil {
+			e.logUntrackedDrop(scope, nk)
+		}
+
+		return
+	}
+
 	if !found {
+		if deleted {
+			e.publishAbsentDelete(ctx, sc, scope, nk, fence)
+
+			return
+		}
+
 		e.logDebug(ctx, "changefeed re-read found no row, keeping current value",
 			log.String(constants.AttrKeyTenantID, scope.Tenant),
 			log.String("namespace", nk.Namespace),
@@ -506,30 +557,50 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
 	// publication. The store read above deliberately stays outside the lock —
 	// holding it across a network round trip would stall every reconcile of
 	// the scope, and so does the validator ingest runs before taking it.
-	// The scope is resolved again because it can be dropped during that round
-	// trip, and this publication must not bring it back. It is compared by
-	// IDENTITY, exactly as applyScope compares before applying a snapshot: a
-	// tenant dropped and brought back up meanwhile is a NEW state under the
-	// same scope value, so a by-value check finds a live scope and publishes a
-	// row read under an entitlement this process no longer holds. The delete
-	// fence cannot stand in for that — it counts deletes, and a fresh state's
-	// counter starts at zero, so for the ordinary key that has never been
-	// deleted it compares zero against zero and lets the row through. The new
-	// state reconciles the key from the store itself.
-	if live := e.scopeForEvent(scope, nk); live != sc {
-		// scopeForEvent already reported the scope that is simply gone. This
-		// line is the other half: a state that IS tracked, under the same
-		// scope value, whose row this re-read is not entitled to hand over.
-		// Both are drops, and a drop nothing says a word about is one an
-		// operator chasing a key that never updated cannot see.
-		if live != nil {
-			e.logUntrackedDrop(scope, nk)
-		}
+	e.ingest(ctx, sc, se, fence)
+}
+
+// publishAbsentDelete puts the registered default in force at revision 0 for a
+// key the changefeed reported deleted and whose row the re-read then found
+// gone. It is the one outcome that concludes something from an EMPTY read, and
+// the op is what entitles it to: an upsert's empty read is a non-answer, a
+// delete's is the removal itself.
+//
+// What it publishes wins the revision fence unconditionally, so it is graded
+// on the wider question instead: anything at all having landed on the key
+// since the read began means the cache holds a fact this read did not see. The
+// case that matters is the caller's own Set, published for read-your-writes
+// (D4) the moment the store acknowledged it, while this reader was still
+// inside a Store.Get that could not yet see the row — publishing the default
+// on top of it would revert a write the caller has already been told landed.
+// A refusal publishes nothing and records nothing: whatever won recorded
+// itself.
+//
+// The delete counter is NOT bumped again here. The feed counted this delete at
+// event arrival, which is what refused every re-read already in flight, and a
+// second bump would refuse a re-read armed after it for a delete it had
+// already seen.
+//
+// The scope is resolved by the caller and compared by identity there, and the
+// publication and the fence it writes are one step under reconcileMu, for the
+// reasons refreshKey and PublishDelete state.
+func (e *Engine) publishAbsentDelete(ctx context.Context, sc *scopeState, scope store.Scope, nk NSKey, fence feedFence) {
+	sc.reconcileMu.Lock()
+	defer sc.reconcileMu.Unlock()
+
+	if sc.supersededByPublication(nk, fence) {
+		e.logDebug(ctx, "changefeed delete superseded by a later publication, keeping current value",
+			log.String(constants.AttrKeyTenantID, scope.Tenant),
+			log.String("namespace", nk.Namespace),
+			log.String("keyname", nk.Key),
+		)
 
 		return
 	}
 
-	e.ingest(ctx, sc, se, fence)
+	if e.ingestDefault(ctx, sc, nk, false) {
+		sc.record(nk, true)
+	}
 }
 
 // recordFeedOutcome tells every reconcile in flight ON sc what the feed

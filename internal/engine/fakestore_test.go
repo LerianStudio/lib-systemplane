@@ -243,10 +243,18 @@ func (f *fakeStore) Close() error {
 	return nil
 }
 
+// Get answers from the row as it stood when the call STARTED, not as it stands
+// when the hook releases. That is READ COMMITTED, which is what the engine's
+// delete fence exists for: a reader whose statement began before a DELETE
+// committed still sees the row, and comes back holding a fact the cache has
+// already moved past. A double that re-read the map after the hook could not
+// model that reader at all — every test that removes a row while a Get is held
+// open would see its own removal.
 func (f *fakeStore) Get(ctx context.Context, scope store.Scope, ns, key string) (store.Entry, bool, error) {
 	f.mu.Lock()
 	f.getCalls++
 	hook := f.getHook
+	e, ok := f.rows[rowKey(scope, ns, key)]
 	f.mu.Unlock()
 
 	if hook != nil {
@@ -258,11 +266,6 @@ func (f *fakeStore) Get(ctx context.Context, scope store.Scope, ns, key string) 
 	if err := ctx.Err(); err != nil {
 		return store.Entry{}, false, err
 	}
-
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	e, ok := f.rows[rowKey(scope, ns, key)]
 
 	return e, ok, nil
 }

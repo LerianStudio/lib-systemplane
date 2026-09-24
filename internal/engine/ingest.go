@@ -40,7 +40,9 @@ import (
 //  4. Revision fence — publish already decided; the value was still usable.
 //  5. Delete fence — a re-read armed before a delete of the key is refused
 //     and recorded unusable, so a concurrent reconcile applies its snapshot
-//     row.
+//     row. Only the delete counter is consulted here: a row this read really
+//     did see is ordered against every other publication by the revision
+//     fence, and only a delete — which publishes revision 0 — escapes it.
 //
 // The ingress runs in two halves and the split is load-bearing. prepare —
 // decode, and the CONSUMER's registered validator — runs OUTSIDE the scope's
@@ -81,7 +83,7 @@ import (
 // never consults the unusable set), and an ABSENT key with nothing usable from
 // the feed keeps its cached value instead of being reset to the default, which
 // is the protection this paragraph's guard was reaching for.
-func (e *Engine) ingest(ctx context.Context, sc *scopeState, se store.Entry, fence deleteFence) {
+func (e *Engine) ingest(ctx context.Context, sc *scopeState, se store.Entry, fence feedFence) {
 	nk := NSKey{Namespace: se.Namespace, Key: se.Key}
 
 	sc.reconcileMu.Lock()
@@ -202,26 +204,29 @@ func errorDetail(redacted bool, what string, err error) log.Field {
 	return log.String("error", fmt.Sprintf("%s (%T)", what, err))
 }
 
-// ingestDefault is the ingress for the no-row case: a feed delete, or a
-// reconcile that finds a registered key absent from the store's snapshot. It
-// publishes the registered default at revision 0 with a zero UpdatedAt and an
-// empty UpdatedBy, because no row backs the value.
+// ingestDefault is the ingress for the no-row case: a Client Delete, a
+// changefeed delete whose re-read found the row gone, or a reconcile that
+// finds a registered key absent from the store's snapshot. It publishes the
+// registered default at revision 0 with a zero UpdatedAt and an empty
+// UpdatedBy, because no row backs the value.
 //
 // The default is cloned before publication so the registry's own copy can
 // never be reached — let alone mutated — through the cache or through a
 // subscriber's callback.
 //
-// deleted separates the two callers that share this ingress. A feed delete is
-// the removal of a row and bumps the key's delete counter, which refuses any
-// re-read that began before it; a reconcile publishing the default for a key
-// its photograph did not carry is a conclusion about that photograph, not a
-// removal, and leaves the counter alone.
+// deleted says whether this publication is the one that must COUNT the delete,
+// and only a Client Delete sets it: the removal happened on the caller's own
+// goroutine and nothing else has counted it. The feed counts its delete at
+// event arrival instead, so its own publication passes false; and a reconcile
+// publishing the default for a key its photograph did not carry is a
+// conclusion about that photograph, not a removal, so it passes false too.
 //
 // sc is the caller's own scope state, for the reason publish takes one.
 func (e *Engine) ingestDefault(ctx context.Context, sc *scopeState, nk NSKey, deleted bool) (notify bool) {
-	// Unreachable from all three production callers, each behind a guard of
-	// its own: PublishDelete, because the feed drops an unregistered key before
-	// it is reached; applySnapshotRow, because it asks its own Registry
+	// Unreachable from all four production callers, each behind a guard of
+	// its own: PublishDelete and publishAbsentDelete, because the feed drops
+	// an unregistered key before either is reached and the Client only deletes
+	// keys it registered; applySnapshotRow, because it asks its own Registry
 	// lookup first and returns rather than fall through for a foreign row the
 	// snapshot carried; applyAbsentKey, because every key it decides came
 	// from Registry.Keys. It is kept as a deliberate invariant check, so a

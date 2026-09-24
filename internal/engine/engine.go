@@ -514,7 +514,7 @@ func (e *Engine) Publish(ctx context.Context, scope store.Scope, se store.Entry)
 		return
 	}
 
-	e.ingest(ctx, sc, se, deleteFence{})
+	e.ingest(ctx, sc, se, feedFence{})
 }
 
 // Lookup returns the published state of nk in scope.
