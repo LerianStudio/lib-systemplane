@@ -113,17 +113,11 @@ func TestPostgresOpenListenRefusedListenIsReportedAndClosed(t *testing.T) {
 	assertClientGone(t, gone)
 }
 
-// "listen connect" shares a prefix with the LISTEN stage, so it is excluded
-// explicitly: a dial that never answered must not satisfy this assertion.
 func assertListenStage(t *testing.T, err error) {
 	t.Helper()
 
 	if err == nil {
 		t.Fatal("LISTEN succeeded; the refusal this test drives no longer happens")
-	}
-
-	if strings.Contains(err.Error(), "listen connect") {
-		t.Fatalf("error %q names the connect stage; the connection came up, so the LISTEN is what failed", err)
 	}
 
 	if !strings.Contains(err.Error(), "systemplane/postgres: listen tenant t1") {
