@@ -222,10 +222,13 @@ func assertDecodeFailureRendering(t *testing.T, logger *recordingLogger, redacte
 // only thing naming a redacted group whose document is withheld, so a
 // log.String("key", …) slipping in here would hand an operator
 // namespace=grpns key=[REDACTED] and nothing else.
-// It does not call t.Parallel(): the production-mode and panic-metric toggles
-// below are process-global, and what documents them as safe is that no test in
-// this package runs in parallel.
+// It runs in parallel: it only parses this package's source. Go pauses a
+// t.Parallel() top-level test and resumes it only after every sequential
+// top-level test in the package has returned, so it can never overlap the
+// process-global toggles the sequential panic tests below set.
 func TestNoLoggedFieldNameIsRedacted(t *testing.T) {
+	t.Parallel()
+
 	logguard.AssertNoneRedacted(t, ".")
 }
 
@@ -346,10 +349,10 @@ func TestCoordinatorApplierPanicIsRecordedLikeAnError(t *testing.T) {
 // hook was holding, routinely the decoded document with its endpoints and its
 // credentials. Status still reports the rejection; only the payload is gone.
 func TestCoordinatorApplierPanicIsRedactedInProductionMode(t *testing.T) {
-	// Process-global, so this test and TestCoordinatorApplierPanicIsRecordedLikeAnError
-	// depend on internal/group running sequentially: no test in the package calls
-	// t.Parallel(). The first one that does must move this toggle behind a
-	// serialized helper.
+	// Process-global. Safe while this test stays sequential: a t.Parallel()
+	// top-level test only runs after every sequential one has returned, so no
+	// parallel test can observe the toggle. What would break it is this test
+	// itself calling t.Parallel(), or running parallel subtests under it.
 	runtime.SetProductionMode(true)
 
 	defer runtime.SetProductionMode(false)
@@ -415,8 +418,9 @@ func (r *countingRecorder) recorded() int64 {
 // with it and the coordinator's own recovery then swallowed the unwind — a
 // fleet whose hot reload stopped, with the panic counter flat.
 //
-// Process-global like the production-mode toggle above: no test in this package
-// calls t.Parallel().
+// Process-global like the production-mode toggle above, and safe for the same
+// reason: this test is sequential, so no t.Parallel() test overlaps it. It must
+// not call t.Parallel() itself or run parallel subtests.
 func TestCoordinatorAPanickingLoggerStillRecordsThePanic(t *testing.T) {
 	recorderMetrics := &countingRecorder{}
 
