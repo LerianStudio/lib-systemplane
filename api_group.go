@@ -177,6 +177,8 @@ func Bind[T any](c *Client, namespace, key string, defaults T, validate func(T) 
 	// coordinator needs the fact, not the policy: masking and hiding are the
 	// same decision to a log stream, so both collapse to true and a panicking
 	// applier's document is withheld from the panic report either way.
+	// Key-level only: when the groups-redaction lane adds its field-level
+	// accessor, it widens this gate with `|| <field-level redaction present>` (FC-13).
 	redacted := c.KeyRedaction(namespace, key) != RedactNone
 
 	g.coordinator = group.NewCoordinator[T](c.Logger(), g.namespace, g.key, redacted, g.decodePublished, g.seedCurrentEntry)
