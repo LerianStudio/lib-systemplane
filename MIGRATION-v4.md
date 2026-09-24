@@ -52,8 +52,9 @@ has to be read even where your code compiles unchanged.
 |---|---|
 | `WithCloseTimeout`, `ErrCloseTimeout` | Bound the wait `Close` gives subscriber callbacks (default 30s) and name the (scope, key) still running when the bound elapses. |
 | `GetEntry`, `Entry` | Read the value together with its revision, `UpdatedAt`, `UpdatedBy` and a per-key `Stale` flag. |
-| `Bind`, `Group[T]`, `Snapshot[T]`, `Applied[T]`, `ApplyStatus`, `Group.OnApply`, `Group.Status`, `ErrApplyPanicked` | Declare a whole typed configuration document as one key, read it as `T`, and apply it through a serialized hook that records what is desired, what is applied and what last failed. |
+| `Bind`, `Group[T]`, `Snapshot[T]`, `Applied[T]`, `ApplyStatus`, `Group.Snapshot`, `Group.Set`, `Group.OnApply`, `Group.Status`, `ErrApplyPanicked` | Declare a whole typed configuration document as one key, read it as `T`, and apply it through a serialized hook that records what is desired, what is applied and what last failed. |
 | `MigrationV3ToV4SQL()` | The v3 → v4 Postgres delta as an importable artifact for your migration pipeline. See § The database and operator contract. |
+| `WithContextValidator` | Validate a value against the `Set` caller's context, so a validator can use the tenant that call carried. The registered default is still validated with `context.Background()`. |
 
 The tenant-manager additions ride the same placeholder as the removed `Manager`
 lifecycle row above; they are not a second thing to wait for.
@@ -71,8 +72,8 @@ Everything else in the facade is unchanged: `NewPostgres`, `NewMongoDB`,
 `GetBool`, `GetFloat64`, `GetDuration`, `Set`, `Delete`, `List`, `Catalog`,
 `CatalogKey`, `CatalogService`, `KeyDescription`, `KeyRedaction`,
 `IsRegistered`, `Logger`, the key options `WithDescription`, `WithValidator`,
-`WithContextValidator`, `WithRedaction`, `WithCatalogMetadata`, the client
-options `WithLogger`, `WithTelemetry`, `WithDebounce`, `WithPollInterval`,
+`WithRedaction`, `WithCatalogMetadata`, the client options `WithLogger`,
+`WithTelemetry`, `WithDebounce`, `WithPollInterval`,
 `WithMultiTenantEnabled`, `WithModule`, `WithCatalogService`, and
 `admin.Mount` / `admin.MountCatalog` with their options.
 
@@ -215,16 +216,16 @@ its first reconcile begins.
 process does not serve it yet", never as "not persisted". What it asks for is
 that you stop reporting the write as lost, not that you retry it.
 
-### Read-your-writes
+### A write's own changefeed echo no longer fires a callback
 
-**Affects:** every single-tenant consumer that reads back what it just wrote.
+**Affects:** every single-tenant consumer that subscribes to a key it also
+writes.
 
 `Set` publishes the value into the cache with the revision the store assigned
 before it returns, and the changefeed echo of that same write arrives at the
 same revision and is deduplicated — refreshing provenance, firing no callback.
-In v3 a `Set` followed immediately by a `Get` could return the old value until
-the NOTIFY came back. **Do:** delete the workarounds for that window — the
-sleep, the retry loop, the second read.
+In v3 the echo fired the subscriber. **Do:** move anything a writer relied on
+that callback for onto the write path itself.
 
 ### Redaction fails closed
 
@@ -488,6 +489,24 @@ delete publishes `revision: 0`. It creates no table, so it upgrades the install
 wherever `search_path` finds it; it is idempotent; and lib-systemplane never
 executes it for you. `SchemaSQL()` is for a database that has no install yet.
 
+The pipeline needs the SQL, not the library. Print it from a throwaway `main`:
+
+~~~go
+package main
+
+import (
+    "fmt"
+
+    systemplane "github.com/LerianStudio/lib-systemplane/v4"
+)
+
+func main() { fmt.Print(systemplane.MigrationV3ToV4SQL()) }
+~~~
+
+`go run ./cmd/print-ddl > 004_systemplane_v4.sql` hands the pipeline its file.
+Fetching the module to emit SQL is not deploying it: the migration runs first,
+the binary boots after.
+
 The migration guards itself, because every statement in it names
 `systemplane_entries` unqualified. It refuses when `search_path` reaches no
 `systemplane_entries` at all — put the schema holding the install first in
@@ -584,10 +603,9 @@ breaking its build are written down, and no per-consumer section repeats them.
 4. Audit every validator for Go-type assertions — a whole number arrives as `float64` — and for a dependency on request scope.
 5. Stop reading a non-nil `Set`/`Delete` error as "not persisted".
 
-matcher is the pilot for typed configuration documents. The glue that decodes a
-namespace of scalar keys into a struct, validates it and re-applies it on change
-is what `Bind`, `Group[T]` and `Group.OnApply` replace; see
-[§ The surface diff](#the-surface-diff).
+The glue that decodes a namespace of scalar keys into a struct, validates it and
+re-applies it on change is what `Bind`, `Group[T]` and `Group.OnApply` replace;
+see [§ The surface diff](#the-surface-diff).
 
 ### billing-worker
 
@@ -630,10 +648,8 @@ runs, so no callback could fire.
 **From:** v2.0.0 — `/v2`, lib-commons `/v6`, lib-observability `/v2`.
 **Mode:** single-tenant template.
 **Breaks:** the same as br-consignado-gw.
-**Do:** the same steps — and **update this one last**. It is the shape every new
-service starts from, so it should copy a recipe that matcher and one
-multi-tenant consumer have already run against a real database, not the recipe
-this document predicts.
+**Do:** the same steps. It is the shape every new service starts from, so it
+should copy a recipe that has already run against a real database.
 
 ### plugin-br-pix-lerian
 
@@ -647,7 +663,7 @@ this document predicts.
 
 **From:** new adopter — no version to leave; take `/v4` directly.
 **Mode:** multi-tenant, MongoDB, through its Go service. The first MongoDB consumer.
-**Breaks:** nothing yet. What follows is what to build against.
+**Breaks:** nothing — there is no earlier version to leave.
 **Do:**
 
 1. Mount the admin surface in the documented order: `admin.MountCatalog` before the tenant-manager middleware, `admin.Mount` after it, so value reads and writes receive the resolved tenant database and catalog metadata does not need one.
@@ -657,10 +673,9 @@ this document predicts.
 
 <!-- NOT-YET(engine-tenants): WithMongoTenantManager wiring, connector-resolved createCollection, shared-collection refusal -->
 
-Until that lands the Console's only tenant shape is the per-request one: the
-database resolved from the request context on every read and write, no
-in-process cache, no changefeed, and `OnChange` refused with
-`ErrNotSupportedInMultiTenant`.
+The Console's tenant shape is the per-request one: the database resolved from
+the request context on every read and write, no in-process cache, no
+changefeed, and `OnChange` refused with `ErrNotSupportedInMultiTenant`.
 
 ### notifications
 
@@ -673,9 +688,6 @@ in-process cache, no changefeed, and `OnChange` refused with
 2. Delete the `Manager`. One `Client` carries what it configured: `WithMultiTenantEnabled()`, `WithModule(...)`, `WithLogger`, `WithTelemetry`.
 3. Replace `Drain(ctx)` with `Close()`, which takes no context. The wait is bounded by `WithCloseTimeout` (30 seconds by default), and a callback still running when the bound elapses comes back as `ErrCloseTimeout` naming every `(scope, key)` inside a delivery — where `Drain` returned nil whatever happened, leaving a goroutine that never acknowledged its cancel to exit unobserved. See [§ `Close` is bounded, and names the callback that would not stop](#close-is-bounded-and-names-the-callback-that-would-not-stop).
 4. Budget for every multi-tenant read reaching the tenant database. The per-tenant cache belonged to the `Manager` and left with it.
-
-The four lifecycle handlers are what this section is waiting on: they have
-nowhere to register today.
 
 ~~~go
 // v1.6.1 — construction, lifecycle registration, shutdown
@@ -715,13 +727,22 @@ defer m.Drain(ctx)
 
 **From:** v3.0.0-beta.2 — `/v3`, already on lib-commons `/v7` and lib-observability `/v4`.
 **Mode:** multi-tenant, Postgres, with 17 `OnChange` callbacks registered before `Start`.
-**Breaks:** all 17. v3 dispatched them through the bound `Manager`, once per NOTIFY across any active tenant, with the tenant on the callback's context. v4 has no `Manager`, and multi-tenant `OnChange` answers `ErrNotSupportedInMultiTenant` for every registered key — so **br-sfn cannot finish this migration against `develop` as it stands.** The rest of the upgrade can land first.
+**Breaks:** all 17. v3 dispatched them through the bound `Manager`, once per NOTIFY across any active tenant, with the tenant on the callback's context. v4 has no `Manager`, and multi-tenant `OnChange` answers `ErrNotSupportedInMultiTenant` for every registered key — so the 17 callbacks have **no delivery path in multi-tenant mode**. Rewrite them and land the rest of the upgrade; none of them fires in this mode.
 **Do:**
 
 1. Bump the module path; nothing else in `go.mod`.
 2. Apply `MigrationV3ToV4SQL()` to every tenant database.
-3. Rewrite the 17 callbacks to `func(ctx context.Context, ch Change)` now — mechanical, and independent of what is still landing. Namespace, key, revision and value come off `ch`. The ctx is the engine's own lifecycle context and carries no request values and no tenant, where the v3 godoc promised the tenant scope on it.
+3. Rewrite the 17 callbacks to `func(ctx context.Context, ch Change)` — mechanical work, and worth doing now. Namespace, key, revision and value come off `ch`. The ctx is the engine's own lifecycle context and carries no request values and no tenant, where the v3 godoc promised the tenant scope on it.
 4. Expect each callback to fire once at `Start` with the value in force, including for a key with no row ([§ Every callback registered before `Start` fires once at `Start`](#every-callback-registered-before-start-fires-once-at-start)), and to skip intermediate revisions under load ([§ Deliveries are coalesced per key and independent across keys](#deliveries-are-coalesced-per-key-and-independent-across-keys)). Seventeen subscribers is also where v3's single synchronous LISTEN goroutine stopped being free.
+
+~~~go
+// v3.0.0-beta.2 — construction, subscriptions, shutdown
+c, err := systemplane.NewPostgres(db, listenDSN, systemplane.WithMultiTenantEnabled())
+m := systemplane.NewManager(c, pgMgr)
+// 17x c.OnChange(ns, key, func(ctx context.Context, ns, key string, v any) { ... })
+// registered before c.Start(ctx) and dispatched through m, once per NOTIFY
+defer m.Drain(ctx)
+~~~
 
 <!-- NOT-YET(engine-tenants): the 17 callbacks fire once per tenant at activation and Change.Tenant names the tenant -->
 

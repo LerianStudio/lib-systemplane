@@ -1,5 +1,9 @@
 # lib-systemplane
 
+This README still documents the v3 line. If you are on v4, or adopting it now,
+start at [MIGRATION-v4.md](MIGRATION-v4.md): the module path, the required
+`lib-commons/v7`, and the removed `Manager` are all different from what follows.
+
 Dual-backend (PostgreSQL / MongoDB) hot-reload runtime configuration for Lerian services. Register operational knobs (log levels, feature flags, rate limits, circuit-breaker thresholds, worker intervals) at startup, mutate them at runtime without a pod restart, and — in single-tenant mode — subscribe to change events through a LISTEN/NOTIFY (Postgres) or change-stream (MongoDB) backed subscription. First-class support for the Lerian database-per-tenant model via the `lib-commons/v6` tenant-manager dispatch layer.
 
 This library was extracted from `lib-commons/v5/commons/systemplane`. The v3 line targets the Fiber v3 stack (`lib-commons/v6`) and uses `lib-observability/v4` internally for logging, tracing, telemetry, redaction, and panic recovery.
