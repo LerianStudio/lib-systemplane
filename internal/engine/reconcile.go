@@ -374,8 +374,9 @@ func (e *Engine) applySnapshotRow(ctx context.Context, sc *scopeState, arm recon
 		return true
 	}
 
-	// The unusable set is deliberately NOT consulted here: a key whose feed
-	// re-read failed still takes a perfectly good snapshot row.
+	// The unusable set does not decide whether the row is applied: a key
+	// whose feed re-read failed still takes a perfectly good snapshot row.
+	// It decides whether applying it CONFIRMS the key — see below.
 	if _, touched := arm.window.touched[nk]; touched {
 		return false
 	}
@@ -383,7 +384,27 @@ func (e *Engine) applySnapshotRow(ctx context.Context, sc *scopeState, arm recon
 	if usable {
 		// The reconcile's own ingress: a drop means the scope is going away
 		// under it, and there is no caller to tell.
-		_, _ = e.publish(sc, pub)
+		notify, _ := e.publish(sc, pub)
+
+		// publish clears the unconfirmed record for every ingress that
+		// converges on it, which is right for the three that READ the row a
+		// moment ago — a changefeed re-read, a Set echo, a delete
+		// publication. A snapshot row is the one that may not have: this
+		// photograph can predate the very change the failed re-read was sent
+		// for, and a publication the fence deduplicated or rejected is the
+		// proof that it does. So the key earns its confirmation instead of
+		// inheriting it — the feed said this key moved, nobody could read it,
+		// and the photograph shows the pre-move revision, which leaves it
+		// unconfirmed until the next notification or a reconcile whose
+		// snapshot post-dates the move (that one is accepted, and notify says
+		// so).
+		//
+		// The delete path never needed this: recordFeedDelete marks the key
+		// touched at ARRIVAL, so a reconcile in flight skips its row entirely
+		// and returns above. Only the upsert path gets here.
+		if _, unusable := arm.window.unusable[nk]; unusable && !notify {
+			sc.markUnconfirmed(nk)
+		}
 
 		return false
 	}

@@ -8,6 +8,7 @@ import (
 
 	"github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
+	"github.com/LerianStudio/lib-observability/v4/runtime"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -231,7 +232,8 @@ func (e *Engine) submitRefresh(scope store.Scope, nk NSKey, deleted bool) {
 // carries the newer revision wins, and the loser is deduplicated away.
 //
 // A second failure is not transient, so THIS KEY is recorded as unconfirmed
-// and the scope's reads report Stale until some later ingress decides it. A
+// and the scope's reads report Stale until some later ingress decides it —
+// unless one already has, which recordUnconfirmed is what answers. A
 // scope-wide flag was the wrong size for the fact, twice over: a reconcile
 // already in flight cleared it without ever having decided this key — a delete
 // records the key as touched at arrival, so the snapshot skips it — and on a
@@ -240,60 +242,69 @@ func (e *Engine) submitRefresh(scope store.Scope, nk NSKey, deleted bool) {
 // for the life of the process. Neither the disconnect generation nor the stale
 // flag is touched here: those belong to the connection, and this is one row.
 //
-// Unless a later ingress already decided the key. The fence answering that is
-// the one the FIRST attempt armed, carried down into the retry: a re-read, a
-// reconcile row, a Set echo or a delete that landed while the retry was
-// waiting out its delay has already confirmed the key, and the retry's own
-// arming happens after it and cannot see it. Recording the key unconfirmed
-// on top of that convergence puts the scope back on a Stale nothing will ever
-// clear — on a connection that never drops, for the life of the process, over
-// a value that is correct.
+// At most ONE retry is pending per key, claimed through beginRetry: a key the
+// feed is hot on while the store is degraded would otherwise schedule a second
+// store call per failed read, doubling its pool checkouts exactly while the
+// pool is scarce.
 //
 // Both outcomes are addressed to the state the re-read was armed on, by
 // IDENTITY, for the reason recordFeedOutcome states: a tenant dropped and
 // brought back up during the store call is a new state under the same scope
 // value, and neither a retry read under an entitlement this process no longer
 // holds nor an unconfirmed record raised by the dead state's failure belongs
-// to it.
+// to it. The delay is part of that window, so the goroutine re-asks the
+// question when its timer fires rather than trusting the answer it got a
+// quarter of a second ago.
 func (e *Engine) retryRefresh(sc *scopeState, nk NSKey, fence feedFence, deleted, retried bool) {
 	if sc == nil || e.trackedScope(sc.scope) != sc {
 		return
 	}
 
 	if retried {
-		// Under reconcileMu, so the question and the record it gates are one
-		// step against the feed — the lock every other reader of a fence
-		// holds for the same reason.
-		sc.reconcileMu.Lock()
-		defer sc.reconcileMu.Unlock()
+		sc.recordUnconfirmed(nk, fence)
 
-		if sc.supersededByPublication(nk, fence) {
-			return
-		}
+		return
+	}
 
-		sc.markUnconfirmed(nk)
-
+	if !sc.beginRetry(nk) {
 		return
 	}
 
 	if !e.beginWork() {
+		// The door is shut and no goroutine will run, so the slot goes back:
+		// leaving it claimed would refuse every later retry of this key on a
+		// scope that outlived the race.
+		sc.endRetry(nk)
+
 		return
 	}
 
-	go func() {
-		defer e.dispatchWG.Done()
+	runtime.SafeGoWithContextAndComponent(e.dispatchContext(), e.logger,
+		"systemplane.engine", "retry", runtime.KeepRunning,
+		func(ctx context.Context) {
+			defer e.dispatchWG.Done()
+			defer sc.endRetry(nk)
 
-		timer := time.NewTimer(retryDelay)
-		defer timer.Stop()
+			timer := time.NewTimer(retryDelay)
+			defer timer.Stop()
 
-		select {
-		case <-timer.C:
-		case <-e.dispatchContext().Done():
-			return
-		}
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				return
+			}
 
-		e.refreshKey(sc.scope, nk, fence, deleted, true)
-	}()
+			// Re-asked after the delay, not before it: the scope this retry
+			// was armed on may have been dropped — and a new state brought up
+			// under the same scope value — while the timer ran, and reading
+			// by scope value would hand that state a pool checkout and a
+			// verdict belonging to a tenant this process no longer serves.
+			if e.trackedScope(sc.scope) != sc {
+				return
+			}
+
+			e.refreshKey(sc.scope, nk, fence, deleted, true)
+		})
 }
 
 // trackedRefresh runs a debounced re-read as engine work Close waits for.
@@ -393,12 +404,12 @@ func (e *Engine) recoverRefresh(scope store.Scope, nk NSKey, deleted, retried bo
 	// logger, and whatever lib-observability's handler reaches through
 	// InitPanicMetrics — a metrics recorder, and the raw logger the consumer
 	// handed that call, neither of which this engine wraps. A panic raised in
-	// there unwinds out of this recovery, and the retry goroutine is launched
-	// bare so its delay can be canceled by the lifecycle context, so on that
-	// path nothing outside would catch it and the process dies over a broken
-	// log line. Same guard, same reason, as internal/group's own panic
-	// handler. It is registered FIRST so it runs LAST: the repair below still
-	// runs on the way out.
+	// there unwinds out of this recovery, and every goroutine a re-read can
+	// run on has an outer net that would then report the SAME broken logger's
+	// failure through that same logger. Swallowing it here ends the line one
+	// frame from where it started. Same guard, same reason, as
+	// internal/group's own panic handler. It is registered FIRST so it runs
+	// LAST: the repair below still runs on the way out.
 	defer swallowPanic()
 
 	recovered := recover()
@@ -613,9 +624,10 @@ func (e *Engine) PublishDelete(scope store.Scope, nk NSKey) error {
 //     what deleted decides. After an upsert the write may simply not be
 //     visible to this reader yet, so the current value stands and nothing is
 //     published: expected rather than wrong, logged at DEBUG, and recorded in
-//     neither set so a concurrent reconcile's snapshot decides the key. After
-//     a DELETE the row really is gone, and publishAbsentDelete puts the
-//     registered default in force at revision 0.
+//     neither set so a concurrent reconcile's snapshot decides the key —
+//     until the retry, which is the last read this repair gets and therefore
+//     records the key unconfirmed. After a DELETE the row really is gone, and
+//     publishAbsentDelete puts the registered default in force at revision 0.
 //   - a row the ingress rejects (undecodable or refused by the validator) is
 //     recorded as unusable, so a concurrent reconcile keeps the cached value
 //     instead of concluding the key is absent.
@@ -686,14 +698,19 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey, origin feedFence, delet
 			return
 		}
 
+		// Scheduled BEFORE the line, for the reason the fence above is
+		// written before it: the logger is the consumer's and nothing bounds
+		// how long it holds this goroutine, and at a zero quiet window that
+		// goroutine is the changefeed's. Everything the repair needs is
+		// already decided here.
+		e.retryRefresh(sc, nk, origin, deleted, retried)
+
 		e.logWarn(ctx, "changefeed re-read failed, keeping current value",
 			log.String(constants.AttrKeyTenantID, scope.Tenant),
 			log.String("namespace", nk.Namespace),
 			log.String("keyname", nk.Key),
 			log.Err(err),
 		)
-
-		e.retryRefresh(sc, nk, origin, deleted, retried)
 
 		return
 	}
@@ -730,6 +747,20 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey, origin feedFence, delet
 			e.publishAbsentDelete(ctx, sc, scope, nk, fence)
 
 			return
+		}
+
+		// A FIRST attempt records the key nowhere: the write may simply not
+		// be visible to this reader yet, and a reconcile in flight holds the
+		// better answer. A retry is the end of the line — the second read
+		// that could not say what the key holds — so it is terminal exactly
+		// as a second store error is, and the key stands as unconfirmed
+		// unless a later ingress already decided it. Left out of both sets it
+		// fell through every repair: the cached value went on being served,
+		// at its old revision, reported as confirmed, with nothing left to
+		// ask. Recorded before the line below, for the reason the store-error
+		// path states.
+		if retried {
+			sc.recordUnconfirmed(nk, origin)
 		}
 
 		e.logDebug(ctx, "changefeed re-read found no row, keeping current value",

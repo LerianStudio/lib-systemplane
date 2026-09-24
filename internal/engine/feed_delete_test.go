@@ -5,6 +5,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -813,4 +814,283 @@ func TestReconcileAgreeingWithTheCacheConfirmsTheKey(t *testing.T) {
 				got.Value, got.Revision)
 		}
 	})
+}
+
+// TestHeldReconcileDoesNotConfirmAKeyNobodyCouldReRead is the probe for the
+// half of the unconfirmed record a reconcile used to take away without having
+// earned it.
+//
+// Clearing the record inside publish is right for every ingress that READ the
+// row: a re-read, a Set echo, a delete publication all looked at the store a
+// moment ago. A reconcile's snapshot row did too — but the photograph may
+// predate the very change the failed re-read was sent for, and applying it
+// then says nothing about what the key holds now.
+//
+// The shape: the key sits at revision 5, the store moves to 9, the feed
+// announces it, both re-reads fail, and a reconcile whose List was taken
+// before the write finally applies its revision-5 row. The publication is
+// deduplicated — same revision, same bytes — yet it cleared the record, and
+// the scope then reported itself confirmed while permanently serving the
+// pre-write revision. Nothing on a connected feed would ever correct it: no
+// further event arrives for a key nobody writes again, and every later
+// reconcile takes the same path.
+func TestHeldReconcileDoesNotConfirmAKeyNobodyCouldReRead(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+
+	forEachWindow(t, func(t *testing.T, window time.Duration) {
+		fs := newFakeStore()
+		e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, window)
+
+		fs.seed(scope, jsonRow(nk, 5, `"five"`, "ops"))
+		settled(t, e, scope)
+
+		// Released on cleanup as well as below, so a failed assertion between
+		// the two does not park the reconcile goroutine on the gate and hang
+		// the engine's own drain.
+		release := heldList(fs)
+		t.Cleanup(release)
+
+		// The photograph this reconcile will apply: the key exactly as it
+		// stood BEFORE the write its own re-read cannot see.
+		fs.freezeNextList([]store.Entry{jsonRow(nk, 5, `"five"`, "ops")})
+
+		e.onEvent(resyncEvent(scope))
+		waitFor(t, hangGuard, "the reconcile to reach its List", func() bool {
+			return fs.listCount() >= 2
+		})
+
+		// The store moves on and stops answering, so neither the re-read nor
+		// its retry can learn what the key now holds.
+		fs.seed(scope, jsonRow(nk, 9, `"nine"`, "ops"))
+		fs.onGet(func(store.Scope, NSKey) error { return errors.New("pool exhausted") })
+
+		e.onEvent(upsertEvent(scope, nk, 9))
+
+		waitFor(t, hangGuard, "both re-reads to fail and record the key unconfirmed", func() bool {
+			return scopeUnconfirmed(t, e, scope) == 1
+		})
+
+		release()
+		waitReconcileIdle(t, e, scope)
+		quiesce(t, e)
+
+		got, ok := e.Lookup(scope, nk)
+		if !ok {
+			t.Fatal("Lookup reports a miss after the reconcile")
+		}
+
+		if !got.Stale {
+			t.Error("a reconcile whose snapshot predates the write took back the unconfirmed record: " +
+				"the scope reports itself confirmed while serving the pre-write revision, and nothing " +
+				"on a connected feed will ever correct it")
+		}
+
+		if got.Value != "five" || got.Revision != 5 {
+			t.Errorf("value in force = (%v, rev %d), want the cached (%q, rev 5)", got.Value, got.Revision, "five")
+		}
+
+		// And the record really is taken back by an ingress that reads the
+		// key: this is the repair the flag points at.
+		fs.onGet(nil)
+		e.onEvent(upsertEvent(scope, nk, 9))
+
+		waitFor(t, hangGuard, "the key to converge and report itself confirmed", func() bool {
+			got, ok := e.Lookup(scope, nk)
+
+			return ok && got.Value == "nine" && got.Revision == 9 && !got.Stale
+		})
+	})
+}
+
+// TestRetryThatFindsNoRowForAnUpsertRecordsTheKeyUnconfirmed covers the one
+// terminal outcome of a repair that fell through every set.
+//
+// An upsert whose re-read finds no row is ordinarily a non-answer — the write
+// may simply not be visible to this reader yet — so the FIRST attempt records
+// the key nowhere and lets a concurrent reconcile decide it. The retry is the
+// end of the line: it is the second read that could not say what the key
+// holds, and leaving it in neither the touched nor the unconfirmed set means
+// the cached value stands, at its old revision, reported as confirmed, with
+// nothing left to ask.
+func TestRetryThatFindsNoRowForAnUpsertRecordsTheKeyUnconfirmed(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+
+	forEachWindow(t, func(t *testing.T, window time.Duration) {
+		fs := newFakeStore()
+		e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, window)
+
+		fs.seed(scope, jsonRow(nk, 5, `"five"`, "ops"))
+		settled(t, e, scope)
+
+		// The first attempt fails; by the time the retry reads, the row the
+		// upsert announced is not there to be read.
+		fs.remove(scope, nk)
+		fs.onGet(func(store.Scope, NSKey) error {
+			fs.onGet(nil)
+
+			return errors.New("pool exhausted")
+		})
+
+		e.onEvent(upsertEvent(scope, nk, 9))
+
+		waitFor(t, hangGuard, "the retry to find no row and record the key unconfirmed", func() bool {
+			return scopeUnconfirmed(t, e, scope) == 1
+		})
+
+		got, ok := e.Lookup(scope, nk)
+		if !ok || got.Value != "five" || got.Revision != 5 {
+			t.Errorf("value in force = (%v, rev %d, cached %t), want the cached (%q, rev 5)",
+				got.Value, got.Revision, ok, "five")
+		}
+	})
+}
+
+// TestASecondFailedEventForOneKeyStartsNoSecondRetry bounds what a degraded
+// store costs.
+//
+// Every failed re-read used to arm a retry of its own, with no per-key
+// dedupe, so a key the feed is hot on doubled its pool checkouts a quarter of
+// a second later — exactly while the pool is scarce, which is what made the
+// reads fail in the first place. One retry may be pending per key, so the
+// in-flight reads for a single key stay capped at two.
+func TestASecondFailedEventForOneKeyStartsNoSecondRetry(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+
+	forEachWindow(t, func(t *testing.T, window time.Duration) {
+		fs := newFakeStore()
+		e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, window)
+
+		fs.seed(scope, jsonRow(nk, 5, `"five"`, "ops"))
+		settled(t, e, scope)
+
+		base := fs.getCount()
+
+		// Both first attempts are held open until the second one has arrived,
+		// so neither can fail — and arm its retry — before the other is in
+		// flight. Without the gate the two failures are separated by a real
+		// quiet window rather than by the microseconds the dedupe is about,
+		// and a slow machine turns the assertion into a coin flip.
+		gate := make(chan struct{})
+
+		var reads atomic.Int64
+
+		fs.onGet(func(store.Scope, NSKey) error {
+			if reads.Add(1) <= 2 {
+				<-gate
+			}
+
+			return errors.New("pool exhausted")
+		})
+
+		// At WithDebounce(0) the re-read runs inline on the caller's
+		// goroutine, so the events have to be delivered off this one or the
+		// gate blocks the test itself.
+		var feeding sync.WaitGroup
+
+		feeding.Add(2)
+
+		go func() {
+			defer feeding.Done()
+
+			e.onEvent(upsertEvent(scope, nk, 6))
+		}()
+
+		waitFor(t, hangGuard, "the first event's re-read to reach the store", func() bool {
+			return reads.Load() >= 1
+		})
+
+		go func() {
+			defer feeding.Done()
+
+			e.onEvent(upsertEvent(scope, nk, 7))
+		}()
+
+		waitFor(t, hangGuard, "the second event's re-read to reach the store", func() bool {
+			return reads.Load() >= 2
+		})
+
+		close(gate)
+		feeding.Wait()
+
+		waitFor(t, hangGuard, "the retry to run", func() bool {
+			return reads.Load() >= 3
+		})
+
+		// Long enough that a second retry, armed a quarter of a second after
+		// the second failure, would have run by now.
+		time.Sleep(2 * retryDelay)
+
+		if got := fs.getCount() - base; got != 3 {
+			t.Errorf("%d store reads for two failed events on one key, want 3 — two first attempts "+
+				"and ONE retry: a retry per failed read doubles pool checkouts exactly while the "+
+				"pool is scarce", got)
+		}
+	})
+}
+
+// TestRetryAbandonsAScopeDroppedDuringItsDelay pins the identity the retry
+// waits on.
+//
+// The retry sleeps a quarter of a second, and a tenant suspended, deleted or
+// rotated in that time takes its scope down with it. Waking up and reading by
+// scope VALUE found whatever state is live now — a tenant brought back up
+// meanwhile is a NEW one under the same value — and then handed that state
+// both an extra pool checkout it never asked for and the dead state's
+// verdict: the key fenced as unusable in the re-activation's own reconcile
+// window, and recorded unconfirmed on a scope whose bring-up had just read the
+// row itself.
+func TestRetryAbandonsAScopeDroppedDuringItsDelay(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+
+	fs := newFakeStore()
+	e := storeEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0, 2*time.Second)
+
+	bringUp(t, e, dropTenant)
+	fs.seed(dropTenant, jsonRow(nk, 7, `"seven"`, "ops"))
+
+	// The store never answers, so the retry too has an outcome to record —
+	// which is the half that lands in the wrong scope's window.
+	fs.onGet(func(store.Scope, NSKey) error { return errors.New("pool exhausted") })
+
+	// A zero quiet window runs the first attempt inline, so it has already
+	// failed and armed its retry by the time onEvent returns.
+	e.onEvent(upsertEvent(dropTenant, nk, 7))
+
+	// The tenant goes away and comes back while the retry waits out its
+	// delay. The re-activation opens a reconcile window of its own, and reads
+	// the row itself: nothing the dead state's retry learns belongs to either.
+	e.dropScope(dropTenant)
+	bringUp(t, e, dropTenant)
+
+	live := e.scopeFor(dropTenant)
+
+	live.mu.Lock()
+	live.entries[nk] = entry{Value: reactivatedValue, Revision: 8}
+	live.mu.Unlock()
+
+	armWindow(live)
+
+	base := fs.getCount()
+
+	time.Sleep(2 * retryDelay)
+
+	if got := fs.getCount() - base; got != 0 {
+		t.Errorf("%d store reads after the scope the retry was armed on was dropped, want 0: "+
+			"the retry resolved the live state by scope value and read for a tenant it was never "+
+			"entitled to", got)
+	}
+
+	if _, unusable := recordedSets(e, dropTenant); len(unusable) != 0 {
+		t.Errorf("the re-activated scope's reconcile window carries %v as unusable: the dead state's "+
+			"retry fenced a key the re-activation had already read, so its own reconcile keeps a "+
+			"value the store may no longer have", unusable)
+	}
+
+	if got := scopeUnconfirmed(t, e, dropTenant); got != 0 {
+		t.Errorf("%d keys recorded unconfirmed on the re-activated scope, want 0: the dead state's "+
+			"retry reported its own failure against a tenant that had just read the row", got)
+	}
 }

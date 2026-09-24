@@ -179,12 +179,19 @@ type scopeState struct {
 	// life of the process. unconfirmed carries that half instead.
 	stale bool
 	// unconfirmed holds the keys whose last change the engine could not read
-	// back: a changefeed re-read that failed twice. Entries are added by
-	// retryRefresh's terminal branch and removed by any later ingress that
-	// DECIDED the key — a re-read, a reconcile snapshot row, a Set echo, a
-	// delete publication — which is every path through publish, plus the one
-	// reconcile outcome that decides a key without publishing: a snapshot
-	// that finds it absent and agreeing with the cache (markConfirmed).
+	// back: a changefeed re-read that failed twice, and a retry that found no
+	// row for an upsert. Entries are added by the terminal branch of each,
+	// and removed by any later ingress that DECIDED the key — a re-read, a
+	// Set echo, a delete publication — which is every path through publish,
+	// plus the one reconcile outcome that decides a key without publishing: a
+	// snapshot that finds it absent and agreeing with the cache
+	// (markConfirmed).
+	//
+	// A reconcile's snapshot ROW is the ingress that only sometimes decides
+	// it. The photograph may predate the very change the failed re-read was
+	// sent for, and a publication the fence deduplicated or rejected is the
+	// proof that it does, so applySnapshotRow puts the record back on exactly
+	// that outcome.
 	//
 	// Lookup reports Stale while this set is non-empty, so one key nobody
 	// could re-read makes the scope's reads say so, and converging that key
@@ -194,6 +201,21 @@ type scopeState struct {
 	// Guarded by mu, alongside stale. Created lazily: most scopes never have
 	// one.
 	unconfirmed map[NSKey]struct{}
+	// retrying holds the keys with a retry already pending, so a failed
+	// re-read arms at most ONE. Without it every failed read of a key the
+	// feed is hot on scheduled a second store call a quarter of a second
+	// later, with nothing deduplicating them: the pool checkouts for that key
+	// doubled exactly while the pool was scarce, which is what made the reads
+	// fail to begin with. With it the in-flight reads for one key stay capped
+	// at two — a first attempt and the one repair it asked for.
+	//
+	// A key is entered before the retry goroutine is launched and removed by
+	// that goroutine's own defer, so a launch that loses the race to Close
+	// takes the entry back too and the next failure may still retry.
+	//
+	// Guarded by mu, alongside unconfirmed, and created lazily for the same
+	// reason.
+	retrying map[NSKey]struct{}
 	// disconnectGen is bumped on every OpDisconnect. A reconcile records it
 	// when it starts and clears stale only if it is unchanged at completion,
 	// so a reconcile that spans a new disconnect cannot clear the flag that
@@ -309,12 +331,68 @@ func (sc *scopeState) markUnconfirmed(nk NSKey) {
 // markConfirmed takes back what markUnconfirmed recorded, for an ingress that
 // decided nk without publishing anything: a reconcile whose snapshot found the
 // key absent and agreeing with the cache. Every ingress that DOES publish
-// clears the record inside publish itself.
+// clears the record inside publish itself, and a reconcile snapshot row whose
+// publication did not advance the cache puts it straight back.
 func (sc *scopeState) markConfirmed(nk NSKey) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 
 	delete(sc.unconfirmed, nk)
+}
+
+// recordUnconfirmed records nk as unconfirmed unless a later ingress already
+// decided it, which is the terminal verdict of a repair that ran out of
+// attempts: a retry whose store call failed again, and a retry that found no
+// row for an upsert.
+//
+// fence is the one the FIRST attempt armed, carried down into the retry. A
+// re-read, a reconcile row, a Set echo or a delete that landed while the retry
+// was waiting out its delay has already confirmed the key, and the retry's own
+// arming happens after it and cannot see it. Recording the key unconfirmed on
+// top of that convergence puts the scope back on a Stale nothing will ever
+// clear — on a connection that never drops, for the life of the process, over
+// a value that is correct.
+//
+// It takes reconcileMu itself, so the question and the record it gates are one
+// step against the feed — the lock every other reader of a fence holds for the
+// same reason.
+func (sc *scopeState) recordUnconfirmed(nk NSKey, fence feedFence) {
+	sc.reconcileMu.Lock()
+	defer sc.reconcileMu.Unlock()
+
+	if sc.supersededByPublication(nk, fence) {
+		return
+	}
+
+	sc.markUnconfirmed(nk)
+}
+
+// beginRetry claims the single retry slot nk has, reporting false when one is
+// already pending. See the retrying field.
+func (sc *scopeState) beginRetry(nk NSKey) bool {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	if _, pending := sc.retrying[nk]; pending {
+		return false
+	}
+
+	if sc.retrying == nil {
+		sc.retrying = make(map[NSKey]struct{}, 1)
+	}
+
+	sc.retrying[nk] = struct{}{}
+
+	return true
+}
+
+// endRetry releases nk's retry slot, so the next failed re-read of the key may
+// arm one again.
+func (sc *scopeState) endRetry(nk NSKey) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	delete(sc.retrying, nk)
 }
 
 // armReconcile opens a reconcile window and puts it in the scope's single-slot

@@ -103,6 +103,13 @@ func (e *Engine) publish(sc *scopeState, pub publication) (notify bool, err erro
 	// delete publication — so clearing the record here covers all four
 	// without a second hook on any of them. A rejected publication clears it
 	// too: a revision below the cached one still means somebody read the row.
+	//
+	// "Somebody read the row" is what makes that sound, and it is true of
+	// three of the four NOW. A reconcile's photograph was taken earlier, and
+	// may predate the change the failed re-read was sent for, so
+	// applySnapshotRow re-marks the key when its row did not advance the
+	// cache. That is the only exception, and it lives with the ingress that
+	// knows how old its evidence is.
 	delete(sc.unconfirmed, pub.NSKey)
 
 	cached, ok := sc.entries[pub.NSKey]
