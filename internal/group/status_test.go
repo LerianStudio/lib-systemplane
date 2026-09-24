@@ -30,6 +30,16 @@ type logLine struct {
 	fields map[string]any
 }
 
+// String renders one recorded line for a failure message. Every assertion in
+// this file that cannot find what it expected dumps the recorded lines, and a
+// bare struct print gives "{2 msg map[...]}" - the level as a naked integer
+// and no cue which of the four coordinator reports the line is. That dump is
+// the only evidence a rare failure leaves behind, so it is rendered, not
+// printed.
+func (l logLine) String() string {
+	return fmt.Sprintf("%s %q %v", log.LevelName(l.level), l.msg, l.fields)
+}
+
 // recordingLogger keeps the lines the coordinator writes so a test can prove a
 // rejection and a recovered panic reached the logger as well as ApplyStatus.
 type recordingLogger struct {
@@ -119,15 +129,37 @@ const (
 // have identified the group is exactly what redaction withheld. "keyname", not
 // "key": the latter is an exact entry in lib-observability's sensitive-field
 // list, and it is the same field name the engine's twin reports emit.
-func assertNamesTheGroup(t *testing.T, line logLine, namespace, key string) {
+//
+// It hangs off the recorder rather than taking a bare line so that a miss can
+// dump every line with its fields. One run in twenty of the unit suite once
+// failed all five call sites of this helper at once with "namespace = <nil>",
+// and the investigation that followed (2026-09-24) reproduced it in none of
+// 150 shuffled race runs and found no mechanism by reading: the four
+// coordinator sites emit the field unconditionally and identically, and no
+// other message in this package or in lib-observability's panic handler
+// matches any substring lineContaining selects on. So the next occurrence has
+// to carry its own evidence - which line was read, what else was recorded and
+// with what fields - because a lone "<nil>" says only that the field was
+// absent from the one line the assertion happened to read.
+func (r *recordingLogger) assertNamesTheGroup(t *testing.T, line logLine, namespace, key string) {
 	t.Helper()
+
+	named := true
 
 	if got := line.fields["namespace"]; got != namespace {
 		t.Errorf("namespace = %v, want %q: the report must name the group", got, namespace)
+
+		named = false
 	}
 
 	if got := line.fields["keyname"]; got != key {
 		t.Errorf("keyname = %v, want %q: the report must name the group", got, key)
+
+		named = false
+	}
+
+	if !named {
+		t.Errorf("the line read was %v; every line recorded: %v", line, r.recorded())
 	}
 }
 
@@ -156,7 +188,7 @@ func assertDecodeFailureRendering(t *testing.T, logger *recordingLogger, redacte
 	t.Helper()
 
 	line := logger.lineContaining(t, "failed to decode")
-	assertNamesTheGroup(t, line, coordNamespace, coordKey)
+	logger.assertNamesTheGroup(t, line, coordNamespace, coordKey)
 
 	detail := fmt.Sprint(line.fields["error"])
 
@@ -190,9 +222,10 @@ func assertDecodeFailureRendering(t *testing.T, logger *recordingLogger, redacte
 // only thing naming a redacted group whose document is withheld, so a
 // log.String("key", …) slipping in here would hand an operator
 // namespace=grpns key=[REDACTED] and nothing else.
+// It does not call t.Parallel(): the production-mode and panic-metric toggles
+// below are process-global, and what documents them as safe is that no test in
+// this package runs in parallel.
 func TestNoLoggedFieldNameIsRedacted(t *testing.T) {
-	t.Parallel()
-
 	logguard.AssertNoneRedacted(t, ".")
 }
 
@@ -452,7 +485,7 @@ func TestCoordinatorApplierErrorIsLogged(t *testing.T) {
 				t.Errorf("revision = %v, want 5", line.fields["revision"])
 			}
 
-			assertNamesTheGroup(t, line, coordNamespace, coordKey)
+			logger.assertNamesTheGroup(t, line, coordNamespace, coordKey)
 			assertRejectionRendering(t, logger, tc.redacted, rejection)
 		})
 	}

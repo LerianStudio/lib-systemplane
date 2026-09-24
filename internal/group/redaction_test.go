@@ -115,7 +115,7 @@ func TestApplierPanicOnARedactedGroupWithholdsTheDocument(t *testing.T) {
 
 	// The document is withheld, so these two fields are all that is left to
 	// say which group stopped being applied.
-	assertNamesTheGroup(t, logger.lineContaining(t, "apply function panicked"), coordNamespace, coordKey)
+	logger.assertNamesTheGroup(t, logger.lineContaining(t, "apply function panicked"), coordNamespace, coordKey)
 
 	reported := logger.lineContaining(t, "panic recovered")
 
