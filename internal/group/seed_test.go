@@ -213,10 +213,23 @@ func TestCoordinatorNeverSeedsAScopeItAlreadyObserved(t *testing.T) {
 	}
 }
 
+// TestCoordinatorSeedThatFailsToDecodeIsRecorded pins the seeded twin of the
+// published decode failure: the same recording, the same single log line, and
+// the same rendering under the group's redaction policy.
 func TestCoordinatorSeedThatFailsToDecodeIsRecorded(t *testing.T) {
-	seed := &seeder{pub: publication("t1", 7, "bad"), ok: true}
+	for _, tc := range decodeRedactionCases {
+		t.Run(tc.name, func(t *testing.T) {
+			seedDecodeFailure(t, tc.redacted)
+		})
+	}
+}
+
+func seedDecodeFailure(t *testing.T, redacted bool) {
+	t.Helper()
+
+	seed := &seeder{pub: publication("t1", 7, redactionSecret), ok: true}
 	logger := newRecordingLogger()
-	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, false, rejectingDecode("bad"), seed.read)
+	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, redacted, rejectingDecode(redactionSecret), seed.read)
 
 	var rec recorder
 
@@ -237,7 +250,7 @@ func TestCoordinatorSeedThatFailsToDecodeIsRecorded(t *testing.T) {
 		t.Fatalf("logged = %v, want the decode failure at error level", lines)
 	}
 
-	assertNamesTheGroup(t, lines[0], coordNamespace, coordKey)
+	assertDecodeFailureRendering(t, logger, redacted)
 
 	// A6 parity with the published-document branch: the rejection IS an
 	// observation, so the observed flag and not just the spent-seed flag says

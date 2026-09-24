@@ -5,6 +5,7 @@ package group
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -13,6 +14,8 @@ import (
 	"github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/runtime"
+
+	"github.com/LerianStudio/lib-systemplane/v4/internal/testsupport/logguard"
 )
 
 var errRejected = errors.New("applier rejected the document")
@@ -126,6 +129,71 @@ func assertNamesTheGroup(t *testing.T, line logLine, namespace, key string) {
 	if got := line.fields["keyname"]; got != key {
 		t.Errorf("keyname = %v, want %q: the report must name the group", got, key)
 	}
+}
+
+// decodeRedactionCases is the axis both decode-failure tests run on. A group
+// registered redacted and one registered plain reach the same log line through
+// different renderings, and only the redacted row can tell them apart.
+var decodeRedactionCases = []struct {
+	name     string
+	redacted bool
+}{
+	{name: "plain", redacted: false},
+	{name: "redacted", redacted: true},
+}
+
+// assertDecodeFailureRendering pins what a document nobody could parse costs a
+// redacted group: the document itself. The cause of a decode failure carries
+// the row in its message by construction — encoding/json needs no help,
+// "invalid character 'h' looking for beginning of value" quotes the first byte
+// — so a redacted group's report names only what refused the document and the
+// cause's dynamic type, while a plain group's keeps the error verbatim.
+//
+// Both coordinator call sites route through safelog.ErrorDetail for exactly
+// this reason, and without the redacted row both could be written log.Err(err)
+// with nothing in the repository turning red.
+func assertDecodeFailureRendering(t *testing.T, logger *recordingLogger, redacted bool) {
+	t.Helper()
+
+	line := logger.lineContaining(t, "failed to decode")
+	assertNamesTheGroup(t, line, coordNamespace, coordKey)
+
+	detail := fmt.Sprint(line.fields["error"])
+
+	if !redacted {
+		if !strings.Contains(detail, redactionSecret) {
+			t.Errorf("error = %q, want the decode cause verbatim for an unredacted group", detail)
+		}
+
+		return
+	}
+
+	for _, recorded := range logger.recorded() {
+		for key, value := range recorded.fields {
+			if text := fmt.Sprint(value); strings.Contains(text, redactionSecret) {
+				t.Errorf("log field %s carries the document of a redacted group: %s", key, text)
+			}
+		}
+
+		if strings.Contains(recorded.msg, redactionSecret) {
+			t.Errorf("a log message carries the document of a redacted group: %s", recorded.msg)
+		}
+	}
+
+	if !strings.Contains(detail, "decode failed") || !strings.Contains(detail, "*errors.errorString") {
+		t.Errorf("error = %q, want what refused the document and the cause's dynamic type, and no more", detail)
+	}
+}
+
+// TestNoLoggedFieldNameIsRedacted reads this package's own source and refuses
+// any field name lib-observability erases. The coordinator's reports are the
+// only thing naming a redacted group whose document is withheld, so a
+// log.String("key", …) slipping in here would hand an operator
+// namespace=grpns key=[REDACTED] and nothing else.
+func TestNoLoggedFieldNameIsRedacted(t *testing.T) {
+	t.Parallel()
+
+	logguard.AssertNoneRedacted(t, ".")
 }
 
 func newRecordingLogger() *recordingLogger {
@@ -438,58 +506,66 @@ func TestCoordinatorRejectionIsNeverRetried(t *testing.T) {
 	}
 }
 
+// TestCoordinatorDecodeFailureIsRecordedAndNeverDelivered pins a published
+// document nobody could parse: it never reaches an applier, the last good one
+// stays replayable, the scope keeps reporting the failure, and the log names
+// the group exactly once — under the group's own redaction policy.
 func TestCoordinatorDecodeFailureIsRecordedAndNeverDelivered(t *testing.T) {
-	logger := newRecordingLogger()
-	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, false, rejectingDecode("bad"), nil)
-	ctx := context.Background()
+	for _, tc := range decodeRedactionCases {
+		t.Run(tc.name, func(t *testing.T) {
+			logger := newRecordingLogger()
+			c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, tc.redacted, rejectingDecode(redactionSecret), nil)
+			ctx := context.Background()
 
-	var rec recorder
+			var rec recorder
 
-	unsubscribe := mustRegister(t, c, rec.apply)
-	defer unsubscribe()
+			unsubscribe := mustRegister(t, c, rec.apply)
+			defer unsubscribe()
 
-	c.Publish(ctx, publication("t1", 1, "good"))
-	c.Publish(ctx, publication("t1", 2, "bad"))
+			c.Publish(ctx, publication("t1", 1, "good"))
+			c.Publish(ctx, publication("t1", 2, redactionSecret))
 
-	if got := rec.names(); len(got) != 1 || got[0] != "good" {
-		t.Errorf("deliveries = %v, want only the decodable document: garbage must never reach an applier", got)
-	}
+			if got := rec.names(); len(got) != 1 || got[0] != "good" {
+				t.Errorf("deliveries = %v, want only the decodable document: garbage must never reach an applier", got)
+			}
 
-	got := statusOf(t, c, "t1")
-	if got.Desired != 2 {
-		t.Errorf("Desired = %d, want 2: a revision rejected at decode still advances Desired", got.Desired)
-	}
+			got := statusOf(t, c, "t1")
+			if got.Desired != 2 {
+				t.Errorf("Desired = %d, want 2: a revision rejected at decode still advances Desired", got.Desired)
+			}
 
-	if got.Applied != 1 {
-		t.Errorf("Applied = %d, want 1: the last good revision stays applied", got.Applied)
-	}
+			if got.Applied != 1 {
+				t.Errorf("Applied = %d, want 1: the last good revision stays applied", got.Applied)
+			}
 
-	if got.LastErr == nil {
-		t.Error("LastErr = nil, want the decode failure")
-	}
+			if got.LastErr == nil {
+				t.Error("LastErr = nil, want the decode failure")
+			}
 
-	assertNamesTheGroup(t, logger.lineContaining(t, "failed to decode"), coordNamespace, coordKey)
+			assertDecodeFailureRendering(t, logger, tc.redacted)
 
-	// The last good publication must stay replayable for a later Register.
-	var late recorder
+			// The last good publication must stay replayable for a later Register.
+			var late recorder
 
-	unsubscribeLate := mustRegister(t, c, late.apply)
-	defer unsubscribeLate()
+			unsubscribeLate := mustRegister(t, c, late.apply)
+			defer unsubscribeLate()
 
-	if names := late.names(); len(names) != 1 || names[0] != "good" {
-		t.Errorf("replay = %v, want the last decodable document", names)
-	}
+			if names := late.names(); len(names) != 1 || names[0] != "good" {
+				t.Errorf("replay = %v, want the last decodable document", names)
+			}
 
-	// The replay hands revision 1 to a second applier, and that acceptance must
-	// not read as convergence: the newest thing the scope observed is the
-	// malformed revision 2, which nobody applied.
-	got = statusOf(t, c, "t1")
-	if got.Desired != 2 {
-		t.Errorf("Desired after the replay = %d, want 2: the malformed revision is still the newest observation", got.Desired)
-	}
+			// The replay hands revision 1 to a second applier, and that acceptance must
+			// not read as convergence: the newest thing the scope observed is the
+			// malformed revision 2, which nobody applied.
+			got = statusOf(t, c, "t1")
+			if got.Desired != 2 {
+				t.Errorf("Desired after the replay = %d, want 2: the malformed revision is still the newest observation", got.Desired)
+			}
 
-	if got.LastErr == nil {
-		t.Error("LastErr after the replay = nil, want the decode failure: replaying an older revision is not an acceptance of the newest one")
+			if got.LastErr == nil {
+				t.Error("LastErr after the replay = nil, want the decode failure: replaying an older revision is not an acceptance of the newest one")
+			}
+		})
 	}
 }
 

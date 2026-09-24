@@ -13,8 +13,10 @@ import (
 	"go.opentelemetry.io/otel/trace/noop"
 )
 
-// redactionSecret is the sentinel an applier panics with, embedded in the
-// document it was handed. Nothing but the real payload can produce it, so an
+// redactionSecret is the sentinel the payload carries: an applier panics with
+// it, and it is also the name of the document the decode-failure tests refuse,
+// so the rejection's own message quotes it the way encoding/json quotes a row
+// it cannot parse. Nothing but the real payload can produce it, so an
 // assertion that never sees it is an assertion about the payload itself.
 const redactionSecret = "probe-secret-Vt71Qm"
 

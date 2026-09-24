@@ -90,7 +90,15 @@ func redactGroup(
 		t.Fatalf("NewForTesting: %v", err)
 	}
 
-	t.Cleanup(func() { _ = c.Close() })
+	// Not discarded: every applier this helper serves either panics or refuses,
+	// and a worker killed by a panicking applier is exactly what Close reports
+	// as ErrCloseTimeout. Swallowing it here would hide the one failure the
+	// redaction tests are most likely to cause.
+	t.Cleanup(func() {
+		if err := c.Close(); err != nil {
+			t.Errorf("Close after a panicking applier: %v, want nil", err)
+		}
+	})
 
 	defaults := groupConfig{Name: redactProbeSecret, Retries: 1}
 
