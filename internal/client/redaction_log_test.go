@@ -335,3 +335,95 @@ func TestMultiTenantDecodeErrorWithholdsTheRedactedRow(t *testing.T) {
 		})
 	}
 }
+
+// TestTypedGetterErrorWithholdsTheRedactedValue closes the last ingress that
+// still printed a value the registration says must never be printed.
+//
+// GetDuration and GetInt are the two typed getters whose rejection quotes what
+// it rejected: GetDuration renders the raw string with %q AND wraps
+// time.ParseDuration, whose own message quotes its input a second time, and
+// GetInt renders the number. Every other getter reports a shape mismatch with
+// %T and carries nothing. The error is the surface that travels furthest — a
+// response body, an error tracker — so a redacted key gets the dynamic type and
+// a reason, and never the value.
+func TestTypedGetterErrorWithholdsTheRedactedValue(t *testing.T) {
+	const unparseable = "s3cr3t-not-a-duration"
+
+	for _, tt := range []struct {
+		name   string
+		value  any
+		call   func(*Client) error
+		leaks  []string
+		policy RedactPolicy
+	}{
+		{
+			name:  "GetDuration on a redacted key",
+			value: unparseable,
+			call: func(c *Client) error {
+				_, _, err := c.GetDuration(context.Background(), "ns", "k")
+
+				return err
+			},
+			leaks:  []string{unparseable, "s3cr3t"},
+			policy: RedactFull,
+		},
+		{
+			name:  "GetInt on a redacted key",
+			value: 1.5,
+			call: func(c *Client) error {
+				_, _, err := c.GetInt(context.Background(), "ns", "k")
+
+				return err
+			},
+			leaks:  []string{"1.5"},
+			policy: RedactMask,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newSingleTenantClient(t, newMemStore(false))
+
+			if err := c.Register("ns", "k", tt.value, WithRedaction(tt.policy)); err != nil {
+				t.Fatalf("register: %v", err)
+			}
+
+			err := tt.call(c)
+			if err == nil {
+				t.Fatal("want a validation error, got nil")
+			}
+
+			if !errors.Is(err, ErrValidation) {
+				t.Errorf("error %v does not wrap ErrValidation", err)
+			}
+
+			for _, leak := range tt.leaks {
+				if strings.Contains(err.Error(), leak) {
+					t.Errorf("error %q carries %q, the value of a redacted key", err, leak)
+				}
+			}
+
+			if !strings.Contains(err.Error(), "value withheld") {
+				t.Errorf("error %q does not say the value was withheld", err)
+			}
+		})
+	}
+}
+
+// TestTypedGetterErrorNamesTheValueOfAnUnredactedKey is the twin: withholding
+// is the key's registration speaking, not a blanket loss of the one detail that
+// makes the rejection actionable.
+func TestTypedGetterErrorNamesTheValueOfAnUnredactedKey(t *testing.T) {
+	c := newSingleTenantClient(t, newMemStore(false))
+
+	if err := c.Register("ns", "k", "4 fortnights"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	_, _, err := c.GetDuration(context.Background(), "ns", "k")
+	if err == nil {
+		t.Fatal("want a validation error, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "4 fortnights") {
+		t.Errorf("error %q does not name the value of an unredacted key", err)
+	}
+}

@@ -246,16 +246,12 @@ func (e *Engine) logValidatorRejection(ctx context.Context, tenant string, nk NS
 // not go through this library — the MongoDB backend stores value as a BSON
 // string nothing validates as JSON, so a hand-edited document lands here.
 //
-// The type alone is enough to tell two failures apart and can never carry a
-// byte of the value; the offset is withheld for the same reason, being a
-// measurement of the secret. What the caller of Set receives is unchanged in
-// both cases: this is the log stream, not the API.
+// The rendering lives in internal/safelog, shared with internal/group's
+// coordinator, which reports the same class of rejection for a group document
+// and cannot import this package. This is the engine's name for it, kept
+// because the client's read path calls it too.
 func ErrorDetail(redacted bool, what string, err error) log.Field {
-	if !redacted {
-		return log.Err(err)
-	}
-
-	return log.String("error", fmt.Sprintf("%s (%T)", what, err))
+	return safelog.ErrorDetail(redacted, what, err)
 }
 
 // ingestDefault is the ingress for the no-row case: a Client Delete, a

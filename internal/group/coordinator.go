@@ -176,7 +176,10 @@ type Coordinator[T any] struct {
 	// carries any redaction policy, and the only reason this package knows
 	// anything about redaction at all. A panicking applier is routinely
 	// holding the decoded document, and the canonical panic handler logs it,
-	// so the fact has to travel from Bind down to the recovery.
+	// so the fact has to travel from Bind down to the recovery — and to the
+	// three lines that report a cause somebody else wrote: a returned apply
+	// error and the two decode failures name the document as freely as a panic
+	// does, so all four withhold it together or the gate is decorative.
 	redacted bool
 	decode   func(any) (T, error)
 	seed     func() (Publication, bool, error)
@@ -253,7 +256,8 @@ func (c *Coordinator[T]) Publish(ctx context.Context, pub Publication) {
 	// cannot be parsed is named exactly once.
 	if err != nil {
 		c.logError(ctx, "systemplane.group: published document failed to decode",
-			log.Err(err), log.String(constants.AttrKeyTenantID, pub.Tenant), log.Any("revision", pub.Revision))
+			safelog.ErrorDetail(c.redacted, "decode failed", err),
+			log.String(constants.AttrKeyTenantID, pub.Tenant), log.Any("revision", pub.Revision))
 
 		return
 	}
@@ -405,7 +409,7 @@ func (c *Coordinator[T]) Register(fn ApplyFunc[T]) (func(), error) {
 	id, observed, seeded := c.add(fn)
 	if seeded.decodeErr != nil {
 		c.logError(ctx, "systemplane.group: seeded document failed to decode",
-			log.Err(seeded.decodeErr),
+			safelog.ErrorDetail(c.redacted, "decode failed", seeded.decodeErr),
 			log.String(constants.AttrKeyTenantID, seeded.pub.Tenant),
 			log.Any("revision", seeded.pub.Revision))
 	}
@@ -786,6 +790,11 @@ var ErrApplyPanicked = errors.New("systemplane/group: apply function panicked")
 // Both failure modes are logged here, at error level, naming the scope and the
 // revision: Status is a surface somebody has to think to read, while a
 // configuration that stopped being applied is something an operator needs told.
+// A returned error is rendered under the key's redaction policy for the same
+// reason its panicking twin is: an apply hook that refuses a document names it
+// — fmt.Errorf("cannot apply %+v", a.Value) — and for a redacted group that put
+// the whole document at ERROR. FC-7's Status keeps the error untouched; that is
+// the consumer's own surface, not a log sink.
 func (c *Coordinator[T]) invoke(
 	ctx context.Context,
 	fn ApplyFunc[T],
@@ -813,7 +822,7 @@ func (c *Coordinator[T]) invoke(
 	err = fn(ctx, current, previous)
 	if err != nil {
 		c.logError(ctx, "systemplane.group: apply function rejected the published document",
-			log.Err(err),
+			safelog.ErrorDetail(c.redacted, "apply rejected the document", err),
 			log.String(constants.AttrKeyTenantID, current.Tenant),
 			log.Any("revision", current.Revision))
 	}

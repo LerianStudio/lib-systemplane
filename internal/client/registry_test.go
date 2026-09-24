@@ -4,6 +4,7 @@ package client
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/LerianStudio/lib-systemplane/v4/internal/engine"
@@ -117,5 +118,44 @@ func TestRegistryKeysReturnsEveryRegisteredKeyOnce(t *testing.T) {
 		if seen != 1 {
 			t.Errorf("key %v seen %d times, want exactly once", nk, seen)
 		}
+	}
+}
+
+// TestRegistryAnyRedacted pins the production gate the engine asks before it
+// reports a recovered reconcile panic: the panic value there is a whole-scope
+// snapshot, so ONE redacted key anywhere in the registry has to withhold it.
+// The behavior was proven only against internal/engine's fake registry, and
+// this implementation could have answered false to everything without a single
+// test turning red.
+func TestRegistryAnyRedacted(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		policies []RedactPolicy
+		want     bool
+	}{
+		{name: "empty registry", want: false},
+		{name: "only unredacted", policies: []RedactPolicy{RedactNone}, want: false},
+		{name: "mask beside a plain key", policies: []RedactPolicy{RedactNone, RedactMask}, want: true},
+		{name: "full beside a plain key", policies: []RedactPolicy{RedactNone, RedactFull}, want: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newSingleTenantClient(t, newMemStore(false))
+
+			for i, policy := range tt.policies {
+				if err := c.Register("ns", fmt.Sprintf("k%d", i), "v", WithRedaction(policy)); err != nil {
+					t.Fatalf("register k%d: %v", i, err)
+				}
+			}
+
+			if got := c.AnyRedacted(); got != tt.want {
+				t.Errorf("AnyRedacted() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+
+	var nilClient *Client
+
+	if nilClient.AnyRedacted() {
+		t.Error("nil client: AnyRedacted() = true, want false")
 	}
 }

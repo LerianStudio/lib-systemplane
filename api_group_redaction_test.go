@@ -70,9 +70,16 @@ func (r *redactRecorder) panicValue(t *testing.T) string {
 	return fmt.Sprint(v)
 }
 
-// redactPanickingGroup binds a group whose applier panics naming the document
-// it was handed, and returns everything the consumer's logger saw.
-func redactPanickingGroup(t *testing.T, redaction systemplane.RedactPolicy) *redactRecorder {
+// redactGroup binds a group under redaction whose applier fails the way apply
+// hooks fail — naming the document it was handed — and returns everything the
+// consumer's logger saw. The failure mode is the caller's, because a panicking
+// hook and one that returns an error reach two different log lines and both of
+// them used to carry the document.
+func redactGroup(
+	t *testing.T,
+	redaction systemplane.RedactPolicy,
+	apply func(context.Context, systemplane.Applied[groupConfig]) error,
+) *redactRecorder {
 	t.Helper()
 
 	rec := &redactRecorder{}
@@ -95,9 +102,7 @@ func redactPanickingGroup(t *testing.T, redaction systemplane.RedactPolicy) *red
 
 	startGroupClient(t, c)
 
-	unsubscribe, err := g.OnApply(func(_ context.Context, a systemplane.Applied[groupConfig]) error {
-		panic(fmt.Sprintf("cannot apply %+v", a.Value))
-	})
+	unsubscribe, err := g.OnApply(apply)
 	if err != nil {
 		t.Fatalf("OnApply: %v", err)
 	}
@@ -107,40 +112,113 @@ func redactPanickingGroup(t *testing.T, redaction systemplane.RedactPolicy) *red
 	return rec
 }
 
-// TestGroupApplierPanicOnARedactedKeyWithholdsTheDocument is the end-to-end
-// probe through the public Bind/OnApply surface. A group registered
-// RedactFull is exactly where a consumer puts the credentials it never wants
-// logged — the matcher pilot keeps hmac_secret, secret_access_key and a tenant
-// API key in one — and an apply hook that panics naming what it could not
-// apply is the ordinary shape of a panic. lib-observability's canonical
-// handler logs log.Any("value", recovered) whenever production mode is off,
-// and off is what ships, so the whole document reached ERROR in the clear.
-func TestGroupApplierPanicOnARedactedKeyWithholdsTheDocument(t *testing.T) {
+// redactPolicyCases is the whole enum, every time. RedactMask was the hole the
+// Phase 2 review found: the gate is "any policy at all", but end to end only
+// RedactFull and RedactNone were ever exercised, so narrowing the gate to
+// RedactFull alone left the suite green and would have published a masked
+// group's document at ERROR.
+var redactPolicyCases = []struct {
+	name         string
+	policy       systemplane.RedactPolicy
+	wantVerbatim bool
+}{
+	{name: "none", policy: systemplane.RedactNone, wantVerbatim: true},
+	{name: "mask", policy: systemplane.RedactMask, wantVerbatim: false},
+	{name: "full", policy: systemplane.RedactFull, wantVerbatim: false},
+}
+
+// TestGroupApplierPanicHonorsTheKeyRedaction is the end-to-end probe through
+// the public Bind/OnApply surface. A redacted group is exactly where a consumer
+// puts the credentials it never wants logged — the matcher pilot keeps
+// hmac_secret, secret_access_key and a tenant API key in one — and an apply
+// hook that panics naming what it could not apply is the ordinary shape of a
+// panic. lib-observability's canonical handler logs log.Any("value", recovered)
+// whenever production mode is off, and off is what ships, so the whole document
+// reached ERROR in the clear.
+func TestGroupApplierPanicHonorsTheKeyRedaction(t *testing.T) {
 	t.Parallel()
 
-	rec := redactPanickingGroup(t, systemplane.RedactFull)
+	for _, tt := range redactPolicyCases {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			rec := redactGroup(t, tt.policy, func(_ context.Context, a systemplane.Applied[groupConfig]) error {
+				panic(fmt.Sprintf("cannot apply %+v", a.Value))
+			})
+
+			value := rec.panicValue(t)
+
+			if tt.wantVerbatim {
+				if !strings.Contains(value, redactProbeSecret) {
+					t.Errorf("panic value field = %q, want the panic value verbatim for an unredacted group", value)
+				}
+
+				return
+			}
+
+			assertNoLineCarriesTheDocument(t, rec)
+
+			if !strings.Contains(value, "(string,") || !strings.Contains(value, "value withheld") {
+				t.Errorf("panic value field = %q, want the panic value's type and no document", value)
+			}
+		})
+	}
+}
+
+// TestGroupApplierErrorHonorsTheKeyRedaction is the returned-error twin. An
+// apply hook that REJECTS a document names it as freely as one that panics —
+// fmt.Errorf("cannot apply %+v", a.Value) — and that error reached a second
+// ERROR line eleven lines below the one the panic gate closed. FC-7's Status
+// keeps the error untouched: that is the consumer's own surface, not a log sink.
+func TestGroupApplierErrorHonorsTheKeyRedaction(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range redactPolicyCases {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			rec := redactGroup(t, tt.policy, func(_ context.Context, a systemplane.Applied[groupConfig]) error {
+				return fmt.Errorf("cannot apply %+v", a.Value)
+			})
+
+			const rejection = "systemplane.group: apply function rejected the published document"
+
+			var line string
+
+			for _, l := range rec.recorded() {
+				if strings.HasPrefix(l, rejection) {
+					line = l
+				}
+			}
+
+			if line == "" {
+				t.Fatalf("no rejection line was logged; logged %v", rec.recorded())
+			}
+
+			if tt.wantVerbatim {
+				if !strings.Contains(line, redactProbeSecret) {
+					t.Errorf("rejection line = %q, want the error verbatim for an unredacted group", line)
+				}
+
+				return
+			}
+
+			assertNoLineCarriesTheDocument(t, rec)
+
+			if !strings.Contains(line, "(*errors.errorString)") {
+				t.Errorf("rejection line = %q, want the cause named by its dynamic type", line)
+			}
+		})
+	}
+}
+
+// assertNoLineCarriesTheDocument is the assertion both tests exist for.
+func assertNoLineCarriesTheDocument(t *testing.T, rec *redactRecorder) {
+	t.Helper()
 
 	for _, line := range rec.recorded() {
 		if strings.Contains(line, redactProbeSecret) {
 			t.Errorf("a log line carries the document of a redacted group: %s", line)
 		}
-	}
-
-	value := rec.panicValue(t)
-	if !strings.Contains(value, "(string,") || !strings.Contains(value, "value withheld") {
-		t.Errorf("panic value field = %q, want the panic value's type and no document", value)
-	}
-}
-
-// TestGroupApplierPanicOnAnUnredactedKeyIsReportedVerbatim is the twin: the
-// withholding is the redaction policy speaking, not a blanket loss of the one
-// thing that tells two panicking hooks apart.
-func TestGroupApplierPanicOnAnUnredactedKeyIsReportedVerbatim(t *testing.T) {
-	t.Parallel()
-
-	rec := redactPanickingGroup(t, systemplane.RedactNone)
-
-	if value := rec.panicValue(t); !strings.Contains(value, redactProbeSecret) {
-		t.Errorf("panic value field = %q, want the panic value verbatim for an unredacted group", value)
 	}
 }

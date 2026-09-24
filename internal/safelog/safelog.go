@@ -1,8 +1,8 @@
-// Package safelog holds the two things this library does to keep a consumer's
-// own observability code from costing it either the process or a secret: a
-// guard that makes a panicking logger harmless, and the one sentence a
-// recovered panic is reported as when the key it belongs to is registered
-// redacted.
+// Package safelog holds the things this library does to keep a consumer's own
+// observability code from costing it either the process or a secret: a guard
+// that makes a panicking logger harmless, and the two renderings a failure is
+// reported as when the key it belongs to is registered redacted — one for a
+// recovered panic, one for an error somebody else wrote.
 //
 // It is a leaf — lib-observability's log package and the standard library,
 // nothing else — because both internal/engine and internal/group need it, and
@@ -100,4 +100,30 @@ func WithheldPanic(what string, recovered any) string {
 // the alternative is unwinding a library goroutine over a log line.
 func swallowPanic() {
 	_ = recover()
+}
+
+// ErrorDetail renders a rejection's cause under the key's registered redaction
+// policy: the error itself for an ordinary key, and for a redacted one only
+// what refused it plus the error's dynamic type.
+//
+// Every rejection a stored document can produce carries the value in its
+// message. A consumer's validator or apply hook may name what it refused —
+// "token %q is too short". encoding/json is worse, because it needs no help: an
+// unparsable row comes back as "invalid character 'h' looking for beginning of
+// value", which quotes the value's first byte.
+//
+// The type alone is enough to tell two failures apart and can never carry a
+// byte of the value; the offset is withheld for the same reason, being a
+// measurement of the secret. What the caller receives is unchanged in every
+// case: this is the log stream, not the API, and FC-7's Status keeps the
+// untouched error.
+//
+// One wording, one place, so the engine and the group coordinator report a
+// withheld cause identically.
+func ErrorDetail(redacted bool, what string, err error) log.Field {
+	if !redacted {
+		return log.Err(err)
+	}
+
+	return log.String("error", fmt.Sprintf("%s (%T)", what, err))
 }

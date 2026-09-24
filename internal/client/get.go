@@ -121,6 +121,22 @@ func (c *Client) getEntry(ctx context.Context, namespace, key string) (Entry, bo
 	}, true, nil
 }
 
+// withheldValueErr is a typed getter's rejection for a key registered redacted:
+// what the value failed to be and its dynamic type, never the value itself.
+//
+// GetInt and GetDuration are the two getters whose message needs the value to
+// be useful — which number is not whole, which string is not a duration — and
+// they are the two that leaked it. An error travels further than a log line,
+// into response bodies, error trackers and retry logs, so the same policy that
+// keeps a value off a log line keeps it out of here, exactly as [decodeErr]
+// does for an undecodable row. time.ParseDuration's own error quotes its input,
+// so it is not wrapped either. The shape-mismatch branches never had the
+// problem: they print %T and stop.
+func withheldValueErr(namespace, key, want string, v any) error {
+	return fmt.Errorf("%w: %s/%s: stored value is not %s (%T, value withheld: key registered redacted)",
+		ErrValidation, namespace, key, want, v)
+}
+
 // GetString returns the value as a string.
 //
 // When the stored value is not a string, returns (zero, false, ErrValidation)
@@ -160,6 +176,10 @@ func (c *Client) GetInt(ctx context.Context, namespace, key string) (int64, bool
 		// JSON decodes all numbers as float64. Reject any value that would
 		// lose precision when truncated to int64 (NaN, Inf, fractional).
 		if n != float64(int64(n)) {
+			if c.KeyRedaction(namespace, key) != RedactNone {
+				return 0, false, withheldValueErr(namespace, key, "an integer", v)
+			}
+
 			return 0, false, fmt.Errorf("%w: %s/%s: stored value %v is not an integer", ErrValidation, namespace, key, n)
 		}
 
@@ -220,6 +240,10 @@ func (c *Client) GetDuration(ctx context.Context, namespace, key string) (time.D
 	case string:
 		parsed, parseErr := time.ParseDuration(d)
 		if parseErr != nil {
+			if c.KeyRedaction(namespace, key) != RedactNone {
+				return 0, false, withheldValueErr(namespace, key, "a parseable duration", v)
+			}
+
 			return 0, false, fmt.Errorf("%w: %s/%s: cannot parse %q as duration: %w",
 				ErrValidation, namespace, key, d, parseErr)
 		}
