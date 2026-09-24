@@ -411,7 +411,14 @@ func TestCoordinatorAPanickingLoggerStillRecordsThePanic(t *testing.T) {
 
 	publishWithoutPanicking(t, c, publication("t1", 1, "one"))
 
-	counter.RequireOnly(t, "systemplane", "group.apply")
+	// Both lines the broken logger drops are counted by log.Guard, then the
+	// applier's panic under its own site.
+	loggerPanic := panicmetric.Increment{Component: "log", Name: "Log"}
+	want := []panicmetric.Increment{loggerPanic, loggerPanic, {Component: "systemplane", Name: "group.apply"}}
+
+	if got := counter.Increments(); !slices.Equal(got, want) {
+		t.Errorf("panic counter increments = %+v, want %+v", got, want)
+	}
 
 	if got := statusOf(t, c, "t1"); !errors.Is(got.LastErr, ErrApplyPanicked) {
 		t.Errorf("LastErr = %v, want ErrApplyPanicked", got.LastErr)
