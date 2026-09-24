@@ -651,6 +651,12 @@ func TestKeyRedactionOnAClosedClientFailsClosed(t *testing.T) {
 		t.Fatalf("KeyRedaction on an open Client = %v, want RedactFull", got)
 	}
 
+	if got := c.KeyRedaction("ns", "never-registered"); got != RedactNone {
+		t.Errorf("KeyRedaction for an unregistered key on an OPEN Client = %v, want RedactNone: this is the "+
+			"branch Bind reads to decide whether a group's document may reach a log line, and nothing "+
+			"registered the key, so nothing declared it sensitive", got)
+	}
+
 	if err := c.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}

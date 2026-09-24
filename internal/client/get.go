@@ -432,8 +432,9 @@ func (c *Client) KeyDescription(namespace, key string) string {
 // document may reach a log line. Widening disclosure is never the right answer
 // to "this Client is gone".
 //
-// An unregistered key still reports RedactNone: nothing registered it, so
-// nothing declared it sensitive, and there is no value of it to disclose.
+// On an open Client, an unregistered key still reports RedactNone: nothing
+// registered it, so nothing declared it sensitive, and there is no value of it
+// to disclose.
 func (c *Client) KeyRedaction(namespace, key string) RedactPolicy {
 	if c == nil || c.closed.Load() {
 		return RedactFull

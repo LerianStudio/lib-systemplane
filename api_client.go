@@ -189,6 +189,11 @@ func (c *Client) KeyDescription(namespace, key string) string {
 }
 
 // KeyRedaction returns the registered redaction policy for a key.
+//
+// A closed or nil Client reports RedactFull for every key, registered or not:
+// a Client that can no longer read its registry withholds rather than
+// discloses, and every caller uses the answer to decide what a value may show.
+// On an open Client an unregistered key reports RedactNone.
 func (c *Client) KeyRedaction(namespace, key string) RedactPolicy {
 	return RedactPolicy(asInternalClient(c).KeyRedaction(namespace, key))
 }
