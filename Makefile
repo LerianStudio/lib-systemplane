@@ -335,6 +335,8 @@ coverage-unit:
 	$(call print_title,Running Go unit tests with coverage)
 	$(call check_command,go,"Install Go from https://golang.org/doc/install")
 	@set -e; mkdir -p $(TEST_REPORTS_DIR); \
+	profile=$$(mktemp "$(TEST_REPORTS_DIR)/unit_coverage.XXXXXX"); \
+	trap 'rm -f "$$profile" "$$profile.filtered"' EXIT; \
 	if [ -n "$(PKG)" ]; then \
 	  echo "Using specified package: $(PKG)"; \
 	  pkgs=$$(go list $(PKG) 2>/dev/null | grep -v '/tests' | tr '\n' ' '); \
@@ -347,19 +349,19 @@ coverage-unit:
 	  echo "Packages: $$pkgs"; \
 	  if [ -n "$(GOTESTSUM)" ]; then \
 	    echo "Running unit tests with gotestsum (coverage enabled)"; \
-	    gotestsum --format testname -- -tags=unit -v $(LOW_RES_P_FLAG) $(LOW_RES_RACE_FLAG) $(LOW_RES_PARALLEL_FLAG) -count=1 $(GO_TEST_LDFLAGS) -covermode=atomic -coverprofile=$(TEST_REPORTS_DIR)/unit_coverage.out $$pkgs || { \
+	    gotestsum --format testname -- -tags=unit -v $(LOW_RES_P_FLAG) $(LOW_RES_RACE_FLAG) $(LOW_RES_PARALLEL_FLAG) -count=1 $(GO_TEST_LDFLAGS) -covermode=atomic -coverprofile="$$profile" $$pkgs || { \
 	      if [ "$(RETRY_ON_FAIL)" = "1" ]; then \
 	        echo "Retrying unit tests once..."; \
-	        gotestsum --format testname -- -tags=unit -v $(LOW_RES_P_FLAG) $(LOW_RES_RACE_FLAG) $(LOW_RES_PARALLEL_FLAG) -count=1 $(GO_TEST_LDFLAGS) -covermode=atomic -coverprofile=$(TEST_REPORTS_DIR)/unit_coverage.out $$pkgs; \
+	        gotestsum --format testname -- -tags=unit -v $(LOW_RES_P_FLAG) $(LOW_RES_RACE_FLAG) $(LOW_RES_PARALLEL_FLAG) -count=1 $(GO_TEST_LDFLAGS) -covermode=atomic -coverprofile="$$profile" $$pkgs; \
 	      else \
 	        exit 1; \
 	      fi; \
 	    }; \
 	  else \
-	    go test -tags=unit -v $(LOW_RES_P_FLAG) $(LOW_RES_RACE_FLAG) $(LOW_RES_PARALLEL_FLAG) -count=1 $(GO_TEST_LDFLAGS) -covermode=atomic -coverprofile=$(TEST_REPORTS_DIR)/unit_coverage.out $$pkgs || { \
+	    go test -tags=unit -v $(LOW_RES_P_FLAG) $(LOW_RES_RACE_FLAG) $(LOW_RES_PARALLEL_FLAG) -count=1 $(GO_TEST_LDFLAGS) -covermode=atomic -coverprofile="$$profile" $$pkgs || { \
 	      if [ "$(RETRY_ON_FAIL)" = "1" ]; then \
 	        echo "Retrying unit tests once..."; \
-	        go test -tags=unit -v $(LOW_RES_P_FLAG) $(LOW_RES_RACE_FLAG) $(LOW_RES_PARALLEL_FLAG) -count=1 $(GO_TEST_LDFLAGS) -covermode=atomic -coverprofile=$(TEST_REPORTS_DIR)/unit_coverage.out $$pkgs; \
+	        go test -tags=unit -v $(LOW_RES_P_FLAG) $(LOW_RES_RACE_FLAG) $(LOW_RES_PARALLEL_FLAG) -count=1 $(GO_TEST_LDFLAGS) -covermode=atomic -coverprofile="$$profile" $$pkgs; \
 	      else \
 	        exit 1; \
 	      fi; \
@@ -370,14 +372,22 @@ coverage-unit:
 	    patterns=$$(grep -v '^#' .ignorecoverunit | grep -v '^$$' | tr '\n' '|' | sed 's/|$$//'); \
 	    if [ -n "$$patterns" ]; then \
 	      regex_patterns=$$(echo "$$patterns" | sed 's/[][(){}+?^$$\\]/\\&/g' | sed 's/\./\\./g' | sed 's/\*/.*/g'); \
-	      head -1 $(TEST_REPORTS_DIR)/unit_coverage.out > $(TEST_REPORTS_DIR)/unit_coverage_filtered.out; \
-	      tail -n +2 $(TEST_REPORTS_DIR)/unit_coverage.out | grep -vE "$$regex_patterns" >> $(TEST_REPORTS_DIR)/unit_coverage_filtered.out || true; \
-	      mv $(TEST_REPORTS_DIR)/unit_coverage_filtered.out $(TEST_REPORTS_DIR)/unit_coverage.out; \
+	      head -1 "$$profile" > "$$profile.filtered"; \
+	      tail -n +2 "$$profile" | grep -vE "$$regex_patterns" >> "$$profile.filtered" || true; \
+	      mv "$$profile.filtered" "$$profile"; \
 	      echo "Excluded patterns: $$patterns"; \
 	    fi; \
 	  fi; \
 	  echo "----------------------------------------"; \
-	  go tool cover -func=$(TEST_REPORTS_DIR)/unit_coverage.out | grep total | awk '{print "Total coverage: " $$3}'; \
+	  report=$$(go tool cover -func="$$profile") || { \
+	    echo "$(RED)$(BOLD)Error:$(NC) go tool cover could not read the coverage profile (error above)"; exit 1; \
+	  }; \
+	  total=$$(echo "$$report" | awk '$$1 == "total:" {print $$3}'); \
+	  if [ -z "$$total" ]; then \
+	    echo "$(RED)$(BOLD)Error:$(NC) go tool cover printed no total line"; exit 1; \
+	  fi; \
+	  echo "Total coverage: $$total"; \
+	  mv "$$profile" $(TEST_REPORTS_DIR)/unit_coverage.out; \
 	  echo "----------------------------------------"; \
 	fi
 	@echo "$(GREEN)$(BOLD)[ok]$(NC) Unit coverage report generated$(GREEN) ✔️$(NC)"
@@ -389,6 +399,8 @@ coverage-integration:
 	$(call check_command,go,"Install Go from https://golang.org/doc/install")
 	$(call check_command,docker,"Install Docker from https://docs.docker.com/get-docker/")
 	@set -e; mkdir -p $(TEST_REPORTS_DIR); \
+	profile=$$(mktemp "$(TEST_REPORTS_DIR)/integration_coverage.XXXXXX"); \
+	trap 'rm -f "$$profile" "$$profile.filtered"' EXIT; \
 	if [ -n "$(PKG)" ]; then \
 	  echo "Using specified package: $(PKG)"; \
 	  pkgs=$$(go list $(PKG) 2>/dev/null | tr '\n' ' '); \
@@ -410,14 +422,14 @@ coverage-integration:
 	    gotestsum --format testname -- \
 	      -tags=integration -v $(LOW_RES_RACE_FLAG) -count=1 -timeout 600s $(GO_TEST_LDFLAGS) \
 	      -p 1 $(LOW_RES_PARALLEL_FLAG) \
-	      -run '$(RUN_PATTERN)' -covermode=atomic -coverprofile=$(TEST_REPORTS_DIR)/integration_coverage.out \
+	      -run '$(RUN_PATTERN)' -covermode=atomic -coverprofile="$$profile" \
 	      $$pkgs || { \
 	      if [ "$(RETRY_ON_FAIL)" = "1" ]; then \
 	        echo "Retrying integration tests once..."; \
 	        gotestsum --format testname -- \
 	          -tags=integration -v $(LOW_RES_RACE_FLAG) -count=1 -timeout 600s $(GO_TEST_LDFLAGS) \
 	          -p 1 $(LOW_RES_PARALLEL_FLAG) \
-	          -run '$(RUN_PATTERN)' -covermode=atomic -coverprofile=$(TEST_REPORTS_DIR)/integration_coverage.out \
+	          -run '$(RUN_PATTERN)' -covermode=atomic -coverprofile="$$profile" \
 	          $$pkgs; \
 	      else \
 	        exit 1; \
@@ -426,13 +438,13 @@ coverage-integration:
 	  else \
 	    go test -tags=integration -v $(LOW_RES_RACE_FLAG) -count=1 -timeout 600s $(GO_TEST_LDFLAGS) \
 	      -p 1 $(LOW_RES_PARALLEL_FLAG) \
-	      -run '$(RUN_PATTERN)' -covermode=atomic -coverprofile=$(TEST_REPORTS_DIR)/integration_coverage.out \
+	      -run '$(RUN_PATTERN)' -covermode=atomic -coverprofile="$$profile" \
 	      $$pkgs || { \
 	      if [ "$(RETRY_ON_FAIL)" = "1" ]; then \
 	        echo "Retrying integration tests once..."; \
 	        go test -tags=integration -v $(LOW_RES_RACE_FLAG) -count=1 -timeout 600s $(GO_TEST_LDFLAGS) \
 	          -p 1 $(LOW_RES_PARALLEL_FLAG) \
-	          -run '$(RUN_PATTERN)' -covermode=atomic -coverprofile=$(TEST_REPORTS_DIR)/integration_coverage.out \
+	          -run '$(RUN_PATTERN)' -covermode=atomic -coverprofile="$$profile" \
 	          $$pkgs; \
 	      else \
 	        exit 1; \
@@ -440,7 +452,15 @@ coverage-integration:
 	    }; \
 	  fi; \
 	  echo "----------------------------------------"; \
-	  go tool cover -func=$(TEST_REPORTS_DIR)/integration_coverage.out | grep total | awk '{print "Total coverage: " $$3}'; \
+	  report=$$(go tool cover -func="$$profile") || { \
+	    echo "$(RED)$(BOLD)Error:$(NC) go tool cover could not read the coverage profile (error above)"; exit 1; \
+	  }; \
+	  total=$$(echo "$$report" | awk '$$1 == "total:" {print $$3}'); \
+	  if [ -z "$$total" ]; then \
+	    echo "$(RED)$(BOLD)Error:$(NC) go tool cover printed no total line"; exit 1; \
+	  fi; \
+	  echo "Total coverage: $$total"; \
+	  mv "$$profile" $(TEST_REPORTS_DIR)/integration_coverage.out; \
 	  echo "----------------------------------------"; \
 	fi
 	@echo "$(GREEN)$(BOLD)[ok]$(NC) Integration coverage report generated$(GREEN) ✔️$(NC)"
@@ -631,22 +651,30 @@ sec:
 	fi
 	@if find . -name "*.go" -type f -not -path './vendor/*' | grep -q .; then \
 		echo "Running security checks on all packages..."; \
+		format_flags=""; \
 		if [ "$(SARIF)" = "1" ]; then \
 			echo "Generating SARIF output: gosec-report.sarif"; \
-			if gosec -fmt sarif -out gosec-report.sarif ./...; then \
+			format_flags="-fmt sarif -out gosec-report.sarif -stdout -verbose text"; \
+		fi; \
+		log=$$(mktemp); \
+		trap 'rm -f "$$log"' EXIT; \
+		rc=0; \
+		gosec -exclude-dir=testdata $$format_flags ./... > "$$log" 2>&1 || rc=$$?; \
+		cat "$$log"; \
+		issues=$$(awk '/^ *Issues :/ { gsub(/\033\[[0-9;]*m/, ""); print $$NF }' "$$log"); \
+		if [ "$$rc" -eq 0 ]; then \
+			if [ "$(SARIF)" = "1" ]; then \
 				echo "$(GREEN)$(BOLD)[ok]$(NC) SARIF report generated: gosec-report.sarif$(GREEN) ✔️$(NC)"; \
 			else \
-				printf "\n%s%sSecurity issues found by gosec. Please address them before proceeding.%s\n\n" "$(BOLD)" "$(RED)" "$(NC)"; \
-				echo "SARIF report with details: gosec-report.sarif"; \
-				exit 1; \
-			fi; \
-		else \
-			if gosec ./...; then \
 				echo "$(GREEN)$(BOLD)[ok]$(NC) Security checks completed$(GREEN) ✔️$(NC)"; \
-			else \
-				printf "\n%s%sSecurity issues found by gosec. Please address them before proceeding.%s\n\n" "$(BOLD)" "$(RED)" "$(NC)"; \
-				exit 1; \
 			fi; \
+		elif [ -n "$$issues" ] && [ "$$issues" -gt 0 ]; then \
+			printf "\n%s%sSecurity issues found by gosec ($$issues). Please address them before proceeding.%s\n\n" "$(BOLD)" "$(RED)" "$(NC)"; \
+			if [ "$(SARIF)" = "1" ]; then echo "SARIF report with details: gosec-report.sarif"; fi; \
+			exit 1; \
+		else \
+			printf "\n%s%sgosec failed (exit $$rc) without reporting issues: a tool or build error, see its output above.%s\n\n" "$(BOLD)" "$(RED)" "$(NC)"; \
+			exit 1; \
 		fi; \
 	else \
 		echo "No Go files found, skipping security checks"; \

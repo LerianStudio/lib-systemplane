@@ -51,5 +51,17 @@ jobs:
           go-version: "1.26.3"
           cache: true
 
+      # go test passes with zero matching tests, so count the TestPerf_ that
+      # passed and fail when there are none: an empty gate is a broken gate.
       - name: Run AC15 perf gate (no -race)
-        run: go test -tags=unit -run=^TestPerf_ ./...
+        shell: bash
+        run: |
+          set -euo pipefail
+          log=$(mktemp)
+          go test -tags=unit -v -run='^TestPerf_' ./... | tee "$log"
+          passed=$(grep -c '^--- PASS: TestPerf_' "$log" || true)
+          if [ "$passed" -eq 0 ]; then
+            echo "::error::AC15 perf gate ran zero TestPerf_ tests; it would pass vacuously"
+            exit 1
+          fi
+          echo "AC15 perf gate: $passed TestPerf_ test(s) passed"
