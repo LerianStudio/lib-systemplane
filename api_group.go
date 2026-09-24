@@ -172,7 +172,14 @@ func Bind[T any](c *Client, namespace, key string, defaults T, validate func(T) 
 
 	g := &Group[T]{client: c, namespace: namespace, key: key, nullIsDocument: nullIsDocument}
 
-	g.coordinator = group.NewCoordinator[T](c.Logger(), g.decodePublished, g.seedCurrentEntry)
+	// Register above has already resolved the options, so the public accessor
+	// answers with the policy this key was actually registered under. The
+	// coordinator needs the fact, not the policy: masking and hiding are the
+	// same decision to a log stream, so both collapse to true and a panicking
+	// applier's document is withheld from the panic report either way.
+	redacted := c.KeyRedaction(namespace, key) != RedactNone
+
+	g.coordinator = group.NewCoordinator[T](c.Logger(), redacted, g.decodePublished, g.seedCurrentEntry)
 
 	// The group's one subscription, taken here — before Start, and therefore
 	// before any publication can exist. That is the structural half of FC-7's

@@ -34,8 +34,8 @@ func (deadLogger) Sync(context.Context) error { return nil }
 // logger — the reconcile worker, the debounced changefeed re-read, and a
 // delivery worker — and the one question the engine asks that logger OUTSIDE
 // every recovery: the DEBUG level check the changefeed goroutine runs per
-// event for an unregistered key. Nothing but safeLogger.Enabled stands
-// between that check and the process.
+// event for an unregistered key. Nothing but safelog.Guard's Enabled
+// stands between that check and the process.
 //
 // Each of them recovers consumer code — a registered validator, a subscriber
 // callback — and then REPORTS that recovery through the logger the consumer
@@ -260,30 +260,6 @@ func TestARetryReportingIntoAPanickingLoggerNeverKillsTheProcess(t *testing.T) {
 	waitFor(t, hangGuard, "the key nobody could re-read to be recorded unconfirmed", func() bool {
 		return scopeUnconfirmed(t, e, scope) == 1
 	})
-}
-
-// TestGuardLoggerIsIdempotentAndSwallows pins the two properties the Client
-// leans on when it hands the same consumer logger to a backend: the backend's
-// own changefeed goroutines, which log from their recoveries and from their
-// listener loop, run under the same guard the engine does; and guarding a
-// logger New will guard again costs one wrapper rather than two.
-func TestGuardLoggerIsIdempotentAndSwallows(t *testing.T) {
-	guarded := GuardLogger(deadLogger{})
-
-	// Both of the consumer's panics, neither reaching this frame.
-	guarded.Log(context.Background(), log.LevelError, "a line the consumer's logger explodes on")
-
-	if guarded.Enabled(log.LevelDebug) {
-		t.Error("Enabled reported true for a logger that panics on its level check")
-	}
-
-	if again := GuardLogger(guarded); again != guarded {
-		t.Error("GuardLogger wrapped an already-guarded logger a second time")
-	}
-
-	if GuardLogger(nil) == nil {
-		t.Error("GuardLogger(nil) returned nil, want a no-op logger")
-	}
 }
 
 // consumerRecorder is the metrics recorder a consumer hands to

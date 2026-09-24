@@ -28,7 +28,7 @@ import (
 	"github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/runtime"
-	"github.com/LerianStudio/lib-systemplane/v4/internal/engine"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/safelog"
 )
 
 // Publication is one published revision of a group's document in one scope.
@@ -172,8 +172,14 @@ type delivery[T any] struct {
 // returns nil.
 type Coordinator[T any] struct {
 	logger log.Logger
-	decode func(any) (T, error)
-	seed   func() (Publication, bool, error)
+	// redacted is the group key's registration speaking: true when the key
+	// carries any redaction policy, and the only reason this package knows
+	// anything about redaction at all. A panicking applier is routinely
+	// holding the decoded document, and the canonical panic handler logs it,
+	// so the fact has to travel from Bind down to the recovery.
+	redacted bool
+	decode   func(any) (T, error)
+	seed     func() (Publication, bool, error)
 
 	mu        sync.Mutex
 	seq       uint64
@@ -184,22 +190,33 @@ type Coordinator[T any] struct {
 }
 
 // NewCoordinator builds a coordinator. logger (may be nil) receives decode
-// failures and applier panics; decode converts a published document into T;
-// seed reads the group's current entry through the Client and reports ok=false
-// when the Client does not yet track the scope. A seed that cannot read at all
-// returns its error instead, and Register hands that error to the registrant.
-// seed is consulted only by a Register that finds no observed publication at
-// all.
+// failures and applier panics, and is guarded here so every site that logs
+// through it — including lib-observability's panic handler, which logs before
+// it counts — is safe from a consumer logger that panics; redacted says the
+// group's key is registered with a redaction policy, which withholds a
+// panicking applier's value from the report; decode converts a published
+// document into T; seed reads the group's current entry through the Client and
+// reports ok=false when the Client does not yet track the scope. A seed that
+// cannot read at all returns its error instead, and Register hands that error
+// to the registrant. seed is consulted only by a Register that finds no
+// observed publication at all.
 func NewCoordinator[T any](
 	logger log.Logger,
+	redacted bool,
 	decode func(any) (T, error),
 	seed func() (Publication, bool, error),
 ) *Coordinator[T] {
 	return &Coordinator[T]{
-		logger: logger,
-		decode: decode,
-		seed:   seed,
-		scopes: map[string]*scope[T]{},
+		// Guarded once, here, rather than at each site that logs: the Client
+		// hands over the consumer's own logger unwrapped, and every line this
+		// package writes runs either on a publishing goroutine the consumer
+		// cannot recover on or inside an applier's recovery. Guard answers nil
+		// with a no-op logger, so the field is never nil below.
+		logger:   safelog.Guard(logger),
+		redacted: redacted,
+		decode:   decode,
+		seed:     seed,
+		scopes:   map[string]*scope[T]{},
 	}
 }
 
@@ -747,10 +764,11 @@ func (c *Coordinator[T]) pendingLocked(sc *scope[T], observed observation[T]) []
 // ErrApplyPanicked is the error an apply function's panic becomes. It carries
 // no part of the recovered value: a panic value is whatever the panicking hook
 // was holding, routinely the decoded document with its endpoints and its
-// credentials, and this error is a field operators read and log. The value and
-// the stack are in the log line the panic handler writes, redacted in
-// production mode.
-var ErrApplyPanicked = errors.New("systemplane/group: apply function panicked; the value and stack are in the log line under group.apply")
+// credentials, and this error is a field operators read and log. Where the
+// value and the stack go is the panic handler's business and the key's
+// redaction policy's — a redacted group's document goes nowhere — so this
+// sentinel does not advertise a log line that may deliberately be missing it.
+var ErrApplyPanicked = errors.New("systemplane/group: apply function panicked")
 
 // invoke runs one applier and turns every failure mode into an error: a
 // returned error passes through, and a panic is recovered into one. The recover
@@ -805,30 +823,41 @@ func (c *Coordinator[T]) invoke(
 
 // reportPanic hands a recovered applier panic to lib-observability and refuses
 // to let the reporting escape: HandlePanicValue serializes the recovered value
-// through the consumer's logger, so a logger that panics would otherwise unwind
-// out of invoke — past the error return that LastErr is built on, and out
-// through the fan-out that recorded the scope as delivering.
+// through the logger, so a logger that panics would otherwise unwind out of
+// invoke — past the error return that LastErr is built on, and out through the
+// fan-out that recorded the scope as delivering. The logger is guarded at
+// construction, which covers this call and every other line this package
+// writes; the recover here is for the rest of the handler, the panic counter
+// and the span event and the error reporter, all of them consumer code nothing
+// can wrap.
 //
-// The logger goes in wrapped because HandlePanicValue LOGS the panic before it
-// records the counter, the span event and the error report: a logger that
-// panics on that line would take all three down with it, and the recover above
-// would then swallow the unwind, leaving a panicking hot-reload hook visible
-// nowhere but Status. Wrapping keeps the canonical handler and its production
-// redaction while making the record step independent of the consumer's logger.
-//
-// engine.GuardLogger is that wrapper, shared rather than copied: it guards the
-// level check as well as the entry, and answers nil with a no-op logger.
+// A redacted group's document never reaches the report. HandlePanicValue logs
+// log.Any("value", recovered) and stamps the same rendering on the span event
+// whenever production mode is off, and off is what lib-observability ships, so
+// an apply hook that panics naming what it could not apply —
+// panic(fmt.Sprintf("cannot apply %+v", doc)) — would publish a RedactFull
+// group's whole document at ERROR. The matcher pilot keeps hmac_secret,
+// secret_access_key and a tenant API key in exactly such a group. For those
+// the handler receives safelog's sentence instead: what panicked and the panic
+// value's dynamic type, which tells two panics apart and can never carry a
+// byte of a secret. Same handler either way, so the counter, the span event
+// and the error report are recorded exactly as before; only what they carry
+// changes.
 func (c *Coordinator[T]) reportPanic(ctx context.Context, recovered any) {
 	defer swallowPanic()
 
-	runtime.HandlePanicValue(ctx, engine.GuardLogger(c.logger), recovered, "systemplane", "group.apply")
-}
-
-func (c *Coordinator[T]) logError(ctx context.Context, msg string, fields ...log.Field) {
-	if c.logger == nil {
-		return
+	reported := recovered
+	if c.redacted {
+		reported = safelog.WithheldPanic("apply function panicked", recovered)
 	}
 
+	runtime.HandlePanicValue(ctx, c.logger, reported, "systemplane", "group.apply")
+}
+
+// logError writes one line through the guarded logger. The guard makes the
+// recover here belt-and-braces rather than the only net, and makes a nil
+// consumer logger a no-op rather than a branch.
+func (c *Coordinator[T]) logError(ctx context.Context, msg string, fields ...log.Field) {
 	defer swallowPanic()
 
 	c.logger.Log(ctx, log.LevelError, msg, fields)

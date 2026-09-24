@@ -33,7 +33,7 @@ func (s *seeder) read() (Publication, bool, error) {
 func newSeedingCoordinator(t *testing.T, seed *seeder) *Coordinator[coordDoc] {
 	t.Helper()
 
-	return NewCoordinator[coordDoc](nil, Decode[coordDoc], seed.read)
+	return NewCoordinator[coordDoc](nil, false, Decode[coordDoc], seed.read)
 }
 
 func TestCoordinatorSeedsWhenNothingWasObserved(t *testing.T) {
@@ -216,7 +216,7 @@ func TestCoordinatorNeverSeedsAScopeItAlreadyObserved(t *testing.T) {
 func TestCoordinatorSeedThatFailsToDecodeIsRecorded(t *testing.T) {
 	seed := &seeder{pub: publication("t1", 7, "bad"), ok: true}
 	logger := newRecordingLogger()
-	c := NewCoordinator[coordDoc](logger, rejectingDecode("bad"), seed.read)
+	c := NewCoordinator[coordDoc](logger, false, rejectingDecode("bad"), seed.read)
 
 	var rec recorder
 
@@ -350,7 +350,7 @@ func TestCoordinatorDeliversAfterASeedItCannotProveIdentical(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			seed := &seeder{pub: Publication{Tenant: "t1", Revision: 1, Value: tc.seeded}, ok: true}
-			c := NewCoordinator[coordDoc](nil, decodeRefusing, seed.read)
+			c := NewCoordinator[coordDoc](nil, false, decodeRefusing, seed.read)
 
 			var rec recorder
 

@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
-	"github.com/LerianStudio/lib-systemplane/v4/internal/engine"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/safelog"
 )
 
 // explodingLogger is the consumer logger that is broken rather than slow:
@@ -53,10 +53,10 @@ func TestTheLoggerEveryBackendGetsIsGuarded(t *testing.T) {
 		t.Error("Enabled reported true for a logger that panics on its level check")
 	}
 
-	// GuardLogger is idempotent, so a value it hands back unchanged is one it
+	// safelog.Guard is idempotent, so a value it hands back unchanged is one it
 	// already wrapped. This pins the VALUE in the config, not the hand-offs:
 	// what the Client itself logs through is pinned by the test below.
-	if guarded := engine.GuardLogger(cfg.logger); guarded != cfg.logger {
+	if guarded := safelog.Guard(cfg.logger); guarded != cfg.logger {
 		t.Error("the logger the backends are handed is not guarded")
 	}
 

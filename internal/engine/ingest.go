@@ -8,6 +8,7 @@ import (
 	"github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/runtime"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/safelog"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -415,11 +416,9 @@ func (e *Engine) runValidator(
 // type, which is enough to tell two panics apart and can never carry a byte of
 // a secret — the same trade ErrorDetail makes for a rejection's message.
 //
-// The engine's two consumer-panic sites are the ones covered: a group applier
-// that panics is recovered and reported by internal/group, which holds no
-// redaction fact today and reports the value verbatim. Closing that needs the
-// bit threaded from Bind through group.NewCoordinator, both of which the
-// groups lane owns.
+// The sentence itself lives in internal/safelog, shared with internal/group's
+// applier recovery, so the two sites that can report a withheld panic word it
+// identically and one test pins the wording.
 //
 // It is the same handler either way, so the panic counter, the span event and
 // the error report are recorded exactly as before; only what they carry
@@ -427,7 +426,7 @@ func (e *Engine) runValidator(
 func (e *Engine) reportConsumerPanic(ctx context.Context, recovered any, redacted bool, what, name string) {
 	reported := recovered
 	if redacted {
-		reported = fmt.Sprintf("%s (%T, value withheld: key registered redacted)", what, recovered)
+		reported = safelog.WithheldPanic(what, recovered)
 	}
 
 	e.reportRecovered(ctx, reported, name)
