@@ -48,7 +48,7 @@ func registryEngine(t *testing.T, reg Registry, fs *fakeStore, window time.Durat
 		// or reconcile that reached the WaitGroup while this Wait ran would
 		// kill the test binary rather than fail a test.
 		e.closeWorkers()
-		e.dispatchWG.Wait()
+		drainWorkers(e)
 	})
 
 	return e
@@ -836,7 +836,7 @@ func untrackedEngine(t *testing.T, defs map[NSKey]KeyDef, fs *fakeStore) *Engine
 		e.debouncer.Close()
 		e.lifecycleCancel()
 		e.closeWorkers()
-		e.dispatchWG.Wait()
+		drainWorkers(e)
 	})
 
 	return e

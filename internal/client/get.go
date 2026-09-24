@@ -74,9 +74,10 @@ func (c *Client) singleTenantEntry(namespace, key string, def keyDef) Entry {
 // redacted is the key's registration speaking, read under the same registryMu
 // hold that produced the value. It travels with the value because a caller
 // that grades the value — the typed getters — must never look the fact up a
-// second time: [Client.KeyRedaction] reports RedactNone once the Client is
-// closed, so a Close racing the getter would degrade its gate open and print
-// the value of a redacted key. It is false whenever ok is false.
+// second time: [Client.KeyRedaction] answers from the registration alone, and
+// once the Client is closed it answers without reading it at all, so a getter
+// that looked the fact up after its read would be grading a value against a
+// policy the read never produced. It is false whenever ok is false.
 func (c *Client) getEntry(ctx context.Context, namespace, key string) (Entry, bool, bool, error) {
 	if c == nil || c.closed.Load() {
 		return Entry{}, false, false, ErrClosed
@@ -419,9 +420,21 @@ func (c *Client) KeyDescription(namespace, key string) string {
 }
 
 // KeyRedaction returns the redaction policy for a registered key.
+//
+// A closed Client reports RedactFull, not RedactNone. The short-circuit stays
+// — a closed Client answers from nothing — but it answers the safe way round,
+// because every caller uses the policy to decide what a value may SHOW. The
+// admin GET and list handlers look it up after their read, so a Close landing
+// in that window would otherwise render a RedactFull key's value in clear into
+// an HTTP response body, and Bind reads it once to decide whether a group's
+// document may reach a log line. Widening disclosure is never the right answer
+// to "this Client is gone".
+//
+// An unregistered key still reports RedactNone: nothing registered it, so
+// nothing declared it sensitive, and there is no value of it to disclose.
 func (c *Client) KeyRedaction(namespace, key string) RedactPolicy {
 	if c == nil || c.closed.Load() {
-		return RedactNone
+		return RedactFull
 	}
 
 	nk := nskey{Namespace: namespace, Key: key}

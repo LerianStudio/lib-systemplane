@@ -37,7 +37,12 @@ func dispatchEngine(t *testing.T) *Engine {
 
 	t.Cleanup(func() {
 		cancel()
-		e.dispatchWG.Wait()
+		// closeWorkers before the drain, exactly as Close does: it is what
+		// makes giving up on the wait safe, because no straggler publication
+		// can then increment the WaitGroup while the drain goroutine is still
+		// inside Wait.
+		e.closeWorkers()
+		drainWorkers(e)
 	})
 
 	return e

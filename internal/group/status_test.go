@@ -413,33 +413,89 @@ func TestCoordinatorAPanickingLoggerStillRecordsThePanic(t *testing.T) {
 // TestCoordinatorApplierErrorIsLogged pins the operational half of a rejection:
 // Status is a pull surface nobody reads at 3am, so an applier refusing a
 // configuration must also reach the consumer's logger, naming the scope, the
-// revision and the error.
+// revision and the error — the error rendered under the group's own redaction
+// policy.
+//
+// It runs redacted as well as plain because the redacted row is the only thing
+// standing between a RedactFull group's document and an ERROR record. An apply
+// hook that refuses a document names it — fmt.Errorf("cannot apply %+v",
+// doc) — so the rejection's cause carries the whole document by construction,
+// exactly as a decode failure's does. Without this row the call site could be
+// written log.Err(err) with nothing in the repository turning red.
 func TestCoordinatorApplierErrorIsLogged(t *testing.T) {
-	logger := newRecordingLogger()
-	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, false, Decode[coordDoc], nil)
+	for _, tc := range decodeRedactionCases {
+		t.Run(tc.name, func(t *testing.T) {
+			logger := newRecordingLogger()
+			c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, tc.redacted, Decode[coordDoc], nil)
 
-	unsubscribe := mustRegister(t, c, func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
-		return errRejected
-	})
-	defer unsubscribe()
+			// The applier names what it refused, which is what a consumer's
+			// apply hook does when it wants the log to be actionable.
+			rejection := fmt.Errorf("refused %s", redactionSecret)
 
-	c.Publish(context.Background(), publication("t1", 5, "five"))
+			unsubscribe := mustRegister(t, c, func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
+				return rejection
+			})
+			defer unsubscribe()
+
+			c.Publish(context.Background(), publication("t1", 5, "five"))
+
+			line := logger.lineContaining(t, "rejected")
+			if line.level != log.LevelError {
+				t.Errorf("the rejection logged at %s level, want error", log.LevelName(line.level))
+			}
+
+			if got := line.fields[constants.AttrKeyTenantID]; got != "t1" {
+				t.Errorf("%s = %v, want the rejecting scope", constants.AttrKeyTenantID, got)
+			}
+
+			if revision, _ := line.fields["revision"].(int64); revision != 5 {
+				t.Errorf("revision = %v, want 5", line.fields["revision"])
+			}
+
+			assertNamesTheGroup(t, line, coordNamespace, coordKey)
+			assertRejectionRendering(t, logger, tc.redacted, rejection)
+		})
+	}
+}
+
+// assertRejectionRendering is assertDecodeFailureRendering's twin for the cause
+// an APPLIER returns: verbatim for a plain group, and for a redacted one only
+// what refused the document and the cause's dynamic type, with the document
+// itself nowhere in the log.
+//
+// FC-7's Status keeps the error untouched either way — that is the consumer's
+// own surface, not a log sink — so only what the log carries changes.
+func assertRejectionRendering(t *testing.T, logger *recordingLogger, redacted bool, rejection error) {
+	t.Helper()
 
 	line := logger.lineContaining(t, "rejected")
-	if line.level != log.LevelError {
-		t.Errorf("the rejection logged at %s level, want error", log.LevelName(line.level))
+	detail := fmt.Sprint(line.fields["error"])
+
+	if !redacted {
+		if err, _ := line.fields["error"].(error); !errors.Is(err, rejection) {
+			t.Errorf("error = %v, want the applier's rejection verbatim for an unredacted group",
+				line.fields["error"])
+		}
+
+		return
 	}
 
-	if got := line.fields[constants.AttrKeyTenantID]; got != "t1" {
-		t.Errorf("%s = %v, want the rejecting scope", constants.AttrKeyTenantID, got)
+	for _, recorded := range logger.recorded() {
+		for key, value := range recorded.fields {
+			if text := fmt.Sprint(value); strings.Contains(text, redactionSecret) {
+				t.Errorf("log field %s carries the document of a redacted group: %s", key, text)
+			}
+		}
+
+		if strings.Contains(recorded.msg, redactionSecret) {
+			t.Errorf("a log message carries the document of a redacted group: %s", recorded.msg)
+		}
 	}
 
-	if revision, _ := line.fields["revision"].(int64); revision != 5 {
-		t.Errorf("revision = %v, want 5", line.fields["revision"])
-	}
-
-	if err, _ := line.fields["error"].(error); !errors.Is(err, errRejected) {
-		t.Errorf("error = %v, want the applier's rejection", line.fields["error"])
+	if !strings.Contains(detail, "apply rejected the document") ||
+		!strings.Contains(detail, fmt.Sprintf("%T", rejection)) {
+		t.Errorf("error = %q, want what refused the document and the cause's dynamic type, and no more",
+			detail)
 	}
 }
 

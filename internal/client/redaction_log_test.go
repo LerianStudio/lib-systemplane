@@ -497,3 +497,49 @@ func TestTypedGetterRedactionSurvivesACloseMidRead(t *testing.T) {
 		})
 	}
 }
+
+// TestKeyRedactionOnAClosedClientFailsClosed pins the DIRECTION of the
+// accessor's closed short-circuit.
+//
+// Every caller of KeyRedaction uses the answer to decide what a value may
+// show, and the admin HTTP handlers ask for it AFTER their GetEntry read: a
+// Close landing in that window used to make the accessor report RedactNone,
+// and the handler then rendered a RedactFull key's value in clear into the
+// response body — the same degrade-open shape the typed getters were fixed
+// for, at a strictly worse sink. Bind reads it once too, to decide whether a
+// group's document may ever reach a log line.
+//
+// A Client that can no longer read its registry must therefore withhold, not
+// disclose. The registered key and the unregistered one are asserted together
+// because they are different questions: the first has a value to protect, the
+// second has none and nothing ever declared it sensitive.
+func TestKeyRedactionOnAClosedClientFailsClosed(t *testing.T) {
+	c := newSingleTenantClient(t, newMemStore(false))
+
+	if err := c.Register("ns", "k", "1s", WithRedaction(RedactFull)); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	if got := c.KeyRedaction("ns", "k"); got != RedactFull {
+		t.Fatalf("KeyRedaction on an open Client = %v, want RedactFull", got)
+	}
+
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if got := c.KeyRedaction("ns", "k"); got != RedactFull {
+		t.Errorf("KeyRedaction after Close = %v, want RedactFull: a closed Client must never widen "+
+			"disclosure — the admin GET and list handlers render the value under whatever this returns", got)
+	}
+
+	if got := c.KeyRedaction("ns", "never-registered"); got != RedactFull {
+		t.Errorf("KeyRedaction for an unregistered key after Close = %v, want RedactFull: the closed "+
+			"short-circuit answers before the registry is consulted at all", got)
+	}
+
+	var nilClient *Client
+	if got := nilClient.KeyRedaction("ns", "k"); got != RedactFull {
+		t.Errorf("KeyRedaction on a nil Client = %v, want RedactFull", got)
+	}
+}

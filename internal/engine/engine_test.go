@@ -633,6 +633,41 @@ func runningDelivery(e *Engine, grace time.Duration) error {
 	return nil
 }
 
+// drainWorkers waits for e's dispatch workers to exit, BOUNDED, the way Close
+// bounds its own drain.
+//
+// A helper teardown that called e.dispatchWG.Wait() directly parked forever on
+// exactly the survivor noDeliveryOutlivesTheTest exists to name: a worker
+// inside a subscriber callback that ignores its context is what that WaitGroup
+// is waiting on. The guard is registered BEFORE each helper's teardown so LIFO
+// runs it last, so an unbounded Wait ran FIRST and never returned — the whole
+// package binary died on the test timeout, naming a stack and no test, which is
+// the outcome the guard was added to replace. Giving up hands the stuck
+// goroutine to the guard, which fails the test by name and quotes the (tenant,
+// namespace, key), and to TestMain's goleak check.
+//
+// Every caller shuts the door on new workers first, so nothing can Add to the
+// WaitGroup while the drain goroutine is still inside Wait — the race Go
+// answers by killing the process rather than returning an error. The drain
+// goroutine only ever closes a channel, so it cannot outlive the workers even
+// when the timer wins.
+func drainWorkers(e *Engine) {
+	drained := make(chan struct{})
+
+	go func() {
+		e.dispatchWG.Wait()
+		close(drained)
+	}()
+
+	timer := time.NewTimer(hangGuard)
+	defer timer.Stop()
+
+	select {
+	case <-drained:
+	case <-timer.C:
+	}
+}
+
 // noDeliveryOutlivesTheTest fails t, BY NAME, when one of e's dispatch workers
 // is still inside a subscriber callback once the test has torn its engine
 // down.
