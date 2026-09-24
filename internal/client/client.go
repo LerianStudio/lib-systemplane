@@ -29,7 +29,13 @@ type nskey struct {
 type Client struct {
 	store  store.Store
 	engine *engine.Engine
-	logger log.Logger
+	// logger is the consumer's own, unwrapped, because Logger() hands it back.
+	// Nothing in this package logs through it: guarded is what every line goes
+	// out on, so a consumer logger that panics cannot unwind out of a library
+	// call — logError runs on the CALLER's goroutine in multi-tenant mode, so
+	// an unguarded one took a Get or a List down with it.
+	logger  log.Logger
+	guarded log.Logger
 
 	multiTenant    bool
 	catalogService string
@@ -120,6 +126,7 @@ func newClient(s store.Store, cfg clientConfig) *Client {
 	c := &Client{
 		store:          s,
 		logger:         own,
+		guarded:        guarded,
 		multiTenant:    cfg.multiTenantEnabled,
 		catalogService: cfg.catalogService,
 		registry:       make(map[nskey]keyDef),

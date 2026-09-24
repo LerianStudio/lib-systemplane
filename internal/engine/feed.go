@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/LerianStudio/lib-commons/v7/commons/backoff"
 	"github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/runtime"
@@ -32,7 +33,10 @@ const defaultReconcileTimeout = 15 * time.Second
 // a long window delay the repair of a key nothing is notifying about.
 //
 // Short enough that a pool that blinked is repaired before an operator can
-// look, long enough that a store in real trouble is not hammered per key.
+// look, long enough that a store in real trouble is not hammered per key. It
+// is the CEILING of the wait, not the wait: retryRefresh draws each attempt
+// from backoff.FullJitter(retryDelay), so the retries a scope-wide failure
+// armed do not all land in the same instant.
 const retryDelay = 250 * time.Millisecond
 
 // scopeNSKey is the debouncer's key: one quiet window per key per scope, so a
@@ -284,12 +288,13 @@ func (e *Engine) retryRefresh(sc *scopeState, nk NSKey, fence feedFence, deleted
 			defer e.dispatchWG.Done()
 			defer sc.endRetry(nk)
 
-			timer := time.NewTimer(retryDelay)
-			defer timer.Stop()
-
-			select {
-			case <-timer.C:
-			case <-ctx.Done():
+			// Jittered, through the same primitive both backends reconnect
+			// with. A scope-wide read failure arms one retry per key, and a
+			// fixed constant fires every one of them at the same instant
+			// against the pool whose scarcity refused them — the engine's own
+			// reason for the first failure. FullJitter spreads the single
+			// attempt over [0, retryDelay) instead.
+			if err := backoff.WaitContext(ctx, backoff.FullJitter(retryDelay)); err != nil {
 				return
 			}
 

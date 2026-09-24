@@ -187,11 +187,11 @@ type scopeState struct {
 	// snapshot that finds it absent and agreeing with the cache
 	// (markConfirmed).
 	//
-	// A reconcile's snapshot ROW is the ingress that only sometimes decides
-	// it. The photograph may predate the very change the failed re-read was
-	// sent for, and a publication the fence deduplicated or rejected is the
-	// proof that it does, so applySnapshotRow puts the record back on exactly
-	// that outcome.
+	// A reconcile's snapshot ROW is the one ingress that never decides it.
+	// The photograph was taken at a moment nothing here knows and may predate
+	// the very change the failed re-read was sent for — advancing the cache
+	// does not prove otherwise — so applySnapshotRow puts the record straight
+	// back for every key its window marked unusable.
 	//
 	// Lookup reports Stale while this set is non-empty, so one key nobody
 	// could re-read makes the scope's reads say so, and converging that key

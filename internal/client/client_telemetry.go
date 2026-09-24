@@ -25,7 +25,7 @@ import (
 // what keeps an empty tenant.id — noise that reads like a missing value — off
 // the single-tenant lines the wave-3 engine-tenants lane adds.
 func (c *Client) logError(ctx context.Context, msg string, fields ...log.Field) {
-	if c == nil || c.logger == nil {
+	if c == nil || c.guarded == nil {
 		return
 	}
 
@@ -33,7 +33,7 @@ func (c *Client) logError(ctx context.Context, msg string, fields ...log.Field) 
 		fields = append(fields, log.String(constants.AttrKeyTenantID, tmcore.GetTenantIDContext(ctx)))
 	}
 
-	c.logger.Log(ctx, log.LevelError, msg, fields)
+	c.guarded.Log(ctx, log.LevelError, msg, fields)
 }
 
 // decodeErr names the row a multi-tenant read-through could not decode, tenant

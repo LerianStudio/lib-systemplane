@@ -413,8 +413,13 @@ func (e *Engine) runValidator(
 // sensitive-field list. For a redacted key the handler therefore receives a
 // sentence in place of the value: what panicked, and the panic value's dynamic
 // type, which is enough to tell two panics apart and can never carry a byte of
-// a secret — the same trade ErrorDetail makes for a rejection's message, and
-// the same shape internal/group reports an applier panic with.
+// a secret — the same trade ErrorDetail makes for a rejection's message.
+//
+// The engine's two consumer-panic sites are the ones covered: a group applier
+// that panics is recovered and reported by internal/group, which holds no
+// redaction fact today and reports the value verbatim. Closing that needs the
+// bit threaded from Bind through group.NewCoordinator, both of which the
+// groups lane owns.
 //
 // It is the same handler either way, so the panic counter, the span event and
 // the error report are recorded exactly as before; only what they carry

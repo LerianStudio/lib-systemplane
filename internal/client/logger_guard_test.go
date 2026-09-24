@@ -54,13 +54,49 @@ func TestTheLoggerEveryBackendGetsIsGuarded(t *testing.T) {
 	}
 
 	// GuardLogger is idempotent, so a value it hands back unchanged is one it
-	// already wrapped: this is what fails if a constructor is ever handed an
-	// unguarded logger again.
+	// already wrapped. This pins the VALUE in the config, not the hand-offs:
+	// what the Client itself logs through is pinned by the test below.
 	if guarded := engine.GuardLogger(cfg.logger); guarded != cfg.logger {
 		t.Error("the logger the backends are handed is not guarded")
 	}
 
 	if cfg.consumerLogger != (explodingLogger{}) {
 		t.Errorf("consumerLogger: got %v, want the logger the caller passed", cfg.consumerLogger)
+	}
+}
+
+// TestAPanickingConsumerLoggerDoesNotUnwindOutOfARead pins the half of the
+// guard the test above cannot see: what newClient puts on the CLIENT, not what
+// it puts in the config.
+//
+// The Client keeps the consumer's logger unwrapped on purpose — Logger() hands
+// it back — and its own error lines used to go out on that field. Both call
+// sites are the multi-tenant read-through naming a row it could not decode, and
+// both run on the CALLER's goroutine: a consumer logger that panics there took
+// the caller's Get or List down with it, past a library boundary that promises
+// a returned error. The config-level assertion above stayed green throughout.
+func TestAPanickingConsumerLoggerDoesNotUnwindOutOfARead(t *testing.T) {
+	m := newMemStore(true)
+	c := newMultiTenantClientWithLogger(t, m, explodingLogger{})
+
+	if err := c.Register("ns", "k", "default"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	t.Cleanup(func() { _ = c.Close() })
+
+	// A row no decoder accepts, which is what drives the Client to log.
+	seedRaw(m, "ns", "k", []byte("{not json"))
+
+	if _, _, err := c.Get(context.Background(), "ns", "k"); err == nil {
+		t.Error("Get: want a decode error, got nil")
+	}
+
+	if _, err := c.List(context.Background(), "ns"); err == nil {
+		t.Error("List: want a decode error, got nil")
 	}
 }

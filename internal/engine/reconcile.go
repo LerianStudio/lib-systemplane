@@ -383,26 +383,32 @@ func (e *Engine) applySnapshotRow(ctx context.Context, sc *scopeState, arm recon
 
 	if usable {
 		// The reconcile's own ingress: a drop means the scope is going away
-		// under it, and there is no caller to tell.
-		notify, _ := e.publish(sc, pub)
+		// under it, and there is no caller to tell. Neither is the notify
+		// flag read — see below.
+		_, _ = e.publish(sc, pub)
 
 		// publish clears the unconfirmed record for every ingress that
 		// converges on it, which is right for the three that READ the row a
 		// moment ago — a changefeed re-read, a Set echo, a delete
-		// publication. A snapshot row is the one that may not have: this
-		// photograph can predate the very change the failed re-read was sent
-		// for, and a publication the fence deduplicated or rejected is the
-		// proof that it does. So the key earns its confirmation instead of
-		// inheriting it — the feed said this key moved, nobody could read it,
-		// and the photograph shows the pre-move revision, which leaves it
-		// unconfirmed until the next notification or a reconcile whose
-		// snapshot post-dates the move (that one is accepted, and notify says
-		// so).
+		// publication. A snapshot row is the one that never has: this
+		// photograph was taken at a moment nothing here knows, and it can
+		// predate the very change the failed re-read was sent for. So the key
+		// earns its confirmation instead of inheriting it, and it earns it
+		// from an ingress that read it back — the next notification, or a
+		// later reconcile.
+		//
+		// Asked of the photograph alone, and NOT of whether the publication
+		// advanced the cache. "It beat the cached revision" is not "it beat
+		// the announced one": a snapshot at an intermediate revision advances
+		// the cache, reports notify, and still shows a revision older than the
+		// change the feed announced — which left the scope reporting itself
+		// confirmed while permanently serving a stale row, with nothing on a
+		// connected feed to correct it.
 		//
 		// The delete path never needed this: recordFeedDelete marks the key
 		// touched at ARRIVAL, so a reconcile in flight skips its row entirely
 		// and returns above. Only the upsert path gets here.
-		if _, unusable := arm.window.unusable[nk]; unusable && !notify {
+		if _, unusable := arm.window.unusable[nk]; unusable {
 			sc.markUnconfirmed(nk)
 		}
 

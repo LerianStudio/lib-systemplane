@@ -925,6 +925,80 @@ func TestHeldReconcileDoesNotConfirmAKeyNobodyCouldReRead(t *testing.T) {
 	})
 }
 
+// TestASnapshotThatAdvancedTheCacheStillDoesNotConfirmTheKey is the sibling
+// case: the photograph that moves the cache forward and STILL predates the
+// change nobody could read back.
+//
+// "The snapshot row beat the cached revision" is not "it beat the announced
+// one". The key sits at revision 5, a held reconcile photographs revision 9,
+// the store then moves to 12 and stops answering, the feed announces 12 and
+// both re-reads fail. The held reconcile applies its revision-9 row: the fence
+// accepts it, the cache advances — and the scope reported itself confirmed
+// while permanently serving revision 9 of a row that holds 12, with no further
+// event ever due for a key nobody writes again.
+func TestASnapshotThatAdvancedTheCacheStillDoesNotConfirmTheKey(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+
+	forEachWindow(t, func(t *testing.T, window time.Duration) {
+		fs := newFakeStore()
+		e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, window)
+
+		fs.seed(scope, jsonRow(nk, 5, `"five"`, "ops"))
+		settled(t, e, scope)
+
+		release := heldList(fs)
+		t.Cleanup(release)
+
+		// An INTERMEDIATE photograph: ahead of the cache, behind the write its
+		// own re-read cannot see.
+		fs.freezeNextList([]store.Entry{jsonRow(nk, 9, `"nine"`, "ops")})
+
+		e.onEvent(resyncEvent(scope))
+		waitFor(t, hangGuard, "the reconcile to reach its List", func() bool {
+			return fs.listCount() >= 2
+		})
+
+		fs.seed(scope, jsonRow(nk, 12, `"twelve"`, "ops"))
+		fs.onGet(func(store.Scope, NSKey) error { return errors.New("pool exhausted") })
+
+		e.onEvent(upsertEvent(scope, nk, 12))
+
+		waitFor(t, hangGuard, "both re-reads to fail and record the key unconfirmed", func() bool {
+			return scopeUnconfirmed(t, e, scope) == 1
+		})
+
+		release()
+		waitReconcileIdle(t, e, scope)
+		quiesce(t, e)
+
+		got, ok := e.Lookup(scope, nk)
+		if !ok {
+			t.Fatal("Lookup reports a miss after the reconcile")
+		}
+
+		if !got.Stale {
+			t.Error("a snapshot that advanced the cache took back the unconfirmed record: the scope " +
+				"reports itself confirmed while serving a revision older than the one the feed " +
+				"announced, and nothing on a connected feed will ever correct it")
+		}
+
+		if got.Value != "nine" || got.Revision != 9 {
+			t.Errorf("value in force = (%v, rev %d), want the snapshot's (%q, rev 9)", got.Value, got.Revision, "nine")
+		}
+
+		// And an ingress that really reads the key takes the record back.
+		fs.onGet(nil)
+		e.onEvent(upsertEvent(scope, nk, 12))
+
+		waitFor(t, hangGuard, "the key to converge and report itself confirmed", func() bool {
+			got, ok := e.Lookup(scope, nk)
+
+			return ok && got.Value == "twelve" && got.Revision == 12 && !got.Stale
+		})
+	})
+}
+
 // TestRetryThatFindsNoRowForAnUpsertRecordsTheKeyUnconfirmed covers the one
 // terminal outcome of a repair that fell through every set.
 //
