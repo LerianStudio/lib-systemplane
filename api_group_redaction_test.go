@@ -25,10 +25,14 @@ const redactProbeMarker = "probe-secret-Xk93Qz"
 type redactRecorder struct {
 	mu    sync.Mutex
 	lines []string
-	value map[string]any
+	// levels runs parallel to lines, so a failure dump can say at what level
+	// each line went out without the level leading the rendered line that
+	// lineStarting matches by prefix.
+	levels []int
+	value  map[string]any
 }
 
-func (r *redactRecorder) Log(_ context.Context, _ int, msg string, fields ...any) {
+func (r *redactRecorder) Log(_ context.Context, level int, msg string, fields ...any) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -47,6 +51,21 @@ func (r *redactRecorder) Log(_ context.Context, _ int, msg string, fields ...any
 	}
 
 	r.lines = append(r.lines, rendered)
+	r.levels = append(r.levels, level)
+}
+
+// dump renders every recorded line with its level, for a failure message.
+func (r *redactRecorder) dump() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var b strings.Builder
+
+	for i, line := range r.lines {
+		fmt.Fprintf(&b, "\n  [%s] %s", log.LevelName(r.levels[i]), line)
+	}
+
+	return b.String()
 }
 
 func (r *redactRecorder) recorded() []string {
@@ -154,7 +173,7 @@ func TestGroupApplierPanicHonorsTheKeyRedaction(t *testing.T) {
 				panic(fmt.Sprintf("cannot apply %+v", a.Value))
 			})
 
-			assertNamesTheGroup(t, rec.lineStarting(t, "systemplane.group: apply function panicked"))
+			rec.assertNamesTheGroup(t, rec.lineStarting(t, "systemplane.group: apply function panicked"))
 
 			value := rec.panicValue(t)
 
@@ -193,7 +212,7 @@ func TestGroupApplierErrorHonorsTheKeyRedaction(t *testing.T) {
 
 			line := rec.lineStarting(t, "systemplane.group: apply function rejected the published document")
 
-			assertNamesTheGroup(t, line)
+			rec.assertNamesTheGroup(t, line)
 
 			if tt.wantVerbatim {
 				if !strings.Contains(line, redactProbeMarker) {
@@ -246,14 +265,18 @@ func (r *redactRecorder) lineStarting(t *testing.T, msg string) string {
 // group produces names the wrong group — and for a redacted group that report
 // is all an operator gets, because the document that would have identified it
 // is exactly what redaction withheld.
-func assertNamesTheGroup(t *testing.T, line string) {
+//
+// It hangs off the recorder, like its internal/group twin, so a miss dumps
+// every recorded line with its level and fields rather than only the one read.
+func (r *redactRecorder) assertNamesTheGroup(t *testing.T, line string) {
 	t.Helper()
 
 	// The leading space is load-bearing: it keeps "keyname=" from matching
 	// inside the rendered value of some other field.
 	for _, want := range []string{" namespace=" + redactGroupNamespace, " keyname=" + redactGroupKeyName} {
 		if !strings.Contains(line, want) {
-			t.Errorf("line = %q, want it to carry %q: the report must name the group Bind was given", line, want)
+			t.Errorf("line = %q, want it to carry %q: the report must name the group Bind was given; every line recorded:%s",
+				line, want, r.dump())
 		}
 	}
 }
