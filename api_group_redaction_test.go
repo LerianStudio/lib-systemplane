@@ -102,7 +102,7 @@ func redactGroup(
 
 	defaults := groupConfig{Name: redactProbeSecret, Retries: 1}
 
-	g, err := systemplane.Bind(c, "runtime", "ingest", defaults, nil,
+	g, err := systemplane.Bind(c, redactGroupNamespace, redactGroupKeyName, defaults, nil,
 		systemplane.WithRedaction(redaction))
 	if err != nil {
 		t.Fatalf("Bind: %v", err)
@@ -154,6 +154,8 @@ func TestGroupApplierPanicHonorsTheKeyRedaction(t *testing.T) {
 				panic(fmt.Sprintf("cannot apply %+v", a.Value))
 			})
 
+			assertNamesTheGroup(t, rec.lineStarting(t, "systemplane.group: apply function panicked"))
+
 			value := rec.panicValue(t)
 
 			if tt.wantVerbatim {
@@ -189,19 +191,9 @@ func TestGroupApplierErrorHonorsTheKeyRedaction(t *testing.T) {
 				return fmt.Errorf("cannot apply %+v", a.Value)
 			})
 
-			const rejection = "systemplane.group: apply function rejected the published document"
+			line := rec.lineStarting(t, "systemplane.group: apply function rejected the published document")
 
-			var line string
-
-			for _, l := range rec.recorded() {
-				if strings.HasPrefix(l, rejection) {
-					line = l
-				}
-			}
-
-			if line == "" {
-				t.Fatalf("no rejection line was logged; logged %v", rec.recorded())
-			}
+			assertNamesTheGroup(t, line)
 
 			if tt.wantVerbatim {
 				if !strings.Contains(line, redactProbeSecret) {
@@ -217,6 +209,52 @@ func TestGroupApplierErrorHonorsTheKeyRedaction(t *testing.T) {
 				t.Errorf("rejection line = %q, want the cause named by its dynamic type", line)
 			}
 		})
+	}
+}
+
+// redactGroupNamespace and redactGroupKeyName are the group redactGroup binds.
+// Two distinct non-empty literals, so an assertion that reads them back out of
+// a coordinator report is reading what Bind actually handed NewCoordinator.
+const (
+	redactGroupNamespace = "runtime"
+	redactGroupKeyName   = "ingest"
+)
+
+// lineStarting returns the last recorded line whose message is msg, and fails
+// the test when nothing carries it.
+func (r *redactRecorder) lineStarting(t *testing.T, msg string) string {
+	t.Helper()
+
+	var found string
+
+	for _, line := range r.recorded() {
+		if strings.HasPrefix(line, msg) {
+			found = line
+		}
+	}
+
+	if found == "" {
+		t.Fatalf("no %q line was logged; logged %v", msg, r.recorded())
+	}
+
+	return found
+}
+
+// assertNamesTheGroup pins the identity Bind hands the coordinator. Nothing
+// else does: swap the namespace and the key arguments at the NewCoordinator
+// call and the whole unit suite stays green, while every report a redacted
+// group produces names the wrong group — and for a redacted group that report
+// is all an operator gets, because the document that would have identified it
+// is exactly what redaction withheld.
+func assertNamesTheGroup(t *testing.T, line string) {
+	t.Helper()
+
+	// The leading space is load-bearing: it keeps "keyname=" from matching
+	// inside the rendered value of some other field.
+	for _, want := range []string{" namespace=" + redactGroupNamespace, " keyname=" + redactGroupKeyName} {
+		if !strings.Contains(line, want) {
+			t.Errorf("line = %q, want it to carry %q: the report must name the group Bind was given", line, want)
+		}
 	}
 }
 
