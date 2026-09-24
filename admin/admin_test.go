@@ -17,6 +17,8 @@ import (
 	obsconstants "github.com/LerianStudio/lib-observability/v4/constants"
 	systemplane "github.com/LerianStudio/lib-systemplane/v4"
 	"github.com/LerianStudio/lib-systemplane/v4/admin"
+	// Aliased: this file has local variables named store.
+	internalstore "github.com/LerianStudio/lib-systemplane/v4/internal/store"
 	"github.com/gofiber/fiber/v3"
 )
 
@@ -171,7 +173,12 @@ func (f *fakeStore) Calls() fakeStoreCalls {
 	}
 }
 
-func (f *fakeStore) Subscribe(_ context.Context, _ systemplane.TestScope, _ func(systemplane.TestEvent)) (func(), error) {
+func (f *fakeStore) Subscribe(_ context.Context, _ systemplane.TestScope, fn func(systemplane.TestEvent)) (func(), error) {
+	// Announce a connected changefeed (FC-2) so the engine's first reconcile
+	// runs and Start returns. Every other event is still discarded: this fake
+	// drives the admin handlers, not the changefeed.
+	fn(systemplane.TestEvent{Op: internalstore.OpResync})
+
 	return func() {}, nil
 }
 

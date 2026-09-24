@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -32,9 +33,16 @@ func dispatchEngine(t *testing.T) *Engine {
 
 	track(t, e, store.Scope{})
 
+	noDeliveryOutlivesTheTest(t, e)
+
 	t.Cleanup(func() {
 		cancel()
-		e.dispatchWG.Wait()
+		// closeWorkers before the drain, exactly as Close does: it is what
+		// makes giving up on the wait safe, because no straggler publication
+		// can then increment the WaitGroup while the drain goroutine is still
+		// inside Wait.
+		e.closeWorkers()
+		drainWorkers(e)
 	})
 
 	return e
@@ -96,6 +104,128 @@ func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool)
 	t.Fatalf("timed out after %s waiting for %s", timeout, what)
 }
 
+// panicLogger is a consumer logger that blows up once: on the next entry after
+// it is armed, and never again.
+//
+// It models the one thing that still ends a delivery worker's goroutine in
+// production. A panicking subscriber alone does not — deliver recovers it per
+// callback — but that recovery hands the panic to the CONSUMER's logger, and a
+// logger that panics too takes the whole goroutine out through
+// lib-observability's net at the top of it.
+//
+// Disarming as it fires is not tidiness: that net logs as well, and a logger
+// that panicked a second time would escape it and kill the process.
+type panicLogger struct {
+	log.Logger
+
+	armed atomic.Bool
+}
+
+func (l *panicLogger) Enabled(int) bool { return true }
+
+func (l *panicLogger) Log(context.Context, int, string, ...any) {
+	if l.armed.CompareAndSwap(true, false) {
+		panic("the consumer's logger blew up")
+	}
+}
+
+// deadRegistry panics on the ONE lookup it is armed for and answers normally
+// afterwards, so a worker dies mid-delivery and its replacement can still
+// deliver the next Change.
+type deadRegistry struct{ armed atomic.Bool }
+
+func (r *deadRegistry) Lookup(string, string) (KeyDef, bool) {
+	if r.armed.CompareAndSwap(true, false) {
+		panic("the registry blew up")
+	}
+
+	return KeyDef{}, false
+}
+
+func (r *deadRegistry) Keys() []NSKey { return nil }
+
+func (r *deadRegistry) AnyRedacted() bool { return false }
+
+// currentWorker reads the worker a scope would hand the next publication of
+// nk, under the lock that starts and sweeps one.
+func currentWorker(e *Engine, sc *scopeState, nk NSKey) *dispatchWorker {
+	e.workersMu.Lock()
+	defer e.workersMu.Unlock()
+
+	return sc.workers[nk]
+}
+
+// TestDispatchReplacesAWorkerWhosePanicEndedIt closes the last way a key can
+// go silent with nothing saying so.
+//
+// A panic that escapes runWorker ends that goroutine — the launcher's policy
+// is KeepRunning, which recovers and returns rather than restarting — while
+// the worker stayed in its scope's map and its marker in running. Every later
+// publication for that (scope, key) is then handed to a mailbox nobody drains
+// and lost silently until the scope is dropped or the engine closes, and a
+// Close that times out names a subscriber that has not been running since.
+//
+// Neither sweep covers it: a scope drop and a Close both end workers they can
+// see, and this one ended itself.
+//
+// The panic comes from the registry lookup deliver runs to decide whether the
+// key is redacted, because that is what can still escape: a subscriber's own
+// panic is recovered per callback, and reporting that recovery cannot unwind
+// either — reportRecovered swallows a broken logger and a broken metrics
+// recorder alike. What this test pins is the net under everything that is
+// left.
+//
+// That lookup is made lazily, in the recover branch, so the first subscriber
+// has to panic for the registry to be asked at all: the panicking callback is
+// the fuse, the exploding registry is the charge.
+func TestDispatchReplacesAWorkerWhosePanicEndedIt(t *testing.T) {
+	e := dispatchEngine(t)
+
+	reg := &deadRegistry{}
+	reg.armed.Store(true)
+	e.registry = reg
+
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	sc := e.scopeFor(store.Scope{})
+
+	var delivered recorder
+
+	unsub := e.OnChange(nk, func(ctx context.Context, ch Change) {
+		if ch.Revision == 1 {
+			panic("the subscriber blew up")
+		}
+
+		delivered.record(ctx, ch)
+	})
+	defer unsub()
+
+	e.dispatch(sc, pub(nk, 1, "one"))
+
+	dead := currentWorker(e, sc, nk)
+	if dead == nil {
+		t.Fatal("no worker was started for a subscribed key")
+	}
+
+	waitFor(t, hangGuard, "the scope to forget the worker whose goroutine the panic ended", func() bool {
+		return currentWorker(e, sc, nk) != dead
+	})
+
+	if got := runningCount(e); got != 0 {
+		t.Errorf("%d worker(s) still marked as inside a subscriber callback after the panic ended the "+
+			"goroutine, want 0: a Close that timed out would report a delivery nobody is running", got)
+	}
+
+	e.dispatch(sc, pub(nk, 2, "two"))
+
+	waitFor(t, hangGuard, "a replacement worker to deliver the next Change", func() bool {
+		return delivered.len() == 1
+	})
+
+	if got := delivered.changes()[0].Revision; got != 2 {
+		t.Errorf("the replacement worker delivered revision %d, want 2", got)
+	}
+}
+
 func pub(nk NSKey, revision int64, value any) publication {
 	return publication{NSKey: nk, Revision: revision, Value: value}
 }
@@ -132,6 +262,107 @@ func TestDispatchIsolatesKeys(t *testing.T) {
 	})
 
 	close(release)
+}
+
+// TestDispatchNeverOverlapsTwoDeliveriesOfOneKey pins what FC-4's "serialized
+// per (scope, key)" buys a subscriber: a newer revision of a key waits for the
+// callback handling the older one to RETURN, so a callback is never re-entered
+// concurrently for its own key and may carry state from one delivery to the
+// next without a lock of its own. The synchronous loop in deliver is the whole
+// mechanism — hand each subscriber its own goroutine there and the concurrency
+// counter below reaches 2.
+//
+// The negative half is asserted in the same test on purpose: serial per KEY is
+// not serial overall, so key B still delivers while key A is blocked. A
+// "fix" that funnelled every key through one worker would satisfy the
+// serialization assertion alone.
+func TestDispatchNeverOverlapsTwoDeliveriesOfOneKey(t *testing.T) {
+	e := dispatchEngine(t)
+	keyA := NSKey{Namespace: "billing", Key: "limits"}
+	keyB := NSKey{Namespace: "billing", Key: "quota"}
+
+	var (
+		mu      sync.Mutex
+		running int
+		maxRun  int
+	)
+
+	// started carries the revision of each delivery as it BEGINS, which is
+	// what separates "has not been delivered yet" from "is running now".
+	started := make(chan int64, 4)
+
+	// release frees the first delivery only: once.Do makes every later
+	// delivery of this key fall straight through.
+	release := make(chan struct{})
+
+	var once sync.Once
+
+	unsubA := e.OnChange(keyA, func(ctx context.Context, ch Change) {
+		mu.Lock()
+
+		running++
+		if running > maxRun {
+			maxRun = running
+		}
+
+		mu.Unlock()
+
+		started <- ch.Revision
+
+		once.Do(func() {
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+		})
+
+		mu.Lock()
+		running--
+		mu.Unlock()
+	})
+	defer unsubA()
+
+	var recB recorder
+
+	unsubB := e.OnChange(keyB, recB.record)
+	defer unsubB()
+
+	e.publishInto(pub(keyA, 1, "a1"))
+
+	if got := <-started; got != 1 {
+		t.Fatalf("first delivery carried revision %d, want 1", got)
+	}
+
+	// Revision 2 lands in key A's mailbox while the subscriber holding
+	// revision 1 is still inside its callback.
+	e.publishInto(pub(keyA, 2, "a2"))
+
+	// Key B is published behind it and delivers anyway: waiting for that is
+	// also what proves the runtime had every chance to start key A's second
+	// delivery before the check below says it never did.
+	e.publishInto(pub(keyB, 1, "b1"))
+	waitFor(t, hangGuard, "key b delivered while key a is blocked", func() bool {
+		return recB.len() == 1
+	})
+
+	select {
+	case rev := <-started:
+		t.Fatalf("revision %d started while the callback holding revision 1 had not returned", rev)
+	default:
+	}
+
+	close(release)
+
+	if got := <-started; got != 2 {
+		t.Fatalf("second delivery carried revision %d, want 2", got)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if maxRun != 1 {
+		t.Errorf("%d callbacks of one key ran at once, want never more than 1", maxRun)
+	}
 }
 
 func TestSubscriberMutationDoesNotAffectCache(t *testing.T) {
@@ -879,5 +1110,97 @@ func workerStopRace(t *testing.T, stop func(e *Engine, w *dispatchWorker)) {
 
 	if _, busy := e.running.Load(w); busy {
 		t.Error("the exited worker left its busy mark behind")
+	}
+}
+
+// TestOnChangePanicOnARedactedKeyWithholdsTheValue is the delivery half of the
+// same leak the validator has: a subscriber callback that panics naming the
+// configuration value it was handed.
+//
+// The callback is consumer code holding the decoded value of a key the
+// consumer itself registered as redacted, and the recovery around it reports
+// through lib-observability's handler, which prints the panic value at ERROR
+// whenever production mode is off — the shipped default. Delivery is the wider
+// door of the two: every subscriber of every published revision runs here.
+func TestOnChangePanicOnARedactedKeyWithholdsTheValue(t *testing.T) {
+	const secret = "redacted-callback-panic-sentinel-Vp3Hd"
+
+	nk := NSKey{Namespace: "billing", Key: "token"}
+
+	e := dispatchEngine(t)
+	logger := &recordingLogger{Logger: log.NewNop()}
+	e.logger = logger
+	e.registry = fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: "default", Redacted: true}}}
+
+	unsub := e.OnChange(nk, func(_ context.Context, ch Change) {
+		panic(fmt.Sprintf("cannot apply %v", ch.Value))
+	})
+	defer unsub()
+
+	e.publishInto(pub(nk, 1, secret))
+
+	waitFor(t, hangGuard, "the panicking delivery to be reported", func() bool {
+		return findLogged(logger, panicRecoveredMsg).Msg == panicRecoveredMsg
+	})
+
+	requirePanicWithheld(t, logger, "onchange", "string", secret)
+}
+
+// countingRegistry counts every Lookup so a test can assert what an ordinary
+// delivery costs. It answers from a fakeRegistry, so the key still resolves.
+type countingRegistry struct {
+	fakeRegistry
+
+	lookups atomic.Int64
+}
+
+func (r *countingRegistry) Lookup(namespace, key string) (KeyDef, bool) {
+	r.lookups.Add(1)
+
+	return r.fakeRegistry.Lookup(namespace, key)
+}
+
+// TestDeliveryReadsTheRegistryOnlyWhenACallbackPanics pins the cost of the
+// redaction gate on the hot path.
+//
+// deliver needs one bit — is this key registered redacted — and only when a
+// subscriber panics, which is rare. Reading it before the fan-out took the
+// registry's lock on EVERY delivery of EVERY subscribed key, contending with
+// Register and with every other ingress, to answer a question almost no
+// delivery asks.
+func TestDeliveryReadsTheRegistryOnlyWhenACallbackPanics(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	reg := &countingRegistry{fakeRegistry: fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: "fallback"}}}}
+
+	e := dispatchEngine(t)
+	e.registry = reg
+
+	sc := e.scopeFor(store.Scope{})
+
+	var calm recorder
+
+	unsub := e.OnChange(nk, calm.record)
+
+	e.dispatch(sc, pub(nk, 1, "one"))
+
+	waitFor(t, hangGuard, "the calm delivery", func() bool { return calm.len() == 1 })
+
+	if got := reg.lookups.Load(); got != 0 {
+		t.Errorf("a delivery nobody panicked on took %d registry lookup(s), want 0", got)
+	}
+
+	unsub()
+
+	unsubPanicking := e.OnChange(nk, func(context.Context, Change) { panic("the callback blew up") })
+	defer unsubPanicking()
+
+	e.dispatch(sc, pub(nk, 2, "two"))
+
+	waitFor(t, hangGuard, "the panicking callback to be reported", func() bool {
+		return reg.lookups.Load() > 0
+	})
+
+	if got := reg.lookups.Load(); got != 1 {
+		t.Errorf("reporting one panicking callback took %d registry lookup(s), want 1", got)
 	}
 }

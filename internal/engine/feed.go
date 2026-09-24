@@ -5,9 +5,11 @@ import (
 	"errors"
 	"time"
 
+	"github.com/LerianStudio/lib-commons/v7/commons/backoff"
 	"github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/runtime"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/safelog"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -22,6 +24,35 @@ const feedTimeout = 5 * time.Second
 // DEFAULT close timeout — a consumer that configures a close timeout below it
 // can still see a hung List hold shutdown until this bound expires.
 const defaultReconcileTimeout = 15 * time.Second
+
+// retryDelay is how long a re-read that could not answer waits before it is
+// tried again. It is deliberately a CONSTANT and not the consumer's debounce
+// window: the window sizes coalescing of a chatty key, and a consumer that
+// sets it to zero — or to five seconds — is saying nothing about how soon a
+// failed store call should be retried. Tying the two together made
+// WithDebounce(0) retry with no pause at all, on the changefeed goroutine, and
+// a long window delay the repair of a key nothing is notifying about.
+//
+// Short enough that a pool that blinked is repaired before an operator can
+// look, long enough that a store in real trouble is not hammered per key. It
+// is the CEILING of the wait, not the wait: retryWait draws each attempt from
+// [retryDelay/2, retryDelay), so the repairs a scope-wide failure armed do not
+// all land in the same instant, and none of them lands in no time at all.
+const retryDelay = 250 * time.Millisecond
+
+// retryWait is how long one repair pauses before it re-reads: half of
+// retryDelay flat, plus a jittered half.
+//
+// The floor is what makes the constant's promise true. Drawing the whole wait
+// from backoff.FullJitter(retryDelay) spreads the repairs a scope-wide failure
+// armed, but it spreads them over [0, retryDelay) with nothing underneath — so
+// a repair can re-read with no pause at all against the pool whose scarcity
+// refused the first read, which is the per-key hammering the constant exists
+// to rule out. Half the window flat keeps every repair off the store for at
+// least retryDelay/2; the jittered half keeps them from arriving together.
+func retryWait() time.Duration {
+	return retryDelay/2 + backoff.FullJitter(retryDelay/2)
+}
 
 // scopeNSKey is the debouncer's key: one quiet window per key per scope, so a
 // burst of notifications for one tenant's key never collapses another tenant's
@@ -47,10 +78,16 @@ type scopeNSKey struct {
 //     reloaded, so it is neither debounced per key nor re-read as an upsert:
 //     it arms the scope's reconcile window here, synchronously, and the reload
 //     itself runs on its own goroutine.
-//   - OpDelete publishes the registered default at revision 0 with no store
-//     read at all: a delete is self-describing.
+//   - OpDelete is fenced here, synchronously, and then re-read like an upsert:
+//     the store is the only thing that can say what the key holds NOW, and a
+//     delete that published blind reverted whatever the caller wrote after it.
+//     What the re-read finds decides the outcome — a row (the key was
+//     recreated) goes through the ingress at its own revision, an empty read
+//     puts the registered default in force at revision 0.
 //   - anything else is treated as an upsert: the store is re-read once the
-//     key's quiet window closes, and the row goes through the ingress.
+//     key's quiet window closes, and the row goes through the ingress. An
+//     empty read is then a non-answer rather than a removal, and the key keeps
+//     the value it holds.
 func (e *Engine) onEvent(evt store.Event) {
 	// An event that arrives while Close is running is dropped whole: there is
 	// nobody left to deliver it to, and answering it would create a scope or
@@ -118,10 +155,17 @@ func (e *Engine) onEvent(evt store.Event) {
 		return
 	}
 
-	if evt.Op == store.OpDelete {
-		e.applyDelete(evt.Scope, nk)
-
-		return
+	// A delete is counted the MOMENT it arrives, before the re-read below
+	// waits for the key's quiet window, and that is the half of a delete that
+	// cannot be deferred. Every revision beats the 0 a delete publishes, so a
+	// re-read already inside Store.Get when the DELETE commits comes back —
+	// under READ COMMITTED — holding the removed row and wins the publish
+	// fence with it. Counting the delete here refuses that reader from this
+	// instant; recording the key as touched does the same for a reconcile
+	// whose List was taken before the delete.
+	deleted := evt.Op == store.OpDelete
+	if deleted {
+		e.recordFeedDelete(evt.Scope, nk)
 	}
 
 	// With a real quiet window the debouncer fires the re-read on a timer
@@ -138,18 +182,156 @@ func (e *Engine) onEvent(evt store.Event) {
 	// by feedTimeout PLUS the consumer's validator, which is bounded by
 	// nothing, and every other key's notification waits behind it.
 	//
-	// Exactly one closure is built, in the branch that wants it. Building the
-	// inline one up front and overwriting it here cost one discarded heap
-	// allocation on every upsert event the feed delivers.
-	var refresh func()
+	// ONE such read, though, not two. A re-read that fails asks to be tried
+	// again, and routing that retry back through here doubled the outage every
+	// other key waited through — two full store calls, back to back, on the
+	// goroutine that delivers the whole scope's notifications. retryRefresh
+	// runs it as tracked work of its own instead.
+	//
+	// A delete takes the same per-key quiet window AND the same store read as
+	// an upsert; the op it carries only decides what an EMPTY read means. That
+	// is what fixed the inversion a self-describing delete used to cause: the
+	// echo of a Delete and the echo of the Set that followed it arrive on the
+	// feed in that order, and re-reading the store answers the delete with the
+	// row the write left behind instead of reverting the key to its registered
+	// default. Coalescing alone could not — it orders only the echoes that
+	// land inside one window, and a busy feed delivers most pairs further
+	// apart than that.
+	e.submitRefresh(evt.Scope, nk, deleted)
+}
+
+// submitRefresh queues nk's re-read behind the key's quiet window. Every
+// submission is a FIRST attempt: a retry never comes through here —
+// retryRefresh runs it off the feed goroutine as tracked work — which is what
+// bounds the one retry a re-read that could not answer asks for.
+//
+// Exactly one closure is built, in the branch that wants it: the two differ
+// only in whether the re-read registers itself as work Close waits for, and
+// building both would cost one discarded heap allocation on every event the
+// feed delivers.
+func (e *Engine) submitRefresh(scope store.Scope, nk NSKey, deleted bool) {
+	var work func()
 
 	if e.debounceAsync {
-		refresh = func() { e.trackedRefresh(evt.Scope, nk) }
+		work = func() { e.trackedRefresh(scope, nk, deleted) }
 	} else {
-		refresh = func() { e.refreshKey(evt.Scope, nk) }
+		work = func() { e.refreshKey(scope, nk, feedFence{}, deleted, false) }
 	}
 
-	e.debouncer.Submit(scopeNSKey{Tenant: evt.Scope.Tenant, Namespace: nk.Namespace, Key: nk.Key}, refresh)
+	e.debouncer.Submit(scopeNSKey{Tenant: scope.Tenant, Namespace: nk.Namespace, Key: nk.Key}, work)
+}
+
+// retryRefresh answers a re-read that could not say what the key holds: its
+// store call failed, or it panicked.
+//
+// Returning was the whole outcome, and every repair is then fenced out. A
+// delete has already recorded the key as touched at event arrival, so a
+// reconcile in flight skips it; the key's own fences stop nothing else from
+// asking; and a reconcile is armed only by an OpResync, so on a connection
+// that never drops nothing ever asks the store again. A row an operator
+// deleted therefore stayed in force at its old revision, reported as not
+// stale, for the life of the process.
+//
+// So the re-read is run once more, carrying the op it was serving: a transient
+// failure — a pool exhausted for a moment, one statement timeout — converges on
+// the retry.
+//
+// That retry runs OFF the changefeed goroutine, always, whatever the
+// consumer's quiet window, and it is the debouncer it no longer goes through.
+// Re-entering it meant that under WithDebounce(0), where Submit runs inline,
+// one failing event held the scope's single feed goroutine for two store calls
+// back to back and every other key's notification waited through both. It is
+// tracked work instead: registered in the WaitGroup Close drains, refused once
+// that door is shut, and waiting on the lifecycle context so a Close during the
+// pause costs nothing and leaves no goroutine behind. The pause is retryDelay
+// rather than the consumer's window, for the reason that constant states. What
+// the change gives up is coalescing with a fresh notification for the key, and
+// the key's own publish fence already decides that overlap: whichever read
+// carries the newer revision wins, and the loser is deduplicated away.
+//
+// A second failure is not transient, so THIS KEY is recorded as unconfirmed
+// and reads OF IT report Stale until some later ingress decides it — unless
+// one already has, which recordUnconfirmed is what answers. A scope-wide flag
+// was the wrong size for the fact, twice over: a reconcile already in flight
+// cleared it without ever having decided this key — a delete records the key
+// as touched at arrival, so the snapshot skips it — and on a connection that
+// never drops no OpResync ever arrives, so nothing cleared it at all and every
+// converged value in the scope reported itself unconfirmed for the life of the
+// process. Neither the disconnect generation nor the stale flag is touched
+// here: those belong to the connection, and this is one row.
+//
+// At most ONE retry is pending per key AND op, claimed through beginRetry: a
+// key the feed is hot on while the store is degraded would otherwise schedule
+// a second store call per failed read, doubling its pool checkouts exactly
+// while the pool is scarce. Two upserts still coalesce onto one repair, which
+// is what that bound is for. A DELETE owns a repair of its own, because the
+// two ops conclude opposite things from the same empty read: keyed by the key
+// alone, an upsert's pending repair refused the delete one, then ran as the
+// upsert it was armed for and kept the removed row in force at its old
+// revision — confirmed, with nothing left to ask on a connection that never
+// drops.
+//
+// Both outcomes are addressed to the state the re-read was armed on, by
+// IDENTITY, for the reason recordFeedOutcome states: a tenant dropped and
+// brought back up during the store call is a new state under the same scope
+// value, and neither a retry read under an entitlement this process no longer
+// holds nor an unconfirmed record raised by the dead state's failure belongs
+// to it. The delay is part of that window, so the goroutine re-asks the
+// question when its timer fires rather than trusting the answer it got a
+// quarter of a second ago.
+func (e *Engine) retryRefresh(sc *scopeState, nk NSKey, fence feedFence, deleted, retried bool) {
+	if sc == nil || e.trackedScope(sc.scope) != sc {
+		return
+	}
+
+	if retried {
+		sc.recordUnconfirmed(nk, fence)
+
+		return
+	}
+
+	rk := retryKey{nk: nk, deleted: deleted}
+
+	if !sc.beginRetry(rk) {
+		return
+	}
+
+	if !e.beginWork() {
+		// The door is shut and no goroutine will run, so the slot goes back:
+		// leaving it claimed would refuse every later retry of this key on a
+		// scope that outlived the race.
+		sc.endRetry(rk)
+
+		return
+	}
+
+	runtime.SafeGoWithContextAndComponent(e.dispatchContext(), e.logger,
+		"systemplane.engine", "retry", runtime.KeepRunning,
+		func(ctx context.Context) {
+			defer e.dispatchWG.Done()
+			defer sc.endRetry(rk)
+
+			// Floored and jittered, through the same primitive both backends
+			// reconnect with. A scope-wide read failure arms one repair per
+			// key and op, and a fixed constant fires every one of them at the
+			// same instant against the pool whose scarcity refused them — the
+			// engine's own reason for the first failure. retryWait spreads the
+			// single attempt over [retryDelay/2, retryDelay) instead.
+			if err := backoff.WaitContext(ctx, retryWait()); err != nil {
+				return
+			}
+
+			// Re-asked after the delay, not before it: the scope this retry
+			// was armed on may have been dropped — and a new state brought up
+			// under the same scope value — while the timer ran, and reading
+			// by scope value would hand that state a pool checkout and a
+			// verdict belonging to a tenant this process no longer serves.
+			if e.trackedScope(sc.scope) != sc {
+				return
+			}
+
+			e.refreshKey(sc.scope, nk, fence, deleted, true)
+		})
 }
 
 // trackedRefresh runs a debounced re-read as engine work Close waits for.
@@ -183,14 +365,14 @@ func (e *Engine) onEvent(evt store.Event) {
 // can be hot on at once, while the validator's share adds goroutines and the
 // values they hold rather than connections — a slow validator therefore shows
 // up as goroutine growth under a flapping feed, not as pool exhaustion.
-func (e *Engine) trackedRefresh(scope store.Scope, nk NSKey) {
+func (e *Engine) trackedRefresh(scope store.Scope, nk NSKey, deleted bool) {
 	if !e.beginWork() {
 		return
 	}
 
 	defer e.dispatchWG.Done()
 
-	e.refreshKey(scope, nk)
+	e.refreshKey(scope, nk, feedFence{}, deleted, false)
 }
 
 // recoverRefresh reports a panic raised under a changefeed re-read, naming the
@@ -221,6 +403,17 @@ func (e *Engine) trackedRefresh(scope store.Scope, nk NSKey) {
 // every frame between here and the panic have already run by the time this
 // one does, so the scope's reconcile mutex is free to take.
 //
+// That record goes into the state the re-read was armed on, which is why the
+// caller hands this a POINTER to its own resolution rather than the scope
+// value: the recovery is deferred before the scope is resolved, and resolving
+// one of its own afterwards would find whatever is live now. A tenant dropped
+// and brought back up during the store call is a new state, and fencing ITS
+// window with what the dead state's read failed to learn makes the
+// re-activation's own reconcile keep a cached value instead of repairing the
+// key. Nothing is recorded while the pointer is still nil — a panic raised
+// before the scope was resolved fences nobody — and recordFeedOutcome drops
+// the write when the state is no longer the tracked one.
+//
 // That fence is written FIRST, before any consumer code can run. Everything
 // below it is the consumer's — its logger, and whatever lib-observability's
 // handler calls into — and nothing bounds how long it holds this goroutine. A
@@ -230,10 +423,24 @@ func (e *Engine) trackedRefresh(scope store.Scope, nk NSKey) {
 //
 // HandlePanicValue rather than a re-panic into that net because only it
 // records panic_recovered_total and the span event: RecoverAndLog takes no
-// context and records neither. The recovered value stays out of the identity
-// line — it is whatever the panicking code was holding, and redacting it
-// belongs with the handler.
-func (e *Engine) recoverRefresh(scope store.Scope, nk NSKey) {
+// context and records neither. It is reached through reportConsumerPanic,
+// which emits the identity line and, for a key registered redacted, withholds
+// the recovered value: a driver that panics naming the row it was decoding is
+// holding that key's value, and the handler prints it unless production mode
+// is on.
+func (e *Engine) recoverRefresh(scope store.Scope, nk NSKey, deleted, retried bool, state **scopeState, origin *feedFence) {
+	// The two lines at the bottom are the CONSUMER's observability: its
+	// logger, and whatever lib-observability's handler reaches through
+	// InitPanicMetrics — a metrics recorder, and the raw logger the consumer
+	// handed that call, neither of which this engine wraps. A panic raised in
+	// there unwinds out of this recovery, and every goroutine a re-read can
+	// run on has an outer net that would then report the SAME broken logger's
+	// failure through that same logger. Swallowing it here ends the line one
+	// frame from where it started. Same guard, same reason, as
+	// internal/group's own panic handler. It is registered FIRST so it runs
+	// LAST: the repair below still runs on the way out.
+	defer safelog.Swallow()
+
 	recovered := recover()
 	if recovered == nil {
 		return
@@ -241,15 +448,34 @@ func (e *Engine) recoverRefresh(scope store.Scope, nk NSKey) {
 
 	ctx := e.dispatchContext()
 
-	e.recordFeedOutcome(scope, nk, false)
+	var sc *scopeState
 
-	e.logError(ctx, "systemplane.engine: changefeed re-read panicked",
-		log.String(constants.AttrKeyTenantID, scope.Tenant),
-		log.String("namespace", nk.Namespace),
-		log.String("keyname", nk.Key),
-	)
+	if state != nil {
+		sc = *state
 
-	runtime.HandlePanicValue(ctx, e.logger, recovered, "systemplane.engine", "refresh")
+		e.recordFeedOutcome(sc, nk, false)
+	}
+
+	// Deferred rather than called last, which is where it used to sit. It still
+	// RUNS last, after the reporting below; registering it first is what keeps
+	// the repair this function promises independent of the reporting surviving.
+	// Both lines below end up inside the consumer's logger, and the guard this
+	// engine puts under that logger covers the one it holds, not whatever
+	// lib-observability's handler reaches on its way to a sink.
+	var fence feedFence
+	if origin != nil {
+		fence = *origin
+	}
+
+	defer e.retryRefresh(sc, nk, fence, deleted, retried)
+
+	// After the repair is deferred, because this reads the registry and the
+	// registry is the consumer's: a Lookup that panics unwinds through the
+	// deferred retry above and dies in safelog.Swallow, rather than costing the
+	// key its re-read.
+	def, _ := e.lookup(nk.Namespace, nk.Key)
+
+	e.reportConsumerPanic(ctx, scope, nk, recovered, def.Redacted, "changefeed re-read panicked", "refresh")
 }
 
 // scopeForEvent resolves the scope a changefeed event, a reconcile or a
@@ -271,15 +497,29 @@ func (e *Engine) scopeForEvent(scope store.Scope, nk NSKey) *scopeState {
 		return sc
 	}
 
-	if e.debugEnabled() {
-		e.logDebug(e.dispatchContext(), "changefeed work for an untracked scope, dropping",
-			log.String(constants.AttrKeyTenantID, scope.Tenant),
-			log.String("namespace", nk.Namespace),
-			log.String("keyname", nk.Key),
-		)
-	}
+	e.logUntrackedDrop(scope, nk)
 
 	return nil
+}
+
+// logUntrackedDrop reports work the engine is dropping because the scope it
+// addresses is no longer the one being tracked — gone, or replaced by the
+// state a re-activation created.
+//
+// DEBUG, because it is the ordinary end of a subscription rather than a fault.
+// The level guard is inside rather than at the two call sites: this line runs
+// per event, not per failure, and the fields are built by the variadic before
+// the call, so asking first is what actually skips the work.
+func (e *Engine) logUntrackedDrop(scope store.Scope, nk NSKey) {
+	if !e.debugEnabled() {
+		return
+	}
+
+	e.logDebug(e.dispatchContext(), "changefeed work for an untracked scope, dropping",
+		log.String(constants.AttrKeyTenantID, scope.Tenant),
+		log.String("namespace", nk.Namespace),
+		log.String("keyname", nk.Key),
+	)
 }
 
 // markStale records that the scope's changefeed is down. The generation is
@@ -299,16 +539,26 @@ func (e *Engine) markStale(scope store.Scope) {
 	sc.disconnectGen++
 }
 
-// applyDelete publishes the registered default at revision 0 for a deleted
-// row. Revision 0 always wins the fence, so the delete is never deduplicated
-// away, and the key is recorded as touched so a reconcile running concurrently
-// does not resurrect the deleted row from its snapshot.
+// recordFeedDelete fences nk against everything already in flight, at the
+// instant the changefeed reports the row removed. It publishes nothing: what
+// goes in force is decided by the re-read the event schedules.
 //
-// The publication and the fence it writes are ONE atomic step. A reconcile
-// takes the same lock across its own check-and-apply pair, so it can no longer
-// read an empty fence, wait, and then republish a snapshot row that predates
-// this delete — which is exactly how a deleted key came back to life.
-func (e *Engine) applyDelete(scope store.Scope, nk NSKey) {
+// Two fences, because two kinds of reader can be holding the pre-delete row.
+// A changefeed re-read already inside Store.Get is refused by the delete
+// counter, which it captured before its call and compares afterwards. A
+// reconcile whose List was taken before the delete is refused by the touched
+// record, since every revision in its photograph beats the revision 0 a delete
+// leads to. Both are the half that cannot wait for the key's quiet window:
+// until the re-read runs, these two are the only things that could publish the
+// removed row back over the removal.
+//
+// Recording the key as touched is not a guess — the feed really does hold the
+// fresher fact about it from here on, and a reconcile that skips it keeps the
+// cached value until the re-read lands.
+//
+// The two locks are taken in the engine's standing order, reconcileMu then mu,
+// which is the order publish takes them under the ingress.
+func (e *Engine) recordFeedDelete(scope store.Scope, nk NSKey) {
 	sc := e.scopeForEvent(scope, nk)
 	if sc == nil {
 		return
@@ -317,27 +567,103 @@ func (e *Engine) applyDelete(scope store.Scope, nk NSKey) {
 	sc.reconcileMu.Lock()
 	defer sc.reconcileMu.Unlock()
 
-	if e.ingestDefault(e.dispatchContext(), sc, nk, true) {
+	sc.record(nk, true)
+	sc.bumpDeletes(nk)
+}
+
+// PublishDelete publishes the registered default at revision 0 for a deleted
+// row. Revision 0 always wins the fence, so the delete is never deduplicated
+// away, and the key is recorded as touched so a reconcile running concurrently
+// does not resurrect the deleted row from its snapshot.
+//
+// The publication and the fence it writes are ONE atomic step. A reconcile
+// takes the same lock across its own check-and-apply pair, so it can no longer
+// read an empty fence, wait, and then republish a snapshot row that predates
+// this delete — which is exactly how a deleted key came back to life.
+//
+// The Client's own Delete is its one caller. Leaving Delete to the feed alone
+// would make read-your-writes on a delete wait for a NOTIFY round trip, so the
+// caller's next read could still be answered by the value it just removed
+// (D4). It bumps the key's delete counter through publish, so a changefeed
+// re-read that was already in flight when the caller deleted is refused
+// exactly as it is for a delete the feed reports.
+//
+// The feed does NOT come through here. A notification says a row is gone, not
+// what the key holds now, and answering it without asking the store reverted
+// whatever the caller wrote next; the feed counts its delete at arrival and
+// re-reads instead (onEvent, refreshKey).
+//
+// Every refusal it can make is REPORTED, exactly as Publish reports a write's:
+// a nil or closed engine, a scope the engine does not track, a key nothing
+// registered, and a publication the engine or the scope went away under. All
+// of them mean the row is deleted in the store and the caller's next read in
+// this process still serves the value it removed — which is precisely what
+// Client.Delete must pass on rather than swallow.
+//
+// A nil error means exactly one thing: the next Lookup of this key in this
+// scope serves the registered default at revision 0, or something newer
+// published since. It does not mean subscribers have seen the removal — the
+// announcement is queued on the key's delivery worker, whose callbacks run
+// after this returns. Unlike Publish it carries no fence outcome, because
+// revision 0 never loses the fence.
+//
+// ctx is the REMOVER's context, the one the Client received from the caller of
+// Delete, and it is used for everything this path emits, exactly as Publish
+// uses the writer's. A removal runs on the consumer's own goroutine inside the
+// consumer's own span, and in multi-tenant mode the tenant the Client stamps
+// on every line is resolved from that context alone: logging the refusals
+// against the engine's background context detached each one from the request
+// that caused it and dropped the tenant with it.
+func (e *Engine) PublishDelete(ctx context.Context, scope store.Scope, nk NSKey) error {
+	// Exported, so this runs on the consumer's goroutine: the same guard
+	// Publish takes, for the same reason. The feed's own callers can never
+	// reach a nil or closed engine; a Client built by a path that never
+	// reached New can.
+	if e == nil || e.closed.Load() {
+		return ErrClosed
+	}
+
+	sc, err := e.writeScope(ctx, scope, nk)
+	if err != nil {
+		return err
+	}
+
+	sc.reconcileMu.Lock()
+	defer sc.reconcileMu.Unlock()
+
+	notify, err := e.ingestDefault(ctx, sc, nk, true)
+	if err != nil {
+		return err
+	}
+
+	if notify {
 		sc.record(nk, true)
 	}
+
+	return nil
 }
 
 // refreshKey re-reads one key and puts the row through the ingress. It is what
 // the debouncer invokes when a key's quiet window closes.
 //
-// Three outcomes that are not a publication, each deliberately different:
+// Three outcomes that are not the ordinary row, each deliberately different:
 //
 //   - a store error teaches the engine nothing, so the key is recorded as
 //     unusable and the cached value stands. The fence is written before the
 //     line, for the reason recoverRefresh states: the logger is the consumer's
 //     and a reconcile must never reach the key while it is still unfenced. An
 //     error that is the lifecycle context being canceled is a shutdown, not an
-//     incident, and logs at DEBUG.
-//   - not found keeps the current value and publishes nothing: the write may
-//     simply not be visible to this reader yet, and a real removal arrives as
-//     OpDelete, so this is expected rather than wrong and logs at DEBUG. It is
-//     recorded in neither set, so a concurrent reconcile's snapshot decides
-//     the key.
+//     incident, and logs at DEBUG. Any other error is retried once and then
+//     leaves the scope stale — retryRefresh says why the event cannot simply
+//     be dropped.
+//   - not found means different things for the two ops, which is the whole of
+//     what deleted decides. After an upsert the write may simply not be
+//     visible to this reader yet, so the current value stands and nothing is
+//     published: expected rather than wrong, logged at DEBUG, and recorded in
+//     neither set so a concurrent reconcile's snapshot decides the key —
+//     until the retry, which is the last read this repair gets and therefore
+//     records the key unconfirmed. After a DELETE the row really is gone, and
+//     publishAbsentDelete puts the registered default in force at revision 0.
 //   - a row the ingress rejects (undecodable or refused by the validator) is
 //     recorded as unusable, so a concurrent reconcile keeps the cached value
 //     instead of concluding the key is absent.
@@ -347,28 +673,54 @@ func (e *Engine) applyDelete(scope store.Scope, nk NSKey) {
 // through, so an exploding store call names its key whether the re-read was
 // tracked or inline. A validator that panics never reaches it — runValidator
 // turns that into an ordinary rejection.
-func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
-	defer e.recoverRefresh(scope, nk)
+//
+// All three of this function's writes into a scope — the publication, the
+// store error's fence, and the recovery's — are addressed by IDENTITY to the
+// state resolved before the store call, never by scope value. A tenant dropped
+// and brought back up during that round trip is a live state under the same
+// scope value, and both a publication and a fence written into it are wrong in
+// the same way: the row was read under an entitlement this process no longer
+// holds, and the new state's own reconcile is the only thing entitled to
+// decide the key. That is why sc is declared before the recovery is deferred
+// and handed to it by pointer.
+func (e *Engine) refreshKey(scope store.Scope, nk NSKey, origin feedFence, deleted, retried bool) {
+	var sc *scopeState
+
+	// origin, not the arming below, is what the retry bookkeeping is graded
+	// on: it is the fence the FIRST attempt of this repair armed, handed down
+	// by the goroutine running the retry, so a convergence that landed while
+	// that goroutine was waiting out its delay is still visible to the
+	// terminal branch. A first attempt arrives with it unarmed and adopts its
+	// own. The recovery is handed a pointer for the same reason it is handed
+	// one for the scope: both are established below it.
+	defer e.recoverRefresh(scope, nk, deleted, retried, &sc, &origin)
 
 	// Checked before the store call, not only after it: a re-read for a
 	// dropped tenant would otherwise open a connection to a database that
 	// tenant no longer has, to publish into a scope nothing tracks.
-	sc := e.scopeForEvent(scope, nk)
+	sc = e.scopeForEvent(scope, nk)
 	if sc == nil {
 		return
 	}
 
 	// Armed BEFORE the store call, because the whole question is what happened
 	// during it. A delete that lands while this read is in flight makes the row
-	// it comes back with older than the cache, however high its revision.
-	fence := sc.deleteFenceFor(nk)
+	// it comes back with older than the cache, however high its revision — and
+	// for a read that comes back empty, so does any publication at all, since
+	// the registered default it would publish wins the revision fence
+	// unconditionally.
+	fence := sc.fenceFor(nk)
+
+	if !origin.armed {
+		origin = fence
+	}
 
 	ctx, cancel := context.WithTimeout(e.dispatchContext(), feedTimeout)
 	defer cancel()
 
 	se, found, err := e.store.Get(ctx, scope, nk.Namespace, nk.Key)
 	if err != nil {
-		e.recordFeedOutcome(scope, nk, false)
+		e.recordFeedOutcome(sc, nk, false)
 
 		if e.canceledByShutdown(err) {
 			e.logDebug(ctx, "changefeed re-read canceled during shutdown",
@@ -376,19 +728,77 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
 				log.String("namespace", nk.Namespace),
 				log.String("keyname", nk.Key),
 			)
-		} else {
-			e.logWarn(ctx, "changefeed re-read failed, keeping current value",
-				log.String(constants.AttrKeyTenantID, scope.Tenant),
-				log.String("namespace", nk.Namespace),
-				log.String("keyname", nk.Key),
-				log.Err(err),
-			)
+
+			// No retry: there is nothing left to converge on, and the engine
+			// is about to stop answering this scope at all.
+			return
+		}
+
+		// Scheduled BEFORE the line, for the reason the fence above is
+		// written before it: the logger is the consumer's and nothing bounds
+		// how long it holds this goroutine, and at a zero quiet window that
+		// goroutine is the changefeed's. Everything the repair needs is
+		// already decided here.
+		e.retryRefresh(sc, nk, origin, deleted, retried)
+
+		e.logWarn(ctx, "changefeed re-read failed, keeping current value",
+			log.String(constants.AttrKeyTenantID, scope.Tenant),
+			log.String("namespace", nk.Namespace),
+			log.String("keyname", nk.Key),
+			log.Err(err),
+		)
+
+		return
+	}
+
+	// The scope is resolved again because it can be dropped during the store
+	// round trip, and nothing this read learned may bring it back. It is
+	// compared by IDENTITY, exactly as applyScope compares before applying a
+	// snapshot: a tenant dropped and brought back up meanwhile is a NEW state
+	// under the same scope value, so a by-value check finds a live scope and
+	// publishes a row read under an entitlement this process no longer holds.
+	// The delete fence cannot stand in for that — it counts deletes, and a
+	// fresh state's counter starts at zero, so for the ordinary key that has
+	// never been deleted it compares zero against zero and lets the row
+	// through. The new state reconciles the key from the store itself.
+	//
+	// It gates BOTH conclusions, not only the row: the registered default a
+	// delete's empty read publishes is as much a decision about the key as a
+	// value is, and the dropped state is entitled to neither.
+	if live := e.scopeForEvent(scope, nk); live != sc {
+		// scopeForEvent already reported the scope that is simply gone. This
+		// line is the other half: a state that IS tracked, under the same
+		// scope value, whose row this re-read is not entitled to hand over.
+		// Both are drops, and a drop nothing says a word about is one an
+		// operator chasing a key that never updated cannot see.
+		if live != nil {
+			e.logUntrackedDrop(scope, nk)
 		}
 
 		return
 	}
 
 	if !found {
+		if deleted {
+			e.publishAbsentDelete(ctx, sc, scope, nk, fence)
+
+			return
+		}
+
+		// A FIRST attempt records the key nowhere: the write may simply not
+		// be visible to this reader yet, and a reconcile in flight holds the
+		// better answer. A retry is the end of the line — the second read
+		// that could not say what the key holds — so it is terminal exactly
+		// as a second store error is, and the key stands as unconfirmed
+		// unless a later ingress already decided it. Left out of both sets it
+		// fell through every repair: the cached value went on being served,
+		// at its old revision, reported as confirmed, with nothing left to
+		// ask. Recorded before the line below, for the reason the store-error
+		// path states.
+		if retried {
+			sc.recordUnconfirmed(nk, origin)
+		}
+
 		e.logDebug(ctx, "changefeed re-read found no row, keeping current value",
 			log.String(constants.AttrKeyTenantID, scope.Tenant),
 			log.String("namespace", nk.Namespace),
@@ -399,38 +809,81 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey) {
 	}
 
 	// The publication and the fence it writes are one atomic step, for the
-	// same reason as in applyDelete: a reconcile deciding this key must see
+	// same reason as in PublishDelete: a reconcile deciding this key must see
 	// either both or neither, never an empty fence followed by this
 	// publication. The store read above deliberately stays outside the lock —
 	// holding it across a network round trip would stall every reconcile of
 	// the scope, and so does the validator ingest runs before taking it.
-	// The scope is resolved again because it can be dropped during that round
-	// trip, and this publication must not bring it back. It is compared by
-	// IDENTITY, exactly as applyScope compares before applying a snapshot: a
-	// tenant dropped and brought back up meanwhile is a NEW state under the
-	// same scope value, so a by-value check finds a live scope and publishes a
-	// row read under an entitlement this process no longer holds. The delete
-	// fence cannot stand in for that — it counts deletes, and a fresh state's
-	// counter starts at zero, so for the ordinary key that has never been
-	// deleted it compares zero against zero and lets the row through. The new
-	// state reconciles the key from the store itself.
-	if e.scopeForEvent(scope, nk) != sc {
+	// A changefeed row is graded here and nowhere else, so the outcome is the
+	// ingress's own business: no caller is waiting to be told.
+	_ = e.ingest(ctx, sc, se, fence, false)
+}
+
+// publishAbsentDelete puts the registered default in force at revision 0 for a
+// key the changefeed reported deleted and whose row the re-read then found
+// gone. It is the one outcome that concludes something from an EMPTY read, and
+// the op is what entitles it to: an upsert's empty read is a non-answer, a
+// delete's is the removal itself.
+//
+// What it publishes wins the revision fence unconditionally, so it is graded
+// on the wider question instead: anything at all having landed on the key
+// since the read began means the cache holds a fact this read did not see. The
+// case that matters is the caller's own Set, published for read-your-writes
+// (D4) the moment the store acknowledged it, while this reader was still
+// inside a Store.Get that could not yet see the row — publishing the default
+// on top of it would revert a write the caller has already been told landed.
+// A refusal publishes nothing and records nothing: whatever won recorded
+// itself.
+//
+// The delete counter is NOT bumped again here. The feed counted this delete at
+// event arrival, which is what refused every re-read already in flight, and a
+// second bump would refuse a re-read armed after it for a delete it had
+// already seen.
+//
+// The scope is resolved by the caller and compared by identity there, and the
+// publication and the fence it writes are one step under reconcileMu, for the
+// reasons refreshKey and PublishDelete state.
+func (e *Engine) publishAbsentDelete(ctx context.Context, sc *scopeState, scope store.Scope, nk NSKey, fence feedFence) {
+	sc.reconcileMu.Lock()
+	defer sc.reconcileMu.Unlock()
+
+	if sc.supersededByPublication(nk, fence) {
+		e.logDebug(ctx, "changefeed delete superseded by a later publication, keeping current value",
+			log.String(constants.AttrKeyTenantID, scope.Tenant),
+			log.String("namespace", nk.Namespace),
+			log.String("keyname", nk.Key),
+		)
+
 		return
 	}
 
-	e.ingest(ctx, sc, se, fence)
+	// The feed's own ingress: nothing is waiting to be told, and the only
+	// errors ingestDefault reports here are a scope going away and a key the
+	// caller already confirmed registered.
+	if notify, _ := e.ingestDefault(ctx, sc, nk, false); notify {
+		sc.record(nk, true)
+	}
 }
 
-// recordFeedOutcome tells every reconcile in flight what the feed learned
-// about nk, and is a no-op otherwise: the fences only exist for the window
-// between a reconcile's List and its application.
+// recordFeedOutcome tells every reconcile in flight ON sc what the feed
+// learned about nk, and is a no-op otherwise: the fences only exist for the
+// window between a reconcile's List and its application.
 //
-// It is for outcomes with no publication of their own — a re-read that
-// errored. Anything that DOES publish holds reconcileMu across the pair and
+// It is for outcomes with no publication of their own — a re-read that errored
+// or panicked. Anything that DOES publish holds reconcileMu across the pair and
 // calls record directly, so the two are indivisible to a reconcile.
-func (e *Engine) recordFeedOutcome(scope store.Scope, nk NSKey, usable bool) {
-	sc := e.scopeForEvent(scope, nk)
-	if sc == nil {
+//
+// The caller passes the state its re-read was armed on, and the write is
+// dropped unless that state is still the one being tracked. Resolving the
+// scope by VALUE here was the hole: a tenant dropped and brought back up
+// inside Store.Get is a new state under the same scope value, and recording
+// "unusable" into ITS window makes the re-activation's own reconcile keep a
+// cached value for a key the snapshot no longer carries — a tenant left on a
+// configuration the store does not have, reporting itself fresh, until some
+// later reconnect. The publishing path refuses the same state by the same
+// identity; this closes the two paths that publish nothing.
+func (e *Engine) recordFeedOutcome(sc *scopeState, nk NSKey, usable bool) {
+	if sc == nil || e.trackedScope(sc.scope) != sc {
 		return
 	}
 
@@ -502,8 +955,14 @@ func (e *Engine) logDebug(ctx context.Context, msg string, fields ...log.Field) 
 
 // logError reports something an operator has to act on — a panic raised under
 // engine work. A nil logger is a no-op, like logWarn.
+//
+// A nil ENGINE is a no-op too, which logWarn and logDebug do not need to be:
+// this one is reached from reportConsumerPanic, and the Client grades a value
+// through RunValidator before anything has confirmed an engine exists, so a
+// validator that panics there would otherwise take the caller's goroutine down
+// on the line meant to report it.
 func (e *Engine) logError(ctx context.Context, msg string, fields ...log.Field) {
-	if e.logger == nil {
+	if e == nil || e.logger == nil {
 		return
 	}
 

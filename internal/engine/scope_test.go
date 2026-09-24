@@ -107,3 +107,37 @@ func TestNewScopeStartsStale(t *testing.T) {
 		t.Error("stale: got false, want true before the scope's first reconcile")
 	}
 }
+
+// TestLookupOnUntrackedScopeCreatesNoScope pins the resolver Lookup goes
+// through, not just its answer. A miss alone proves nothing — an empty tracked
+// scope misses too — so the assertion is on the map: a read addressed to a
+// scope the engine does not track must leave e.scopes exactly as it found it.
+// Resolving through scopeFor instead would conjure a permanently stale,
+// permanently unfed scope on every multi-tenant read.
+func TestLookupOnUntrackedScopeCreatesNoScope(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+
+	sc := newScopeState(store.Scope{})
+	sc.entries[nk] = entry{Value: "cached", Revision: 1}
+
+	e := engineTracking(sc)
+	before := scopeCount(e)
+
+	if got, ok := e.Lookup(store.Scope{Tenant: "t1"}, nk); ok || got != (Entry{}) {
+		t.Errorf("Lookup on an untracked scope: got (%+v, %t), want (Entry{}, false)", got, ok)
+	}
+
+	if after := scopeCount(e); after != before {
+		t.Errorf("scopes tracked: got %d, want %d: a read created a scope nothing feeds", after, before)
+	}
+}
+
+// scopeCount reads the number of scopes the engine tracks under the same lock
+// every resolver takes, so the -race detector does not see the assertion
+// itself as the bug.
+func scopeCount(e *Engine) int {
+	e.scopesMu.RLock()
+	defer e.scopesMu.RUnlock()
+
+	return len(e.scopes)
+}

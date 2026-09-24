@@ -201,7 +201,9 @@ func TestReconcileKeepsRecreatedValueOverListSnapshot(t *testing.T) {
 
 	// A delete and a recreate reach the feed while the snapshot is held. The
 	// recreated row carries revision 1, lower than the snapshot's revision 5,
-	// so only the touched fence can keep it.
+	// so only the touched fence can keep it. The row is removed before the
+	// delete's notification, because its re-read is what decides the key.
+	fs.remove(scope, nk)
 	e.onEvent(deleteEvent(scope, nk))
 	fs.seed(scope, jsonRow(nk, 1, `"recreated"`, "ops"))
 	e.onEvent(upsertEvent(scope, nk, 1))
@@ -1401,8 +1403,11 @@ func TestConcurrentFeedDeleteIsNotResurrected(t *testing.T) {
 // on a stable connection, never, and two processes of one consumer then
 // disagree about a key an operator deleted.
 //
-// The row deliberately stays in the store double. A reader whose snapshot
-// predates the commit still sees it, and that reader is the whole hazard.
+// The row is removed from the store double when the DELETE commits, and the
+// double answers every Get from the row as it stood when that call STARTED. So
+// the held reader still sees the row it began on, while a read that starts
+// after the commit finds nothing — which is the pair of facts the fence has to
+// tell apart.
 func TestDeleteIsNotResurrectedByAnInFlightReRead(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 	scope := store.Scope{}
@@ -1465,6 +1470,7 @@ func TestDeleteIsNotResurrectedByAnInFlightReRead(t *testing.T) {
 
 			<-inGet
 
+			fs.remove(scope, nk)
 			e.onEvent(deleteEvent(scope, nk))
 
 			releaseGet()
@@ -1863,11 +1869,11 @@ func TestFailedReconcileLeavesTheNewerWindowArmed(t *testing.T) {
 //
 // The changefeed's re-read records BOTH outcomes: a value it published, and a
 // row it could not use. Set recorded only the first, so a write whose stored
-// value the registered validator rejects left both fences empty — and a
-// reconcile holding a photograph taken before that write then found the key
-// absent, concluded the row was gone, and published the registered default at
-// revision 0 over the value that was cached. One transient rejection, one
-// silent config reset, announced to every subscriber.
+// bytes the ingress cannot use left both fences empty — and a reconcile
+// holding a photograph taken before that write then found the key absent,
+// concluded the row was gone, and published the registered default at revision
+// 0 over the value that was cached. One transient rejection, one silent config
+// reset, announced to every subscriber.
 func TestPublishRecordsARejectedWriteAgainstAConcurrentReconcile(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 	scope := store.Scope{}
@@ -1902,11 +1908,16 @@ func TestPublishRecordsARejectedWriteAgainstAConcurrentReconcile(t *testing.T) {
 
 	waitFor(t, time.Second, "the reconcile to reach its List", func() bool { return fs.listCount() >= 2 })
 
-	// A Set whose persisted value the registered validator refuses: the row is
-	// in the store, and the engine learned nothing usable from it.
-	row := jsonRow(nk, 4, `42`, "ops")
+	// A Set whose persisted bytes the ingress cannot decode: the row is in the
+	// store, and the engine learned nothing usable from it. Decoding is the
+	// refusal the write path can still make — the registered validator graded
+	// this value at Client.Set and the engine does not run it again.
+	row := jsonRow(nk, 4, `{not json`, "ops")
 	fs.seed(scope, row)
-	e.Publish(context.Background(), scope, row)
+
+	if err := e.Publish(context.Background(), scope, row); err == nil {
+		t.Fatal("Publish reported success for bytes it could not decode")
+	}
 
 	release()
 

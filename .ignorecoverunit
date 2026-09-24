@@ -23,9 +23,5 @@ internal/mongodb/mongodb.go
 internal/mongodb/mongodb_changestream.go
 internal/mongodb/mongodb_crud.go
 
-# Manager LISTEN/schema paths are Postgres I/O paths covered by integration tests.
-internal/manager/listen.go
-internal/manager/schema.go
-
 # Build-tagged test helper for out-of-package tests, not production code.
 internal/client/client_testing.go

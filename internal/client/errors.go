@@ -3,6 +3,7 @@ package client
 import (
 	"errors"
 
+	"github.com/LerianStudio/lib-systemplane/v4/internal/engine"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -40,13 +41,14 @@ var (
 	// WithMultiTenantEnabled().
 	ErrNotSupportedInMultiTenant = store.ErrNotSupportedInMultiTenant
 
+	// ErrCloseTimeout is returned by Close when a subscriber callback was
+	// still running after the WithCloseTimeout bound elapsed. Aliased to
+	// engine.ErrCloseTimeout so errors.Is matches the error the engine
+	// actually returns, the same way ErrValidation aliases the store's.
+	ErrCloseTimeout = engine.ErrCloseTimeout
+
 	// ErrTenantConnectionMissing is returned when a method runs in multi-tenant
 	// mode and the caller's context carries no tenant database for the
 	// configured module.
 	ErrTenantConnectionMissing = store.ErrTenantConnectionMissing
-
-	// errValidatorPanicked reports that a key's registered validator panicked
-	// while grading a value read back from the store. It is never returned to a
-	// caller: hydration and refresh log it and keep the value already in force.
-	errValidatorPanicked = errors.New("systemplane: validator panicked")
 )

@@ -39,6 +39,8 @@ func registryEngine(t *testing.T, reg Registry, fs *fakeStore, window time.Durat
 
 	track(t, e, store.Scope{})
 
+	noDeliveryOutlivesTheTest(t, e)
+
 	t.Cleanup(func() {
 		e.debouncer.Close()
 		e.lifecycleCancel()
@@ -46,7 +48,7 @@ func registryEngine(t *testing.T, reg Registry, fs *fakeStore, window time.Durat
 		// or reconcile that reached the WaitGroup while this Wait ran would
 		// kill the test binary rather than fail a test.
 		e.closeWorkers()
-		e.dispatchWG.Wait()
+		drainWorkers(e)
 	})
 
 	return e
@@ -144,6 +146,9 @@ func TestDeleteEventPublishesDefaultAtRevisionZero(t *testing.T) {
 
 	readsBeforeDelete := fs.getCount()
 
+	// The DELETE committed, so the row is gone before its notification is
+	// delivered. What the re-read finds is what decides the key.
+	fs.remove(store.Scope{}, nk)
 	e.onEvent(deleteEvent(store.Scope{}, nk))
 	waitFor(t, time.Second, "the delete delivery", func() bool { return rec.len() == 2 })
 
@@ -164,8 +169,84 @@ func TestDeleteEventPublishesDefaultAtRevisionZero(t *testing.T) {
 		t.Errorf("delivered revisions: got %v, want the second to be 0", revs)
 	}
 
-	if after := fs.getCount(); after != readsBeforeDelete {
-		t.Errorf("delete triggered %d store read(s), want 0: a delete is self-describing", after-readsBeforeDelete)
+	if after := fs.getCount(); after != readsBeforeDelete+1 {
+		t.Errorf("delete triggered %d store read(s), want 1: a delete says a row is gone, not what the "+
+			"key holds now", after-readsBeforeDelete)
+	}
+}
+
+// TestFeedDeleteDoesNotRevertTheWriteThatFollowedIt is the regression for the
+// inversion a self-describing delete used to cause.
+//
+// A caller deletes a key and writes it again. Both are published locally the
+// moment the store acknowledges them (D4), so the value in force is already
+// the new row when their echoes arrive on the feed, in the order the store
+// produced them: OpDelete, then OpUpsert. The delete carries revision 0, which
+// always wins the publish fence, so applied on arrival it reverted a write
+// that had already succeeded — Lookup served the registered default for a
+// quiet window, and every subscriber took a spurious Revision 0 delivery — and
+// only the upsert's debounced re-read repaired it.
+//
+// Sharing that window is what orders the two: the upsert replaces the pending
+// delete instead of landing behind it, so the pair collapses to the write.
+func TestFeedDeleteDoesNotRevertTheWriteThatFollowedIt(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 20*time.Millisecond)
+
+	var rec recorder
+
+	unsub := e.OnChange(nk, rec.record)
+	defer unsub()
+
+	// The caller's own Delete, then its own Set, each published as it returned.
+	if err := e.PublishDelete(context.Background(), scope, nk); err != nil {
+		t.Fatalf("PublishDelete: %v", err)
+	}
+
+	row := jsonRow(nk, 7, `"written"`, "actor")
+	fs.seed(scope, row)
+	e.Publish(context.Background(), scope, row)
+
+	waitFor(t, time.Second, "the write's delivery", func() bool {
+		revs := rec.revisions()
+
+		return len(revs) > 0 && revs[len(revs)-1] == 7
+	})
+
+	delivered := rec.len()
+
+	// Their echoes, in the order the store produced them. The delete arrives
+	// first and carries revision 0.
+	e.onEvent(deleteEvent(scope, nk))
+
+	if got, _ := e.Lookup(scope, nk); got.Value != "written" || got.Revision != 7 {
+		t.Fatalf("value in force the moment the delete echo arrived: got (%v, rev %d), want "+
+			"(\"written\", rev 7): the echo of a delete reverted a write made after it", got.Value, got.Revision)
+	}
+
+	e.onEvent(upsertEvent(scope, nk, 7))
+
+	waitFor(t, time.Second, "the coalesced re-read", func() bool { return fs.getCount() > 0 })
+	quiesce(t, e)
+
+	got, ok := e.Lookup(scope, nk)
+	if !ok {
+		t.Fatal("Lookup reports a miss after the echoes of a delete and the write that followed it")
+	}
+
+	if got.Value != "written" || got.Revision != 7 {
+		t.Errorf("value in force after both echoes: got (%v, rev %d), want (\"written\", rev 7)", got.Value, got.Revision)
+	}
+
+	for _, ch := range rec.changes()[delivered:] {
+		if ch.Revision == 0 {
+			t.Errorf("delivered revisions: got %v, want no Revision 0 after the write: subscribers "+
+				"were handed the registered default for a key the caller had just written", rec.revisions())
+
+			break
+		}
 	}
 }
 
@@ -547,9 +628,10 @@ func TestUpsertEventNeverBlocksOnASubscriber(t *testing.T) {
 }
 
 // TestDeleteEventNeverBlocksOnASubscriber is the same rule for the delete
-// path, which reaches publish without passing through the debouncer: a delete
-// is self-describing, so it is applied inline on the changefeed goroutine and
-// would be the one operation able to park that goroutine in a subscriber.
+// path. A delete is self-describing, so the debouncer it shares with an upsert
+// has no store read to schedule: at the zero quiet window this test uses it is
+// applied inline on the changefeed goroutine, which makes it the one operation
+// able to park that goroutine in a subscriber.
 func TestDeleteEventNeverBlocksOnASubscriber(t *testing.T) {
 	keyA := NSKey{Namespace: "billing", Key: "a"}
 	keyB := NSKey{Namespace: "billing", Key: "b"}
@@ -713,5 +795,96 @@ func TestForeignUpsertEventCostsNoStoreRead(t *testing.T) {
 				t.Errorf("store reads for an upsert on a key this process never registered: got %d, want 0", reads)
 			}
 		})
+	}
+}
+
+// TestPublishDeleteOnUntrackedScopeCreatesNoScope covers the path the Client's
+// own Delete takes in multi-tenant mode and before Start: there is no tracked
+// scope, and an exported publication must drop rather than bring one up. A
+// scope created here would have no changefeed behind it, no reconcile to
+// confirm it and a delivery worker registered in the WaitGroup Close drains —
+// a cache that reads as current forever.
+func TestPublishDeleteOnUntrackedScopeCreatesNoScope(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	fs := newFakeStore()
+	e := untrackedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs)
+
+	if err := e.PublishDelete(context.Background(), store.Scope{}, nk); !errors.Is(err, ErrScopeNotTracked) {
+		t.Errorf("PublishDelete into an untracked scope: got %v, want errors.Is ErrScopeNotTracked", err)
+	}
+
+	if got := scopeCount(e); got != 0 {
+		t.Errorf("scopes tracked after PublishDelete: got %d, want 0", got)
+	}
+
+	if got, ok := e.Lookup(store.Scope{}, nk); ok || got != (Entry{}) {
+		t.Errorf("Lookup after PublishDelete on an untracked scope: got (%+v, %t), want (Entry{}, false)", got, ok)
+	}
+}
+
+// untrackedEngine is registryEngine without the scope: an engine that has been
+// built but never brought a scope up, which is what the Client holds in
+// multi-tenant mode and before Start.
+func untrackedEngine(t *testing.T, defs map[NSKey]KeyDef, fs *fakeStore) *Engine {
+	t.Helper()
+
+	e := New(Config{Store: fs, Registry: fakeRegistry{defs: defs}, Debounce: 0})
+
+	noDeliveryOutlivesTheTest(t, e)
+
+	t.Cleanup(func() {
+		e.debouncer.Close()
+		e.lifecycleCancel()
+		e.closeWorkers()
+		drainWorkers(e)
+	})
+
+	return e
+}
+
+// TestPublishDeleteRecordsTheKeyAsTouched is the exported entry point standing
+// in for the feed in the scenario the delete fence exists for: a reconcile's
+// photograph still carries the row, and the caller deletes the key while that
+// List is held open. The snapshot row is NEWER than the revision-0 default a
+// delete publishes, so the revision fence alone lets it back in; only the
+// touched record keeps the deleted key dead. A Client Delete has to write that
+// record too, or a delete issued during a reconnect is undone by the snapshot.
+func TestPublishDeleteRecordsTheKeyAsTouched(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 0)
+
+	fs.seed(scope, jsonRow(nk, 5, `"five"`, "ops"))
+	settled(t, e, scope)
+
+	release := heldList(fs)
+	defer release()
+
+	fs.freezeNextList([]store.Entry{jsonRow(nk, 5, `"five"`, "ops")})
+
+	e.onEvent(disconnectEvent(scope))
+	e.onEvent(resyncEvent(scope))
+
+	waitFor(t, hangGuard, "the reconcile to reach its List", func() bool { return fs.listCount() >= 2 })
+
+	fs.remove(scope, nk)
+
+	if err := e.PublishDelete(context.Background(), scope, nk); err != nil {
+		t.Fatalf("PublishDelete: %v", err)
+	}
+
+	release()
+	waitReconcileIdle(t, e, scope)
+	quiesce(t, e)
+
+	got, ok := e.Lookup(scope, nk)
+	if !ok {
+		t.Fatal("Lookup reports a miss after a delete that spanned a reconcile")
+	}
+
+	if got.Value != "fallback" || got.Revision != 0 {
+		t.Errorf("after the delete: got (%v, rev %d), want the registered default at rev 0: "+
+			"the reconcile's snapshot resurrected a key the caller deleted", got.Value, got.Revision)
 	}
 }

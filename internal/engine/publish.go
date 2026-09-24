@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bytes"
+	"fmt"
 	"reflect"
 	"time"
 
@@ -25,16 +26,25 @@ type publication struct {
 	Raw []byte
 	// Deleted marks the one publication that is a row's REMOVAL rather than a
 	// value: it bumps the key's delete counter, which is what a changefeed
-	// re-read still inside its store call is fenced against. A reconcile
-	// publishing the default for a key its photograph did not carry is not a
-	// delete — see entry.Deletes.
+	// re-read still inside its store call is fenced against. Only a caller's
+	// own Delete sets it — the changefeed counts its delete at event arrival
+	// instead, before the re-read that answers it. A reconcile publishing the
+	// default for a key its photograph did not carry is not a delete either —
+	// see keyFence.
 	Deleted   bool
 	UpdatedAt time.Time
 	UpdatedBy string
 }
 
 // publish applies pub to its scope's cache under the revision fence and
-// reports whether subscribers must be notified.
+// reports whether subscribers must be notified, and separately whether the
+// publication was DROPPED — which is not the same thing. A fence that refuses
+// a publication has decided the cache already holds this value or something
+// newer, so the caller's write is readable and notify=false is the whole
+// answer. The two drops below decide nothing: they cache nothing, deliver
+// nothing, and leave the key exactly as it was. A caller waiting to be told
+// whether its write is readable needs them spelled as an error, or Set returns
+// nil for a row no read in this process will ever serve.
 //
 //   - accepted (notify=true): pub.Revision > cached.Revision, the key is not
 //     cached yet, or pub.Revision == 0 (a delete or a reconcile-absent; never
@@ -63,12 +73,13 @@ type publication struct {
 // It does not clone. The caller owns producing a value the engine may keep —
 // the ingress already decoded fresh JSON, and cloning again per publication
 // would cost a reflective walk on the hot path for nothing.
-func (e *Engine) publish(sc *scopeState, pub publication) (notify bool) {
+func (e *Engine) publish(sc *scopeState, pub publication) (notify bool, err error) {
 	// A closed engine takes no publication: its workers are gone or going, so
 	// caching a value nobody can be told about only resurrects a scope during
-	// shutdown.
+	// shutdown. Reached AFTER Publish's own guard, by a write that was still
+	// inside the ingress when the Client closed under it.
 	if e.closed.Load() {
-		return false
+		return false, ErrClosed
 	}
 
 	// The caller's state, refused once its scope has been dropped. publish no
@@ -78,12 +89,28 @@ func (e *Engine) publish(sc *scopeState, pub publication) (notify bool) {
 	// delivery worker nothing will ever stop before Close.
 	select {
 	case <-sc.reconcileStop:
-		return false
+		return false, fmt.Errorf("%w: %s", ErrScopeNotTracked, scopeLabel(sc.scope))
 	default:
 	}
 
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
+
+	// The key is decided from here on, whichever way the fence below goes: the
+	// store answered for it, so a re-read that failed twice is no longer what
+	// the cache is standing on. This is the ONE place every ingress converges
+	// — a changefeed re-read, a reconcile snapshot row, a caller's Set, a
+	// delete publication — so clearing the record here covers all four
+	// without a second hook on any of them. A rejected publication clears it
+	// too: a revision below the cached one still means somebody read the row.
+	//
+	// "Somebody read the row" is what makes that sound, and it is true of
+	// three of the four NOW. A reconcile's photograph was taken earlier, and
+	// may predate the change the failed re-read was sent for, so
+	// applySnapshotRow re-marks the key when its row did not advance the
+	// cache. That is the only exception, and it lives with the ingress that
+	// knows how old its evidence is.
+	delete(sc.unconfirmed, pub.NSKey)
 
 	cached, ok := sc.entries[pub.NSKey]
 
@@ -93,7 +120,7 @@ func (e *Engine) publish(sc *scopeState, pub publication) (notify bool) {
 		// reconcile-absent, which always wins and resets the counter), or a
 		// newer row. All three fall through to the store below.
 	case pub.Revision < cached.Revision:
-		return false
+		return false, nil
 	case len(pub.Raw) > 0 && bytes.Equal(pub.Raw, cached.Raw):
 		// The same row read twice: bytes the store itself handed over last
 		// time, which is what a changefeed re-read and a reconcile snapshot
@@ -111,7 +138,7 @@ func (e *Engine) publish(sc *scopeState, pub publication) (notify bool) {
 		cached.UpdatedBy = pub.UpdatedBy
 		sc.entries[pub.NSKey] = cached
 
-		return false
+		return false, nil
 	case reflect.DeepEqual(pub.Value, cached.Value):
 		// Equal non-zero revision, different bytes, same meaning: a writer
 		// reformatted the JSON or reordered object keys, or a Set echo is
@@ -137,36 +164,48 @@ func (e *Engine) publish(sc *scopeState, pub publication) (notify bool) {
 		cached.UpdatedBy = pub.UpdatedBy
 		sc.entries[pub.NSKey] = cached
 
-		return false
+		return false, nil
 	default:
 		// Equal non-zero revision carrying a different value: D3's foreign
 		// writer, which changed value without bumping revision. Observed.
-	}
-
-	deletes := cached.Deletes
-	if pub.Deleted {
-		deletes++
 	}
 
 	sc.entries[pub.NSKey] = entry{
 		Value:     pub.Value,
 		Raw:       pub.Raw,
 		Revision:  pub.Revision,
-		Deletes:   deletes,
 		UpdatedAt: pub.UpdatedAt,
 		UpdatedBy: pub.UpdatedBy,
 	}
+
+	// The counters a changefeed re-read is graded against, bumped under the
+	// same acquisition that stored the value so a re-read can never observe
+	// the pair half-applied. publications rises on every accepted publication;
+	// deletes only for a caller's own Delete, the feed having already counted
+	// its own at event arrival. See keyFence.
+	fence := sc.fences[pub.NSKey]
+	fence.publications++
+
+	if pub.Deleted {
+		fence.deletes++
+	}
+
+	sc.fences[pub.NSKey] = fence
 
 	// Still under the scope's write lock, on purpose: queueing a notification
 	// is what keeps deliveries in revision order. If the queueing happened
 	// after the unlock, a publication that won the fence could be overtaken on
 	// the way to the worker's mailbox by one that lost it, and the subscriber
 	// would see the older revision last. No callback runs here — the worker
-	// goroutine does that — so the lock is held for a mutex and a
-	// non-blocking channel send.
+	// goroutine does that — so the lock usually costs a mutex and a
+	// non-blocking channel send. It costs one more thing on a subscribed key's
+	// FIRST published change, which starts that key's delivery goroutine under
+	// this lock. Workers are bounded at one per subscribed key per scope, so
+	// this is a one-off per key, and FC-11 concentrates almost every launch in
+	// the first reconcile at Start, where it publishes every registered key.
 	e.dispatch(sc, pub)
 
-	return true
+	return true, nil
 }
 
 // trackedScope returns scope's state, or nil when the engine is not tracking

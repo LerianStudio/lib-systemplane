@@ -9,7 +9,7 @@ import (
 )
 
 // TestMain runs every unit test in this package under goleak.VerifyTestMain so
-// that any goroutine spawned by Client (hydration, debouncer, refresh, OnChange
+// that any goroutine spawned by Client (reconcile, debouncer, refresh, OnChange
 // dispatch) but not cleaned up by Close() fails the package run.
 //
 // No ignore list is needed today: the only goroutines this package launches

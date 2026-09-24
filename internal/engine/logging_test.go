@@ -210,6 +210,8 @@ func loggingEngineWith(t *testing.T, defs map[NSKey]KeyDef, fs *fakeStore, rec *
 
 	track(t, e, store.Scope{})
 
+	noDeliveryOutlivesTheTest(t, e)
+
 	t.Cleanup(func() {
 		if err := e.Close(); err != nil {
 			t.Errorf("Close: %v", err)
@@ -302,7 +304,11 @@ func TestReReadErrorIsLoggedAtWarn(t *testing.T) {
 
 	fs.onGet(func(store.Scope, NSKey) error { return errors.New("connection reset") })
 
-	e.refreshKey(store.Scope{}, nk)
+	// Driven as the RETRY, so the one failure produces the one line this test
+	// counts. A first attempt logs the same line and then submits itself once
+	// more (retryRefresh), which is behavior TestFailedRereadIsRetriedOnce
+	// owns rather than a second spelling of this assertion.
+	e.refreshKey(store.Scope{}, nk, feedFence{}, false, true)
 
 	requireLogged(t, rec, log.LevelWarn, "changefeed re-read failed, keeping current value", store.Scope{}, nk)
 }
@@ -325,7 +331,7 @@ func TestReReadCanceledByCloseIsLoggedAtDebug(t *testing.T) {
 
 	// The re-read a debounce timer already fired, reaching the store after
 	// Close canceled the lifecycle context.
-	e.refreshKey(scope, nk)
+	e.refreshKey(scope, nk, feedFence{}, false, false)
 
 	requireLogged(t, rec, log.LevelDebug, "changefeed re-read canceled during shutdown", scope, nk)
 }
@@ -342,7 +348,7 @@ func TestLogLevelReReadWithNoRowIsDebug(t *testing.T) {
 
 	track(t, e, scope)
 
-	e.refreshKey(scope, nk)
+	e.refreshKey(scope, nk, feedFence{}, false, false)
 
 	requireLogged(t, rec, log.LevelDebug, "changefeed re-read found no row, keeping current value", scope, nk)
 }
@@ -501,20 +507,24 @@ func requireOneRecord(t *testing.T, r *recordingLogger, msg string) logRecord {
 // own span; logging its ingress under the engine's background context detaches
 // every rejection an operator would use to explain why a write did not take
 // effect from the request that caused it.
+//
+// The rejection driven here is the decode failure, because it is the one the
+// write path can still make: the registered validator has already graded this
+// value at Client.Set, under this same context, and the engine does not run it
+// again.
 func TestPublishLogsUnderTheCallerContext(t *testing.T) {
 	type ctxKey struct{}
 
 	nk := NSKey{Namespace: "billing", Key: "limits"}
-	e, rec := loggingEngine(t, map[NSKey]KeyDef{nk: {
-		Default:  "fallback",
-		Validate: func(context.Context, any) error { return errors.New("want a string") },
-	}}, newFakeStore())
+	e, rec := loggingEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, newFakeStore())
 
 	ctx := context.WithValue(context.Background(), ctxKey{}, "caller-span")
 
-	e.Publish(ctx, store.Scope{}, jsonRow(nk, 1, `42`, "ops"))
+	if err := e.Publish(ctx, store.Scope{}, jsonRow(nk, 1, `{not json`, "ops")); err == nil {
+		t.Fatal("Publish reported success for bytes it could not decode")
+	}
 
-	got := requireOneRecord(t, rec, "stored value rejected by validator, keeping cached value")
+	got := requireOneRecord(t, rec, "failed to unmarshal stored value, keeping cached value")
 	if got.Ctx == nil || got.Ctx.Value(ctxKey{}) != "caller-span" {
 		t.Errorf("the write path logged under a context that is not the caller's: %s", got)
 	}
@@ -522,7 +532,7 @@ func TestPublishLogsUnderTheCallerContext(t *testing.T) {
 
 // TestTenantIsLoggedUnderTheCanonicalKey pins the field key every tenant-scoped
 // line in this package uses. Three spellings were live in one repository at
-// once — a bare "tenant" here, "tenant_id" in internal/manager, and
+// once — a bare "tenant" here, "tenant_id" in the v3 multi-tenant Manager, and
 // lib-observability's own constants.AttrKeyTenantID — so an operator filtering
 // a log stream by tenant matched two of the three and silently lost the rest.
 // The engine follows the library constant; this assertion is what stops the
@@ -535,7 +545,13 @@ func TestTenantIsLoggedUnderTheCanonicalKey(t *testing.T) {
 
 	// loggingEngine tracks only the zero scope, so a write addressed to a
 	// tenant is dropped — and the drop names the tenant it was addressed to.
-	e.Publish(context.Background(), store.Scope{Tenant: tenant}, jsonRow(nk, 1, `"5"`, "ops"))
+	// Asserted rather than discarded: a fixture that started tracking the
+	// tenant would emit no line at all, and the record assertions below would
+	// then be reporting the wrong fault.
+	err := e.Publish(context.Background(), store.Scope{Tenant: tenant}, jsonRow(nk, 1, `"5"`, "ops"))
+	if !errors.Is(err, ErrScopeNotTracked) {
+		t.Fatalf("Publish into an untracked scope: got %v, want errors.Is ErrScopeNotTracked", err)
+	}
 
 	got := requireOneRecord(t, rec, "write for an untracked scope, dropping")
 
@@ -684,7 +700,8 @@ func TestReReadCanceledOutsideShutdownIsLoggedAtWarn(t *testing.T) {
 		return fmt.Errorf("pool checkout aborted: %w", context.Canceled)
 	})
 
-	e.refreshKey(store.Scope{}, nk)
+	// The retry, for the reason TestReReadErrorIsLoggedAtWarn states.
+	e.refreshKey(store.Scope{}, nk, feedFence{}, false, true)
 
 	requireLogged(t, rec, log.LevelWarn, "changefeed re-read failed, keeping current value", store.Scope{}, nk)
 }
@@ -804,7 +821,7 @@ func TestScopeDropDiagnosticsAreDebug(t *testing.T) {
 			name: "a write addressed to a scope the engine never tracked",
 			msg:  "write for an untracked scope, dropping",
 			drive: func(t *testing.T, e *Engine) {
-				e.Publish(context.Background(), store.Scope{Tenant: "acme"}, jsonRow(nk, 1, `"5"`, "ops"))
+				_ = e.Publish(context.Background(), store.Scope{Tenant: "acme"}, jsonRow(nk, 1, `"5"`, "ops"))
 			},
 		},
 		{
@@ -906,6 +923,8 @@ func TestReReadPanicNamesTheKey(t *testing.T) {
 			})
 			track(t, e, scope)
 
+			noDeliveryOutlivesTheTest(t, e)
+
 			t.Cleanup(func() {
 				if err := e.Close(); err != nil {
 					t.Errorf("Close after a panicking re-read: %v, want nil: one exploding "+
@@ -913,7 +932,14 @@ func TestReReadPanicNamesTheKey(t *testing.T) {
 				}
 			})
 
-			fs.onGet(func(store.Scope, NSKey) error { panic("the store driver exploded") })
+			// One-shot, because the retry a panicking re-read now schedules
+			// would otherwise report the same panic a second time and make
+			// this test's line count race the debounce timer.
+			fs.onGet(func(store.Scope, NSKey) error {
+				fs.onGet(nil)
+
+				panic("the store driver exploded")
+			})
 
 			e.onEvent(upsertEvent(scope, nk, 1))
 
@@ -941,7 +967,6 @@ func TestReReadPanicNamesTheKey(t *testing.T) {
 			requireLogged(t, rec, log.LevelError, rereadPanicMsg, scope, nk)
 			requirePanicAccounted(t, rec, "refresh")
 
-			fs.onGet(nil)
 			fs.seed(scope, jsonRow(nk, 2, `"after"`, "ops"))
 
 			var delivered recorder
@@ -1158,7 +1183,14 @@ func TestFailedRereadFencesTheKeyBeforeLogging(t *testing.T) {
 			level: log.LevelError,
 			def:   KeyDef{Default: "fallback"},
 			arrange: func(fs *fakeStore) {
-				fs.onGet(func(store.Scope, NSKey) error { panic("the store driver exploded") })
+				// One-shot: a re-read that could not answer is retried once,
+				// so a hook that kept failing would produce the same line
+				// twice and say nothing more than this one does.
+				fs.onGet(func(store.Scope, NSKey) error {
+					fs.onGet(nil)
+
+					panic("the store driver exploded")
+				})
 			},
 		},
 		{
@@ -1167,7 +1199,11 @@ func TestFailedRereadFencesTheKeyBeforeLogging(t *testing.T) {
 			level: log.LevelWarn,
 			def:   KeyDef{Default: "fallback"},
 			arrange: func(fs *fakeStore) {
-				fs.onGet(func(store.Scope, NSKey) error { return errors.New("backend down") })
+				fs.onGet(func(store.Scope, NSKey) error {
+					fs.onGet(nil)
+
+					return errors.New("backend down")
+				})
 			},
 		},
 		{
@@ -1277,6 +1313,8 @@ func TestAcceptedReReadIsFencedThroughTheValidator(t *testing.T) {
 		}}},
 	})
 
+	noDeliveryOutlivesTheTest(t, e)
+
 	t.Cleanup(func() {
 		if err := e.Close(); err != nil {
 			t.Errorf("Close: %v", err)
@@ -1365,6 +1403,8 @@ func TestPanicUnderReReadCannotResetALiveValue(t *testing.T) {
 		}},
 	})
 
+	noDeliveryOutlivesTheTest(t, e)
+
 	t.Cleanup(func() {
 		if err := e.Close(); err != nil {
 			t.Errorf("Close: %v", err)
@@ -1421,4 +1461,176 @@ func TestPanicUnderReReadCannotResetALiveValue(t *testing.T) {
 	}
 
 	<-done
+}
+
+// TestPublishDeleteLogsUnderTheCallerContext pins the removal's half of the
+// write path to the caller's context, and to the write path's own drop line.
+//
+// A delete arrives on the consumer's own goroutine, inside the consumer's own
+// span, exactly as a write does — and in multi-tenant mode the tenant the
+// Client stamps on the line is resolved from that context alone. Logging it
+// under the engine's background context detached every refused removal from
+// the request that caused it and dropped the tenant with it.
+//
+// The message matters as much as the context: a removal refused because the
+// engine tracks no such scope is a WRITE being dropped, not changefeed work,
+// and an operator reading "changefeed work for an untracked scope" went
+// looking for a feed that was never involved.
+func TestPublishDeleteLogsUnderTheCallerContext(t *testing.T) {
+	type ctxKey struct{}
+
+	const tenant = "acme"
+
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	e, rec := loggingEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, newFakeStore())
+
+	ctx := context.WithValue(context.Background(), ctxKey{}, "caller-span")
+
+	// loggingEngine tracks only the zero scope, so a removal addressed to a
+	// tenant is dropped — by the write path, under the caller's context.
+	if err := e.PublishDelete(ctx, store.Scope{Tenant: tenant}, nk); !errors.Is(err, ErrScopeNotTracked) {
+		t.Fatalf("PublishDelete into an untracked scope: got %v, want errors.Is ErrScopeNotTracked", err)
+	}
+
+	got := requireOneRecord(t, rec, "write for an untracked scope, dropping")
+	if got.Ctx == nil || got.Ctx.Value(ctxKey{}) != "caller-span" {
+		t.Errorf("the delete path logged under a context that is not the caller's: %s", got)
+	}
+
+	if f, ok := got.field(constants.AttrKeyTenantID); !ok || f.Value != tenant {
+		t.Errorf("field %q: got (%v, %t), want %q", constants.AttrKeyTenantID, f.Value, ok, tenant)
+	}
+}
+
+// reconcilePanicMsg is the identity line a panic under a scope snapshot
+// produces. It names no key, because a reconcile is not about one: the
+// snapshot covers every registered key of the scope, and which one the store
+// was holding when it exploded is exactly what the engine does not know.
+const reconcilePanicMsg = "systemplane.engine: reconcile panicked"
+
+// TestReReadPanicOnARedactedKeyWithholdsTheValue closes the second half of the
+// hole the validator report already closed.
+//
+// A changefeed re-read hands the store a key and gets back its row. A driver
+// that panics naming what it was decoding — pgx and the mongo driver both
+// interpolate the document into their panics — is therefore holding the value
+// of a key whose entire registration says it must never reach a log line, and
+// the report went to lib-observability's handler verbatim: log.Any("value",
+// recovered) at ERROR, and the same rendering stamped on the span event,
+// whenever production mode is off, which is its shipped default.
+//
+// The identity is asserted in the same test on purpose: withholding the value
+// must not cost the operator the tenant, namespace and key, which are the only
+// thing left to act on.
+func TestReReadPanicOnARedactedKeyWithholdsTheValue(t *testing.T) {
+	const secret = "reread-panic-sentinel-Qv3Ly"
+
+	nk := NSKey{Namespace: "billing", Key: "token"}
+	scope := store.Scope{Tenant: "acme"}
+
+	fs := newFakeStore()
+	rec := &recordingLogger{Logger: log.NewNop()}
+
+	e := New(Config{
+		Store:    fs,
+		Registry: fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: "fallback", Redacted: true}}},
+		Logger:   rec,
+	})
+	track(t, e, scope)
+
+	t.Cleanup(func() {
+		if err := e.Close(); err != nil {
+			t.Errorf("Close after a panicking re-read: %v, want nil", err)
+		}
+	})
+
+	// One-shot, so the retry the panic schedules converges instead of
+	// reporting the same panic a second time.
+	fs.onGet(func(_ store.Scope, k NSKey) error {
+		fs.onGet(nil)
+
+		panic(fmt.Sprintf("driver exploded decoding %s/%s = %q", k.Namespace, k.Key, secret))
+	})
+
+	e.onEvent(upsertEvent(scope, nk, 1))
+
+	waitFor(t, hangGuard, "the panicking re-read to be reported and accounted", func() bool {
+		var reported, accounted bool
+
+		for _, r := range rec.snapshot() {
+			switch r.Msg {
+			case rereadPanicMsg:
+				reported = true
+			case panicRecoveredMsg:
+				accounted = true
+			}
+		}
+
+		return reported && accounted
+	})
+
+	requireLogged(t, rec, log.LevelError, rereadPanicMsg, scope, nk)
+	requirePanicWithheld(t, rec, "refresh", "string", secret)
+}
+
+// TestReconcilePanicOnARedactedRegistryWithholdsTheValue pins the last engine
+// report that still printed whatever the panicking code was holding.
+//
+// A reconcile's List returns every row of the scope at once, so a store or
+// driver panic under it can be holding any of them — including a key the
+// consumer registered redacted. The engine cannot tell which, so the gate is
+// the registry as a whole: one redacted key anywhere in it withholds the value
+// from the report. That never under-redacts, and a deployment with no redacted
+// key at all keeps the verbatim panic it had.
+func TestReconcilePanicOnARedactedRegistryWithholdsTheValue(t *testing.T) {
+	const probeMarker = "reconcile-panic-sentinel-Nw8Br"
+
+	plain := NSKey{Namespace: "billing", Key: "limits"}
+	hidden := NSKey{Namespace: "billing", Key: "token"}
+	scope := store.Scope{Tenant: "acme"}
+
+	fs := newFakeStore()
+	rec := &recordingLogger{Logger: log.NewNop()}
+
+	e := New(Config{
+		Store: fs,
+		Registry: fakeRegistry{defs: map[NSKey]KeyDef{
+			plain:  {Default: "fallback"},
+			hidden: {Default: "default", Redacted: true},
+		}},
+		Logger: rec,
+	})
+	track(t, e, scope)
+
+	t.Cleanup(func() {
+		if err := e.Close(); err != nil {
+			t.Errorf("Close after a panicking reconcile: %v, want nil", err)
+		}
+	})
+
+	fs.onList(func(store.Scope) error {
+		fs.onList(nil)
+
+		panic(fmt.Sprintf("driver exploded scanning %s/%s = %q", hidden.Namespace, hidden.Key, probeMarker))
+	})
+
+	e.onEvent(resyncEvent(scope))
+
+	waitFor(t, hangGuard, "the panicking reconcile to be reported and accounted", func() bool {
+		var reported, accounted bool
+
+		for _, r := range rec.snapshot() {
+			switch r.Msg {
+			case reconcilePanicMsg:
+				reported = true
+			case panicRecoveredMsg:
+				accounted = true
+			}
+		}
+
+		return reported && accounted
+	})
+
+	requireLogged(t, rec, log.LevelError, reconcilePanicMsg, scope, NSKey{})
+	requirePanicWithheld(t, rec, "reconcile", "string", probeMarker)
 }

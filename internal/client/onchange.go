@@ -4,10 +4,8 @@ package client
 import (
 	"context"
 	"fmt"
-	"sync"
 
 	"github.com/LerianStudio/lib-systemplane/v4/internal/engine"
-	"github.com/LerianStudio/lib-systemplane/v4/internal/manager"
 )
 
 // OnChange registers a callback for backend-observed value changes.
@@ -16,21 +14,35 @@ import (
 // subscription could never deliver anything, so refusing it surfaces the typo
 // instead of hiding it behind a callback that never fires.
 //
-// In single-tenant mode the callback fires whenever the changefeed echo for
-// (namespace, key) arrives.
+// In single-tenant mode deliveries are COALESCED per key and serialized, off
+// the changefeed goroutine: while fn runs, a newer revision of the same key
+// replaces the pending one, so fn may skip intermediate revisions but always
+// receives the newest and never sees revisions out of order. Different keys
+// deliver independently.
 //
-// In multi-tenant mode without a bound Manager, OnChange returns
-// ErrNotSupportedInMultiTenant — preserving the v1.4.0 contract for callers
-// that have not opted into the v1.5.0 Manager.
+// A subscriber registered before [Client.Start] is handed the value in force
+// once, as the first reconcile publishes every registered key (FC-11). The
+// publication happens while Start is still on the stack; the DELIVERY is
+// queued there and runs on the key's own worker goroutine, so it may land
+// either side of Start's return. That decides what a callback may do:
 //
-// In multi-tenant mode with a bound Manager, the callback is registered on
-// the Manager's per-tenant LISTEN dispatcher. It fires once per NOTIFY
-// observed across any active tenant's LISTEN goroutine; Change.Tenant names
-// the tenant whose row changed and a delete delivers the registered default.
+//   - it may call Get, GetEntry, List and OnChange re-entrantly — no Client or
+//     engine lock is held while it runs, and Get already serves the value the
+//     delivery carries. The ctx fn receives is the engine's OWN lifecycle
+//     context, not the context of whatever wrote the row: it carries no
+//     request values and no tenant, so a callback that needs the tenant reads
+//     Change.Tenant and never ctx;
+//   - it may call Set and Delete: the Client counts itself started before the
+//     first reconcile runs, so a write from that first delivery lands on
+//     either side of Start's return rather than being refused;
+//   - Register, Start and Close block on the Client's start lock for as long
+//     as Start is still running, and during Close until the close timeout
+//     expires.
 //
-// In this wave-1 shim the Manager path reports Change.Revision == 0 on every
-// delivery, upsert or delete, because the NOTIFY payload carries no revision
-// until the storage lane lands.
+// In multi-tenant mode OnChange returns ErrNotSupportedInMultiTenant for every
+// registered key: no scope is tracked and no changefeed runs, so no callback
+// could ever fire. The wave-3 engine-tenants lane makes multi-tenant OnChange
+// work on both backends, delivering per-tenant changes with Change.Tenant set.
 func (c *Client) OnChange(namespace, key string, fn func(ctx context.Context, ch Change)) (func(), error) {
 	noop := func() {}
 
@@ -49,84 +61,15 @@ func (c *Client) OnChange(namespace, key string, fn func(ctx context.Context, ch
 	}
 
 	if c.multiTenant {
-		mgr := c.boundManager()
-		if mgr == nil {
-			return noop, ErrNotSupportedInMultiTenant
-		}
-
-		if fn == nil {
-			return noop, nil
-		}
-
-		unsub := mgr.RegisterCallback(namespace, key, c.managerCallback(fn))
-		if unsub == nil {
-			return noop, nil
-		}
-
-		return func() { unsub() }, nil
+		return noop, ErrNotSupportedInMultiTenant
 	}
 
 	if fn == nil {
 		return noop, nil
 	}
 
-	id := c.nextSubID.Add(1)
-
-	c.subsMu.Lock()
-	c.subscribers[nk] = append(c.subscribers[nk], subscription{
-		id: id,
-		// ctx is the Client's lifecycle context (passed in by fireSubscribers);
-		// callbacks receive cancellation when the Client shuts down. Falling
-		// back to context.Background() here would defeat that propagation.
-		fn: func(ctx context.Context, newValue any) {
-			// fireSubscribers already handed us a private clone.
-			fn(ctx, Change{Namespace: namespace, Key: key, Value: newValue})
-		},
-	})
-	c.subsMu.Unlock()
-
-	var once sync.Once
-
-	return func() {
-		once.Do(func() {
-			c.subsMu.Lock()
-			defer c.subsMu.Unlock()
-
-			subs := c.subscribers[nk]
-			for i, s := range subs {
-				if s.id == id {
-					c.subscribers[nk] = append(subs[:i], subs[i+1:]...)
-
-					return
-				}
-			}
-		})
-	}, nil
-}
-
-// managerCallback adapts a subscriber to the Manager dispatch signature. The
-// Manager flags a delete; FC-4 publishes the registered default in its place,
-// and the value is cloned so each subscriber owns its copy. An upsert is
-// delivered as it decoded, nil included, so a key stored as null stays
-// distinguishable from a deleted one.
-func (c *Client) managerCallback(fn func(ctx context.Context, ch Change)) manager.Callback {
-	return func(ctx context.Context, tenantID, ns, k string, revision int64, isDelete bool, newValue any) {
-		if isDelete {
-			c.registryMu.RLock()
-			def, registered := c.registry[nskey{Namespace: ns, Key: k}]
-			c.registryMu.RUnlock()
-
-			if registered {
-				newValue = def.defaultValue
-			}
-		}
-
-		fn(ctx, Change{
-			Tenant:    tenantID,
-			Namespace: ns,
-			Key:       k,
-			Revision:  revision,
-			Value:     engine.Clone(newValue),
-		})
-	}
+	// Straight through: the engine builds the whole Change — tenant, revision,
+	// value — and hands each subscriber its own clone, so wrapping fn here
+	// would double-clone and drop the revision.
+	return c.engine.OnChange(engine.NSKey{Namespace: namespace, Key: key}, fn), nil
 }

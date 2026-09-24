@@ -31,66 +31,126 @@ type entry struct {
 	// top of the decoded values. Negligible single-tenant, where there is one
 	// scope; in wave 3 it is multiplied by the number of tenants the process
 	// has activated.
-	Raw      []byte
-	Revision int64
-	// Deletes counts the deletes this key has taken in this scope. A delete
-	// publishes the registered default at Revision 0, which FC-4 and FC-5
-	// require at the public surface, so the revision alone cannot tell a
-	// changefeed re-read that the row it is holding has since been removed:
-	// every revision beats 0.
-	//
-	// A re-read reads this counter BEFORE its store call and hands it back
-	// afterwards, and a publication whose count no longer matches is refused.
-	// That is causal rather than numeric — it asks "did a delete land while I
-	// was reading?", not "is this revision high enough" — so it refuses a row
-	// read under a snapshot that predates the DELETE (READ COMMITTED gives a
-	// reader exactly that) while still accepting a recreate at any revision,
-	// including one below the deleted row's. D11 makes a recreate through the
-	// library come back strictly above every earlier revision, but it names a
-	// residual where it does not, and the engine does not need to care.
-	//
-	// A reconcile that finds a key absent does NOT bump it: absence from a
-	// photograph is a conclusion about a snapshot, and a re-read in flight may
-	// hold the fresher fact.
-	Deletes   uint64
+	Raw       []byte
+	Revision  int64
 	UpdatedAt time.Time
 	UpdatedBy string
 }
 
-// deleteFence is what a changefeed re-read carries across its store call: the
-// number of deletes the key had taken when the read began. The zero value is
-// unarmed, and every ingress that is not a re-read passes it — a write's own
-// value is never superseded by a delete it did not see.
-type deleteFence struct {
-	deletes uint64
-	armed   bool
+// keyFence counts the two things a changefeed re-read must be able to notice
+// across its store call: the deletes the key has taken in this scope, and the
+// publications its cache entry has accepted.
+//
+// Both live BESIDE the entries map rather than inside an entry. A delete can
+// arrive for a key nothing has published yet — before the first reconcile has
+// run, or after a re-read of it failed — and inventing a cache entry to carry
+// the count would put a nil value in force behind every read of that key.
+//
+// deletes is what makes a delete refusable at all. A delete publishes the
+// registered default at Revision 0, which FC-4 and FC-5 require at the public
+// surface, so the revision alone cannot tell a re-read that the row it is
+// holding has since been removed: every revision beats 0. It is bumped the
+// instant the changefeed reports the row gone — at event ARRIVAL, before the
+// key's quiet window, by recordFeedDelete — and by a Client Delete, which
+// publishes on the caller's own goroutine for read-your-writes (D4). The feed
+// bumps it exactly once per event: the re-read that event schedules publishes
+// through the ordinary no-row ingress and counts no second delete.
+//
+// A re-read reads both counters BEFORE its store call and hands them back
+// afterwards. That is causal rather than numeric — it asks "did a delete land
+// while I was reading?", not "is this revision high enough" — so it refuses a
+// row read under a snapshot that predates the DELETE (READ COMMITTED gives a
+// reader exactly that) while still accepting a recreate at any revision,
+// including one below the deleted row's. D11 makes a recreate through the
+// library come back strictly above every earlier revision, but it names a
+// residual where it does not, and the engine does not need to care.
+//
+// publications counts every publication the revision fence accepted, and is
+// what the OTHER outcome of a delete's re-read is fenced on: a read that comes
+// back EMPTY publishes the registered default at Revision 0, which wins
+// unconditionally, so it must not land on top of a value published while it
+// was reading — the echo of a Set the caller made right after the delete.
+//
+// A reconcile that finds a key absent bumps deletes for neither reason:
+// absence from a photograph is a conclusion about a snapshot, and a re-read in
+// flight may hold the fresher fact.
+type keyFence struct {
+	deletes      uint64
+	publications uint64
 }
 
-// deleteFenceFor arms a fence for nk as it stands now. A key with nothing
-// cached yet reads zero, which is what makes the FIRST delete of a key — the
-// one that has no cached revision to fence against either — still refuse a
-// re-read that started before it.
-func (sc *scopeState) deleteFenceFor(nk NSKey) deleteFence {
-	cached, _ := sc.cached(nk)
+// feedFence is what a changefeed re-read carries across its store call: the
+// key's counters as they stood when the read began. The zero value is unarmed,
+// and every ingress that is not a re-read passes it — a write's own value is
+// never superseded by a delete it did not see.
+type feedFence struct {
+	keyFence
 
-	return deleteFence{deletes: cached.Deletes, armed: true}
+	armed bool
+}
+
+// fenceFor arms a fence for nk as it stands now. A key nothing has touched yet
+// reads zero, which is what makes the FIRST delete of a key — the one that has
+// no cached revision to fence against either — still refuse a re-read that
+// started before it.
+func (sc *scopeState) fenceFor(nk NSKey) feedFence {
+	sc.mu.RLock()
+	defer sc.mu.RUnlock()
+
+	return feedFence{keyFence: sc.fences[nk], armed: true}
 }
 
 // supersededByDelete reports whether a delete landed on nk since fence was
-// armed, which makes whatever the re-read is holding older than the cache.
+// armed, which makes whatever row the re-read is holding older than the cache.
 //
 // The caller holds sc.reconcileMu, which is what makes the answer and the
-// publication it gates one step: applyDelete holds the same lock across its own
+// publication it gates one step: PublishDelete holds the same lock across its own
 // publish-and-record pair, so a delete can no longer land between this check
 // and the publication it permitted.
-func (sc *scopeState) supersededByDelete(nk NSKey, fence deleteFence) bool {
+func (sc *scopeState) supersededByDelete(nk NSKey, fence feedFence) bool {
 	if !fence.armed {
 		return false
 	}
 
-	cached, _ := sc.cached(nk)
+	sc.mu.RLock()
+	defer sc.mu.RUnlock()
 
-	return cached.Deletes != fence.deletes
+	return sc.fences[nk].deletes != fence.deletes
+}
+
+// supersededByPublication reports whether ANYTHING landed on nk since fence
+// was armed — a publication, or another delete.
+//
+// It is the wider of the two questions, and only the empty re-read of a delete
+// asks it. What that re-read is about to publish is the registered default at
+// Revision 0, which no revision can refuse, so the ordinary fence cannot
+// protect a value that arrived while the read was in flight. Anything at all
+// having landed means the cache already holds a fact this read did not see,
+// and the read's conclusion — "there is no row" — is the older one.
+//
+// The caller holds sc.reconcileMu, for the reason supersededByDelete states.
+func (sc *scopeState) supersededByPublication(nk NSKey, fence feedFence) bool {
+	if !fence.armed {
+		return false
+	}
+
+	sc.mu.RLock()
+	defer sc.mu.RUnlock()
+
+	return sc.fences[nk] != fence.keyFence
+}
+
+// bumpDeletes records that the changefeed reported nk's row removed, so every
+// re-read already inside its store call is refused from this instant. It is
+// deliberately not a publication: what goes in force for the key is decided by
+// the re-read the event schedules, once the key's quiet window closes.
+func (sc *scopeState) bumpDeletes(nk NSKey) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	fence := sc.fences[nk]
+	fence.deletes++
+	sc.fences[nk] = fence
 }
 
 // scopeState is one tracked scope.
@@ -99,7 +159,73 @@ type scopeState struct {
 
 	mu      sync.RWMutex
 	entries map[NSKey]entry
-	stale   bool
+	// fences holds the per-key counters a changefeed re-read is graded
+	// against. It is keyed like entries and guarded by the same mutex, but is
+	// a map of its OWN because a key can be fenced before it is ever cached —
+	// see keyFence. Entries are never removed: the count is bounded by the
+	// registered keys of this scope.
+	fences map[NSKey]keyFence
+	// stale is the scope-wide flag: the changefeed is disconnected, or the
+	// scope has not been reconciled since it (re)connected. It is set by a
+	// disconnect and by every arming, and cleared only by a reconcile that
+	// applied a snapshot under unmoved generations.
+	//
+	// It is no longer the whole of what a caller sees as Stale. A re-read that
+	// failed twice belongs to ONE key, and raising a scope-wide flag for it
+	// put the repair in the hands of whatever happened to clear the flag next:
+	// a reconcile already in flight cleared it without ever having decided
+	// that key, and on a connection that never drops nothing cleared it at
+	// all, so the scope reported every converged value as unconfirmed for the
+	// life of the process. unconfirmed carries that half instead.
+	stale bool
+	// unconfirmed holds the keys whose last change the engine could not read
+	// back: a changefeed re-read that failed twice, and a retry that found no
+	// row for an upsert. Entries are added by the terminal branch of each,
+	// and removed by any later ingress that DECIDED the key — a re-read, a
+	// Set echo, a delete publication — which is every path through publish,
+	// plus the one reconcile outcome that decides a key without publishing: a
+	// snapshot that finds it absent and agreeing with the cache
+	// (markConfirmed).
+	//
+	// A reconcile's snapshot ROW is the one ingress that never decides it.
+	// The photograph was taken at a moment nothing here knows and may predate
+	// the very change the failed re-read was sent for — advancing the cache
+	// does not prove otherwise — so applySnapshotRow puts the record straight
+	// back for every key its window marked unusable.
+	//
+	// Lookup reports Stale for a key held in this set, and for that key only:
+	// what was lost is one row nobody could re-read, and converging that key
+	// is what takes it back. Reading the set's size instead made one
+	// unreadable row report every sibling stale on a hold nothing but that key
+	// releases. clearStale never touches it: a reconcile that skipped the key
+	// decided nothing about it.
+	//
+	// Guarded by mu, alongside stale. Created lazily: most scopes never have
+	// one.
+	unconfirmed map[NSKey]struct{}
+	// retrying holds the repairs already pending, so a failed re-read arms at
+	// most ONE per key and op. Without it every failed read of a key the feed
+	// is hot on scheduled a second store call a quarter of a second later,
+	// with nothing deduplicating them: the pool checkouts for that key doubled
+	// exactly while the pool was scarce, which is what made the reads fail to
+	// begin with. With it the in-flight reads for one key stay capped at
+	// THREE — a first attempt, the one repair an upsert asks for, and the one
+	// a delete asks for.
+	//
+	// The op is half the key because it is half the answer: an empty read
+	// means "not visible yet, keep the value" after an upsert and "the row is
+	// gone" after a delete. Keyed by NSKey alone, an upsert's pending repair
+	// refused the delete that followed it one of its own, and then answered
+	// for it as an upsert — leaving the deleted row in force. Two upserts
+	// still share one repair, which is the bound this field exists for.
+	//
+	// An entry is made before the retry goroutine is launched and removed by
+	// that goroutine's own defer, so a launch that loses the race to Close
+	// takes the entry back too and the next failure may still retry.
+	//
+	// Guarded by mu, alongside unconfirmed, and created lazily for the same
+	// reason.
+	retrying map[retryKey]struct{}
 	// disconnectGen is bumped on every OpDisconnect. A reconcile records it
 	// when it starts and clears stale only if it is unchanged at completion,
 	// so a reconcile that spans a new disconnect cannot clear the flag that
@@ -187,12 +313,103 @@ func newScopeState(scope store.Scope) *scopeState {
 	return &scopeState{
 		scope:              scope,
 		entries:            make(map[NSKey]entry),
+		fences:             make(map[NSKey]keyFence),
 		workers:            make(map[NSKey]*dispatchWorker),
 		stale:              true,
 		firstReconcileDone: make(chan struct{}),
 		resyncSignal:       make(chan struct{}, 1),
 		reconcileStop:      make(chan struct{}),
 	}
+}
+
+// markUnconfirmed records that nk's last change could not be read back, so
+// reads of nk report Stale until some later ingress decides the key.
+//
+// It is per key rather than scope-wide because that is the size of what was
+// actually lost: one row nobody could re-read. See the unconfirmed field.
+func (sc *scopeState) markUnconfirmed(nk NSKey) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	if sc.unconfirmed == nil {
+		sc.unconfirmed = make(map[NSKey]struct{}, 1)
+	}
+
+	sc.unconfirmed[nk] = struct{}{}
+}
+
+// markConfirmed takes back what markUnconfirmed recorded, for an ingress that
+// decided nk without publishing anything: a reconcile whose snapshot found the
+// key absent and agreeing with the cache. Every ingress that DOES publish
+// clears the record inside publish itself, and a reconcile snapshot row whose
+// publication did not advance the cache puts it straight back.
+func (sc *scopeState) markConfirmed(nk NSKey) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	delete(sc.unconfirmed, nk)
+}
+
+// recordUnconfirmed records nk as unconfirmed unless a later ingress already
+// decided it, which is the terminal verdict of a repair that ran out of
+// attempts: a retry whose store call failed again, and a retry that found no
+// row for an upsert.
+//
+// fence is the one the FIRST attempt armed, carried down into the retry. A
+// re-read, a reconcile row, a Set echo or a delete that landed while the retry
+// was waiting out its delay has already confirmed the key, and the retry's own
+// arming happens after it and cannot see it. Recording the key unconfirmed on
+// top of that convergence puts the scope back on a Stale nothing will ever
+// clear — on a connection that never drops, for the life of the process, over
+// a value that is correct.
+//
+// It takes reconcileMu itself, so the question and the record it gates are one
+// step against the feed — the lock every other reader of a fence holds for the
+// same reason.
+func (sc *scopeState) recordUnconfirmed(nk NSKey, fence feedFence) {
+	sc.reconcileMu.Lock()
+	defer sc.reconcileMu.Unlock()
+
+	if sc.supersededByPublication(nk, fence) {
+		return
+	}
+
+	sc.markUnconfirmed(nk)
+}
+
+// retryKey is one repair slot: a key and the op whose answer the repair is
+// carrying. See the retrying field for why the op belongs in the key.
+type retryKey struct {
+	nk      NSKey
+	deleted bool
+}
+
+// beginRetry claims the single retry slot rk has, reporting false when one is
+// already pending. See the retrying field.
+func (sc *scopeState) beginRetry(rk retryKey) bool {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	if _, pending := sc.retrying[rk]; pending {
+		return false
+	}
+
+	if sc.retrying == nil {
+		sc.retrying = make(map[retryKey]struct{}, 1)
+	}
+
+	sc.retrying[rk] = struct{}{}
+
+	return true
+}
+
+// endRetry releases rk's retry slot, so the next failed re-read of that key
+// and op may arm one again.
+func (sc *scopeState) endRetry(rk retryKey) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	delete(sc.retrying, rk)
 }
 
 // armReconcile opens a reconcile window and puts it in the scope's single-slot

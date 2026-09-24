@@ -5,6 +5,9 @@ package engine
 import (
 	"context"
 	"errors"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,6 +25,8 @@ func startEngine(t *testing.T, defs map[NSKey]KeyDef, fs *fakeStore) *Engine {
 	e := New(Config{Store: fs, Registry: fakeRegistry{defs: defs}})
 
 	track(t, e, store.Scope{})
+
+	noDeliveryOutlivesTheTest(t, e)
 
 	t.Cleanup(func() {
 		if err := e.Close(); err != nil {
@@ -94,6 +99,27 @@ func scopeStale(t *testing.T, e *Engine, scope store.Scope) bool {
 	defer sc.mu.RUnlock()
 
 	return sc.stale
+}
+
+// scopeUnconfirmed reports how many keys of scope could not be read back after
+// their last change. Tests read it to synchronize on the SECOND failure of a
+// re-read, which the store's call counter cannot see: Get counts on entry, so
+// two calls is not two failures recorded.
+func scopeUnconfirmed(t *testing.T, e *Engine, scope store.Scope) int {
+	t.Helper()
+
+	e.scopesMu.RLock()
+	sc := e.scopes[scope]
+	e.scopesMu.RUnlock()
+
+	if sc == nil {
+		t.Fatalf("the engine does not track scope %+v", scope)
+	}
+
+	sc.mu.RLock()
+	defer sc.mu.RUnlock()
+
+	return len(sc.unconfirmed)
 }
 
 func firstReconcileOutcome(t *testing.T, e *Engine, scope store.Scope) error {
@@ -491,5 +517,230 @@ func TestStartFailsWhenFirstReconcilePanics(t *testing.T) {
 
 	if errors.Is(err, store.ErrValidation) {
 		t.Error("a panicked reconcile reports as a store validation failure; it is an internal engine failure")
+	}
+}
+
+// failListOnce makes the fake's next List fail and every later one succeed,
+// standing in for the transient store failure a consumer must be able to
+// retry Start after.
+func failListOnce(fs *fakeStore) {
+	var failed atomic.Bool
+
+	fs.onList(func(store.Scope) error {
+		if failed.CompareAndSwap(false, true) {
+			return errList
+		}
+
+		return nil
+	})
+}
+
+// TestStartRetriesAfterAFailedFirstReconcile pins that a first reconcile that
+// failed does not poison the engine for good. Start records its scope's first
+// outcome once and never rewrites it, so without a retry a consumer whose
+// database blinked at boot would get that same error from every later Start
+// for the life of the process.
+//
+// The retry lives here rather than in the Client discarding its engine: the
+// subscriber registry is the engine's and is keyed by key, not by scope, so a
+// discarded engine takes every OnChange registered before Start with it.
+func TestStartRetriesAfterAFailedFirstReconcile(t *testing.T) {
+	scope := store.Scope{}
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+
+	fs := newFakeStore()
+	fs.resyncOnSubscribe()
+	fs.seed(scope, store.Entry{Namespace: nk.Namespace, Key: nk.Key, Value: []byte(`"stored"`), Revision: 4})
+	failListOnce(fs)
+
+	e := startEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs)
+
+	if err := e.Start(startCtx(t, 2*time.Second)); !errors.Is(err, errList) {
+		t.Fatalf("first Start: got %v, want one wrapping %v", err, errList)
+	}
+
+	if err := e.Start(startCtx(t, 2*time.Second)); err != nil {
+		t.Fatalf("second Start: got %v, want nil — a store that blinked once must not be permanent", err)
+	}
+
+	got, ok := e.Lookup(scope, nk)
+	if !ok || got.Value != "stored" || got.Revision != 4 {
+		t.Fatalf("Lookup after the retry = (%+v, %v), want the stored row at revision 4", got, ok)
+	}
+
+	if got.Stale {
+		t.Error("the scope still reports Stale after a successful retry")
+	}
+}
+
+// TestStartRetryKeepsSubscriptions pins what the retry must not cost: an
+// OnChange registered before the failed Start still receives the announcement
+// the successful one makes (FC-11).
+func TestStartRetryKeepsSubscriptions(t *testing.T) {
+	scope := store.Scope{}
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+
+	fs := newFakeStore()
+	fs.resyncOnSubscribe()
+	fs.seed(scope, store.Entry{Namespace: nk.Namespace, Key: nk.Key, Value: []byte(`"stored"`), Revision: 4})
+	failListOnce(fs)
+
+	e := startEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs)
+
+	delivered := make(chan Change, 4)
+
+	unsubscribe := e.OnChange(nk, func(_ context.Context, ch Change) { delivered <- ch })
+	t.Cleanup(unsubscribe)
+
+	if err := e.Start(startCtx(t, 2*time.Second)); !errors.Is(err, errList) {
+		t.Fatalf("first Start: got %v, want one wrapping %v", err, errList)
+	}
+
+	if err := e.Start(startCtx(t, 2*time.Second)); err != nil {
+		t.Fatalf("second Start: got %v, want nil", err)
+	}
+
+	select {
+	case ch := <-delivered:
+		if ch.Value != "stored" || ch.Revision != 4 {
+			t.Errorf("announced %+v, want the stored row at revision 4", ch)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the subscriber registered before the failed Start never heard the retry's announcement")
+	}
+}
+
+// runningDelivery reports the delivery still inside a subscriber callback,
+// waiting up to grace for the last one to leave and returning nil once none
+// is. The description comes from stuckError, the same set a timed-out Close
+// names, so the report carries the (tenant, namespace, key) whose callback is
+// running rather than a bare "something leaked".
+//
+// A worker parked between deliveries is not in that set, and neither is one
+// whose goroutine is unwinding: this asks only whether consumer code is still
+// executing, which is the survivor that has outlived a test here.
+func runningDelivery(e *Engine, grace time.Duration) error {
+	deadline := time.Now().Add(grace)
+
+	for runningCount(e) > 0 {
+		if time.Now().After(deadline) {
+			return e.stuckError(grace)
+		}
+
+		time.Sleep(time.Millisecond)
+	}
+
+	return nil
+}
+
+// drainWorkers waits for e's dispatch workers to exit, BOUNDED, the way Close
+// bounds its own drain.
+//
+// A helper teardown that called e.dispatchWG.Wait() directly parked forever on
+// exactly the survivor noDeliveryOutlivesTheTest exists to name: a worker
+// inside a subscriber callback that ignores its context is what that WaitGroup
+// is waiting on. The guard is registered BEFORE each helper's teardown so LIFO
+// runs it last, so an unbounded Wait ran FIRST and never returned — the whole
+// package binary died on the test timeout, naming a stack and no test, which is
+// the outcome the guard was added to replace. Giving up hands the stuck
+// goroutine to the guard, which fails the test by name and quotes the (tenant,
+// namespace, key), and to TestMain's goleak check.
+//
+// Every caller shuts the door on new workers first, so nothing can Add to the
+// WaitGroup while the drain goroutine is still inside Wait — the race Go
+// answers by killing the process rather than returning an error. The drain
+// goroutine only ever closes a channel, so it cannot outlive the workers even
+// when the timer wins.
+func drainWorkers(e *Engine) {
+	drained := make(chan struct{})
+
+	go func() {
+		e.dispatchWG.Wait()
+		close(drained)
+	}()
+
+	timer := time.NewTimer(hangGuard)
+	defer timer.Stop()
+
+	select {
+	case <-drained:
+	case <-timer.C:
+	}
+}
+
+// noDeliveryOutlivesTheTest fails t, BY NAME, when one of e's dispatch workers
+// is still inside a subscriber callback once the test has torn its engine
+// down.
+//
+// goleak already catches that goroutine, but it runs from TestMain once the
+// whole package is over, so its report names a stack and no test — which is
+// how one such survivor stayed unattributable through every attempt to
+// reproduce it. A per-test goleak.VerifyNone would name the test too, but it
+// would have to be retrofitted into every test that subscribes and would then
+// police goroutines this package does not own, trading one flake for another;
+// this reads the engine's own marker, so it fires on exactly the survivor and
+// nothing else, and it goes on the shared helper rather than on the test.
+//
+// It is registered BEFORE the helper's own teardown so LIFO runs it last:
+// after Close, after the test's own releases, after every unsubscribe. An
+// engine built inline in a test rather than through a helper needs its own
+// call.
+func noDeliveryOutlivesTheTest(t *testing.T, e *Engine) {
+	t.Helper()
+
+	const grace = 2 * time.Second
+
+	t.Cleanup(func() {
+		if err := runningDelivery(e, grace); err != nil {
+			t.Errorf("a subscriber callback is still running %s after this test tore its engine "+
+				"down: %v. TestMain's goleak check reports that goroutine without naming a test, "+
+				"so release the callback and wait for it here", grace, err)
+		}
+	})
+}
+
+// TestRunningDeliveryNamesTheCallbackStillInside is the check on the guard
+// every engine helper in this package now ends with. A guard that reported a
+// drained engine while a subscriber was still running would put the intermittent
+// survivor it exists to attribute straight back where it came from: TestMain's
+// goleak report, which names a stack and no test.
+func TestRunningDeliveryNamesTheCallbackStillInside(t *testing.T) {
+	e := dispatchEngine(t)
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+
+	inside, gate := make(chan struct{}), make(chan struct{})
+
+	// Released on every exit path, a failed assertion included: a test that
+	// left its own callback parked would hang the package run instead of
+	// failing, which is the very shape this guard exists to make visible.
+	release := sync.OnceFunc(func() { close(gate) })
+	defer release()
+
+	unsub := e.OnChange(nk, func(context.Context, Change) {
+		close(inside)
+		<-gate // deliberately ignores ctx, the way the survivor this guard chases does
+	})
+	defer unsub()
+
+	e.publishInto(pub(nk, 1, "v1"))
+	mustReceive(t, inside, "the subscriber to start running")
+
+	err := runningDelivery(e, 20*time.Millisecond)
+	if err == nil {
+		t.Fatal("runningDelivery reported a drained engine while a subscriber callback was still " +
+			"inside it: the guard would let an unattributable leak through")
+	}
+
+	for _, want := range []string{"single-tenant", nk.Namespace, nk.Key} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("runningDelivery reported %q, which does not name %q: a guard that fires "+
+				"without saying which delivery is stuck sends the next reader hunting", err, want)
+		}
+	}
+
+	release()
+
+	if err := runningDelivery(e, hangGuard); err != nil {
+		t.Errorf("runningDelivery still reports %v once the callback has returned", err)
 	}
 }

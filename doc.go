@@ -9,8 +9,8 @@
 // optional polling).
 //
 // Construct a Client with [NewPostgres] or [NewMongoDB], register keys with
-// [Client.Register], call [Client.Start] to hydrate initial values and begin
-// listening for changes, and read values with the typed accessors ([Client.GetString],
+// [Client.Register], call [Client.Start] to load and reconcile initial values
+// and begin listening for changes, and read values with the typed accessors ([Client.GetString],
 // [Client.GetInt], etc.). Use [Client.OnChange] to react to live updates.
 //
 // Settings that imply resource teardown (DB DSNs, secrets, TLS material, listen

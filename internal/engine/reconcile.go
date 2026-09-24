@@ -8,6 +8,7 @@ import (
 	"github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/runtime"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/safelog"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -171,7 +172,24 @@ func (e *Engine) runOneReconcile(ctx context.Context, sc *scopeState, arm reconc
 		}
 	}()
 
-	defer runtime.RecoverAndLogWithContext(ctx, e.logger, "systemplane.engine", "reconcile")
+	// Recovered here rather than by RecoverAndLogWithContext, which reports
+	// what it recovered on the way out: reportConsumerPanic is what keeps a
+	// consumer's broken metrics recorder from turning that report into an
+	// unrecovered panic on this worker.
+	//
+	// The redaction gate is the registry as a WHOLE, not one key: a snapshot
+	// carries every registered key at once, so a store or driver panic under
+	// it may be holding any of them and the engine cannot tell which. The
+	// swallow is there because AnyRedacted is the consumer's code too, and a
+	// panic inside it would otherwise escape the recovery that was reporting
+	// and end this scope's only reconcile goroutine.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			defer safelog.Swallow()
+
+			e.reportConsumerPanic(ctx, sc.scope, NSKey{}, recovered, e.anyRedacted(), "reconcile panicked", "reconcile")
+		}
+	}()
 
 	e.reconcileScope(sc, arm)
 
@@ -356,7 +374,8 @@ func (e *Engine) listSnapshot(ctx context.Context, scope store.Scope) ([]store.E
 func (e *Engine) applySnapshotRow(ctx context.Context, sc *scopeState, arm reconcileArming, se store.Entry) (superseded bool) {
 	nk := NSKey{Namespace: se.Namespace, Key: se.Key}
 
-	pub, usable := e.prepare(ctx, sc.scope, se)
+	pub, prepareErr := e.prepare(ctx, sc.scope, se, false)
+	usable := prepareErr == nil
 
 	sc.reconcileMu.Lock()
 	defer sc.reconcileMu.Unlock()
@@ -365,14 +384,43 @@ func (e *Engine) applySnapshotRow(ctx context.Context, sc *scopeState, arm recon
 		return true
 	}
 
-	// The unusable set is deliberately NOT consulted here: a key whose feed
-	// re-read failed still takes a perfectly good snapshot row.
+	// The unusable set does not decide whether the row is applied: a key
+	// whose feed re-read failed still takes a perfectly good snapshot row.
+	// It decides whether applying it CONFIRMS the key — see below.
 	if _, touched := arm.window.touched[nk]; touched {
 		return false
 	}
 
 	if usable {
-		e.publish(sc, pub)
+		// The reconcile's own ingress: a drop means the scope is going away
+		// under it, and there is no caller to tell. Neither is the notify
+		// flag read — see below.
+		_, _ = e.publish(sc, pub)
+
+		// publish clears the unconfirmed record for every ingress that
+		// converges on it, which is right for the three that READ the row a
+		// moment ago — a changefeed re-read, a Set echo, a delete
+		// publication. A snapshot row is the one that never has: this
+		// photograph was taken at a moment nothing here knows, and it can
+		// predate the very change the failed re-read was sent for. So the key
+		// earns its confirmation instead of inheriting it, and it earns it
+		// from an ingress that read it back — the next notification, or a
+		// later reconcile.
+		//
+		// Asked of the photograph alone, and NOT of whether the publication
+		// advanced the cache. "It beat the cached revision" is not "it beat
+		// the announced one": a snapshot at an intermediate revision advances
+		// the cache, reports notify, and still shows a revision older than the
+		// change the feed announced — which left the scope reporting itself
+		// confirmed while permanently serving a stale row, with nothing on a
+		// connected feed to correct it.
+		//
+		// The delete path never needed this: recordFeedDelete marks the key
+		// touched at ARRIVAL, so a reconcile in flight skips its row entirely
+		// and returns above. Only the upsert path gets here.
+		if _, unusable := arm.window.unusable[nk]; unusable {
+			sc.markUnconfirmed(nk)
+		}
 
 		return false
 	}
@@ -383,7 +431,11 @@ func (e *Engine) applySnapshotRow(ctx context.Context, sc *scopeState, arm recon
 	// reports as a no-row event — a second line, for a key the snapshot plainly
 	// carried, per foreign row, on every reconcile of a table one database
 	// shares with every other consumer.
-	if _, registered := e.lookup(nk.Namespace, nk.Key); !registered {
+	//
+	// Asked of the error the ingress already returned rather than of the
+	// registry a second time: the answer is the same and this runs once per
+	// foreign row, which is the volume the whole branch exists for.
+	if errors.Is(prepareErr, errUnregisteredKey) {
 		return false
 	}
 
@@ -403,7 +455,7 @@ func (e *Engine) applySnapshotRow(ctx context.Context, sc *scopeState, arm recon
 	// failed to list — it completed, with an error, and the row it never saw
 	// was never announced by any reconcile after it.
 	if _, isCached := sc.cached(nk); !isCached {
-		e.ingestDefault(ctx, sc, nk, false)
+		_, _ = e.ingestDefault(ctx, sc, nk, false)
 	}
 
 	return false
@@ -424,11 +476,22 @@ func (e *Engine) applyAbsentKey(ctx context.Context, sc *scopeState, arm reconci
 		return true
 	}
 
-	if e.keepsCachedValue(sc, arm, nk) {
+	if keep, agreed := e.keepsCachedValue(sc, arm, nk); keep {
+		// The snapshot read this key back and found exactly what the cache
+		// holds, so the reconcile DID decide it — and a key a failed re-read
+		// left unconfirmed is confirmed by that, the same as by a
+		// publication. Nothing else would ever take the record back: no
+		// changefeed event arrives for a row that does not exist, and every
+		// later reconcile takes this same early return, so the scope reported
+		// Stale over a converged value for the life of the process.
+		if agreed {
+			sc.markConfirmed(nk)
+		}
+
 		return false
 	}
 
-	e.ingestDefault(ctx, sc, nk, false)
+	_, _ = e.ingestDefault(ctx, sc, nk, false)
 
 	return false
 }
@@ -451,25 +514,31 @@ func (e *Engine) applyAbsentKey(ctx context.Context, sc *scopeState, arm reconci
 //     behind it. Revision 0 never loses the fence, so republishing it would
 //     deliver a second Change for a key that never changed.
 //
+// agreed separates the last reason from the first two, and only it means the
+// snapshot decided the key: absence agrees with what the cache holds, which is
+// a read of the key, where the other two are the feed holding a fact this
+// snapshot does not have. The caller confirms the key on that, and only that.
+//
 // The caller holds sc.reconcileMu: the answer and the publication it gates are
 // one atomic step against the feed.
-func (e *Engine) keepsCachedValue(sc *scopeState, arm reconcileArming, nk NSKey) bool {
+func (e *Engine) keepsCachedValue(sc *scopeState, arm reconcileArming, nk NSKey) (keep, agreed bool) {
 	if _, touched := arm.window.touched[nk]; touched {
-		return true
+		return true, false
 	}
 
 	cached, isCached := sc.cached(nk)
 	if !isCached {
-		return false
+		return false, false
 	}
 
 	if _, unusable := arm.window.unusable[nk]; unusable {
-		return true
+		return true, false
 	}
 
 	def, registered := e.lookup(nk.Namespace, nk.Key)
+	agreed = registered && cached.Revision == 0 && reflect.DeepEqual(cached.Value, def.Default)
 
-	return registered && cached.Revision == 0 && reflect.DeepEqual(cached.Value, def.Default)
+	return agreed, agreed
 }
 
 // superseded reports whether a newer OpResync has taken the window this
@@ -505,6 +574,14 @@ func (sc *scopeState) closeWindow(arm reconcileArming) {
 // It is called only by a reconcile that applied a snapshot: a failed List
 // never reaches it, so stale survives even when both generations are
 // unchanged.
+//
+// It clears the CONNECTION's flag and nothing else. The scope's unconfirmed
+// keys are deliberately untouched: a reconcile whose window already carried a
+// key as touched skipped that key's snapshot row, so it decided nothing about
+// it, and clearing the record here reported a row nobody could re-read as
+// confirmed by a reconcile that never looked at it. A snapshot row this
+// reconcile did apply clears its own key, through publish, like every other
+// ingress.
 //
 // The check and the write are ONE acquisition of reconcileMu, the lock
 // armReconcile holds across arming. Split in two, an OpResync arriving

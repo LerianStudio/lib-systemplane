@@ -33,7 +33,7 @@ func (s *seeder) read() (Publication, bool, error) {
 func newSeedingCoordinator(t *testing.T, seed *seeder) *Coordinator[coordDoc] {
 	t.Helper()
 
-	return NewCoordinator[coordDoc](nil, Decode[coordDoc], seed.read)
+	return NewCoordinator[coordDoc](nil, coordNamespace, coordKey, false, false, Decode[coordDoc], seed.read)
 }
 
 func TestCoordinatorSeedsWhenNothingWasObserved(t *testing.T) {
@@ -213,10 +213,23 @@ func TestCoordinatorNeverSeedsAScopeItAlreadyObserved(t *testing.T) {
 	}
 }
 
+// TestCoordinatorSeedThatFailsToDecodeIsRecorded pins the seeded twin of the
+// published decode failure: the same recording, the same single log line, and
+// the same rendering under the group's redaction policy.
 func TestCoordinatorSeedThatFailsToDecodeIsRecorded(t *testing.T) {
-	seed := &seeder{pub: publication("t1", 7, "bad"), ok: true}
+	for _, tc := range decodeRedactionCases {
+		t.Run(tc.name, func(t *testing.T) {
+			seedDecodeFailure(t, tc.redacted)
+		})
+	}
+}
+
+func seedDecodeFailure(t *testing.T, redacted bool) {
+	t.Helper()
+
+	seed := &seeder{pub: publication("t1", 7, redactionMarker), ok: true}
 	logger := newRecordingLogger()
-	c := NewCoordinator[coordDoc](logger, rejectingDecode("bad"), seed.read)
+	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, redacted, false, rejectingDecode(redactionMarker), seed.read)
 
 	var rec recorder
 
@@ -236,6 +249,8 @@ func TestCoordinatorSeedThatFailsToDecodeIsRecorded(t *testing.T) {
 	if len(lines) != 1 || !strings.Contains(lines[0].msg, "failed to decode") {
 		t.Fatalf("logged = %v, want the decode failure at error level", lines)
 	}
+
+	assertDecodeFailureRendering(t, logger, redacted)
 
 	// A6 parity with the published-document branch: the rejection IS an
 	// observation, so the observed flag and not just the spent-seed flag says
@@ -350,7 +365,7 @@ func TestCoordinatorDeliversAfterASeedItCannotProveIdentical(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			seed := &seeder{pub: Publication{Tenant: "t1", Revision: 1, Value: tc.seeded}, ok: true}
-			c := NewCoordinator[coordDoc](nil, decodeRefusing, seed.read)
+			c := NewCoordinator[coordDoc](nil, coordNamespace, coordKey, false, false, decodeRefusing, seed.read)
 
 			var rec recorder
 

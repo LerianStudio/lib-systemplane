@@ -5,14 +5,20 @@ package client
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
+// facadeTestStore is read and written from the caller's goroutine and from the
+// engine's own (a reconcile per scope, a debounced re-read), so every field
+// lives under mu and every method releases it before invoking the subscriber.
 type facadeTestStore struct {
+	mu           sync.Mutex
 	entries      []TestEntry
+	revision     int64
 	gotSet       TestEntry
 	gotDeleteNS  string
 	gotDeleteKey string
@@ -23,6 +29,9 @@ type facadeTestStore struct {
 func (s *facadeTestStore) Start(context.Context) error { return nil }
 func (s *facadeTestStore) Close() error                { return nil }
 func (s *facadeTestStore) Get(_ context.Context, _ TestScope, ns, key string) (TestEntry, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	for _, e := range s.entries {
 		if e.Namespace == ns && e.Key == key {
 			return e, true, nil
@@ -33,12 +42,20 @@ func (s *facadeTestStore) Get(_ context.Context, _ TestScope, ns, key string) (T
 }
 
 func (s *facadeTestStore) Set(_ context.Context, _ TestScope, e TestEntry) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.revision++
+	e.Revision = s.revision
 	s.gotSet = e
 
-	return 0, nil
+	return s.revision, nil
 }
 
 func (s *facadeTestStore) Delete(_ context.Context, _ TestScope, ns, key, actor string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	s.gotDeleteNS = ns
 	s.gotDeleteKey = key
 	s.gotActor = actor
@@ -46,17 +63,49 @@ func (s *facadeTestStore) Delete(_ context.Context, _ TestScope, ns, key, actor 
 	return nil
 }
 func (s *facadeTestStore) List(context.Context, TestScope) ([]TestEntry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	return s.entries, nil
 }
 func (s *facadeTestStore) Subscribe(_ context.Context, _ TestScope, fn func(TestEvent)) (func(), error) {
+	s.mu.Lock()
 	s.subscribeFn = fn
+	s.mu.Unlock()
 
-	return func() { s.subscribeFn = nil }, nil
+	// Announce a connected changefeed (FC-2), outside the lock: the engine
+	// reads this store back on the calling goroutine.
+	fn(TestEvent{Op: store.OpResync})
+
+	return func() {
+		s.mu.Lock()
+		s.subscribeFn = nil
+		s.mu.Unlock()
+	}, nil
+}
+
+func (s *facadeTestStore) lastSet() TestEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.gotSet
+}
+
+func (s *facadeTestStore) lastDelete() (ns, key, actor string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.gotDeleteNS, s.gotDeleteKey, s.gotActor
+}
+
+func (s *facadeTestStore) subscriber() func(TestEvent) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.subscribeFn
 }
 
 func TestNewForTestingAdapterAndOptions(t *testing.T) {
-	t.Parallel()
-
 	backend := &facadeTestStore{entries: []TestEntry{{
 		Namespace: "ns",
 		Key:       "k",
@@ -89,23 +138,31 @@ func TestNewForTestingAdapterAndOptions(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 
+	defer c.Close()
+
 	if got, ok, err := c.GetString(context.Background(), "ns", "k"); err != nil || !ok || got != "stored" {
 		t.Fatalf("GetString = (%q, %v, %v), want stored/true/nil", got, ok, err)
 	}
 	if err := c.Set(context.Background(), "ns", "k", "new", "actor"); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	if backend.gotSet.Namespace != "ns" || backend.gotSet.Key != "k" || string(backend.gotSet.Value) != `"new"` {
-		t.Fatalf("backend Set = %#v", backend.gotSet)
+	if gotSet := backend.lastSet(); gotSet.Namespace != "ns" || gotSet.Key != "k" || string(gotSet.Value) != `"new"` {
+		t.Fatalf("backend Set = %#v", gotSet)
 	}
 	if err := c.Delete(context.Background(), "ns", "k", "actor"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	if backend.gotDeleteNS != "ns" || backend.gotDeleteKey != "k" || backend.gotActor != "actor" {
-		t.Fatalf("backend Delete = %q/%q by %q", backend.gotDeleteNS, backend.gotDeleteKey, backend.gotActor)
+	if ns, key, actor := backend.lastDelete(); ns != "ns" || key != "k" || actor != "actor" {
+		t.Fatalf("backend Delete = %q/%q by %q", ns, key, actor)
 	}
 
 	unsub, err := c.store.Subscribe(context.Background(), store.Scope{}, func(evt store.Event) {
+		// Subscribe announces a connected changefeed before returning (FC-2);
+		// this callback only asserts on the per-key event fired below it.
+		if evt.Op == store.OpResync {
+			return
+		}
+
 		if evt.Namespace != "ns" || evt.Key != "k" || evt.Op != store.OpUpsert {
 			t.Fatalf("event = %#v", evt)
 		}
@@ -113,16 +170,14 @@ func TestNewForTestingAdapterAndOptions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("adapter Subscribe: %v", err)
 	}
-	backend.subscribeFn(TestEvent{Namespace: "ns", Key: "k", Op: store.OpUpsert})
+	backend.subscriber()(TestEvent{Namespace: "ns", Key: "k", Op: store.OpUpsert})
 	unsub()
-	if backend.subscribeFn != nil {
+	if backend.subscriber() != nil {
 		t.Fatal("unsubscribe did not clear callback")
 	}
 }
 
 func TestNewForTestingRejectsNilStores(t *testing.T) {
-	t.Parallel()
-
 	if _, err := NewForTesting(nil); !errors.Is(err, store.ErrNilBackend) {
 		t.Fatalf("nil interface store error = %v, want ErrNilBackend", err)
 	}
@@ -133,9 +188,7 @@ func TestNewForTestingRejectsNilStores(t *testing.T) {
 	}
 }
 
-func TestRedactionAndClientHookHelpers(t *testing.T) {
-	t.Parallel()
-
+func TestRedactionHelpers(t *testing.T) {
 	if got := ApplyRedaction("visible", RedactNone); got != "visible" {
 		t.Fatalf("ApplyRedaction none = %#v", got)
 	}
@@ -145,33 +198,4 @@ func TestRedactionAndClientHookHelpers(t *testing.T) {
 	if got := RedactPolicy(99).String(); got != "none" {
 		t.Fatalf("unknown RedactPolicy string = %q", got)
 	}
-
-	var nilHook *clientHook
-	if got := nilHook.RegisteredKeys(); got != nil {
-		t.Fatalf("nil hook RegisteredKeys = %#v, want nil", got)
-	}
-	if got := nilHook.LifecycleContext(); got == nil {
-		t.Fatal("nil hook LifecycleContext returned nil")
-	}
-
-	c := newSingleTenantClient(t, newMemStore(false))
-	if err := c.Register("ns", "slice", []string{"a"}); err != nil {
-		t.Fatalf("Register: %v", err)
-	}
-	hook := newClientHook(c)
-	keys := hook.RegisteredKeys()
-	if len(keys) != 1 || keys[0].Namespace != "ns" || keys[0].Key != "slice" {
-		t.Fatalf("RegisteredKeys = %#v", keys)
-	}
-	keys[0].DefaultValue.([]string)[0] = "mutated"
-	if got := hook.RegisteredKeys()[0].DefaultValue.([]string)[0]; got != "a" {
-		t.Fatalf("RegisteredKeys did not clone default: got %q", got)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	c.lifecycleCtx = ctx
-	if got := hook.LifecycleContext(); got != ctx {
-		t.Fatal("LifecycleContext did not return client lifecycle context")
-	}
-	cancel()
 }

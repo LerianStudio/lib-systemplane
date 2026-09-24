@@ -28,6 +28,7 @@ import (
 	"github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/runtime"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/safelog"
 )
 
 // Publication is one published revision of a group's document in one scope.
@@ -171,8 +172,30 @@ type delivery[T any] struct {
 // returns nil.
 type Coordinator[T any] struct {
 	logger log.Logger
-	decode func(any) (T, error)
-	seed   func() (Publication, bool, error)
+	// namespace and key name the group every report below is about. They are
+	// carried rather than derived because a redacted group's report withholds
+	// the document, which would otherwise have been the only thing saying
+	// which group stopped being applied. Same two field names the engine's
+	// twin reports emit: "namespace" and "keyname" — never "key", which is an
+	// exact entry in lib-observability's sensitive-field list.
+	namespace string
+	key       string
+	// redacted is the group key's registration speaking: true when the key
+	// carries any redaction policy, and the only reason this package knows
+	// anything about redaction at all. A panicking applier is routinely
+	// holding the decoded document, and the canonical panic handler logs it,
+	// so the fact has to travel from Bind down to the recovery — and to the
+	// three lines that report a cause somebody else wrote: a returned apply
+	// error and the two decode failures name the document as freely as a panic
+	// does, so all four withhold it together or the gate is decorative.
+	redacted bool
+	// multiTenant is the Client's mode, and decides the tenant stamp on every
+	// report: a single-tenant scope has no tenant, so its reports carry no
+	// tenant field; a multi-tenant one names the publication's tenant, or
+	// safelog.UnresolvedTenant when the publication carries none.
+	multiTenant bool
+	decode      func(any) (T, error)
+	seed        func() (Publication, bool, error)
 
 	mu        sync.Mutex
 	seq       uint64
@@ -183,22 +206,40 @@ type Coordinator[T any] struct {
 }
 
 // NewCoordinator builds a coordinator. logger (may be nil) receives decode
-// failures and applier panics; decode converts a published document into T;
-// seed reads the group's current entry through the Client and reports ok=false
-// when the Client does not yet track the scope. A seed that cannot read at all
-// returns its error instead, and Register hands that error to the registrant.
-// seed is consulted only by a Register that finds no observed publication at
-// all.
+// failures and applier panics, and is guarded here so every site that logs
+// through it — including lib-observability's panic handler, which logs before
+// it counts — is safe from a consumer logger that panics; namespace and key
+// name the group, and every line this package writes carries them, because a
+// redacted group withholds the document that would otherwise have identified
+// it; redacted says the group's key is registered with a redaction policy,
+// which withholds a panicking applier's value from the report; multiTenant is
+// the Client's mode, which decides whether a report names a tenant; decode
+// converts a published document into T; seed reads the group's current entry
+// through the Client and reports ok=false when the Client does not yet track
+// the scope. A seed that cannot read at all returns its error instead, and
+// Register hands that error to the registrant. seed is consulted only by a
+// Register that finds no observed publication at all.
 func NewCoordinator[T any](
 	logger log.Logger,
+	namespace, key string,
+	redacted, multiTenant bool,
 	decode func(any) (T, error),
 	seed func() (Publication, bool, error),
 ) *Coordinator[T] {
 	return &Coordinator[T]{
-		logger: logger,
-		decode: decode,
-		seed:   seed,
-		scopes: map[string]*scope[T]{},
+		// Guarded once, here, rather than at each site that logs: the Client
+		// hands over the consumer's own logger unwrapped, and every line this
+		// package writes runs either on a publishing goroutine the consumer
+		// cannot recover on or inside an applier's recovery. Guard answers nil
+		// with a no-op logger, so the field is never nil below.
+		logger:      safelog.Guard(logger),
+		namespace:   namespace,
+		key:         key,
+		redacted:    redacted,
+		multiTenant: multiTenant,
+		decode:      decode,
+		seed:        seed,
+		scopes:      map[string]*scope[T]{},
 	}
 }
 
@@ -234,8 +275,10 @@ func (c *Coordinator[T]) Publish(ctx context.Context, pub Publication) {
 	// so the log line is the only place it is ever named. Every document that
 	// cannot be parsed is named exactly once.
 	if err != nil {
-		c.logError(ctx, "systemplane.group: published document failed to decode",
-			log.Err(err), log.String(constants.AttrKeyTenantID, pub.Tenant), log.Any("revision", pub.Revision))
+		c.logError(ctx, "systemplane.group: published document failed to decode", pub.Tenant,
+			safelog.ErrorDetail(c.redacted, "decode failed", err),
+			log.String("namespace", c.namespace), log.String("keyname", c.key),
+			log.Any("revision", pub.Revision))
 
 		return
 	}
@@ -386,9 +429,9 @@ func (c *Coordinator[T]) Register(fn ApplyFunc[T]) (func(), error) {
 
 	id, observed, seeded := c.add(fn)
 	if seeded.decodeErr != nil {
-		c.logError(ctx, "systemplane.group: seeded document failed to decode",
-			log.Err(seeded.decodeErr),
-			log.String(constants.AttrKeyTenantID, seeded.pub.Tenant),
+		c.logError(ctx, "systemplane.group: seeded document failed to decode", seeded.pub.Tenant,
+			safelog.ErrorDetail(c.redacted, "decode failed", seeded.decodeErr),
+			log.String("namespace", c.namespace), log.String("keyname", c.key),
 			log.Any("revision", seeded.pub.Revision))
 	}
 
@@ -529,8 +572,11 @@ func (c *Coordinator[T]) remove(id uint64) {
 // invariant it imposes on the Client is load-bearing: the seed closure reaches
 // Client.GetEntry from inside this mutex, therefore the Client must never hold
 // a lock across an OnChange dispatch, and must tolerate a subscriber calling
-// Get or GetEntry re-entrantly. Verified 2026-09-23: refreshFromStore releases
-// registryMu and cacheMu before fireSubscribers (internal/client/client.go).
+// Get or GetEntry re-entrantly. The engine holds to it: deliver
+// (internal/engine/dispatch.go) copies the subscriber slice, releases subsMu
+// and runs each callback with no engine or Client lock held, and the Client's
+// read paths (getEntry and listFromEngine, internal/client/get.go) release
+// registryMu before they call the engine.
 func (c *Coordinator[T]) seedLocked() seedOutcome {
 	if c.seed == nil || c.seedTaken || c.decode == nil || c.anyObservedLocked() {
 		return seedOutcome{}
@@ -743,10 +789,11 @@ func (c *Coordinator[T]) pendingLocked(sc *scope[T], observed observation[T]) []
 // ErrApplyPanicked is the error an apply function's panic becomes. It carries
 // no part of the recovered value: a panic value is whatever the panicking hook
 // was holding, routinely the decoded document with its endpoints and its
-// credentials, and this error is a field operators read and log. The value and
-// the stack are in the log line the panic handler writes, redacted in
-// production mode.
-var ErrApplyPanicked = errors.New("systemplane/group: apply function panicked; the value and stack are in the log line under group.apply")
+// credentials, and this error is a field operators read and log. Where the
+// value and the stack go is the panic handler's business and the key's
+// redaction policy's — a redacted group's document goes nowhere — so this
+// sentinel does not advertise a log line that may deliberately be missing it.
+var ErrApplyPanicked = errors.New("systemplane/group: apply function panicked")
 
 // invoke runs one applier and turns every failure mode into an error: a
 // returned error passes through, and a panic is recovered into one. The recover
@@ -764,6 +811,11 @@ var ErrApplyPanicked = errors.New("systemplane/group: apply function panicked; t
 // Both failure modes are logged here, at error level, naming the scope and the
 // revision: Status is a surface somebody has to think to read, while a
 // configuration that stopped being applied is something an operator needs told.
+// A returned error is rendered under the key's redaction policy for the same
+// reason its panicking twin is: an apply hook that refuses a document names it
+// — fmt.Errorf("cannot apply %+v", a.Value) — and for a redacted group that put
+// the whole document at ERROR. FC-7's Status keeps the error untouched; that is
+// the consumer's own surface, not a log sink.
 func (c *Coordinator[T]) invoke(
 	ctx context.Context,
 	fn ApplyFunc[T],
@@ -780,8 +832,8 @@ func (c *Coordinator[T]) invoke(
 			// something panicked and never says what stopped being applied.
 			// The recovered value stays out of it — redaction lives with the
 			// handler.
-			c.logError(ctx, "systemplane.group: apply function panicked",
-				log.String(constants.AttrKeyTenantID, current.Tenant),
+			c.logError(ctx, "systemplane.group: apply function panicked", current.Tenant,
+				log.String("namespace", c.namespace), log.String("keyname", c.key),
 				log.Any("revision", current.Revision))
 
 			c.reportPanic(ctx, recovered)
@@ -790,9 +842,9 @@ func (c *Coordinator[T]) invoke(
 
 	err = fn(ctx, current, previous)
 	if err != nil {
-		c.logError(ctx, "systemplane.group: apply function rejected the published document",
-			log.Err(err),
-			log.String(constants.AttrKeyTenantID, current.Tenant),
+		c.logError(ctx, "systemplane.group: apply function rejected the published document", current.Tenant,
+			safelog.ErrorDetail(c.redacted, "apply rejected the document", err),
+			log.String("namespace", c.namespace), log.String("keyname", c.key),
 			log.Any("revision", current.Revision))
 	}
 
@@ -801,53 +853,56 @@ func (c *Coordinator[T]) invoke(
 
 // reportPanic hands a recovered applier panic to lib-observability and refuses
 // to let the reporting escape: HandlePanicValue serializes the recovered value
-// through the consumer's logger, so a logger that panics would otherwise unwind
-// out of invoke — past the error return that LastErr is built on, and out
-// through the fan-out that recorded the scope as delivering.
+// through the logger, so a logger that panics would otherwise unwind out of
+// invoke — past the error return that LastErr is built on, and out through the
+// fan-out that recorded the scope as delivering. The logger is guarded at
+// construction, which covers this call and every other line this package
+// writes; the recover here is for the rest of the handler, the panic counter
+// and the span event and the error reporter, all of them consumer code nothing
+// can wrap.
 //
-// The logger goes in wrapped because HandlePanicValue LOGS the panic before it
-// records the counter, the span event and the error report: a logger that
-// panics on that line would take all three down with it, and the recover above
-// would then swallow the unwind, leaving a panicking hot-reload hook visible
-// nowhere but Status. Wrapping keeps the canonical handler and its production
-// redaction while making the record step independent of the consumer's logger.
+// A redacted group's document never reaches the report. HandlePanicValue logs
+// log.Any("value", recovered) and stamps the same rendering on the span event
+// whenever production mode is off, and off is what lib-observability ships, so
+// an apply hook that panics naming what it could not apply —
+// panic(fmt.Sprintf("cannot apply %+v", doc)) — would publish a RedactFull
+// group's whole document at ERROR. The matcher pilot keeps hmac_secret,
+// secret_access_key and a tenant API key in exactly such a group. For those
+// the handler receives safelog's sentence instead: what panicked and the panic
+// value's dynamic type, which tells two panics apart and can never carry a
+// byte of a secret. Same handler either way, so the counter, the span event
+// and the error report are recorded exactly as before; only what they carry
+// changes.
 func (c *Coordinator[T]) reportPanic(ctx context.Context, recovered any) {
-	defer swallowPanic()
+	defer safelog.Swallow()
 
-	runtime.HandlePanicValue(ctx, safeLogger{inner: c.logger}, recovered, "systemplane", "group.apply")
-}
-
-// safeLogger is a logger whose Log cannot unwind into its caller. It exists for
-// the panic handler above, which runs the consumer's logger ahead of everything
-// else it does.
-type safeLogger struct{ inner log.Logger }
-
-func (l safeLogger) Log(ctx context.Context, level int, msg string, fields ...any) {
-	if l.inner == nil {
-		return
+	reported := recovered
+	if c.redacted {
+		reported = safelog.WithheldPanic("apply function panicked", recovered)
 	}
 
-	defer swallowPanic()
-
-	l.inner.Log(ctx, level, msg, fields...)
+	runtime.HandlePanicValue(ctx, c.logger, reported, "systemplane", "group.apply")
 }
 
-func (c *Coordinator[T]) logError(ctx context.Context, msg string, fields ...log.Field) {
-	if c.logger == nil {
-		return
-	}
+// logError writes one line through the guarded logger. The guard makes the
+// recover here belt-and-braces rather than the only net, and makes a nil
+// consumer logger a no-op rather than a branch.
+//
+// tenant is the scope the report is about. A single-tenant report carries no
+// tenant field, and a multi-tenant one whose publication named no tenant
+// carries safelog.UnresolvedTenant, so neither renders an empty tenant.id.
+func (c *Coordinator[T]) logError(ctx context.Context, msg, tenant string, fields ...log.Field) {
+	defer safelog.Swallow()
 
-	defer swallowPanic()
+	if c.multiTenant {
+		if tenant == "" {
+			tenant = safelog.UnresolvedTenant
+		}
+
+		fields = append(fields, log.String(constants.AttrKeyTenantID, tenant))
+	}
 
 	c.logger.Log(ctx, log.LevelError, msg, fields)
-}
-
-// swallowPanic discards a panic raised by the consumer's own observability
-// code. There is nowhere left to report it — the logger is what panicked — and
-// the alternative is unwinding a publication, or a recovered applier panic,
-// over a log line.
-func swallowPanic() {
-	_ = recover()
 }
 
 // recordLocked writes back what each applier did with its delivery: an

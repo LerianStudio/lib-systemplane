@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
+	"github.com/LerianStudio/lib-observability/v4/runtime"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -86,7 +87,10 @@ func newSingleTenantClientWithLogger(t *testing.T, s *memStore, logger log.Logge
 
 	cfg := defaultClientConfig()
 	cfg.debounce = 0
-	cfg.logger = logger
+
+	// Through the option rather than the field, so the logger reaching the
+	// engine is the guarded one a real constructor hands it.
+	applyClientOptions(&cfg, []Option{WithLogger(logger)})
 
 	return newClient(s, cfg)
 }
@@ -106,19 +110,53 @@ func seedEntry(t *testing.T, m *memStore, ns, key string, value any) {
 	m.mu.Unlock()
 }
 
+// waitFor polls cond until it holds or the bound expires, so a test can wait on
+// work the engine does on a goroutine of its own without sleeping for a fixed
+// slice of time.
+func waitFor(t *testing.T, cond func() bool, msg string) {
+	t.Helper()
+
+	deadline := time.After(2 * time.Second)
+
+	for {
+		if cond() {
+			return
+		}
+
+		select {
+		case <-deadline:
+			t.Fatal(msg)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+// productionMode turns lib-observability's production mode on for one test and
+// restores it afterwards. Its recovery pipeline prints the recovered value
+// otherwise, and the value a validator panics on is the configuration row —
+// which is exactly what the rejection contract says must never be logged.
+func productionMode(t *testing.T) {
+	t.Helper()
+
+	previous := runtime.IsProductionMode()
+	runtime.SetProductionMode(true)
+
+	t.Cleanup(func() { runtime.SetProductionMode(previous) })
+}
+
 // rejectedSecret is the stored value the validators below refuse. It reads
 // like a credential on purpose: no log line may reproduce it.
 const rejectedSecret = "s3cr3t-token-do-not-log"
 
 var errSchemeRefused = errors.New("cleartext scheme refused on a hardened deployment")
 
-// TestHydrateRunsTheValidatorOnStoredValues covers the defect a consumer hit in
-// production: a value persisted before the key had a validator (or written by
-// an older binary, or straight into the table) was hydrated into the cache
-// unchecked, so the value in force was one the admin write path would refuse.
-// Hydration must grade it and keep the registered default when it fails, while
-// a sibling key whose stored value passes still hydrates.
-func TestHydrateRunsTheValidatorOnStoredValues(t *testing.T) {
+// TestReconcileRunsTheValidatorOnStoredValues covers the defect a consumer hit
+// in production: a value persisted before the key had a validator (or written
+// by an older binary, or straight into the table) was published unchecked, so
+// the value in force was one the admin write path would refuse. The first
+// reconcile must grade it and keep the registered default when it fails, while
+// a sibling key whose stored value passes is still published.
+func TestReconcileRunsTheValidatorOnStoredValues(t *testing.T) {
 	m := newMemStore(false)
 	logger := &recordingLogger{}
 	c := newSingleTenantClientWithLogger(t, m, logger)
@@ -165,7 +203,7 @@ func TestHydrateRunsTheValidatorOnStoredValues(t *testing.T) {
 		}
 	}
 
-	warns := logger.warns("stored value rejected by validator, keeping default")
+	warns := logger.warns("stored value rejected by validator, keeping cached value")
 	if len(warns) != 1 {
 		t.Fatalf("got %d WARN lines for the rejected stored value, want exactly 1", len(warns))
 	}
@@ -182,8 +220,8 @@ func TestHydrateRunsTheValidatorOnStoredValues(t *testing.T) {
 // TestRefreshRunsTheValidatorOnRefreshedValues covers the second unchecked
 // write path: a value that arrives through the changefeed after start. A
 // refusal keeps the value already in force, and — when the refresh lands
-// during hydration — must not claim the key, or hydration's own List snapshot
-// would be dropped on the strength of a value nobody accepted.
+// during the first reconcile — must not claim the key, or that reconcile's own
+// List snapshot would be dropped on the strength of a value nobody accepted.
 func TestRefreshRunsTheValidatorOnRefreshedValues(t *testing.T) {
 	t.Run("keeps the current value after start", func(t *testing.T) {
 		m := newMemStore(false)
@@ -243,7 +281,7 @@ func TestRefreshRunsTheValidatorOnRefreshedValues(t *testing.T) {
 			t.Errorf("value in force = %v, want the value that was already in force", got)
 		}
 
-		if n := len(logger.warns("refreshed value rejected by validator, keeping current value")); n != 1 {
+		if n := len(logger.warns("stored value rejected by validator, keeping cached value")); n != 1 {
 			t.Errorf("got %d WARN lines for the rejected refresh, want exactly 1", n)
 		}
 
@@ -252,8 +290,8 @@ func TestRefreshRunsTheValidatorOnRefreshedValues(t *testing.T) {
 		}
 	})
 
-	t.Run("does not claim the key against hydration", func(t *testing.T) {
-		m := newMemStoreWithListHook(false)
+	t.Run("does not claim the key against the first reconcile", func(t *testing.T) {
+		m := newMemStore(false)
 		logger := &recordingLogger{}
 		c := newSingleTenantClientWithLogger(t, m, logger)
 
@@ -289,17 +327,28 @@ func TestRefreshRunsTheValidatorOnRefreshedValues(t *testing.T) {
 			startDone <- c.Start(context.Background())
 		}()
 
-		<-listReady
+		// Never a bare receive: a hook the reconcile never reaches has to fail
+		// by name here rather than as a package timeout with no diagnosis.
+		select {
+		case <-listReady:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the first reconcile never reached List()")
+		}
 
-		// A changefeed event mid-hydration carrying a value the validator
-		// refuses. Marking the key touched here would make hydrate() skip it
-		// and leave the registered default in force.
+		// A changefeed event mid-reconcile carrying a value the validator
+		// refuses. Marking the key touched here would make the reconcile skip
+		// it and leave the registered default in force.
 		seedEntry(t, m, "ns", "k", rejectedSecret)
 		m.fire(store.Event{Namespace: "ns", Key: "k", Op: store.OpUpsert})
 
-		time.Sleep(50 * time.Millisecond)
+		// Wait on the refusal itself, not on a slice of wall clock: the race
+		// this test describes only exists once the refresh has run AND been
+		// rejected, and its WARN line is the only thing that says so.
+		waitFor(t, func() bool {
+			return len(logger.warns("stored value rejected by validator, keeping cached value")) > 0
+		}, "the refresh never rejected the value the changefeed carried")
 
-		// Restore the value List() is about to read, so hydration sees the
+		// Restore the value List() is about to read, so the reconcile sees the
 		// acceptable snapshot the changefeed raced.
 		seedEntry(t, m, "ns", "k", "accepted-from-list")
 		close(listRelease)
@@ -318,14 +367,14 @@ func TestRefreshRunsTheValidatorOnRefreshedValues(t *testing.T) {
 		}
 
 		if got != "accepted-from-list" {
-			t.Errorf("value in force = %v, want the hydrated snapshot — a rejected refresh claimed the key", got)
+			t.Errorf("value in force = %v, want the reconciled snapshot — a rejected refresh claimed the key", got)
 		}
 	})
 }
 
 // TestAcceptingValidatorSeesTheValueBothPathsCache pins that nothing changed
 // for a validator that accepts: it is handed exactly the decoded value the
-// cache goes on to serve, on hydration and on refresh alike.
+// cache goes on to serve, on reconcile and on refresh alike.
 func TestAcceptingValidatorSeesTheValueBothPathsCache(t *testing.T) {
 	m := newMemStore(false)
 	c := newSingleTenantClientWithLogger(t, m, &recordingLogger{})
@@ -357,13 +406,13 @@ func TestAcceptingValidatorSeesTheValueBothPathsCache(t *testing.T) {
 
 	t.Cleanup(func() { _ = c.Close() })
 
-	hydrated, ok, err := c.Get(context.Background(), "ns", "k")
+	reconciled, ok, err := c.Get(context.Background(), "ns", "k")
 	if err != nil || !ok {
-		t.Fatalf("get after hydrate: value=%v ok=%v err=%v", hydrated, ok, err)
+		t.Fatalf("get after the first reconcile: value=%v ok=%v err=%v", reconciled, ok, err)
 	}
 
-	if !reflect.DeepEqual(hydrated, fromStore) {
-		t.Fatalf("hydrated value = %#v, want %#v", hydrated, fromStore)
+	if !reflect.DeepEqual(reconciled, fromStore) {
+		t.Fatalf("reconciled value = %#v, want %#v", reconciled, fromStore)
 	}
 
 	fromFeed := []any{"https"}
@@ -392,7 +441,7 @@ func TestAcceptingValidatorSeesTheValueBothPathsCache(t *testing.T) {
 	seenMu.Lock()
 	defer seenMu.Unlock()
 
-	// Register (the default), hydrate, refresh — in that order.
+	// Register (the default), reconcile, refresh — in that order.
 	want := []any{[]any{"https"}, fromStore, fromFeed}
 	if !reflect.DeepEqual(seen, want) {
 		t.Errorf("validator saw %#v, want %#v", seen, want)
@@ -403,12 +452,14 @@ func TestAcceptingValidatorSeesTheValueBothPathsCache(t *testing.T) {
 // handed on a read-back path.
 type readBackCtxKey struct{}
 
-// TestStoredValueValidatorSeesTheReadBackContext pins the context contract the
-// two read-back call sites document: the context passed to Start on hydration,
-// and a deadline-bounded one derived from the client's lifecycle on a refresh.
-// Without it, passing context.Background() at either call site is a silent
-// change — a validator that reads a deadline or a value loses both.
-func TestStoredValueValidatorSeesTheReadBackContext(t *testing.T) {
+// TestStoredValueValidatorNeverSeesTheStartContext pins the v4 context
+// contract, which reverses what v3 documented. Every read-back now runs on an
+// engine-owned goroutine: the first reconcile and every later one validate with
+// the engine's lifecycle context — no request values, no tenant, no deadline —
+// and a changefeed re-read with a bounded context derived from it. The context
+// a caller hands to Start reaches neither, so a validator that expects request
+// scope must treat its absence as "cannot verify" rather than read it.
+func TestStoredValueValidatorNeverSeesTheStartContext(t *testing.T) {
 	m := newMemStore(false)
 	c := newSingleTenantClientWithLogger(t, m, &recordingLogger{})
 
@@ -448,25 +499,48 @@ func TestStoredValueValidatorSeesTheReadBackContext(t *testing.T) {
 	seedEntry(t, m, "ns", "k", "from-feed")
 	m.fire(store.Event{Namespace: "ns", Key: "k", Op: store.OpUpsert})
 
+	waitFor(t, func() bool {
+		seenMu.Lock()
+		defer seenMu.Unlock()
+
+		_, ok := seen["from-feed"]
+
+		return ok
+	}, "the changefeed re-read never handed the refreshed value to the validator")
+
 	seenMu.Lock()
 	defer seenMu.Unlock()
 
-	if got := seen["from-list"].carried; got != "start-context" {
-		t.Errorf("hydration handed the validator a context carrying %v, want the one passed to Start", got)
+	if got := seen["from-list"].carried; got != nil {
+		t.Errorf("the first reconcile handed the validator a context carrying %v, want the engine's own context with no request values", got)
+	}
+
+	if seen["from-list"].deadline {
+		t.Error("the first reconcile handed the validator a context with a deadline; the engine's lifecycle context has none")
+	}
+
+	if got := seen["from-feed"].carried; got != nil {
+		t.Errorf("the changefeed re-read handed the validator a context carrying %v, want the engine's own context with no request values", got)
 	}
 
 	if !seen["from-feed"].deadline {
-		t.Error("the refresh handed the validator a context with no deadline, want the bounded refresh context")
+		t.Error("the changefeed re-read handed the validator a context with no deadline, want the bounded re-read context")
 	}
 }
 
 // TestPanickingValidatorIsARefusal covers the row class the read-back grading
 // exists for, met by a validator that is not defensive: a legacy row of the
-// wrong shape makes a type-asserting validator panic. Hydration runs inside
-// Start, so an unrecovered panic there would take down boot — the very deploy
-// the fix was written to survive.
+// wrong shape makes a type-asserting validator panic. The first reconcile runs
+// inside Start, so an unrecovered panic there would take down boot — the very
+// deploy the fix was written to survive.
 func TestPanickingValidatorIsARefusal(t *testing.T) {
-	t.Run("hydration keeps the default and does not abort start", func(t *testing.T) {
+	// The engine hands the panic to lib-observability's recovery pipeline,
+	// which prints the panic VALUE unless production mode is on — and the
+	// value a validator panics on is the configuration row itself. Production
+	// mode is process-wide state, so these subtests never run in parallel.
+	productionMode(t)
+
+	t.Run("the first reconcile keeps the default and does not abort start", func(t *testing.T) {
 		m := newMemStore(false)
 		logger := &recordingLogger{}
 		c := newSingleTenantClientWithLogger(t, m, logger)
@@ -501,7 +575,7 @@ func TestPanickingValidatorIsARefusal(t *testing.T) {
 			t.Errorf("value in force = %v, want the registered default", got)
 		}
 
-		if n := len(logger.warns("stored value rejected by validator, keeping default")); n != 1 {
+		if n := len(logger.warns("stored value rejected by validator, keeping cached value")); n != 1 {
 			t.Errorf("got %d WARN lines for the panicking validator, want exactly 1", n)
 		}
 
@@ -547,32 +621,35 @@ func TestPanickingValidatorIsARefusal(t *testing.T) {
 			t.Errorf("value in force = %v, want the value that was already in force", got)
 		}
 
-		warns := logger.warns("refreshed value rejected by validator, keeping current value")
+		warns := logger.warns("stored value rejected by validator, keeping cached value")
 		if len(warns) != 1 {
 			t.Fatalf("got %d WARN lines for the panicking validator, want exactly 1", len(warns))
 		}
 
-		if rendered := fmt.Sprintf("%v", warns[0]); !strings.Contains(rendered, errSchemeRefused.Error()) {
-			t.Errorf("WARN line %q does not carry what the validator panicked with", rendered)
+		// What the validator panicked WITH stays out of this line: it is a
+		// value the validator was handed, so the ingress reports only that it
+		// panicked and leaves the value to the redacting recovery pipeline.
+		if rendered := fmt.Sprintf("%v", warns[0]); !strings.Contains(rendered, "validator panicked") {
+			t.Errorf("WARN line %q does not report that the validator panicked", rendered)
 		}
 	})
 }
 
-// TestHydrationYieldsToARefreshThatLandedDuringValidation closes the window the
-// grading opened. hydrationTouched exists so a changefeed value that arrives
-// mid-hydration is not overwritten by the older List snapshot; reading it
-// before the validator runs and writing the cache after leaves that window
-// open for as long as the validator takes, which is now consumer time.
-func TestHydrationYieldsToARefreshThatLandedDuringValidation(t *testing.T) {
+// TestReconcileYieldsToARefreshThatLandedDuringValidation closes the window the
+// grading opened. The reconcile's touched set exists so a changefeed value that
+// arrives mid-reconcile is not overwritten by the older List snapshot; reading
+// it before the validator runs and writing the published state after leaves
+// that window open for as long as the validator takes, which is consumer time.
+func TestReconcileYieldsToARefreshThatLandedDuringValidation(t *testing.T) {
 	m := newMemStore(false)
 	c := newSingleTenantClientWithLogger(t, m, &recordingLogger{})
 
-	hydrating := make(chan struct{})
+	reconciling := make(chan struct{})
 	release := make(chan struct{})
 
 	validator := func(_ context.Context, value any) error {
 		if value == "old-from-list" {
-			close(hydrating)
+			close(reconciling)
 			<-release
 		}
 
@@ -591,11 +668,17 @@ func TestHydrationYieldsToARefreshThatLandedDuringValidation(t *testing.T) {
 		startDone <- c.Start(context.Background())
 	}()
 
-	<-hydrating
+	// Never a bare receive: a validator the reconcile never reaches has to
+	// fail by name here rather than as a package timeout with no diagnosis.
+	select {
+	case <-reconciling:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first reconcile never ran the validator over the stored row")
+	}
 
 	// The whole refresh runs inline on this goroutine (the debounce window is
 	// zero), so when fire returns the changefeed value is cached and the key is
-	// claimed against hydration.
+	// claimed against the reconcile.
 	seedEntry(t, m, "ns", "k", "new-from-feed")
 	m.fire(store.Event{Namespace: "ns", Key: "k", Op: store.OpUpsert})
 

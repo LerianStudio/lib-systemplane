@@ -24,12 +24,14 @@ var exportedPackages = []string{".", "admin", "systemplanetest"}
 // v3 exists for: naming its log.Logger and its *tracing.Telemetry in parameters
 // forced every consumer onto one exact lib-observability major.
 //
-// lib-commons is deliberately NOT here. NewManager takes a *tmpostgres.Manager,
-// a concrete connection-pool handle with no interface to stand in for it, so
-// lib-commons' major is part of this contract by construction. Listing it would
-// make this test fail on a shape nobody intends to change, and a gate that
-// fails on purpose gets deleted. If that coupling ever becomes worth breaking,
-// it is its own change and this list is where it starts.
+// lib-commons is deliberately NOT here. internal/postgres.NewTenantManagerConnector
+// takes a *tmpostgres.Manager, a concrete connection-pool handle with no
+// interface to stand in for it, and the engine-tenants lane is the one that
+// puts that same handle behind a public Option, so lib-commons' major is part
+// of this contract by construction. Listing it would make this test fail on a
+// shape nobody intends to change, and a gate that fails on purpose gets
+// deleted. If that coupling ever becomes worth breaking, it is its own change
+// and this list is where it starts.
 var coupledModules = []string{"lib-observability"}
 
 // loggerish are the parameter names that indicate a logger or recorder is

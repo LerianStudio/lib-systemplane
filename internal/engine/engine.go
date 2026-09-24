@@ -13,6 +13,7 @@ import (
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/runtime"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/debounce"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/safelog"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -118,13 +119,17 @@ type Config struct {
 // default: a nil logger becomes a no-op, a zero CloseTimeout becomes 30s, and
 // a zero Debounce disables debouncing rather than dropping notifications.
 //
+// The logger is guarded ONCE, here, rather than at each of the sites that hand
+// it to a recovery handler or a goroutine launcher: every one of them reads
+// e.logger, and the debouncer is handed the same wrapped value, so the guard
+// covers the whole engine and nothing new has to remember it. safelog.Guard is
+// idempotent, so a Client that guarded the same logger already pays for one
+// wrapper, not two.
+//
 // It opens no connection and starts no goroutine — Start does that — so a
 // Client that is constructed and never started leaves nothing behind.
 func New(cfg Config) *Engine {
-	logger := cfg.Logger
-	if logger == nil {
-		logger = log.NewNop()
-	}
+	logger := safelog.Guard(cfg.Logger)
 
 	closeTimeout := cfg.CloseTimeout
 	if closeTimeout <= 0 {
@@ -183,9 +188,22 @@ func New(cfg Config) *Engine {
 // opening a changefeed whose events it could not answer. A nil Engine reports
 // the same nil-backend sentinel; the read paths stay nil-safe instead.
 //
-// Start is idempotent: a second call finds the changefeed open and the first
-// reconcile finished, and returns that same recorded outcome without
+// Start is idempotent on success: a second call finds the changefeed open and
+// the first reconcile finished, and returns that same recorded outcome without
 // subscribing or listing again.
+//
+// A FAILED first reconcile is the exception, and deliberately so. Its outcome
+// is recorded once and no later reconcile rewrites it, so without a retry a
+// consumer whose database blinked during boot would get that same error from
+// every Start for the life of the process — a configuration library that needs
+// a new Client after one hiccup. So a Start that finds its scope's recorded
+// outcome is an error tears the scope down and brings it up again, and the
+// store's OpResync after the fresh Subscribe drives a fresh first reconcile.
+// Subscriptions survive it: they belong to the engine and are keyed by key,
+// never by scope, so an OnChange registered before the failed Start hears the
+// retry's announcement (FC-11). A ctx expiry needs none of this — the scope is
+// still subscribed and still waiting for its first resync, so the next Start
+// waits on the same channel.
 func (e *Engine) Start(ctx context.Context) error {
 	if e == nil {
 		return store.ErrNilBackend
@@ -204,6 +222,8 @@ func (e *Engine) Start(ctx context.Context) error {
 	}
 
 	scope := store.Scope{}
+
+	e.retryFailedScope(scope)
 
 	sc, err := e.bringUpScope(scope)
 	if err != nil {
@@ -230,6 +250,40 @@ func (e *Engine) Start(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// retryFailedScope drops scope when its first reconcile is on record as having
+// FAILED, so the Start that follows brings it up again from nothing.
+//
+// The check and the drop are one critical section under startMu, so two
+// concurrent retries cannot both drop. The lock is released before bringUpScope
+// takes it again, so what keeps a retry from dropping a scope another Start has
+// just rebuilt is not this lock but Client.Start, which holds its own startMu
+// across the pair. A scope whose first reconcile has not finished is left
+// alone: it is still subscribed and its resync is still coming, and tearing it
+// down would throw away the changefeed the caller is waiting on.
+func (e *Engine) retryFailedScope(scope store.Scope) {
+	e.startMu.Lock()
+	defer e.startMu.Unlock()
+
+	sc := e.trackedScope(scope)
+	if sc == nil {
+		return
+	}
+
+	select {
+	case <-sc.firstReconcileDone:
+	default:
+		return
+	}
+
+	sc.mu.RLock()
+	failed := sc.firstReconcileErr != nil
+	sc.mu.RUnlock()
+
+	if failed {
+		e.dropScope(scope)
+	}
 }
 
 // bringUpScope creates scope's state and opens its changefeed, exactly once.
@@ -259,6 +313,17 @@ func (e *Engine) bringUpScope(scope store.Scope) (*scopeState, error) {
 		e.dropScope(scope)
 
 		return nil, fmt.Errorf("systemplane: changefeed for %s failed to open: %w", scopeLabel(scope), err)
+	}
+
+	// Nothing in store.Store forbids a backend from reporting success with no
+	// handle, and NewForTesting passes a consumer's return straight through its
+	// adapter. Normalising it here, once, is what keeps every later site honest:
+	// the rollback below and Close call it without asking, dropScope's nil check
+	// stays a "already dropped" test rather than a crash guard, and the
+	// idempotence check above keeps reading a stored handle as "subscribed"
+	// instead of re-subscribing this scope on every bring-up.
+	if unsubscribe == nil {
+		unsubscribe = func() {}
 	}
 
 	// Close reads each tracked scope's unsubscribe exactly once, and a Subscribe
@@ -419,6 +484,33 @@ func scopeLabel(scope store.Scope) string {
 // ingress, one canonical shape, and the echo of this write is then deduplicated
 // by revision.
 //
+// A local publication is TRUSTED and is not graded again here: Client.Set
+// marshals the value, decodes it back to the canonical shape these same bytes
+// produce, and runs the registered validator on it under the caller's own
+// context a moment before the store write — the same function, the same value,
+// the same shape, the same ctx. Grading it a second time bought nothing and
+// cost correctness: a validator that answered differently on the second call
+// dropped the publication while the row stayed written and Set still returned
+// nil, so a caller was told its write landed while the next read served the
+// previous value. Changefeed and reconcile ingress stays fully graded — those
+// rows were written by somebody else, and nothing in this process has ever
+// looked at them.
+//
+// What Publish can still refuse it REPORTS, and Client.Set passes that error
+// on: a closed or nil engine, a scope it does not track, a key nothing
+// registered, bytes that do not decode, and the two the ingress meets only
+// AFTER the guards above have passed — the engine closed under this write, and
+// the scope torn down under it. Every one of them means the row is persisted
+// and the next read will not serve it, which is exactly what a caller of Set
+// needs to be told.
+//
+// A nil error means exactly one thing: the next Lookup of this key in this
+// scope serves this write or something newer. It does not mean subscribers
+// have seen it — an accepted publication is queued on the key's delivery
+// worker, whose callbacks run after this returns — and it does not mean the
+// value was cached, because the fence refusing a write the cache already
+// holds at a higher revision is a nil error too.
+//
 // A write whose revision the store could not report (0) still takes effect,
 // because revision 0 always wins the fence — at the cost of the echo
 // publishing a second time. A value the caller just wrote must be readable.
@@ -427,8 +519,8 @@ func scopeLabel(scope store.Scope) string {
 // Start, or after the scope was dropped. Caching it would rebuild that scope
 // around one value with no changefeed behind it and no reconcile goroutine to
 // confirm it — readable forever as though it were current. A nil Engine
-// ignores the write instead of panicking, and a closed one drops it rather
-// than resurrecting a scope during shutdown.
+// reports the write refused instead of panicking, and a closed one drops it
+// rather than resurrecting a scope during shutdown.
 //
 // The write is fenced against a reconcile in flight exactly as a changefeed
 // publication is: the outcome is recorded, under the same lock, in the same
@@ -451,40 +543,78 @@ func scopeLabel(scope store.Scope) string {
 // engine's background context belongs to the goroutines the engine owns (the
 // workers, the reconcile, the debounced re-read), and using it here detached
 // every one of those records from the request that caused it.
-func (e *Engine) Publish(ctx context.Context, scope store.Scope, se store.Entry) {
+func (e *Engine) Publish(ctx context.Context, scope store.Scope, se store.Entry) error {
 	if e == nil || e.closed.Load() {
-		return
+		return ErrClosed
 	}
 
+	sc, err := e.writeScope(ctx, scope, NSKey{Namespace: se.Namespace, Key: se.Key})
+	if err != nil {
+		return err
+	}
+
+	return e.ingest(ctx, sc, se, feedFence{}, true)
+}
+
+// writeScope resolves the scope a LOCAL WRITE addresses — Publish and
+// PublishDelete, the two entry points a consumer's own goroutine reaches — and
+// reports ErrScopeNotTracked for a scope the engine holds no state for.
+//
+// It is deliberately not scopeForEvent, which answers the same question for
+// the changefeed and reports the drop as changefeed work under the engine's
+// background context. A write refused here was made by a caller that is still
+// waiting, inside that caller's span: the line is logged under ctx so it
+// belongs to the request that caused it, and says a write was dropped, so an
+// operator reading it does not go looking for a feed that was never involved.
+//
+// DEBUG, and unguarded, because this line runs once per refused write rather
+// than once per event: the guard scopeForEvent's own line carries would cost
+// more than the fields it skips.
+func (e *Engine) writeScope(ctx context.Context, scope store.Scope, nk NSKey) (*scopeState, error) {
 	sc := e.trackedScope(scope)
-	if sc == nil {
-		e.logDebug(ctx, "write for an untracked scope, dropping",
-			log.String(constants.AttrKeyTenantID, scope.Tenant),
-			log.String("namespace", se.Namespace),
-			log.String("keyname", se.Key),
-		)
-
-		return
+	if sc != nil {
+		return sc, nil
 	}
 
-	e.ingest(ctx, sc, se, deleteFence{})
+	e.logDebug(ctx, "write for an untracked scope, dropping",
+		log.String(constants.AttrKeyTenantID, scope.Tenant),
+		log.String("namespace", nk.Namespace),
+		log.String("keyname", nk.Key),
+	)
+
+	return nil, fmt.Errorf("%w: %s", ErrScopeNotTracked, scopeLabel(scope))
 }
 
 // Lookup returns the published state of nk in scope.
 //
 // ok is false for a scope the engine does not track and for a key that scope
 // has not published yet; the caller then falls back to the registered
-// default. Value is a deep copy the caller owns, and Stale reports whether the
-// scope's changefeed is disconnected or has not been reconciled yet. A nil
-// Engine reports a miss instead of panicking.
+// default. Value is a deep copy the caller owns. A nil Engine reports a miss
+// instead of panicking.
 //
-// A miss inside a tracked scope still carries that scope's Stale flag, and
-// only the scope the engine does not track at all reports the zero Entry.
-// Discarding staleness on the miss path was a silent lie: after a first
-// reconcile that published nothing — a transient List failure at Start — every
-// registered key is a miss, so every read is answered by the caller's
-// registered default, and dropping Stale reported each of those defaults as a
-// value the store had confirmed (FC-5).
+// Stale reports that nothing is currently confirming THIS key, which is two
+// facts read as one: the scope's changefeed is disconnected or has not been
+// reconciled since it connected — nothing is confirming any key of it — OR nk
+// itself could not be re-read after its last change (see
+// scopeState.unconfirmed). Both are read under the same lock as the entry, so
+// one Lookup is an atomic read of value and freshness.
+//
+// The second half is per key because that is the size of what was lost: one
+// row nobody could re-read. Reading the whole unconfirmed set instead put every
+// sibling of that key on a Stale with no release — the record is taken back
+// only by an ingress that DECIDES that key, so a key never written again held
+// the scope's every value stale for the life of a process whose connection
+// never drops. FC-5 freezes Stale as a field of one Entry, and an Entry is one
+// key's: narrowing the field to the key it is returned with is what the
+// contract already describes.
+//
+// A miss inside a tracked scope still carries that key's Stale, and only the
+// scope the engine does not track at all reports the zero Entry. Discarding
+// staleness on the miss path was a silent lie: after a first reconcile that
+// published nothing — a transient List failure at Start — every registered key
+// is a miss, so every read is answered by the caller's registered default, and
+// dropping Stale reported each of those defaults as a value the store had
+// confirmed (FC-5).
 func (e *Engine) Lookup(scope store.Scope, nk NSKey) (Entry, bool) {
 	if e == nil {
 		return Entry{}, false
@@ -497,7 +627,8 @@ func (e *Engine) Lookup(scope store.Scope, nk NSKey) (Entry, bool) {
 
 	sc.mu.RLock()
 	cached, ok := sc.entries[nk]
-	stale := sc.stale
+	_, unconfirmed := sc.unconfirmed[nk]
+	stale := sc.stale || unconfirmed
 	sc.mu.RUnlock()
 
 	if !ok {

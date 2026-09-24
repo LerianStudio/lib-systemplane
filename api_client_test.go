@@ -5,14 +5,28 @@ package systemplane
 import (
 	"context"
 	"errors"
+	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	// Aliased: this file has local variables named store.
+	internalstore "github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
+// apiMemoryStore is read and written from the caller's goroutine and from the
+// engine's own (a reconcile per scope, a debounced re-read), so every field
+// lives under mu and every method releases it before invoking the subscriber.
 type apiMemoryStore struct {
+	mu      sync.Mutex
 	entries map[string]TestEntry
-	sub     func(TestEvent)
-	closed  bool
+
+	// revision is the store-assigned revision FC-2 promises from Set, so a
+	// write and its changefeed echo carry the same non-zero revision.
+	revision int64
+
+	sub    func(TestEvent)
+	closed bool
 }
 
 func newAPIMemoryStore() *apiMemoryStore {
@@ -23,36 +37,76 @@ func apiMemoryKey(ns, key string) string { return ns + "\x00" + key }
 
 func (s *apiMemoryStore) Start(context.Context) error { return nil }
 func (s *apiMemoryStore) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	s.closed = true
 
 	return nil
 }
 
+// isClosed reports whether Client.Close reached the store it was handed. The
+// Client owns the backend's lifetime once NewForTesting accepts it, and a
+// Close that returned nil having closed nothing leaks the connection pool of
+// every consumer that trusted it.
+func (s *apiMemoryStore) isClosed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.closed
+}
+
+// seed writes a row straight into the fake, under the same lock its methods
+// take.
+func (s *apiMemoryStore) seed(e TestEntry) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.entries[apiMemoryKey(e.Namespace, e.Key)] = e
+}
+
 func (s *apiMemoryStore) Get(_ context.Context, _ TestScope, ns, key string) (TestEntry, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	e, ok := s.entries[apiMemoryKey(ns, key)]
 
 	return e, ok, nil
 }
 
 func (s *apiMemoryStore) Set(_ context.Context, _ TestScope, e TestEntry) (int64, error) {
+	s.mu.Lock()
+	s.revision++
+	rev := s.revision
+	e.Revision = rev
 	s.entries[apiMemoryKey(e.Namespace, e.Key)] = e
-	if s.sub != nil {
-		s.sub(TestEvent{Namespace: e.Namespace, Key: e.Key, Op: "upsert"})
+	sub := s.sub
+	s.mu.Unlock()
+
+	if sub != nil {
+		sub(TestEvent{Namespace: e.Namespace, Key: e.Key, Op: internalstore.OpUpsert, Revision: rev})
 	}
 
-	return 0, nil
+	return rev, nil
 }
 
 func (s *apiMemoryStore) Delete(_ context.Context, _ TestScope, ns, key, _ string) error {
+	s.mu.Lock()
 	delete(s.entries, apiMemoryKey(ns, key))
-	if s.sub != nil {
-		s.sub(TestEvent{Namespace: ns, Key: key, Op: "delete"})
+	sub := s.sub
+	s.mu.Unlock()
+
+	if sub != nil {
+		sub(TestEvent{Namespace: ns, Key: key, Op: internalstore.OpDelete})
 	}
 
 	return nil
 }
 
 func (s *apiMemoryStore) List(context.Context, TestScope) ([]TestEntry, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	out := make([]TestEntry, 0, len(s.entries))
 	for _, e := range s.entries {
 		out = append(out, e)
@@ -62,9 +116,50 @@ func (s *apiMemoryStore) List(context.Context, TestScope) ([]TestEntry, error) {
 }
 
 func (s *apiMemoryStore) Subscribe(_ context.Context, _ TestScope, fn func(TestEvent)) (func(), error) {
+	s.mu.Lock()
 	s.sub = fn
+	s.mu.Unlock()
 
-	return func() { s.sub = nil }, nil
+	// Announce a connected changefeed (FC-2), outside the lock: the engine
+	// reads this store back on the calling goroutine.
+	fn(TestEvent{Op: internalstore.OpResync})
+
+	return func() {
+		s.mu.Lock()
+		s.sub = nil
+		s.mu.Unlock()
+	}, nil
+}
+
+// TestPublicKeyRedactionFailsClosed pins the exported accessor's delegation:
+// a nil Client and a closed one answer RedactFull for every key, registered or
+// not, because every caller uses the answer to decide what a value may show.
+func TestPublicKeyRedactionFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	var nilClient *Client
+	if got := nilClient.KeyRedaction("runtime", "name"); got != RedactFull {
+		t.Errorf("KeyRedaction on a nil Client = %v, want RedactFull", got)
+	}
+
+	c, err := NewForTesting(newAPIMemoryStore())
+	if err != nil {
+		t.Fatalf("NewForTesting: %v", err)
+	}
+
+	if err := c.Register("runtime", "name", "default"); err != nil {
+		t.Fatalf("register name: %v", err)
+	}
+
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	for _, key := range []string{"name", "never-registered"} {
+		if got := c.KeyRedaction("runtime", key); got != RedactFull {
+			t.Errorf("KeyRedaction(%q) on a closed Client = %v, want RedactFull", key, got)
+		}
+	}
 }
 
 func TestPublicClientFacadeRuntimeMethods(t *testing.T) {
@@ -143,9 +238,11 @@ func TestPublicClientFacadeRuntimeMethods(t *testing.T) {
 		t.Fatalf("List returned %d entries, want 5: %#v", len(entries), entries)
 	}
 
-	var changed any
+	// Buffered, not a bare variable: under the engine this callback runs on a
+	// dispatch worker, so reading a plain variable back here is a data race.
+	changed := make(chan any, 4)
 	unsub, err := c.OnChange("runtime", "name", func(_ context.Context, ch Change) {
-		changed = ch.Value
+		changed <- ch.Value
 	})
 	if err != nil {
 		t.Fatalf("OnChange: %v", err)
@@ -153,9 +250,16 @@ func TestPublicClientFacadeRuntimeMethods(t *testing.T) {
 	if err := c.Set(ctx, "runtime", "name", "again", "actor"); err != nil {
 		t.Fatalf("Set again: %v", err)
 	}
-	if changed != "again" {
-		t.Fatalf("OnChange new value = %#v, want again", changed)
+
+	select {
+	case got := <-changed:
+		if got != "again" {
+			t.Fatalf("OnChange new value = %#v, want again", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("OnChange did not deliver the new value")
 	}
+
 	unsub()
 
 	if err := c.Delete(ctx, "runtime", "name", "actor"); err != nil {
@@ -212,6 +316,9 @@ func TestPublicConstructorsAndOptions(t *testing.T) {
 	if err := c.Start(context.Background()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
+
+	defer c.Close()
+
 	if err := c.Set(context.Background(), "ns", "k", "bad", "actor"); !errors.Is(err, ErrValidation) {
 		t.Fatalf("Set invalid error = %v, want ErrValidation", err)
 	}
@@ -226,14 +333,14 @@ func TestPublicGetEntryCarriesRevisionAndProvenance(t *testing.T) {
 	updatedAt := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
 
 	store := newAPIMemoryStore()
-	store.entries[apiMemoryKey("runtime", "name")] = TestEntry{
+	store.seed(TestEntry{
 		Namespace: "runtime",
 		Key:       "name",
 		Value:     []byte(`"stored"`),
 		Revision:  11,
 		UpdatedAt: updatedAt,
 		UpdatedBy: "operator",
-	}
+	})
 
 	c, err := NewForTesting(store, WithMultiTenantEnabled())
 	if err != nil {
@@ -263,5 +370,130 @@ func TestPublicGetEntryCarriesRevisionAndProvenance(t *testing.T) {
 
 	if _, ok, err := c.GetEntry(ctx, "runtime", "absent"); ok || err != nil {
 		t.Errorf("GetEntry for unregistered key = (%v, %v), want (false, nil)", ok, err)
+	}
+}
+
+// TestPublicCloseTimeoutNamesTheStuckKey pins D10 at the facade: a subscriber
+// that ignores its canceled context makes Close return ErrCloseTimeout naming
+// the key it is stuck on, and WithCloseTimeout is what bounds the wait — the
+// 30s engine default would make this test a timeout instead of an assertion.
+func TestPublicCloseTimeoutNamesTheStuckKey(t *testing.T) {
+	t.Parallel()
+
+	c, err := NewForTesting(newAPIMemoryStore(), WithCloseTimeout(100*time.Millisecond))
+	if err != nil {
+		t.Fatalf("NewForTesting: %v", err)
+	}
+
+	if err := c.Register("runtime", "name", "default"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Subscribed after Start so the FC-11 announcement is not what wedges the
+	// worker: the only delivery this callback ever sees is the Set below.
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+
+	var enterOnce, doneOnce sync.Once
+
+	if _, err := c.OnChange("runtime", "name", func(context.Context, Change) {
+		enterOnce.Do(func() { close(entered) })
+		<-release
+		doneOnce.Do(func() { close(done) })
+	}); err != nil {
+		t.Fatalf("OnChange: %v", err)
+	}
+
+	if err := c.Set(ctx, "runtime", "name", "changed", "actor"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("subscriber callback never ran")
+	}
+
+	err = c.Close()
+	if !errors.Is(err, ErrCloseTimeout) {
+		t.Fatalf("Close() = %v, want an error wrapping ErrCloseTimeout", err)
+	}
+
+	if msg := err.Error(); !strings.Contains(msg, "runtime") || !strings.Contains(msg, "name") {
+		t.Errorf("Close() error = %q, want it to name the namespace and the key", msg)
+	}
+
+	close(release)
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("subscriber callback never returned after release")
+	}
+}
+
+// TestPublicCloseReturnsNilWhenTheSubscriberHonoursCancellation is the other
+// half of D10: cancellation is cooperative, so a callback that watches its ctx
+// ends on Close and Close reports no leak.
+func TestPublicCloseReturnsNilWhenTheSubscriberHonoursCancellation(t *testing.T) {
+	t.Parallel()
+
+	backend := newAPIMemoryStore()
+
+	c, err := NewForTesting(backend, WithCloseTimeout(5*time.Second))
+	if err != nil {
+		t.Fatalf("NewForTesting: %v", err)
+	}
+
+	if err := c.Register("runtime", "name", "default"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	ctx := context.Background()
+	if err := c.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	entered := make(chan struct{})
+	done := make(chan struct{})
+
+	var enterOnce, doneOnce sync.Once
+
+	if _, err := c.OnChange("runtime", "name", func(cbCtx context.Context, _ Change) {
+		enterOnce.Do(func() { close(entered) })
+		<-cbCtx.Done()
+		doneOnce.Do(func() { close(done) })
+	}); err != nil {
+		t.Fatalf("OnChange: %v", err)
+	}
+
+	if err := c.Set(ctx, "runtime", "name", "changed", "actor"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("subscriber callback never ran")
+	}
+
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close() = %v, want nil for a callback that honours cancellation", err)
+	}
+
+	if !backend.isClosed() {
+		t.Error("Close() returned nil without closing the store it was handed")
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("subscriber callback never observed its canceled context")
 	}
 }

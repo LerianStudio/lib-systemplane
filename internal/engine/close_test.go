@@ -36,6 +36,8 @@ func closeEngine(t *testing.T, timeout time.Duration) *Engine {
 
 	track(t, e, store.Scope{})
 
+	noDeliveryOutlivesTheTest(t, e)
+
 	return e
 }
 
@@ -131,8 +133,8 @@ func TestCloseReportsTimeoutNamingStuckKey(t *testing.T) {
 	}
 
 	// A timeout still leaves the engine fully closed.
-	if e.publishInto(pub(nk, 2, "v2")) {
-		t.Error("publish after a timed-out Close was accepted, want dropped")
+	if notify, err := e.publishInto(pub(nk, 2, "v2")); notify || err == nil {
+		t.Errorf("publish after a timed-out Close: (notify %t, err %v), want (false, a refusal)", notify, err)
 	}
 
 	// The half TestCloseIsIdempotent cannot reach: it replays a nil outcome,
@@ -196,8 +198,8 @@ func TestPublishAfterCloseIsDropped(t *testing.T) {
 		t.Fatalf("Close() = %v, want nil", err)
 	}
 
-	if e.publishInto(pub(nk, 1, "v1")) {
-		t.Error("publish after Close was accepted, want dropped")
+	if notify, err := e.publishInto(pub(nk, 1, "v1")); notify || err == nil {
+		t.Errorf("publish after Close: (notify %t, err %v), want (false, a refusal)", notify, err)
 	}
 
 	if _, ok := e.Lookup(store.Scope{}, nk); ok {
@@ -282,7 +284,7 @@ func TestRefreshRacingCloseNeverReachesTheStore(t *testing.T) {
 	// inside Wait".
 	e.closeWorkers()
 
-	e.trackedRefresh(scope, nk)
+	e.trackedRefresh(scope, nk, false)
 
 	if got := fs.getCount(); got != 0 {
 		t.Errorf("Store.Get called %d times by a re-read that lost the race to Close, want 0", got)
@@ -318,6 +320,8 @@ func storeEngine(t *testing.T, defs map[NSKey]KeyDef, fs *fakeStore, window, tim
 	})
 
 	track(t, e, store.Scope{})
+
+	noDeliveryOutlivesTheTest(t, e)
 
 	t.Cleanup(func() { _ = e.Close() })
 
