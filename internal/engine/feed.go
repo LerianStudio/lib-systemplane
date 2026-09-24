@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"errors"
-	"fmt"
 	"time"
 
 	"github.com/LerianStudio/lib-observability/v4/constants"
@@ -578,7 +577,15 @@ func (e *Engine) recordFeedDelete(scope store.Scope, nk NSKey) {
 // announcement is queued on the key's delivery worker, whose callbacks run
 // after this returns. Unlike Publish it carries no fence outcome, because
 // revision 0 never loses the fence.
-func (e *Engine) PublishDelete(scope store.Scope, nk NSKey) error {
+//
+// ctx is the REMOVER's context, the one the Client received from the caller of
+// Delete, and it is used for everything this path emits, exactly as Publish
+// uses the writer's. A removal runs on the consumer's own goroutine inside the
+// consumer's own span, and in multi-tenant mode the tenant the Client stamps
+// on every line is resolved from that context alone: logging the refusals
+// against the engine's background context detached each one from the request
+// that caused it and dropped the tenant with it.
+func (e *Engine) PublishDelete(ctx context.Context, scope store.Scope, nk NSKey) error {
 	// Exported, so this runs on the consumer's goroutine: the same guard
 	// Publish takes, for the same reason. The feed's own callers can never
 	// reach a nil or closed engine; a Client built by a path that never
@@ -587,15 +594,15 @@ func (e *Engine) PublishDelete(scope store.Scope, nk NSKey) error {
 		return ErrClosed
 	}
 
-	sc := e.scopeForEvent(scope, nk)
-	if sc == nil {
-		return fmt.Errorf("%w: %s", ErrScopeNotTracked, scopeLabel(scope))
+	sc, err := e.writeScope(ctx, scope, nk)
+	if err != nil {
+		return err
 	}
 
 	sc.reconcileMu.Lock()
 	defer sc.reconcileMu.Unlock()
 
-	notify, err := e.ingestDefault(e.dispatchContext(), sc, nk, true)
+	notify, err := e.ingestDefault(ctx, sc, nk, true)
 	if err != nil {
 		return err
 	}

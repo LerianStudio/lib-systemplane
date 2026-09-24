@@ -45,7 +45,7 @@ func TestNilEngineIsInert(t *testing.T) {
 			call: func(t *testing.T) {
 				var e *Engine
 
-				if err := e.PublishDelete(store.Scope{}, nk); !errors.Is(err, ErrClosed) {
+				if err := e.PublishDelete(context.Background(), store.Scope{}, nk); !errors.Is(err, ErrClosed) {
 					t.Errorf("PublishDelete: got %v, want %v", err, ErrClosed)
 				}
 			},

@@ -131,8 +131,8 @@ func TestCloseReportsTimeoutNamingStuckKey(t *testing.T) {
 	}
 
 	// A timeout still leaves the engine fully closed.
-	if e.publishInto(pub(nk, 2, "v2")) {
-		t.Error("publish after a timed-out Close was accepted, want dropped")
+	if notify, err := e.publishInto(pub(nk, 2, "v2")); notify || err == nil {
+		t.Errorf("publish after a timed-out Close: (notify %t, err %v), want (false, a refusal)", notify, err)
 	}
 
 	// The half TestCloseIsIdempotent cannot reach: it replays a nil outcome,
@@ -196,8 +196,8 @@ func TestPublishAfterCloseIsDropped(t *testing.T) {
 		t.Fatalf("Close() = %v, want nil", err)
 	}
 
-	if e.publishInto(pub(nk, 1, "v1")) {
-		t.Error("publish after Close was accepted, want dropped")
+	if notify, err := e.publishInto(pub(nk, 1, "v1")); notify || err == nil {
+		t.Errorf("publish after Close: (notify %t, err %v), want (false, a refusal)", notify, err)
 	}
 
 	if _, ok := e.Lookup(store.Scope{}, nk); ok {

@@ -637,7 +637,7 @@ func TestPublishDeleteReportsEveryRefusalItCanStillMake(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			reg := &hookedRegistry{Registry: fakeRegistry{defs: defs}}
 
-			err := tc.engine(t, reg).PublishDelete(tc.scope, tc.nk)
+			err := tc.engine(t, reg).PublishDelete(context.Background(), tc.scope, tc.nk)
 
 			requireRefusal(t, "PublishDelete", err, tc.wantErr, tc.wantText)
 		})
@@ -758,7 +758,7 @@ func requireValidatorPanic(t *testing.T, err error) {
 // was handed.
 //
 // A returned error is already rendered under the key's redaction policy
-// (errorDetail), but a panic is not the engine's line to write — it goes to
+// ([ErrorDetail]), but a panic is not the engine's line to write — it goes to
 // lib-observability's canonical handler, which logs log.Any("value", panicked)
 // whenever production mode is off, and off is the shipped default. The field
 // key is "value", which is not on the sensitive-field list, so nothing

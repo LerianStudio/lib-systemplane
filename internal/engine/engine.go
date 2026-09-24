@@ -601,18 +601,41 @@ func (e *Engine) Publish(ctx context.Context, scope store.Scope, se store.Entry)
 		return ErrClosed
 	}
 
-	sc := e.trackedScope(scope)
-	if sc == nil {
-		e.logDebug(ctx, "write for an untracked scope, dropping",
-			log.String(constants.AttrKeyTenantID, scope.Tenant),
-			log.String("namespace", se.Namespace),
-			log.String("keyname", se.Key),
-		)
-
-		return fmt.Errorf("%w: %s", ErrScopeNotTracked, scopeLabel(scope))
+	sc, err := e.writeScope(ctx, scope, NSKey{Namespace: se.Namespace, Key: se.Key})
+	if err != nil {
+		return err
 	}
 
 	return e.ingest(ctx, sc, se, feedFence{}, true)
+}
+
+// writeScope resolves the scope a LOCAL WRITE addresses — Publish and
+// PublishDelete, the two entry points a consumer's own goroutine reaches — and
+// reports ErrScopeNotTracked for a scope the engine holds no state for.
+//
+// It is deliberately not scopeForEvent, which answers the same question for
+// the changefeed and reports the drop as changefeed work under the engine's
+// background context. A write refused here was made by a caller that is still
+// waiting, inside that caller's span: the line is logged under ctx so it
+// belongs to the request that caused it, and says a write was dropped, so an
+// operator reading it does not go looking for a feed that was never involved.
+//
+// DEBUG, and unguarded, because this line runs once per refused write rather
+// than once per event: the guard scopeForEvent's own line carries would cost
+// more than the fields it skips.
+func (e *Engine) writeScope(ctx context.Context, scope store.Scope, nk NSKey) (*scopeState, error) {
+	sc := e.trackedScope(scope)
+	if sc != nil {
+		return sc, nil
+	}
+
+	e.logDebug(ctx, "write for an untracked scope, dropping",
+		log.String(constants.AttrKeyTenantID, scope.Tenant),
+		log.String("namespace", nk.Namespace),
+		log.String("keyname", nk.Key),
+	)
+
+	return nil, fmt.Errorf("%w: %s", ErrScopeNotTracked, scopeLabel(scope))
 }
 
 // Lookup returns the published state of nk in scope.

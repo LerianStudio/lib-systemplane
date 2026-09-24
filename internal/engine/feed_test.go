@@ -199,7 +199,7 @@ func TestFeedDeleteDoesNotRevertTheWriteThatFollowedIt(t *testing.T) {
 	defer unsub()
 
 	// The caller's own Delete, then its own Set, each published as it returned.
-	if err := e.PublishDelete(scope, nk); err != nil {
+	if err := e.PublishDelete(context.Background(), scope, nk); err != nil {
 		t.Fatalf("PublishDelete: %v", err)
 	}
 
@@ -807,7 +807,7 @@ func TestPublishDeleteOnUntrackedScopeCreatesNoScope(t *testing.T) {
 	fs := newFakeStore()
 	e := untrackedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs)
 
-	if err := e.PublishDelete(store.Scope{}, nk); !errors.Is(err, ErrScopeNotTracked) {
+	if err := e.PublishDelete(context.Background(), store.Scope{}, nk); !errors.Is(err, ErrScopeNotTracked) {
 		t.Errorf("PublishDelete into an untracked scope: got %v, want errors.Is ErrScopeNotTracked", err)
 	}
 
@@ -866,7 +866,7 @@ func TestPublishDeleteRecordsTheKeyAsTouched(t *testing.T) {
 
 	fs.remove(scope, nk)
 
-	if err := e.PublishDelete(scope, nk); err != nil {
+	if err := e.PublishDelete(context.Background(), scope, nk); err != nil {
 		t.Fatalf("PublishDelete: %v", err)
 	}
 

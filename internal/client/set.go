@@ -173,7 +173,7 @@ func (c *Client) Delete(ctx context.Context, namespace, key, actor string) error
 		// Every refusal it can still make is passed on for the reason Set
 		// passes its own: the row is gone from the store and the next read in
 		// this process still serves the value the caller just removed.
-		switch err := c.engine.PublishDelete(store.Scope{}, engine.NSKey{Namespace: namespace, Key: key}); {
+		switch err := c.engine.PublishDelete(ctx, store.Scope{}, engine.NSKey{Namespace: namespace, Key: key}); {
 		case err == nil:
 		case errors.Is(err, engine.ErrClosed):
 			return ErrClosed

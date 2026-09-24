@@ -415,7 +415,11 @@ func (e *Engine) applySnapshotRow(ctx context.Context, sc *scopeState, arm recon
 	// reports as a no-row event — a second line, for a key the snapshot plainly
 	// carried, per foreign row, on every reconcile of a table one database
 	// shares with every other consumer.
-	if _, registered := e.lookup(nk.Namespace, nk.Key); !registered {
+	//
+	// Asked of the error the ingress already returned rather than of the
+	// registry a second time: the answer is the same and this runs once per
+	// foreign row, which is the volume the whole branch exists for.
+	if errors.Is(prepareErr, errUnregisteredKey) {
 		return false
 	}
 

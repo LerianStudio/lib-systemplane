@@ -132,7 +132,7 @@ func TestFeedDeleteRePublishesTheRowAWriteLeftBehind(t *testing.T) {
 		defer unsub()
 
 		// The caller's own Delete, then its own Set, each published as it returned.
-		if err := e.PublishDelete(scope, nk); err != nil {
+		if err := e.PublishDelete(context.Background(), scope, nk); err != nil {
 			t.Fatalf("PublishDelete: %v", err)
 		}
 

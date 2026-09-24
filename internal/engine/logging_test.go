@@ -543,7 +543,13 @@ func TestTenantIsLoggedUnderTheCanonicalKey(t *testing.T) {
 
 	// loggingEngine tracks only the zero scope, so a write addressed to a
 	// tenant is dropped — and the drop names the tenant it was addressed to.
-	_ = e.Publish(context.Background(), store.Scope{Tenant: tenant}, jsonRow(nk, 1, `"5"`, "ops"))
+	// Asserted rather than discarded: a fixture that started tracking the
+	// tenant would emit no line at all, and the record assertions below would
+	// then be reporting the wrong fault.
+	err := e.Publish(context.Background(), store.Scope{Tenant: tenant}, jsonRow(nk, 1, `"5"`, "ops"))
+	if !errors.Is(err, ErrScopeNotTracked) {
+		t.Fatalf("Publish into an untracked scope: got %v, want errors.Is ErrScopeNotTracked", err)
+	}
 
 	got := requireOneRecord(t, rec, "write for an untracked scope, dropping")
 
@@ -1447,4 +1453,43 @@ func TestPanicUnderReReadCannotResetALiveValue(t *testing.T) {
 	}
 
 	<-done
+}
+
+// TestPublishDeleteLogsUnderTheCallerContext pins the removal's half of the
+// write path to the caller's context, and to the write path's own drop line.
+//
+// A delete arrives on the consumer's own goroutine, inside the consumer's own
+// span, exactly as a write does — and in multi-tenant mode the tenant the
+// Client stamps on the line is resolved from that context alone. Logging it
+// under the engine's background context detached every refused removal from
+// the request that caused it and dropped the tenant with it.
+//
+// The message matters as much as the context: a removal refused because the
+// engine tracks no such scope is a WRITE being dropped, not changefeed work,
+// and an operator reading "changefeed work for an untracked scope" went
+// looking for a feed that was never involved.
+func TestPublishDeleteLogsUnderTheCallerContext(t *testing.T) {
+	type ctxKey struct{}
+
+	const tenant = "acme"
+
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	e, rec := loggingEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, newFakeStore())
+
+	ctx := context.WithValue(context.Background(), ctxKey{}, "caller-span")
+
+	// loggingEngine tracks only the zero scope, so a removal addressed to a
+	// tenant is dropped — by the write path, under the caller's context.
+	if err := e.PublishDelete(ctx, store.Scope{Tenant: tenant}, nk); !errors.Is(err, ErrScopeNotTracked) {
+		t.Fatalf("PublishDelete into an untracked scope: got %v, want errors.Is ErrScopeNotTracked", err)
+	}
+
+	got := requireOneRecord(t, rec, "write for an untracked scope, dropping")
+	if got.Ctx == nil || got.Ctx.Value(ctxKey{}) != "caller-span" {
+		t.Errorf("the delete path logged under a context that is not the caller's: %s", got)
+	}
+
+	if f, ok := got.field(constants.AttrKeyTenantID); !ok || f.Value != tenant {
+		t.Errorf("field %q: got (%v, %t), want %q", constants.AttrKeyTenantID, f.Value, ok, tenant)
+	}
 }

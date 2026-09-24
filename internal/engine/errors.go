@@ -51,3 +51,21 @@ var ErrClosed = errors.New("systemplane: engine is closed")
 // row is persisted and nothing in this process will serve it, which is what
 // the caller of Set or Delete is told. The wrapped message names the scope.
 var ErrScopeNotTracked = errors.New("systemplane: the engine does not track that scope")
+
+// errUnregisteredKey marks the ingress's one ordinary refusal: a row for a key
+// nothing in this process registered. One systemplane_entries table serves
+// every consumer of a database, so a scope's snapshot carries every other
+// consumer's namespaces and each of them reaches the ingress on every resync.
+//
+// It is a sentinel rather than a formatted string because of who asks. The
+// reconcile is the high-volume caller and it does not report the error to
+// anybody — it only needs to tell this refusal from the ones that mean a
+// registered key could not be read, which errors.Is answers for free. Building
+// a message per foreign row instead charged four allocations each to a caller
+// that discarded every one of them.
+//
+// The pregraded write path, whose caller IS waiting to hear what its next read
+// serves, wraps it with the key so the message names what was refused. It stays
+// unexported: the Client maps this refusal to its own ErrUnknownKey before a
+// caller of Set can see it, and the key is registered by then in any case.
+var errUnregisteredKey = errors.New("systemplane: is not a registered key")

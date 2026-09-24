@@ -166,7 +166,15 @@ func (e *Engine) prepare(ctx context.Context, scope store.Scope, se store.Entry,
 			)
 		}
 
-		return publication{}, fmt.Errorf("systemplane: %s/%s is not a registered key", se.Namespace, se.Key)
+		// The reconcile is this branch's high-volume caller and discards
+		// what it returns; only the pregraded write path has a caller
+		// waiting to be told which key was refused, so only it pays for a
+		// message. errUnregisteredKey says why both were refused.
+		if pregraded {
+			return publication{}, fmt.Errorf("%w: %s/%s", errUnregisteredKey, se.Namespace, se.Key)
+		}
+
+		return publication{}, errUnregisteredKey
 	}
 
 	var decoded any
@@ -175,7 +183,7 @@ func (e *Engine) prepare(ctx context.Context, scope store.Scope, se store.Entry,
 			log.String(constants.AttrKeyTenantID, scope.Tenant),
 			log.String("namespace", se.Namespace),
 			log.String("keyname", se.Key),
-			errorDetail(def.Redacted, "decode failed", err),
+			ErrorDetail(def.Redacted, "decode failed", err),
 		)
 
 		return publication{}, fmt.Errorf("systemplane: decode value for %s/%s: %w", se.Namespace, se.Key, err)
@@ -204,7 +212,7 @@ func (e *Engine) prepare(ctx context.Context, scope store.Scope, se store.Entry,
 
 // logValidatorRejection reports a row the registered validator refused, with
 // the key's registered redaction policy applied to the ERROR TEXT by
-// errorDetail.
+// [ErrorDetail].
 //
 // The validator is consumer code and its message is a consumer-built string,
 // so it is the one place a configuration value reaches the log stream having
@@ -221,11 +229,11 @@ func (e *Engine) logValidatorRejection(ctx context.Context, tenant string, nk NS
 		log.String(constants.AttrKeyTenantID, tenant),
 		log.String("namespace", nk.Namespace),
 		log.String("keyname", nk.Key),
-		errorDetail(redacted, "validation failed", err),
+		ErrorDetail(redacted, "validation failed", err),
 	)
 }
 
-// errorDetail renders a rejection's cause under the key's registered redaction
+// ErrorDetail renders a rejection's cause under the key's registered redaction
 // policy: the error itself for an ordinary key, and for a redacted one only
 // what refused it plus the error's dynamic type.
 //
@@ -241,7 +249,7 @@ func (e *Engine) logValidatorRejection(ctx context.Context, tenant string, nk NS
 // byte of the value; the offset is withheld for the same reason, being a
 // measurement of the secret. What the caller of Set receives is unchanged in
 // both cases: this is the log stream, not the API.
-func errorDetail(redacted bool, what string, err error) log.Field {
+func ErrorDetail(redacted bool, what string, err error) log.Field {
 	if !redacted {
 		return log.Err(err)
 	}
@@ -405,7 +413,7 @@ func (e *Engine) runValidator(
 // sensitive-field list. For a redacted key the handler therefore receives a
 // sentence in place of the value: what panicked, and the panic value's dynamic
 // type, which is enough to tell two panics apart and can never carry a byte of
-// a secret — the same trade errorDetail makes for a rejection's message, and
+// a secret — the same trade ErrorDetail makes for a rejection's message, and
 // the same shape internal/group reports an applier panic with.
 //
 // It is the same handler either way, so the panic counter, the span event and
