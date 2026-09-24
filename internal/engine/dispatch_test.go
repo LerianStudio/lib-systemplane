@@ -1077,3 +1077,36 @@ func workerStopRace(t *testing.T, stop func(e *Engine, w *dispatchWorker)) {
 		t.Error("the exited worker left its busy mark behind")
 	}
 }
+
+// TestOnChangePanicOnARedactedKeyWithholdsTheValue is the delivery half of the
+// same leak the validator has: a subscriber callback that panics naming the
+// configuration value it was handed.
+//
+// The callback is consumer code holding the decoded value of a key the
+// consumer itself registered as redacted, and the recovery around it reports
+// through lib-observability's handler, which prints the panic value at ERROR
+// whenever production mode is off — the shipped default. Delivery is the wider
+// door of the two: every subscriber of every published revision runs here.
+func TestOnChangePanicOnARedactedKeyWithholdsTheValue(t *testing.T) {
+	const secret = "redacted-callback-panic-sentinel-Vp3Hd"
+
+	nk := NSKey{Namespace: "billing", Key: "token"}
+
+	e := dispatchEngine(t)
+	logger := &recordingLogger{Logger: log.NewNop()}
+	e.logger = logger
+	e.registry = fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: "default", Redacted: true}}}
+
+	unsub := e.OnChange(nk, func(_ context.Context, ch Change) {
+		panic(fmt.Sprintf("cannot apply %v", ch.Value))
+	})
+	defer unsub()
+
+	e.publishInto(pub(nk, 1, secret))
+
+	waitFor(t, hangGuard, "the panicking delivery to be reported", func() bool {
+		return findLogged(logger, panicRecoveredMsg).Msg == panicRecoveredMsg
+	})
+
+	requirePanicWithheld(t, logger, "onchange", "string", secret)
+}

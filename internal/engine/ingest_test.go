@@ -5,6 +5,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -176,8 +177,7 @@ func TestIngestClonesRegisteredDefault(t *testing.T) {
 func TestIngestRejectsPanickingValidatorWithoutLeakingPanicValue(t *testing.T) {
 	// lib-observability's production mode is a process-global switch, which is why it is
 	// restored in t.Cleanup and why this test must never run in parallel with another.
-	runtime.SetProductionMode(true)
-	t.Cleanup(func() { runtime.SetProductionMode(false) })
+	productionMode(t)
 
 	const secret = "validator-panic-sentinel-Zq7Xk"
 
@@ -659,8 +659,7 @@ func TestRunValidator(t *testing.T) {
 	// lib-observability's production mode is a process-global switch: without
 	// it the recovery pipeline prints the recovered value, which is the one
 	// thing the panic case asserts is absent.
-	runtime.SetProductionMode(true)
-	t.Cleanup(func() { runtime.SetProductionMode(false) })
+	productionMode(t)
 
 	const secret = "run-validator-panic-sentinel-Wq4Nb"
 
@@ -735,7 +734,7 @@ func TestRunValidator(t *testing.T) {
 				e.logger = logger
 			}
 
-			tc.check(t, e.RunValidator(context.Background(), tc.validate, secret), logger)
+			tc.check(t, e.RunValidator(context.Background(), tc.validate, secret, false), logger)
 		})
 	}
 }
@@ -752,4 +751,83 @@ func requireValidatorPanic(t *testing.T, err error) {
 	if !strings.Contains(err.Error(), "validator panicked") {
 		t.Errorf("err = %q, want it to name the panic", err)
 	}
+}
+
+// TestValidatorPanicOnARedactedKeyWithholdsTheValue pins the one hole the
+// rejection contract still had: a validator that panics NAMING the value it
+// was handed.
+//
+// A returned error is already rendered under the key's redaction policy
+// (errorDetail), but a panic is not the engine's line to write — it goes to
+// lib-observability's canonical handler, which logs log.Any("value", panicked)
+// whenever production mode is off, and off is the shipped default. The field
+// key is "value", which is not on the sensitive-field list, so nothing
+// downstream catches it either: a RedactFull key's secret reaches ERROR in the
+// clear. Deliberately NOT run in production mode, because that mode is what
+// the old assertions leaned on and nothing ships with it.
+func TestValidatorPanicOnARedactedKeyWithholdsTheValue(t *testing.T) {
+	const secret = "redacted-validator-panic-sentinel-Rk9Tz"
+
+	nk := NSKey{Namespace: "billing", Key: "token"}
+	logger := &recordingLogger{Logger: log.NewNop()}
+	e := engineWithRegistry(fakeRegistry{defs: map[NSKey]KeyDef{
+		nk: {
+			Default:  "default",
+			Redacted: true,
+			Validate: func(_ context.Context, v any) error {
+				panic(fmt.Sprintf("refusing %v", v))
+			},
+		},
+	}})
+	e.logger = logger
+
+	ingestRow(e, store.Entry{
+		Namespace: nk.Namespace,
+		Key:       nk.Key,
+		Value:     []byte(`"` + secret + `"`),
+		Revision:  1,
+		UpdatedBy: "ops",
+	})
+
+	requirePanicWithheld(t, logger, "validator", "string", secret)
+}
+
+// requirePanicWithheld asserts the report of a panic raised by consumer code
+// over a redacted key: lib-observability's handler ran under the named source,
+// so the panic counter and the span event were recorded and not only logged;
+// the line names the panic value's dynamic type, which is enough to tell two
+// panics apart; and no entry anywhere carries the value itself.
+func requirePanicWithheld(t *testing.T, r *recordingLogger, source, wantType, secret string) {
+	t.Helper()
+
+	requirePanicAccounted(t, r, source)
+
+	value, ok := findLogged(r, panicRecoveredMsg).field("value")
+	if !ok {
+		t.Fatalf("%q carries no value field, got %v", panicRecoveredMsg, r.all())
+	}
+
+	rendered := fmt.Sprint(value.Value)
+	if !strings.Contains(rendered, "("+wantType+",") || !strings.Contains(rendered, "value withheld") {
+		t.Errorf("%q value field: got %q, want the panic value's type and no value", panicRecoveredMsg, rendered)
+	}
+
+	for _, entry := range r.all() {
+		if strings.Contains(entry, secret) {
+			t.Errorf("a log entry carries the value of a redacted key: %s", entry)
+		}
+	}
+}
+
+// productionMode turns lib-observability's production mode on for one test and
+// puts back whatever it held, rather than the literal false: the switch is
+// process-global, so a test that restores a constant silently turns the mode
+// off for every test that ran outside it.
+func productionMode(t *testing.T) {
+	t.Helper()
+
+	previous := runtime.IsProductionMode()
+	runtime.SetProductionMode(true)
+
+	t.Cleanup(func() { runtime.SetProductionMode(previous) })
 }

@@ -353,16 +353,29 @@ func (e *Engine) runWorker(ctx context.Context, wk workerKey, w *dispatchWorker)
 // kills neither the worker nor the process and is counted and recorded on the
 // span rather than merely logged; the subscriber list is copied before any
 // callback runs, so a callback may unsubscribe itself without deadlocking.
+//
+// The key's redaction policy is read once for the whole fan-out, because a
+// callback is consumer code holding the decoded value and a panic naming it —
+// panic(fmt.Sprintf("cannot apply %v", ch.Value)) — is reported by that same
+// recovery, which prints the panic value unless production mode is on. An
+// unregistered key reports false, which is the honest answer: nothing
+// registered it, so nothing declared it sensitive.
 func (e *Engine) deliver(ctx context.Context, nk NSKey, ch Change) {
 	e.subsMu.RLock()
 	subs := make([]subscription, len(e.subscribers[nk]))
 	copy(subs, e.subscribers[nk])
 	e.subsMu.RUnlock()
 
+	def, _ := e.lookup(nk.Namespace, nk.Key)
+
 	for _, sub := range subs {
 		func() {
-			defer runtime.RecoverAndLogWithContext(ctx, e.logger,
-				"systemplane.engine", "onchange")
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					e.reportConsumerPanic(ctx, recovered, def.Redacted,
+						"onchange callback panicked", "onchange")
+				}
+			}()
 
 			delivered := ch
 			delivered.Value = Clone(ch.Value)

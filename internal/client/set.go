@@ -81,7 +81,7 @@ func (c *Client) Set(ctx context.Context, namespace, key string, value any, acto
 		// recovery, the same one every ingress grades under: a validator that
 		// panics on the canonical shape refuses the write instead of unwinding
 		// into the caller's request goroutine.
-		if err := c.engine.RunValidator(ctx, def.validator, canonical); err != nil {
+		if err := c.engine.RunValidator(ctx, def.validator, canonical, def.redaction != RedactNone); err != nil {
 			return fmt.Errorf("%w: %w", ErrValidation, err)
 		}
 	}

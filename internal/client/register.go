@@ -102,7 +102,8 @@ func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOp
 	// not written for must come back as ErrValidation — which is what the
 	// option's own documentation promises — rather than kill the process at
 	// boot.
-	if err := c.engine.RunValidator(context.Background(), def.validator, canonical); err != nil {
+	if err := c.engine.RunValidator(context.Background(), def.validator, canonical,
+		def.redaction != RedactNone); err != nil {
 		return fmt.Errorf("%w: default value rejected: %w", ErrValidation, err)
 	}
 
