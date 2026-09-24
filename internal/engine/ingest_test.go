@@ -152,9 +152,17 @@ func TestIngestDefaultPublishesAtRevisionZero(t *testing.T) {
 		t.Errorf("provenance: got (%s, %q), want (zero time, \"\")", got.UpdatedAt, got.UpdatedBy)
 	}
 
-	if notify, err := e.ingestDefault(context.Background(), e.scopeFor(store.Scope{}),
-		NSKey{Namespace: "billing", Key: "unknown"}, true); notify || err == nil {
-		t.Errorf("no-row publication for an unregistered key: (notify %t, err %v), want (false, an error)", notify, err)
+	// errors.Is, not merely non-nil: reconcile tells this refusal apart from
+	// the ones that mean a registered key could not be read by matching the
+	// sentinel, so a message built by hand here reads to it as a real failure.
+	notify, err := e.ingestDefault(context.Background(), e.scopeFor(store.Scope{}),
+		NSKey{Namespace: "billing", Key: "unknown"}, true)
+	if notify || !errors.Is(err, errUnregisteredKey) {
+		t.Errorf("no-row publication for an unregistered key: (notify %t, err %v), want (false, errUnregisteredKey)", notify, err)
+	}
+
+	if err != nil && !strings.Contains(err.Error(), "billing/unknown") {
+		t.Errorf("refusal message = %q, want it to name billing/unknown", err)
 	}
 }
 
@@ -769,7 +777,7 @@ func requireValidatorPanic(t *testing.T, err error) {
 // was handed.
 //
 // A returned error is already rendered under the key's redaction policy
-// ([ErrorDetail]), but a panic is not the engine's line to write — it goes to
+// ([safelog.ErrorDetail]), but a panic is not the engine's line to write — it goes to
 // lib-observability's canonical handler, which logs log.Any("value", panicked)
 // whenever production mode is off, and off is the shipped default. The field
 // key is "value", which is not on the sensitive-field list, so nothing

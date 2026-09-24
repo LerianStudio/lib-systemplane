@@ -871,7 +871,7 @@ func (c *Coordinator[T]) invoke(
 // and the error report are recorded exactly as before; only what they carry
 // changes.
 func (c *Coordinator[T]) reportPanic(ctx context.Context, recovered any) {
-	defer swallowPanic()
+	defer safelog.Swallow()
 
 	reported := recovered
 	if c.redacted {
@@ -885,17 +885,9 @@ func (c *Coordinator[T]) reportPanic(ctx context.Context, recovered any) {
 // recover here belt-and-braces rather than the only net, and makes a nil
 // consumer logger a no-op rather than a branch.
 func (c *Coordinator[T]) logError(ctx context.Context, msg string, fields ...log.Field) {
-	defer swallowPanic()
+	defer safelog.Swallow()
 
 	c.logger.Log(ctx, log.LevelError, msg, fields)
-}
-
-// swallowPanic discards a panic raised by the consumer's own observability
-// code. There is nowhere left to report it — the logger is what panicked — and
-// the alternative is unwinding a publication, or a recovered applier panic,
-// over a log line.
-func swallowPanic() {
-	_ = recover()
 }
 
 // recordLocked writes back what each applier did with its delivery: an

@@ -61,7 +61,7 @@ func (c *Client) scopeFor(ctx context.Context) store.Scope {
 // way to find. Only the read-through paths use it: the single-tenant ingress
 // decodes rows the engine already holds by scope.
 //
-// redacted makes the same trade [engine.ErrorDetail] makes on the log line
+// redacted makes the same trade safelog.ErrorDetail makes on the log line
 // beside this: encoding/json reports what it choked on by quoting the byte —
 // `invalid character 's' looking for beginning of value` — and carries the
 // offset on the *json.SyntaxError for anyone who unwraps, so for a key whose

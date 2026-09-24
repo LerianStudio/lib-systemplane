@@ -184,3 +184,63 @@ func TestNoLoggedFieldNameIsRedacted(t *testing.T) {
 
 	logguard.AssertNoneRedacted(t, ".")
 }
+
+// typedNilLogger is the shape a `== nil` check does not catch: a nil POINTER
+// inside a non-nil interface. It is the ordinary way a consumer arrives with
+// no logger — a struct field of its own logger type left unset, handed to
+// WithLogger — and every method here dereferences the receiver, which is what
+// such a logger does in production.
+type typedNilLogger struct{ sink []string }
+
+func (l *typedNilLogger) Log(_ context.Context, _ int, msg string, _ ...any) {
+	l.sink = append(l.sink, msg)
+}
+
+func (l *typedNilLogger) Enabled(int) bool { return len(l.sink) > 0 }
+
+func (l *typedNilLogger) With(...any) log.Logger { l.sink = nil; return l }
+
+func (l *typedNilLogger) WithGroup(string) log.Logger { l.sink = nil; return l }
+
+func (l *typedNilLogger) Sync(context.Context) error { l.sink = nil; return nil }
+
+// TestGuardNormalisesATypedNilLogger pins the guard against the nil every other
+// nil check in this module already uses log.IsNil for. Guard runs FIRST — the
+// Client's option pass, the engine's constructor and the group coordinator all
+// hand it the consumer's raw logger — so a typed nil it wraps rather than
+// replaces is no longer log.IsNil to anything downstream, and the
+// normalisations that used to catch it never fire.
+//
+// Every method is exercised, not only the two the wrapper overrides: With,
+// WithGroup and Sync are forwarded to the wrapped logger, so a typed nil that
+// survives Guard panics on the caller's own stack with no recover in front of
+// it.
+func TestGuardNormalisesATypedNilLogger(t *testing.T) {
+	t.Parallel()
+
+	var typedNil *typedNilLogger
+
+	guarded := Guard(typedNil)
+
+	if log.IsNil(guarded) {
+		t.Fatal("Guard returned a nil logger for a typed nil, want a usable no-op")
+	}
+
+	guarded.Log(context.Background(), log.LevelError, "a line nobody has a logger for")
+
+	if guarded.Enabled(log.LevelDebug) {
+		t.Error("Enabled reported true for a typed-nil logger, want false")
+	}
+
+	if with := guarded.With("k", "v"); log.IsNil(with) {
+		t.Error("With returned a nil logger")
+	}
+
+	if group := guarded.WithGroup("g"); log.IsNil(group) {
+		t.Error("WithGroup returned a nil logger")
+	}
+
+	if err := guarded.Sync(context.Background()); err != nil {
+		t.Errorf("Sync = %v, want nil", err)
+	}
+}

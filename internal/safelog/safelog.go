@@ -38,7 +38,7 @@ import (
 type guardedLogger struct{ log.Logger }
 
 func (l guardedLogger) Log(ctx context.Context, level int, msg string, fields ...any) {
-	defer swallowPanic()
+	defer Swallow()
 
 	l.Logger.Log(ctx, level, msg, fields...)
 }
@@ -48,7 +48,7 @@ func (l guardedLogger) Log(ctx context.Context, level int, msg string, fields ..
 // guarded DEBUG line is skipped rather than built for a logger that cannot
 // take it.
 func (l guardedLogger) Enabled(level int) bool {
-	defer swallowPanic()
+	defer Swallow()
 
 	return l.Logger.Enabled(level)
 }
@@ -59,11 +59,21 @@ func (l guardedLogger) Enabled(level int) bool {
 // the group coordinator, and the store whose changefeed goroutines log from
 // their own recoveries and from the listener loop.
 //
+// Nil means log.IsNil, not l == nil: a consumer whose own logger field is an
+// unset pointer arrives here as a nil POINTER inside a non-nil interface, and
+// == nil does not see it. Guard runs FIRST on every path — the Client's option
+// pass, the engine's constructor, the group coordinator — so wrapping such a
+// logger rather than replacing it hides it from every log.IsNil downstream,
+// and the two backend configs and the Client that normalise a nil logger to a
+// no-op stop firing. Only the two overridden methods would be covered by the
+// recover below; With, WithGroup and Sync are forwarded and would panic on the
+// caller's own stack.
+//
 // Idempotent: a logger already guarded is handed back as it is, so a caller
 // that guards early and a constructor that guards again cost one wrapper, not
 // two.
 func Guard(l log.Logger) log.Logger {
-	if l == nil {
+	if log.IsNil(l) {
 		return log.NewNop()
 	}
 
@@ -95,10 +105,14 @@ func WithheldPanic(what string, recovered any) string {
 	return fmt.Sprintf("%s (%T, value withheld: key registered redacted)", what, recovered)
 }
 
-// swallowPanic discards a panic raised by the consumer's own observability
-// code. There is nowhere left to report it — the logger is what panicked — and
-// the alternative is unwinding a library goroutine over a log line.
-func swallowPanic() {
+// Swallow discards a panic raised by the consumer's own observability code.
+// There is nowhere left to report it — the logger is what panicked — and the
+// alternative is unwinding a library goroutine over a log line.
+//
+// It lives here because every caller of it is a caller of this package: the
+// guard's two overridden methods, the engine's log helpers and the group
+// coordinator's, which each used to carry a byte-identical copy.
+func Swallow() {
 	_ = recover()
 }
 

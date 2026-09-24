@@ -10,6 +10,7 @@ import (
 
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/engine"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/safelog"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -107,7 +108,7 @@ func (c *Client) getEntry(ctx context.Context, namespace, key string) (Entry, bo
 		c.logError(ctx, "failed to unmarshal stored value",
 			log.String("namespace", namespace),
 			log.String("keyname", key),
-			engine.ErrorDetail(def.redaction != RedactNone, "decode failed", err),
+			safelog.ErrorDetail(def.redaction != RedactNone, "decode failed", err),
 		)
 
 		return Entry{}, false, decodeErr(ctx, namespace, key, def.redaction != RedactNone, err)
@@ -364,7 +365,7 @@ func (c *Client) listFromStore(ctx context.Context, namespace string, keys []reg
 				c.logError(ctx, "failed to unmarshal stored value",
 					log.String("namespace", namespace),
 					log.String("keyname", rk.Key),
-					engine.ErrorDetail(rk.def.redaction != RedactNone, "decode failed", err),
+					safelog.ErrorDetail(rk.def.redaction != RedactNone, "decode failed", err),
 				)
 
 				return nil, decodeErr(ctx, namespace, rk.Key, rk.def.redaction != RedactNone, err)

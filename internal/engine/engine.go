@@ -115,13 +115,6 @@ type Config struct {
 	CloseTimeout time.Duration
 }
 
-// swallowPanic discards a panic raised by the consumer's own observability
-// code. There is nowhere left to report it — the logger is what panicked — and
-// the alternative is unwinding an engine goroutine over a log line.
-func swallowPanic() {
-	_ = recover()
-}
-
 // New builds an engine from cfg, defaulting everything that has a sensible
 // default: a nil logger becomes a no-op, a zero CloseTimeout becomes 30s, and
 // a zero Debounce disables debouncing rather than dropping notifications.

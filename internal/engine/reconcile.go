@@ -8,6 +8,7 @@ import (
 	"github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/runtime"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/safelog"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -184,7 +185,7 @@ func (e *Engine) runOneReconcile(ctx context.Context, sc *scopeState, arm reconc
 	// and end this scope's only reconcile goroutine.
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			defer swallowPanic()
+			defer safelog.Swallow()
 
 			e.reportConsumerPanic(ctx, sc.scope, NSKey{}, recovered, e.anyRedacted(), "reconcile panicked", "reconcile")
 		}

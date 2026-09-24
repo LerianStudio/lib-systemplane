@@ -9,6 +9,7 @@ import (
 	"github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/runtime"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/safelog"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -438,7 +439,7 @@ func (e *Engine) recoverRefresh(scope store.Scope, nk NSKey, deleted, retried bo
 	// frame from where it started. Same guard, same reason, as
 	// internal/group's own panic handler. It is registered FIRST so it runs
 	// LAST: the repair below still runs on the way out.
-	defer swallowPanic()
+	defer safelog.Swallow()
 
 	recovered := recover()
 	if recovered == nil {
@@ -471,7 +472,7 @@ func (e *Engine) recoverRefresh(scope store.Scope, nk NSKey, deleted, retried bo
 
 	// After the repair is deferred, because this reads the registry and the
 	// registry is the consumer's: a Lookup that panics unwinds through the
-	// deferred retry above and dies in swallowPanic, rather than costing the
+	// deferred retry above and dies in safelog.Swallow, rather than costing the
 	// key its re-read.
 	def, _ := e.lookup(nk.Namespace, nk.Key)
 

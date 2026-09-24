@@ -184,7 +184,7 @@ func (e *Engine) prepare(ctx context.Context, scope store.Scope, se store.Entry,
 			log.String(constants.AttrKeyTenantID, scope.Tenant),
 			log.String("namespace", se.Namespace),
 			log.String("keyname", se.Key),
-			ErrorDetail(def.Redacted, "decode failed", err),
+			safelog.ErrorDetail(def.Redacted, "decode failed", err),
 		)
 
 		return publication{}, fmt.Errorf("systemplane: decode value for %s/%s: %w", se.Namespace, se.Key, err)
@@ -213,7 +213,7 @@ func (e *Engine) prepare(ctx context.Context, scope store.Scope, se store.Entry,
 
 // logValidatorRejection reports a row the registered validator refused, with
 // the key's registered redaction policy applied to the ERROR TEXT by
-// [ErrorDetail].
+// [safelog.ErrorDetail].
 //
 // The validator is consumer code and its message is a consumer-built string,
 // so it is the one place a configuration value reaches the log stream having
@@ -230,28 +230,8 @@ func (e *Engine) logValidatorRejection(ctx context.Context, tenant string, nk NS
 		log.String(constants.AttrKeyTenantID, tenant),
 		log.String("namespace", nk.Namespace),
 		log.String("keyname", nk.Key),
-		ErrorDetail(redacted, "validation failed", err),
+		safelog.ErrorDetail(redacted, "validation failed", err),
 	)
-}
-
-// ErrorDetail renders a rejection's cause under the key's registered redaction
-// policy: the error itself for an ordinary key, and for a redacted one only
-// what refused it plus the error's dynamic type.
-//
-// Both rejections a stored row can produce carry the value in their message.
-// A validator is consumer code and may name what it refused — "token %q is too
-// short". encoding/json is worse, because it needs no help: an unparsable row
-// comes back as "invalid character 'h' looking for beginning of value", which
-// quotes the value's first byte and is reachable through any writer that does
-// not go through this library — the MongoDB backend stores value as a BSON
-// string nothing validates as JSON, so a hand-edited document lands here.
-//
-// The rendering lives in internal/safelog, shared with internal/group's
-// coordinator, which reports the same class of rejection for a group document
-// and cannot import this package. This is the engine's name for it, kept
-// because the client's read path calls it too.
-func ErrorDetail(redacted bool, what string, err error) log.Field {
-	return safelog.ErrorDetail(redacted, what, err)
 }
 
 // ingestDefault is the ingress for the no-row case: a Client Delete, a
@@ -289,9 +269,11 @@ func (e *Engine) ingestDefault(ctx context.Context, sc *scopeState, nk NSKey, de
 	// future caller — or one whose guard is removed — publishes nothing here
 	// rather than a nil default over a live value.
 	// TestIngestDefaultPublishesAtRevisionZero in ingest_test.go pins it, and
-	// asserts only that notify is false — no test asserts the level of the
-	// line below, which is a judgement about foreign traffic on a shared table
-	// rather than a contract.
+	// asserts that notify is false and that the refusal wraps
+	// errUnregisteredKey — the sentinel reconcile matches with errors.Is, so a
+	// message built by hand here would read to it as a real failure. No test
+	// asserts the level of the line below, which is a judgement about foreign
+	// traffic on a shared table rather than a contract.
 	def, registered := e.lookup(nk.Namespace, nk.Key)
 	if !registered {
 		e.logDebug(ctx, "no-row event for unregistered key, skipping",
@@ -300,7 +282,7 @@ func (e *Engine) ingestDefault(ctx context.Context, sc *scopeState, nk NSKey, de
 			log.String("keyname", nk.Key),
 		)
 
-		return false, fmt.Errorf("systemplane: %s/%s is not a registered key", nk.Namespace, nk.Key)
+		return false, fmt.Errorf("%w: %s/%s", errUnregisteredKey, nk.Namespace, nk.Key)
 	}
 
 	return e.publish(sc, publication{
@@ -429,7 +411,7 @@ func (e *Engine) runValidator(
 // sensitive-field list. For a redacted key the handler therefore receives a
 // sentence in place of the value: what panicked, and the panic value's dynamic
 // type, which is enough to tell two panics apart and can never carry a byte of
-// a secret — the same trade ErrorDetail makes for a rejection's message.
+// a secret — the same trade safelog.ErrorDetail makes for a rejection's message.
 //
 // The sentence itself lives in internal/safelog, shared with internal/group's
 // applier recovery, so the two sites that can report a withheld panic word it
@@ -480,7 +462,7 @@ func (e *Engine) reportConsumerPanic(
 // log line it was already given and loses the span event and the error report
 // behind it.
 func (e *Engine) reportRecovered(ctx context.Context, recovered any, name string) {
-	defer swallowPanic()
+	defer safelog.Swallow()
 
 	runtime.HandlePanicValue(ctx, e.recoveryLogger(), recovered, "systemplane.engine", name)
 }
