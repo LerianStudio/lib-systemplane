@@ -229,6 +229,107 @@ func TestDispatchIsolatesKeys(t *testing.T) {
 	close(release)
 }
 
+// TestDispatchNeverOverlapsTwoDeliveriesOfOneKey pins what FC-4's "serialized
+// per (scope, key)" buys a subscriber: a newer revision of a key waits for the
+// callback handling the older one to RETURN, so a callback is never re-entered
+// concurrently for its own key and may carry state from one delivery to the
+// next without a lock of its own. The synchronous loop in deliver is the whole
+// mechanism — hand each subscriber its own goroutine there and the concurrency
+// counter below reaches 2.
+//
+// The negative half is asserted in the same test on purpose: serial per KEY is
+// not serial overall, so key B still delivers while key A is blocked. A
+// "fix" that funnelled every key through one worker would satisfy the
+// serialization assertion alone.
+func TestDispatchNeverOverlapsTwoDeliveriesOfOneKey(t *testing.T) {
+	e := dispatchEngine(t)
+	keyA := NSKey{Namespace: "billing", Key: "limits"}
+	keyB := NSKey{Namespace: "billing", Key: "quota"}
+
+	var (
+		mu      sync.Mutex
+		running int
+		maxRun  int
+	)
+
+	// started carries the revision of each delivery as it BEGINS, which is
+	// what separates "has not been delivered yet" from "is running now".
+	started := make(chan int64, 4)
+
+	// release frees the first delivery only: once.Do makes every later
+	// delivery of this key fall straight through.
+	release := make(chan struct{})
+
+	var once sync.Once
+
+	unsubA := e.OnChange(keyA, func(ctx context.Context, ch Change) {
+		mu.Lock()
+
+		running++
+		if running > maxRun {
+			maxRun = running
+		}
+
+		mu.Unlock()
+
+		started <- ch.Revision
+
+		once.Do(func() {
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+		})
+
+		mu.Lock()
+		running--
+		mu.Unlock()
+	})
+	defer unsubA()
+
+	var recB recorder
+
+	unsubB := e.OnChange(keyB, recB.record)
+	defer unsubB()
+
+	e.publishInto(pub(keyA, 1, "a1"))
+
+	if got := <-started; got != 1 {
+		t.Fatalf("first delivery carried revision %d, want 1", got)
+	}
+
+	// Revision 2 lands in key A's mailbox while the subscriber holding
+	// revision 1 is still inside its callback.
+	e.publishInto(pub(keyA, 2, "a2"))
+
+	// Key B is published behind it and delivers anyway: waiting for that is
+	// also what proves the runtime had every chance to start key A's second
+	// delivery before the check below says it never did.
+	e.publishInto(pub(keyB, 1, "b1"))
+	waitFor(t, hangGuard, "key b delivered while key a is blocked", func() bool {
+		return recB.len() == 1
+	})
+
+	select {
+	case rev := <-started:
+		t.Fatalf("revision %d started while the callback holding revision 1 had not returned", rev)
+	default:
+	}
+
+	close(release)
+
+	if got := <-started; got != 2 {
+		t.Fatalf("second delivery carried revision %d, want 2", got)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if maxRun != 1 {
+		t.Errorf("%d callbacks of one key ran at once, want never more than 1", maxRun)
+	}
+}
+
 func TestSubscriberMutationDoesNotAffectCache(t *testing.T) {
 	e := dispatchEngine(t)
 	nk := NSKey{Namespace: "billing", Key: "limits"}

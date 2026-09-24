@@ -1988,20 +1988,30 @@ func groupBurstDocument(i int) groupConfig {
 	}
 }
 
-// TestGroupOnApplyBeforeStartIsDeliveredDuringStart pins FC-7's "Before Start,
-// OnApply registers and the initial delivery happens during Start": the store
-// announces its seeded row as Subscribe registers, which is the shape the
-// engine's first reconcile takes (FC-11), so the stored document is published
-// while Start is still running.
+// TestGroupOnApplyBeforeStartDeliversTheStartFeedAnnouncementOnce covers the
+// ingress its sibling below does not. This store announces an upsert for every
+// seeded row as the subscription registers — what a backend that was already
+// changing when the process came up looks like — so the stored document
+// reaches the applier through the FEED's re-read, inline on the Subscribe
+// goroutine, and the first reconcile then reaches the same row with the key
+// already marked as touched by that re-read and leaves its snapshot alone.
+// The sibling's store stays silent, so there the reconcile's snapshot is the
+// only thing that can publish.
 //
-// No delivery count is asserted, deliberately. On this base GetEntry reports
-// Stale false even before Start (FC-5's wave-1 shim), so OnApply's seed fires
-// at registration time with the registered DEFAULT and the stored document
-// arrives during Start — two deliveries where an engine-backed Client produces
-// one. D-G7 predicted exactly that ("the pre-Start gate cannot be exercised
-// through the facade on this lane's base"); the assertion that survives both
-// shapes is that the applier holds the current document when Start returns.
-func TestGroupOnApplyBeforeStartIsDeliveredDuringStart(t *testing.T) {
+// Two ingresses read one row here, and the applier must still see it exactly
+// once. That count is what the assertions below pin, and it is worth being
+// honest about its strength: TWO mechanisms uphold it — the touched-key skip
+// in the reconcile, and behind that the equal-revision publish fence, which
+// absorbs the reconcile's duplicate as a provenance refresh when the skip is
+// removed (D2, D3). Removing either one alone leaves this test green, so it
+// is an end-to-end guard on the guarantee rather than a detector for one
+// fence.
+//
+// The Set is a barrier, not a subject: deliveries of one key run in order on
+// one worker, so waiting for the second document proves everything Start put
+// in flight has already been delivered. A duplicate would surface as the
+// second delivery here instead of the document this test wrote.
+func TestGroupOnApplyBeforeStartDeliversTheStartFeedAnnouncementOnce(t *testing.T) {
 	t.Parallel()
 
 	s := newGroupMemoryStore()
@@ -2025,6 +2035,25 @@ func TestGroupOnApplyBeforeStartIsDeliveredDuringStart(t *testing.T) {
 
 	rec.awaitLast(t, "the OnApply registered before Start never received the stored document",
 		func(a systemplane.Applied[groupConfig]) bool { return reflect.DeepEqual(a.Value, stored) })
+
+	barrier := groupConfig{Name: "after-start", Retries: 1, Hosts: []string{"b"}}
+	if err := g.Set(context.Background(), barrier, "operator"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	seen := rec.await(t, 2)
+
+	if len(seen) != 2 {
+		t.Fatalf("deliveries = %d, want exactly 2: the announced document once, then the barrier write; %#v", len(seen), seen)
+	}
+
+	if !reflect.DeepEqual(seen[0].Value, stored) {
+		t.Errorf("first delivery = %#v, want the announced document %#v", seen[0].Value, stored)
+	}
+
+	if !reflect.DeepEqual(seen[1].Value, barrier) {
+		t.Errorf("second delivery = %#v, want the barrier write %#v: the feed announcement and the reconcile of the same row delivered twice", seen[1].Value, barrier)
+	}
 }
 
 // TestGroupOnApplyBeforeStartReceivesTheStoredDocumentFromStart pins FC-11
@@ -2421,15 +2450,22 @@ func TestGroupOnApplySetFromInsideAnApplierIsDeliveredAfterIt(t *testing.T) {
 
 	written := groupConfig{Name: "written-by-the-hook", Retries: 4, Hosts: []string{"inner"}}
 
-	// depth, nested, scopes and setErr are deliberately unguarded: no two
-	// deliveries of one scope may ever OVERLAP, so -race reports it if the echo
-	// of the re-entrant write runs while the delivery that wrote it is still
-	// inside the applier. The seeded delivery runs on the registering goroutine
-	// and the echo may run on that key's dispatch worker instead, which is not
-	// a race precisely because the coordinator hands the scope from one to the
-	// other under its own state mutex — take that hand-off away and the
-	// detector fires here. A sync.Mutex around these four would silence exactly
-	// the defect the test exists to catch.
+	// depth, nested, scopes and setErr are unguarded on purpose, and are safe
+	// for a reason that is ordering rather than affinity: the seeded delivery
+	// runs on the registering goroutine and the echo may run on that key's
+	// dispatch worker instead, and the coordinator takes its state mutex
+	// around the bookkeeping on either side of every invocation, so whatever
+	// one delivery writes here happens-before the next delivery reads it,
+	// whichever goroutine runs it.
+	//
+	// They are NOT a -race detector. This applier returns immediately, so two
+	// deliveries of this scope do not overlap in wall-clock time even when the
+	// ordering that would make an overlap legal is taken away, and -race stays
+	// quiet either way. What catches the defect is nested, plus the delivery
+	// sequence pinned at the bottom of this test: exactly two, the registered
+	// defaults and then the hook's own write carrying those defaults as
+	// Previous. Duplicating every delivery inside the coordinator makes those
+	// assertions fail.
 	var (
 		rec    applyRecorder
 		once   sync.Once
