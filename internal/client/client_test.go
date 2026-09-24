@@ -1966,12 +1966,18 @@ func TestGetEntryReportsStaleUntilTheFirstReconcile(t *testing.T) {
 	}
 
 	// The third source the godoc names, and the only one no Client-level test
-	// reached: a key of the scope that could not be re-read after its last
-	// change. It is not a disconnect and not a missing first reconcile — the
-	// feed is up and the scope reconciled — so a Stale that only ever answered
-	// those two would report this scope current while one of its keys is
-	// serving a value nothing has confirmed since it changed.
-	t.Run("an unconfirmed key makes every read of its scope stale", func(t *testing.T) {
+	// reached: a key that could not be re-read after its last change. It is not
+	// a disconnect and not a missing first reconcile — the feed is up and the
+	// scope reconciled — so a Stale that only ever answered those two would
+	// report that key current while it serves a value nothing has confirmed
+	// since it changed.
+	//
+	// It is the KEY that says so, not its scope. The record is taken back only
+	// by an ingress that decides that key, and on a connected feed nothing
+	// arrives for a key nobody writes again — so answering it on every sibling
+	// would leave every value of the scope reporting itself unconfirmed for the
+	// life of the process, over one row that failed to read once.
+	t.Run("an unconfirmed key reports stale without dragging its siblings along", func(t *testing.T) {
 		s := newMemStore(false)
 		seedEntryAt(t, s, "ns", "a", "a-stored", 3)
 		seedEntryAt(t, s, "ns", "b", "b-stored", 4)
@@ -2013,22 +2019,30 @@ func TestGetEntryReportsStaleUntilTheFirstReconcile(t *testing.T) {
 		// only then is the key unconfirmed — so this waits rather than reads
 		// once.
 		waitFor(t, func() bool {
-			e, _, _ := c.GetEntry(context.Background(), "ns", "b")
+			e, _, _ := c.GetEntry(context.Background(), "ns", "a")
 
 			return e.Stale
-		}, "b to report Stale after a's re-read failed twice")
+		}, "a to report Stale after its own re-read failed twice")
 
-		// b itself never stopped being current, and a still serves the last
-		// value anything confirmed: Stale reports that nothing is vouching
-		// for the scope, it does not erase.
-		if e, ok, err := c.GetEntry(context.Background(), "ns", "b"); err != nil || !ok || e.Value != "b-stored" || e.Revision != 4 {
-			t.Errorf("b while a is unconfirmed: got (%v, rev %d, ok %t, err %v), want (\"b-stored\", rev 4)",
+		// b was never in question: its own last change was read back, and
+		// nothing about a says otherwise.
+		if e, ok, err := c.GetEntry(context.Background(), "ns", "b"); err != nil || !ok || e.Stale ||
+			e.Value != "b-stored" || e.Revision != 4 {
+			t.Errorf("b while a is unconfirmed: got (%v, rev %d, stale %t, ok %t, err %v), "+
+				"want (\"b-stored\", rev 4, stale false)", e.Value, e.Revision, e.Stale, ok, err)
+		}
+
+		// a still serves the last value anything confirmed: Stale reports that
+		// nothing is vouching for the key, it does not erase.
+		if e, ok, err := c.GetEntry(context.Background(), "ns", "a"); err != nil || !ok ||
+			e.Value != "a-stored" || e.Revision != 3 {
+			t.Errorf("a while unconfirmed: got (%v, rev %d, ok %t, err %v), want (\"a-stored\", rev 3)",
 				e.Value, e.Revision, ok, err)
 		}
 
 		// a becomes readable again. Nothing reconnects and nothing resyncs,
 		// so the next notification's re-read is the only thing that can clear
-		// the record — and clearing it must make the whole scope current.
+		// a's record — and it is a's read that has to go current.
 		s.mu.Lock()
 		s.getErrHook = nil
 		s.mu.Unlock()
@@ -2036,10 +2050,10 @@ func TestGetEntryReportsStaleUntilTheFirstReconcile(t *testing.T) {
 		s.fire(store.Event{Namespace: "ns", Key: "a", Op: store.OpUpsert})
 
 		waitFor(t, func() bool {
-			e, _, _ := c.GetEntry(context.Background(), "ns", "b")
+			e, _, _ := c.GetEntry(context.Background(), "ns", "a")
 
 			return !e.Stale
-		}, "b to report itself fresh once a was read back")
+		}, "a to report itself fresh once it was read back")
 
 		if e, ok, err := c.GetEntry(context.Background(), "ns", "a"); err != nil || !ok || e.Value != "a-stored" || e.Revision != 3 {
 			t.Errorf("a after the recovery: got (%v, rev %d, ok %t, err %v), want (\"a-stored\", rev 3)",

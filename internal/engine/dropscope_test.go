@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -827,4 +828,86 @@ func TestRereadRefusesAScopeDroppedDuringTheStoreCall(t *testing.T) {
 			requirePanicAccounted(t, rec, "refresh")
 		})
 	}
+}
+
+// nilUnsubscribeStore is a backend whose Subscribe reports success and hands
+// back no unsubscribe handle. Nothing in store.Store forbids it, and the
+// public NewForTesting passes a consumer's return straight through its
+// adapter, so it is a shape a caller outside this module can build.
+//
+// onSubscribed runs while the engine is inside Subscribe, which is what lets a
+// test land a Close in the one window bring-up rolls back in.
+type nilUnsubscribeStore struct {
+	*fakeStore
+
+	calls        *atomic.Int64
+	onSubscribed func()
+}
+
+func (s nilUnsubscribeStore) Subscribe(context.Context, store.Scope, func(store.Event)) (func(), error) {
+	s.calls.Add(1)
+
+	if s.onSubscribed != nil {
+		s.onSubscribed()
+	}
+
+	return nil, nil
+}
+
+// TestNilUnsubscribeHandleNeverPanics pins the normalisation bring-up does on
+// the handle Store.Subscribe returns. Three sites call it — bring-up's
+// Close-raced rollback, dropScope and Close — and a nil handle is a nil
+// function call at every one of them. Two of the three guard it; the rollback
+// does not, and the idempotence check at the top of bring-up reads a nil
+// handle as "not subscribed", so the scope would re-subscribe forever.
+//
+// Normalising once, where the handle arrives, is what makes all three agree.
+func TestNilUnsubscribeHandleNeverPanics(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	defs := map[NSKey]KeyDef{nk: {Default: "fallback"}}
+
+	t.Run("on the Close-raced rollback", func(t *testing.T) {
+		var calls atomic.Int64
+
+		fs := newFakeStore()
+		e := New(Config{Store: nilUnsubscribeStore{fakeStore: fs, calls: &calls}, Registry: fakeRegistry{defs: defs}})
+
+		// The engine is closed while it is inside Subscribe, so bring-up takes
+		// the scope lock after Close released it, observes closed, and releases
+		// the subscription it can no longer keep.
+		e.store = nilUnsubscribeStore{fakeStore: fs, calls: &calls, onSubscribed: func() { _ = e.Close() }}
+
+		if _, err := e.bringUpScope(dropTenant); !errors.Is(err, store.ErrClosed) {
+			t.Fatalf("bringUpScope on a closed engine = %v, want one wrapping store.ErrClosed", err)
+		}
+
+		if tracked(e, dropTenant) {
+			t.Error("the rolled-back bring-up left the scope tracked")
+		}
+	})
+
+	t.Run("on Close and on a drop", func(t *testing.T) {
+		var calls atomic.Int64
+
+		fs := newFakeStore()
+		e := New(Config{Store: nilUnsubscribeStore{fakeStore: fs, calls: &calls}, Registry: fakeRegistry{defs: defs}})
+
+		bringUp(t, e, dropTenant)
+
+		// Bring-up ran once and stored a handle, so the second call is the
+		// idempotence check: it must see a subscribed scope rather than open a
+		// second changefeed for it.
+		bringUp(t, e, dropTenant)
+
+		if got := calls.Load(); got != 1 {
+			t.Errorf("Subscribe was called %d times for one scope, want 1: a nil handle reads as "+
+				"an unsubscribed scope", got)
+		}
+
+		e.dropScope(dropTenant)
+
+		if err := e.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
 }

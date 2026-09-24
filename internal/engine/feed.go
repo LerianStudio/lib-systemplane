@@ -249,15 +249,15 @@ func (e *Engine) submitRefresh(scope store.Scope, nk NSKey, deleted bool) {
 // carries the newer revision wins, and the loser is deduplicated away.
 //
 // A second failure is not transient, so THIS KEY is recorded as unconfirmed
-// and the scope's reads report Stale until some later ingress decides it —
-// unless one already has, which recordUnconfirmed is what answers. A
-// scope-wide flag was the wrong size for the fact, twice over: a reconcile
-// already in flight cleared it without ever having decided this key — a delete
-// records the key as touched at arrival, so the snapshot skips it — and on a
-// connection that never drops no OpResync ever arrives, so nothing cleared it
-// at all and every converged value in the scope reported itself unconfirmed
-// for the life of the process. Neither the disconnect generation nor the stale
-// flag is touched here: those belong to the connection, and this is one row.
+// and reads OF IT report Stale until some later ingress decides it — unless
+// one already has, which recordUnconfirmed is what answers. A scope-wide flag
+// was the wrong size for the fact, twice over: a reconcile already in flight
+// cleared it without ever having decided this key — a delete records the key
+// as touched at arrival, so the snapshot skips it — and on a connection that
+// never drops no OpResync ever arrives, so nothing cleared it at all and every
+// converged value in the scope reported itself unconfirmed for the life of the
+// process. Neither the disconnect generation nor the stale flag is touched
+// here: those belong to the connection, and this is one row.
 //
 // At most ONE retry is pending per key AND op, claimed through beginRetry: a
 // key the feed is hot on while the store is degraded would otherwise schedule

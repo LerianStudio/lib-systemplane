@@ -392,12 +392,12 @@ func TestFailedRereadIsRetriedThenReportsStale(t *testing.T) {
 			})
 
 			if got, _ := e.Lookup(scope, nk); got.Stale {
-				t.Error("the scope reports itself unconfirmed after a re-read that converged on its retry")
+				t.Error("the key reports itself unconfirmed after a re-read that converged on its retry")
 			}
 		})
 	})
 
-	t.Run("a failure that repeats leaves the scope stale until the next resync", func(t *testing.T) {
+	t.Run("a failure that repeats leaves the key stale until the next resync", func(t *testing.T) {
 		forEachWindow(t, func(t *testing.T, window time.Duration) {
 			fs := newFakeStore()
 			e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, window)
@@ -414,7 +414,7 @@ func TestFailedRereadIsRetriedThenReportsStale(t *testing.T) {
 			// that learned nothing is no reason to discard the last value that
 			// did — but it stands as unconfirmed, which is the one thing a caller
 			// can act on.
-			waitFor(t, hangGuard, "the scope to report itself unconfirmed", func() bool {
+			waitFor(t, hangGuard, "the key to report itself unconfirmed", func() bool {
 				got, ok := e.Lookup(scope, nk)
 
 				return ok && got.Stale
@@ -522,7 +522,7 @@ func TestRecoveredKeyClearsUnconfirmedWithoutAResync(t *testing.T) {
 		fs.onGet(func(store.Scope, NSKey) error { return errors.New("pool exhausted") })
 		e.onEvent(upsertEvent(scope, nk, 4))
 
-		waitFor(t, hangGuard, "the scope to report itself unconfirmed", func() bool {
+		waitFor(t, hangGuard, "the key to report itself unconfirmed", func() bool {
 			got, _ := e.Lookup(scope, nk)
 
 			return got.Stale
@@ -547,10 +547,17 @@ func TestRecoveredKeyClearsUnconfirmedWithoutAResync(t *testing.T) {
 	})
 }
 
-// TestUnconfirmedIsPerKey pins the granularity. One key nobody could re-read
-// makes the scope report Stale; a second key converging normally does not
-// clear it; and the scope goes back to confirmed when the FIRST key converges,
-// not when any key does.
+// TestUnconfirmedIsPerKey pins the granularity of the record AND of what a
+// read is told. One key nobody could re-read reports Stale; a sibling that
+// converged normally on the same scope reports Stale false, because nothing
+// about that sibling is unconfirmed; the failing key reports Stale until IT
+// converges, not until any key does; and a disconnect, which really is
+// scope-wide, marks both.
+//
+// Reporting the failing key's record on every key of the scope was a hold with
+// no release: the record is cleared only by an ingress that decides THAT key,
+// and a key never written again therefore held every sibling Stale for the
+// life of a process whose connection never drops.
 func TestUnconfirmedIsPerKey(t *testing.T) {
 	a := NSKey{Namespace: "billing", Key: "limits"}
 	b := NSKey{Namespace: "billing", Key: "retries"}
@@ -588,19 +595,35 @@ func TestUnconfirmedIsPerKey(t *testing.T) {
 			return ok && got.Value == "b2"
 		})
 
-		if got, _ := e.Lookup(scope, b); !got.Stale {
-			t.Error("the scope reports itself confirmed while key A could not be read back")
+		if got, _ := e.Lookup(scope, b); got.Stale {
+			t.Error("key B reports itself unconfirmed because a DIFFERENT key could not be " +
+				"read back: one unreadable row makes every value in the scope look unconfirmed")
+		}
+
+		if got, _ := e.Lookup(scope, a); !got.Stale {
+			t.Error("key A reports itself confirmed after a re-read that failed twice")
 		}
 
 		fs.onGet(nil)
 		fs.seed(scope, jsonRow(a, 3, `"a3"`, "ops"))
 		e.onEvent(upsertEvent(scope, a, 3))
 
-		waitFor(t, hangGuard, "the scope to report itself confirmed once A converged", func() bool {
+		waitFor(t, hangGuard, "key A to report itself confirmed once it converged", func() bool {
 			got, ok := e.Lookup(scope, a)
 
 			return ok && got.Value == "a3" && !got.Stale
 		})
+
+		// A disconnect is the half that really is scope-wide: nothing is
+		// confirming any key of the scope, so every key says so.
+		e.onEvent(disconnectEvent(scope))
+
+		for _, nk := range []NSKey{a, b} {
+			if got, _ := e.Lookup(scope, nk); !got.Stale {
+				t.Errorf("%s/%s reports itself confirmed while the changefeed is disconnected",
+					nk.Namespace, nk.Key)
+			}
+		}
 	})
 }
 
@@ -716,7 +739,7 @@ func TestZeroWindowRetryDoesNotHoldTheFeedGoroutine(t *testing.T) {
 // there is the same permanent false alarm the per-key set was built to remove:
 // the value in force is correct and current, nothing on a connected feed ever
 // emits an OpResync, and no later event arrives for a key nobody writes again,
-// so every read of the scope reports Stale for the life of the process.
+// so every read of the key reports Stale for the life of the process.
 //
 // The store answers exactly one of the three reads, so which read converges
 // the key does not depend on timing.
@@ -852,7 +875,7 @@ func TestReconcileAgreeingWithTheCacheConfirmsTheKey(t *testing.T) {
 // announces it, both re-reads fail, and a reconcile whose List was taken
 // before the write finally applies its revision-5 row. The publication is
 // deduplicated — same revision, same bytes — yet it cleared the record, and
-// the scope then reported itself confirmed while permanently serving the
+// the key then reported itself confirmed while permanently serving the
 // pre-write revision. Nothing on a connected feed would ever correct it: no
 // further event arrives for a key nobody writes again, and every later
 // reconcile takes the same path.
@@ -904,7 +927,7 @@ func TestHeldReconcileDoesNotConfirmAKeyNobodyCouldReRead(t *testing.T) {
 
 		if !got.Stale {
 			t.Error("a reconcile whose snapshot predates the write took back the unconfirmed record: " +
-				"the scope reports itself confirmed while serving the pre-write revision, and nothing " +
+				"the key reports itself confirmed while serving the pre-write revision, and nothing " +
 				"on a connected feed will ever correct it")
 		}
 
@@ -933,7 +956,7 @@ func TestHeldReconcileDoesNotConfirmAKeyNobodyCouldReRead(t *testing.T) {
 // one". The key sits at revision 5, a held reconcile photographs revision 9,
 // the store then moves to 12 and stops answering, the feed announces 12 and
 // both re-reads fail. The held reconcile applies its revision-9 row: the fence
-// accepts it, the cache advances — and the scope reported itself confirmed
+// accepts it, the cache advances — and the key reported itself confirmed
 // while permanently serving revision 9 of a row that holds 12, with no further
 // event ever due for a key nobody writes again.
 func TestASnapshotThatAdvancedTheCacheStillDoesNotConfirmTheKey(t *testing.T) {
@@ -978,7 +1001,7 @@ func TestASnapshotThatAdvancedTheCacheStillDoesNotConfirmTheKey(t *testing.T) {
 		}
 
 		if !got.Stale {
-			t.Error("a snapshot that advanced the cache took back the unconfirmed record: the scope " +
+			t.Error("a snapshot that advanced the cache took back the unconfirmed record: the key " +
 				"reports itself confirmed while serving a revision older than the one the feed " +
 				"announced, and nothing on a connected feed will ever correct it")
 		}

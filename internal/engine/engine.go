@@ -322,6 +322,17 @@ func (e *Engine) bringUpScope(scope store.Scope) (*scopeState, error) {
 		return nil, fmt.Errorf("systemplane: changefeed for %s failed to open: %w", scopeLabel(scope), err)
 	}
 
+	// Nothing in store.Store forbids a backend from reporting success with no
+	// handle, and NewForTesting passes a consumer's return straight through its
+	// adapter. Normalising it here, once, is what keeps every later site honest:
+	// the rollback below and Close call it without asking, dropScope's nil check
+	// stays a "already dropped" test rather than a crash guard, and the
+	// idempotence check above keeps reading a stored handle as "subscribed"
+	// instead of re-subscribing this scope on every bring-up.
+	if unsubscribe == nil {
+		unsubscribe = func() {}
+	}
+
 	// Close reads each tracked scope's unsubscribe exactly once, and a Subscribe
 	// still in flight at that moment has none to be read. Storing the handle
 	// afterwards would leave it held by nobody: the callback stays registered in
@@ -588,19 +599,29 @@ func (e *Engine) writeScope(ctx context.Context, scope store.Scope, nk NSKey) (*
 // default. Value is a deep copy the caller owns. A nil Engine reports a miss
 // instead of panicking.
 //
-// Stale reports that nothing is currently confirming the scope, which is two
-// facts read as one: the changefeed is disconnected or has not been reconciled
-// since it connected, OR at least one key could not be re-read after its last
-// change (see scopeState.unconfirmed). Both are read under the same lock as
-// the entry, so one Lookup is an atomic read of value and freshness.
+// Stale reports that nothing is currently confirming THIS key, which is two
+// facts read as one: the scope's changefeed is disconnected or has not been
+// reconciled since it connected — nothing is confirming any key of it — OR nk
+// itself could not be re-read after its last change (see
+// scopeState.unconfirmed). Both are read under the same lock as the entry, so
+// one Lookup is an atomic read of value and freshness.
 //
-// A miss inside a tracked scope still carries that scope's Stale flag, and
-// only the scope the engine does not track at all reports the zero Entry.
-// Discarding staleness on the miss path was a silent lie: after a first
-// reconcile that published nothing — a transient List failure at Start — every
-// registered key is a miss, so every read is answered by the caller's
-// registered default, and dropping Stale reported each of those defaults as a
-// value the store had confirmed (FC-5).
+// The second half is per key because that is the size of what was lost: one
+// row nobody could re-read. Reading the whole unconfirmed set instead put every
+// sibling of that key on a Stale with no release — the record is taken back
+// only by an ingress that DECIDES that key, so a key never written again held
+// the scope's every value stale for the life of a process whose connection
+// never drops. FC-5 freezes Stale as a field of one Entry, and an Entry is one
+// key's: narrowing the field to the key it is returned with is what the
+// contract already describes.
+//
+// A miss inside a tracked scope still carries that key's Stale, and only the
+// scope the engine does not track at all reports the zero Entry. Discarding
+// staleness on the miss path was a silent lie: after a first reconcile that
+// published nothing — a transient List failure at Start — every registered key
+// is a miss, so every read is answered by the caller's registered default, and
+// dropping Stale reported each of those defaults as a value the store had
+// confirmed (FC-5).
 func (e *Engine) Lookup(scope store.Scope, nk NSKey) (Entry, bool) {
 	if e == nil {
 		return Entry{}, false
@@ -613,7 +634,8 @@ func (e *Engine) Lookup(scope store.Scope, nk NSKey) (Entry, bool) {
 
 	sc.mu.RLock()
 	cached, ok := sc.entries[nk]
-	stale := sc.stale || len(sc.unconfirmed) > 0
+	_, unconfirmed := sc.unconfirmed[nk]
+	stale := sc.stale || unconfirmed
 	sc.mu.RUnlock()
 
 	if !ok {

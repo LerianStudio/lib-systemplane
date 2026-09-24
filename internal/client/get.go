@@ -35,9 +35,10 @@ func (c *Client) Get(ctx context.Context, namespace, key string) (any, bool, err
 // GetEntry resolves the caller's scope like Get. ok is false for an
 // unregistered key. Revision, UpdatedAt and UpdatedBy describe the persisted
 // row backing the value in force, and Stale reports whether anything is
-// currently confirming it: true while the changefeed is disconnected or has
-// not been reconciled since it connected, and true while at least one key of
-// the scope could not be re-read after its last change (FC-5).
+// currently confirming THIS key: true while the changefeed is disconnected or
+// has not been reconciled since it connected, and true while this key could not
+// be re-read after its last change. A sibling key nobody could re-read leaves
+// this one confirmed (FC-5).
 func (c *Client) GetEntry(ctx context.Context, namespace, key string) (e Entry, ok bool, err error) {
 	return c.getEntry(ctx, namespace, key)
 }

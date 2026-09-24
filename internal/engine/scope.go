@@ -193,10 +193,12 @@ type scopeState struct {
 	// does not prove otherwise — so applySnapshotRow puts the record straight
 	// back for every key its window marked unusable.
 	//
-	// Lookup reports Stale while this set is non-empty, so one key nobody
-	// could re-read makes the scope's reads say so, and converging that key
-	// alone is what takes it back. clearStale never touches it: a reconcile
-	// that skipped the key decided nothing about it.
+	// Lookup reports Stale for a key held in this set, and for that key only:
+	// what was lost is one row nobody could re-read, and converging that key
+	// is what takes it back. Reading the set's size instead made one
+	// unreadable row report every sibling stale on a hold nothing but that key
+	// releases. clearStale never touches it: a reconcile that skipped the key
+	// decided nothing about it.
 	//
 	// Guarded by mu, alongside stale. Created lazily: most scopes never have
 	// one.
@@ -320,8 +322,8 @@ func newScopeState(scope store.Scope) *scopeState {
 	}
 }
 
-// markUnconfirmed records that nk's last change could not be read back, so the
-// scope's reads report Stale until some later ingress decides the key.
+// markUnconfirmed records that nk's last change could not be read back, so
+// reads of nk report Stale until some later ingress decides the key.
 //
 // It is per key rather than scope-wide because that is the size of what was
 // actually lost: one row nobody could re-read. See the unconfirmed field.

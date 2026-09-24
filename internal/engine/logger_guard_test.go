@@ -216,7 +216,7 @@ func TestRecoverRefreshRetriesBeforeReportingThePanic(t *testing.T) {
 //
 // Surviving is half the assertion. The other half is that the repair the
 // recovery promises still completed on the way out: the key whose re-read
-// could not answer twice is recorded unconfirmed, so the scope's reads say so.
+// could not answer twice is recorded unconfirmed, so reads of it say so.
 func TestARetryReportingIntoAPanickingLoggerNeverKillsTheProcess(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 	scope := store.Scope{}

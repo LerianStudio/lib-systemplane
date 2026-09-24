@@ -68,4 +68,4 @@ var ErrScopeNotTracked = errors.New("systemplane: the engine does not track that
 // serves, wraps it with the key so the message names what was refused. It stays
 // unexported: the Client maps this refusal to its own ErrUnknownKey before a
 // caller of Set can see it, and the key is registered by then in any case.
-var errUnregisteredKey = errors.New("systemplane: is not a registered key")
+var errUnregisteredKey = errors.New("systemplane: not a registered key")
