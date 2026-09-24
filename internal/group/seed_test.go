@@ -227,9 +227,9 @@ func TestCoordinatorSeedThatFailsToDecodeIsRecorded(t *testing.T) {
 func seedDecodeFailure(t *testing.T, redacted bool) {
 	t.Helper()
 
-	seed := &seeder{pub: publication("t1", 7, redactionSecret), ok: true}
+	seed := &seeder{pub: publication("t1", 7, redactionMarker), ok: true}
 	logger := newRecordingLogger()
-	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, redacted, rejectingDecode(redactionSecret), seed.read)
+	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, redacted, rejectingDecode(redactionMarker), seed.read)
 
 	var rec recorder
 

@@ -13,12 +13,12 @@ import (
 	"go.opentelemetry.io/otel/trace/noop"
 )
 
-// redactionSecret is the sentinel the payload carries: an applier panics with
+// redactionMarker is the sentinel the payload carries: an applier panics with
 // it, and it is also the name of the document the decode-failure tests refuse,
 // so the rejection's own message quotes it the way encoding/json quotes a row
 // it cannot parse. Nothing but the real payload can produce it, so an
 // assertion that never sees it is an assertion about the payload itself.
-const redactionSecret = "probe-secret-Vt71Qm"
+const redactionMarker = "probe-secret-Vt71Qm"
 
 // recordingSpan is a span that records, so a test can read what the panic
 // handler stamped on it. lib-observability writes the panic value into the
@@ -79,7 +79,7 @@ func panickingApply(t *testing.T, redacted bool) (*recordingLogger, *recordingSp
 	})
 	defer unsubscribe()
 
-	c.Publish(trace.ContextWithSpan(context.Background(), span), publication("t1", 4, redactionSecret))
+	c.Publish(trace.ContextWithSpan(context.Background(), span), publication("t1", 4, redactionMarker))
 
 	return logger, span
 }
@@ -97,18 +97,18 @@ func TestApplierPanicOnARedactedGroupWithholdsTheDocument(t *testing.T) {
 
 	for _, line := range logger.recorded() {
 		for key, value := range line.fields {
-			if text := fmt.Sprint(value); strings.Contains(text, redactionSecret) {
+			if text := fmt.Sprint(value); strings.Contains(text, redactionMarker) {
 				t.Errorf("log field %s carries the document of a redacted group: %s", key, text)
 			}
 		}
 
-		if strings.Contains(line.msg, redactionSecret) {
+		if strings.Contains(line.msg, redactionMarker) {
 			t.Errorf("a log message carries the document of a redacted group: %s", line.msg)
 		}
 	}
 
 	for _, written := range span.recorded() {
-		if strings.Contains(written, redactionSecret) {
+		if strings.Contains(written, redactionMarker) {
 			t.Errorf("the span carries the document of a redacted group: %s", written)
 		}
 	}
@@ -132,11 +132,11 @@ func TestApplierPanicOnAnUnredactedGroupIsReportedVerbatim(t *testing.T) {
 	logger, span := panickingApply(t, false)
 
 	reported := logger.lineContaining(t, "panic recovered")
-	if value := fmt.Sprint(reported.fields["value"]); !strings.Contains(value, redactionSecret) {
+	if value := fmt.Sprint(reported.fields["value"]); !strings.Contains(value, redactionMarker) {
 		t.Errorf("panic value field = %q, want the panic value verbatim for an unredacted group", value)
 	}
 
-	if !strings.Contains(strings.Join(span.recorded(), "\n"), redactionSecret) {
+	if !strings.Contains(strings.Join(span.recorded(), "\n"), redactionMarker) {
 		t.Errorf("span recorded %v, want the panic value verbatim for an unredacted group", span.recorded())
 	}
 }

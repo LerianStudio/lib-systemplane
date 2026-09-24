@@ -63,7 +63,7 @@ func TestGuardIsIdempotentAndSwallows(t *testing.T) {
 func TestWithheldPanicNamesTheTypeAndNeverTheValue(t *testing.T) {
 	t.Parallel()
 
-	const secret = "probe-secret-Rk9Tz"
+	const marker = "probe-secret-Rk9Tz"
 
 	cases := []struct {
 		name      string
@@ -74,13 +74,13 @@ func TestWithheldPanicNamesTheTypeAndNeverTheValue(t *testing.T) {
 		{
 			name:      "a string panic",
 			what:      "apply function panicked",
-			recovered: "cannot apply " + secret,
+			recovered: "cannot apply " + marker,
 			want:      "apply function panicked (string, value withheld: key registered redacted)",
 		},
 		{
 			name:      "an error panic",
 			what:      "validator panicked",
-			recovered: errors.New(secret),
+			recovered: errors.New(marker),
 			want:      "validator panicked (*errors.errorString, value withheld: key registered redacted)",
 		},
 	}
@@ -111,12 +111,12 @@ func TestWithheldPanicNamesTheTypeAndNeverTheValue(t *testing.T) {
 func TestErrorDetailWithholdsTheCauseForARedactedKey(t *testing.T) {
 	t.Parallel()
 
-	const secret = "probe-secret-Qw83Lm"
+	const marker = "probe-secret-Qw83Lm"
 
 	// The real leak, not a stand-in: encoding/json refusing a row that opens
 	// with the secret's first byte, which is what an undecodable stored
 	// document produces at an ingress, offset and all.
-	syntaxErr := json.Unmarshal([]byte(secret), new(map[string]any))
+	syntaxErr := json.Unmarshal([]byte(marker), new(map[string]any))
 	if syntaxErr == nil {
 		t.Fatal("json.Unmarshal accepted a malformed document, want a syntax error to render")
 	}
@@ -130,7 +130,7 @@ func TestErrorDetailWithholdsTheCauseForARedactedKey(t *testing.T) {
 		{
 			name: "a validator rejection naming what it refused",
 			what: "validation failed",
-			err:  errors.New("token " + secret + " is too short"),
+			err:  errors.New("token " + marker + " is too short"),
 			want: "validation failed (*errors.errorString)",
 		},
 		{
@@ -168,7 +168,7 @@ func TestErrorDetailWithholdsTheCauseForARedactedKey(t *testing.T) {
 				t.Errorf("ErrorDetail(true, …) = %q, want %q", text, tc.want)
 			}
 
-			if strings.Contains(text, secret) {
+			if strings.Contains(text, marker) {
 				t.Errorf("ErrorDetail(true, …) = %q, want no byte of the value it refused", text)
 			}
 		})

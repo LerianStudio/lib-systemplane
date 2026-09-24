@@ -193,7 +193,7 @@ func assertDecodeFailureRendering(t *testing.T, logger *recordingLogger, redacte
 	detail := fmt.Sprint(line.fields["error"])
 
 	if !redacted {
-		if !strings.Contains(detail, redactionSecret) {
+		if !strings.Contains(detail, redactionMarker) {
 			t.Errorf("error = %q, want the decode cause verbatim for an unredacted group", detail)
 		}
 
@@ -202,12 +202,12 @@ func assertDecodeFailureRendering(t *testing.T, logger *recordingLogger, redacte
 
 	for _, recorded := range logger.recorded() {
 		for key, value := range recorded.fields {
-			if text := fmt.Sprint(value); strings.Contains(text, redactionSecret) {
+			if text := fmt.Sprint(value); strings.Contains(text, redactionMarker) {
 				t.Errorf("log field %s carries the document of a redacted group: %s", key, text)
 			}
 		}
 
-		if strings.Contains(recorded.msg, redactionSecret) {
+		if strings.Contains(recorded.msg, redactionMarker) {
 			t.Errorf("a log message carries the document of a redacted group: %s", recorded.msg)
 		}
 	}
@@ -463,7 +463,7 @@ func TestCoordinatorApplierErrorIsLogged(t *testing.T) {
 
 			// The applier names what it refused, which is what a consumer's
 			// apply hook does when it wants the log to be actionable.
-			rejection := fmt.Errorf("refused %s", redactionSecret)
+			rejection := fmt.Errorf("refused %s", redactionMarker)
 
 			unsubscribe := mustRegister(t, c, func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
 				return rejection
@@ -515,12 +515,12 @@ func assertRejectionRendering(t *testing.T, logger *recordingLogger, redacted bo
 
 	for _, recorded := range logger.recorded() {
 		for key, value := range recorded.fields {
-			if text := fmt.Sprint(value); strings.Contains(text, redactionSecret) {
+			if text := fmt.Sprint(value); strings.Contains(text, redactionMarker) {
 				t.Errorf("log field %s carries the document of a redacted group: %s", key, text)
 			}
 		}
 
-		if strings.Contains(recorded.msg, redactionSecret) {
+		if strings.Contains(recorded.msg, redactionMarker) {
 			t.Errorf("a log message carries the document of a redacted group: %s", recorded.msg)
 		}
 	}
@@ -603,7 +603,7 @@ func TestCoordinatorDecodeFailureIsRecordedAndNeverDelivered(t *testing.T) {
 	for _, tc := range decodeRedactionCases {
 		t.Run(tc.name, func(t *testing.T) {
 			logger := newRecordingLogger()
-			c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, tc.redacted, rejectingDecode(redactionSecret), nil)
+			c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, tc.redacted, rejectingDecode(redactionMarker), nil)
 			ctx := context.Background()
 
 			var rec recorder
@@ -612,7 +612,7 @@ func TestCoordinatorDecodeFailureIsRecordedAndNeverDelivered(t *testing.T) {
 			defer unsubscribe()
 
 			c.Publish(ctx, publication("t1", 1, "good"))
-			c.Publish(ctx, publication("t1", 2, redactionSecret))
+			c.Publish(ctx, publication("t1", 2, redactionMarker))
 
 			if got := rec.names(); len(got) != 1 || got[0] != "good" {
 				t.Errorf("deliveries = %v, want only the decodable document: garbage must never reach an applier", got)

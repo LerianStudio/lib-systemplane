@@ -1583,7 +1583,7 @@ func TestReReadPanicOnARedactedKeyWithholdsTheValue(t *testing.T) {
 // from the report. That never under-redacts, and a deployment with no redacted
 // key at all keeps the verbatim panic it had.
 func TestReconcilePanicOnARedactedRegistryWithholdsTheValue(t *testing.T) {
-	const secret = "reconcile-panic-sentinel-Nw8Br"
+	const probeMarker = "reconcile-panic-sentinel-Nw8Br"
 
 	plain := NSKey{Namespace: "billing", Key: "limits"}
 	hidden := NSKey{Namespace: "billing", Key: "token"}
@@ -1611,7 +1611,7 @@ func TestReconcilePanicOnARedactedRegistryWithholdsTheValue(t *testing.T) {
 	fs.onList(func(store.Scope) error {
 		fs.onList(nil)
 
-		panic(fmt.Sprintf("driver exploded scanning %s/%s = %q", hidden.Namespace, hidden.Key, secret))
+		panic(fmt.Sprintf("driver exploded scanning %s/%s = %q", hidden.Namespace, hidden.Key, probeMarker))
 	})
 
 	e.onEvent(resyncEvent(scope))
@@ -1632,5 +1632,5 @@ func TestReconcilePanicOnARedactedRegistryWithholdsTheValue(t *testing.T) {
 	})
 
 	requireLogged(t, rec, log.LevelError, reconcilePanicMsg, scope, NSKey{})
-	requirePanicWithheld(t, rec, "reconcile", "string", secret)
+	requirePanicWithheld(t, rec, "reconcile", "string", probeMarker)
 }

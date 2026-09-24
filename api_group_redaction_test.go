@@ -13,11 +13,11 @@ import (
 	systemplane "github.com/LerianStudio/lib-systemplane/v4"
 )
 
-// redactProbeSecret is the sentinel a panicking applier carries inside the
+// redactProbeMarker is the sentinel a panicking applier carries inside the
 // document it was handed. It is the shape the matcher pilot stores in a
 // RedactFull group — hmac_secret, secret_access_key, a tenant API key — and the
 // only thing an assertion here can match on that a look-alike could not produce.
-const redactProbeSecret = "probe-secret-Xk93Qz"
+const redactProbeMarker = "probe-secret-Xk93Qz"
 
 // redactRecorder is a consumer logger that keeps every line, so a test can
 // prove what did and did not reach it. It implements systemplane.Logger, the
@@ -100,7 +100,7 @@ func redactGroup(
 		}
 	})
 
-	defaults := groupConfig{Name: redactProbeSecret, Retries: 1}
+	defaults := groupConfig{Name: redactProbeMarker, Retries: 1}
 
 	g, err := systemplane.Bind(c, redactGroupNamespace, redactGroupKeyName, defaults, nil,
 		systemplane.WithRedaction(redaction))
@@ -159,7 +159,7 @@ func TestGroupApplierPanicHonorsTheKeyRedaction(t *testing.T) {
 			value := rec.panicValue(t)
 
 			if tt.wantVerbatim {
-				if !strings.Contains(value, redactProbeSecret) {
+				if !strings.Contains(value, redactProbeMarker) {
 					t.Errorf("panic value field = %q, want the panic value verbatim for an unredacted group", value)
 				}
 
@@ -196,7 +196,7 @@ func TestGroupApplierErrorHonorsTheKeyRedaction(t *testing.T) {
 			assertNamesTheGroup(t, line)
 
 			if tt.wantVerbatim {
-				if !strings.Contains(line, redactProbeSecret) {
+				if !strings.Contains(line, redactProbeMarker) {
 					t.Errorf("rejection line = %q, want the error verbatim for an unredacted group", line)
 				}
 
@@ -263,7 +263,7 @@ func assertNoLineCarriesTheDocument(t *testing.T, rec *redactRecorder) {
 	t.Helper()
 
 	for _, line := range rec.recorded() {
-		if strings.Contains(line, redactProbeSecret) {
+		if strings.Contains(line, redactProbeMarker) {
 			t.Errorf("a log line carries the document of a redacted group: %s", line)
 		}
 	}
