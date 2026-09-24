@@ -28,7 +28,10 @@ import (
 //
 //   - it may call Get, GetEntry, List and OnChange re-entrantly — no Client or
 //     engine lock is held while it runs, and Get already serves the value the
-//     delivery carries;
+//     delivery carries. The ctx fn receives is the engine's OWN lifecycle
+//     context, not the context of whatever wrote the row: it carries no
+//     request values and no tenant, so a callback that needs the tenant reads
+//     Change.Tenant and never ctx;
 //   - it may call Set and Delete: the Client counts itself started before the
 //     first reconcile runs, so a write from that first delivery lands on
 //     either side of Start's return rather than being refused;

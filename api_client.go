@@ -169,7 +169,9 @@ func (c *Client) CatalogService() string {
 // receives the newest and never sees revisions out of order. Different keys
 // deliver independently. A callback may read the Client re-entrantly, and may
 // write: [Client.Set] and [Client.Delete] called from that first delivery land
-// whether or not it wins the race with Start's return.
+// whether or not it wins the race with Start's return. The ctx a callback
+// receives is the engine's own lifecycle context — no request values, no
+// tenant — so a callback that needs the tenant reads Change.Tenant, not ctx.
 //
 // OnChange returns ErrUnknownKey for a key that was not registered, in both
 // modes. In multi-tenant mode it then returns ErrNotSupportedInMultiTenant for

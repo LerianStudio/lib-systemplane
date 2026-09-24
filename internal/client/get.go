@@ -106,7 +106,7 @@ func (c *Client) getEntry(ctx context.Context, namespace, key string) (Entry, bo
 		c.logError(ctx, "failed to unmarshal stored value",
 			log.String("namespace", namespace),
 			log.String("keyname", key),
-			errorDetail(def.redaction != RedactNone, "decode failed", err),
+			engine.ErrorDetail(def.redaction != RedactNone, "decode failed", err),
 		)
 
 		return Entry{}, false, decodeErr(ctx, namespace, key, err)
@@ -142,10 +142,12 @@ func (c *Client) GetString(ctx context.Context, namespace, key string) (string, 
 
 // GetInt returns the value as an int64.
 //
-// Accepts int, int64, and integer-valued float64 (JSON-decoded numbers).
-// Fractional float64 values, strings, and other types fail conversion and
-// return (0, false, ErrValidation). This avoids silently truncating
-// fractional input or returning 0 for a malformed value.
+// Accepts integer-valued float64, the only shape a number ever reaches a
+// reader in: every value in force has been through JSON, whether it came from
+// a store row or from the registered default Register canonicalises.
+// Fractional float64 values, strings and other types return
+// (0, false, ErrValidation), so a malformed value neither truncates silently
+// nor reads as 0.
 func (c *Client) GetInt(ctx context.Context, namespace, key string) (int64, bool, error) {
 	v, ok, err := c.Get(ctx, namespace, key)
 	if err != nil || !ok {
@@ -153,10 +155,6 @@ func (c *Client) GetInt(ctx context.Context, namespace, key string) (int64, bool
 	}
 
 	switch n := v.(type) {
-	case int:
-		return int64(n), true, nil
-	case int64:
-		return n, true, nil
 	case float64:
 		// JSON decodes all numbers as float64. Reject any value that would
 		// lose precision when truncated to int64 (NaN, Inf, fractional).
@@ -199,10 +197,6 @@ func (c *Client) GetFloat64(ctx context.Context, namespace, key string) (float64
 	switch n := v.(type) {
 	case float64:
 		return n, true, nil
-	case int:
-		return float64(n), true, nil
-	case int64:
-		return float64(n), true, nil
 	default:
 		return 0, false, fmt.Errorf("%w: %s/%s: stored value is %T, want float64", ErrValidation, namespace, key, v)
 	}
@@ -345,7 +339,7 @@ func (c *Client) listFromStore(ctx context.Context, namespace string, keys []reg
 				c.logError(ctx, "failed to unmarshal stored value",
 					log.String("namespace", namespace),
 					log.String("keyname", rk.Key),
-					errorDetail(rk.def.redaction != RedactNone, "decode failed", err),
+					engine.ErrorDetail(rk.def.redaction != RedactNone, "decode failed", err),
 				)
 
 				return nil, decodeErr(ctx, namespace, rk.Key, err)
