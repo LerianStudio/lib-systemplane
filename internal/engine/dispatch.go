@@ -253,12 +253,20 @@ func (e *Engine) workerFor(sc *scopeState, nk NSKey) *dispatchWorker {
 // Every ordinary exit leaves nothing to repair — the scope's stop and the
 // engine's both sweep the map and refuse replacements under this same lock —
 // so this exists for the one exit neither can see: a panic that escaped
-// runWorker. The launcher's policy recovers it and returns without restarting,
-// and the reachable trigger is a consumer logger that panics inside the
-// per-callback recovery in deliver. Left in place, that dead worker goes on
-// being handed every later Change for its key, silently, until the scope is
-// dropped or the engine closes, and its marker makes a timed-out Close name a
-// subscriber that has not been running since.
+// runWorker, which the launcher's policy recovers and returns from without
+// restarting.
+//
+// No production path reaches that today. A callback panic is recovered per
+// subscriber inside deliver, and the report deliver then makes cannot unwind
+// out either: reportConsumerPanic hands it to reportRecovered, which swallows
+// a panic raised by the consumer's own recorder or error reporter, and the
+// consumer's logger is wrapped at construction by safelog.Guard. It is kept
+// as defence in depth, the way ingestDefault keeps its unregistered-key
+// branch: a future delivery step that panics outside deliver's recovery is
+// repaired here rather than left in the map. Left in place, that dead worker
+// goes on being handed every later Change for its key, silently, until the
+// scope is dropped or the engine closes, and its marker makes a timed-out
+// Close name a subscriber that has not been running since.
 //
 // The map entry goes only when it is still THIS worker. A scope dropped and
 // brought back up, or a worker already swept and replaced, owns the slot now,

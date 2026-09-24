@@ -184,6 +184,12 @@ func formatServerDatabaseKey(database, addr string, port int32, startedAt, dsn s
 }
 
 // NewTenantManagerConnector wraps a lib-commons tenant-manager Postgres Manager.
+//
+// It has no production caller between wave 2 and wave 3: internal/manager was
+// the only one, and the engine-core lane deleted it. The caller that returns
+// it again is the tenant-manager option in the engine-tenants lane
+// (lane-engine-tenants.md Task 1.2.1), so this adapter stays rather than being
+// cleaned up and written a second time.
 func NewTenantManagerConnector(mgr *tmpostgres.Manager) Connector {
 	return &pgMgrConnector{mgr: mgr}
 }
