@@ -13,6 +13,7 @@ import (
 	"github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/runtime"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/testsupport/panicmetric"
 )
 
 var errRejected = errors.New("applier rejected the document")
@@ -257,29 +258,6 @@ func TestCoordinatorApplierPanicIsRedactedInProductionMode(t *testing.T) {
 	assertPanicScopeLine(t, logger, "t1", 3)
 }
 
-// countingRecorder is the panic metric factory lib-observability records
-// through. It counts increments so a test can prove the panic counter fired.
-type countingRecorder struct {
-	mu    sync.Mutex
-	count int64
-}
-
-func (r *countingRecorder) AddCounter(_ context.Context, _, _, _ string, _ map[string]string, delta int64) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	r.count += delta
-
-	return nil
-}
-
-func (r *countingRecorder) recorded() int64 {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	return r.count
-}
-
 // TestCoordinatorAPanickingLoggerStillRecordsThePanic pins the observability
 // half of a recovered applier panic against the consumer's own logger failing:
 // the panic handler logs BEFORE it records the counter, the span event and the
@@ -290,12 +268,7 @@ func (r *countingRecorder) recorded() int64 {
 // Process-global like the production-mode toggle above: no test in this package
 // calls t.Parallel().
 func TestCoordinatorAPanickingLoggerStillRecordsThePanic(t *testing.T) {
-	recorderMetrics := &countingRecorder{}
-
-	runtime.ResetPanicMetrics()
-	runtime.InitPanicMetrics(recorderMetrics)
-
-	defer runtime.ResetPanicMetrics()
+	counter := panicmetric.Install(t)
 
 	c := NewCoordinator[coordDoc](&alwaysPanickingLogger{NopLogger: &log.NopLogger{}}, Decode[coordDoc], nil)
 
@@ -306,9 +279,7 @@ func TestCoordinatorAPanickingLoggerStillRecordsThePanic(t *testing.T) {
 
 	publishWithoutPanicking(t, c, publication("t1", 1, "one"))
 
-	if got := recorderMetrics.recorded(); got != 1 {
-		t.Errorf("panic counter incremented %d times, want 1: the metric, the span event and the error report must not depend on the consumer's logger surviving", got)
-	}
+	counter.RequireOnly(t, "systemplane", "group.apply")
 
 	if got := statusOf(t, c, "t1"); !errors.Is(got.LastErr, ErrApplyPanicked) {
 		t.Errorf("LastErr = %v, want ErrApplyPanicked", got.LastErr)

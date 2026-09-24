@@ -745,7 +745,7 @@ func (s *Store) Subscribe(ctx context.Context, scope store.Scope, fn func(store.
 			// Same guard the reader goroutine carries: teardown releases the
 			// feed, and a panic here would take the process down from a
 			// goroutine no caller can recover for.
-			defer runtime.RecoverAndLog(s.cfg.Logger, "systemplane.mongodb.subscriber")
+			defer runtime.RecoverAndLogWithContext(ctx, s.cfg.Logger, recoveryComponent, "subscriber")
 
 			select {
 			case <-ctx.Done():
@@ -973,7 +973,11 @@ func (s *Store) startFeedReader(f *feed, stream *mongo.ChangeStream) {
 
 	go func() {
 		defer close(done)
-		defer runtime.RecoverAndLog(s.cfg.Logger, "systemplane.mongodb.listener")
+		// The documents this goroutine holds carry configuration VALUES. The
+		// recovered panic value is the only payload the report carries, and
+		// production mode redacts it from the log line; nothing here may add a
+		// document field to it.
+		defer runtime.RecoverAndLogWithContext(context.Background(), s.cfg.Logger, recoveryComponent, "listener")
 
 		if stream == nil {
 			s.pollForever(f, f.pollStart)
@@ -1050,7 +1054,7 @@ func (s *Store) consumeUntilFailure(f *feed, stream *mongo.ChangeStream) (consum
 	defer cancel()
 
 	go func() {
-		defer runtime.RecoverAndLog(s.cfg.Logger, "systemplane.mongodb.observer")
+		defer runtime.RecoverAndLogWithContext(ctx, s.cfg.Logger, recoveryComponent, "observer")
 
 		select {
 		case <-f.stop:

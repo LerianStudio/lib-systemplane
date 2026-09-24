@@ -13,6 +13,7 @@ import (
 	obsconstants "github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/testsupport/panicmetric"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -319,8 +320,9 @@ func TestStore_ClosedAndNilPaths(t *testing.T) {
 // missing either half of its identifier is dropped, and fan-out is the one
 // place an event learns its scope. The classification rules themselves live in
 // TestChangeEventDecodesTombstoneAsDelete.
+// Not parallel: the panicking subscriber below is counted on the process-wide
+// panic counter, which this test installs and reads.
 func TestChangeEventAndDispatch(t *testing.T) {
-	t.Parallel()
 
 	for _, ce := range []changeEvent{
 		{},
@@ -348,7 +350,10 @@ func TestChangeEventAndDispatch(t *testing.T) {
 	// Fan-out runs on the feed, which is also the one place an event learns
 	// its scope: a change stream cannot name it.
 	s := newSubscribeStore()
+	logger := &captureLogger{}
+	s.cfg.Logger = logger
 	f := newFeed(store.Scope{}, nil)
+	counter := panicmetric.Install(t)
 
 	var got []store.Event
 
@@ -363,6 +368,8 @@ func TestChangeEventAndDispatch(t *testing.T) {
 	if len(got) != 1 || got[0] != want {
 		t.Fatalf("dispatch events = %#v, want %#v", got, []store.Event{want})
 	}
+
+	requirePanicReported(t, logger, counter, "handler")
 }
 
 func TestIsNamespaceExists(t *testing.T) {
