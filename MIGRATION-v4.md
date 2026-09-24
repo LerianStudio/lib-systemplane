@@ -466,7 +466,102 @@ is, how it advances and what it refuses to promise is in
 
 ## The database and operator contract
 
-<!-- filled by Task 1.1.3 -->
+### Postgres
+
+**The row carries a `revision`.** `revision BIGINT NOT NULL` is drawn from a
+table-level sequence, `systemplane_revision_seq`, and only ever by the
+`BEFORE INSERT OR UPDATE` trigger `systemplane_bump_revision_trigger`, whose
+function is `SECURITY DEFINER`; once the DDL finishes the column carries no
+`DEFAULT`. The sequence is therefore advanced with the privileges of the role
+that applied the DDL, and **the runtime role needs plain DML on
+`systemplane_entries` and no grant at all on `systemplane_revision_seq`**.
+
+**Upgrade an existing install with `MigrationV3ToV4SQL()`, never
+`SchemaSQL()`.** It adds `revision` at 1 for every row already stored, creates
+and seeds the sequence past the highest revision present, installs
+`systemplane_bump_revision_v4()` and `systemplane_notify_v4()`, drops
+`systemplane_notify_v3()`, and installs three triggers: the new
+`systemplane_bump_revision_trigger`, plus `systemplane_notify_trigger` and
+`systemplane_notify_update_trigger`, which keep the names they had in v3. The
+NOTIFY payload gains a fourth field — `{namespace, key, op, revision}` — and a
+delete publishes `revision: 0`. It creates no table, so it upgrades the install
+wherever `search_path` finds it; it is idempotent; and lib-systemplane never
+executes it for you. `SchemaSQL()` is for a database that has no install yet.
+
+The migration guards itself, because every statement in it names
+`systemplane_entries` unqualified. It refuses when `search_path` reaches no
+`systemplane_entries` at all — put the schema holding the install first in
+`search_path` and re-run — and when a second `systemplane_entries` exists in
+another user schema, where it would upgrade whichever one `search_path`
+resolves first and leave the other on v3, reading v3 payloads through a v4
+runtime; drop or rename the stray table, or narrow `search_path` to the schema
+holding the install you mean.
+
+`SchemaSQL()` carries the opposite guard, which fires when any non-system
+schema other than `current_schema()` already holds the table:
+
+> systemplane_entries already exists in schema %, but this role would provision
+> into %; applying the full schema here would fork the install into a second,
+> empty table and orphan the populated one
+
+`CREATE TABLE IF NOT EXISTS` only ever looks at the first schema of
+`search_path`, so without that guard the case exits 0 and leaves every
+registered key serving its default out of a second, empty table. The fix is to
+drop the stray copy if that is what it is, to put the schema holding the real
+install first in `search_path`, or to upgrade that install with
+`MigrationV3ToV4SQL()`, which creates no table and so follows `search_path` to
+wherever the table actually is.
+
+**One database per tenant, never one schema per tenant inside a shared
+database.** Two reasons, both structural: NOTIFY is database-wide and every
+feed listens on the single `systemplane_changes` channel, so two installs in
+one database each receive the other's events; and the unqualified
+`DROP FUNCTION` of the v3 notify function resolves through the applying role's
+whole `search_path`, so applying the DDL in one schema can drop another
+schema's function. Nothing in the database enforces this — it is the
+operator's responsibility.
+<!-- NOT-YET(engine-tenants): the public refusal (root ErrSharedDatabaseUnsupported) when two tenant feeds of one Store resolve to one database; a pinned search_path alone is not refused -->
+
+A single-tenant Client holds one LISTEN connection, opened from `listenDSN` and
+held for the life of the Client, separate from the `*sql.DB` pool you hand
+`NewPostgres`.
+<!-- NOT-YET(engine-tenants): one extra LISTEN backend per active tenant per replica; size max_connections against active tenants × replicas -->
+
+**Revisions are opaque and monotonic per `(namespace, key)`**, including across
+a delete and a recreate: the counter is table-level, so a key that comes back
+always lands above every revision it ever had. They may skip numbers, they
+start at 2 on a fresh database rather than 1, and their magnitude differs
+between backends — compare two revisions of one key for ordering and nothing
+else. Writing the same value again keeps the revision: `updated_at` and
+`updated_by` move, the row's provenance is refreshed, and no callback fires.
+
+### MongoDB
+
+**`Delete` writes a tombstone; it does not remove the document.** The document
+stays, carrying `deleted: true`, no `value`, a bumped `revision` and the
+provenance of the delete — which is what keeps a revision monotonic across a
+delete and a recreate on a backend with no table-level counter. `Get` reports
+the key as not found and `List` skips it, so nothing about the library's own
+API changes.
+
+**Anything that reads `systemplane_entries` directly — a report, a dashboard, a
+support query, your own migration — must filter `deleted: {$ne: true}`.** `$ne`
+rather than `$exists: false`: a document written before v4 carries no `deleted`
+field at all and must stay visible, and `$ne` matches a missing field. The
+library's own reads use exactly that filter.
+
+Tombstones are never purged. Their count is bounded by the set of keys you
+register, so there is nothing to schedule: a key deleted a thousand times
+leaves one document.
+
+**Change streams need a replica set.** Against a standalone server, pass
+`WithPollInterval`: the fallback reads the same collection on a timer and obeys
+the same resync and revision rules, costing latency rather than correctness. In
+multi-tenant mode the tenant database resolved from the request context is
+materialized on first use with `createCollection`, so the runtime role needs
+that privilege in every tenant database; the single-tenant collection is left
+to be created by its first write.
+<!-- NOT-YET(engine-tenants): the same for a connector-resolved database, and the refusal when two tenants resolve to one database and collection -->
 
 ---
 
