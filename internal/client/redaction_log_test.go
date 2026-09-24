@@ -432,11 +432,14 @@ func TestTypedGetterErrorNamesTheValueOfAnUnredactedKey(t *testing.T) {
 // read the key's redaction from.
 //
 // The gate must carry the fact out of the same registry lookup that produced
-// the value. Reading it back afterwards through the public KeyRedaction
-// accessor cannot work: that accessor deliberately reports RedactNone for a
-// closed Client, so a Close landing between the read and the check degrades the
-// gate open and the rejection prints the value of a RedactFull key — on the
-// multi-tenant read-through path, where the error reaches response bodies.
+// the value. Looking it back up afterwards through the public KeyRedaction
+// accessor is a second, differently-timed registry read, and it answers from
+// whatever the Client is by then: once closed, it answers RedactFull for every
+// key without consulting the registration at all. So a Close landing between
+// the read and the check grades the value against a policy that read never
+// produced — the key registered in the clear is over-withheld, and its
+// rejection loses the one detail that makes it actionable. The carried fact is
+// right on both rows, whatever lands under the read.
 //
 // The store hook closes the Client under the read it is serving, which is the
 // race made deterministic.
@@ -444,13 +447,16 @@ func TestTypedGetterRedactionSurvivesACloseMidRead(t *testing.T) {
 	for _, tt := range []struct {
 		name string
 		raw  string
-		leak string
-		call func(*Client) error
+		// value is the malformed value as the rejection would print it: what a
+		// redacted key's error must never carry, and what an unredacted key's
+		// must.
+		value string
+		call  func(*Client) error
 	}{
 		{
-			name: "GetDuration",
-			raw:  `"` + rejectedSecret + `"`,
-			leak: rejectedSecret,
+			name:  "GetDuration",
+			raw:   `"` + rejectedSecret + `"`,
+			value: rejectedSecret,
 			call: func(c *Client) error {
 				_, _, err := c.GetDuration(context.Background(), "ns", "k")
 
@@ -458,9 +464,9 @@ func TestTypedGetterRedactionSurvivesACloseMidRead(t *testing.T) {
 			},
 		},
 		{
-			name: "GetInt",
-			raw:  `1.5`,
-			leak: "1.5",
+			name:  "GetInt",
+			raw:   `1.5`,
+			value: "1.5",
 			call: func(c *Client) error {
 				_, _, err := c.GetInt(context.Background(), "ns", "k")
 
@@ -468,34 +474,155 @@ func TestTypedGetterRedactionSurvivesACloseMidRead(t *testing.T) {
 			},
 		},
 	} {
-		t.Run(tt.name, func(t *testing.T) {
-			m := newMemStore(true)
-			c := newMultiTenantClient(t, m)
+		for _, policy := range []RedactPolicy{RedactFull, RedactNone} {
+			t.Run(tt.name+"/"+policy.String(), func(t *testing.T) {
+				m := newMemStore(true)
+				c := newMultiTenantClient(t, m)
 
-			if err := c.Register("ns", "k", "1s", WithRedaction(RedactFull)); err != nil {
-				t.Fatalf("register: %v", err)
-			}
+				if err := c.Register("ns", "k", "1s", WithRedaction(policy)); err != nil {
+					t.Fatalf("register: %v", err)
+				}
 
-			m.getHook = func(ns, key string) (store.Entry, bool, bool) {
-				_ = c.Close()
+				m.getHook = func(ns, key string) (store.Entry, bool, bool) {
+					_ = c.Close()
 
-				return store.Entry{Namespace: ns, Key: key, Value: []byte(tt.raw)}, true, true
-			}
+					return store.Entry{Namespace: ns, Key: key, Value: []byte(tt.raw)}, true, true
+				}
 
-			err := tt.call(c)
-			if err == nil {
-				t.Fatal("want a validation error, got nil")
-			}
+				err := tt.call(c)
+				if err == nil {
+					t.Fatal("want a validation error, got nil")
+				}
 
-			if strings.Contains(err.Error(), tt.leak) {
-				t.Errorf("error %q carries %q, the value of a redacted key", err, tt.leak)
-			}
+				if policy == RedactNone {
+					if !strings.Contains(err.Error(), tt.value) {
+						t.Errorf("error %q does not name %q, the value of a key nobody registered redacted: "+
+							"the gate graded it against a policy its own read never produced", err, tt.value)
+					}
 
-			if !strings.Contains(err.Error(), "value withheld") {
-				t.Errorf("error %q does not say the value was withheld", err)
-			}
-		})
+					if strings.Contains(err.Error(), "value withheld") {
+						t.Errorf("error %q withholds the value of a key registered in the clear", err)
+					}
+
+					return
+				}
+
+				if strings.Contains(err.Error(), tt.value) {
+					t.Errorf("error %q carries %q, the value of a redacted key", err, tt.value)
+				}
+
+				if !strings.Contains(err.Error(), "value withheld") {
+					t.Errorf("error %q does not say the value was withheld", err)
+				}
+			})
+		}
 	}
+}
+
+// TestGetEntryCarriesTheRegisteredPolicy pins WHAT the single read path hands
+// back beside the value: the key's policy itself, on every path that answers
+// with a value.
+//
+// RedactMask is the subject because it is the answer a collapse cannot fake:
+// a boolean, or a gate that re-reads the registration through some other
+// accessor, can still come out right on a RedactNone and a RedactFull key and
+// be wrong here. ok=false carries RedactNone because there is no value to
+// grade.
+func TestGetEntryCarriesTheRegisteredPolicy(t *testing.T) {
+	register := func(t *testing.T, c *Client) {
+		t.Helper()
+
+		if err := c.Register("ns", "k", "1s", WithRedaction(RedactMask)); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+	}
+
+	assertMask := func(t *testing.T, policy RedactPolicy, ok bool, err error) {
+		t.Helper()
+
+		if err != nil {
+			t.Fatalf("getEntry: %v", err)
+		}
+
+		if !ok {
+			t.Fatal("getEntry reports the registered key as unknown")
+		}
+
+		if policy != RedactMask {
+			t.Errorf("getEntry returned policy %v, want %v as registered", policy, RedactMask)
+		}
+	}
+
+	t.Run("single-tenant hit", func(t *testing.T) {
+		m := newMemStore(false)
+		c := newSingleTenantClient(t, m)
+
+		register(t, c)
+		seedEntry(t, m, "ns", "k", "2s")
+
+		if err := c.Start(context.Background()); err != nil {
+			t.Fatalf("start: %v", err)
+		}
+
+		t.Cleanup(func() { _ = c.Close() })
+
+		e, policy, ok, err := c.getEntry(context.Background(), "ns", "k")
+		assertMask(t, policy, ok, err)
+
+		if e.Value != "2s" {
+			t.Fatalf("value = %v, want the stored row: the policy was graded off the default, not a hit", e.Value)
+		}
+	})
+
+	t.Run("multi-tenant row found", func(t *testing.T) {
+		m := newMemStore(true)
+		c := newMultiTenantClient(t, m)
+
+		register(t, c)
+		seedEntry(t, m, "ns", "k", "2s")
+		t.Cleanup(func() { _ = c.Close() })
+
+		e, policy, ok, err := c.getEntry(context.Background(), "ns", "k")
+		assertMask(t, policy, ok, err)
+
+		if e.Value != "2s" {
+			t.Fatalf("value = %v, want the stored row", e.Value)
+		}
+	})
+
+	t.Run("multi-tenant row absent", func(t *testing.T) {
+		m := newMemStore(true)
+		c := newMultiTenantClient(t, m)
+
+		register(t, c)
+		t.Cleanup(func() { _ = c.Close() })
+
+		e, policy, ok, err := c.getEntry(context.Background(), "ns", "k")
+		assertMask(t, policy, ok, err)
+
+		if e.Value != "1s" {
+			t.Fatalf("value = %v, want the registered default", e.Value)
+		}
+	})
+
+	t.Run("unregistered key", func(t *testing.T) {
+		c := newSingleTenantClient(t, newMemStore(false))
+		t.Cleanup(func() { _ = c.Close() })
+
+		_, policy, ok, err := c.getEntry(context.Background(), "ns", "never-registered")
+		if err != nil {
+			t.Fatalf("getEntry: %v", err)
+		}
+
+		if ok {
+			t.Fatal("getEntry reports an unregistered key as known")
+		}
+
+		if policy != RedactNone {
+			t.Errorf("getEntry returned policy %v for an unregistered key, want %v: nothing declared it sensitive "+
+				"and there is no value of it to grade", policy, RedactNone)
+		}
+	})
 }
 
 // TestKeyRedactionOnAClosedClientFailsClosed pins the DIRECTION of the

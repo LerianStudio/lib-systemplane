@@ -71,20 +71,21 @@ func (c *Client) singleTenantEntry(namespace, key string, def keyDef) Entry {
 
 // getEntry is the single read path behind Get and GetEntry.
 //
-// redacted is the key's registration speaking, read under the same registryMu
-// hold that produced the value. It travels with the value because a caller
-// that grades the value — the typed getters — must never look the fact up a
-// second time: [Client.KeyRedaction] answers from the registration alone, and
-// once the Client is closed it answers without reading it at all, so a getter
-// that looked the fact up after its read would be grading a value against a
-// policy the read never produced. It is false whenever ok is false.
-func (c *Client) getEntry(ctx context.Context, namespace, key string) (Entry, bool, bool, error) {
+// The redaction policy is the key's registration speaking, read under the same
+// registryMu hold that produced the value. It travels with the value because a
+// caller that grades the value — the typed getters — must never look the fact
+// up a second time: [Client.KeyRedaction] answers from the registration alone,
+// and once the Client is closed it answers without reading it at all, so a
+// getter that looked the fact up after its read would be grading a value
+// against a policy the read never produced. It is RedactNone whenever ok is
+// false.
+func (c *Client) getEntry(ctx context.Context, namespace, key string) (Entry, RedactPolicy, bool, error) {
 	if c == nil || c.closed.Load() {
-		return Entry{}, false, false, ErrClosed
+		return Entry{}, RedactNone, false, ErrClosed
 	}
 
 	if ctx == nil {
-		return Entry{}, false, false, ErrNilContext
+		return Entry{}, RedactNone, false, ErrNilContext
 	}
 
 	nk := nskey{Namespace: namespace, Key: key}
@@ -94,13 +95,14 @@ func (c *Client) getEntry(ctx context.Context, namespace, key string) (Entry, bo
 	c.registryMu.RUnlock()
 
 	if !registered {
-		return Entry{}, false, false, nil
+		return Entry{}, RedactNone, false, nil
 	}
 
-	redacted := def.redaction != RedactNone
+	policy := def.redaction
+	redacted := policy != RedactNone
 
 	if !c.multiTenant {
-		return c.singleTenantEntry(namespace, key, def), redacted, true, nil
+		return c.singleTenantEntry(namespace, key, def), policy, true, nil
 	}
 
 	// Multi-tenant: resolve the tenant database from ctx and read through.
@@ -108,11 +110,11 @@ func (c *Client) getEntry(ctx context.Context, namespace, key string) (Entry, bo
 	// what the tenant row holds right now, including this caller's own write.
 	entry, found, err := c.store.Get(ctx, store.Scope{}, namespace, key)
 	if err != nil {
-		return Entry{}, false, false, fmt.Errorf("systemplane: Get: %w", err)
+		return Entry{}, RedactNone, false, fmt.Errorf("systemplane: Get: %w", err)
 	}
 
 	if !found {
-		return Entry{Value: engine.Clone(def.defaultValue)}, redacted, true, nil
+		return Entry{Value: engine.Clone(def.defaultValue)}, policy, true, nil
 	}
 
 	var decoded any
@@ -123,7 +125,7 @@ func (c *Client) getEntry(ctx context.Context, namespace, key string) (Entry, bo
 			safelog.ErrorDetail(redacted, "decode failed", err),
 		)
 
-		return Entry{}, false, false, decodeErr(ctx, namespace, key, redacted, err)
+		return Entry{}, RedactNone, false, decodeErr(ctx, namespace, key, redacted, err)
 	}
 
 	return Entry{
@@ -131,7 +133,7 @@ func (c *Client) getEntry(ctx context.Context, namespace, key string) (Entry, bo
 		Revision:  entry.Revision,
 		UpdatedAt: entry.UpdatedAt,
 		UpdatedBy: entry.UpdatedBy,
-	}, redacted, true, nil
+	}, policy, true, nil
 }
 
 // withheldValueErr is a typed getter's rejection for a key registered redacted:
@@ -179,7 +181,7 @@ func (c *Client) GetString(ctx context.Context, namespace, key string) (string, 
 // (0, false, ErrValidation), so a malformed value neither truncates silently
 // nor reads as 0.
 func (c *Client) GetInt(ctx context.Context, namespace, key string) (int64, bool, error) {
-	e, redacted, ok, err := c.getEntry(ctx, namespace, key)
+	e, policy, ok, err := c.getEntry(ctx, namespace, key)
 	if err != nil || !ok {
 		return 0, ok, err
 	}
@@ -191,7 +193,7 @@ func (c *Client) GetInt(ctx context.Context, namespace, key string) (int64, bool
 		// JSON decodes all numbers as float64. Reject any value that would
 		// lose precision when truncated to int64 (NaN, Inf, fractional).
 		if n != float64(int64(n)) {
-			if redacted {
+			if policy != RedactNone {
 				return 0, false, withheldValueErr(namespace, key, "an integer", v)
 			}
 
@@ -246,7 +248,7 @@ func (c *Client) GetFloat64(ctx context.Context, namespace, key string) (float64
 // registered default Register canonicalises. All other shapes — including
 // unparseable strings — return (0, false, ErrValidation).
 func (c *Client) GetDuration(ctx context.Context, namespace, key string) (time.Duration, bool, error) {
-	e, redacted, ok, err := c.getEntry(ctx, namespace, key)
+	e, policy, ok, err := c.getEntry(ctx, namespace, key)
 	if err != nil || !ok {
 		return 0, ok, err
 	}
@@ -257,7 +259,7 @@ func (c *Client) GetDuration(ctx context.Context, namespace, key string) (time.D
 	case string:
 		parsed, parseErr := time.ParseDuration(d)
 		if parseErr != nil {
-			if redacted {
+			if policy != RedactNone {
 				return 0, false, withheldValueErr(namespace, key, "a parseable duration", v)
 			}
 
