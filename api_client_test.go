@@ -84,7 +84,7 @@ func (s *apiMemoryStore) Set(_ context.Context, _ TestScope, e TestEntry) (int64
 	s.mu.Unlock()
 
 	if sub != nil {
-		sub(TestEvent{Namespace: e.Namespace, Key: e.Key, Op: internalstore.OpUpsert})
+		sub(TestEvent{Namespace: e.Namespace, Key: e.Key, Op: internalstore.OpUpsert, Revision: rev})
 	}
 
 	return rev, nil
