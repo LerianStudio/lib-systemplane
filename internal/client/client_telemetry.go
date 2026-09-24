@@ -31,10 +31,28 @@ func (c *Client) logError(ctx context.Context, msg string, fields ...log.Field) 
 	}
 
 	if c.multiTenant {
-		fields = append(fields, log.String(constants.AttrKeyTenantID, tmcore.GetTenantIDContext(ctx)))
+		tenant, ok := tenantOf(ctx)
+		if !ok {
+			tenant = unresolvedTenant
+		}
+
+		fields = append(fields, log.String(constants.AttrKeyTenantID, tenant))
 	}
 
 	c.guarded.Log(ctx, log.LevelError, msg, fields)
+}
+
+// unresolvedTenant is the tenant.id a multi-tenant line carries when ctx holds
+// no tenant id. The tenant database and the tenant id ride independent context
+// keys, so a read can resolve a database with no id; an empty value there
+// would read exactly like a single-tenant line.
+const unresolvedTenant = "unresolved"
+
+// tenantOf returns the tenant id ctx carries and whether it carries one.
+func tenantOf(ctx context.Context) (string, bool) {
+	tenant := tmcore.GetTenantIDContext(ctx)
+
+	return tenant, tenant != ""
 }
 
 // scopeFor names the tenant a report about this call belongs to, and is the
@@ -71,13 +89,16 @@ func (c *Client) scopeFor(ctx context.Context) store.Scope {
 // there matters at least as much. An ordinary key keeps the json error
 // wrapped, which is what a caller debugging the row reaches for.
 func decodeErr(ctx context.Context, namespace, key string, redacted bool, err error) error {
-	tenant := tmcore.GetTenantIDContext(ctx)
-
-	if redacted {
-		return fmt.Errorf("systemplane: decode value for %s/%s in tenant %q failed (%T, cause withheld: key registered redacted)",
-			namespace, key, tenant, err)
+	where := "in an unresolved tenant"
+	if tenant, ok := tenantOf(ctx); ok {
+		where = fmt.Sprintf("in tenant %q", tenant)
 	}
 
-	return fmt.Errorf("systemplane: decode value for %s/%s in tenant %q: %w",
-		namespace, key, tenant, err)
+	if redacted {
+		return fmt.Errorf("systemplane: decode value for %s/%s %s failed (%T, cause withheld: key registered redacted)",
+			namespace, key, where, err)
+	}
+
+	return fmt.Errorf("systemplane: decode value for %s/%s %s: %w",
+		namespace, key, where, err)
 }
