@@ -571,7 +571,98 @@ Find your row and read only it. Every section below assumes § Behaviour changes
 has already been read: it is where the changes that break a service without
 breaking its build are written down, and no per-consumer section repeats them.
 
-<!-- filled by Tasks 1.1.4, 1.1.5 -->
+### matcher
+
+**From:** v2.0.0 — `/v2`, lib-commons `/v6`, lib-observability `/v2`.
+**Mode:** single-tenant, Postgres.
+**Breaks:** all three module paths (the `/v2` row of [§ The module and dependency hop](#the-module-and-dependency-hop)); the `OnChange` signature; every validator that asserts a Go type; `Set` and `Delete`, which now return an error for a change that landed.
+**Do:**
+
+1. Apply `MigrationV3ToV4SQL()` through your migration pipeline before the new binary boots.
+2. Bump the three module paths in one change. lib-commons `/v7` is not optional.
+3. Rewrite each `OnChange` callback to `func(ctx context.Context, ch Change)`; namespace, key, revision and value all come off `ch`.
+4. Audit every validator for Go-type assertions — a whole number arrives as `float64` — and for a dependency on request scope.
+5. Stop reading a non-nil `Set`/`Delete` error as "not persisted".
+
+matcher is the pilot for typed configuration documents. The glue that decodes a
+namespace of scalar keys into a struct, validates it and re-applies it on change
+is what `Bind`, `Group[T]` and `Group.OnApply` replace; see
+[§ The surface diff](#the-surface-diff).
+
+### billing-worker
+
+**From:** v2.0.0 — `/v2`, lib-commons `/v6`, lib-observability `/v2`.
+**Mode:** multi-tenant flag, per-request dispatch, Postgres.
+**Breaks:** the three module paths; the `DefaultSeedSQL()` DDL generator, which no longer exists; the fixed Postgres names; the canonical JSON shape and the new `Set`/`Delete` errors.
+**Do:**
+
+1. Delete the seed-DDL generator. Defaults belong at `Register` / `Bind` in code; a row an operator must be able to override before first boot is one your own migration pipeline inserts.
+2. Drop the table and channel overrides. The table is `systemplane_entries` and the channel is `systemplane_changes`, both fixed; a name collision is now a reason for the install to have its own database, not a reason to rename an object.
+3. Apply `MigrationV3ToV4SQL()` per tenant database, then bump the three module paths.
+4. Audit the validators for the canonical shape, and the `Set`/`Delete` call sites for the new errors.
+
+`OnChange` still returns `ErrNotSupportedInMultiTenant` on this shape — a
+documented refusal, not a regression: no scope is tracked and no changefeed
+runs, so no callback could fire.
+
+### finance-hub
+
+**From:** v1.6.0 — unsuffixed module, Fiber v2, lib-commons v5, lib-observability v1. The hardest starting point in the matrix.
+**Mode:** single-tenant, Postgres.
+**Breaks:** everything the `/v2` consumers above are hit by, plus the v1.6.x preconditions.
+**Do, in this order:**
+
+1. **Fiber v2 → v3 first, as its own change.** It is not part of this upgrade: it retypes `admin.WithAuthorizer` from `func(*fiber.Ctx, string) error` to `func(fiber.Ctx, string) error` and touches your whole HTTP layer.
+2. Take the observability boundary — lib-observability v1 → `/v4`, lib-commons v5 → `/v7` — as described in [MIGRATION-v3.md](MIGRATION-v3.md).
+3. Delete the `DefaultSeedSQL()` generator; see billing-worker above for what replaces it.
+4. Then the single-tenant steps: `MigrationV3ToV4SQL()`, the module path, the callback signature, the validator audit, the `Set`/`Delete` errors.
+
+### br-consignado-gw
+
+**From:** v2.0.0 — `/v2`, lib-commons `/v6`, lib-observability `/v2`.
+**Mode:** single-tenant, Postgres.
+**Breaks:** the three module paths, and nothing this library asks you to redesign.
+**Do:** the cheapest path in the matrix — apply `MigrationV3ToV4SQL()`, bump the three module paths, rewrite the `OnChange` callbacks if you have any. Still audit every validator against
+[§ Validators and defaults see the canonical JSON shape](#validators-and-defaults-see-the-canonical-json-shape): a validator that asserts `int` now refuses its own registered default, at `Register`, on boot.
+
+### go-boilerplate-ddd
+
+**From:** v2.0.0 — `/v2`, lib-commons `/v6`, lib-observability `/v2`.
+**Mode:** single-tenant template.
+**Breaks:** the same as br-consignado-gw.
+**Do:** the same steps — and **update this one last**. It is the shape every new
+service starts from, so it should copy a recipe that matcher and one
+multi-tenant consumer have already run against a real database, not the recipe
+this document predicts.
+
+### plugin-br-pix-lerian
+
+**From:** no dependency on this library in `go.mod`.
+**Mode:** not a consumer; it carries a mount helper only.
+**Breaks:** nothing. v4 asks nothing of it.
+**Do:** nothing. If it ever takes the dependency, take `/v4` directly and read
+[§ Behaviour changes](#behaviour-changes) before registering the first key.
+
+### product-console
+
+**From:** new adopter — no version to leave; take `/v4` directly.
+**Mode:** multi-tenant, MongoDB, through its Go service. The first MongoDB consumer.
+**Breaks:** nothing yet. What follows is what to build against.
+**Do:**
+
+1. Mount the admin surface in the documented order: `admin.MountCatalog` before the tenant-manager middleware, `admin.Mount` after it, so value reads and writes receive the resolved tenant database and catalog metadata does not need one.
+2. Expect `revision`, `updatedAt` (JSON null when no row backs the value), `updatedBy` and `stale` on every admin GET and list response, and render `stale` — it is the Console's only signal that a value is not currently being confirmed.
+3. Run MongoDB as a replica set, or pass `WithPollInterval` to fall back to a timer. Change streams need the replica set; the fallback costs latency, not correctness.
+4. Filter `deleted: {$ne: true}` in **every** direct read of `systemplane_entries`. A delete writes a tombstone rather than removing the document; see [§ MongoDB](#mongodb).
+
+<!-- NOT-YET(engine-tenants): WithMongoTenantManager wiring, connector-resolved createCollection, shared-collection refusal -->
+
+Until that lands the Console's only tenant shape is the per-request one: the
+database resolved from the request context on every read and write, no
+in-process cache, no changefeed, and `OnChange` refused with
+`ErrNotSupportedInMultiTenant`.
+
+<!-- filled by Task 1.1.5 -->
 
 ---
 
