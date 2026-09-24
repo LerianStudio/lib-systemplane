@@ -42,9 +42,9 @@ has to be read even where your code compiles unchanged.
 | `Manager`, `ManagerOption`, `NewManager`, `WithManagerLogger`, `WithManagerTelemetry`, `WithManagerAggregateTenantThreshold` | The type and its constructor no longer exist. A single-tenant process never needed them. A multi-tenant process configures the one `Client` instead: `WithLogger`, `WithTelemetry`, `WithMultiTenantEnabled`, `WithModule`. |
 | `(*Manager).Drain` | `Client.Close()`. It now waits, bounded by `WithCloseTimeout`, for subscriber callbacks whose context it has cancelled. |
 | `(*Manager).IsClosed` | No replacement. Calls on a closed `Client` return `ErrClosed`; that is the answer the flag was read for. |
-| `(*Manager).OnTenantActivated`, `OnTenantSuspended`, `OnTenantDeleted`, `OnTenantCredentialsRotated`, `HandleTenantLifecycle` | <!-- NOT-YET(engine-tenants): Client.HandleTenantLifecycle, WithAggregateTenantThreshold, tenant-scope teardown in Close --> |
+| `(*Manager).OnTenantActivated`, `OnTenantSuspended`, `OnTenantDeleted`, `OnTenantCredentialsRotated`, `HandleTenantLifecycle` | No replacement yet: tenant lifecycle handling does not exist on the v4 Client, so a process that depends on it cannot take this upgrade. <!-- NOT-YET(engine-tenants): Client.HandleTenantLifecycle, WithAggregateTenantThreshold, tenant-scope teardown in Close --> |
 | `DefaultSeedSQL` | No replacement. Defaults live in code, at `Register` / `Bind`. A value an operator must be able to override before first boot is a row your own migration pipeline inserts, not something this library seeds. |
-| `WithTable`, `WithListenChannel`, `WithCollection` | No replacement: the names are fixed. Postgres table `systemplane_entries`, Postgres channel `systemplane_changes`, MongoDB collection `systemplane_entries`. Drop the option; if you renamed an object, rename it back before upgrading. |
+| `WithTable`, `WithListenChannel`, `WithCollection` | No replacement: the names are fixed, and v4 reads nothing else. Postgres: rename or copy a custom table to `systemplane_entries` first, then apply `MigrationV3ToV4SQL()`, which names the table unqualified, refuses when `search_path` reaches none, and recreates the notification triggers on `systemplane_changes`, so a custom channel needs no step of its own. MongoDB: copy a custom collection to `systemplane_entries` before starting v4; the bootstrap creates the collection and its indexes but moves no data. |
 
 **Added.**
 
@@ -52,12 +52,9 @@ has to be read even where your code compiles unchanged.
 |---|---|
 | `WithCloseTimeout`, `ErrCloseTimeout` | Bound the wait `Close` gives subscriber callbacks (default 30s) and name the (scope, key) still running when the bound elapses. |
 | `GetEntry`, `Entry` | Read the value together with its revision, `UpdatedAt`, `UpdatedBy` and a per-key `Stale` flag. |
-| `Bind`, `Group[T]`, `Snapshot[T]`, `Applied[T]`, `ApplyStatus`, `Group.Snapshot`, `Group.Set`, `Group.OnApply`, `Group.Status`, `ErrApplyPanicked` | Declare a whole typed configuration document as one key, read it as `T`, and apply it through a serialized hook that records what is desired, what is applied and what last failed. |
+| `Bind`, `Group[T]`, `Snapshot[T]`, `Applied[T]`, `ApplyStatus`, `Group.Snapshot`, `Group.Set`, `Group.OnApply`, `Group.Status`, `ErrApplyPanicked` | Declare a whole typed configuration document as one key, read it as `T`, and apply it through a serialized hook that records what is desired, what is applied and what last failed. `Bind`, `Snapshot` and `Set` work in both modes; on a multi-tenant Client `OnApply` returns `ErrNotSupportedInMultiTenant` and `Snapshot` reads through ungraded. |
 | `MigrationV3ToV4SQL()` | The v3 → v4 Postgres delta as an importable artifact for your migration pipeline. See § The database and operator contract. |
 | `WithContextValidator` | Validate a value against the `Set` caller's context, so a validator can use the tenant that call carried. The registered default is still validated with `context.Background()`. |
-
-The tenant-manager additions ride the same placeholder as the removed `Manager`
-lifecycle row above; they are not a second thing to wait for.
 
 **Changed shape.**
 
@@ -253,12 +250,14 @@ and stop parsing values back out of these errors and log lines.
 **Affects:** operators, and anyone running Postgres behind a resolver that
 carries replicas.
 
-Every systemplane statement is pinned to the primary, reads included — and to
-the first primary deterministically when a resolver reports several. A standby
+Where a resolver supplies the handle — multi-tenant mode, or a tenant
+connector — every systemplane statement is pinned to the primary, reads
+included, and to the first primary deterministically when a resolver reports several. A standby
 could otherwise serve a revision older than the one `Set` just returned, and
 older than the NOTIFY the changefeed is reconciling against, since the feed
 LISTENs on the primary DSN. What this gives up is read spreading, and only on a
-resolver reporting more than one primary.
+resolver reporting more than one primary. A single-tenant Client uses the
+`*sql.DB` you hand `NewPostgres` unchanged, so read routing there is yours.
 
 Every log line that named a configuration key in field `key` names it in
 `keyname` instead. `key` is an exact entry in lib-observability's default
@@ -411,7 +410,9 @@ that nothing is currently confirming **this** key: before `Start`; while the
 changefeed is disconnected, or connected but not yet reconciled; and while this
 key's last change could not be re-read. Reads keep serving the last published
 value throughout — `Stale` is about confidence, not absence — and a sibling key
-that could not be re-read does not make this one stale.
+that could not be re-read does not make this one stale. In multi-tenant mode
+`Stale` is always false: every read resolves the tenant database and reads
+through, so no cache can lag.
 
 Three rules produce that per-key answer:
 
@@ -454,14 +455,6 @@ or `unresolved` when the context carries none.
 
 **Do:** nothing, unless a panicking callback was what failed your boot. It no
 longer does.
-
-### Revisions are opaque
-
-**Affects:** anything that persists, exports or compares a `Revision`.
-
-Compare revisions of one key, for ordering, and nothing else: what a revision
-is, how it advances and what it refuses to promise is in
-[§ The database and operator contract](#the-database-and-operator-contract).
 
 ---
 
@@ -666,8 +659,8 @@ should copy a recipe that has already run against a real database.
 **Breaks:** nothing — there is no earlier version to leave.
 **Do:**
 
-1. Mount the admin surface in the documented order: `admin.MountCatalog` before the tenant-manager middleware, `admin.Mount` after it, so value reads and writes receive the resolved tenant database and catalog metadata does not need one.
-2. Expect `revision`, `updatedAt` (JSON null when no row backs the value), `updatedBy` and `stale` on every admin GET and list response, and render `stale` — it is the Console's only signal that a value is not currently being confirmed.
+1. Mount `admin.MountCatalog` before the tenant-manager middleware, `admin.Mount` after it, so value reads and writes receive the resolved tenant database and catalog metadata does not need one.
+2. Render `revision`, `updatedAt` (JSON null when no row backs the value) and `updatedBy` from every admin GET and list response as the Console's provenance fields. `stale` is always false on this shape.
 3. Run MongoDB as a replica set, or pass `WithPollInterval` to fall back to a timer. Change streams need the replica set; the fallback costs latency, not correctness.
 4. Filter `deleted: {$ne: true}` in **every** direct read of `systemplane_entries`. A delete writes a tombstone rather than removing the document; see [§ MongoDB](#mongodb).
 
@@ -686,8 +679,9 @@ changefeed, and `OnChange` refused with `ErrNotSupportedInMultiTenant`.
 
 1. Fiber v2 → v3 first, as its own change, then the observability boundary. Both are in the hop table above.
 2. Delete the `Manager`. One `Client` carries what it configured: `WithMultiTenantEnabled()`, `WithModule(...)`, `WithLogger`, `WithTelemetry`.
-3. Replace `Drain(ctx)` with `Close()`, which takes no context. The wait is bounded by `WithCloseTimeout` (30 seconds by default), and a callback still running when the bound elapses comes back as `ErrCloseTimeout` naming every `(scope, key)` inside a delivery — where `Drain` returned nil whatever happened, leaving a goroutine that never acknowledged its cancel to exit unobserved. See [§ `Close` is bounded, and names the callback that would not stop](#close-is-bounded-and-names-the-callback-that-would-not-stop).
+3. Replace `Drain(ctx)` with `Close()`, which takes no context — see [§ `Close` is bounded, and names the callback that would not stop](#close-is-bounded-and-names-the-callback-that-would-not-stop).
 4. Budget for every multi-tenant read reaching the tenant database. The per-tenant cache belonged to the `Manager` and left with it.
+5. The four `OnTenant*` handlers have no replacement yet: a process that depends on tenant lifecycle handling cannot take this upgrade.
 
 ~~~go
 // v1.6.1 — construction, lifecycle registration, shutdown
@@ -708,14 +702,14 @@ defer m.Drain(ctx)
 **Do:**
 
 1. Bump the module path. That is the whole dependency hop for this consumer — the `/v3` row of the hop table, no lib-commons and no lib-observability move.
-2. Delete the seed-DDL generator and the name overrides. [§ The surface diff](#the-surface-diff) says what replaces each; the channel is `systemplane_changes` and the table `systemplane_entries`, both fixed.
+2. Delete the seed-DDL generator and the name overrides; the name-override row of [§ The surface diff](#the-surface-diff) says what each needs.
 3. Apply `MigrationV3ToV4SQL()` to every tenant database before the new binary boots.
 4. Replace `Drain(ctx)` with `Close()` — the same contrast notifications carries above.
+5. `HandleTenantLifecycle` has no replacement yet: a process that depends on tenant lifecycle handling cannot take this upgrade.
 
 ~~~go
 // v3.0.0 — construction, lifecycle registration, shutdown
-c, err := systemplane.NewPostgres(db, listenDSN,
-    systemplane.WithMultiTenantEnabled(), systemplane.WithListenChannel("pix_jd_changes"))
+c, err := systemplane.NewPostgres(db, listenDSN, systemplane.WithMultiTenantEnabled()) // plus the pix_jd_changes channel override
 m := systemplane.NewManager(c, pgMgr)
 // m.HandleTenantLifecycle registered as the tmevent handler
 defer m.Drain(ctx)
@@ -755,6 +749,4 @@ a **minor** bump, guarded in both directions by `admin/release_policy_test.go`,
 because a `major` rule on a `/vN` line computes a `/vN+1` version whose tag Go
 cannot consume and whose release run dies at `git tag`. The path rename and the
 API break are therefore one change, since Go rejects a module whose path says
-`/v4` under a `v3.x` tag outright. The `v4.0.0` cut follows a semantic-release
-dry-run against `main`, which decides whether the run cuts the tag itself or a
-hand tag plus its channel note is needed — never a reflex tag.
+`/v4` under a `v3.x` tag outright.

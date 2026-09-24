@@ -1,8 +1,8 @@
 # lib-systemplane
 
-This README still documents the v3 line. If you are on v4, or adopting it now,
-start at [MIGRATION-v4.md](MIGRATION-v4.md): the module path, the required
-`lib-commons/v7`, and the removed `Manager` are all different from what follows.
+Parts of this README still describe the v3 line (module path, lib-commons major,
+`Manager`); the schema section is already v4. Until it is rewritten, take
+[MIGRATION-v4.md](MIGRATION-v4.md) as the source of truth for anything that differs.
 
 Dual-backend (PostgreSQL / MongoDB) hot-reload runtime configuration for Lerian services. Register operational knobs (log levels, feature flags, rate limits, circuit-breaker thresholds, worker intervals) at startup, mutate them at runtime without a pod restart, and — in single-tenant mode — subscribe to change events through a LISTEN/NOTIFY (Postgres) or change-stream (MongoDB) backed subscription. First-class support for the Lerian database-per-tenant model via the `lib-commons/v6` tenant-manager dispatch layer.
 

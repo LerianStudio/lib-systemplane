@@ -9,9 +9,9 @@
 //
 // Construct a Client with [NewPostgres] or [NewMongoDB]; declare each key with
 // [Client.Register], or bind a typed document with [Bind]; call [Client.Start];
-// read with the typed accessors ([Client.GetString], [Client.GetInt], etc.) or
-// with [Group.Snapshot]; react to live updates with [Client.OnChange] or
-// [Group.OnApply]; release the backend with [Client.Close].
+// read with the nil-receiver-safe typed accessors ([Client.GetString],
+// [Client.GetInt], etc.) or with [Group.Snapshot]; react to live updates with
+// [Client.OnChange] or [Group.OnApply]; release the backend with [Client.Close].
 //
 // In single-tenant mode every value is decoded and graded by the key's
 // registered validator before it enters the cache — on the write path for a

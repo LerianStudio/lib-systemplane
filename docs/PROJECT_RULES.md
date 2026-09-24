@@ -21,22 +21,7 @@ This document defines the coding standards, architecture patterns, and developme
 
 ### Package Structure
 
-```text
-lib-systemplane/
-├── (root package: systemplane)     # Small public API facade (api_*.go)
-├── admin/                          # Fiber HTTP handlers for runtime config management
-├── systemplanetest/                # Backend-equivalence contract test suite
-└── internal/
-    ├── client/                     # Client lifecycle, registry, options, catalog, redaction
-    ├── engine/                     # Convergent engine: feed, ingest, publish, dispatch, reconcile
-    ├── group/                      # Publication coordinator behind typed groups
-    ├── store/                      # Backend-agnostic Store interface (private)
-    ├── postgres/                   # PostgreSQL LISTEN/NOTIFY implementation
-    ├── mongodb/                    # MongoDB change-stream (+ polling fallback) implementation
-    ├── debounce/                   # Trailing-edge debouncer for changefeed coalescing
-    ├── safelog/                    # Redaction-safe failure renderings shared by engine and group
-    └── testsupport/                # Test-only helpers (log-field scan)
-```
+The package tree, annotated, is in [`CLAUDE.md`](../CLAUDE.md) § Repository shape.
 
 ### Package Design Principles
 
@@ -338,6 +323,7 @@ Do not reintroduce observability packages from `lib-commons`; they are being rem
 - `github.com/gofiber/fiber/v3` — HTTP framework for the admin routes
 - `github.com/jackc/pgx/v5` — PostgreSQL driver with LISTEN/NOTIFY support
 - `go.mongodb.org/mongo-driver/v2` — MongoDB driver with change streams
+- `github.com/bxcodec/dbresolver/v2` — read/write resolver; a resolver-supplied Postgres handle is pinned to its primary
 - `github.com/testcontainers/testcontainers-go` — Ephemeral containers for integration tests
 - OpenTelemetry SDK — tracing and metrics instrumentation, normally reached through `lib-observability`
 
