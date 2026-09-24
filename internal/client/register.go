@@ -4,6 +4,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -104,6 +105,12 @@ func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOp
 	// boot.
 	if err := c.engine.RunValidator(context.Background(), def.validator, canonical,
 		def.redaction != RedactNone); err != nil {
+		// Already labelled when the validator panicked — see the same branch
+		// on the write path — so only the context this call adds is wrapped.
+		if errors.Is(err, ErrValidation) {
+			return fmt.Errorf("default value rejected: %w", err)
+		}
+
 		return fmt.Errorf("%w: default value rejected: %w", ErrValidation, err)
 	}
 

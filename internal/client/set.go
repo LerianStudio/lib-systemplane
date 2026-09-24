@@ -82,6 +82,15 @@ func (c *Client) Set(ctx context.Context, namespace, key string, value any, acto
 		// panics on the canonical shape refuses the write instead of unwinding
 		// into the caller's request goroutine.
 		if err := c.engine.RunValidator(ctx, def.validator, canonical, def.redaction != RedactNone); err != nil {
+			// A validator that PANICKED comes back already labelled: the
+			// engine's recovery wraps the store's validation sentinel, which
+			// is the value this package exports as ErrValidation. Labelling it
+			// again printed the sentence twice. A validator that RETURNED an
+			// error carries no label of its own, so that branch still adds one.
+			if errors.Is(err, ErrValidation) {
+				return err
+			}
+
 			return fmt.Errorf("%w: %w", ErrValidation, err)
 		}
 	}

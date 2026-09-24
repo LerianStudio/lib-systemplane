@@ -5,6 +5,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -236,5 +237,101 @@ func TestSingleTenantDecodeFailureWithholdsTheRedactedRow(t *testing.T) {
 
 	if v != "default" {
 		t.Errorf("value in force = %v, want the registered default", v)
+	}
+}
+
+// TestMultiTenantDecodeErrorWithholdsTheRedactedRow closes the leak beside the
+// one the test above closed.
+//
+// Both read-through paths render their LOG line through the engine's
+// policy-aware detail, and then return an error that wraps the raw
+// encoding/json failure — which quotes the offending byte of the row and
+// carries its offset for anyone who unwraps it. An error is the half of the
+// report the consumer is most likely to persist: it reaches a response body,
+// an error tracker, a retry log. A key registered redacted must not have its
+// row quoted there either.
+func TestMultiTenantDecodeErrorWithholdsTheRedactedRow(t *testing.T) {
+	raw := []byte(rejectedSecret)
+	leak := decodeErrText(t, raw)
+
+	read := map[string]func(*Client) error{
+		"Get": func(c *Client) error {
+			_, _, err := c.Get(context.Background(), "ns", "k")
+
+			return err
+		},
+		"List": func(c *Client) error {
+			_, err := c.List(context.Background(), "ns")
+
+			return err
+		},
+	}
+
+	start := func(t *testing.T, opts ...KeyOption) (*Client, *memStore) {
+		t.Helper()
+
+		m := newMemStore(true)
+		c := newMultiTenantClientWithLogger(t, m, &recordingLogger{})
+
+		if err := c.Register("ns", "k", "default", opts...); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+
+		if err := c.Start(context.Background()); err != nil {
+			t.Fatalf("start: %v", err)
+		}
+
+		t.Cleanup(func() { _ = c.Close() })
+		seedRaw(m, "ns", "k", raw)
+
+		return c, m
+	}
+
+	for name, call := range read {
+		t.Run(name+"/redacted", func(t *testing.T) {
+			c, _ := start(t, WithRedaction(RedactFull))
+
+			err := call(c)
+			if err == nil {
+				t.Fatal("want a decode error, got nil")
+			}
+
+			// Not merely the whole row: any run of it is a fragment of a
+			// secret, and the json error quotes the row byte by byte.
+			for i := 0; i+4 <= len(rejectedSecret); i++ {
+				if fragment := rejectedSecret[i : i+4]; strings.Contains(err.Error(), fragment) {
+					t.Fatalf("the error carries %q, a fragment of the stored row: %v", fragment, err)
+				}
+			}
+
+			if strings.Contains(err.Error(), leak) {
+				t.Errorf("the error carries the json message, which quotes the row: %v", err)
+			}
+
+			// The offset travels on the json error itself, so leaving that
+			// error in the chain hands the row's shape to anyone who unwraps.
+			var syntax *json.SyntaxError
+			if errors.As(err, &syntax) {
+				t.Errorf("the json error is still in the chain, offset %d and all: %v", syntax.Offset, err)
+			}
+
+			if !strings.Contains(err.Error(), "ns") || !strings.Contains(err.Error(), "k") {
+				t.Errorf("the error names neither namespace nor key: %v", err)
+			}
+		})
+
+		t.Run(name+"/unredacted", func(t *testing.T) {
+			c, _ := start(t)
+
+			err := call(c)
+			if err == nil {
+				t.Fatal("want a decode error, got nil")
+			}
+
+			var syntax *json.SyntaxError
+			if !errors.As(err, &syntax) {
+				t.Errorf("an ordinary key lost the json cause callers debug the row with: %v", err)
+			}
+		})
 	}
 }

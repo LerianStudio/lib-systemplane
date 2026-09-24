@@ -109,7 +109,7 @@ func (c *Client) getEntry(ctx context.Context, namespace, key string) (Entry, bo
 			engine.ErrorDetail(def.redaction != RedactNone, "decode failed", err),
 		)
 
-		return Entry{}, false, decodeErr(ctx, namespace, key, err)
+		return Entry{}, false, decodeErr(ctx, namespace, key, def.redaction != RedactNone, err)
 	}
 
 	return Entry{
@@ -250,7 +250,7 @@ func (c *Client) List(ctx context.Context, namespace string) ([]ListEntry, error
 	// snapshot both paths work from is internally consistent.
 	c.registryMu.RLock()
 
-	keys := make([]registeredKey, 0)
+	keys := make([]registeredKey, 0, len(c.registry))
 
 	for nk, def := range c.registry {
 		if nk.Namespace == namespace {
@@ -342,7 +342,7 @@ func (c *Client) listFromStore(ctx context.Context, namespace string, keys []reg
 					engine.ErrorDetail(rk.def.redaction != RedactNone, "decode failed", err),
 				)
 
-				return nil, decodeErr(ctx, namespace, rk.Key, err)
+				return nil, decodeErr(ctx, namespace, rk.Key, rk.def.redaction != RedactNone, err)
 			}
 
 			val = decoded

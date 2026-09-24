@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -228,6 +229,86 @@ func TestLastValidatorOptionAppliedWins(t *testing.T) {
 
 		if !errors.Is(err, ctxSentinel) {
 			t.Errorf("register: got %v, want the validator's own error preserved through the \"default value rejected\" wrap", err)
+		}
+	})
+}
+
+// TestValidationFailureIsLabelledOnce pins the shape of the error a refused
+// value comes back as.
+//
+// The engine's own recovery already labels a panicking validator with the
+// store's validation sentinel — the very value this package exports as
+// ErrValidation — so both call sites wrapping it again reported "validation
+// failed: validation failed: validator panicked" to the consumer. The label is
+// what errors.Is matches on; saying it twice is noise in every log line and
+// every API response built from the message.
+func TestValidationFailureIsLabelledOnce(t *testing.T) {
+	label := ErrValidation.Error()
+	explode := func(context.Context, any) error { panic("the validator blew up") }
+	refuse := errors.New("the validator refused")
+
+	assertOnce := func(t *testing.T, err error) {
+		t.Helper()
+
+		if err == nil {
+			t.Fatal("want a validation error, got nil")
+		}
+
+		if !errors.Is(err, ErrValidation) {
+			t.Errorf("got %v, want it to match ErrValidation", err)
+		}
+
+		if n := strings.Count(err.Error(), label); n != 1 {
+			t.Errorf("got %q — %d occurrences of %q, want exactly 1", err, n, label)
+		}
+	}
+
+	t.Run("register with a panicking validator", func(t *testing.T) {
+		c := newSingleTenantClient(t, newMemStore(false))
+
+		assertOnce(t, c.Register("ns", "k", "default", WithContextValidator(explode)))
+	})
+
+	t.Run("set with a panicking validator", func(t *testing.T) {
+		c := newSingleTenantClient(t, newMemStore(false))
+
+		if err := c.Register("ns", "k", "default", WithContextValidator(func(_ context.Context, v any) error {
+			if v == "boom" {
+				panic("the validator blew up")
+			}
+
+			return nil
+		})); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+
+		startForValidator(t, c)
+
+		assertOnce(t, c.Set(context.Background(), "ns", "k", "boom", "tester"))
+	})
+
+	// A validator that returns its own error carries no label of its own, so
+	// this branch must still add one — and keep the validator's error reachable.
+	t.Run("set with a refusing validator", func(t *testing.T) {
+		c := newSingleTenantClient(t, newMemStore(false))
+
+		if err := c.Register("ns", "k", "default", WithContextValidator(func(_ context.Context, v any) error {
+			if v == "no" {
+				return refuse
+			}
+
+			return nil
+		})); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+
+		startForValidator(t, c)
+
+		err := c.Set(context.Background(), "ns", "k", "no", "tester")
+		assertOnce(t, err)
+
+		if !errors.Is(err, refuse) {
+			t.Errorf("got %v, want the validator's own error preserved", err)
 		}
 	})
 }

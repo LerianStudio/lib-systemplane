@@ -62,16 +62,7 @@ func NewPostgres(db *sql.DB, listenDSN string, opts ...Option) (*Client, error) 
 		return nil, store.ErrNilBackend
 	}
 
-	pgStore, err := postgres.New(postgres.Config{
-		DB:                 db,
-		ListenDSN:          listenDSN,
-		Channel:            cfg.listenChannel,
-		Table:              cfg.table,
-		Logger:             cfg.logger,
-		Telemetry:          cfg.telemetry,
-		MultiTenantEnabled: cfg.multiTenantEnabled,
-		Module:             cfg.module,
-	})
+	pgStore, err := postgres.New(postgresConfig(db, listenDSN, cfg))
 	if err != nil {
 		return nil, err
 	}
@@ -91,7 +82,41 @@ func NewMongoDB(client *mongo.Client, database string, opts ...Option) (*Client,
 		return nil, store.ErrNilBackend
 	}
 
-	mStore, err := mongoDB.New(mongoDB.Config{
+	mStore, err := mongoDB.New(mongoConfig(client, database, cfg))
+	if err != nil {
+		return nil, err
+	}
+
+	return newClient(mStore, cfg), nil
+}
+
+// postgresConfig builds the Postgres backend's configuration from the
+// Client's own. It and mongoConfig below exist for one field.
+//
+// cfg.logger is the GUARDED logger — the backends log from their changefeed
+// goroutines, where a consumer logger that panics takes the process down — and
+// cfg.consumerLogger, the raw one Logger() hands back, sits beside it in the
+// same struct. Inline in the constructors the choice between them was a
+// literal nobody could hold: swapping it compiled and left the suite green,
+// because no unit test runs a live changefeed. Named, it is one value a test
+// can assert is already guarded.
+func postgresConfig(db *sql.DB, listenDSN string, cfg clientConfig) postgres.Config {
+	return postgres.Config{
+		DB:                 db,
+		ListenDSN:          listenDSN,
+		Channel:            cfg.listenChannel,
+		Table:              cfg.table,
+		Logger:             cfg.logger,
+		Telemetry:          cfg.telemetry,
+		MultiTenantEnabled: cfg.multiTenantEnabled,
+		Module:             cfg.module,
+	}
+}
+
+// mongoConfig is postgresConfig's twin for the MongoDB backend, and carries
+// the same guarded logger for the same reason.
+func mongoConfig(client *mongo.Client, database string, cfg clientConfig) mongoDB.Config {
+	return mongoDB.Config{
 		Client:             client,
 		Database:           database,
 		Collection:         cfg.collection,
@@ -100,12 +125,7 @@ func NewMongoDB(client *mongo.Client, database string, opts ...Option) (*Client,
 		Telemetry:          cfg.telemetry,
 		MultiTenantEnabled: cfg.multiTenantEnabled,
 		Module:             cfg.module,
-	})
-	if err != nil {
-		return nil, err
 	}
-
-	return newClient(mStore, cfg), nil
 }
 
 func newClient(s store.Store, cfg clientConfig) *Client {

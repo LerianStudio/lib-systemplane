@@ -43,7 +43,24 @@ func (c *Client) logError(ctx context.Context, msg string, fields ...log.Field) 
 // carrying only those two sends a caller looking for a broken row it has no
 // way to find. Only the read-through paths use it: the single-tenant ingress
 // decodes rows the engine already holds by scope.
-func decodeErr(ctx context.Context, namespace, key string, err error) error {
+//
+// redacted makes the same trade [engine.ErrorDetail] makes on the log line
+// beside this: encoding/json reports what it choked on by quoting the byte —
+// `invalid character 's' looking for beginning of value` — and carries the
+// offset on the *json.SyntaxError for anyone who unwraps, so for a key whose
+// registration says its value must never be printed the cause is named by its
+// dynamic type instead and left out of the chain. An error travels further
+// than a log line, into response bodies and error trackers, so withholding it
+// there matters at least as much. An ordinary key keeps the json error
+// wrapped, which is what a caller debugging the row reaches for.
+func decodeErr(ctx context.Context, namespace, key string, redacted bool, err error) error {
+	tenant := tmcore.GetTenantIDContext(ctx)
+
+	if redacted {
+		return fmt.Errorf("systemplane: decode value for %s/%s in tenant %q failed (%T, cause withheld: key registered redacted)",
+			namespace, key, tenant, err)
+	}
+
 	return fmt.Errorf("systemplane: decode value for %s/%s in tenant %q: %w",
-		namespace, key, tmcore.GetTenantIDContext(ctx), err)
+		namespace, key, tenant, err)
 }

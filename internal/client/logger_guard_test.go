@@ -100,3 +100,34 @@ func TestAPanickingConsumerLoggerDoesNotUnwindOutOfARead(t *testing.T) {
 		t.Error("List: want a decode error, got nil")
 	}
 }
+
+// TestBackendConfigsAreBuiltWithTheGuardedLogger pins the hand-off neither
+// test above can see.
+//
+// The value in the config is guarded, but each constructor copies it field by
+// field into a backend Config, and swapping that one field for the consumer's
+// raw logger compiles and leaves the whole suite green — the backends only log
+// from a live changefeed, which no unit test runs. Building both Configs
+// through one named function each puts the hand-off somewhere a test can hold.
+func TestBackendConfigsAreBuiltWithTheGuardedLogger(t *testing.T) {
+	cfg := defaultClientConfig()
+	applyClientOptions(&cfg, []Option{WithLogger(explodingLogger{})})
+
+	cases := []struct {
+		name string
+		got  log.Logger
+	}{
+		{"postgres", postgresConfig(nil, "", cfg).Logger},
+		{"mongodb", mongoConfig(nil, "", cfg).Logger},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// safelog.Guard is idempotent, so a logger it hands back unchanged
+			// is one it already wrapped.
+			if safelog.Guard(tc.got) != tc.got {
+				t.Error("the backend is handed the consumer's raw logger, not the guarded one")
+			}
+		})
+	}
+}
