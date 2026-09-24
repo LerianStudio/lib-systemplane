@@ -43,8 +43,10 @@ func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOp
 // itself guarantees is that every read taken after it already serves the value
 // that announcement carries.
 //
-// A Start that fails is retryable: the Client stays usable, subscriptions
-// registered before it survive, and the next Start reconciles from nothing.
+// A Start that fails is retryable: the Client stays usable and subscriptions
+// registered before it survive. After a failed reconcile the next Start
+// reconciles from nothing; after a ctx expiry it waits for the reconcile
+// already pending, and [Client.Register] stays refused.
 //
 // The Client counts as started from the moment that reconcile begins, so a
 // [Client.Set] racing Start writes its row and then reports [ErrNotStarted]

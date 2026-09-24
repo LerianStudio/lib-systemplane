@@ -43,10 +43,14 @@ type Client struct {
 	registryMu sync.RWMutex
 	registry   map[nskey]keyDef
 
-	startMu   sync.Mutex
-	started   atomic.Bool
-	closeOnce sync.Once
-	closed    atomic.Bool
+	startMu sync.Mutex
+	started atomic.Bool
+	// registryFrozen keeps Register refused after a Start that timed out with
+	// its first reconcile pending: the next Start waits on that reconcile, which
+	// may already have read the registry. Guarded by startMu.
+	registryFrozen bool
+	closeOnce      sync.Once
+	closed         atomic.Bool
 	// closeErr is the first Close's outcome, replayed by every later Close
 	// the way the engine replays its own.
 	closeErr error
@@ -233,11 +237,12 @@ func (c *Client) Start(ctx context.Context) error {
 
 	// The engine subscribes before it reconciles and rolls a failed Subscribe
 	// back itself, so a write landing between the snapshot and the first feed
-	// event is still observed. A failed Start leaves the Client usable: the
-	// engine retries the scope from nothing on the next Start.
+	// event is still observed. A failed Start leaves the Client usable: a
+	// failed reconcile is retried from nothing, a ctx expiry is waited on again.
 	if !c.multiTenant {
 		if err := c.engine.Start(ctx); err != nil {
 			c.started.Store(false)
+			c.registryFrozen = ctx.Err() != nil
 
 			return err
 		}

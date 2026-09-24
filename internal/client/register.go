@@ -52,7 +52,7 @@ func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOp
 	c.startMu.Lock()
 	defer c.startMu.Unlock()
 
-	if c.started.Load() {
+	if c.started.Load() || c.registryFrozen {
 		return ErrRegisterAfterStart
 	}
 

@@ -1208,3 +1208,42 @@ func TestAPanickingValidatorOnARedactedKeyWithholdsTheValue(t *testing.T) {
 		assertWithheld(t, logger)
 	})
 }
+
+// TestRegisterStaysRefusedAfterStartTimesOutMidReconcile pins that a Start
+// whose deadline expires while its first reconcile is running keeps the
+// registry closed. The next Start waits on that same reconcile rather than
+// running a new one, so a key registered in between would never be read.
+func TestRegisterStaysRefusedAfterStartTimesOutMidReconcile(t *testing.T) {
+	s := newMemStore(false)
+	seedEntryAt(t, s, "ns", "late", "stored", 2)
+
+	release := make(chan struct{})
+	s.listHook = func() { <-release }
+
+	unblock := sync.OnceFunc(func() { close(release) })
+
+	c := newSingleTenantClient(t, s)
+	defer func() { _ = c.Close() }()
+	defer unblock()
+
+	if err := c.Register("ns", "key", "default"); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	if err := c.Start(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first Start: got %v, want the deadline", err)
+	}
+
+	if err := c.Register("ns", "late", "default"); !errors.Is(err, ErrRegisterAfterStart) {
+		t.Fatalf("Register after a timed-out Start: got %v, want ErrRegisterAfterStart", err)
+	}
+
+	unblock()
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("second Start: %v", err)
+	}
+}
