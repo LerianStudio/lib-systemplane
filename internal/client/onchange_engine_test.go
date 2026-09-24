@@ -6,8 +6,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -461,6 +463,13 @@ func TestSetValidatesTheCanonicalDecodedShape(t *testing.T) {
 		defer func() { _ = c.Close() }()
 
 		err := c.Register("ns", "key", 0, WithValidator(func(v any) error {
+			// The registered default is graded in canonical shape too, so it
+			// reaches this validator a float64 and has to be let through: what
+			// the validator is written to refuse is the caller's own write.
+			if v == float64(0) {
+				return nil
+			}
+
 			if _, ok := v.(int); !ok {
 				return errors.New("want an int")
 			}
@@ -485,6 +494,135 @@ func TestSetValidatesTheCanonicalDecodedShape(t *testing.T) {
 
 		if stored {
 			t.Error("a refused write reached the store")
+		}
+	})
+}
+
+// writerMarkKey marks a context as the one a caller handed to Set, so a
+// validator can tell a write it is grading from a value the engine read back.
+type writerMarkKey struct{}
+
+// TestSetGradesALocalWriteExactlyOnce pins where a local write is judged: at
+// Set, in canonical shape, under the caller's own context, once.
+//
+// The engine's ingress used to grade the same value a second time as the
+// Client published it. A validator that answered differently on that second
+// call — one consulting a system that had moved on, one counting calls — left
+// the row written, the publication dropped and Set reporting success, so the
+// caller was told its write landed while the next Get still served the
+// previous value.
+func TestSetGradesALocalWriteExactlyOnce(t *testing.T) {
+	s := newMemStore(false)
+	// A real quiet window, so the changefeed echo the fake fires inside
+	// store.Set cannot do the write path's job for it.
+	c := newSingleTenantClientWithDebounce(t, s, 50*time.Millisecond)
+
+	defer func() { _ = c.Close() }()
+
+	var writerGradings atomic.Int32
+
+	err := c.Register("ns", "key", "default", WithContextValidator(func(ctx context.Context, _ any) error {
+		if ctx.Value(writerMarkKey{}) == nil {
+			// A read-back grading (Register, the reconcile, a re-read): not
+			// what this test counts.
+			return nil
+		}
+
+		if writerGradings.Add(1) > 1 {
+			return errors.New("the same write was graded a second time")
+		}
+
+		return nil
+	}))
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	ctx := context.WithValue(context.Background(), writerMarkKey{}, true)
+
+	if err := c.Set(ctx, "ns", "key", "written", "actor"); err != nil {
+		t.Fatalf("Set: %v, want nil", err)
+	}
+
+	if got := writerGradings.Load(); got != 1 {
+		t.Errorf("the write path graded the value %d times, want 1", got)
+	}
+
+	got, ok, err := c.Get(ctx, "ns", "key")
+	if err != nil || !ok || got != "written" {
+		t.Fatalf("Get after Set: got (%v, %v, %v), want the value Set reported as written", got, ok, err)
+	}
+}
+
+// TestSetAfterCloseReportsItClosed pins that a write can never be reported as
+// landed once nothing is left to publish it.
+func TestSetAfterCloseReportsItClosed(t *testing.T) {
+	c := newSingleTenantClient(t, newMemStore(false))
+
+	if err := c.Register("ns", "key", "default"); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if err := c.Set(context.Background(), "ns", "key", "written", "actor"); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Set after Close: got %v, want ErrClosed", err)
+	}
+}
+
+// TestRegisterGradesTheDefaultInCanonicalShape pins the registered default to
+// the same shape every other ingress grades: what the store hands back.
+//
+// Register used to grade the caller's raw Go value, so a validator written for
+// the canonical shape — the only shape a stored row ever arrives in — refused
+// the very default it was registered with, and one written for the Go type
+// passed registration and then refused every read-back of its own key.
+func TestRegisterGradesTheDefaultInCanonicalShape(t *testing.T) {
+	t.Run("a validator written for the decoded shape accepts an int default", func(t *testing.T) {
+		c := newSingleTenantClient(t, newMemStore(false))
+
+		defer func() { _ = c.Close() }()
+
+		err := c.Register("ns", "key", 5, WithValidator(func(v any) error {
+			if _, ok := v.(float64); !ok {
+				return fmt.Errorf("want the decoded number, got %T", v)
+			}
+
+			return nil
+		}))
+		if err != nil {
+			t.Fatalf("Register: %v, want nil — an int default comes back from the store a float64", err)
+		}
+	})
+
+	t.Run("a validator written for the caller's Go type refuses the default", func(t *testing.T) {
+		c := newSingleTenantClient(t, newMemStore(false))
+
+		defer func() { _ = c.Close() }()
+
+		err := c.Register("ns", "key", 5, WithValidator(func(v any) error {
+			if _, ok := v.(int); !ok {
+				return fmt.Errorf("want an int, got %T", v)
+			}
+
+			return nil
+		}))
+		if !errors.Is(err, ErrValidation) {
+			t.Fatalf("Register: got %v, want ErrValidation", err)
+		}
+
+		if !strings.Contains(err.Error(), "default value") {
+			t.Errorf("Register error does not name the default: %v", err)
 		}
 	})
 }

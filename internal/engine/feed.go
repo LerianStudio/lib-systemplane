@@ -557,7 +557,9 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey, deleted bool) {
 	// publication. The store read above deliberately stays outside the lock —
 	// holding it across a network round trip would stall every reconcile of
 	// the scope, and so does the validator ingest runs before taking it.
-	e.ingest(ctx, sc, se, fence)
+	// A changefeed row is graded here and nowhere else, so the outcome is the
+	// ingress's own business: no caller is waiting to be told.
+	_ = e.ingest(ctx, sc, se, fence, false)
 }
 
 // publishAbsentDelete puts the registered default in force at revision 0 for a

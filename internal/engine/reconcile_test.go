@@ -1869,11 +1869,11 @@ func TestFailedReconcileLeavesTheNewerWindowArmed(t *testing.T) {
 //
 // The changefeed's re-read records BOTH outcomes: a value it published, and a
 // row it could not use. Set recorded only the first, so a write whose stored
-// value the registered validator rejects left both fences empty — and a
-// reconcile holding a photograph taken before that write then found the key
-// absent, concluded the row was gone, and published the registered default at
-// revision 0 over the value that was cached. One transient rejection, one
-// silent config reset, announced to every subscriber.
+// bytes the ingress cannot use left both fences empty — and a reconcile
+// holding a photograph taken before that write then found the key absent,
+// concluded the row was gone, and published the registered default at revision
+// 0 over the value that was cached. One transient rejection, one silent config
+// reset, announced to every subscriber.
 func TestPublishRecordsARejectedWriteAgainstAConcurrentReconcile(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 	scope := store.Scope{}
@@ -1908,11 +1908,16 @@ func TestPublishRecordsARejectedWriteAgainstAConcurrentReconcile(t *testing.T) {
 
 	waitFor(t, time.Second, "the reconcile to reach its List", func() bool { return fs.listCount() >= 2 })
 
-	// A Set whose persisted value the registered validator refuses: the row is
-	// in the store, and the engine learned nothing usable from it.
-	row := jsonRow(nk, 4, `42`, "ops")
+	// A Set whose persisted bytes the ingress cannot decode: the row is in the
+	// store, and the engine learned nothing usable from it. Decoding is the
+	// refusal the write path can still make — the registered validator graded
+	// this value at Client.Set and the engine does not run it again.
+	row := jsonRow(nk, 4, `{not json`, "ops")
 	fs.seed(scope, row)
-	e.Publish(context.Background(), scope, row)
+
+	if err := e.Publish(context.Background(), scope, row); err == nil {
+		t.Fatal("Publish reported success for bytes it could not decode")
+	}
 
 	release()
 

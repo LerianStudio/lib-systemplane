@@ -4,6 +4,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -20,6 +21,20 @@ import (
 // numbers, map[string]any, []any, string, bool, nil), so a validator that type-
 // asserts a Go type fails loudly here instead of passing Set and being refused
 // silently when the row is read back.
+//
+// It grades the write EXACTLY ONCE, here, before the store is written: a
+// refused value is never persisted, and the engine trusts the publication that
+// follows rather than running the same validator over the same value a second
+// time. A validator that answered differently on that second call used to
+// leave the row written, the publication dropped and Set returning nil, so the
+// caller was told its write landed while the next Get served the previous
+// value.
+//
+// A nil return therefore means the next read in this process serves this write
+// or something newer. Every refusal the publication can still make — a Client
+// closing under the write, a scope with no changefeed behind it, bytes that do
+// not survive the round trip — comes back as an error naming the key, with the
+// row already persisted.
 func (c *Client) Set(ctx context.Context, namespace, key string, value any, actor string) error {
 	if c == nil || c.closed.Load() {
 		return ErrClosed
@@ -82,7 +97,16 @@ func (c *Client) Set(ctx context.Context, namespace, key string, value any, acto
 		// the provenance without firing a callback.
 		entry.Revision = revision
 
-		c.engine.Publish(ctx, store.Scope{}, entry)
+		switch err := c.engine.Publish(ctx, store.Scope{}, entry); {
+		case err == nil:
+		case errors.Is(err, engine.ErrClosed):
+			// The Client closed under this write, between the guard above and
+			// the publication. The row is persisted; nothing in this process
+			// will ever serve it.
+			return ErrClosed
+		default:
+			return fmt.Errorf("systemplane: %s/%s was written but not published: %w", namespace, key, err)
+		}
 	}
 
 	// Multi-tenant holds no in-process cache: the row itself is the only copy,

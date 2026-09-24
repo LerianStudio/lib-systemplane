@@ -356,7 +356,8 @@ func (e *Engine) listSnapshot(ctx context.Context, scope store.Scope) ([]store.E
 func (e *Engine) applySnapshotRow(ctx context.Context, sc *scopeState, arm reconcileArming, se store.Entry) (superseded bool) {
 	nk := NSKey{Namespace: se.Namespace, Key: se.Key}
 
-	pub, usable := e.prepare(ctx, sc.scope, se)
+	pub, prepareErr := e.prepare(ctx, sc.scope, se, false)
+	usable := prepareErr == nil
 
 	sc.reconcileMu.Lock()
 	defer sc.reconcileMu.Unlock()

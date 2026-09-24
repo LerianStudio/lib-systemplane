@@ -52,7 +52,7 @@ func engineWithRegistry(reg Registry) *Engine {
 // it made of the row is asserted where it is visible: the cache it did or did
 // not change, and the line it logged.
 func ingestRow(e *Engine, se store.Entry) {
-	e.ingest(context.Background(), e.scopeFor(store.Scope{}), se, feedFence{})
+	_ = e.ingest(context.Background(), e.scopeFor(store.Scope{}), se, feedFence{}, false)
 }
 
 func TestIngestRejectsInvalidValueKeepingPrevious(t *testing.T) {
@@ -267,12 +267,17 @@ func (w *markerWatcher) observations() []bool {
 	return append([]bool(nil), w.sawn...)
 }
 
-// TestIngestValidatorSeesTheWriterContextOnPublish pins the write half of the
-// per-ingress context contract: a value that arrives through Publish is
-// validated with the WRITER's context, the one the consumer handed to Set. A
-// validator that resolves a tenant, a locale or a policy from the request
-// context can only do that on the path where a request exists, and this is it.
-func TestIngestValidatorSeesTheWriterContextOnPublish(t *testing.T) {
+// TestPublishDoesNotRegradeALocalWrite pins the write half of the per-ingress
+// grading contract: a local publication has already been graded by the Client,
+// against these same canonical bytes and under the caller's own context, so
+// the engine does not run the registered validator over it a second time.
+//
+// The watcher here refuses whatever it is handed on a context carrying no
+// request marker, which is what a second grading would be handed on this path.
+// It is never called, so the write reaches the cache — and a validator whose
+// answer moved between the two calls can no longer strand a write the Client
+// already reported as landed.
+func TestPublishDoesNotRegradeALocalWrite(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 
 	var watcher markerWatcher
@@ -282,15 +287,17 @@ func TestIngestValidatorSeesTheWriterContextOnPublish(t *testing.T) {
 		Validate: watcher.validate,
 	}}, newFakeStore())
 
-	e.Publish(markedContext(), store.Scope{}, jsonRow(nk, 1, `"accepted"`, "ops"))
+	if err := e.Publish(context.Background(), store.Scope{}, jsonRow(nk, 1, `"accepted"`, "ops")); err != nil {
+		t.Fatalf("Publish: %v, want nil", err)
+	}
 
-	if got := watcher.observations(); len(got) != 1 || !got[0] {
-		t.Fatalf("validator context on the write path: saw the caller's marker = %v, want [true]", got)
+	if got := watcher.observations(); len(got) != 0 {
+		t.Fatalf("the engine graded a local write the Client had already graded: %v", got)
 	}
 
 	entry, ok := e.Lookup(store.Scope{}, nk)
 	if !ok || entry.Value != "accepted" {
-		t.Errorf("the write the validator accepted did not reach the cache: %+v (ok=%v)", entry, ok)
+		t.Errorf("the write did not reach the cache: %+v (ok=%v)", entry, ok)
 	}
 }
 
@@ -308,9 +315,10 @@ func TestIngestValidatorGetsNoTenantOnFeedAndReconcile(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 	scope := store.Scope{}
 
-	// arrange seeds the cache through the one ingress that carries a request —
-	// the write path — so both subtests start from a value that passed, and
-	// the observation recorded by that write is the leading true below.
+	// arrange seeds the cache through the write path, which the Client has
+	// already graded and the engine therefore does not grade again — so both
+	// subtests start from a value in force with no observation recorded, and
+	// the only grading either of them sees is its own read-back's.
 	arrange := func(t *testing.T) (*Engine, *fakeStore, *recordingLogger, *markerWatcher) {
 		t.Helper()
 
@@ -322,7 +330,9 @@ func TestIngestValidatorGetsNoTenantOnFeedAndReconcile(t *testing.T) {
 			Validate: watcher.validate,
 		}}, fs)
 
-		e.Publish(markedContext(), scope, jsonRow(nk, 1, `"in-force"`, "ops"))
+		if err := e.Publish(context.Background(), scope, jsonRow(nk, 1, `"in-force"`, "ops")); err != nil {
+			t.Fatalf("seeding Publish: %v", err)
+		}
 
 		// The store moves on behind the engine's back, which is what both
 		// read-back paths exist to notice.
@@ -339,9 +349,9 @@ func TestIngestValidatorGetsNoTenantOnFeedAndReconcile(t *testing.T) {
 			t.Errorf("a row the validator refused replaced the value in force: %+v (ok=%v)", entry, ok)
 		}
 
-		if got := watcher.observations(); len(got) != 2 || !got[0] || got[1] {
-			t.Errorf("validator contexts: got %v, want [true false] — the write carries the "+
-				"caller's request, the read-back carries none", got)
+		if got := watcher.observations(); len(got) != 1 || got[0] {
+			t.Errorf("validator contexts: got %v, want [false] — the only grading on either "+
+				"path is the read-back's, and it carries no request", got)
 		}
 
 		requireOneRecord(t, rec, rejection)
@@ -374,5 +384,69 @@ func TestIngestValidatorGetsNoTenantOnFeedAndReconcile(t *testing.T) {
 		}
 
 		requireValueInForce(t, e, watcher, rec)
+	})
+}
+
+// TestPublishReportsEveryRefusalItCanStillMake pins the write path's return
+// value to what the next read will serve. A local write is graded by the
+// Client before the store sees it, so the engine grades it no second time —
+// but it can still refuse the publication, and a refusal it swallowed left the
+// Client returning nil for a write nobody could read back.
+func TestPublishReportsEveryRefusalItCanStillMake(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	defs := map[NSKey]KeyDef{nk: {Default: "fallback"}}
+
+	t.Run("an accepted write reports nothing", func(t *testing.T) {
+		e, _ := loggingEngine(t, defs, newFakeStore())
+
+		if err := e.Publish(context.Background(), store.Scope{}, jsonRow(nk, 1, `"written"`, "ops")); err != nil {
+			t.Fatalf("Publish: %v, want nil", err)
+		}
+	})
+
+	t.Run("a closed engine reports ErrClosed", func(t *testing.T) {
+		e, _ := loggingEngine(t, defs, newFakeStore())
+
+		if err := e.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+
+		if err := e.Publish(context.Background(), store.Scope{}, jsonRow(nk, 1, `"written"`, "ops")); !errors.Is(err, ErrClosed) {
+			t.Errorf("Publish on a closed engine: got %v, want ErrClosed", err)
+		}
+	})
+
+	t.Run("a nil engine reports ErrClosed", func(t *testing.T) {
+		var e *Engine
+
+		if err := e.Publish(context.Background(), store.Scope{}, jsonRow(nk, 1, `"written"`, "ops")); !errors.Is(err, ErrClosed) {
+			t.Errorf("Publish on a nil engine: got %v, want ErrClosed", err)
+		}
+	})
+
+	t.Run("an untracked scope reports the drop", func(t *testing.T) {
+		e, _ := loggingEngine(t, defs, newFakeStore())
+
+		if err := e.Publish(context.Background(), store.Scope{Tenant: "acme"}, jsonRow(nk, 1, `"written"`, "ops")); err == nil {
+			t.Error("Publish into an untracked scope reported success for a write nothing cached")
+		}
+	})
+
+	t.Run("an unregistered key reports the skip", func(t *testing.T) {
+		e, _ := loggingEngine(t, defs, newFakeStore())
+
+		foreign := NSKey{Namespace: "billing", Key: "unregistered"}
+
+		if err := e.Publish(context.Background(), store.Scope{}, jsonRow(foreign, 1, `"written"`, "ops")); err == nil {
+			t.Error("Publish of an unregistered key reported success")
+		}
+	})
+
+	t.Run("undecodable bytes report the decode failure", func(t *testing.T) {
+		e, _ := loggingEngine(t, defs, newFakeStore())
+
+		if err := e.Publish(context.Background(), store.Scope{}, jsonRow(nk, 1, `{not json`, "ops")); err == nil {
+			t.Error("Publish of an undecodable value reported success for a write nothing cached")
+		}
 	})
 }

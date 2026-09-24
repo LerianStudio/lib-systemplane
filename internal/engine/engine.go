@@ -466,6 +466,25 @@ func scopeLabel(scope store.Scope) string {
 // ingress, one canonical shape, and the echo of this write is then deduplicated
 // by revision.
 //
+// A local publication is TRUSTED and is not graded again here: Client.Set
+// marshals the value, decodes it back to the canonical shape these same bytes
+// produce, and runs the registered validator on it under the caller's own
+// context a moment before the store write — the same function, the same value,
+// the same shape, the same ctx. Grading it a second time bought nothing and
+// cost correctness: a validator that answered differently on the second call
+// dropped the publication while the row stayed written and Set still returned
+// nil, so a caller was told its write landed while the next read served the
+// previous value. Changefeed and reconcile ingress stays fully graded — those
+// rows were written by somebody else, and nothing in this process has ever
+// looked at them.
+//
+// What Publish can still refuse it REPORTS, and Client.Set passes that error
+// on: a closed or nil engine, a scope it does not track, a key nothing
+// registered, and bytes that do not decode. Every one of them means the row is
+// persisted and the next read will not serve it, which is exactly what a
+// caller of Set needs to be told. A nil error means the cache holds this write
+// or something newer.
+//
 // A write whose revision the store could not report (0) still takes effect,
 // because revision 0 always wins the fence — at the cost of the echo
 // publishing a second time. A value the caller just wrote must be readable.
@@ -474,8 +493,8 @@ func scopeLabel(scope store.Scope) string {
 // Start, or after the scope was dropped. Caching it would rebuild that scope
 // around one value with no changefeed behind it and no reconcile goroutine to
 // confirm it — readable forever as though it were current. A nil Engine
-// ignores the write instead of panicking, and a closed one drops it rather
-// than resurrecting a scope during shutdown.
+// reports the write refused instead of panicking, and a closed one drops it
+// rather than resurrecting a scope during shutdown.
 //
 // The write is fenced against a reconcile in flight exactly as a changefeed
 // publication is: the outcome is recorded, under the same lock, in the same
@@ -498,9 +517,9 @@ func scopeLabel(scope store.Scope) string {
 // engine's background context belongs to the goroutines the engine owns (the
 // workers, the reconcile, the debounced re-read), and using it here detached
 // every one of those records from the request that caused it.
-func (e *Engine) Publish(ctx context.Context, scope store.Scope, se store.Entry) {
+func (e *Engine) Publish(ctx context.Context, scope store.Scope, se store.Entry) error {
 	if e == nil || e.closed.Load() {
-		return
+		return ErrClosed
 	}
 
 	sc := e.trackedScope(scope)
@@ -511,10 +530,10 @@ func (e *Engine) Publish(ctx context.Context, scope store.Scope, se store.Entry)
 			log.String("keyname", se.Key),
 		)
 
-		return
+		return fmt.Errorf("systemplane: the engine does not track %s", scopeLabel(scope))
 	}
 
-	e.ingest(ctx, sc, se, feedFence{})
+	return e.ingest(ctx, sc, se, feedFence{}, true)
 }
 
 // Lookup returns the published state of nk in scope.

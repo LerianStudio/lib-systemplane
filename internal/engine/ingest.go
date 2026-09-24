@@ -13,18 +13,32 @@ import (
 
 // ingest is the engine's single ingress. Every value that reaches a scope's
 // cache — the first reconcile, a changefeed re-read, a reconcile snapshot row,
-// the echo of a Set — arrives here and is decoded once, validated once against
+// the echo of a Set — arrives here and is decoded once, graded once against
 // the registered validator, and published once under the revision fence. No
 // other code path in this package may json.Unmarshal into the cache: a value
 // that skipped this function is a value the registered validator never saw,
 // which is exactly the hole this closes.
 //
+// pregraded says the caller has ALREADY run the registered validator against
+// this exact value, in this exact shape, under this exact context: it is set
+// only by Publish, the local-write path, where Client.Set marshals the value,
+// decodes it back to the canonical shape and grades it under the caller's own
+// context BEFORE the store is written. Re-running the validator here graded
+// one write twice, and a validator that answered differently the second time —
+// one consulting a system that had moved on — left the row written, the
+// publication dropped and Set returning nil, so the caller was told its write
+// landed while the next read still served the previous value. Changefeed and
+// reconcile ingress is never pregraded: those rows were written by somebody
+// else and nothing in this process has graded them.
+//
 // Dispatch is not the caller's business: an accepted publication is handed to
-// the key's delivery worker inside publish, so ingest reports only usable —
-// the value decoded and passed the validator. That is what the changefeed
-// needs to tell a value it could not read from a value the fence merely found
-// no newer than the cached one: the first means the engine learned nothing
-// about the key, the second means the cache is already current.
+// the key's delivery worker inside publish, so ingest reports only whether the
+// value was usable — decoded, and graded unless the caller had graded it
+// already. That is what the changefeed needs to tell a value it could not read
+// from a value the fence merely found no newer than the cached one: the first
+// means the engine learned nothing about the key, the second means the cache
+// is already current. The error is the same fact spelled for the write path,
+// where a caller is waiting to be told whether its write is readable.
 //
 // Five rejections, each with its own outcome:
 //
@@ -83,31 +97,38 @@ import (
 // never consults the unusable set), and an ABSENT key with nothing usable from
 // the feed keeps its cached value instead of being reset to the default, which
 // is the protection this paragraph's guard was reaching for.
-func (e *Engine) ingest(ctx context.Context, sc *scopeState, se store.Entry, fence feedFence) {
+func (e *Engine) ingest(ctx context.Context, sc *scopeState, se store.Entry, fence feedFence, pregraded bool) error {
 	nk := NSKey{Namespace: se.Namespace, Key: se.Key}
 
 	sc.reconcileMu.Lock()
 	sc.record(nk, false)
 	sc.reconcileMu.Unlock()
 
-	pub, usable := e.prepare(ctx, sc.scope, se)
+	pub, err := e.prepare(ctx, sc.scope, se, pregraded)
 
 	sc.reconcileMu.Lock()
 	defer sc.reconcileMu.Unlock()
 
-	publishable := usable && !sc.supersededByDelete(nk, fence)
+	publishable := err == nil && !sc.supersededByDelete(nk, fence)
 	if publishable {
 		e.publish(sc, pub)
 	}
 
 	sc.record(nk, publishable)
+
+	return err
 }
 
-// prepare is the ingress's consumer-facing half: it decodes the row and runs
-// the registered validator against it, reporting the publication the second
-// half will apply. It touches no cache, no fence and no lock, so a validator
-// that takes a second costs that second to this goroutine alone.
-func (e *Engine) prepare(ctx context.Context, scope store.Scope, se store.Entry) (pub publication, usable bool) {
+// prepare is the ingress's consumer-facing half: it decodes the row and, when
+// the caller has not graded it already, runs the registered validator against
+// it, reporting the publication the second half will apply. It touches no
+// cache, no fence and no lock, so a validator that takes a second costs that
+// second to this goroutine alone.
+//
+// A nil error is the only thing that makes the publication usable; the error
+// itself is what the write path returns to the caller of Set, so every
+// rejection carries the key it refused.
+func (e *Engine) prepare(ctx context.Context, scope store.Scope, se store.Entry, pregraded bool) (pub publication, err error) {
 	def, registered := e.lookup(se.Namespace, se.Key)
 	if !registered {
 		// Guarded like the feed's own drop lines, and for the same reason:
@@ -123,7 +144,7 @@ func (e *Engine) prepare(ctx context.Context, scope store.Scope, se store.Entry)
 			)
 		}
 
-		return publication{}, false
+		return publication{}, fmt.Errorf("systemplane: %s/%s is not a registered key", se.Namespace, se.Key)
 	}
 
 	var decoded any
@@ -135,15 +156,17 @@ func (e *Engine) prepare(ctx context.Context, scope store.Scope, se store.Entry)
 			errorDetail(def.Redacted, "decode failed", err),
 		)
 
-		return publication{}, false
+		return publication{}, fmt.Errorf("systemplane: decode value for %s/%s: %w", se.Namespace, se.Key, err)
 	}
 
 	nk := NSKey{Namespace: se.Namespace, Key: se.Key}
 
-	if err := e.runValidator(ctx, def.Validate, decoded); err != nil {
-		e.logValidatorRejection(ctx, scope.Tenant, nk, def.Redacted, err)
+	if !pregraded {
+		if err := e.runValidator(ctx, def.Validate, decoded); err != nil {
+			e.logValidatorRejection(ctx, scope.Tenant, nk, def.Redacted, err)
 
-		return publication{}, false
+			return publication{}, err
+		}
 	}
 
 	return publication{
@@ -154,7 +177,7 @@ func (e *Engine) prepare(ctx context.Context, scope store.Scope, se store.Entry)
 		Raw:       se.Value,
 		UpdatedAt: se.UpdatedAt,
 		UpdatedBy: se.UpdatedBy,
-	}, true
+	}, nil
 }
 
 // logValidatorRejection reports a row the registered validator refused, with

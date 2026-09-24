@@ -186,6 +186,13 @@ func WithDescription(s string) KeyOption {
 // scope of the write — the tenant a caller carried into Set, say — takes
 // [WithContextValidator] instead.
 //
+// It always grades the CANONICAL shape — what the store hands back, so float64
+// for every number, map[string]any for an object, []any for an array — on
+// every ingress, the registered default at [Client.Register] included. A
+// validator that type-asserts the caller's own Go type therefore fails at
+// registration rather than passing Set and refusing the same key's row on the
+// next restart.
+//
 // A nil fn is ignored. WithValidator and [WithContextValidator] set the same
 // single validator, so when both are applied to one key the last NON-NIL one
 // applied wins, exactly as two WithValidator calls already do.
@@ -205,15 +212,19 @@ func WithValidator(fn func(any) error) KeyOption {
 // Four callers invoke it today: [Client.Set], with the context of that write;
 // [Client.Register], with context.Background(); and, in single-tenant mode,
 // the first reconcile at [Client.Start] and each changefeed refresh, with the
-// contexts described below. A context validator must therefore treat a context
+// contexts described below. A write is graded ONCE, at [Client.Set], before
+// the row is persisted: what [Client.Set] returns therefore says whether the
+// next read in this process serves that write. A context validator must therefore treat a context
 // that lacks the scope it expects as "cannot verify" and decide by its own policy —
 // accept it, or refuse it with its own error — rather than assume request scope
 // is there to read.
 //
 // The same function validates the registered default at [Client.Register]
-// time. Registering a default is not a write and carries no request scope, so
-// it is called there with a non-nil but empty context.Background(), while the
-// client holds its start lock. For the registered default the function MUST
+// time, in the CANONICAL shape every other ingress grades — the default is
+// marshaled and decoded first, so a default of 5 arrives as float64(5), the
+// way the stored row would. Registering a default is not a write and carries
+// no request scope, so it is called there with a non-nil but empty
+// context.Background(), while the client holds its start lock. For the registered default the function MUST
 // NOT perform I/O or block: a validator that blocks there blocks registration,
 // [Client.Start] and [Client.Close] with it. Recognise the default (or empty)
 // value and return before any external call. Whether an empty context is

@@ -27,3 +27,14 @@ var ErrCloseTimeout = errors.New("systemplane: close timed out waiting for in-fl
 // nothing and can fail in no useful way — and refusing loudly beats a silent
 // cache that never fills.
 var ErrNilRegistry = errors.New("systemplane: engine built without a registry")
+
+// ErrClosed is returned by Publish for a write that arrived once the engine
+// had been closed, or for one addressed to a nil engine.
+//
+// Publish is the one entry point a consumer's own goroutine reaches — it runs
+// inside Client.Set — so a write that lands as the Client is closing under it
+// has already been persisted and can no longer be published to anybody. Saying
+// so is what keeps Set's return value honest about what the next read serves;
+// returning nil there reported a write as landed that no reader would ever
+// see.
+var ErrClosed = errors.New("systemplane: engine is closed")

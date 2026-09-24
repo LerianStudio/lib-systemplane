@@ -501,20 +501,24 @@ func requireOneRecord(t *testing.T, r *recordingLogger, msg string) logRecord {
 // own span; logging its ingress under the engine's background context detaches
 // every rejection an operator would use to explain why a write did not take
 // effect from the request that caused it.
+//
+// The rejection driven here is the decode failure, because it is the one the
+// write path can still make: the registered validator has already graded this
+// value at Client.Set, under this same context, and the engine does not run it
+// again.
 func TestPublishLogsUnderTheCallerContext(t *testing.T) {
 	type ctxKey struct{}
 
 	nk := NSKey{Namespace: "billing", Key: "limits"}
-	e, rec := loggingEngine(t, map[NSKey]KeyDef{nk: {
-		Default:  "fallback",
-		Validate: func(context.Context, any) error { return errors.New("want a string") },
-	}}, newFakeStore())
+	e, rec := loggingEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, newFakeStore())
 
 	ctx := context.WithValue(context.Background(), ctxKey{}, "caller-span")
 
-	e.Publish(ctx, store.Scope{}, jsonRow(nk, 1, `42`, "ops"))
+	if err := e.Publish(ctx, store.Scope{}, jsonRow(nk, 1, `{not json`, "ops")); err == nil {
+		t.Fatal("Publish reported success for bytes it could not decode")
+	}
 
-	got := requireOneRecord(t, rec, "stored value rejected by validator, keeping cached value")
+	got := requireOneRecord(t, rec, "failed to unmarshal stored value, keeping cached value")
 	if got.Ctx == nil || got.Ctx.Value(ctxKey{}) != "caller-span" {
 		t.Errorf("the write path logged under a context that is not the caller's: %s", got)
 	}
@@ -535,7 +539,7 @@ func TestTenantIsLoggedUnderTheCanonicalKey(t *testing.T) {
 
 	// loggingEngine tracks only the zero scope, so a write addressed to a
 	// tenant is dropped — and the drop names the tenant it was addressed to.
-	e.Publish(context.Background(), store.Scope{Tenant: tenant}, jsonRow(nk, 1, `"5"`, "ops"))
+	_ = e.Publish(context.Background(), store.Scope{Tenant: tenant}, jsonRow(nk, 1, `"5"`, "ops"))
 
 	got := requireOneRecord(t, rec, "write for an untracked scope, dropping")
 
@@ -804,7 +808,7 @@ func TestScopeDropDiagnosticsAreDebug(t *testing.T) {
 			name: "a write addressed to a scope the engine never tracked",
 			msg:  "write for an untracked scope, dropping",
 			drive: func(t *testing.T, e *Engine) {
-				e.Publish(context.Background(), store.Scope{Tenant: "acme"}, jsonRow(nk, 1, `"5"`, "ops"))
+				_ = e.Publish(context.Background(), store.Scope{Tenant: "acme"}, jsonRow(nk, 1, `"5"`, "ops"))
 			},
 		},
 		{

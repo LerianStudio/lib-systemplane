@@ -3,6 +3,7 @@ package client
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -64,9 +65,20 @@ func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOp
 	}
 
 	if def.validator != nil {
+		// The CANONICAL shape, the one every other ingress grades: a default
+		// is a value in force whenever no row exists, and a validator written
+		// for what the store hands back (float64 for numbers, map[string]any,
+		// []any) used to refuse the very default it was registered with, while
+		// one written for the caller's Go type passed here and then refused
+		// every read-back of its own key.
+		canonical, err := canonicalValue(def.defaultValue)
+		if err != nil {
+			return fmt.Errorf("%w: default value is not JSON-serializable: %w", ErrValidation, err)
+		}
+
 		// Background context, under startMu: see the register-time contract
 		// stated on WithContextValidator (no request scope, no I/O, no blocking).
-		if err := def.validator(context.Background(), def.defaultValue); err != nil {
+		if err := def.validator(context.Background(), canonical); err != nil {
 			return fmt.Errorf("%w: default value rejected: %w", ErrValidation, err)
 		}
 	}
@@ -110,4 +122,22 @@ func applyKeyOptions(def *keyDef, opts []KeyOption) {
 
 		opt(def)
 	}
+}
+
+// canonicalValue renders v the way the store hands it back: JSON-marshaled and
+// decoded again, so numbers are float64, objects map[string]any and arrays
+// []any. It is the one shape a registered validator ever grades, whatever
+// ingress the value arrived through.
+func canonicalValue(v any) (any, error) {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+
+	var canonical any
+	if err := json.Unmarshal(raw, &canonical); err != nil {
+		return nil, err
+	}
+
+	return canonical, nil
 }
