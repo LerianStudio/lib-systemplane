@@ -474,7 +474,7 @@ func TestTypedGetterRedactionSurvivesACloseMidRead(t *testing.T) {
 			},
 		},
 	} {
-		for _, policy := range []RedactPolicy{RedactFull, RedactNone} {
+		for _, policy := range []RedactPolicy{RedactFull, RedactMask, RedactNone} {
 			t.Run(tt.name+"/"+policy.String(), func(t *testing.T) {
 				m := newMemStore(true)
 				c := newMultiTenantClient(t, m)
