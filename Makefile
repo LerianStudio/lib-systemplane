@@ -651,22 +651,30 @@ sec:
 	fi
 	@if find . -name "*.go" -type f -not -path './vendor/*' | grep -q .; then \
 		echo "Running security checks on all packages..."; \
+		format_flags=""; \
 		if [ "$(SARIF)" = "1" ]; then \
 			echo "Generating SARIF output: gosec-report.sarif"; \
-			if gosec -fmt sarif -out gosec-report.sarif ./...; then \
+			format_flags="-fmt sarif -out gosec-report.sarif -stdout -verbose text"; \
+		fi; \
+		log=$$(mktemp); \
+		trap 'rm -f "$$log"' EXIT; \
+		rc=0; \
+		gosec -exclude-dir=testdata $$format_flags ./... > "$$log" 2>&1 || rc=$$?; \
+		cat "$$log"; \
+		issues=$$(awk '/^ *Issues :/ { gsub(/\033\[[0-9;]*m/, ""); print $$NF }' "$$log"); \
+		if [ "$$rc" -eq 0 ]; then \
+			if [ "$(SARIF)" = "1" ]; then \
 				echo "$(GREEN)$(BOLD)[ok]$(NC) SARIF report generated: gosec-report.sarif$(GREEN) ✔️$(NC)"; \
 			else \
-				printf "\n%s%sSecurity issues found by gosec. Please address them before proceeding.%s\n\n" "$(BOLD)" "$(RED)" "$(NC)"; \
-				echo "SARIF report with details: gosec-report.sarif"; \
-				exit 1; \
-			fi; \
-		else \
-			if gosec ./...; then \
 				echo "$(GREEN)$(BOLD)[ok]$(NC) Security checks completed$(GREEN) ✔️$(NC)"; \
-			else \
-				printf "\n%s%sSecurity issues found by gosec. Please address them before proceeding.%s\n\n" "$(BOLD)" "$(RED)" "$(NC)"; \
-				exit 1; \
 			fi; \
+		elif [ -n "$$issues" ] && [ "$$issues" -gt 0 ]; then \
+			printf "\n%s%sSecurity issues found by gosec ($$issues). Please address them before proceeding.%s\n\n" "$(BOLD)" "$(RED)" "$(NC)"; \
+			if [ "$(SARIF)" = "1" ]; then echo "SARIF report with details: gosec-report.sarif"; fi; \
+			exit 1; \
+		else \
+			printf "\n%s%sgosec failed (exit $$rc) without reporting issues: a tool or build error, see its output above.%s\n\n" "$(BOLD)" "$(RED)" "$(NC)"; \
+			exit 1; \
 		fi; \
 	else \
 		echo "No Go files found, skipping security checks"; \
