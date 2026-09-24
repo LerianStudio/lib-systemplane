@@ -8,6 +8,7 @@ import (
 	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
 	"github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
 // logError reports a read-through failure, stamped with the tenant it happened
@@ -34,6 +35,22 @@ func (c *Client) logError(ctx context.Context, msg string, fields ...log.Field) 
 	}
 
 	c.guarded.Log(ctx, log.LevelError, msg, fields)
+}
+
+// scopeFor names the tenant a report about this call belongs to, and is the
+// same rule logError applies above: the tenant travels on the caller's own
+// context, and a single-tenant Client has none, so it reports the zero scope
+// rather than an empty tenant.id that reads like a missing value.
+//
+// It exists because the engine reports a recovered panic with the identity of
+// what the panic was about, and the write path grades a value through the
+// engine before any scope has been resolved for it.
+func (c *Client) scopeFor(ctx context.Context) store.Scope {
+	if c == nil || !c.multiTenant {
+		return store.Scope{}
+	}
+
+	return store.Scope{Tenant: tmcore.GetTenantIDContext(ctx)}
 }
 
 // decodeErr names the row a multi-tenant read-through could not decode, tenant

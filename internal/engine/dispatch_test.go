@@ -137,6 +137,8 @@ func (r *deadRegistry) Lookup(string, string) (KeyDef, bool) {
 
 func (r *deadRegistry) Keys() []NSKey { return nil }
 
+func (r *deadRegistry) AnyRedacted() bool { return false }
+
 // currentWorker reads the worker a scope would hand the next publication of
 // nk, under the lock that starts and sweeps one.
 func currentWorker(e *Engine, sc *scopeState, nk NSKey) *dispatchWorker {
@@ -159,11 +161,16 @@ func currentWorker(e *Engine, sc *scopeState, nk NSKey) *dispatchWorker {
 // Neither sweep covers it: a scope drop and a Close both end workers they can
 // see, and this one ended itself.
 //
-// The panic comes from the registry lookup deliver runs before its first
-// callback, because that is what can still escape: a subscriber's own panic is
-// recovered per callback, and reporting that recovery cannot unwind either —
-// reportRecovered swallows a broken logger and a broken metrics recorder
-// alike. What this test pins is the net under everything that is left.
+// The panic comes from the registry lookup deliver runs to decide whether the
+// key is redacted, because that is what can still escape: a subscriber's own
+// panic is recovered per callback, and reporting that recovery cannot unwind
+// either — reportRecovered swallows a broken logger and a broken metrics
+// recorder alike. What this test pins is the net under everything that is
+// left.
+//
+// That lookup is made lazily, in the recover branch, so the first subscriber
+// has to panic for the registry to be asked at all: the panicking callback is
+// the fuse, the exploding registry is the charge.
 func TestDispatchReplacesAWorkerWhosePanicEndedIt(t *testing.T) {
 	e := dispatchEngine(t)
 
@@ -176,7 +183,13 @@ func TestDispatchReplacesAWorkerWhosePanicEndedIt(t *testing.T) {
 
 	var delivered recorder
 
-	unsub := e.OnChange(nk, delivered.record)
+	unsub := e.OnChange(nk, func(ctx context.Context, ch Change) {
+		if ch.Revision == 1 {
+			panic("the subscriber blew up")
+		}
+
+		delivered.record(ctx, ch)
+	})
 	defer unsub()
 
 	e.dispatch(sc, pub(nk, 1, "one"))
@@ -1124,4 +1137,63 @@ func TestOnChangePanicOnARedactedKeyWithholdsTheValue(t *testing.T) {
 	})
 
 	requirePanicWithheld(t, logger, "onchange", "string", secret)
+}
+
+// countingRegistry counts every Lookup so a test can assert what an ordinary
+// delivery costs. It answers from a fakeRegistry, so the key still resolves.
+type countingRegistry struct {
+	fakeRegistry
+
+	lookups atomic.Int64
+}
+
+func (r *countingRegistry) Lookup(namespace, key string) (KeyDef, bool) {
+	r.lookups.Add(1)
+
+	return r.fakeRegistry.Lookup(namespace, key)
+}
+
+// TestDeliveryReadsTheRegistryOnlyWhenACallbackPanics pins the cost of the
+// redaction gate on the hot path.
+//
+// deliver needs one bit — is this key registered redacted — and only when a
+// subscriber panics, which is rare. Reading it before the fan-out took the
+// registry's lock on EVERY delivery of EVERY subscribed key, contending with
+// Register and with every other ingress, to answer a question almost no
+// delivery asks.
+func TestDeliveryReadsTheRegistryOnlyWhenACallbackPanics(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	reg := &countingRegistry{fakeRegistry: fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: "fallback"}}}}
+
+	e := dispatchEngine(t)
+	e.registry = reg
+
+	sc := e.scopeFor(store.Scope{})
+
+	var calm recorder
+
+	unsub := e.OnChange(nk, calm.record)
+
+	e.dispatch(sc, pub(nk, 1, "one"))
+
+	waitFor(t, hangGuard, "the calm delivery", func() bool { return calm.len() == 1 })
+
+	if got := reg.lookups.Load(); got != 0 {
+		t.Errorf("a delivery nobody panicked on took %d registry lookup(s), want 0", got)
+	}
+
+	unsub()
+
+	unsubPanicking := e.OnChange(nk, func(context.Context, Change) { panic("the callback blew up") })
+	defer unsubPanicking()
+
+	e.dispatch(sc, pub(nk, 2, "two"))
+
+	waitFor(t, hangGuard, "the panicking callback to be reported", func() bool {
+		return reg.lookups.Load() > 0
+	})
+
+	if got := reg.lookups.Load(); got != 1 {
+		t.Errorf("reporting one panicking callback took %d registry lookup(s), want 1", got)
+	}
 }

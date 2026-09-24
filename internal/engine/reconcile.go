@@ -172,12 +172,21 @@ func (e *Engine) runOneReconcile(ctx context.Context, sc *scopeState, arm reconc
 	}()
 
 	// Recovered here rather than by RecoverAndLogWithContext, which reports
-	// what it recovered on the way out: reportRecovered is what keeps a
+	// what it recovered on the way out: reportConsumerPanic is what keeps a
 	// consumer's broken metrics recorder from turning that report into an
 	// unrecovered panic on this worker.
+	//
+	// The redaction gate is the registry as a WHOLE, not one key: a snapshot
+	// carries every registered key at once, so a store or driver panic under
+	// it may be holding any of them and the engine cannot tell which. The
+	// swallow is there because AnyRedacted is the consumer's code too, and a
+	// panic inside it would otherwise escape the recovery that was reporting
+	// and end this scope's only reconcile goroutine.
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			e.reportRecovered(ctx, recovered, "reconcile")
+			defer swallowPanic()
+
+			e.reportConsumerPanic(ctx, sc.scope, NSKey{}, recovered, e.anyRedacted(), "reconcile panicked", "reconcile")
 		}
 	}()
 

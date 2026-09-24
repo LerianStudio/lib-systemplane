@@ -11,6 +11,16 @@ type Registry interface {
 	// Keys returns every registered key. Reconcile uses it to decide which
 	// keys are absent from a List snapshot and must fall back to default.
 	Keys() []NSKey
+	// AnyRedacted reports whether ANY registered key carries a redaction
+	// policy.
+	//
+	// It gates the one panic report that is not about a single key: a
+	// reconcile panics under a List that returned the whole scope at once, so
+	// the value the panicking code was holding may belong to any registered
+	// key and the engine cannot tell which. One redacted key anywhere in the
+	// registry therefore withholds it. That never under-redacts, and a
+	// registry with no redacted key at all keeps the verbatim report.
+	AnyRedacted() bool
 }
 
 // KeyDef is the subset of a registered key the engine needs.
@@ -78,4 +88,15 @@ func (e *Engine) registeredKeys() []NSKey {
 	}
 
 	return e.registry.Keys()
+}
+
+// anyRedacted is the scope-wide redaction gate, nil-safe for the same reason
+// lookup is: a registry that is not there has no keys, so it holds nothing
+// sensitive.
+func (e *Engine) anyRedacted() bool {
+	if e.registry == nil {
+		return false
+	}
+
+	return e.registry.AnyRedacted()
 }

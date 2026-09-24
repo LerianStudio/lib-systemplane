@@ -422,9 +422,11 @@ func (e *Engine) trackedRefresh(scope store.Scope, nk NSKey, deleted bool) {
 //
 // HandlePanicValue rather than a re-panic into that net because only it
 // records panic_recovered_total and the span event: RecoverAndLog takes no
-// context and records neither. The recovered value stays out of the identity
-// line — it is whatever the panicking code was holding, and redacting it
-// belongs with the handler.
+// context and records neither. It is reached through reportConsumerPanic,
+// which emits the identity line and, for a key registered redacted, withholds
+// the recovered value: a driver that panics naming the row it was decoding is
+// holding that key's value, and the handler prints it unless production mode
+// is on.
 func (e *Engine) recoverRefresh(scope store.Scope, nk NSKey, deleted, retried bool, state **scopeState, origin *feedFence) {
 	// The two lines at the bottom are the CONSUMER's observability: its
 	// logger, and whatever lib-observability's handler reaches through
@@ -467,13 +469,13 @@ func (e *Engine) recoverRefresh(scope store.Scope, nk NSKey, deleted, retried bo
 
 	defer e.retryRefresh(sc, nk, fence, deleted, retried)
 
-	e.logError(ctx, "systemplane.engine: changefeed re-read panicked",
-		log.String(constants.AttrKeyTenantID, scope.Tenant),
-		log.String("namespace", nk.Namespace),
-		log.String("keyname", nk.Key),
-	)
+	// After the repair is deferred, because this reads the registry and the
+	// registry is the consumer's: a Lookup that panics unwinds through the
+	// deferred retry above and dies in swallowPanic, rather than costing the
+	// key its re-read.
+	def, _ := e.lookup(nk.Namespace, nk.Key)
 
-	e.reportRecovered(ctx, recovered, "refresh")
+	e.reportConsumerPanic(ctx, scope, nk, recovered, def.Redacted, "changefeed re-read panicked", "refresh")
 }
 
 // scopeForEvent resolves the scope a changefeed event, a reconcile or a
@@ -953,8 +955,14 @@ func (e *Engine) logDebug(ctx context.Context, msg string, fields ...log.Field) 
 
 // logError reports something an operator has to act on — a panic raised under
 // engine work. A nil logger is a no-op, like logWarn.
+//
+// A nil ENGINE is a no-op too, which logWarn and logDebug do not need to be:
+// this one is reached from reportConsumerPanic, and the Client grades a value
+// through RunValidator before anything has confirmed an engine exists, so a
+// validator that panics there would otherwise take the caller's goroutine down
+// on the line meant to report it.
 func (e *Engine) logError(ctx context.Context, msg string, fields ...log.Field) {
-	if e.logger == nil {
+	if e == nil || e.logger == nil {
 		return
 	}
 

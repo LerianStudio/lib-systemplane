@@ -1493,3 +1493,136 @@ func TestPublishDeleteLogsUnderTheCallerContext(t *testing.T) {
 		t.Errorf("field %q: got (%v, %t), want %q", constants.AttrKeyTenantID, f.Value, ok, tenant)
 	}
 }
+
+// reconcilePanicMsg is the identity line a panic under a scope snapshot
+// produces. It names no key, because a reconcile is not about one: the
+// snapshot covers every registered key of the scope, and which one the store
+// was holding when it exploded is exactly what the engine does not know.
+const reconcilePanicMsg = "systemplane.engine: reconcile panicked"
+
+// TestReReadPanicOnARedactedKeyWithholdsTheValue closes the second half of the
+// hole the validator report already closed.
+//
+// A changefeed re-read hands the store a key and gets back its row. A driver
+// that panics naming what it was decoding — pgx and the mongo driver both
+// interpolate the document into their panics — is therefore holding the value
+// of a key whose entire registration says it must never reach a log line, and
+// the report went to lib-observability's handler verbatim: log.Any("value",
+// recovered) at ERROR, and the same rendering stamped on the span event,
+// whenever production mode is off, which is its shipped default.
+//
+// The identity is asserted in the same test on purpose: withholding the value
+// must not cost the operator the tenant, namespace and key, which are the only
+// thing left to act on.
+func TestReReadPanicOnARedactedKeyWithholdsTheValue(t *testing.T) {
+	const secret = "reread-panic-sentinel-Qv3Ly"
+
+	nk := NSKey{Namespace: "billing", Key: "token"}
+	scope := store.Scope{Tenant: "acme"}
+
+	fs := newFakeStore()
+	rec := &recordingLogger{Logger: log.NewNop()}
+
+	e := New(Config{
+		Store:    fs,
+		Registry: fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: "fallback", Redacted: true}}},
+		Logger:   rec,
+	})
+	track(t, e, scope)
+
+	t.Cleanup(func() {
+		if err := e.Close(); err != nil {
+			t.Errorf("Close after a panicking re-read: %v, want nil", err)
+		}
+	})
+
+	// One-shot, so the retry the panic schedules converges instead of
+	// reporting the same panic a second time.
+	fs.onGet(func(_ store.Scope, k NSKey) error {
+		fs.onGet(nil)
+
+		panic(fmt.Sprintf("driver exploded decoding %s/%s = %q", k.Namespace, k.Key, secret))
+	})
+
+	e.onEvent(upsertEvent(scope, nk, 1))
+
+	waitFor(t, hangGuard, "the panicking re-read to be reported and accounted", func() bool {
+		var reported, accounted bool
+
+		for _, r := range rec.snapshot() {
+			switch r.Msg {
+			case rereadPanicMsg:
+				reported = true
+			case panicRecoveredMsg:
+				accounted = true
+			}
+		}
+
+		return reported && accounted
+	})
+
+	requireLogged(t, rec, log.LevelError, rereadPanicMsg, scope, nk)
+	requirePanicWithheld(t, rec, "refresh", "string", secret)
+}
+
+// TestReconcilePanicOnARedactedRegistryWithholdsTheValue pins the last engine
+// report that still printed whatever the panicking code was holding.
+//
+// A reconcile's List returns every row of the scope at once, so a store or
+// driver panic under it can be holding any of them — including a key the
+// consumer registered redacted. The engine cannot tell which, so the gate is
+// the registry as a whole: one redacted key anywhere in it withholds the value
+// from the report. That never under-redacts, and a deployment with no redacted
+// key at all keeps the verbatim panic it had.
+func TestReconcilePanicOnARedactedRegistryWithholdsTheValue(t *testing.T) {
+	const secret = "reconcile-panic-sentinel-Nw8Br"
+
+	plain := NSKey{Namespace: "billing", Key: "limits"}
+	hidden := NSKey{Namespace: "billing", Key: "token"}
+	scope := store.Scope{Tenant: "acme"}
+
+	fs := newFakeStore()
+	rec := &recordingLogger{Logger: log.NewNop()}
+
+	e := New(Config{
+		Store: fs,
+		Registry: fakeRegistry{defs: map[NSKey]KeyDef{
+			plain:  {Default: "fallback"},
+			hidden: {Default: "default", Redacted: true},
+		}},
+		Logger: rec,
+	})
+	track(t, e, scope)
+
+	t.Cleanup(func() {
+		if err := e.Close(); err != nil {
+			t.Errorf("Close after a panicking reconcile: %v, want nil", err)
+		}
+	})
+
+	fs.onList(func(store.Scope) error {
+		fs.onList(nil)
+
+		panic(fmt.Sprintf("driver exploded scanning %s/%s = %q", hidden.Namespace, hidden.Key, secret))
+	})
+
+	e.onEvent(resyncEvent(scope))
+
+	waitFor(t, hangGuard, "the panicking reconcile to be reported and accounted", func() bool {
+		var reported, accounted bool
+
+		for _, r := range rec.snapshot() {
+			switch r.Msg {
+			case reconcilePanicMsg:
+				reported = true
+			case panicRecoveredMsg:
+				accounted = true
+			}
+		}
+
+		return reported && accounted
+	})
+
+	requireLogged(t, rec, log.LevelError, reconcilePanicMsg, scope, NSKey{})
+	requirePanicWithheld(t, rec, "reconcile", "string", secret)
+}

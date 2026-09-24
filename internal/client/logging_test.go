@@ -251,3 +251,69 @@ func TestMultiTenantDecodeFailureNamesTheTenant(t *testing.T) {
 			constants.AttrKeyTenantID, tenant, logger.rendered())
 	}
 }
+
+// TestMultiTenantValidatorPanicNamesTheTenantAndKey pins the identity on the
+// one consumer panic the engine still reported anonymously.
+//
+// A validator that panics is recovered and turned into a validation refusal,
+// and the report carried the source, the panic value and a stack — no tenant,
+// no namespace, no key. On a multi-tenant deployment one namespace and one key
+// serve every tenant in the fleet, so an operator paged by that line learned
+// that SOMEBODY's write was refused by an exploding validator and had no way
+// to tell whose or which key. The changefeed re-read already named all three;
+// this is the same line, emitted from the one place every consumer panic is
+// reported.
+func TestMultiTenantValidatorPanicNamesTheTenantAndKey(t *testing.T) {
+	m := newMemStore(true)
+	logger := &recordingLogger{}
+	c := newMultiTenantClientWithLogger(t, m, logger)
+
+	// The registered default is graded at Register with context.Background(),
+	// so the validator has to pass it and blow up only on the write below.
+	if err := c.Register("ns", "k", "default", WithValidator(func(v any) error {
+		if v == "default" {
+			return nil
+		}
+
+		panic("validator blew up")
+	})); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	t.Cleanup(func() { _ = c.Close() })
+
+	ctx := tmcore.ContextWithTenantID(context.Background(), "acme")
+
+	if err := c.Set(ctx, "ns", "k", "new", "ops"); err == nil {
+		t.Fatal("Set: want a validation refusal from the panicking validator, got nil")
+	}
+
+	lines := logger.errs("systemplane.engine: validator panicked")
+	if len(lines) != 1 {
+		t.Fatalf("got %d ERROR lines naming the panicking validator, want exactly 1: %s", len(lines), logger.rendered())
+	}
+
+	want := map[string]string{constants.AttrKeyTenantID: "acme", "namespace": "ns", "keyname": "k"}
+
+	for _, f := range lines[0].structured() {
+		if redaction.IsSensitiveField(f.Key) {
+			t.Errorf("the line carries field %q, which lib-observability redacts", f.Key)
+		}
+
+		if expected, ok := want[f.Key]; ok {
+			if f.Value != expected {
+				t.Errorf("the line carries %s = %v, want %q", f.Key, f.Value, expected)
+			}
+
+			delete(want, f.Key)
+		}
+	}
+
+	for missing := range want {
+		t.Errorf("the line carries no %q field, so an operator cannot tell whose write was refused: %v", missing, lines[0])
+	}
+}

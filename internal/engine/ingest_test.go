@@ -27,6 +27,17 @@ func (r fakeRegistry) Lookup(namespace, key string) (KeyDef, bool) {
 	return def, ok
 }
 
+// AnyRedacted scans the defs the way the Client scans its registry.
+func (r fakeRegistry) AnyRedacted() bool {
+	for _, def := range r.defs {
+		if def.Redacted {
+			return true
+		}
+	}
+
+	return false
+}
+
 func (r fakeRegistry) Keys() []NSKey {
 	keys := make([]NSKey, 0, len(r.defs))
 	for nk := range r.defs {
@@ -734,7 +745,7 @@ func TestRunValidator(t *testing.T) {
 				e.logger = logger
 			}
 
-			tc.check(t, e.RunValidator(context.Background(), tc.validate, secret, false), logger)
+			tc.check(t, e.RunValidator(context.Background(), store.Scope{}, NSKey{}, tc.validate, secret, false), logger)
 		})
 	}
 }

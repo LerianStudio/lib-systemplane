@@ -338,7 +338,7 @@ func (e *Engine) runWorker(ctx context.Context, wk workerKey, w *dispatchWorker)
 			}
 
 			if ch, ok := w.take(); ok {
-				e.deliver(ctx, wk.NSKey, ch)
+				e.deliver(ctx, wk.Scope, wk.NSKey, ch)
 			}
 
 			e.running.Delete(w)
@@ -354,25 +354,33 @@ func (e *Engine) runWorker(ctx context.Context, wk workerKey, w *dispatchWorker)
 // span rather than merely logged; the subscriber list is copied before any
 // callback runs, so a callback may unsubscribe itself without deadlocking.
 //
-// The key's redaction policy is read once for the whole fan-out, because a
-// callback is consumer code holding the decoded value and a panic naming it —
+// The key's redaction policy is read only when a callback actually panics,
+// and then once per panicking callback. A callback is consumer code holding
+// the decoded value and a panic naming it —
 // panic(fmt.Sprintf("cannot apply %v", ch.Value)) — is reported by that same
-// recovery, which prints the panic value unless production mode is on. An
-// unregistered key reports false, which is the honest answer: nothing
+// recovery, which prints the panic value unless production mode is on, so the
+// bit is needed there and nowhere else. Reading it before the fan-out took the
+// registry's lock on every delivery of every subscribed key, contending with
+// Register and with every ingress, to answer a question almost no delivery
+// asks. An unregistered key reports false, which is the honest answer: nothing
 // registered it, so nothing declared it sensitive.
-func (e *Engine) deliver(ctx context.Context, nk NSKey, ch Change) {
+func (e *Engine) deliver(ctx context.Context, scope store.Scope, nk NSKey, ch Change) {
 	e.subsMu.RLock()
 	subs := make([]subscription, len(e.subscribers[nk]))
 	copy(subs, e.subscribers[nk])
 	e.subsMu.RUnlock()
 
-	def, _ := e.lookup(nk.Namespace, nk.Key)
+	if len(subs) == 0 {
+		return
+	}
 
 	for _, sub := range subs {
 		func() {
 			defer func() {
 				if recovered := recover(); recovered != nil {
-					e.reportConsumerPanic(ctx, recovered, def.Redacted,
+					def, _ := e.lookup(nk.Namespace, nk.Key)
+
+					e.reportConsumerPanic(ctx, scope, nk, recovered, def.Redacted,
 						"onchange callback panicked", "onchange")
 				}
 			}()

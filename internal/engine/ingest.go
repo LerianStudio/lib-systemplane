@@ -193,7 +193,7 @@ func (e *Engine) prepare(ctx context.Context, scope store.Scope, se store.Entry,
 	nk := NSKey{Namespace: se.Namespace, Key: se.Key}
 
 	if !pregraded {
-		if err := e.runValidator(ctx, def.Validate, decoded, def.Redacted); err != nil {
+		if err := e.runValidator(ctx, scope, nk, def.Validate, decoded, def.Redacted); err != nil {
 			e.logValidatorRejection(ctx, scope.Tenant, nk, def.Redacted, err)
 
 			return publication{}, err
@@ -329,13 +329,21 @@ func (e *Engine) ingestDefault(ctx context.Context, sc *scopeState, nk NSKey, de
 // same one KeyDef carries: both call sites grade the value of a key they
 // looked up, and a panic over a redacted one must report no more than every
 // other path does.
+//
+// scope and nk are that key's identity, carried so a panic here reports the
+// tenant, namespace and key like every other recovered consumer panic. The
+// write path builds the scope the way the Client's own multi-tenant lines name
+// the tenant; Register grades a default under no tenant at all and passes the
+// zero scope.
 func (e *Engine) RunValidator(
 	ctx context.Context,
+	scope store.Scope,
+	nk NSKey,
 	validate func(context.Context, any) error,
 	value any,
 	redacted bool,
 ) error {
-	return e.runValidator(ctx, validate, value, redacted)
+	return e.runValidator(ctx, scope, nk, validate, value, redacted)
 }
 
 // recoveryLogger is the logger the panic handlers below write through. A nil
@@ -377,6 +385,8 @@ func (e *Engine) recoveryLogger() log.Logger {
 // that row's contents into a WARN line the redaction never sees.
 func (e *Engine) runValidator(
 	ctx context.Context,
+	scope store.Scope,
+	nk NSKey,
 	validate func(context.Context, any) error,
 	value any,
 	redacted bool,
@@ -394,16 +404,25 @@ func (e *Engine) runValidator(
 		if recovered := recover(); recovered != nil {
 			err = fmt.Errorf("%w: validator panicked", store.ErrValidation)
 
-			e.reportConsumerPanic(ctx, recovered, redacted, "validator panicked", "validator")
+			e.reportConsumerPanic(ctx, scope, nk, recovered, redacted, "validator panicked", "validator")
 		}
 	}()
 
 	return validate(ctx, value)
 }
 
-// reportConsumerPanic hands a panic raised by CONSUMER code — a registered
-// validator, an OnChange callback — to lib-observability's canonical handler,
-// withholding the panic value for a key registered redacted.
+// reportConsumerPanic is the one place the engine reports a recovered panic:
+// consumer code — a registered validator, an OnChange callback — and the store
+// calls the engine makes on its own goroutines alike. It names what the panic
+// was about before handing it to lib-observability's canonical handler, and
+// withholds the panic value for a key registered redacted.
+//
+// The identity line comes first and is emitted here rather than at each call
+// site, because a report that says only "something under the engine panicked"
+// is unactionable in exactly the deployments that need it most: one namespace
+// and one key serve every tenant of a multi-tenant fleet, so a panic naming
+// neither sends an operator through every tenant's logs. A reconcile passes
+// the zero key, since a whole-scope snapshot is about no single one.
 //
 // HandlePanicValue logs log.Any("value", recovered) whenever production mode
 // is off, and off is lib-observability's shipped default. So a validator or a
@@ -423,7 +442,20 @@ func (e *Engine) runValidator(
 // It is the same handler either way, so the panic counter, the span event and
 // the error report are recorded exactly as before; only what they carry
 // changes. An unredacted key is reported verbatim.
-func (e *Engine) reportConsumerPanic(ctx context.Context, recovered any, redacted bool, what, name string) {
+func (e *Engine) reportConsumerPanic(
+	ctx context.Context,
+	scope store.Scope,
+	nk NSKey,
+	recovered any,
+	redacted bool,
+	what, name string,
+) {
+	e.logError(ctx, "systemplane.engine: "+what,
+		log.String(constants.AttrKeyTenantID, scope.Tenant),
+		log.String("namespace", nk.Namespace),
+		log.String("keyname", nk.Key),
+	)
+
 	reported := recovered
 	if redacted {
 		reported = safelog.WithheldPanic(what, recovered)
@@ -445,9 +477,12 @@ func (e *Engine) reportConsumerPanic(ctx context.Context, recovered any, redacte
 // through this same pipeline and panics again with nothing under it: one
 // broken counter turns every recovered panic into process death.
 //
-// So every engine site that reports a recovered panic comes through here. The
-// counter, the span event and the error report still fire exactly as before;
-// what a broken one now costs is its own line, not the goroutine.
+// So every engine site that reports a recovered panic comes through here, and
+// what a broken one now costs is its own line rather than the goroutine. The
+// handler runs its steps in sequence, so whatever ran before the panic still
+// landed and whatever came after did not: a recorder that explodes keeps the
+// log line it was already given and loses the span event and the error report
+// behind it.
 func (e *Engine) reportRecovered(ctx context.Context, recovered any, name string) {
 	defer swallowPanic()
 

@@ -38,6 +38,29 @@ func (c *Client) Lookup(namespace, key string) (engine.KeyDef, bool) {
 	}, true
 }
 
+// AnyRedacted reports whether any registered key carries a redaction policy.
+//
+// Scanned rather than counted: it is read only when the engine recovers a
+// panic under a whole-scope snapshot, which is rare, and a counter maintained
+// beside the map would have to be kept correct by every future writer of it
+// for a saving nothing measures.
+func (c *Client) AnyRedacted() bool {
+	if c == nil {
+		return false
+	}
+
+	c.registryMu.RLock()
+	defer c.registryMu.RUnlock()
+
+	for _, def := range c.registry {
+		if def.redaction != RedactNone {
+			return true
+		}
+	}
+
+	return false
+}
+
 // Keys returns every registered key, in no particular order.
 func (c *Client) Keys() []engine.NSKey {
 	if c == nil {

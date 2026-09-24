@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/LerianStudio/lib-systemplane/v4/internal/engine"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
 const (
@@ -103,8 +104,11 @@ func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOp
 	// not written for must come back as ErrValidation — which is what the
 	// option's own documentation promises — rather than kill the process at
 	// boot.
-	if err := c.engine.RunValidator(context.Background(), def.validator, canonical,
-		def.redaction != RedactNone); err != nil {
+	// The zero scope: a default is graded before any request exists, so there
+	// is no tenant to name in the report a panic here produces.
+	if err := c.engine.RunValidator(context.Background(), store.Scope{},
+		engine.NSKey{Namespace: namespace, Key: key},
+		def.validator, canonical, def.redaction != RedactNone); err != nil {
 		// Already labelled when the validator panicked — see the same branch
 		// on the write path — so only the context this call adds is wrapped.
 		if errors.Is(err, ErrValidation) {
