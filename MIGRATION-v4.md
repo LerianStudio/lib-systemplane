@@ -662,7 +662,68 @@ database resolved from the request context on every read and write, no
 in-process cache, no changefeed, and `OnChange` refused with
 `ErrNotSupportedInMultiTenant`.
 
-<!-- filled by Task 1.1.5 -->
+### notifications
+
+**From:** v1.6.1 — unsuffixed module, Fiber v2, lib-commons v5, lib-observability v1, and a `Manager`.
+**Mode:** multi-tenant, Postgres.
+**Breaks:** the v1.6.x row of [§ The module and dependency hop](#the-module-and-dependency-hop), and the `Manager` on top of it: `NewManager`, `WithManagerLogger`, `WithManagerTelemetry`, the four `OnTenant*` handlers and `Drain` all stop existing in the same change. The two cannot be split — one import line cannot be on v1.6.x and on `/v4` at once — which makes this the largest single upgrade in the matrix. Budget it as two.
+**Do:**
+
+1. Fiber v2 → v3 first, as its own change, then the observability boundary. Both are in the hop table above.
+2. Delete the `Manager`. One `Client` carries what it configured: `WithMultiTenantEnabled()`, `WithModule(...)`, `WithLogger`, `WithTelemetry`.
+3. Replace `Drain(ctx)` with `Close()`, which takes no context. The wait is bounded by `WithCloseTimeout` (30 seconds by default), and a callback still running when the bound elapses comes back as `ErrCloseTimeout` naming every `(scope, key)` inside a delivery — where `Drain` returned nil whatever happened, leaving a goroutine that never acknowledged its cancel to exit unobserved. See [§ `Close` is bounded, and names the callback that would not stop](#close-is-bounded-and-names-the-callback-that-would-not-stop).
+4. Budget for every multi-tenant read reaching the tenant database. The per-tenant cache belonged to the `Manager` and left with it.
+
+The four lifecycle handlers are what this section is waiting on: they have
+nowhere to register today.
+
+~~~go
+// v1.6.1 — construction, lifecycle registration, shutdown
+c, err := systemplane.NewPostgres(db, listenDSN, systemplane.WithMultiTenantEnabled())
+m := systemplane.NewManager(c, pgMgr, systemplane.WithManagerLogger(lg))
+// m.OnTenantActivated / OnTenantSuspended / OnTenantDeleted /
+// OnTenantCredentialsRotated wired into the lifecycle dispatcher
+defer m.Drain(ctx)
+~~~
+
+<!-- NOT-YET(engine-tenants): WithPostgresTenantManager construction, HandleTenantLifecycle registration with the tmevent dispatcher, returned handler errors, after-fragment -->
+
+### plugin-br-pix-jd
+
+**From:** v3.0.0 — `/v3`, already on lib-commons `/v7` and lib-observability `/v4`.
+**Mode:** multi-tenant, Postgres.
+**Breaks:** the `Manager` — `NewManager`, `Drain`, and `HandleTenantLifecycle` as a method on it; the `DefaultSeedSQL()` DDL generator; the table and channel overrides.
+**Do:**
+
+1. Bump the module path. That is the whole dependency hop for this consumer — the `/v3` row of the hop table, no lib-commons and no lib-observability move.
+2. Delete the seed-DDL generator and the name overrides. [§ The surface diff](#the-surface-diff) says what replaces each; the channel is `systemplane_changes` and the table `systemplane_entries`, both fixed.
+3. Apply `MigrationV3ToV4SQL()` to every tenant database before the new binary boots.
+4. Replace `Drain(ctx)` with `Close()` — the same contrast notifications carries above.
+
+~~~go
+// v3.0.0 — construction, lifecycle registration, shutdown
+c, err := systemplane.NewPostgres(db, listenDSN,
+    systemplane.WithMultiTenantEnabled(), systemplane.WithListenChannel("pix_jd_changes"))
+m := systemplane.NewManager(c, pgMgr)
+// m.HandleTenantLifecycle registered as the tmevent handler
+defer m.Drain(ctx)
+~~~
+
+<!-- NOT-YET(engine-tenants): HandleTenantLifecycle moves Manager → Client with the same signature and now returns errors; lazy activation; blocked-marker semantics; after-fragment -->
+
+### br-sfn
+
+**From:** v3.0.0-beta.2 — `/v3`, already on lib-commons `/v7` and lib-observability `/v4`.
+**Mode:** multi-tenant, Postgres, with 17 `OnChange` callbacks registered before `Start`.
+**Breaks:** all 17. v3 dispatched them through the bound `Manager`, once per NOTIFY across any active tenant, with the tenant on the callback's context. v4 has no `Manager`, and multi-tenant `OnChange` answers `ErrNotSupportedInMultiTenant` for every registered key — so **br-sfn cannot finish this migration against `develop` as it stands.** The rest of the upgrade can land first.
+**Do:**
+
+1. Bump the module path; nothing else in `go.mod`.
+2. Apply `MigrationV3ToV4SQL()` to every tenant database.
+3. Rewrite the 17 callbacks to `func(ctx context.Context, ch Change)` now — mechanical, and independent of what is still landing. Namespace, key, revision and value come off `ch`. The ctx is the engine's own lifecycle context and carries no request values and no tenant, where the v3 godoc promised the tenant scope on it.
+4. Expect each callback to fire once at `Start` with the value in force, including for a key with no row ([§ Every callback registered before `Start` fires once at `Start`](#every-callback-registered-before-start-fires-once-at-start)), and to skip intermediate revisions under load ([§ Deliveries are coalesced per key and independent across keys](#deliveries-are-coalesced-per-key-and-independent-across-keys)). Seventeen subscribers is also where v3's single synchronous LISTEN goroutine stopped being free.
+
+<!-- NOT-YET(engine-tenants): the 17 callbacks fire once per tenant at activation and Change.Tenant names the tenant -->
 
 ---
 
