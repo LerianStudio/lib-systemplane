@@ -169,6 +169,79 @@ func TestDeleteEventPublishesDefaultAtRevisionZero(t *testing.T) {
 	}
 }
 
+// TestFeedDeleteDoesNotRevertTheWriteThatFollowedIt is the regression for the
+// inversion a self-describing delete used to cause.
+//
+// A caller deletes a key and writes it again. Both are published locally the
+// moment the store acknowledges them (D4), so the value in force is already
+// the new row when their echoes arrive on the feed, in the order the store
+// produced them: OpDelete, then OpUpsert. The delete carries revision 0, which
+// always wins the publish fence, so applied on arrival it reverted a write
+// that had already succeeded — Lookup served the registered default for a
+// quiet window, and every subscriber took a spurious Revision 0 delivery — and
+// only the upsert's debounced re-read repaired it.
+//
+// Sharing that window is what orders the two: the upsert replaces the pending
+// delete instead of landing behind it, so the pair collapses to the write.
+func TestFeedDeleteDoesNotRevertTheWriteThatFollowedIt(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+	fs := newFakeStore()
+	e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, 20*time.Millisecond)
+
+	var rec recorder
+
+	unsub := e.OnChange(nk, rec.record)
+	defer unsub()
+
+	// The caller's own Delete, then its own Set, each published as it returned.
+	e.PublishDelete(scope, nk)
+
+	row := jsonRow(nk, 7, `"written"`, "actor")
+	fs.seed(scope, row)
+	e.Publish(context.Background(), scope, row)
+
+	waitFor(t, time.Second, "the write's delivery", func() bool {
+		revs := rec.revisions()
+
+		return len(revs) > 0 && revs[len(revs)-1] == 7
+	})
+
+	delivered := rec.len()
+
+	// Their echoes, in the order the store produced them. The delete arrives
+	// first and carries revision 0.
+	e.onEvent(deleteEvent(scope, nk))
+
+	if got, _ := e.Lookup(scope, nk); got.Value != "written" || got.Revision != 7 {
+		t.Fatalf("value in force the moment the delete echo arrived: got (%v, rev %d), want "+
+			"(\"written\", rev 7): the echo of a delete reverted a write made after it", got.Value, got.Revision)
+	}
+
+	e.onEvent(upsertEvent(scope, nk, 7))
+
+	waitFor(t, time.Second, "the coalesced re-read", func() bool { return fs.getCount() > 0 })
+	quiesce(t, e)
+
+	got, ok := e.Lookup(scope, nk)
+	if !ok {
+		t.Fatal("Lookup reports a miss after the echoes of a delete and the write that followed it")
+	}
+
+	if got.Value != "written" || got.Revision != 7 {
+		t.Errorf("value in force after both echoes: got (%v, rev %d), want (\"written\", rev 7)", got.Value, got.Revision)
+	}
+
+	for _, ch := range rec.changes()[delivered:] {
+		if ch.Revision == 0 {
+			t.Errorf("delivered revisions: got %v, want no Revision 0 after the write: subscribers "+
+				"were handed the registered default for a key the caller had just written", rec.revisions())
+
+			break
+		}
+	}
+}
+
 func TestUpsertEventReReadsAndIngests(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 	fs := newFakeStore()
@@ -547,9 +620,10 @@ func TestUpsertEventNeverBlocksOnASubscriber(t *testing.T) {
 }
 
 // TestDeleteEventNeverBlocksOnASubscriber is the same rule for the delete
-// path, which reaches publish without passing through the debouncer: a delete
-// is self-describing, so it is applied inline on the changefeed goroutine and
-// would be the one operation able to park that goroutine in a subscriber.
+// path. A delete is self-describing, so the debouncer it shares with an upsert
+// has no store read to schedule: at the zero quiet window this test uses it is
+// applied inline on the changefeed goroutine, which makes it the one operation
+// able to park that goroutine in a subscriber.
 func TestDeleteEventNeverBlocksOnASubscriber(t *testing.T) {
 	keyA := NSKey{Namespace: "billing", Key: "a"}
 	keyB := NSKey{Namespace: "billing", Key: "b"}

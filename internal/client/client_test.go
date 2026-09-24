@@ -216,8 +216,25 @@ func (m *memStore) fire(evt store.Event) {
 func newSingleTenantClient(t *testing.T, s *memStore) *Client {
 	t.Helper()
 
+	return newSingleTenantClientWithDebounce(t, s, 0)
+}
+
+// newSingleTenantClientWithDebounce is newSingleTenantClient with a chosen
+// quiet window. Zero is what most tests want: the debouncer runs every
+// re-read inline, so a feed event fired by the fake is fully applied by the
+// time the call that fired it returns.
+//
+// A test that must pin what the CLIENT does on its own passes a real window
+// instead. The fake fires its changefeed events synchronously inside Set and
+// Delete, so at zero the engine has already re-read the row and cached it
+// before the write returns — which silently satisfies read-your-writes (D4)
+// without the write path publishing anything at all, and makes a test of that
+// hand-off pass with the hand-off deleted.
+func newSingleTenantClientWithDebounce(t *testing.T, s *memStore, window time.Duration) *Client {
+	t.Helper()
+
 	cfg := defaultClientConfig()
-	cfg.debounce = 0
+	cfg.debounce = window
 
 	c := newClient(s, cfg)
 
@@ -1010,17 +1027,18 @@ func TestListReturnsErrorOnCorruptedJSON(t *testing.T) {
 	}
 }
 
-// Item #9: the first reconcile must not overwrite fresher changefeed state. We
-// seed a row, then between Subscribe registration and List() completion we
-// force a change event to fire for the same key with a newer value. The
-// expected outcome: the value in force is the changefeed-delivered one, not the
-// older List snapshot, because the feed recorded the key as touched while the
-// reconcile was in flight and the snapshot row is skipped for it
-// (reconcileWindow, internal/engine/reconcile.go).
+// Item #9: the first reconcile must not overwrite fresher changefeed state.
 //
-// We exercise this by having the memStore's List block until the injected
-// upsert has been published, which the test observes through a subscriber
-// registered before Start rather than by sleeping.
+// The reconcile's List is held open, and while it is the changefeed reports
+// the row REMOVED. The photograph it is holding still carries that row, and
+// every revision beats the Revision 0 a delete publishes, so the publish fence
+// alone would let the snapshot straight back in: the only thing keeping it out
+// is the feed recording the key as touched while the reconcile was in flight
+// (reconcileWindow, internal/engine/reconcile.go — D2(b)).
+//
+// The row therefore stays in the fake for the whole test: a snapshot taken
+// before a delete is exactly a List that still reports the row. The delete is
+// observed through a subscriber registered before Start rather than slept on.
 func TestReconcileDoesNotOverwriteFresherChangefeedState(t *testing.T) {
 	m := newMemStoreWithListHook(false)
 	c := newSingleTenantClient(t, m)
@@ -1029,15 +1047,22 @@ func TestReconcileDoesNotOverwriteFresherChangefeedState(t *testing.T) {
 		t.Fatalf("register: %v", err)
 	}
 
-	// Seed an OLD value visible to List().
+	// The row List() photographs, and goes on photographing.
 	rawOld, _ := json.Marshal("old-from-list")
 	if _, err := m.Set(context.Background(), store.Scope{}, store.Entry{Namespace: "ns", Key: "k", Value: rawOld}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
-	// Force List() to block until the changefeed has delivered the NEW value.
-	listReady := make(chan struct{})
+	// Force List() to block until the changefeed has reported the delete.
+	// listReady is BUFFERED: with an unbuffered channel the non-blocking send
+	// below is dropped whenever the reconcile reaches the hook before this
+	// goroutine reaches the receive, and both sides then park forever.
+	listReady := make(chan struct{}, 1)
 	listRelease := make(chan struct{})
+	release := sync.OnceFunc(func() { close(listRelease) })
+
+	defer release()
+
 	m.listHook = func() {
 		select {
 		case listReady <- struct{}{}:
@@ -1046,10 +1071,10 @@ func TestReconcileDoesNotOverwriteFresherChangefeedState(t *testing.T) {
 		<-listRelease
 	}
 
-	// Subscribed BEFORE Start, so the injected upsert can be waited for
-	// instead of slept on. A pre-Start subscriber also receives the FC-11
-	// announcement of every registered key, so the wait below matches on the
-	// injected value AND revision rather than on the first delivery.
+	// Subscribed BEFORE Start, so the delete can be waited for instead of
+	// slept on. A pre-Start subscriber also receives the FC-11 announcement of
+	// every registered key, so the wait below matches on the value AND the
+	// revision rather than on the first delivery.
 	changes := make(chan Change, 16)
 
 	unsubscribe, err := c.OnChange("ns", "k", func(_ context.Context, ch Change) {
@@ -1070,24 +1095,23 @@ func TestReconcileDoesNotOverwriteFresherChangefeedState(t *testing.T) {
 		startDone <- c.Start(context.Background())
 	}()
 
-	// Wait until Start has reached List() — at this point Subscribe has run.
-	<-listReady
+	// Never a bare receive: a hook the reconcile never reaches has to fail by
+	// name here rather than as a package timeout with no diagnosis.
+	select {
+	case <-listReady:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first reconcile never reached List()")
+	}
 
-	// Inject a fresh upsert via the memStore's fire() (simulates the
-	// changefeed delivering a newer value while the first reconcile is in
-	// flight). Revision 7 is above the seeded row's, so the publish fence
-	// accepts it and GetEntry can report it.
-	rawNew, _ := json.Marshal("new-from-changefeed")
-	m.mu.Lock()
-	m.entries[memKey("ns", "k")] = store.Entry{Namespace: "ns", Key: "k", Value: rawNew, Revision: 7}
-	m.mu.Unlock()
-	m.fire(store.Event{Namespace: "ns", Key: "k", Op: store.OpUpsert})
+	// The changefeed reports the row gone while the reconcile is still holding
+	// a photograph that carries it.
+	m.fire(store.Event{Namespace: "ns", Key: "k", Op: store.OpDelete})
 
-	// Release List() only once the injected value has actually been published,
-	// so the reconcile applies its snapshot against a key the feed has already
+	// Release List() only once the delete has actually been published, so the
+	// reconcile applies its snapshot against a key the feed has already
 	// claimed.
-	waitForChange(t, changes, "new-from-changefeed", 7)
-	close(listRelease)
+	waitForChange(t, changes, "default", 0)
+	release()
 
 	if err := <-startDone; err != nil {
 		t.Fatalf("start: %v", err)
@@ -1100,8 +1124,8 @@ func TestReconcileDoesNotOverwriteFresherChangefeedState(t *testing.T) {
 		t.Fatalf("get: ok=%v err=%v", ok, err)
 	}
 
-	if v.(string) != "new-from-changefeed" {
-		t.Errorf("value in force is %q — the first reconcile overwrote fresher changefeed state", v)
+	if v.(string) != "default" {
+		t.Errorf("value in force is %q — the first reconcile's snapshot resurrected a key the changefeed had already reported deleted", v)
 	}
 
 	e, ok, err := c.GetEntry(context.Background(), "ns", "k")
@@ -1109,8 +1133,8 @@ func TestReconcileDoesNotOverwriteFresherChangefeedState(t *testing.T) {
 		t.Fatalf("get entry: ok=%v err=%v", ok, err)
 	}
 
-	if e.Revision != 7 {
-		t.Errorf("Revision = %d, want 7: the revision the injected upsert carried", e.Revision)
+	if e.Revision != 0 {
+		t.Errorf("Revision = %d, want 0: a delete puts the registered default in force", e.Revision)
 	}
 }
 
@@ -1450,7 +1474,11 @@ func TestCloseOnAnUnstartedClientClosesTheEngine(t *testing.T) {
 // changed is the whole request.
 func TestSetThenGetReturnsNewValue(t *testing.T) {
 	s := newMemStore(false)
-	c := newSingleTenantClient(t, s)
+
+	// A real quiet window, so the write's own feed echo cannot land before the
+	// assertions below: what they read can only have come from Set publishing
+	// it (D4).
+	c := newSingleTenantClientWithDebounce(t, s, time.Second)
 
 	defer func() { _ = c.Close() }()
 
@@ -1503,10 +1531,15 @@ func TestSetThenGetReturnsNewValue(t *testing.T) {
 // The delivery count is deliberately a floor and not an exact number: the fake
 // fires its OpDelete synchronously inside store.Delete and the Client
 // publishes the same delete itself, and Revision 0 is never deduplicated (D3),
-// so one or two deliveries are both within FC-4.
+// so one or two deliveries are both within FC-4. The quiet window keeps that
+// echo pending for the whole test, so what the assertions read is the Client's
+// own publication and nothing else.
 func TestDeletePublishesDefaultAtRevisionZero(t *testing.T) {
 	s := newMemStore(false)
-	c := newSingleTenantClient(t, s)
+
+	// A real quiet window, so the delete's own feed echo is still pending when
+	// the assertions run: what they read is what Delete published itself.
+	c := newSingleTenantClientWithDebounce(t, s, time.Second)
 
 	defer func() { _ = c.Close() }()
 

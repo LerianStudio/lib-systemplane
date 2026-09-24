@@ -48,7 +48,10 @@ type scopeNSKey struct {
 //     it arms the scope's reconcile window here, synchronously, and the reload
 //     itself runs on its own goroutine.
 //   - OpDelete publishes the registered default at revision 0 with no store
-//     read at all: a delete is self-describing.
+//     read at all: a delete is self-describing. It is still queued behind the
+//     key's quiet window, like an upsert, so that a delete immediately
+//     followed by a write coalesces into the write instead of reverting it;
+//     the reconcile fence it needs is recorded here, synchronously.
 //   - anything else is treated as an upsert: the store is re-read once the
 //     key's quiet window closes, and the row goes through the ingress.
 func (e *Engine) onEvent(evt store.Event) {
@@ -118,10 +121,13 @@ func (e *Engine) onEvent(evt store.Event) {
 		return
 	}
 
+	// A delete is fenced against every reconcile in flight the MOMENT it
+	// arrives, before the publication below waits for the key's quiet window.
+	// From here on the feed holds the fresher fact about this key, and a
+	// snapshot taken before the delete must never be applied over it — which
+	// is what the publication used to record for itself when it ran inline.
 	if evt.Op == store.OpDelete {
-		e.PublishDelete(evt.Scope, nk)
-
-		return
+		e.recordFeedDelete(evt.Scope, nk)
 	}
 
 	// With a real quiet window the debouncer fires the re-read on a timer
@@ -138,18 +144,35 @@ func (e *Engine) onEvent(evt store.Event) {
 	// by feedTimeout PLUS the consumer's validator, which is bounded by
 	// nothing, and every other key's notification waits behind it.
 	//
+	// A delete takes the SAME per-key quiet window as an upsert, and that is
+	// the whole fix for the inversion a self-describing delete used to cause:
+	// the echo of a Delete and the echo of the Set that followed it arrive on
+	// the feed as close together as the two writes were, so the upsert's
+	// re-read replaces the pending delete instead of the delete reverting the
+	// write to the registered default for a window. Revision 0 always wins the
+	// publish fence, so nothing downstream could have ordered those two — only
+	// the feed's own order can, and coalescing is how the engine reads it.
+	//
+	// It needs no WaitGroup registration of its own: a delete makes no store
+	// call, so a timer that fires after Close has returned publishes into a
+	// closed engine and is refused there, rather than reaching a store the
+	// Client is about to close under it.
+	//
 	// Exactly one closure is built, in the branch that wants it. Building the
 	// inline one up front and overwriting it here cost one discarded heap
 	// allocation on every upsert event the feed delivers.
-	var refresh func()
+	var work func()
 
-	if e.debounceAsync {
-		refresh = func() { e.trackedRefresh(evt.Scope, nk) }
-	} else {
-		refresh = func() { e.refreshKey(evt.Scope, nk) }
+	switch {
+	case evt.Op == store.OpDelete:
+		work = func() { e.PublishDelete(evt.Scope, nk) }
+	case e.debounceAsync:
+		work = func() { e.trackedRefresh(evt.Scope, nk) }
+	default:
+		work = func() { e.refreshKey(evt.Scope, nk) }
 	}
 
-	e.debouncer.Submit(scopeNSKey{Tenant: evt.Scope.Tenant, Namespace: nk.Namespace, Key: nk.Key}, refresh)
+	e.debouncer.Submit(scopeNSKey{Tenant: evt.Scope.Tenant, Namespace: nk.Namespace, Key: nk.Key}, work)
 }
 
 // trackedRefresh runs a debounced re-read as engine work Close waits for.
@@ -324,6 +347,29 @@ func (e *Engine) markStale(scope store.Scope) {
 
 	sc.stale = true
 	sc.disconnectGen++
+}
+
+// recordFeedDelete fences nk against every reconcile in flight, at the instant
+// the changefeed reports the row removed.
+//
+// The publication itself waits for the key's quiet window, so this is the half
+// that cannot wait: a reconcile whose List was taken before the delete still
+// carries the row, and every revision beats the revision 0 a delete publishes,
+// so without this record the photograph resurrects the key for as long as the
+// window lasts. Recording the key as touched is not a guess — the feed really
+// does hold the fresher fact about it from here on, and a reconcile that skips
+// it keeps the cached value until the delete (or the write that coalesced over
+// it) lands.
+func (e *Engine) recordFeedDelete(scope store.Scope, nk NSKey) {
+	sc := e.scopeForEvent(scope, nk)
+	if sc == nil {
+		return
+	}
+
+	sc.reconcileMu.Lock()
+	defer sc.reconcileMu.Unlock()
+
+	sc.record(nk, true)
 }
 
 // PublishDelete publishes the registered default at revision 0 for a deleted

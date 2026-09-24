@@ -21,16 +21,19 @@ import (
 // deliver independently.
 //
 // A subscriber registered before [Client.Start] is handed the value in force
-// once, during Start, as the first reconcile publishes every registered key
-// (FC-11). That delivery runs while Start is still on the stack, which decides
-// what a callback may do:
+// once, as the first reconcile publishes every registered key (FC-11). The
+// publication happens while Start is still on the stack; the DELIVERY is
+// queued there and runs on the key's own worker goroutine, so it may land
+// either side of Start's return. That decides what a callback may do:
 //
 //   - it may call Get, GetEntry, List and OnChange re-entrantly — no Client or
-//     engine lock is held while it runs;
-//   - Set and Delete called from that first delivery return ErrNotStarted,
-//     because Start has not returned yet;
-//   - Register, Start and Close block on the Client's start lock until Start
-//     returns, and during Close until the close timeout expires.
+//     engine lock is held while it runs, and Get already serves the value the
+//     delivery carries;
+//   - Set and Delete return ErrNotStarted when that first delivery wins the
+//     race with Start's return, so a callback that writes must tolerate it;
+//   - Register, Start and Close block on the Client's start lock for as long
+//     as Start is still running, and during Close until the close timeout
+//     expires.
 //
 // In multi-tenant mode OnChange returns ErrNotSupportedInMultiTenant for every
 // registered key: no scope is tracked and no changefeed runs, so no callback

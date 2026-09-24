@@ -138,10 +138,13 @@ func newClient(s store.Store, cfg clientConfig) *Client {
 
 // Start performs backend bootstrap and, in single-tenant mode, starts the
 // engine: it opens the changefeed and returns once the first reconcile has
-// confirmed every registered key against the store, so an OnChange subscriber
-// registered beforehand has been handed the value in force (FC-11) before
-// Start returns. In multi-tenant mode it only marks the Client started;
-// schema bootstrap and reads run lazily against the per-request tenant DB.
+// confirmed every registered key against the store, so every read taken after
+// it serves what is stored rather than the registered default. That reconcile
+// also queues the FC-11 announcement for every subscriber registered
+// beforehand; the delivery runs on the key's own goroutine, so it may land
+// just after Start returns. In multi-tenant mode it only marks the Client
+// started; schema bootstrap and reads run lazily against the per-request
+// tenant DB.
 //
 // Start and Close are mutually exclusive: both take startMu for the duration
 // of their work, and Start re-checks `closed` under the lock so a concurrent

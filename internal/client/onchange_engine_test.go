@@ -279,8 +279,14 @@ func TestSubscriberCanReadTheClientFromInsideItsCallback(t *testing.T) {
 			t.Errorf("delivery %d: GetEntry returned revision %d while the Change carried %d — a subscriber must not read a value older than its own notification", i, r.entry.Revision, r.change.Revision)
 		}
 
-		if r.get != r.entry.Value {
-			t.Errorf("delivery %d: Get returned %v while GetEntry returned %v — the two reads must agree", i, r.get, r.entry.Value)
+		// Get and GetEntry are two separate reads, so a publication landing
+		// between them legitimately makes them differ — asserting they agree
+		// was unsound and failed about one run in twenty under -race. What
+		// must hold is that Get served a value this key actually held around
+		// this delivery: the one the subscriber was told, or the one the
+		// second read went on to see.
+		if r.get != r.change.Value && r.get != r.entry.Value {
+			t.Errorf("delivery %d: Get returned %v, which is neither the delivered value %v nor what GetEntry read a moment later (%v)", i, r.get, r.change.Value, r.entry.Value)
 		}
 	}
 }

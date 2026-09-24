@@ -27,10 +27,13 @@ func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOp
 // validator's error is logged. The refused value itself is never logged.
 //
 // Every subscriber registered before Start is handed the value in force once,
-// during Start, including the keys the store had no row for and the keys whose
-// row was refused — those are announced as the registered default. A consumer
-// can therefore put its reload in [Client.OnChange] alone and be correct from
-// boot.
+// including the keys the store had no row for and the keys whose row was
+// refused — those are announced as the registered default. A consumer can
+// therefore put its reload in [Client.OnChange] alone and be correct from
+// boot. The announcement is queued while Start runs and delivered on the key's
+// own goroutine, so a callback may run just after Start returns; what Start
+// itself guarantees is that every read taken after it already serves the value
+// that announcement carries.
 //
 // A Start that fails is retryable: the Client stays usable, subscriptions
 // registered before it survive, and the next Start reconciles from nothing.
@@ -141,14 +144,15 @@ func (c *Client) CatalogService() string {
 // Revision 0.
 //
 // In single-tenant mode a subscriber registered before [Client.Start] is
-// handed the value in force once during Start. Deliveries for one key are
-// serialized and coalesced off the caller's goroutine: while a callback runs,
-// a newer revision of that key replaces the pending one, so a callback may
-// skip intermediate revisions but always receives the newest and never sees
-// revisions out of order. Different keys deliver independently. A callback may
-// read the Client re-entrantly; [Client.Set] and [Client.Delete] called from
-// the delivery made during Start return ErrNotStarted, because Start has not
-// returned yet.
+// handed the value in force once: Start queues that announcement and the key's
+// own goroutine delivers it, so it may land either side of Start's return.
+// Deliveries for one key are serialized and coalesced off the caller's
+// goroutine: while a callback runs, a newer revision of that key replaces the
+// pending one, so a callback may skip intermediate revisions but always
+// receives the newest and never sees revisions out of order. Different keys
+// deliver independently. A callback may read the Client re-entrantly;
+// [Client.Set] and [Client.Delete] called from that first delivery return
+// ErrNotStarted when it wins the race with Start's return.
 //
 // OnChange returns ErrUnknownKey for a key that was not registered, in both
 // modes. In multi-tenant mode it then returns ErrNotSupportedInMultiTenant for
