@@ -47,6 +47,9 @@ type Client struct {
 	started   atomic.Bool
 	closeOnce sync.Once
 	closed    atomic.Bool
+	// closeErr is the first Close's outcome, replayed by every later Close
+	// the way the engine replays its own.
+	closeErr error
 }
 
 // NewPostgres creates a Client backed by Postgres.
@@ -254,8 +257,6 @@ func (c *Client) Close() error {
 		return nil
 	}
 
-	var closeErr error
-
 	c.closeOnce.Do(func() {
 		c.startMu.Lock()
 		defer c.startMu.Unlock()
@@ -278,8 +279,8 @@ func (c *Client) Close() error {
 
 		// errors.Join(nil, nil) is nil, so the clean path is unchanged, and a
 		// subscriber that refused to stop does not swallow a store failure.
-		closeErr = errors.Join(engineErr, storeErr)
+		c.closeErr = errors.Join(engineErr, storeErr)
 	})
 
-	return closeErr
+	return c.closeErr
 }

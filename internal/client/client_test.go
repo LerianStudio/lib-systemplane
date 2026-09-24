@@ -715,11 +715,17 @@ func TestSetNilContext(t *testing.T) {
 	}
 }
 
+// TestCloseIsIdempotent pins the clean half: both calls report nil. The
+// replay of a failed first Close lives in
+// TestCloseReportsBothTheStuckSubscriberAndTheStoreFailure.
 func TestCloseIsIdempotent(t *testing.T) {
 	c := newSingleTenantClient(t, newMemStore(false))
 
-	_ = c.Close()
-	_ = c.Close()
+	for i := range 2 {
+		if err := c.Close(); err != nil {
+			t.Fatalf("Close #%d: %v, want nil", i+1, err)
+		}
+	}
 }
 
 func TestKeyDescriptionAndRedaction(t *testing.T) {
@@ -2207,6 +2213,14 @@ func TestCloseReportsBothTheStuckSubscriberAndTheStoreFailure(t *testing.T) {
 
 	if !errors.Is(closeErr, backendErr) {
 		t.Errorf("Close: got %v, want it to report the backend failure %v — the stuck subscriber must not swallow it", closeErr, backendErr)
+	}
+
+	// A second Close must replay the first one's outcome, the way the engine
+	// replays its own: a consumer retrying Close on its way out would
+	// otherwise be told the stuck subscriber let go and the store closed.
+	second := c.Close()
+	if !errors.Is(second, ErrCloseTimeout) || !errors.Is(second, backendErr) {
+		t.Errorf("second Close: got %v, want the first Close's error replayed (%v)", second, closeErr)
 	}
 
 	// Release the callback and wait for it: a test that leaks on purpose fails
