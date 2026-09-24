@@ -335,6 +335,15 @@ func (e *Engine) recoverRefresh(scope store.Scope, nk NSKey, deleted, retried bo
 		e.recordFeedOutcome(sc, nk, false)
 	}
 
+	// Deferred rather than called last, which is where it used to sit. It
+	// still RUNS last — on a zero quiet window the retry runs inline, right
+	// here — but registering it before the reporting is what keeps the repair
+	// this function promises independent of the reporting surviving. Both
+	// lines below end up inside the consumer's logger, and the guard this
+	// engine puts under that logger covers the one it holds, not whatever
+	// lib-observability's handler reaches on its way to a sink.
+	defer e.retryRefresh(sc, nk, deleted, retried)
+
 	e.logError(ctx, "systemplane.engine: changefeed re-read panicked",
 		log.String(constants.AttrKeyTenantID, scope.Tenant),
 		log.String("namespace", nk.Namespace),
@@ -342,10 +351,6 @@ func (e *Engine) recoverRefresh(scope store.Scope, nk NSKey, deleted, retried bo
 	)
 
 	runtime.HandlePanicValue(ctx, e.logger, recovered, "systemplane.engine", "refresh")
-
-	// Last, so the panic is fully reported before any new work is queued: on a
-	// zero quiet window the retry runs inline, right here.
-	e.retryRefresh(sc, nk, deleted, retried)
 }
 
 // scopeForEvent resolves the scope a changefeed event, a reconcile or a

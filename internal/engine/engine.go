@@ -114,16 +114,68 @@ type Config struct {
 	CloseTimeout time.Duration
 }
 
+// safeLogger is the consumer's logger with a net under it: neither an entry
+// nor a level check can unwind into the engine.
+//
+// It is what makes the guard below hold everywhere at once. The engine hands
+// its logger to lib-observability's recovery handlers on three goroutines it
+// owns — the reconcile worker, a debounced changefeed re-read and a delivery
+// worker — and every one of those handlers LOGS the panic it just recovered
+// before it counts it. A consumer logger that panics on that line turns a
+// recovered panic into an unrecovered one on a goroutine the consumer cannot
+// reach, and takes the process down; on the v3 path the same broken logger
+// panicked on the caller's own stack, where the caller could see it. Enabled
+// is guarded too, because the DEBUG level check runs per changefeed event,
+// outside every recovery.
+//
+// Only Log and Enabled are overridden: With, WithGroup and Sync are forwarded
+// to the consumer's logger because nothing in this package or in
+// lib-observability's recovery path calls them.
+//
+// Four lines of this also live in internal/group, guarding the same hazard in
+// the coordinator's own panic handler. They are deliberately not shared: that
+// package belongs to another lane, and a shared helper would have to be
+// wired through it.
+type safeLogger struct{ log.Logger }
+
+func (l safeLogger) Log(ctx context.Context, level int, msg string, fields ...any) {
+	defer swallowPanic()
+
+	l.Logger.Log(ctx, level, msg, fields...)
+}
+
+// Enabled reports false for a logger that panics on its level check: the
+// recovered return never runs the assignment, so the zero value stands, and a
+// guarded DEBUG line is skipped rather than built for a logger that cannot
+// take it.
+func (l safeLogger) Enabled(level int) bool {
+	defer swallowPanic()
+
+	return l.Logger.Enabled(level)
+}
+
+// swallowPanic discards a panic raised by the consumer's own observability
+// code. There is nowhere left to report it — the logger is what panicked — and
+// the alternative is unwinding an engine goroutine over a log line.
+func swallowPanic() {
+	_ = recover()
+}
+
 // New builds an engine from cfg, defaulting everything that has a sensible
 // default: a nil logger becomes a no-op, a zero CloseTimeout becomes 30s, and
 // a zero Debounce disables debouncing rather than dropping notifications.
 //
+// The logger is wrapped ONCE, here, rather than at each of the sites that hand
+// it to a recovery handler or a goroutine launcher: every one of them reads
+// e.logger, and the debouncer is handed the same wrapped value, so the guard
+// covers the whole engine and nothing new has to remember it.
+//
 // It opens no connection and starts no goroutine — Start does that — so a
 // Client that is constructed and never started leaves nothing behind.
 func New(cfg Config) *Engine {
-	logger := cfg.Logger
-	if logger == nil {
-		logger = log.NewNop()
+	logger := safeLogger{log.NewNop()}
+	if cfg.Logger != nil {
+		logger = safeLogger{cfg.Logger}
 	}
 
 	closeTimeout := cfg.CloseTimeout
