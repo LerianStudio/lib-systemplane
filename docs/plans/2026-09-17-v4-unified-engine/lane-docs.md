@@ -39,15 +39,15 @@ Only these paths. Every one of them is a document or an example; this lane write
 - `examples/**` — three new directories created from scratch
 - `.github/workflows/go-combined-analysis.yml` — one added job
 
-**Files this lane MUST NOT touch:** every Go package under `internal/**`; every root `api_*.go` and its tests; `manager.go`, `manager_methods.go`, `ddl.go`, `ddl_test.go`, `boundary_test.go`; `admin/**`; `systemplanetest/**`; `ddl/**`; `go.mod`; `go.sum`; `.ignorecoverunit`; `.golangci.yml`; `.releaserc.yml`; `CHANGELOG.md`; `docs/plans/**`.
+**Files this lane MUST NOT touch:** every Go package under `internal/**`; every root `api_*.go` and its tests; `ddl.go`, `ddl_test.go`, `boundary_test.go`; `admin/**`; `systemplanetest/**`; `ddl/**`; `go.mod`; `go.sum`; `.ignorecoverunit`; `.golangci.yml`; `.releaserc.yml`; `CHANGELOG.md`; `docs/plans/**`.
 
 Three of those need their reason stated once, so no task re-derives it:
 
-- **`.ignorecoverunit` already carries `examples/*`.** New example directories need no edit there, and the `engine-core` lane is removing the two `internal/manager/*` lines from that same file — an edit here would collide at merge for nothing.
+- **`.ignorecoverunit` already carries `examples/*`.** New example directories need no edit there.
 - **`.golangci.yml` already excludes `examples$`** from both `linters.exclusions.paths` and `formatters.exclusions.paths`. The examples must still compile and pass `go vet`; they are simply not linted, which is deliberate and needs no change.
-- **`api_constructors.go`, `api_client.go` and `internal/client/options.go` belong to `engine-tenants`**, this lane's wave-3 sibling, which is writing them at the same time. The godoc clauses the index assigns to "the root Postgres tenant-connector option" therefore cannot be written here (see § DEVIATIONS, item 1).
+- **`api_constructors.go`, `api_client.go`, `api_errors.go` and `internal/client/{client,get,set,onchange,errors,options}.go` belong to `engine-tenants`**, this lane's wave-3 sibling, and engine-core Phase 3 Epic 3.1 also edits `api_constructors.go` and `internal/client/options.go` to drop the three name-override options. The godoc clauses the index assigns to "the root Postgres tenant-connector option" therefore cannot be written here (see § DEVIATIONS, item 1).
 
-**`examples/manager/` is deleted by the `engine-core` lane, in its Task 2.2.1, together with the public `Manager` surface.** This lane does not delete it and must never recreate it. If `feat/v4-docs` is cut from a base where `examples/manager/main.go` still exists, that base predates `engine-core` merging and the lane's dependency is unmet — stop and report to the orchestrator rather than deleting it here.
+**`examples/manager/` was deleted by `engine-core` Task 2.2.1** (no `examples/` directory exists on `develop` `0ecdf9e`). This lane must never recreate it.
 
 ---
 
@@ -81,11 +81,13 @@ PY
 Also written once. It is the index's forbidden-token list, narrowed so it cannot fire on a legitimate use, and scoped to the product documents this lane owns — never repo-wide, because a lane cannot prove a negative while its siblings are writing (lane-cut rule 4; the repo-wide sweep is the `integration` lane's). `MIGRATION-v4.md` is deliberately excluded: naming a removed symbol as removed is that document's job.
 
 ~~~bash
-grep -rnE 'lib-commons/v6|lib-systemplane/v3|NewManager|ManagerOption|WithManagerLogger|WithManagerTelemetry|WithManagerAggregateTenantThreshold|systemplane\.Manager|\.Drain\(|OnTenant(Activated|Suspended|Deleted|CredentialsRotated)|DefaultSeedSQL|WithTable\(|WithListenChannel\(|WithCollection\(|WithLazyTenantLoad|WithTenantAuthorizer|WithTenantSchemaEnabled|RegisterTenantScoped|GetForTenant|systemplane_notify_v3' \
-  README.md CLAUDE.md doc.go docs/PROJECT_RULES.md examples/
+ABSENT='lib-commons/v6|lib-systemplane/v3|NewManager|ManagerOption|WithManagerLogger|WithManagerTelemetry|WithManagerAggregateTenantThreshold|systemplane\.Manager|\.Drain\(|OnTenant(Activated|Suspended|Deleted|CredentialsRotated)|DefaultSeedSQL|WithTable\(|WithListenChannel\(|WithCollection\(|WithLazyTenantLoad|WithTenantAuthorizer|WithTenantSchemaEnabled|RegisterTenantScoped|GetForTenant|systemplane_notify_v3'
+grep -rnE "$ABSENT" README.md CLAUDE.md doc.go docs/PROJECT_RULES.md examples/
 ~~~
 
-Three narrowings are deliberate and must not be widened. **`NewManager` and `systemplane\.Manager`, never a bare `Manager`** — `docs/PROJECT_RULES.md` uses `Manager` as a naming-convention example and v4's own `WithPostgresTenantManager(mgr *tmpostgres.Manager)` names a lib-commons `Manager` legitimately. **`WithTable\(` with the parenthesis** — the word "table" is ordinary prose. **`Slice N` is absent from this list**: it appears only in `internal/manager/**`, which `engine-core` deletes, so it can never appear in a document this lane owns; the index's repo-wide check covers it in the `integration` lane. Baseline on `develop`: this grep returns 48 lines. Target after Phase 2: zero.
+A task that touches one file runs `grep -nE "$ABSENT" <file>` with `ABSENT` set exactly as above; expected: no output.
+
+Three narrowings are deliberate and must not be widened. **`NewManager` and `systemplane\.Manager`, never a bare `Manager`** — `docs/PROJECT_RULES.md` uses `Manager` as a naming-convention example and v4's own `WithPostgresTenantManager(mgr *tmpostgres.Manager)` names a lib-commons `Manager` legitimately. **`WithTable\(` with the parenthesis** — the word "table" is ordinary prose. **`Slice N` is absent from this list**: it appears only in `internal/manager/**`, which `engine-core` deletes, so it can never appear in a document this lane owns; the index's repo-wide check covers it in the `integration` lane. Baseline on `develop` `0ecdf9e`: 24 lines (`README.md` 16, `docs/PROJECT_RULES.md` 8, `CLAUDE.md` 0, `doc.go` 0; `examples/` does not exist). Target after Phase 1: `README.md` 16 only. Target after Phase 2: zero.
 
 ---
 
@@ -93,243 +95,352 @@ Three narrowings are deliberate and must not be widened. **`NewManager` and `sys
 
 | Phase | Milestone | Epics | Status |
 |-------|-----------|-------|--------|
-| 1 | Every document whose content is fixed by the frozen contracts is written and correct: `MIGRATION-v4.md` complete (surface diff, behaviour changes, database/operator contract, one section per consumer), `CLAUDE.md` describing the v4 facade and engine, `docs/PROJECT_RULES.md` corrected against the API that actually ships, `doc.go` rewritten. No example, no README rewrite, no deletion. | 1.1, 1.2 | Detailed |
+| 1 | Every document whose content the merged code determines is written and true against `develop` `0ecdf9e`: `MIGRATION-v4.md` (surface diff, behaviour changes, database/operator contract, one section per consumer), `CLAUDE.md` finished, `docs/PROJECT_RULES.md` corrected, `doc.go` rewritten. Behaviour still owned by engine-tenants, engine-core Phase 3 or the panic-posture branch is a `NOT-YET(<lane>)` placeholder, never a claim. No example, no README rewrite, no deletion. | 1.1, 1.2 | Detailed |
 | 2 | The three examples exist and compile in CI; the README is rebuilt around them; `.env.reference` is gone; the godoc truth sweep is run and its findings are either fixed here or handed to the owning lane | 2.1, 2.2, 2.3 | Epic-level |
 
-**Why the split falls here.** Phase 1 writes only what FC-1 through FC-11 and decisions D1–D11 already determine: which symbols exist, which are gone, what a delete publishes, what `Start` announces, what the DDL does. None of that needs a line of landed code, so Phase 1 can be authored the moment this worktree exists — including before `engine-core` and `storage` merge, if the orchestrator wants the wall-clock. Phase 2 needs the real thing: an example cannot be compiled against a `WithCloseTimeout` that has not landed, the README cannot stop showing `DefaultSeedSQL()` until `storage` Epic 3.2 removes it, and a godoc sweep over a surface still carrying `Manager` reports the pre-v4 world.
+**Why the split falls here.** Phase 1 writes only what FC-1 through FC-11 and decisions D1–D11 already determine: which symbols exist, which are gone, what a delete publishes, what `Start` announces, what the DDL does. Re-elaborated 2026-09-24 against `develop` `0ecdf9e`, after engine-core Phase 2, storage and groups Phase 2 merged: every claim now cites the tree, and what is still frozen-but-unbuilt is marked (§ Phase 1, The NOT-YET convention). Phase 2 needs the real thing: an example cannot be compiled against a `WithCloseTimeout` that has not landed, the README cannot stop showing `DefaultSeedSQL()` until `storage` Epic 3.2 removes it, and a godoc sweep over a surface still carrying `Manager` reports the pre-v4 world.
 
 ---
 
-## Phase 1: the documents the frozen contracts already determine
+## Phase 1: the documents the merged code already determines
 
-At the end of this phase a consumer holding v2.0.0 or v3.0.0 can read `MIGRATION-v4.md` and know exactly what their upgrade costs, and an agent opening `CLAUDE.md` or `docs/PROJECT_RULES.md` gets the v4 contract instead of the v1.x one. Nothing compiles differently; `go build ./...` is untouched by every task in this phase except none — Phase 1 edits exactly one `.go` file, `doc.go`, and only its comments.
+At the end of this phase a consumer holding v2.0.0 or v3.0.0 can read `MIGRATION-v4.md` and know what their upgrade costs today, and an agent opening `CLAUDE.md` or `docs/PROJECT_RULES.md` gets the v4 contract instead of the v1.x one. The only `.go` file touched is `doc.go`, comments only.
+
+**Base.** `develop` at `0ecdf9e` (engine-core Phase 2 merged as PR #93, tagged `v4.0.0-beta.13`). Every `file:line` below was checked against that tree on 2026-09-24. Cut the worktree from `origin/develop`; if `origin/develop` has moved, re-check the anchors a task cites before writing from them.
+
+**Execution order** (one task per commit; each task is 10-40 tool-call turns):
+
+| Order | Task | Name | Est. turns | NOT-YET placeholders left |
+|---|---|---|---|---|
+| 1 | 1.2.2 | Correct `docs/PROJECT_RULES.md` | 30 | 3 |
+| 2 | 1.2.3 | Rewrite the root package doc | 12 | 0 (one marker, no placeholder) |
+| 3 | 1.1.1 | Create `MIGRATION-v4.md`: framing, surface diff, module hop | 30 | 3 |
+| 4 | 1.1.2a | § Behaviour changes: reads, writes, validation | 35 | 2 |
+| 5 | 1.1.2b | § Behaviour changes: callbacks, lifecycle, freshness, panics | 35 | 3 |
+| 6 | 1.1.3 | § The database and operator contract | 25 | 3 |
+| 7 | 1.1.4 | Per-consumer sections: seven Client-only consumers | 25 | 2 |
+| 8 | 1.2.1 | Finish `CLAUDE.md` | 15 | 3 |
+| 9 | 1.1.5 | Per-consumer sections: three Manager users | 30 now, ~15 after engine-tenants | 4 |
+
+**The NOT-YET convention.** Some v4 behaviour is frozen in the index but not in the tree. Three lanes own it:
+
+- `NOT-YET(engine-tenants)` — tenant-manager options (`WithPostgresTenantManager`, `WithMongoTenantManager`), `Client.HandleTenantLifecycle` and its returned errors, `WithAggregateTenantThreshold`, the blocked marker, lazy activation, multi-tenant `OnChange` and a non-empty `Change.Tenant`, the root aliases `ErrSharedDatabaseUnsupported` and `ErrTenantManagerBackendMismatch`, LISTEN-per-tenant sizing, multi-tenant validator grading. Pending; nothing in the tree.
+- `NOT-YET(engine-core-p3)` — engine-core Phase 3 Epic 3.1: removal of the three name-override options (`WithTable`, `WithListenChannel`, `WithCollection`). Pending; still exported at `api_constructors.go:62-63,78-82` and wired at `internal/client/options.go:70-132`.
+- `NOT-YET(panic-posture)` — branch `fix/panic-posture-storage` (PR not merged): deletes `internal/safelog.Guard` and guards the consumer logger with lib-observability `log.Guard`; reports every panic the library recovers (store changefeeds, debounce, admin authorizer and actor extractor, `OnChange` callbacks, group appliers, logger calls) with a log line, the `panic_recovered_total` counter and a span event through lib-observability `runtime`; moves the lib-observability pin to `v4.5.0-beta.10`. The counter only lights after the host calls `runtime.InitPanicMetrics`. On `develop` the store changefeeds still recover with `runtime.RecoverAndLog` (`internal/postgres/postgres_listen.go:233,707,804,1033`, `internal/mongodb/mongodb_changestream.go:748,976,1053`) and the pin is `v4.5.0-beta.7` (`go.mod:7`).
+
+The writer follows one rule for every marker: **describe the behaviour that holds on `develop` today (the v3 behaviour, where v4 has not changed it yet), then leave exactly one line `<!-- NOT-YET(<lane>): <what lands, one clause> -->` where the owning lane's text goes.** The owning lane, or this lane right after that lane merges, replaces the line. Never write a NOT-YET behaviour as fact. In `CLAUDE.md`, `docs/PROJECT_RULES.md` and `doc.go` a placeholder never names a symbol the absence grep forbids (write "the three name-override options", not their names). No document cites `internal/safelog` for guarding the logger: describe the guard by its effect. `grep -c 'NOT-YET(' <file>` counts the placeholders a task left; the count each task states is its expected output.
+
+**Two checks every `MIGRATION-v4.md` task runs**, besides § The link check:
+
+~~~bash
+# every engine-tenants symbol sits on a placeholder line (expected: no output)
+grep -nE 'WithPostgresTenantManager|WithMongoTenantManager|Client\.HandleTenantLifecycle|WithAggregateTenantThreshold|ErrTenantManagerBackendMismatch|ErrSharedDatabaseUnsupported|blocked marker|lazy activation' MIGRATION-v4.md | grep -v 'NOT-YET('
+# no false claim the recheck removed (expected: no output)
+grep -nE 'internal/safelog|safelog\.Guard|RecoverAndLog|changes an import line and nothing else|is hand-tagged|v3\.0\.0 kept' MIGRATION-v4.md
+~~~
 
 ### Epic 1.1: `MIGRATION-v4.md`
 
-**Goal:** One document that answers, for every consumer in the matrix, "what breaks, what replaces it, and what do I have to do to my database".
+**Goal:** One document that answers, for every consumer in the matrix, "what breaks, what replaces it, and what do I have to do to my database", true against `develop` today and explicit about what is still landing.
 **Scope:** `MIGRATION-v4.md` (new), one pointer line in `MIGRATION-v3.md`.
-**Dependencies:** none
-**Done when:** `MIGRATION-v4.md` exists with the seven top-level sections Task 1.1.1 establishes; every symbol in FC-10's "Removed in v4" list appears in it with its replacement named; every behaviour change in `index.md` § "Behaviour changes MIGRATION-v4.md must name" has a subsection; the matrix's ten rows each have a `###` section; § The link check passes.
+**Dependencies:** none for Tasks 1.1.1-1.1.4; Task 1.1.5 is finished after engine-tenants merges.
+**Done when:** `MIGRATION-v4.md` exists with the seven `##` sections of Task 1.1.1; every FC-10 removed symbol appears with its replacement or its placeholder; every entry of `index.md` § "Behaviour changes MIGRATION-v4.md must name" is covered by Task 1.1.2a, 1.1.2b, 1.1.3 or (as a placeholder) 1.1.5; the ten matrix rows each have a `###` section; both § Phase 1 checks and § The link check pass.
 **Status:** Pending
 
-#### Task 1.1.1: Create `MIGRATION-v4.md` — framing, the surface diff, and the dependency hop
+#### Task 1.1.1: Create `MIGRATION-v4.md` — framing, surface diff, module hop
 
 - [ ] Done
 
-**Context:** There is no v4 migration document. `MIGRATION-v3.md` is the only precedent and it is a good one: it opens with *why the major exists* in one sentence, gives a from/to table with a "breaking?" column, then shows the actual consumer diff. Copy that shape, not its content. The material for this task is entirely in `index.md`: FC-10 lists what is kept, what is removed and what is added; FC-1 gives the module path; the repository's own `go.mod` on this branch already declares `lib-commons/v7` and `lib-observability/v4`.
+**Context:** No v4 migration document exists; `MIGRATION-v3.md` (225 lines) is the shape to copy: why the major exists, a from/to table, the consumer diff. Verified generations: v1.6.1 = unsuffixed path, `lib-commons/v5`, `lib-observability v1.1.0`, `gofiber/fiber/v2`, `admin.WithAuthorizer(func(*fiber.Ctx, string) error)` (`git show v1.6.1:go.mod`, `v1.6.1:admin/admin.go:85`); v1.6.0 = lib-commons v5.3.0, lib-observability v1.0.0. v2.0.0 = `/v2`, Fiber v3, `lib-commons/v6`, `lib-observability/v2 v2.0.0`. **v3.0.0 = `/v3`, `lib-commons/v7 v7.0.0`, `lib-observability/v4 v4.0.1`** (`git show v3.0.0:go.mod`, PR #58); v3.0.0-beta.2 is already on v7 too. `develop` = `/v4`, `lib-commons/v7`, `lib-observability/v4` (`go.mod:1,6,7`). Surface verified with `go doc -short .`: removed `Manager` and its API (existed at `v3.0.0:manager.go:36-72`, `v3.0.0:manager_methods.go:31-94`) and `DefaultSeedSQL` (gone from `ddl.go`); added `WithCloseTimeout` (`api_constructors.go:76`), `ErrCloseTimeout` (`api_errors.go:56-63`), `GetEntry`/`Entry` (`api_client.go:84`, `api_change.go:9`), `Bind`, `Group[T]`, `Snapshot[T]`, `Applied[T]`, `ApplyStatus`, `Group.OnApply`, `Group.Status`, `ErrApplyPanicked` (`api_group.go:12-14,108,495,527`), `MigrationV3ToV4SQL()` (`ddl.go:130`). `OnChange` was `func(ctx, ns, key string, newValue any)` at `v3.0.0:api_client.go:113`; it is `func(ctx context.Context, ch Change)` now (`api_client.go:184`). `.releaserc.yml:5-16` maps breaking → minor, guarded by `admin/release_policy_test.go`; the v4.0.0 cut rule is `index.md` § Merge Order step 4 (a dry-run decides; hand tag only if it computes `3.1.0`).
 
-Four generations of this library are in the fleet at once, and they are not equally far from v4. Verified against the tags in this repository: v1.6.1 is module path `github.com/LerianStudio/lib-systemplane` with **no** major suffix, `lib-commons/v5`, `lib-observability v1.1.0` and `gofiber/fiber/v2`, and its `admin.WithAuthorizer` takes `func(*fiber.Ctx, string) error` — a pointer receiver on Fiber v2. v2.0.0 moved to `/v2` on the Fiber v3 stack with `lib-commons/v6`. v3.0.0 kept that and changed only the observability boundary (`MIGRATION-v3.md`). v4 is `/v4` on `lib-commons/v7`. So a v1.6.x consumer's jump is not one hop, and the document must say so before it says anything else, or two consumers will read a list of v4 changes and be blindsided by Fiber.
+**Implementation vision:** Create `MIGRATION-v4.md` with seven `##` sections in this order; 4, 5, 6 are a heading plus `<!-- filled by Task 1.1.2a/1.1.2b -->`, `<!-- filled by Task 1.1.3 -->`, `<!-- filled by Tasks 1.1.4, 1.1.5 -->`.
 
-**Implementation vision:** Create `MIGRATION-v4.md` with these seven `##` sections, in this order, and leave four of them as a one-line heading plus a `<!-- filled by task N -->` marker for the tasks that own them:
+1. `## Why v4 exists` — three paragraphs. (a) v3 carried two engines implementing one policy twice (single-tenant `Client` cache, multi-tenant `Manager`); every 2026-09 audit defect was one bug present in one and fixed in the other. (b) v4 has one engine that converges a scope by reconciling it against the store after every changefeed (re)connect and stamps every published value with a store revision. (c) What a single-tenant consumer gets today: a value written while the feed was down becomes visible after reconnect without a second write; a slow subscriber of one key no longer delays another key. State that this is a behaviour upgrade, so § Behaviour changes must be read even when the code compiles unchanged. One placeholder: `<!-- NOT-YET(engine-tenants): the same guarantees per tenant scope -->`.
+2. `## The surface diff` — three tables with a "what to do" column, introduced by bold labels, not headings (no `###` in this section).
+   - **Removed:** `Manager`, `ManagerOption`, `NewManager`, `WithManagerLogger`, `WithManagerTelemetry`, `WithManagerAggregateTenantThreshold`, every `(*Manager)` method (`OnTenantActivated`, `OnTenantSuspended`, `OnTenantDeleted`, `OnTenantCredentialsRotated`, `Drain`, `IsClosed`, `HandleTenantLifecycle`), `DefaultSeedSQL` (no replacement: defaults live in code; persisted overrides are the consumer's own migration, D8). `Drain` → `Client.Close()` for a single-tenant Client. The Manager's tenant replacements go on one row with `<!-- NOT-YET(engine-tenants): Client.HandleTenantLifecycle, WithAggregateTenantThreshold, tenant-scope teardown in Close -->`. `WithTable`, `WithListenChannel`, `WithCollection` get their own row: "still exported and honoured, as in v3" plus `<!-- NOT-YET(engine-core-p3): removed with no replacement; canonical names systemplane_entries / systemplane_changes (D8) -->`.
+   - **Added:** `WithCloseTimeout`, `ErrCloseTimeout`, `GetEntry`, `Entry`, `Bind`, `Group[T]`, `Snapshot[T]`, `Applied[T]`, `ApplyStatus`, `Group.OnApply`, `Group.Status`, `ErrApplyPanicked`, `MigrationV3ToV4SQL()`. The tenant-manager additions ride the same engine-tenants placeholder as the removed row, not a second one.
+   - **Changed shape:** `OnChange` (show both signatures; `Change{Tenant, Namespace, Key, Revision, Value}`, `Tenant` is `""` in single-tenant mode); `Close` keeps its signature and gains a bounded wait; `SchemaSQL()` returns the v4 DDL. Close the section with the kept list from FC-10 and one corrected sentence: a single-tenant consumer that registers keys and reads them changes its import line, then reads § Behaviour changes, because numeric defaults and validators now see `float64` and `Set`/`Delete` can return errors they did not return in v3 (`api_client.go:18-24`, `internal/client/set.go:121-136`).
+3. `## The module and dependency hop` — one row per starting generation:
+   - `/v3` → `/v4`: module path only. `lib-commons/v7` and `lib-observability/v4` are already what v3.0.0 ships.
+   - `/v2` → `/v4`: module path, `lib-commons/v6` → `/v7`, `lib-observability/v2` → `/v4` (the observability boundary: point at `MIGRATION-v3.md`, do not repeat it). Say why lib-commons is not optional: lib-commons' major is part of this library's contract by construction, which is why `boundary_test.go:27-30` leaves it out of the denylist. Concretely today: multi-tenant mode reads the tenant connection through lib-commons v7's `tmcore.GetPGContext` / `GetMBContext` (`internal/client/options.go:134-149`), so a consumer whose tenant middleware is still v6 sets a context key the library never finds and every call fails with `ErrTenantConnectionMissing` (`internal/postgres/postgres.go:297`).
+   - v1.6.x → `/v4`: precondition, not part of this upgrade — Fiber v2 → v3 (changes `admin.WithAuthorizer` from `func(*fiber.Ctx, string) error` to `func(fiber.Ctx, string) error`), `lib-commons` v5 → v7, `lib-observability` v1 → v4. This repository publishes no v1 → v2 document and documents from v3 onward (orchestrator resolution 5).
+   - One sentence: lib-observability stays on `/v4` in every row, and `go mod tidy` raises its minor to whatever the library requires; do not name a beta pin (`NOT-YET(panic-posture)` moves it).
+4-6. Headings plus markers, as above. § Per consumer carries one reading instruction: find your row; every section assumes § Behaviour changes has been read.
+7. `## Why the module path moved in the same commit as the break` — three sentences: this repository does not auto-major (`.releaserc.yml` maps breaking → minor, guarded by `admin/release_policy_test.go`); the path rename and the API break are one change because Go rejects a `/v4` module tagged `v3.x`; the `v4.0.0` cut follows a semantic-release dry-run on `main`, not a reflex hand tag.
 
-1. `## Why v4 exists` — written here. Three paragraphs, no more. (a) The library carried two engines that implemented the same policy twice — the single-tenant `Client` cache and the multi-tenant `Manager` — and every defect the 2026-09 audit found was the same bug present in one and fixed in the other. (b) v4 collapses them into one engine that tracks N scopes, converges a scope by reconciling it against the store after every changefeed reconnect instead of trusting the feed, and stamps every published value with a store revision. (c) What that buys a consumer: a value written while the connection was down becomes visible after reconnect **without a second write**; a slow subscriber of one key no longer delays another key; a callback now knows which tenant it is for. State plainly that this is a behaviour upgrade, not only a rename, which is why § Behaviour changes exists and must be read even by a consumer whose code compiles unchanged.
-2. `## The surface diff` — written here. Three tables, each with a "what to do" column:
-   - **Removed.** Exactly FC-10's removed list: `Manager`, `ManagerOption`, `NewManager`, `WithManagerLogger`, `WithManagerTelemetry`, `WithManagerAggregateTenantThreshold`, every `(*Manager)` method (`OnTenantActivated`, `OnTenantSuspended`, `OnTenantDeleted`, `OnTenantCredentialsRotated`, `Drain`, `IsClosed`, `HandleTenantLifecycle`), `WithTable`, `WithListenChannel`, `WithCollection`, `DefaultSeedSQL`. Each row names its replacement: the `OnTenant*` handlers and `HandleTenantLifecycle` become `Client.HandleTenantLifecycle` (FC-6); `Drain` becomes `Close` (D10); `WithManagerAggregateTenantThreshold` becomes `WithAggregateTenantThreshold` on the Client; `WithTable`/`WithListenChannel`/`WithCollection` have **no** replacement — `systemplane_entries` and `systemplane_changes` are the only names (D8); `DefaultSeedSQL` has no replacement — defaults live in code, and a consumer who wants persisted overrides writes its own migration (D8).
-   - **Added.** `WithPostgresTenantManager`, `WithMongoTenantManager`, `Client.HandleTenantLifecycle`, `WithAggregateTenantThreshold` (FC-6); `WithCloseTimeout` and `ErrCloseTimeout` (D10); `GetEntry` and `Entry` (FC-5); `Bind`, `Group[T]`, `Snapshot[T]`, `Applied[T]`, `ApplyStatus` (FC-7); `MigrationV3ToV4SQL()` (FC-8).
-   - **Changed shape.** `OnChange`: the callback went from `func(ctx context.Context, ns, key string, newValue any)` — verified as the v2.0.0 and v3.0.0 signature — to `func(ctx context.Context, ch Change)` where `Change` carries `Tenant`, `Namespace`, `Key`, `Revision` and `Value` (FC-4). `Change` is also the only place a callback learns its tenant. `Close` keeps its signature and gains a bounded wait (D10). `SchemaSQL()` returns different SQL (FC-8).
-   - Close with the sentence that FC-10's kept list is kept: `NewPostgres`, `NewMongoDB`, `Register`, `Start`, every typed getter, `Set`, `Delete`, `List`, the whole catalog surface, `KeyDescription`, `KeyRedaction`, `IsRegistered`, `Logger`, every key option, `admin.Mount` and `admin.MountCatalog` are untouched. A single-tenant consumer that registers keys and reads them changes an import line and nothing else.
-3. `## The module and dependency hop` — written here. A table with one row per starting generation: from `github.com/LerianStudio/lib-systemplane` (v1.6.x), `/v2`, `/v3` → `/v4`, each naming what else moves. For v3 → v4: `lib-commons/v6` → `lib-commons/v7`, and say *why it is not optional* — `WithPostgresTenantManager(mgr *tmpostgres.Manager)` takes a concrete tenant-manager handle, Go matches it nominally, so a v6 `*tmpostgres.Manager` does not satisfy a v7 parameter and will not compile. This is the same coupling `boundary_test.go` deliberately leaves out of its denylist: lib-commons' major **is** part of this library's contract, by construction. For v2 → v4: the same, plus the observability boundary of v3 — point at `MIGRATION-v3.md` rather than repeating it. For v1.6.x → v4: the same, plus `lib-observability` v1 → v4, plus **`gofiber/fiber/v2` → `gofiber/fiber/v3`**, which changes `admin.WithAuthorizer` from `func(*fiber.Ctx, string) error` to `func(fiber.Ctx, string) error` and is a migration of the consumer's whole HTTP stack, not of this library. State it as a precondition: a service still on Fiber v2 upgrades Fiber first; this repository publishes no v1 → v2 migration document.
-4. `## Behaviour changes` — heading only, marker comment. Task 1.1.2 fills it.
-5. `## The database and operator contract` — heading only, marker comment. Task 1.1.3 fills it.
-6. `## Per consumer` — heading only, plus a one-paragraph reading instruction ("find your row; every section assumes you have read § Behaviour changes"). Tasks 1.1.4 and 1.1.5 fill the subsections.
-7. `## Why the module path moved in the same commit as the break` — written here, three sentences reusing the reasoning `MIGRATION-v3.md` already carries: this repository does not auto-major by policy (`.releaserc.yml` maps breaking → minor, guarded by `admin/release_policy_test.go`), so `v4.0.0` is hand-tagged, and the path rename and the API break are one change because Go rejects a `/v4` module tagged `v3.x`.
-
-Then add exactly one line to `MIGRATION-v3.md`, directly under its title: a sentence saying this document covers the v2 → v3 move only, and pointing at `MIGRATION-v4.md` for v4. Do not touch anything else in that file.
+Add one line to `MIGRATION-v3.md` directly under its title (`MIGRATION-v3.md:1`): this document covers v2 → v3 only; v4 is in `MIGRATION-v4.md`. Nothing else in that file.
 
 **Files:**
 - Create: `MIGRATION-v4.md`
-- Modify: `MIGRATION-v3.md` (one pointer line under the title)
+- Modify: `MIGRATION-v3.md` (one line under the title)
 
-**Verification:** from `/srv/worktrees/v4-docs`, the link check (§ The link check) over `MIGRATION-v4.md MIGRATION-v3.md` exits 0, and every symbol in FC-10's removed list is present:
+**Verification:** from `/srv/worktrees/v4-docs`:
 
 ~~~bash
 for s in Manager ManagerOption NewManager WithManagerLogger WithManagerTelemetry \
          WithManagerAggregateTenantThreshold WithTable WithListenChannel \
          WithCollection DefaultSeedSQL Drain OnTenantActivated OnTenantSuspended \
-         OnTenantDeleted OnTenantCredentialsRotated; do
+         OnTenantDeleted OnTenantCredentialsRotated IsClosed HandleTenantLifecycle; do
   grep -q "$s" MIGRATION-v4.md || echo "MISSING: $s"
-done
+done                                     # expected: no output
+grep -c 'lib-commons/v6' MIGRATION-v4.md # expected: 1 (the /v2 row)
+grep -c 'NOT-YET(' MIGRATION-v4.md       # expected: 3
+git diff --numstat MIGRATION-v3.md       # expected: added 1 or 2 (one line plus at most one blank), deleted 0
 ~~~
 
-prints nothing.
+plus both § Phase 1 checks (no output) and § The link check over `MIGRATION-v4.md MIGRATION-v3.md` (exit 0).
 
-**Done when:** `MIGRATION-v4.md` exists with the seven sections, sections 1, 2, 3 and 7 are written, sections 4, 5 and 6 are headings with markers, every removed symbol is named with its replacement, the three generation hops are tabulated with Fiber named as a precondition for v1.6.x, and `MIGRATION-v3.md` has gained exactly one line.
+**Done when:** seven sections exist, 1, 2, 3 and 7 written; the v3 → v4 row says module path only; every removed symbol is named with its replacement or placeholder; three placeholders; `MIGRATION-v3.md` gained one line.
 
-#### Task 1.1.2: Write § Behaviour changes — what a consumer observes without changing a line
+#### Task 1.1.2a: Write § Behaviour changes — reads, writes and validation
 
 - [ ] Done
 
-**Context:** This is the section the index singles out, and it is the one a consumer skips at its peril: several of these change what a service *does* at runtime while its code still compiles. The complete source list is `index.md` § "Behaviour changes MIGRATION-v4.md must name" (five entries collected from the lanes during elaboration) plus the four the docs Done-when names directly (FC-11 initial publication at `Start`, coalesced delivery, the `Change` signature, the removed options) plus D10's `Close`. Two of them are ordered by blast radius rather than by source order, because one of them will break a running service quietly.
+**Context:** Sources: `index.md` § "Behaviour changes MIGRATION-v4.md must name" and the verified list below. Every item is single-tenant fact on `develop` unless it carries a marker.
 
-**Implementation vision:** Nine `###` subsections under `## Behaviour changes`, each opening with a one-line "**Affects:** …" naming who, then what changed, then what to do. In this order — most likely to surprise first:
+| Behaviour | Anchor |
+|---|---|
+| A stored row the key's validator rejects never reaches a read; the registered default (hydration) or last valid value (refresh) stays; WARN names key and error, never the value | `api_client.go:33-35`, `internal/engine/ingest.go:154,228-233` |
+| Multi-tenant per-request `Get`/`List` stay ungraded | `internal/client/get.go:108-135` |
+| Validators and registered defaults see the canonical JSON shape (`float64`, `map[string]any`, `[]any`); `v.(int)` fails at `Register`/`Set` with `ErrValidation`; `Get` of a numeric no-row key returns `float64` | `api_client.go:18-24`, `api_constructors.go:104-106`, `internal/client/set.go:73-97` |
+| A validator panic refuses the write or the row instead of crashing | `internal/engine/ingest.go:364-385` |
+| Read-back validation ctx carries no tenant and no request values; a `WithContextValidator` that refuses without a tenant pins the last valid value | `api_constructors.go:115-122` |
+| `Set`/`Delete` return an error when the row persisted but was not published: `ErrClosed`, or an error wrapping `ErrNotStarted` saying "was written/deleted but not published"; v3 returned nil | `internal/client/set.go:121-136,187-195` |
+| A `Set` racing `Start` can persist and still return `ErrNotStarted` | `api_client.go:51-53,115-117` |
+| Read-your-writes: `Set` publishes into the cache with the store's revision before returning; the echo is deduplicated | `internal/client/set.go:113-141` |
+| `KeyRedaction` answers `RedactFull` on a closed or nil Client (v3: `RedactNone`); an unregistered key on an open Client stays `RedactNone` | `api_client.go:193-199`, `internal/client/get.go:438-441` |
+| Redacted values are withheld from every panic, decode, validator, apply and typed-getter report | `internal/engine/ingest.go:187,233,439`, `internal/group/coordinator.go:279,433,846,881`, `internal/client/get.go:136-150` |
+| Postgres reads under a dbresolver with replicas are pinned to the primary | `internal/postgres/postgres.go:267-308` |
+| Log field `key` renamed `keyname` | `internal/engine/ingest.go:166,186,232` |
 
-1. **A stored row your own validator rejects no longer reaches a read.** Affects: every consumer that registered a key with `WithValidator`, single-tenant especially. In v3 the raw row reached `Get` and `Group.Snapshot`; hydration, refresh and warm-load skipped the validator entirely. v4 runs one `decode → validate → publish` ingress for every path, so an invalid row is rejected at ingress, the last valid value (or the registered default) stays in force, and the rejection is logged. The visible consequence: a service that had been silently running on an out-of-range value reverts to its default on the next restart. Tell the reader to check their store for rows their own validators would refuse, **before** deploying v4.
-2. **Every registered callback fires once at `Start`.** Affects: anyone calling `OnChange` before `Start`; br-sfn does it 17 times. FC-11: when a scope completes its first reconcile the engine publishes every registered key, including keys with no row (registered default, `Revision 0`), and dispatches those to subscribers registered before that moment. v3 deliberately suppressed callbacks during hydration. A callback that assumed "I only run when something changed" now runs once at boot with the current value — so a callback that, for instance, bumps a counter or posts a notification will do it at every start. Name the fix: make the callback idempotent, or compare against the value the callback last applied.
-3. **`OnChange`'s callback signature changed.** Affects: everyone who subscribes. `func(ctx, ns, key string, newValue any)` → `func(ctx, ch Change)`, with `Change{Tenant, Namespace, Key, Revision, Value}` (FC-4). Show the two signatures and the mechanical rewrite. Say that `Change.Tenant` is how a multi-tenant callback learns which tenant it fired for — in v3 it could not, which is the defect this closes — and that `Revision 0` means no row exists and `Value` is the registered default.
-4. **Deliveries are coalesced per (scope, key), and independent across keys.** Affects: anyone whose callback is slow. While a callback is busy, a newer revision of the same key in the same scope **replaces** the pending one: the callback may skip intermediate revisions but always receives the newest and never sees revisions out of order. Different keys deliver independently, so a blocked subscriber of key A no longer delays key B — in v3 a slow callback stalled the whole LISTEN goroutine. The same non-zero revision with the same value bytes is never delivered twice; `Revision 0` is never deduplicated. Consequence to state: a consumer that was counting callbacks, or that relied on seeing every intermediate value, must stop.
-5. **`Close` replaces `Drain`, and it can now tell you about a stuck callback.** Affects: Manager users (notifications, plugin-br-pix-jd) and anyone with long-running callbacks. `Client.Close()` keeps its signature: it cancels every scope's feed and the ctx handed to every in-flight callback, then waits for the dispatch workers up to `WithCloseTimeout` (default 30s). A callback that honours ctx ends and `Close` returns nil. A callback that ignores ctx makes `Close` return `ErrCloseTimeout` naming the (scope, key) still running — that goroutine is the subscriber's leak, now visible instead of hidden. Tell the reader to honour the ctx they are handed.
-6. **Multi-tenant gained a cache and push hot reload — if you opt in.** Affects: every multi-tenant consumer. Two multi-tenant shapes now exist and the difference matters: with `WithPostgresTenantManager` / `WithMongoTenantManager` (FC-6) a tenant's scope activates lazily on its first read, caches, subscribes and reconciles; with plain `WithMultiTenantEnabled()` and no connector the per-request path of v3 is unchanged — every read resolves the tenant database from ctx and reads through, with no cache. State which surfaces are gated on the connector, and see § DEVIATIONS item 4 for the one clause this task must not guess.
-7. **`GetEntry` reports revision, provenance and freshness.** Affects: anyone who wants to know whether what they just read is current. FC-5: `Entry{Value, Revision, UpdatedAt, UpdatedBy, Stale}`; `Stale` is true while the scope's changefeed is disconnected or not yet reconciled, and reads keep serving the last published value during that window rather than blocking or erasing. The admin `GET` routes render the same four fields.
-8. **Read-your-writes, in every mode.** Affects: anyone who writes then immediately reads. `Set` publishes to the caller's scope cache with the revision the store returned **before returning** (D4); the feed echo is deduplicated by revision. In v3 a `Set` followed by a `Get` could return the old value until the NOTIFY came back.
-9. **Revisions are opaque.** One line, pointing forward to § The database and operator contract, where the number's properties are stated.
+In v3.0.0 a raw stored row reached `Get` ungraded; read-back grading arrived on the v4 line (PR #84, first in `v4.0.0-beta.10`). `Group` never existed in a v3 release, so the document must not say v3's raw row reached `Group.Snapshot`.
+
+**Implementation vision:** Replace the § Behaviour changes marker with an opening sentence ("ordered by how quietly each one changes a running service") and these `###` subsections, each opening with **Affects:**, then what changed, then what to do:
+
+1. **A stored row your validator rejects no longer reaches a read** (single-tenant). Do: before deploying, query the store for rows your validators would refuse; the service reverts those keys to their default on the next start. One line: multi-tenant per-request reads still read through ungraded, then `<!-- NOT-YET(engine-tenants): tenant scopes graded at ingress -->`.
+2. **Validators and defaults see the canonical JSON shape.** Show the one-line failing validator (`v.(int)`) and its fix (`v.(float64)`). Validators must be deterministic, because read-back grades the stored row again in the same shape. Include the panic-refuses-the-write sentence and the context-validator-without-tenant sentence here.
+3. **`Set` and `Delete` can return an error for a write that landed.** Name `ErrClosed`, the `ErrNotStarted` wrap and the `Set`-racing-`Start` case; Do: treat a non-nil error as "persisted, not served by this process yet", not as "not persisted".
+4. **Read-your-writes.** One paragraph; in v3 a `Set` followed by a `Get` could return the old value until the NOTIFY came back.
+5. **Redaction fails closed.** `KeyRedaction` after `Close`; redacted values are withheld from every error and panic report. Do: a consumer rendering values after `Close` now sees masked output.
+6. **Operational: primary pinning and the `keyname` log field.** Two short paragraphs; Do: re-point any log query or alert that matches on field `key`.
 
 **Files:**
-- Modify: `MIGRATION-v4.md` (replace the § Behaviour changes marker)
+- Modify: `MIGRATION-v4.md` (replace the § Behaviour changes marker with subsections 1-6)
 
-**Verification:** the link check (§ The link check) over `MIGRATION-v4.md` exits 0, and each of the nine subsections is present:
+**Verification:** both § Phase 1 checks (no output); § The link check over `MIGRATION-v4.md` (exit 0);
 
 ~~~bash
-grep -c '^### ' MIGRATION-v4.md   # >= 9 at this point
-grep -n 'ErrCloseTimeout\|Revision 0\|WithCloseTimeout\|Change{' MIGRATION-v4.md
+for t in float64 ErrValidation 'written but not published' RedactFull keyname primary; do
+  grep -q -- "$t" MIGRATION-v4.md || echo "MISSING: $t"
+done                                 # expected: no output
+grep -c 'NOT-YET(' MIGRATION-v4.md   # expected: 4 (3 from Task 1.1.1 + 1)
 ~~~
 
-**Done when:** § Behaviour changes has the nine subsections, each with an "**Affects:**" line and a stated action; the validator-at-ingress change is first; FC-11, coalescing, the `Change` signature, `Close`/`ErrCloseTimeout`, `GetEntry`/`Stale` and read-your-writes are each named with their decision reference.
+**Done when:** six subsections exist, each with **Affects:** and a stated action; the validator-at-ingress change is first; nothing in them asserts multi-tenant grading.
+
+#### Task 1.1.2b: Write § Behaviour changes — callbacks, lifecycle, freshness and panics
+
+- [ ] Done
+
+**Context:**
+
+| Behaviour | Anchor |
+|---|---|
+| Every subscriber registered before `Start` gets one delivery per registered key at `Start` (FC-11), no-row and refused keys as the default at Revision 0; delivery runs on the key's goroutine and may land after `Start` returns | `api_client.go:37-44`, `internal/client/client.go:180-190` |
+| New signature; Revision 0 = no row, `Value` is the default | `api_client.go:161-184` |
+| Coalesced per (scope, key), independent across keys, never out of order; same non-zero revision + same bytes never delivered twice; Revision 0 never deduplicated | `api_client.go:169-173`, `internal/engine/dispatch.go:170-305`, `internal/engine/publish.go` |
+| v3's Manager ran callbacks synchronously on the LISTEN goroutine | `v3.0.0:internal/manager/events.go:81-93` |
+| Callback ctx is the engine lifecycle ctx: no request values, no tenant; callbacks may call `Set`/`Delete` re-entrantly. v3 godoc promised a tenant-scoped ctx and passed the LISTEN ctx | `api_client.go:173-177`; `v3.0.0:internal/client/onchange.go:20-22`, `v3.0.0:internal/manager/listen.go:266` |
+| `OnChange` on an unregistered key returns `ErrUnknownKey` in both modes (v3: no-op unsubscribe); multi-tenant `OnChange` returns `ErrNotSupportedInMultiTenant` | `api_client.go:179-183` |
+| `OnChange` callback panics recovered per subscriber, reported through `runtime.HandlePanicValue`, component `systemplane.engine`, name `onchange` | `internal/engine/dispatch.go:386-393`, `internal/engine/ingest.go:464-468` |
+| `Close` cancels the feed and callback ctx, waits up to `WithCloseTimeout` (default 30s); `ErrCloseTimeout` names the (scope, key) still running; an empty key set means the engine is stuck inside the store | `internal/engine/engine.go:23,676-705`, `internal/engine/errors.go:5-19`, `api_errors.go:56-63` |
+| `WithCloseTimeout` bounds the engine wait only; `Close` returns the engine timeout joined with the store close error; a repeat `Close` replays the first result | `api_constructors.go:71-76`, `internal/client/client.go:54-56,260-290`, `internal/engine/engine.go:83-88,681-705` |
+| A failed `Start` is retriable and pre-`Start` subscriptions survive; after a ctx expiry the next `Start` waits for the pending reconcile and `Register` stays refused | `api_client.go:46-49`, `internal/client/register.go:55`, `internal/client/client.go:245` |
+| `GetEntry` → `Entry{Value, Revision, UpdatedAt, UpdatedBy, Stale}`; `Stale` before `Start`, while the feed is down or unreconciled, and per key while its last re-read is unconfirmed | `api_client.go:76-84`, `internal/engine/engine.go:595-631` |
+| A changefeed delete is fenced at arrival then re-read: empty re-read publishes the default, a recreated row wins at its revision | `internal/engine/feed.go:158-168,561-575` |
+| A failed re-read is retried once, off the feed goroutine, after a jittered wait in [125ms, 250ms); a second failure marks only that key `Stale` | `internal/engine/feed.go:41-54,282-331` |
+| A key is confirmed only by an ingress that read it back; a reconcile snapshot does not clear an unconfirmed key | `internal/engine/reconcile.go:400-422` |
+| Admin GET renders `revision`, `updatedAt` (null when no row), `updatedBy`, `stale` | `admin/admin_responses.go:21-38` |
+| The consumer logger is guarded: a panicking logger cannot kill a library goroutine or unwind a library call; `Logger()` still returns the raw one | `internal/client/client.go:31-38` |
+| Multi-tenant error lines stamp `tenant.id` from ctx, `unresolved` when absent | `internal/client/client_telemetry.go:29-44`, `internal/group/coordinator.go:894-906` |
+
+**Implementation vision:** Append these `###` subsections after Task 1.1.2a's, same **Affects:** / changed / do shape:
+
+7. **Every callback registered before `Start` fires once at `Start`.** Do: make callbacks idempotent or compare against the value last applied; a callback that posts a notification now posts one per boot. br-sfn's 17 callbacks are cross-linked from its section, but state here that this holds for single-tenant today: `<!-- NOT-YET(engine-tenants): multi-tenant callbacks fire once per tenant at activation -->`.
+8. **`OnChange`'s callback signature changed, and `ErrUnknownKey` replaces the silent no-op.** Before/after signatures and the mechanical rewrite. The callback ctx has no tenant and no request values; `Change.Tenant` is where a tenant will appear. Multi-tenant `OnChange` is a documented refusal today (`ErrNotSupportedInMultiTenant`, FC-4) — billing-worker's shape keeps it permanently; the connector shape is `<!-- NOT-YET(engine-tenants): multi-tenant OnChange with a tenant manager, Change.Tenant set -->`.
+9. **Deliveries are coalesced per key and independent across keys.** Consequence: a consumer counting callbacks or accumulating intermediate values must reconcile to the newest instead.
+10. **`Close` is bounded and names a stuck callback.** `ErrCloseTimeout`, the empty-key-set reading, the joined store error, the replay on repeat `Close`. Do: honour the ctx a callback is handed.
+11. **A failed `Start` is retriable.** Include the ctx-expiry case (`Register` stays refused until the pending reconcile finishes).
+12. **`GetEntry` reports revision, provenance and freshness.** The three `Stale` conditions, the admin GET fields, and the delete-fence / one-retry / per-key-confirmation rules as the mechanism behind "per key". Reads keep serving the last published value while stale.
+13. **Panics and the logger.** A panicking `OnChange` callback is recovered per subscriber and reported through lib-observability `runtime`; a panicking consumer logger cannot take a library goroutine down; describe both by effect, never by `internal/safelog`. Then `<!-- NOT-YET(panic-posture): every recovered panic reported with a log line, panic_recovered_total and a span event; the counter needs runtime.InitPanicMetrics in the host -->`.
+14. **Revisions are opaque.** One line pointing at § The database and operator contract.
+
+Do not add a subsection for `HandleTenantLifecycle` returning errors: it lives in the plugin-br-pix-jd and notifications sections (Task 1.1.5).
+
+**Files:**
+- Modify: `MIGRATION-v4.md` (subsections 7-14 under § Behaviour changes)
+
+**Verification:** both § Phase 1 checks (no output); § The link check over `MIGRATION-v4.md` (exit 0);
+
+~~~bash
+for t in ErrCloseTimeout WithCloseTimeout ErrUnknownKey 'Revision 0' 'Change{' Stale onchange; do
+  grep -qF -- "$t" MIGRATION-v4.md || echo "MISSING: $t"
+done                                 # expected: no output
+grep -c '^### ' MIGRATION-v4.md      # expected: 14
+grep -c 'NOT-YET(' MIGRATION-v4.md   # expected: 7
+~~~
+
+**Done when:** fourteen behaviour subsections exist in total; FC-11, coalescing, the `Change` signature, bounded `Close`, retriable `Start`, `GetEntry`/`Stale` and panic recovery are each named with their anchor-backed facts; every multi-tenant claim is a placeholder.
 
 #### Task 1.1.3: Write § The database and operator contract
 
 - [ ] Done
 
-**Context:** Everything a consumer must do to its *database* rather than to its code, in one place, because the person who runs the migration is often not the person who bumps the import. Sources: FC-8 (the Postgres DDL, the `revision` column, the sequence, the SECURITY DEFINER trigger, the fork guard, `MigrationV3ToV4SQL()`), FC-9 (the MongoDB document, tombstones), D11 (revision monotonicity), and the three operational facts the index's docs Done-when names (own database per tenant; one LISTEN backend per active tenant per replica; revisions opaque, may skip, start at 2).
+**Context:** Storage is merged (PR #90, #91). Verified: `revision BIGINT NOT NULL` from `systemplane_revision_seq` via a SECURITY DEFINER `BEFORE INSERT OR UPDATE` trigger, runtime role DML only (`ddl/schema.sql:105,126,133-143,172-175`, `ddl.go:43-49`); `MigrationV3ToV4SQL()` (`ddl.go:86-132`, `ddl/migrate_v3_to_v4.sql`) adds the column, seeds the sequence, replaces `systemplane_notify_v3()` with `systemplane_bump_revision_v4()` + `systemplane_notify_v4()`, keeps trigger names `systemplane_notify_trigger` / `systemplane_notify_update_trigger` and adds `systemplane_bump_revision_trigger`; payload `{namespace, key, op, revision}`, revision 0 on delete (`ddl/schema.sql:145-185`); the migration's own guard refuses when `systemplane_entries` is not on `search_path` or exists in a second schema (`ddl/migrate_v3_to_v4.sql:73-88`); the `SchemaSQL()` guard fires when any non-system schema other than `current_schema()` holds the table (`ddl/schema.sql:84-97`, RAISE text at `:95`); one database per tenant, NOTIFY database-wide, `DROP FUNCTION` resolves through `search_path` (`ddl.go:36-41`); revisions opaque, may skip, start at 2 (`ddl.go:50-53`, `ddl/schema.sql:128`); an identical re-set keeps the revision (`ddl/schema.sql:135-139`) and the engine dedupes the NOTIFY. MongoDB: tombstone delete (`internal/mongodb/mongodb.go:696-700`, `internal/mongodb/mongodb_crud.go:135-169`, `$ne` because pre-v4 documents lack the field), never purged, change streams need a replica set, `WithPollInterval` fallback (`api_constructors.go:65-66`), a resolved tenant database needs `createCollection` (`internal/mongodb/mongodb_crud.go:32-60`). Both backends refuse two scopes on one database (Postgres) or one database+collection (MongoDB) at feed open (`internal/postgres/connector.go:60-84`, `internal/mongodb/connector.go:48-73`), but no public path reaches a tenant feed today (`internal/client/client.go:110-121` wires no connector) and the root alias does not exist (`api_errors.go`).
 
-**Implementation vision:** Two `###` subsections.
+**Implementation vision:** Replace the marker with two `###` subsections.
 
-**`### Postgres`** — six points:
-1. **The table gained a `revision BIGINT NOT NULL` column**, assigned from a table-level sequence `systemplane_revision_seq` by a `SECURITY DEFINER` `BEFORE INSERT OR UPDATE` trigger. The runtime role still needs only DML — no grant on the sequence, no `CREATE` on the schema — because the trigger function is the only caller of `nextval` and runs as its owner.
-2. **Upgrading an existing install: `MigrationV3ToV4SQL()`**, not `SchemaSQL()`. It creates no table; it adds the column, seeds the sequence past the highest existing revision, replaces the functions and installs the three triggers. It is idempotent and safe to apply twice. Say explicitly that it replaces the v3 `systemplane_notify_v3()` function and its two triggers with `systemplane_bump_revision_v4()`, `systemplane_notify_v4()` and three triggers, and that the NOTIFY payload gained a `revision` field.
-3. **`SchemaSQL()` now refuses to run against an install that lives in another schema.** The file opens with a guard that raises when `systemplane_entries` already exists in a schema other than `current_schema()`, because `CREATE TABLE IF NOT EXISTS` looks only at the first schema on `search_path` and would otherwise provision a second, empty table, exit 0, and orphan the populated one. Such an install upgrades with `MigrationV3ToV4SQL()`, which creates no table. Name the error the consumer will see and the hint it carries.
-4. **One database per tenant. Never one schema per tenant inside a shared database.** NOTIFY is database-wide and every feed listens on the same channel `systemplane_changes`, so two tenants sharing a database cross-deliver each other's events; the migration artifacts also resolve `DROP FUNCTION IF EXISTS systemplane_notify_v3()` through the whole `search_path`. See § DEVIATIONS item 2 for the clause about a schema-isolated DSN this task must not invent.
-5. **Connection sizing.** Each active tenant costs one extra LISTEN backend **per replica**, on top of whatever pool the tenant-manager holds. Size `max_connections` against active tenants × replicas, not against tenants.
-6. **Revisions are opaque monotonic integers.** They increase per `(namespace, key)` across delete and re-create, they may skip, they start at 2 on a fresh database (the sequence is seeded to 1 and the first insert draws 2), and their magnitude differs between backends. Nothing may depend on the number itself — only on the ordering. Also: re-setting an identical value bumps `updated_at` but not `revision`, and fires no callback.
+`### Postgres`:
+1. `revision` column, sequence, SECURITY DEFINER trigger; runtime role needs DML only.
+2. Upgrade with `MigrationV3ToV4SQL()`, never `SchemaSQL()`: what it adds and replaces, the three trigger names, the payload gaining `revision`, idempotent. Its own guard (not on `search_path` / two schemas) with the fix its HINT gives.
+3. `SchemaSQL()` refuses an install that lives in another schema: quote the RAISE message verbatim from `ddl/schema.sql:95`; paraphrase the HINT without the error name.
+4. One database per tenant, never one schema per tenant in a shared database: the NOTIFY reason and the `search_path` reason. State that this is the operator's responsibility; then `<!-- NOT-YET(engine-tenants): the public refusal (root ErrSharedDatabaseUnsupported) when two tenant feeds of one Store resolve to one database; a pinned search_path alone is not refused -->`.
+5. Connection sizing: `<!-- NOT-YET(engine-tenants): one extra LISTEN backend per active tenant per replica; size max_connections against active tenants × replicas -->`. Today a single-tenant Client holds one LISTEN connection on `listenDSN`; say only that.
+6. Revisions: opaque, monotonic per (namespace, key) across delete and recreate, may skip, start at 2, magnitude differs between backends; an identical re-set bumps `updated_at`, not `revision`, and fires no callback.
 
-**`### MongoDB`** — four points:
-1. **`Delete` no longer removes the document.** It rewrites it as a tombstone (`deleted: true`, `value` unset, `revision` bumped, provenance updated) so that a key deleted and re-created comes back above every revision it ever had (D11, FC-9). `Get` reports not found and `List` skips tombstones, so the library's own behaviour is unchanged.
-2. **Anything reading `systemplane_entries` directly must filter `deleted: {$ne: true}`.** This is the one place where a non-library reader — a dashboard query, an export job, a Mongo shell — silently gets wrong answers if it does not change. Put it in bold.
-3. **Tombstones are never purged in v4.0.** One small document per `(namespace, key)` ever deleted, bounded by the registered key set. No growth risk, no cleanup job.
-4. **Change streams need a replica set**; `WithPollInterval` remains the fallback for standalone MongoDB and honours the same resync and revision rules. A connector-resolved tenant database needs `createCollection` on its first use, exactly as a ctx-resolved multi-tenant database does today.
+`### MongoDB`:
+1. `Delete` writes a tombstone (`deleted: true`, `value` unset, `revision` bumped, provenance updated); `Get` reports not found, `List` skips it.
+2. **Anything reading `systemplane_entries` directly must filter `deleted: {$ne: true}`** — bold; say why `$ne` and not `$exists`.
+3. Tombstones are never purged; bounded by the registered key set.
+4. Change streams need a replica set; `WithPollInterval` is the fallback with the same resync and revision rules. A multi-tenant ctx-resolved tenant database needs `createCollection` on first use (true today). `<!-- NOT-YET(engine-tenants): the same for a connector-resolved database, and the refusal when two tenants resolve to one database and collection -->` — one placeholder covering both.
 
 **Files:**
 - Modify: `MIGRATION-v4.md` (replace the § The database and operator contract marker)
 
-**Verification:** the link check over `MIGRATION-v4.md` exits 0, and the operational facts are present:
+**Verification:** both § Phase 1 checks (no output); § The link check over `MIGRATION-v4.md` (exit 0);
 
 ~~~bash
-grep -n 'MigrationV3ToV4SQL\|systemplane_revision_seq\|deleted: {\$ne: true}\|max_connections\|start at 2' MIGRATION-v4.md
+for t in MigrationV3ToV4SQL systemplane_revision_seq systemplane_bump_revision_trigger 'deleted: {$ne: true}' 'start at 2' 'replica set'; do
+  grep -qF -- "$t" MIGRATION-v4.md || echo "MISSING: $t"
+done                                 # expected: no output
+grep -c 'NOT-YET(' MIGRATION-v4.md   # expected: 10
 ~~~
 
-returns at least one hit for each.
-
-**Done when:** both subsections are written; `MigrationV3ToV4SQL()` is named as the upgrade path and `SchemaSQL()` as fresh-install only; the schema-fork guard, the one-database-per-tenant rule, the LISTEN-per-tenant-per-replica sizing rule and the opaque-revision rule are each stated; the direct-reader tombstone filter is bold.
+**Done when:** both subsections are written; `MigrationV3ToV4SQL()` is the upgrade path and `SchemaSQL()` fresh-install only; both SQL guards are stated with their fix; the one-database rule is stated as the operator's responsibility; LISTEN sizing and the public shared-database refusal are placeholders; the tombstone filter is bold.
 
 #### Task 1.1.4: Write the per-consumer sections for the seven Client-only consumers
 
 - [ ] Done
 
-**Context:** The index's Done-when requires "one section per consumer in the matrix naming what breaks and what replaces it". The matrix has ten rows; seven of them never construct a `Manager`, so their sections are short and share a spine. Splitting them from the three Manager users keeps each task to one commit's worth of prose. Every fact about a consumer comes from the matrix row — this lane does not open the consumers' repositories, and any claim beyond the matrix row is a guess (see § DEVIATIONS item 5).
+**Context:** Facts come from `index.md` § Consumer matrix and the tags in this repository; this lane does not open the consumers' repositories. Verified: matcher, billing-worker, br-consignado-gw, go-boilerplate-ddd are on v2.0.0 (`lib-commons/v6`, `lib-observability/v2`); finance-hub on v1.6.0; `DefaultSeedSQL` is gone; `WithListenChannel` is still exported (`api_constructors.go:62-63`); plain `WithMultiTenantEnabled()` keeps the v3 per-request path (`internal/client/options.go:134-149`) and refuses `OnChange` (`api_client.go:179-183`, FC-4). Every v2 consumer is hit by the canonical-shape change and by `Set`/`Delete` returning errors (Task 1.1.2a items 2 and 3).
 
-**Implementation vision:** Seven `###` subsections under `## Per consumer`, each with the same four-line spine — **From:**, **Mode:**, **Breaks:**, **Do:** — followed by whatever is specific. Keep each under 20 lines.
+**Implementation vision:** Seven `###` subsections under `## Per consumer`, each with the spine **From:** / **Mode:** / **Breaks:** / **Do:**, under 20 lines:
 
-- **`### matcher` (v2.0.0, single-tenant, Postgres).** Breaks: import path `/v2` → `/v4`; `lib-commons` → v7; the `OnChange` callback signature; the validator-at-ingress change. Do: run `MigrationV3ToV4SQL()`, bump the import, rewrite the callbacks. Add the sentence that matcher is the pilot: it converts its ~1,300 lines of glue to typed groups (`Bind`, `Group[T]`) and the recipe the other consumers follow comes out of that PR. Point at the groups section of § The surface diff rather than duplicating FC-7 here.
-- **`### billing-worker` (v2.0.0, multi-tenant flag with per-request reads, Postgres).** Breaks: `WithListenChannel` is **removed with no replacement** — the channel is `systemplane_changes`, full stop, and if billing-worker was using a custom channel to avoid a collision with another service sharing the database, that collision is now a reason to give the service its own database (§ The database and operator contract, Postgres point 4). Also: its 841-line DDL generator is built on `DefaultSeedSQL()`, which is removed; defaults live in code, and a consumer who wants persisted overrides writes its own migration. Do: delete the generator, adopt `SchemaSQL()` / `MigrationV3ToV4SQL()`, drop the channel option. Note that billing-worker reads per request and therefore stays on the connector-less multi-tenant path unless it adopts `WithPostgresTenantManager`.
-- **`### finance-hub` (v1.6.0, single-tenant, Postgres).** Breaks: everything in § The module and dependency hop's v1.6.x row — **including Fiber v2 → v3**, which is a precondition, not part of this upgrade — plus the `DefaultSeedSQL()` DDL generator. Do: upgrade the service's Fiber and lib-commons first, then take v4 in one hop. Say that this repository publishes no v1 → v2 migration document, so the Fiber and lib-commons work is the consumer's, and this section is the only warning it gets.
-- **`### br-consignado-gw` (v2.0.0, single-tenant, Postgres).** The cheapest migration in the fleet: import path, `lib-commons` v7, the `OnChange` signature if it subscribes, `MigrationV3ToV4SQL()`. Say so — a consumer that reads a short section and finds it genuinely short trusts the long ones.
-- **`### go-boilerplate-ddd` (v2.0.0, single-tenant template).** Same mechanical change as br-consignado-gw, plus the instruction the matrix carries: **update it last**, after the recipe has been proven on matcher and at least one multi-tenant consumer, because every new service is cut from it and a wrong template multiplies.
-- **`### plugin-br-pix-lerian` (no dependency in `go.mod` today).** It carries only a mount helper. Nothing breaks. State that explicitly, and state what it must do *if* it ever adds the dependency: take `/v4` directly and read § Behaviour changes. A section that says "nothing to do" is worth writing — its absence reads as an oversight.
-- **`### product-console` (new adopter, MongoDB, multi-tenant).** Not a migration: an adoption guide. Its Go service imports the library with `WithMongoTenantManager` and exposes `admin.Mount` / `admin.MountCatalog` to the Next.js front end, which means **the library is the only writer of `systemplane_entries`** and the tombstone shape stays internal. Name the three things the Console must honour: change streams need a replica set (or `WithPollInterval`), a connector-resolved tenant database needs `createCollection` on first use, and any direct read of the collection filters `deleted: {$ne: true}`.
+- **matcher** (v2.0.0, ST, Postgres): module path, lib-commons v6 → v7, lib-observability v2 → v4, `OnChange` signature, validator at ingress, canonical shape. Do: `MigrationV3ToV4SQL()`, bump, rewrite callbacks, audit validators for Go-type assertions. It is the groups pilot: point at `Bind`/`Group[T]` in § The surface diff.
+- **billing-worker** (v2.0.0, MT flag, per-request, Postgres): `DefaultSeedSQL()` generator must go (defaults live in code); `WithListenChannel` still works today, then `<!-- NOT-YET(engine-core-p3): the option is removed; the channel is systemplane_changes, and a collision reason becomes a reason for its own database -->`. Multi-tenant `OnChange` stays `ErrNotSupportedInMultiTenant` on its shape — a documented refusal.
+- **finance-hub** (v1.6.0, ST, Postgres): the v1.6.x preconditions (Fiber v2 → v3, lib-commons v5 → v7, lib-observability v1 → v4) come first; then the `DefaultSeedSQL()` generator; then the v2 steps.
+- **br-consignado-gw** (v2.0.0, ST, Postgres): the cheapest path — say so, and still name the canonical-shape audit.
+- **go-boilerplate-ddd** (v2.0.0, ST template): same as br-consignado-gw; **update last**, after matcher and one multi-tenant consumer prove the recipe.
+- **plugin-br-pix-lerian** (no dependency in `go.mod`): nothing breaks; if it adds the dependency, take `/v4` and read § Behaviour changes.
+- **product-console** (new adopter, MongoDB, MT): admin today — `admin.Mount` / `admin.MountCatalog` and the GET fields of Task 1.1.2b item 12; replica set or `WithPollInterval`; the tombstone filter for any direct read. `<!-- NOT-YET(engine-tenants): WithMongoTenantManager wiring, connector-resolved createCollection, shared-collection refusal -->`. Until then the Console's only tenant shape is the per-request one.
 
 **Files:**
-- Modify: `MIGRATION-v4.md` (seven `###` subsections under § Per consumer)
+- Modify: `MIGRATION-v4.md` (seven subsections under § Per consumer)
 
-**Verification:**
+**Verification:** both § Phase 1 checks (no output); § The link check over `MIGRATION-v4.md` (exit 0);
 
 ~~~bash
 for c in matcher billing-worker finance-hub br-consignado-gw go-boilerplate-ddd \
          plugin-br-pix-lerian product-console; do
   grep -q "^### .*$c" MIGRATION-v4.md || echo "MISSING SECTION: $c"
-done
+done                                  # expected: no output
+grep -c 'NOT-YET(' MIGRATION-v4.md    # expected: 12
 ~~~
 
-prints nothing, and the link check over `MIGRATION-v4.md` exits 0.
-
-**Done when:** all seven sections exist with the four-line spine; `WithListenChannel` and `DefaultSeedSQL` removal are named against the consumers the matrix attributes them to; the Fiber precondition is stated in the finance-hub section; go-boilerplate-ddd carries the "update last" instruction; plugin-br-pix-lerian says there is nothing to do.
+**Done when:** seven sections with the spine; `DefaultSeedSQL` removal named for billing-worker and finance-hub; `WithListenChannel` removal is a placeholder; the Fiber precondition is in finance-hub; go-boilerplate-ddd says update last; plugin-br-pix-lerian says nothing to do.
 
 #### Task 1.1.5: Write the per-consumer sections for the three Manager users
 
 - [ ] Done
 
-**Context:** notifications, plugin-br-pix-jd and br-sfn are the only consumers that construct a `Manager`, and the Manager is gone. Their sections are the ones with real work in them, and each has a different shape: notifications uses `OnTenantActivated` and `Drain`, plugin-br-pix-jd uses `HandleTenantLifecycle` and `Drain` *and* has a `DefaultSeedSQL()` DDL generator *and* calls `WithListenChannel`, br-sfn registers 17 `OnChange` callbacks before `Start`.
+**Context:** notifications (v1.6.1: Fiber v2, lib-commons v5, lib-observability v1; `NewManager`, `WithManagerLogger`, `OnTenantActivated`, `Drain`), plugin-br-pix-jd (v3.0.0: already `lib-commons/v7`, so its module hop is `/v3` → `/v4` only; `HandleTenantLifecycle`, `Drain`, `WithListenChannel`, a `DefaultSeedSQL()` generator), br-sfn (v3.0.0-beta.2: already `lib-commons/v7`; 17 `OnChange` calls before `Start`). All three are multi-tenant and all three depend on engine-tenants for the replacement of the Manager: no tenant-manager option, no `Client.HandleTenantLifecycle`, no multi-tenant `OnChange` exists on `develop` (`go doc -short .`; `api_client.go:179-183`). What is true today: the Manager is gone (`v3.0.0:manager.go:36-72` has no v4 counterpart), `DefaultSeedSQL` is gone, `Drain(ctx)` took a ctx (`v3.0.0:manager_methods.go:71`) while `Close()` takes none and is bounded by `WithCloseTimeout` (`api_constructors.go:76`), the callback ctx carries no tenant (`api_client.go:175-177`). `Client.HandleTenantLifecycle` will return errors where v3 logged and swallowed them (index § Behaviour changes, engine-tenants D-T5).
 
-**Implementation vision:** Three `###` subsections, same four-line spine, each carrying a before/after code block of the *bootstrap wiring only* — the construction, the lifecycle registration, the shutdown — because that is the part every one of the three has to rewrite and it is the part they cannot infer from the surface diff table. These blocks are illustrative fragments in a Markdown file, not programs: keep each under fifteen lines and do not write a `func main` (§ Architecture — a runnable program lives under `examples/`, and the multi-tenant one is `examples/multi-tenant`, which this section links to).
+**Implementation vision:** Three `###` subsections, same spine. The before/after bootstrap fragments (construction, lifecycle registration, shutdown; under fifteen lines each, no `func main`) are written only after engine-tenants merges; now each section carries its "before" fragment and a placeholder for the "after".
 
-- **`### notifications` (v1.6.1, multi-tenant, Manager).** The hardest section in the document, because it is the only consumer that is *both* a Manager user and on the v1.6.x line: it takes the Fiber v2 → v3 hop, `lib-commons` v5 → v7, `lib-observability` v1 → v4 and the Manager removal in one change. Lead with that. Breaks: `NewManager`, `WithManagerLogger`, `OnTenantActivated`, `Drain`. Do: construct the Client with `WithPostgresTenantManager(pgMgr)` (which implies `WithMultiTenantEnabled()`); delete the `NewManager` call and the `OnTenant*` fan-out; register `client.HandleTenantLifecycle` directly with the tenant-manager event dispatcher — it has the `tmevent.EventHandler` signature for exactly that reason; replace `manager.Drain(ctx)` with `client.Close()`. Name the semantic difference: `Drain` took a ctx with a deadline, `Close` takes none and bounds itself with `WithCloseTimeout` (default 30s), returning `ErrCloseTimeout` naming the stuck (scope, key) rather than a ctx error.
-- **`### plugin-br-pix-jd` (v3.0.0, multi-tenant, Manager).** The shortest module hop (`/v3` → `/v4`, `lib-commons` v6 → v7) but the widest surface: `HandleTenantLifecycle` moves from `Manager` to `Client` with the same signature, so the registration line changes receiver and nothing else; `Drain` → `Close`; `WithListenChannel` is removed; the `DefaultSeedSQL()` DDL generator has to go. Say that lazy activation now covers what an explicit `Activated` event used to do — the first read for a tenant activates its scope — and that `Activated` stays idempotent and additionally clears a blocked marker, so keeping the registration costs nothing. Name the blocked-marker semantics, because this is the consumer most likely to notice: `Suspended` and `Deleted` drop the scope **and block the tenant**, so no read re-activates it until an `Activated` arrives; `CredentialsRotated` re-activates an active tenant and is a no-op for a blocked one.
-- **`### br-sfn` (v3.0.0-beta.2, multi-tenant, Manager, 17 `OnChange` calls).** Breaks: the Manager removal, and — the one that will actually change its runtime behaviour — **all 17 callbacks now fire once at `Start`** (FC-11), because they are registered before it. Cross-link to § Behaviour changes item 2 and spell out the work: each of the 17 has to be idempotent, or has to compare against the value it last applied. Second item: all 17 signatures change to `func(ctx, ch Change)`, and each gains `Change.Tenant`, which is how a callback finally knows which tenant it fired for — in v3 it could not, and a multi-tenant callback receiving no tenant is one of the defects v4 closes. Third: coalescing means a callback may skip intermediate revisions; a callback that was accumulating rather than reconciling to the current value must be rewritten.
+- **notifications**: lead with the combined hop (v1.6.x preconditions plus the Manager removal in one change). Today: `NewManager`, `WithManagerLogger`, `OnTenantActivated` and `Drain` are gone; `Close()` replaces `Drain(ctx)` for the Client, bounded by `WithCloseTimeout`, reporting `ErrCloseTimeout` rather than a ctx error. `<!-- NOT-YET(engine-tenants): WithPostgresTenantManager construction, HandleTenantLifecycle registration with the tmevent dispatcher, returned handler errors, after-fragment -->`.
+- **plugin-br-pix-jd**: module path only for dependencies (`/v3` → `/v4`; no lib-commons hop). Today: `Drain` → `Close`; the `DefaultSeedSQL()` generator must go; `WithListenChannel` still works, then `<!-- NOT-YET(engine-core-p3): WithListenChannel removed -->`. `<!-- NOT-YET(engine-tenants): HandleTenantLifecycle moves Manager → Client with the same signature and now returns errors; lazy activation; blocked-marker semantics; after-fragment -->`.
+- **br-sfn**: no lib-commons hop. Today: the 17 callbacks change signature to `func(ctx, ch Change)`; coalescing lets a callback skip intermediate revisions; the callback ctx carries no tenant (the v3 godoc promised one). Cross-link § Behaviour changes item 7. `<!-- NOT-YET(engine-tenants): the 17 callbacks fire once per tenant at activation, Change.Tenant names the tenant; until then multi-tenant OnChange returns ErrNotSupportedInMultiTenant -->`. State plainly that br-sfn cannot complete its migration before that lands.
 
 **Files:**
-- Modify: `MIGRATION-v4.md` (three `###` subsections under § Per consumer)
+- Modify: `MIGRATION-v4.md` (three subsections under § Per consumer)
 
-**Verification:**
+**Verification:** both § Phase 1 checks (no output); § The link check over `MIGRATION-v4.md` (exit 0);
 
 ~~~bash
 for c in notifications plugin-br-pix-jd br-sfn; do
   grep -q "^### .*$c" MIGRATION-v4.md || echo "MISSING SECTION: $c"
-done
-grep -c '^### ' MIGRATION-v4.md   # >= 19: 9 behaviour + 2 database + 10 consumers
+done                                  # expected: no output
+grep -c '^### ' MIGRATION-v4.md       # expected: 26 (14 behaviour + 2 database + 10 consumers)
+grep -c 'NOT-YET(' MIGRATION-v4.md    # expected: 16
 ~~~
 
-first loop prints nothing; the link check over `MIGRATION-v4.md` exits 0.
-
-**Done when:** all three sections exist; each has a before/after bootstrap fragment under fifteen lines with no `func main`; `HandleTenantLifecycle`'s move, `Drain` → `Close` and the blocked-marker semantics are named; br-sfn's section leads with the 17-callbacks-at-`Start` consequence; every one of the matrix's ten rows now has a section.
+**Done when:** written with NOT-YET markers; finished after engine-tenants merges (the placeholders replaced by the bootstrap after-fragments, `HandleTenantLifecycle`'s move and returned errors, the blocked-marker semantics and br-sfn's per-tenant `Start` consequence, and the engine-tenants check of § Phase 1 then run without its `grep -v` filter).
 
 ---
 
 ### Epic 1.2: The repository's own contract documents
 
-**Goal:** `CLAUDE.md`, `docs/PROJECT_RULES.md` and `doc.go` describe the library that ships, so an agent or a new engineer reading them is not working from a design that was removed two majors ago.
+**Goal:** `CLAUDE.md`, `docs/PROJECT_RULES.md` and `doc.go` describe the library on `develop`, with the pending lanes marked.
 **Scope:** `CLAUDE.md`, `docs/PROJECT_RULES.md`, `doc.go`.
-**Dependencies:** none (parallel with Epic 1.1)
-**Done when:** all three describe v4; the scoped absence grep over them returns nothing; `go build ./...` and `go vet ./...` still pass (`doc.go` is comments only).
+**Dependencies:** none (parallel with Epic 1.1).
+**Done when:** all three describe v4 as merged; the absence grep over each returns nothing; `go build ./...` and `go vet ./...` pass.
 **Status:** Pending
 
-#### Task 1.2.1: Rewrite `CLAUDE.md` against the v4 facade and engine
+#### Task 1.2.1: Finish `CLAUDE.md` against the merged facade and engine
 
 - [ ] Done
 
-**Context:** `CLAUDE.md` is the file every agent session in this repository reads first, so a stale line in it propagates into code. It is stale in nine places, all verifiable by grep on the current file: the module is given as `/v3` (twice, plus once in the dependency list), the current API generation is described as "v3.x … built on `lib-commons/v6`", the multi-tenant operating mode says "No in-process cache. No LISTEN/NOTIFY. `OnChange` returns `ErrNotSupportedInMultiTenant`" and names `DefaultSeedSQL()` as a provisioning artifact, the Postgres storage shape names the `systemplane_notify_v3` trigger and a three-field NOTIFY payload with no `revision` column, and the client-options list carries `WithListenChannel`, `WithTable` and `WithCollection`. The observability-boundary paragraph, by contrast, is still exactly right and must survive unchanged — `boundary_test.go` still enforces it, `MIGRATION-v3.md` is still its rationale.
+**Context:** engine-core already did most of this (commits 59e859b, 3d4d82e, and the `Start` sentence at `CLAUDE.md:65`): `/v4` (`CLAUDE.md:7,25,54`), `lib-commons/v7` (`:10`), `internal/engine` (`:33-36`), revision / sequence / `notify_v4` storage shape (`:70-81`), `WithCloseTimeout` and `ErrCloseTimeout` (`:90-93`), FC-4 `OnChange` with `ErrUnknownKey` (`:88`). The absence grep over `CLAUDE.md` already returns zero. Still true and to keep: the two-mode description with "No in-process cache. No LISTEN/NOTIFY. `OnChange` returns `ErrNotSupportedInMultiTenant`" (`:66`, true until engine-tenants), the name-override options in the client-options list (`:90`, true until engine-core Phase 3), the observability-boundary bullet (`:11`, enforced by `boundary_test.go`). Missing: `internal/group`, `internal/testsupport`, `internal/safelog` in § Repository shape (`:30-40`); `GetEntry`/`Entry`, `Bind`/`Group[T]`/`OnApply`/`Status`/`ErrApplyPanicked`, `MigrationV3ToV4SQL`, `admin.MountCatalog` in § API invariants (`:84-95`); `KeyRedaction` fail-closed (`api_client.go:193-199`); a `MIGRATION-v4.md` pointer beside the `MIGRATION-v3.md` one (`:11`). Stale: the "current observability migration is an approved breaking change" objective (`:16`).
 
-**Implementation vision:** Targeted replacement, section by section, not a rewrite from a blank file — most of the document is correct and the parts that are correct are load-bearing.
-
-- **Project snapshot:** module → `/v4`; API generation → "v4.x unified engine (built on `lib-commons/v7`, `lib-observability/v4`, `gofiber/fiber/v3`)". Keep the observability-boundary bullet verbatim except for adding a pointer to `MIGRATION-v4.md` beside the existing `MIGRATION-v3.md` one.
-- **Repository shape:** add `internal/engine/` with a one-line description (scope state, the `decode → validate → publish` ingress, reconcile on `OpResync`, the per-(scope, key) coalescing dispatch queue, revision fencing); add `internal/group/`; remove `internal/manager` wherever it appears; update `internal/client/` to "registry, options, catalog, redaction, value cloning and the facade adapter" — the cache, hydrate, refresh, subscribe and dispatch code moved to the engine.
-- **External Lerian dependencies:** `lib-commons/v6` → `/v7`; `lib-systemplane/v3` → `/v4`. Add the sentence that lib-commons' major is part of this library's contract by construction, because `WithPostgresTenantManager` takes a concrete `*tmpostgres.Manager` and `boundary_test.go` deliberately leaves lib-commons out of its denylist for that reason.
-- **Operating modes:** rewrite to the three shapes that now exist rather than two. Single-tenant (default): one scope, cache, changefeed, reconcile on reconnect. Multi-tenant per request (`WithMultiTenantEnabled()` alone): unchanged from v3 — resolve the tenant database from ctx on every call, no cache, no feed. Multi-tenant with a connector (`WithPostgresTenantManager` / `WithMongoTenantManager`, each implying `WithMultiTenantEnabled()`): lazy activation on first read, per-tenant cache and feed, `Client.HandleTenantLifecycle` for suspended/deleted/rotated. Remove the `DefaultSeedSQL()` reference and point at `SchemaSQL()` / `MigrationV3ToV4SQL()`.
-- **Storage shape:** Postgres gains `revision BIGINT NOT NULL`, the sequence `systemplane_revision_seq`, the `systemplane_bump_revision_v4()` SECURITY DEFINER trigger, `systemplane_notify_v4()` and three triggers, and a NOTIFY payload of `{namespace, key, op, revision}`. Keep the "**No `tenant_id` column**" line — it is still true and still worth pinning. MongoDB gains `revision` and the `deleted` tombstone flag; keep the compound `_id` line.
-- **Public API:** rewrite the bullet list against FC-10 plus FC-4, FC-5, FC-6, FC-7. Remove `WithTable`, `WithListenChannel`, `WithCollection`. Add `WithCloseTimeout`, `WithPostgresTenantManager`, `WithMongoTenantManager`, `WithAggregateTenantThreshold`, `GetEntry`, `Bind` / `Group[T]`, `ErrCloseTimeout`. Update `OnChange` to its FC-4 signature and semantics (coalesced per (scope, key), independent across keys, `ErrUnknownKey` for an unregistered key). Update `Close` to D10.
-- **Coding rules and Testing:** unchanged except for any sentence naming a removed symbol. Do not touch the Makefile target list or the AC15 perf-gate note.
-
-Do not add anything about how to run the examples here; that belongs in the README (Phase 2).
+**Implementation vision:** Targeted edits, no rewrite.
+- § Repository shape: add `internal/group/` (typed-group coordinator behind `Bind`/`OnApply`/`Status`), `internal/testsupport/` (test helpers), `internal/safelog/` described as redaction-safe report helpers, never as the logger guard (`NOT-YET(panic-posture)` deletes its `Guard`; if the package is gone by then, drop the line).
+- § API invariants: one bullet each for `GetEntry`/`Entry` (with the three `Stale` conditions), typed groups (`Bind`, `Group[T].Snapshot/Set/OnApply/Status`, `ErrApplyPanicked`, one key per group), `MigrationV3ToV4SQL()` next to `SchemaSQL()`, `admin.MountCatalog`'s two routes, `KeyRedaction` fail-closed; add `ErrApplyPanicked` to the sentinel list.
+- Replace `:16` with nothing (delete the line); add the `MIGRATION-v4.md` pointer at `:11`.
+- Three placeholders: after the multi-tenant mode bullet `<!-- NOT-YET(engine-tenants): third mode, multi-tenant with a tenant manager -->`; after the client-options bullet `<!-- NOT-YET(engine-core-p3): the three name-override options are removed -->`; after the panic sentence in the `OnChange` bullet `<!-- NOT-YET(panic-posture): every recovered panic reported with log line, counter and span event -->`.
 
 **Files:**
 - Modify: `CLAUDE.md`
 
-**Verification:** from `/srv/worktrees/v4-docs`, the absence grep (§ The absence grep) narrowed to `CLAUDE.md` alone returns no output and exits 1, and the link check over `CLAUDE.md` exits 0. Baseline for comparison: the same grep over the four product documents on `develop` returns 48 lines.
+**Verification:**
 
-**Done when:** every stale item above is corrected; the observability-boundary paragraph is unchanged; the three operating modes are described; the absence grep over `CLAUDE.md` is empty.
+~~~bash
+grep -nE "$ABSENT" CLAUDE.md                     # expected: no output
+for t in GetEntry Bind MigrationV3ToV4SQL MountCatalog ErrApplyPanicked internal/group internal/testsupport MIGRATION-v4; do
+  grep -qF -- "$t" CLAUDE.md || echo "MISSING: $t"
+done                                             # expected: no output
+grep -n 'approved breaking change' CLAUDE.md     # expected: no output
+grep -c 'NOT-YET(' CLAUDE.md                     # expected: 3
+~~~
+
+and § The link check over `CLAUDE.md` (exit 0).
+
+**Done when:** the missing items are in, the stale objective line is gone, the observability-boundary bullet is unchanged apart from the pointer, three placeholders.
 
 #### Task 1.2.2: Correct `docs/PROJECT_RULES.md` to the API that actually ships
 
 - [ ] Done
 
-**Context:** This file is worse than stale. Its § API Invariants table describes a **tenant-scoped-keys API that does not exist and has not existed in any shipped major this repository still supports**: `RegisterTenantScoped`, `GetForTenant`, `SetForTenant`, `DeleteForTenant`, `ListTenantsForKey`, `OnTenantChange`, `WithTenantAuthorizer`, `WithTenantSchemaEnabled`, six admin routes (three "legacy global", three "tenant-scoped"), sentinels `ErrMissingTenantContext`, `ErrInvalidTenantID`, `ErrTenantScopeNotRegistered`, `ErrTenantSchemaNotEnabled`, a Postgres `tenant_id TEXT NOT NULL DEFAULT '_global'` column with a composite unique index, a MongoDB `_id` of `{namespace, key, tenant_id}`, and an `ensureSchema` backfill migration run inside `NewMongoDB`. Verified: `grep -rn 'RegisterTenantScoped\|GetForTenant\|WithTenantAuthorizer\|ErrTenantSchemaNotEnabled\|OnTenantChange\|ListTenantsForKey' --include='*.go' .` returns **nothing** on `develop`. The storage claims also contradict FC-8 and FC-9 head-on, which both state there is no `tenant_id`. Three smaller items are ordinary staleness: the module path (`/v3`), the `lib-commons/v6` dependency line, and the `lib-systemplane/v3` self-reference.
+**Context:** § API Invariants (`docs/PROJECT_RULES.md:480-497`) describes a tenant-scoped-keys API that no Go file has (`RegisterTenantScoped`, `GetForTenant`, `SetForTenant`, `DeleteForTenant`, `ListTenantsForKey`, `OnTenantChange`, `WithTenantAuthorizer`, `WithTenantSchemaEnabled`, six admin routes, four tenant sentinels, a `tenant_id` column, a three-part Mongo `_id`); the grep in the Verification returns nothing over `--include='*.go'`. Also stale: header "tenant-scoped overrides" (`:3`), module `/v3` (`:65`), `lib-commons/v6` (`:325`), `lib-systemplane/v3` (`:327`), package structure missing `internal/engine`, `internal/group`, `internal/safelog`, `internal/testsupport`, and `internal/client` described as "subscribers, tenant APIs" (`:22-34`), and the subscription row citing `runtime.RecoverAndLog` (`:485`) — `OnChange` panics go through `runtime.HandlePanicValue`, component `systemplane.engine`, name `onchange` (`internal/engine/dispatch.go:386-393`, `internal/engine/ingest.go:464-468`). Keep: the naming-table `Manager` example (`:54`), the ToC (`:9-16`), every generic section. Absence-grep baseline for this file: 8 lines.
 
-This is the single largest correctness gap in the repository's documentation, and it is not a v4 problem — the file has been wrong since before v2. Say so in the commit body.
+**Implementation vision:** Rewrite the § API Invariants table from FC-4, FC-5, FC-7, FC-10 and D10 against `develop`:
+- Keep, corrected: construction; lifecycle (`Register` → `Start` → ops → `Close`, `ErrRegisterAfterStart`, retriable `Start`); reads (nil-receiver safe, `(value, ok, err)`, canonical `float64` shape); write path (last-write-wins, read-your-writes, `Set`/`Delete` return an error when persisted but unpublished); subscriptions (FC-4 in full, `ErrUnknownKey`, panics via `runtime.HandlePanicValue` component `systemplane.engine` name `onchange`, then `<!-- NOT-YET(panic-posture): log line, counter and span event for every recovered panic -->`); delete (idempotent, default at Revision 0); admin (four value routes, each with a `/*` wildcard twin, plus two catalog routes, `admin/admin.go:124-130,159-160`, default `/system`, default-deny); `KeyRedaction` fail-closed; internal `Store`; sentinels (FC-10 set plus `ErrCloseTimeout`, `ErrApplyPanicked`, `ErrNotSupportedInMultiTenant`, `ErrTenantConnectionMissing`); test helper; scope.
+- Delete outright: tenant-scoped keys, tenant access, tenant validation, resolution order, tenant ctx propagation, the tenant half of admin authorization.
+- Replace storage evolution with FC-8 / FC-9 (PK `(namespace, key)`, `revision`, no tenant column; Mongo `_id` `{namespace, key}`, `revision`, `deleted` tombstone).
+- Add: operating modes (single-tenant engine-backed; multi-tenant per request, `OnChange` refused) plus `<!-- NOT-YET(engine-tenants): multi-tenant with a tenant manager: lazy activation, lifecycle handler, blocked marker -->`; revision and freshness (`GetEntry`, `Stale`, revisions opaque); typed groups (`Bind`, one key per group).
+- Client options row: name only the options that stay, plus `<!-- NOT-YET(engine-core-p3): the three name-override options are removed -->`.
+- Header, module path, both dependency lines to v4; add the `MIGRATION-v4.md` pointer beside `MIGRATION-v3.md`; package structure as above.
 
-**Implementation vision:**
-
-- **§ API Invariants:** delete the table and rewrite it from FC-10, FC-4, FC-5, FC-6, FC-7 and D10. Rows to keep, corrected: client construction; lifecycle (`Register` → `Start` → ops → `Close`, `ErrRegisterAfterStart`); read paths (nil-receiver safe, `(value, ok, err)`); write path (last-write-wins, read-your-writes per D4); subscriptions (FC-4 in full: coalesced per (scope, key), independent across keys, `ErrUnknownKey`, panic recovery via `lib-observability/runtime.RecoverAndLog`); delete semantics (idempotent; publishes the registered default at `Revision 0`); admin HTTP surface (**four** value routes plus **two** catalog routes, at a configurable prefix, default `/system`; `WithAuthorizer` is default-deny); internal `Store`; sentinel errors (exactly the FC-10 set plus `ErrCloseTimeout`, `ErrNotSupportedInMultiTenant`, `ErrTenantConnectionMissing`); the test helper; scope. Rows to **delete outright**: tenant-scoped keys, tenant access, tenant validation, resolution order, tenant ctx propagation, admin authorization's tenant half. Rows to **replace**: storage evolution → FC-8 and FC-9 (primary key `(namespace, key)`, `revision`, no `tenant_id`; MongoDB `_id` `{namespace, key}`, `revision`, `deleted` tombstone). Rows to **add**: operating modes (the three shapes from Task 1.2.1); revision and freshness (`GetEntry`, `Entry.Stale`, revisions opaque and monotonic); tenant lifecycle (`Client.HandleTenantLifecycle`, lazy activation, the blocked marker); typed groups (`Bind`, one key per group, atomicity of a group = atomicity of one row).
-- **§ Code Conventions → Go Version:** module path → `/v4`.
-- **§ Dependencies:** `lib-commons/v6` → `/v7`; `lib-systemplane/v3` → `/v4`; keep the `lib-observability/v4` bullet and its boundary rationale, adding the `MIGRATION-v4.md` pointer beside the `MIGRATION-v3.md` one.
-- **§ Architecture Patterns → Package Structure:** add `internal/engine/` and `internal/group/`, remove `internal/manager/`, and fix the header sentence that still advertises "tenant-scoped overrides" as a feature of this library.
-- **Leave alone:** naming conventions, build tags, error handling, testing requirements, documentation standards, security, DevOps, the checklist. They are generic and correct. One exception inside the naming table: the row `| Interfaces | -er suffix or descriptive | Logger, Manager, LockManager |` uses `Manager` as a *naming example*, not as an API reference. It is correct and must stay — and it is the reason the absence grep in this lane matches `NewManager` and `systemplane\.Manager` rather than a bare `Manager`.
+Commit body: this file has been wrong since before v2; the tenant-scoped-keys API never shipped in a supported major.
 
 **Files:**
 - Modify: `docs/PROJECT_RULES.md`
@@ -337,34 +448,43 @@ This is the single largest correctness gap in the repository's documentation, an
 **Verification:**
 
 ~~~bash
-grep -rnE 'RegisterTenantScoped|GetForTenant|SetForTenant|DeleteForTenant|ListTenantsForKey|OnTenantChange|WithTenantAuthorizer|WithTenantSchemaEnabled|ErrMissingTenantContext|ErrInvalidTenantID|ErrTenantScopeNotRegistered|ErrTenantSchemaNotEnabled|tenant_id|_global|lib-commons/v6|lib-systemplane/v3|DefaultSeedSQL|WithTable\(|WithListenChannel\(|WithCollection\(' docs/PROJECT_RULES.md
+grep -nE "$ABSENT" docs/PROJECT_RULES.md   # expected: no output (baseline 8)
+grep -nE 'RegisterTenantScoped|GetForTenant|SetForTenant|DeleteForTenant|ListTenantsForKey|OnTenantChange|WithTenantAuthorizer|WithTenantSchemaEnabled|ErrMissingTenantContext|ErrInvalidTenantID|ErrTenantScopeNotRegistered|ErrTenantSchemaNotEnabled|tenant_id|_global|RecoverAndLog|tenant-scoped overrides' docs/PROJECT_RULES.md   # expected: no output
+grep -rn 'RegisterTenantScoped\|GetForTenant\|WithTenantAuthorizer' --include='*.go' .   # expected: no output
+grep -c 'NOT-YET(' docs/PROJECT_RULES.md   # expected: 3
 ~~~
 
-returns nothing, and the link check over `docs/PROJECT_RULES.md` exits 0 (it links to `../MIGRATION-v3.md` and to its own table-of-contents anchors, so a renamed section silently breaks the ToC without it).
+and § The link check over `docs/PROJECT_RULES.md` (exit 0; it guards the ToC anchors).
 
-**Done when:** § API Invariants describes only symbols that exist; the tenant-scoped-keys rows are gone; the storage row matches FC-8 and FC-9; the module path and both dependency lines are v4; the package structure lists `internal/engine` and `internal/group` and no `internal/manager`; the naming-conventions `Manager` example is untouched.
+**Done when:** § API Invariants names only symbols on `develop`; storage matches FC-8/FC-9; panic recovery names `HandlePanicValue`; module path and both dependency lines are v4; package structure lists `internal/engine`, `internal/group`, `internal/safelog`, `internal/testsupport`; the naming-table `Manager` example is untouched; three placeholders.
 
 #### Task 1.2.3: Rewrite the root package doc
 
 - [ ] Done
 
-**Context:** `doc.go` is the first thing a consumer sees on pkg.go.dev, and it is the only `.go` file this lane owns. It currently describes the v3 model: "Reads are low-contention (read-locked) and nil-receiver safe; writes are persisted to either Postgres (with LISTEN/NOTIFY change-feed) or MongoDB". It names no groups, no revisions, no staleness, no tenants, and its lifecycle sentence stops at `OnChange`. Nothing in it is false; it is simply the wrong library now.
+**Context:** `doc.go` (18 lines) still says "Reads are low-contention (read-locked) … LISTEN/NOTIFY change-feed … change-streams" (`doc.go:7-9`), and its lifecycle sentence stops at `OnChange` (`doc.go:11-14`); the closing bootstrap paragraph (`doc.go:16-17`) is correct. Every link target exists: `NewPostgres`, `NewMongoDB`, `Client.Register`, `Bind` (`api_group.go:108`), `Client.Start`, `Group.Snapshot`, `Client.OnChange`, `Group.OnApply` (`api_group.go:495`), `Client.Close`, `Client.GetEntry` (`api_client.go:84`). `example_group_test.go` belongs to the groups lane.
 
-**Implementation vision:** Keep it short — a package doc is a front door, not a manual. Four paragraphs:
+**Implementation vision:** Four paragraphs, `[Symbol]` doc links throughout:
+1. What the library is: hot-reload a small set of operational knobs without a pod restart, on Postgres or MongoDB.
+2. Lifecycle: construct with [NewPostgres] or [NewMongoDB]; declare keys with [Client.Register] or a typed document with [Bind]; call [Client.Start]; read with the typed accessors or [Group.Snapshot]; react with [Client.OnChange] or [Group.OnApply]; shut down with [Client.Close].
+3. Guarantees, single-tenant: every value entering the cache is decoded and validated once (`internal/engine/ingest.go:109-154`); the scope reconciles against the store after every changefeed reconnect; [Client.GetEntry] reports revision, provenance and staleness. One sentence for multi-tenant mode as it is today: reads resolve the tenant database from ctx and read through.
+4. The closing paragraph, verbatim.
 
-1. What the library is (unchanged in substance): hot-reload a small set of operational knobs without a pod restart, on Postgres or MongoDB.
-2. The lifecycle, corrected: construct with [NewPostgres] or [NewMongoDB]; declare every key with [Client.Register] or, for a typed document, [Bind]; call [Client.Start]; read with the typed accessors or [Group.Snapshot]; react to changes with [Client.OnChange] or [Group.OnApply]; shut down with [Client.Close]. Use the `[Symbol]` doc-link form throughout so pkg.go.dev renders them — the existing file already does this and the convention is worth keeping.
-3. What v4 guarantees, in three sentences: every value entering the cache is decoded and validated once; a scope reconciles against the store after every changefeed reconnect, so a value written while the connection was down becomes visible without a second write; [Client.GetEntry] reports the revision, provenance and staleness of what it returned.
-4. Keep the existing closing paragraph verbatim — bootstrap-only settings (DSNs, secrets, TLS material, listen addresses) belong in environment variables, not here. It is the scope statement and it has not changed.
-
-Do not add an `Example` function here: executable examples live in `examples/` (§ Architecture) and `api_group.go` already carries `example_group_test.go` from the groups lane, which this lane does not own.
+`NOT-YET(engine-tenants)`: no placeholder in `doc.go` (a package-doc line renders on pkg.go.dev); the connector sentence is added by Epic 2.3's godoc sweep after engine-tenants merges. No `Example` function here.
 
 **Files:**
 - Modify: `doc.go`
 
-**Verification:** `cd /srv/worktrees/v4-docs && go build ./... && go vet ./... && gofmt -l doc.go` — the last prints nothing — and `go doc . | head -40` renders the new text with the doc links resolved.
+**Verification:**
 
-**Done when:** the package doc names groups, revisions, reconciliation and `Close`; every `[Symbol]` link resolves to a symbol that exists; `gofmt` is clean and the build is green.
+~~~bash
+cd /srv/worktrees/v4-docs && go build ./... && go vet ./... && gofmt -l doc.go   # expected: no output from gofmt
+grep -nE "$ABSENT" doc.go                     # expected: no output
+grep -nE 'read-locked|NOT-YET' doc.go         # expected: no output
+go doc . | head -30                           # expected: the four paragraphs, links rendered as symbol names
+~~~
+
+**Done when:** the package doc names groups, reconciliation, `GetEntry` and `Close`; every link resolves; `gofmt` clean; build and vet green; no placeholder in the file.
 
 ---
 
@@ -413,9 +533,10 @@ Two facts to carry into elaboration rather than rediscover. First, the added CI 
 | A README snippet stops compiling and nobody notices | the README carries no complete program (§ Architecture); the programs are in `examples/` and CI builds them | 2 |
 | `docs/PROJECT_RULES.md` keeps describing an API that never shipped | Task 1.2.2's grep for the tenant-scoped-keys symbol set | 1 |
 | A consumer on v1.6.x reads a v4 change list and is blindsided by Fiber v2 → v3 | Task 1.1.1 § The module and dependency hop; restated in the finance-hub and notifications sections | 1 |
-| br-sfn deploys v4 and 17 callbacks fire at boot | Behaviour change 2 (FC-11), cross-linked from the br-sfn section | 1 |
+| br-sfn deploys v4 and 17 callbacks fire at boot | Behaviour change 7 (FC-11), cross-linked from the br-sfn section | 1 |
 | A Console query reads tombstones as live rows | § The database and operator contract → MongoDB, point 2, in bold, and restated in the product-console section | 1 |
 | An operator runs `SchemaSQL()` on an install living in another schema and forks it | § The database and operator contract → Postgres, point 3 | 1 |
+| A document asserts behaviour a pending lane has not landed | § Phase 1 NOT-YET convention; the engine-tenants placeholder check in every `MIGRATION-v4.md` task | 1 |
 | A table-of-contents anchor breaks when a section is renamed | § The link check, run in every task's verification | 1, 2 |
 | This lane edits a file `engine-tenants` is writing | § What this lane owns names the three files; Epic 2.3 makes the godoc sweep a report for them | 2 |
 
@@ -431,11 +552,11 @@ Two facts to carry into elaboration rather than rediscover. First, the added CI 
 | … nor `Slice`, `WithLazyTenantLoad`, `WithTenantAuthorizer`, `WithTenantSchemaEnabled` | Task 1.2.2 (the last three live only in `docs/PROJECT_RULES.md` and `.env.reference`); `Slice N` is **not** a docs-lane token — verified, it appears only in `internal/manager/**`, which `engine-core` deletes, and the repo-wide check belongs to the `integration` lane under lane-cut rule 4 |
 | `CHANGELOG.md` and `docs/plans/` out of scope | § What this lane owns lists both as must-not-touch |
 | `MIGRATION-v4.md` has one section per consumer in the matrix | Tasks 1.1.4 (seven) and 1.1.5 (three) — ten of ten rows |
-| … plus a behaviour-change section (FC-11, coalesced delivery, `Change` signature, removed options) | Task 1.1.2, items 2, 4, 3 and the § The surface diff table from Task 1.1.1 |
+| … plus a behaviour-change section (FC-11, coalesced delivery, `Change` signature, removed options) | Task 1.1.2b items 7, 9, 8 and the § The surface diff table from Task 1.1.1 (name-override options as a `NOT-YET(engine-core-p3)` placeholder) |
 | Three examples build in CI, each demonstrating a value changing at runtime | Epics 2.1 and 2.3 |
 | `CLAUDE.md` API invariants match the facade | Task 1.2.1 |
-| `MIGRATION-v4.md` states (a) one database per tenant / schema-isolated DSN refused | Task 1.1.3 Postgres point 4 — **partially**, see § DEVIATIONS item 2 |
-| … (b) one LISTEN backend per active tenant per replica, size `max_connections` accordingly | Task 1.1.3 Postgres point 5 |
+| `MIGRATION-v4.md` states (a) one database per tenant / schema-isolated DSN refused | Task 1.1.3 Postgres point 4: the rule now, the public `ErrSharedDatabaseUnsupported` refusal as a `NOT-YET(engine-tenants)` placeholder |
+| … (b) one LISTEN backend per active tenant per replica, size `max_connections` accordingly | Task 1.1.3 Postgres point 5, a `NOT-YET(engine-tenants)` placeholder |
 | … (c) revisions opaque, may skip, start at 2 | Task 1.1.3 Postgres point 6 |
 | The godoc of the root Postgres tenant-connector option states (a), (b), (c) | **Not covered** — see § DEVIATIONS item 1 |
 | `.env.reference` deleted | Epic 2.2 |
@@ -444,15 +565,15 @@ Two facts to carry into elaboration rather than rediscover. First, the added CI 
 
 ### Vagueness scan
 
-Ran over all eight Phase 1 tasks. No "appropriate", no "handle edge cases", no "TBD", no unnamed deferral. Every task names its file, its exact section headings, its verification command and its acceptance. Three things that could read as deferrals are decisions with reasons attached: `MIGRATION-v3.md` is kept unrewritten (a consumer on v2 still needs it to describe v3); `.env.reference` is deleted rather than corrected (Epic 2.2 states what survives and where); the README is rewritten wholly in Phase 2 rather than split across both (its prose and its code blocks change together, and splitting rewrites the same file twice). Phase 2 is epic-level by the rolling-detail rule, and its three epics each carry the shape decision that elaboration would otherwise relitigate.
+Ran over all nine Phase 1 tasks (re-elaborated 2026-09-24). No "appropriate", no "handle edge cases", no "TBD", no unnamed deferral. Every task names its file, its exact section headings, its verification command and its acceptance. Three things that could read as deferrals are decisions with reasons attached: `MIGRATION-v3.md` is kept unrewritten (a consumer on v2 still needs it to describe v3); `.env.reference` is deleted rather than corrected (Epic 2.2 states what survives and where); the README is rewritten wholly in Phase 2 rather than split across both (its prose and its code blocks change together, and splitting rewrites the same file twice). Phase 2 is epic-level by the rolling-detail rule, and its three epics each carry the shape decision that elaboration would otherwise relitigate.
 
 ### File disjointness
 
 This lane writes only `MIGRATION-v4.md`, `MIGRATION-v3.md` (one line), `README.md`, `CLAUDE.md`, `doc.go`, `docs/PROJECT_RULES.md`, `.env.reference` (deleted), `examples/**` and one job in `.github/workflows/go-combined-analysis.yml`. Intersected against its wave-3 siblings: `engine-tenants` writes `internal/engine/**`, `internal/client/options.go`, root `api_constructors.go` and `api_client.go`; `matcher-pilot` is in a different repository. **The intersection is empty** — and it is empty only because Epic 2.3 makes the godoc sweep a report for `api_*.go` rather than an edit. `doc.go` is the one `.go` file this lane touches and no other lane claims it: it is absent from `engine-core`'s owned list, from `groups`' (`api_group*.go`, `internal/group`), from `storage`'s and from `admin`'s.
 
-Against the merged wave-2 lanes there is one ordering dependency rather than a conflict: `examples/manager/` is deleted by `engine-core` Task 2.2.1, not here.
+Against the merged wave-2 lanes there is no remaining dependency: `examples/manager/` is already gone.
 
-Every `file:line` reference in this document points at a file this lane owns. Everything else — `WithPostgresTenantManager`, `MigrationV3ToV4SQL`, `Bind`, `Group.OnApply`, `ErrCloseTimeout` — is named by symbol only.
+Phase 1 cites `file:line` in code this lane does not own, as **Context** evidence only; no Phase 1 task edits those files. The anchors are valid for `develop` `0ecdf9e`.
 
 ---
 
@@ -483,3 +604,7 @@ notifications (v1.6.1) and finance-hub (v1.6.0) are on the unsuffixed module pat
 - **3** corrected: the Lane Overview marks groups `In flight` (Phase 1 merged as PR #72, Phase 2 with `OnApply`/`Status` being elaborated on `feat/v4-groups-hot-reload`). `examples/groups` and the `doc.go` paragraph that need `OnApply` wait for groups Phase 2; Phase 1 tasks that only cite FC-7 may proceed.
 - **4** frozen in FC-4: multi-tenant `OnChange` with no tenant manager returns `ErrNotSupportedInMultiTenant`. Write it as a documented refusal in behaviour change 6 and in the billing-worker section.
 - **5** accepted: the v1.6.x hops (Fiber v2 to v3, lib-commons v5 to v7, lib-observability v1 to v4) are stated as preconditions; `MIGRATION-v4.md` documents from v3 onward.
+
+## Re-elaboration note (2026-09-24)
+
+Phase 1 was re-elaborated against `develop` `0ecdf9e` (tag `v4.0.0-beta.13`) from the verified recheck of that tree. Item 3 above is closed: groups Phase 2 merged as PR #86 (`OnApply`, `Applied`, `ApplyStatus`, `Status`, `ErrApplyPanicked` exist). The module-hop table was wrong: v3.0.0 already ships `lib-commons/v7` and `lib-observability/v4`, so v3 → v4 moves only the module path. Behaviour owned by engine-tenants, engine-core Phase 3 or `fix/panic-posture-storage` is written as `NOT-YET(<lane>)` placeholders.
