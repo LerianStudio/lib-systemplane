@@ -113,7 +113,159 @@ to whatever this library requires. Do not pin it yourself.
 
 ## Behaviour changes
 
-<!-- filled by Task 1.1.2a/1.1.2b -->
+These are ordered by how quietly each one changes a running service: the first
+breaks no build and can change what your process serves on its next boot; the
+last is a log query.
+
+### A stored row your validator rejects no longer reaches a read
+
+**Affects:** every single-tenant consumer that registered a validator.
+
+v3 handed a stored row straight to `Get`. v4 grades every value on the way in —
+the first reconcile at `Start`, every later reconcile, every changefeed re-read
+— with the same validator that grades a `Set`. A row the validator refuses
+never comes into force: at `Start` the registered default stays in force, on a
+later refresh the last valid value stays, and a WARN names the namespace, the
+key and the validator's error. The refused value itself is never logged.
+
+So a row an older binary wrote, or an operator wrote by hand, or that a
+validator you have since tightened would now refuse, stops being served the
+next time the process boots — with nothing failing at build time to say so.
+
+**Do:** before deploying, query the store for rows your validators would
+refuse. Those keys revert to their registered default on the next start, so fix
+the rows or widen the validator first.
+
+Multi-tenant per-request reads (`Get`, `List`) still read through ungraded.
+
+<!-- NOT-YET(engine-tenants): tenant scopes graded at ingress -->
+
+### Validators and defaults see the canonical JSON shape
+
+**Affects:** every consumer with a validator that type-asserts, and every
+numeric or structured default.
+
+A value reaches a validator — and a reader — in the shape the store hands back:
+numbers as `float64`, objects as `map[string]any`, arrays as `[]any`. That now
+holds at `Register` too, where the default is marshaled and decoded before it
+enters the registry, so `Get` of a numeric key with no row returns `float64`
+and never the Go value you passed. A validator that asserts the Go type it
+registered fails with `ErrValidation` — at `Register` for the default, at `Set`
+for a write:
+
+~~~go
+// v3 accepted this. v4 refuses it at Register and at Set.
+systemplane.WithValidator(func(v any) error {
+	n, ok := v.(int)
+	if !ok || n < 1 {
+		return errors.New("want a positive whole number")
+	}
+	return nil
+})
+
+// v4: grade the canonical shape.
+systemplane.WithValidator(func(v any) error {
+	n, ok := v.(float64)
+	if !ok || n < 1 || n != math.Trunc(n) {
+		return errors.New("want a positive whole number")
+	}
+	return nil
+})
+~~~
+
+Grading one shape on every ingress has two further consequences. Validators
+must be **deterministic**, because read-back grades the stored row again in
+that same shape and a validator answering differently on that pass pins the
+last valid value. And a validator that **panics** refuses the write, or the
+row, instead of unwinding into the caller's goroutine: it comes back as
+`ErrValidation`, and the panic is reported through lib-observability's recovery
+pipeline — for a key registered redacted, carrying the panic value's dynamic
+type rather than the value.
+
+`WithContextValidator` sees the `Set` caller's own context on a write, but
+read-back grades with the client's lifecycle context: no request values, no
+tenant. A context validator that refuses when it cannot find a tenant therefore
+refuses every stored row on read-back and pins the last valid value in force.
+Treat a context that lacks the scope you expect as "cannot verify" and decide
+by your own policy.
+
+**Do:** audit every validator for Go-type assertions and for a dependency on
+request scope.
+
+### `Set` and `Delete` can return an error for a change that landed
+
+**Affects:** every caller that reads a nil error as "persisted".
+
+A single-tenant `Set` persists the row and then publishes it into this
+process's own cache. v3 returned nil when that publication was dropped. v4
+returns an error, with the row already in the store:
+
+- `ErrClosed`, when the Client closed under the write;
+- an error wrapping `ErrNotStarted` that names the key and says it "was
+  written but not published" — the engine holds no live scope, because `Start`
+  never brought one up or it was dropped under the write;
+- otherwise an error naming the key and the publication failure.
+
+`Delete` reports the same three, worded "was deleted but not published". The
+narrow case worth knowing: a `Set` racing `Start` can persist its row and still
+report `ErrNotStarted`, because the Client counts as started from the moment
+its first reconcile begins.
+
+**Do:** read a non-nil error from `Set` or `Delete` as "persisted, but this
+process does not serve it yet", never as "not persisted". What it asks for is
+that you stop reporting the write as lost, not that you retry it.
+
+### Read-your-writes
+
+**Affects:** every single-tenant consumer that reads back what it just wrote.
+
+`Set` publishes the value into the cache with the revision the store assigned
+before it returns, and the changefeed echo of that same write arrives at the
+same revision and is deduplicated — refreshing provenance, firing no callback.
+In v3 a `Set` followed immediately by a `Get` could return the old value until
+the NOTIFY came back. **Do:** delete the workarounds for that window — the
+sleep, the retry loop, the second read.
+
+### Redaction fails closed
+
+**Affects:** consumers that render configuration values, and anything that
+reads `KeyRedaction`.
+
+`KeyRedaction` reports `RedactFull` for a closed or nil Client, where v3
+reported `RedactNone`. A Client that can no longer read its own registry
+withholds rather than discloses: the admin GET and list handlers look the
+policy up after their read, so a `Close` landing in that window would otherwise
+render a redacted key in clear into a response body. On an open Client an
+unregistered key still reports `RedactNone`.
+
+A redacted key's value is also withheld from every report it could ride out on:
+the decode-failure and validator-rejection log lines, a validator or apply-hook
+panic, the typed getters' errors (`GetInt` and `GetDuration` used to quote the
+value they could not convert) and the group decode and apply lines. Each
+carries what failed and the value's dynamic type instead.
+
+**Do:** expect masked output wherever a consumer renders values after `Close`,
+and stop parsing values back out of these errors and log lines.
+
+### Operational: primary pinning and the `keyname` log field
+
+**Affects:** operators, and anyone running Postgres behind a resolver that
+carries replicas.
+
+Every systemplane statement is pinned to the primary, reads included — and to
+the first primary deterministically when a resolver reports several. A standby
+could otherwise serve a revision older than the one `Set` just returned, and
+older than the NOTIFY the changefeed is reconciling against, since the feed
+LISTENs on the primary DSN. What this gives up is read spreading, and only on a
+resolver reporting more than one primary.
+
+Every log line that named a configuration key in field `key` names it in
+`keyname` instead. `key` is an exact entry in lib-observability's default
+sensitive-field list, so those lines shipped `key=[REDACTED]` to an operator
+hunting a rejected row — a line that reads correctly in the source and is wrong
+only in production.
+
+**Do:** re-point any log query, dashboard or alert that matches on field `key`.
 
 ---
 
