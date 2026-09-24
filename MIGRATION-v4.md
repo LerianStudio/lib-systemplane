@@ -267,6 +267,201 @@ only in production.
 
 **Do:** re-point any log query, dashboard or alert that matches on field `key`.
 
+### Every callback registered before `Start` fires once at `Start`
+
+**Affects:** every single-tenant consumer with an `OnChange` subscriber.
+
+`Start` reconciles every registered key against the store and hands the value
+in force to every subscriber registered beforehand — once, per key. Keys the
+store had no row for, and keys whose stored row the validator refused, are
+announced as the registered default at `Revision 0`. The announcement is queued
+while `Start` runs and delivered on the key's own goroutine, so a callback may
+run just after `Start` returns; what `Start` itself guarantees is that every
+read taken after it already serves the value that announcement carries.
+
+What it buys is that a consumer can put its whole reload path in `OnChange` and
+be correct from boot, instead of reading each key once at start-up and
+subscribing for the rest. What it costs is that everything a callback does as a
+side effect now happens on every boot.
+
+**Do:** make callbacks idempotent, or compare the announced value against the
+one last applied. A callback that posts a notification, rotates a credential or
+restarts a worker now does it once per process start.
+
+This holds for the single-tenant scope today.
+
+<!-- NOT-YET(engine-tenants): multi-tenant callbacks fire once per tenant at activation -->
+
+### `OnChange`'s signature changed, and an unregistered key is refused
+
+**Affects:** every `OnChange` caller. It is the one change in this section that
+breaks the build, which makes it the easy one.
+
+~~~go
+// v3
+unsub, _ := c.OnChange(ns, key, func(ctx context.Context, ns, key string, v any) {
+	reload(v)
+})
+
+// v4
+unsub, err := c.OnChange(ns, key, func(ctx context.Context, ch systemplane.Change) {
+	reload(ch.Value)
+})
+~~~
+
+`Change{Tenant, Namespace, Key, Revision, Value}` carries two things the four
+arguments could not. `Revision` is the store revision behind the value, and 0
+means no row: the registered default is in force because the key was deleted,
+was never written, or its stored row was refused. `Tenant` names the tenant
+whose row changed and is `""` in single-tenant mode — it is what a callback
+reads to learn the tenant, never the context.
+
+Never the context, because the context a callback receives is the engine's own
+lifecycle context: no request values, no tenant. v3's godoc promised a
+tenant-scoped context and handed over the LISTEN goroutine's. Cancellation is
+the one thing to read out of it, and honouring it is what lets `Close` finish.
+
+`OnChange` for a key nothing registered returns `ErrUnknownKey` in both modes,
+where v3 logged a debug line and handed back a no-op unsubscribe — a
+subscription that could never deliver anything now surfaces the typo at wiring
+time. In multi-tenant mode a registered key then returns
+`ErrNotSupportedInMultiTenant`: no scope is tracked and no changefeed runs, so
+nothing could fire. For a consumer that only reads per-request configuration
+that refusal is permanent, and reading through on each request is the whole
+design.
+
+<!-- NOT-YET(engine-tenants): multi-tenant OnChange with a tenant manager, Change.Tenant set -->
+
+**Do:** rewrite the signature, and check the error — v3 callers routinely
+discarded it because it only ever reported a closed Client.
+
+### Deliveries are coalesced per key and independent across keys
+
+**Affects:** subscribers that count callbacks or accumulate what they receive.
+
+One goroutine per subscribed key delivers that key's changes, serially and off
+the changefeed goroutine. While a callback runs, a newer revision of the same
+key replaces the pending one: the callback may skip intermediate revisions,
+always receives the newest, and never sees revisions out of order. Different
+keys deliver independently, so a subscriber blocking on one key delays nothing
+else. v3's `Manager` ran every callback synchronously on the LISTEN goroutine,
+where one slow subscriber stalled every key of every tenant.
+
+Two deliveries are suppressed rather than coalesced. A row republished at the
+same non-zero revision with the same bytes refreshes `UpdatedAt` and
+`UpdatedBy` and fires no callback — that is how a `Set`'s own changefeed echo
+is absorbed. `Revision 0` is never deduplicated, so a delete always delivers.
+
+**Do:** read a delivery as "the current value is this", never as "one change
+happened". A consumer that counted events, or that applied each value in turn
+to build up state, reconciles to the newest value instead.
+
+### `Close` is bounded, and names the callback that would not stop
+
+**Affects:** every consumer that closes a Client, and anyone with a
+long-running callback.
+
+`Close` cancels the changefeed and the context every callback holds, then waits
+for deliveries still running — up to `WithCloseTimeout`, 30 seconds by default.
+A callback that honours its context ends and `Close` returns nil. One that
+ignores it survives `Close`, which returns `ErrCloseTimeout` naming every
+`(scope, key)` still inside a delivery; the single-tenant scope renders as
+`single-tenant`. That goroutine is the subscriber's leak, reported rather than
+hidden.
+
+An `ErrCloseTimeout` that names no key at all is a different diagnosis, not a
+missing one: no callback is running, so what held shutdown is engine work
+inside the store — a reconcile whose `List` has not answered, or a debounced
+re-read. That is a backend or network fault, and looking for it in consumer
+code wastes the outage.
+
+`WithCloseTimeout` bounds the engine's wait alone. Releasing the backend is not
+covered by it, and `Close` returns the engine's timeout joined with the store's
+own error so neither hides the other. A second `Close` replays the first one's
+result.
+
+**Do:** honour the context a callback is handed. Raising the timeout is the
+second-best answer to a callback that cannot be interrupted.
+
+### A failed `Start` is retriable
+
+**Affects:** consumers that start against a database that may not be up yet.
+
+A `Start` that fails leaves the Client usable and every subscription registered
+before it intact, so the answer to a database that is not up is to call `Start`
+again rather than to rebuild the Client. After a failed reconcile the next
+`Start` reconciles from nothing. After a context expiry it waits on the
+reconcile already pending, and `Register` stays refused with
+`ErrRegisterAfterStart` — that reconcile may already have read the registry, so
+the registry cannot grow underneath it.
+
+**Do:** register every key before the first `Start` attempt, and retry `Start`
+itself on failure.
+
+### `GetEntry` reports revision, provenance and freshness
+
+**Affects:** consumers that need to know whether the value they just read is
+being confirmed by anything.
+
+`GetEntry` returns `Entry{Value, Revision, UpdatedAt, UpdatedBy, Stale}`.
+`Revision`, `UpdatedAt` and `UpdatedBy` describe the persisted row behind the
+value and are zero when the registered default is in force. `Stale` reports
+that nothing is currently confirming **this** key: before `Start`; while the
+changefeed is disconnected, or connected but not yet reconciled; and while this
+key's last change could not be re-read. Reads keep serving the last published
+value throughout — `Stale` is about confidence, not absence — and a sibling key
+that could not be re-read does not make this one stale.
+
+Three rules produce that per-key answer:
+
+- A changefeed delete is counted the moment it arrives, ahead of the re-read
+  that answers it, so nothing can publish the removed row back over the
+  removal. An empty re-read publishes the registered default at `Revision 0`;
+  a row recreated in the meantime wins at its own revision.
+- A re-read that fails is retried once, off the changefeed goroutine, after a
+  wait drawn from [125ms, 250ms) — floored so the pool that refused the first
+  read is not hammered, jittered so a scope-wide failure does not send every
+  key back at the same instant. A second failure marks that one key `Stale`.
+- A key is confirmed only by an ingress that read it back. A reconcile snapshot
+  does not clear the mark, because that photograph may predate the very change
+  the failed re-read was sent for.
+
+The admin GET and list responses render the same four fields: `revision`,
+`updatedAt` (JSON null when no row backs the value), `updatedBy` and `stale`.
+
+**Do:** use `GetEntry` where a decision depends on freshness — gating a risky
+action, or answering a health endpoint. `Get` is unchanged for everything else.
+
+### Panics, and your logger
+
+**Affects:** everyone.
+
+An `OnChange` callback that panics is recovered per subscriber: the other
+subscribers of that key still run, the delivery worker survives, and the panic
+is reported through lib-observability's recovery pipeline under component
+`systemplane.engine`, name `onchange`. For a key registered redacted the report
+carries the panic value's dynamic type instead of the value.
+
+The logger you pass in is guarded. A logger that panics can neither take a
+library goroutine down nor unwind out of a library call — in multi-tenant mode
+the error lines are written on the caller's own goroutine, so an unguarded one
+took a `Get` or a `List` with it. `Logger()` still hands back the logger you
+passed, unwrapped. Multi-tenant error lines stamp `tenant.id` from the context,
+or `unresolved` when the context carries none.
+
+<!-- NOT-YET(panic-posture): every recovered panic reported with a log line, panic_recovered_total and a span event; the counter needs runtime.InitPanicMetrics in the host -->
+
+**Do:** nothing, unless a panicking callback was what failed your boot. It no
+longer does.
+
+### Revisions are opaque
+
+**Affects:** anything that persists, exports or compares a `Revision`.
+
+Compare revisions of one key, for ordering, and nothing else: what a revision
+is, how it advances and what it refuses to promise is in
+[§ The database and operator contract](#the-database-and-operator-contract).
+
 ---
 
 ## The database and operator contract
