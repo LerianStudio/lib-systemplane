@@ -28,6 +28,7 @@ import (
 	"github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/runtime"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/engine"
 )
 
 // Publication is one published revision of a group's document in one scope.
@@ -814,25 +815,13 @@ func (c *Coordinator[T]) invoke(
 // would then swallow the unwind, leaving a panicking hot-reload hook visible
 // nowhere but Status. Wrapping keeps the canonical handler and its production
 // redaction while making the record step independent of the consumer's logger.
+//
+// engine.GuardLogger is that wrapper, shared rather than copied: it guards the
+// level check as well as the entry, and answers nil with a no-op logger.
 func (c *Coordinator[T]) reportPanic(ctx context.Context, recovered any) {
 	defer swallowPanic()
 
-	runtime.HandlePanicValue(ctx, safeLogger{inner: c.logger}, recovered, "systemplane", "group.apply")
-}
-
-// safeLogger is a logger whose Log cannot unwind into its caller. It exists for
-// the panic handler above, which runs the consumer's logger ahead of everything
-// else it does.
-type safeLogger struct{ inner log.Logger }
-
-func (l safeLogger) Log(ctx context.Context, level int, msg string, fields ...any) {
-	if l.inner == nil {
-		return
-	}
-
-	defer swallowPanic()
-
-	l.inner.Log(ctx, level, msg, fields...)
+	runtime.HandlePanicValue(ctx, engine.GuardLogger(c.logger), recovered, "systemplane", "group.apply")
 }
 
 func (c *Coordinator[T]) logError(ctx context.Context, msg string, fields ...log.Field) {

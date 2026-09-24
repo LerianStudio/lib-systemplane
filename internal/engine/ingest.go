@@ -417,7 +417,29 @@ func (e *Engine) reportConsumerPanic(ctx context.Context, recovered any, redacte
 		reported = fmt.Sprintf("%s (%T, value withheld: key registered redacted)", what, recovered)
 	}
 
-	runtime.HandlePanicValue(ctx, e.recoveryLogger(), reported, "systemplane.engine", name)
+	e.reportRecovered(ctx, reported, name)
+}
+
+// reportRecovered hands a recovered panic to lib-observability's canonical
+// handler and refuses to let the REPORTING escape.
+//
+// That handler logs the panic, then counts it on panic_recovered_total through
+// whatever Recorder the consumer registered process-wide with
+// runtime.InitPanicMetrics, then records the span event and hands it to the
+// error reporter. All three are consumer code this engine never sees and
+// cannot wrap — the logger guard covers the logger, nothing covers the rest —
+// so a panic raised in there unwinds out of the recovery that was reporting.
+// The only net left is the goroutine launcher's single recovery, which reports
+// through this same pipeline and panics again with nothing under it: one
+// broken counter turns every recovered panic into process death.
+//
+// So every engine site that reports a recovered panic comes through here. The
+// counter, the span event and the error report still fire exactly as before;
+// what a broken one now costs is its own line, not the goroutine.
+func (e *Engine) reportRecovered(ctx context.Context, recovered any, name string) {
+	defer swallowPanic()
+
+	runtime.HandlePanicValue(ctx, e.recoveryLogger(), recovered, "systemplane.engine", name)
 }
 
 // logWarn reports an ingress rejection. A nil logger is a no-op: the engine

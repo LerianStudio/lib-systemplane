@@ -87,7 +87,10 @@ func newSingleTenantClientWithLogger(t *testing.T, s *memStore, logger log.Logge
 
 	cfg := defaultClientConfig()
 	cfg.debounce = 0
-	cfg.logger = logger
+
+	// Through the option rather than the field, so the logger reaching the
+	// engine is the guarded one a real constructor hands it.
+	applyClientOptions(&cfg, []Option{WithLogger(logger)})
 
 	return newClient(s, cfg)
 }

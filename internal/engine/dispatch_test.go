@@ -122,6 +122,21 @@ func (l *panicLogger) Log(context.Context, int, string, ...any) {
 	}
 }
 
+// deadRegistry panics on the ONE lookup it is armed for and answers normally
+// afterwards, so a worker dies mid-delivery and its replacement can still
+// deliver the next Change.
+type deadRegistry struct{ armed atomic.Bool }
+
+func (r *deadRegistry) Lookup(string, string) (KeyDef, bool) {
+	if r.armed.CompareAndSwap(true, false) {
+		panic("the registry blew up")
+	}
+
+	return KeyDef{}, false
+}
+
+func (r *deadRegistry) Keys() []NSKey { return nil }
+
 // currentWorker reads the worker a scope would hand the next publication of
 // nk, under the lock that starts and sweeps one.
 func currentWorker(e *Engine, sc *scopeState, nk NSKey) *dispatchWorker {
@@ -143,25 +158,25 @@ func currentWorker(e *Engine, sc *scopeState, nk NSKey) *dispatchWorker {
 //
 // Neither sweep covers it: a scope drop and a Close both end workers they can
 // see, and this one ended itself.
+//
+// The panic comes from the registry lookup deliver runs before its first
+// callback, because that is what can still escape: a subscriber's own panic is
+// recovered per callback, and reporting that recovery cannot unwind either —
+// reportRecovered swallows a broken logger and a broken metrics recorder
+// alike. What this test pins is the net under everything that is left.
 func TestDispatchReplacesAWorkerWhosePanicEndedIt(t *testing.T) {
 	e := dispatchEngine(t)
-	lg := &panicLogger{Logger: log.NewNop()}
-	e.logger = lg
+
+	reg := &deadRegistry{}
+	reg.armed.Store(true)
+	e.registry = reg
 
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 	sc := e.scopeFor(store.Scope{})
 
 	var delivered recorder
 
-	unsub := e.OnChange(nk, func(ctx context.Context, ch Change) {
-		if ch.Revision == 1 {
-			lg.armed.Store(true)
-
-			panic("the subscriber blew up")
-		}
-
-		delivered.record(ctx, ch)
-	})
+	unsub := e.OnChange(nk, delivered.record)
 	defer unsub()
 
 	e.dispatch(sc, pub(nk, 1, "one"))

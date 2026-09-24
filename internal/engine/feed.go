@@ -8,7 +8,6 @@ import (
 
 	"github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
-	"github.com/LerianStudio/lib-observability/v4/runtime"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -437,7 +436,7 @@ func (e *Engine) recoverRefresh(scope store.Scope, nk NSKey, deleted, retried bo
 		log.String("keyname", nk.Key),
 	)
 
-	runtime.HandlePanicValue(ctx, e.logger, recovered, "systemplane.engine", "refresh")
+	e.reportRecovered(ctx, recovered, "refresh")
 }
 
 // scopeForEvent resolves the scope a changefeed event, a reconcile or a

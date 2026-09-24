@@ -61,7 +61,7 @@ func NewPostgres(db *sql.DB, listenDSN string, opts ...Option) (*Client, error) 
 		ListenDSN:          listenDSN,
 		Channel:            cfg.listenChannel,
 		Table:              cfg.table,
-		Logger:             engine.GuardLogger(cfg.logger),
+		Logger:             cfg.logger,
 		Telemetry:          cfg.telemetry,
 		MultiTenantEnabled: cfg.multiTenantEnabled,
 		Module:             cfg.module,
@@ -90,7 +90,7 @@ func NewMongoDB(client *mongo.Client, database string, opts ...Option) (*Client,
 		Database:           database,
 		Collection:         cfg.collection,
 		PollInterval:       cfg.pollInterval,
-		Logger:             engine.GuardLogger(cfg.logger),
+		Logger:             cfg.logger,
 		Telemetry:          cfg.telemetry,
 		MultiTenantEnabled: cfg.multiTenantEnabled,
 		Module:             cfg.module,
@@ -103,14 +103,23 @@ func NewMongoDB(client *mongo.Client, database string, opts ...Option) (*Client,
 }
 
 func newClient(s store.Store, cfg clientConfig) *Client {
-	logger := cfg.logger
-	if logger == nil {
-		logger = log.NewNop()
+	// cfg.logger is guarded by applyClientOptions; the Client's own field
+	// keeps the consumer's logger unwrapped, because Logger() hands it back.
+	// A config built by hand — every test that skips applyClientOptions — has
+	// neither, so both normalise to a no-op here.
+	guarded := cfg.logger
+	if log.IsNil(guarded) {
+		guarded = log.NewNop()
+	}
+
+	own := cfg.consumerLogger
+	if log.IsNil(own) {
+		own = log.NewNop()
 	}
 
 	c := &Client{
 		store:          s,
-		logger:         logger,
+		logger:         own,
 		multiTenant:    cfg.multiTenantEnabled,
 		catalogService: cfg.catalogService,
 		registry:       make(map[nskey]keyDef),
@@ -123,7 +132,7 @@ func newClient(s store.Store, cfg clientConfig) *Client {
 	c.engine = engine.New(engine.Config{
 		Store:    s,
 		Registry: c,
-		Logger:   logger,
+		Logger:   guarded,
 		Debounce: cfg.debounce,
 
 		// Left zero when the caller set no WithCloseTimeout, so the engine's

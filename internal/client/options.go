@@ -6,12 +6,20 @@ import (
 	"time"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/engine"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
 // clientConfig holds the merged configuration applied by Option functions.
+//
+// Two loggers, and the difference is load-bearing. logger is what every
+// internal consumer reads — both backends and the engine — and applyClientOptions
+// leaves it GUARDED, so a panic raised inside the consumer's own logger cannot
+// unwind a library goroutine. consumerLogger is what the caller handed in,
+// untouched, and is what Client.Logger() gives back.
 type clientConfig struct {
 	logger         log.Logger
+	consumerLogger log.Logger
 	telemetry      store.Telemetry
 	listenChannel  string
 	pollInterval   time.Duration
@@ -168,6 +176,18 @@ func applyClientOptions(cfg *clientConfig, opts []Option) {
 
 		opt(cfg)
 	}
+
+	// The whole library's guard, applied once, here. Every consumer of
+	// cfg.logger downstream — the Postgres store's listener and changefeed
+	// goroutines, the MongoDB change stream's, the engine's workers — logs a
+	// recovered panic through the logger the caller handed in, on a goroutine
+	// the caller cannot recover, so a logger that panics kills the process
+	// from any of them. Guarding at each of those call sites is a rule the
+	// next one has to remember; guarding the value they all read is not.
+	// engine.GuardLogger is idempotent, so engine.New guarding again costs one
+	// wrapper rather than two, and a nil logger becomes a no-op one.
+	cfg.consumerLogger = cfg.logger
+	cfg.logger = engine.GuardLogger(cfg.logger)
 }
 
 // KeyOption configures a single key at registration time.

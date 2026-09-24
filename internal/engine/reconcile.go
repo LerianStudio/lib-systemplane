@@ -171,7 +171,15 @@ func (e *Engine) runOneReconcile(ctx context.Context, sc *scopeState, arm reconc
 		}
 	}()
 
-	defer runtime.RecoverAndLogWithContext(ctx, e.logger, "systemplane.engine", "reconcile")
+	// Recovered here rather than by RecoverAndLogWithContext, which reports
+	// what it recovered on the way out: reportRecovered is what keeps a
+	// consumer's broken metrics recorder from turning that report into an
+	// unrecovered panic on this worker.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			e.reportRecovered(ctx, recovered, "reconcile")
+		}
+	}()
 
 	e.reconcileScope(sc, arm)
 

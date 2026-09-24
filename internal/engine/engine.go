@@ -132,10 +132,8 @@ type Config struct {
 // to the consumer's logger because nothing in this package or in
 // lib-observability's recovery path calls them.
 //
-// Four lines of this also live in internal/group, guarding the same hazard in
-// the coordinator's own panic handler. They are deliberately not shared: that
-// package belongs to another lane, and a shared helper would have to be
-// wired through it.
+// internal/group's panic handler guards the same hazard and now shares this
+// one through GuardLogger rather than keeping its own copy.
 type safeLogger struct{ log.Logger }
 
 func (l safeLogger) Log(ctx context.Context, level int, msg string, fields ...any) {
