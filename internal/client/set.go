@@ -70,8 +70,11 @@ func (c *Client) Set(ctx context.Context, namespace, key string, value any, acto
 		}
 
 		// The caller's own context, so a validator can read the tenant, the
-		// deadline and the trace the write carried.
-		if err := def.validator(ctx, canonical); err != nil {
+		// deadline and the trace the write carried. Through the engine's
+		// recovery, the same one every ingress grades under: a validator that
+		// panics on the canonical shape refuses the write instead of unwinding
+		// into the caller's request goroutine.
+		if err := c.engine.RunValidator(ctx, def.validator, canonical); err != nil {
 			return fmt.Errorf("%w: %w", ErrValidation, err)
 		}
 	}

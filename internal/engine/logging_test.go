@@ -302,7 +302,11 @@ func TestReReadErrorIsLoggedAtWarn(t *testing.T) {
 
 	fs.onGet(func(store.Scope, NSKey) error { return errors.New("connection reset") })
 
-	e.refreshKey(store.Scope{}, nk, false)
+	// Driven as the RETRY, so the one failure produces the one line this test
+	// counts. A first attempt logs the same line and then submits itself once
+	// more (retryRefresh), which is behavior TestFailedRereadIsRetriedOnce
+	// owns rather than a second spelling of this assertion.
+	e.refreshKey(store.Scope{}, nk, false, true)
 
 	requireLogged(t, rec, log.LevelWarn, "changefeed re-read failed, keeping current value", store.Scope{}, nk)
 }
@@ -325,7 +329,7 @@ func TestReReadCanceledByCloseIsLoggedAtDebug(t *testing.T) {
 
 	// The re-read a debounce timer already fired, reaching the store after
 	// Close canceled the lifecycle context.
-	e.refreshKey(scope, nk, false)
+	e.refreshKey(scope, nk, false, false)
 
 	requireLogged(t, rec, log.LevelDebug, "changefeed re-read canceled during shutdown", scope, nk)
 }
@@ -342,7 +346,7 @@ func TestLogLevelReReadWithNoRowIsDebug(t *testing.T) {
 
 	track(t, e, scope)
 
-	e.refreshKey(scope, nk, false)
+	e.refreshKey(scope, nk, false, false)
 
 	requireLogged(t, rec, log.LevelDebug, "changefeed re-read found no row, keeping current value", scope, nk)
 }
@@ -688,7 +692,8 @@ func TestReReadCanceledOutsideShutdownIsLoggedAtWarn(t *testing.T) {
 		return fmt.Errorf("pool checkout aborted: %w", context.Canceled)
 	})
 
-	e.refreshKey(store.Scope{}, nk, false)
+	// The retry, for the reason TestReReadErrorIsLoggedAtWarn states.
+	e.refreshKey(store.Scope{}, nk, false, true)
 
 	requireLogged(t, rec, log.LevelWarn, "changefeed re-read failed, keeping current value", store.Scope{}, nk)
 }
@@ -917,7 +922,14 @@ func TestReReadPanicNamesTheKey(t *testing.T) {
 				}
 			})
 
-			fs.onGet(func(store.Scope, NSKey) error { panic("the store driver exploded") })
+			// One-shot, because the retry a panicking re-read now schedules
+			// would otherwise report the same panic a second time and make
+			// this test's line count race the debounce timer.
+			fs.onGet(func(store.Scope, NSKey) error {
+				fs.onGet(nil)
+
+				panic("the store driver exploded")
+			})
 
 			e.onEvent(upsertEvent(scope, nk, 1))
 
@@ -945,7 +957,6 @@ func TestReReadPanicNamesTheKey(t *testing.T) {
 			requireLogged(t, rec, log.LevelError, rereadPanicMsg, scope, nk)
 			requirePanicAccounted(t, rec, "refresh")
 
-			fs.onGet(nil)
 			fs.seed(scope, jsonRow(nk, 2, `"after"`, "ops"))
 
 			var delivered recorder
@@ -1162,7 +1173,14 @@ func TestFailedRereadFencesTheKeyBeforeLogging(t *testing.T) {
 			level: log.LevelError,
 			def:   KeyDef{Default: "fallback"},
 			arrange: func(fs *fakeStore) {
-				fs.onGet(func(store.Scope, NSKey) error { panic("the store driver exploded") })
+				// One-shot: a re-read that could not answer is retried once,
+				// so a hook that kept failing would produce the same line
+				// twice and say nothing more than this one does.
+				fs.onGet(func(store.Scope, NSKey) error {
+					fs.onGet(nil)
+
+					panic("the store driver exploded")
+				})
 			},
 		},
 		{
@@ -1171,7 +1189,11 @@ func TestFailedRereadFencesTheKeyBeforeLogging(t *testing.T) {
 			level: log.LevelWarn,
 			def:   KeyDef{Default: "fallback"},
 			arrange: func(fs *fakeStore) {
-				fs.onGet(func(store.Scope, NSKey) error { return errors.New("backend down") })
+				fs.onGet(func(store.Scope, NSKey) error {
+					fs.onGet(nil)
+
+					return errors.New("backend down")
+				})
 			},
 		},
 		{

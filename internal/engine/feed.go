@@ -160,20 +160,71 @@ func (e *Engine) onEvent(evt store.Event) {
 	// default. Coalescing alone could not — it orders only the echoes that
 	// land inside one window, and a busy feed delivers most pairs further
 	// apart than that.
-	//
-	// Exactly one closure is built, in the branch that wants it: the two
-	// differ only in whether the re-read registers itself as work Close waits
-	// for, and building both would cost one discarded heap allocation on every
-	// event the feed delivers.
+	e.submitRefresh(evt.Scope, nk, deleted, false)
+}
+
+// submitRefresh queues nk's re-read behind the key's quiet window. retried says
+// this is the second attempt at the same event, which is what bounds the one
+// retry a re-read that could not answer asks for.
+//
+// Exactly one closure is built, in the branch that wants it: the two differ
+// only in whether the re-read registers itself as work Close waits for, and
+// building both would cost one discarded heap allocation on every event the
+// feed delivers.
+func (e *Engine) submitRefresh(scope store.Scope, nk NSKey, deleted, retried bool) {
 	var work func()
 
 	if e.debounceAsync {
-		work = func() { e.trackedRefresh(evt.Scope, nk, deleted) }
+		work = func() { e.trackedRefresh(scope, nk, deleted, retried) }
 	} else {
-		work = func() { e.refreshKey(evt.Scope, nk, deleted) }
+		work = func() { e.refreshKey(scope, nk, deleted, retried) }
 	}
 
-	e.debouncer.Submit(scopeNSKey{Tenant: evt.Scope.Tenant, Namespace: nk.Namespace, Key: nk.Key}, work)
+	e.debouncer.Submit(scopeNSKey{Tenant: scope.Tenant, Namespace: nk.Namespace, Key: nk.Key}, work)
+}
+
+// retryRefresh answers a re-read that could not say what the key holds: its
+// store call failed, or it panicked.
+//
+// Returning was the whole outcome, and every repair is then fenced out. A
+// delete has already recorded the key as touched at event arrival, so a
+// reconcile in flight skips it; the key's own fences stop nothing else from
+// asking; and a reconcile is armed only by an OpResync, so on a connection
+// that never drops nothing ever asks the store again. A row an operator
+// deleted therefore stayed in force at its old revision, reported as not
+// stale, for the life of the process.
+//
+// So the re-read is submitted once more, through the same debouncer and
+// carrying the op it was serving: a transient failure — a pool exhausted for a
+// moment, one statement timeout — converges on the retry, and the retry
+// coalesces with a fresh notification for the key exactly as any other
+// submission does.
+//
+// A second failure is not transient, so the scope is marked stale and the next
+// OpResync reconciles the whole of it. The disconnect generation is
+// deliberately NOT bumped: a reconcile already in flight holds a snapshot of
+// every key and is entitled to clear the flag when it lands.
+//
+// Both are addressed to the state the re-read was armed on, by IDENTITY, for
+// the reason recordFeedOutcome states: a tenant dropped and brought back up
+// during the store call is a new state under the same scope value, and neither
+// a retry read under an entitlement this process no longer holds nor a stale
+// flag raised by the dead state's failure belongs to it.
+func (e *Engine) retryRefresh(sc *scopeState, nk NSKey, deleted, retried bool) {
+	if sc == nil || e.trackedScope(sc.scope) != sc {
+		return
+	}
+
+	if !retried {
+		e.submitRefresh(sc.scope, nk, deleted, true)
+
+		return
+	}
+
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	sc.stale = true
 }
 
 // trackedRefresh runs a debounced re-read as engine work Close waits for.
@@ -207,14 +258,14 @@ func (e *Engine) onEvent(evt store.Event) {
 // can be hot on at once, while the validator's share adds goroutines and the
 // values they hold rather than connections — a slow validator therefore shows
 // up as goroutine growth under a flapping feed, not as pool exhaustion.
-func (e *Engine) trackedRefresh(scope store.Scope, nk NSKey, deleted bool) {
+func (e *Engine) trackedRefresh(scope store.Scope, nk NSKey, deleted, retried bool) {
 	if !e.beginWork() {
 		return
 	}
 
 	defer e.dispatchWG.Done()
 
-	e.refreshKey(scope, nk, deleted)
+	e.refreshKey(scope, nk, deleted, retried)
 }
 
 // recoverRefresh reports a panic raised under a changefeed re-read, naming the
@@ -268,7 +319,7 @@ func (e *Engine) trackedRefresh(scope store.Scope, nk NSKey, deleted bool) {
 // context and records neither. The recovered value stays out of the identity
 // line — it is whatever the panicking code was holding, and redacting it
 // belongs with the handler.
-func (e *Engine) recoverRefresh(scope store.Scope, nk NSKey, state **scopeState) {
+func (e *Engine) recoverRefresh(scope store.Scope, nk NSKey, deleted, retried bool, state **scopeState) {
 	recovered := recover()
 	if recovered == nil {
 		return
@@ -276,8 +327,12 @@ func (e *Engine) recoverRefresh(scope store.Scope, nk NSKey, state **scopeState)
 
 	ctx := e.dispatchContext()
 
+	var sc *scopeState
+
 	if state != nil {
-		e.recordFeedOutcome(*state, nk, false)
+		sc = *state
+
+		e.recordFeedOutcome(sc, nk, false)
 	}
 
 	e.logError(ctx, "systemplane.engine: changefeed re-read panicked",
@@ -287,6 +342,10 @@ func (e *Engine) recoverRefresh(scope store.Scope, nk NSKey, state **scopeState)
 	)
 
 	runtime.HandlePanicValue(ctx, e.logger, recovered, "systemplane.engine", "refresh")
+
+	// Last, so the panic is fully reported before any new work is queued: on a
+	// zero quiet window the retry runs inline, right here.
+	e.retryRefresh(sc, nk, deleted, retried)
 }
 
 // scopeForEvent resolves the scope a changefeed event, a reconcile or a
@@ -435,7 +494,9 @@ func (e *Engine) PublishDelete(scope store.Scope, nk NSKey) {
 //     line, for the reason recoverRefresh states: the logger is the consumer's
 //     and a reconcile must never reach the key while it is still unfenced. An
 //     error that is the lifecycle context being canceled is a shutdown, not an
-//     incident, and logs at DEBUG.
+//     incident, and logs at DEBUG. Any other error is retried once and then
+//     leaves the scope stale — retryRefresh says why the event cannot simply
+//     be dropped.
 //   - not found means different things for the two ops, which is the whole of
 //     what deleted decides. After an upsert the write may simply not be
 //     visible to this reader yet, so the current value stands and nothing is
@@ -462,10 +523,10 @@ func (e *Engine) PublishDelete(scope store.Scope, nk NSKey) {
 // holds, and the new state's own reconcile is the only thing entitled to
 // decide the key. That is why sc is declared before the recovery is deferred
 // and handed to it by pointer.
-func (e *Engine) refreshKey(scope store.Scope, nk NSKey, deleted bool) {
+func (e *Engine) refreshKey(scope store.Scope, nk NSKey, deleted, retried bool) {
 	var sc *scopeState
 
-	defer e.recoverRefresh(scope, nk, &sc)
+	defer e.recoverRefresh(scope, nk, deleted, retried, &sc)
 
 	// Checked before the store call, not only after it: a re-read for a
 	// dropped tenant would otherwise open a connection to a database that
@@ -496,14 +557,20 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey, deleted bool) {
 				log.String("namespace", nk.Namespace),
 				log.String("keyname", nk.Key),
 			)
-		} else {
-			e.logWarn(ctx, "changefeed re-read failed, keeping current value",
-				log.String(constants.AttrKeyTenantID, scope.Tenant),
-				log.String("namespace", nk.Namespace),
-				log.String("keyname", nk.Key),
-				log.Err(err),
-			)
+
+			// No retry: there is nothing left to converge on, and the engine
+			// is about to stop answering this scope at all.
+			return
 		}
+
+		e.logWarn(ctx, "changefeed re-read failed, keeping current value",
+			log.String(constants.AttrKeyTenantID, scope.Tenant),
+			log.String("namespace", nk.Namespace),
+			log.String("keyname", nk.Key),
+			log.Err(err),
+		)
+
+		e.retryRefresh(sc, nk, deleted, retried)
 
 		return
 	}

@@ -305,6 +305,29 @@ func (e *Engine) ingestDefault(ctx context.Context, sc *scopeState, nk NSKey, de
 // returned here names only that the validator panicked. Interpolating the
 // panic value into it would put that row's contents into a WARN line the
 // redaction never sees.
+// RunValidator runs a consumer's registered validator under exactly the
+// recovery every engine ingress uses. It exists for the Client's own two
+// direct call sites — grading a registered default, and grading a local write
+// — which are the only places in the library that hand a validator a value
+// without going through an ingress, and which therefore used to let a
+// validator's panic take the consumer's process down instead of coming back as
+// a validation error. Nil-receiver safe, so a Client whose engine was never
+// built still grades rather than crashes.
+func (e *Engine) RunValidator(ctx context.Context, validate func(context.Context, any) error, value any) error {
+	return e.runValidator(ctx, validate, value)
+}
+
+// recoveryLogger is the logger the panic handlers below write through. A nil
+// Engine reports a no-op one rather than panicking, because RunValidator is
+// reached from the Client before anything has confirmed an engine exists.
+func (e *Engine) recoveryLogger() log.Logger {
+	if e == nil || e.logger == nil {
+		return log.NewNop()
+	}
+
+	return e.logger
+}
+
 func (e *Engine) runValidator(ctx context.Context, validate func(context.Context, any) error, value any) (err error) {
 	if validate == nil {
 		return nil
@@ -319,7 +342,7 @@ func (e *Engine) runValidator(ctx context.Context, validate func(context.Context
 			err = fmt.Errorf("%w: validator panicked", store.ErrValidation)
 		}
 	}()
-	defer runtime.RecoverAndLogWithContext(ctx, e.logger, "systemplane.engine", "validator")
+	defer runtime.RecoverAndLogWithContext(ctx, e.recoveryLogger(), "systemplane.engine", "validator")
 
 	err = validate(ctx, value)
 	panicked = false

@@ -14,6 +14,14 @@ func asInternalClient(c *Client) *internalclient.Client {
 
 // Register declares a configuration key with its default value and options.
 // Must be called before [Client.Start].
+//
+// defaultValue is stored, served and announced in its CANONICAL shape — the
+// shape a stored row comes back in: numbers as float64, objects as
+// map[string]any, arrays as []any. One key therefore answers with one Go type
+// whether a row exists or not, which is what lets a subscriber type-assert the
+// shape its validator grades without the boot announcement and every delete
+// handing it something else. A default that does not survive a JSON round trip
+// is refused with [ErrValidation].
 func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOption) error {
 	return asInternalClient(c).Register(namespace, key, defaultValue, opts...)
 }

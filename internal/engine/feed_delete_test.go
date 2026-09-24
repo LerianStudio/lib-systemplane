@@ -4,6 +4,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -322,4 +323,88 @@ func TestPendingDeleteReReadAfterCloseNeverReachesTheStore(t *testing.T) {
 	if got := fs.getCount(); got != 0 {
 		t.Errorf("Store.Get called %d times after Close, want 0", got)
 	}
+}
+
+// TestFailedRereadIsRetriedThenReportsStale closes the hole the delete re-read
+// opened: answering a delete from the store made the removal conditional on
+// that one read succeeding, and nothing retried it.
+//
+// A delete publishes nothing of its own — what goes in force is whatever the
+// re-read finds — so a re-read that errors drops the removal entirely. The key
+// keeps the deleted row at its old revision, the feed has already recorded it
+// as touched so a reconcile in flight skips it, and a reconcile is armed only
+// by an OpResync: on a connection that never drops, a row an operator deleted
+// stayed in force for the life of the process while every read reported the
+// scope as current.
+func TestFailedRereadIsRetriedThenReportsStale(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	scope := store.Scope{}
+
+	t.Run("a transient failure converges on the retry", func(t *testing.T) {
+		fs := newFakeStore()
+		e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, deleteWindow)
+
+		fs.seed(scope, jsonRow(nk, 5, `"five"`, "ops"))
+		settled(t, e, scope)
+
+		// The row really is gone; the first re-read of the delete simply
+		// cannot say so — one pool checkout that failed.
+		fs.remove(scope, nk)
+		fs.onGet(func(store.Scope, NSKey) error {
+			fs.onGet(nil)
+
+			return errors.New("pool exhausted")
+		})
+
+		e.onEvent(deleteEvent(scope, nk))
+
+		waitFor(t, hangGuard, "the retry to put the registered default in force", func() bool {
+			got, ok := e.Lookup(scope, nk)
+
+			return ok && got.Revision == 0 && got.Value == "fallback"
+		})
+
+		if got, _ := e.Lookup(scope, nk); got.Stale {
+			t.Error("the scope reports itself unconfirmed after a re-read that converged on its retry")
+		}
+	})
+
+	t.Run("a failure that repeats leaves the scope stale until the next resync", func(t *testing.T) {
+		fs := newFakeStore()
+		e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, deleteWindow)
+
+		fs.seed(scope, jsonRow(nk, 5, `"five"`, "ops"))
+		settled(t, e, scope)
+
+		fs.remove(scope, nk)
+		fs.onGet(func(store.Scope, NSKey) error { return errors.New("pool exhausted") })
+
+		e.onEvent(deleteEvent(scope, nk))
+
+		// Two failures are not a blip. The cached value still stands — a read
+		// that learned nothing is no reason to discard the last value that
+		// did — but it stands as unconfirmed, which is the one thing a caller
+		// can act on.
+		waitFor(t, hangGuard, "the scope to report itself unconfirmed", func() bool {
+			got, ok := e.Lookup(scope, nk)
+
+			return ok && got.Stale
+		})
+
+		if got, _ := e.Lookup(scope, nk); got.Value != "five" || got.Revision != 5 {
+			t.Errorf("after two failed re-reads: got (%v, rev %d), want the cached (\"five\", rev 5)",
+				got.Value, got.Revision)
+		}
+
+		// And the repair the stale flag points at actually lands.
+		fs.onGet(nil)
+		e.onEvent(resyncEvent(scope))
+		waitReconcileIdle(t, e, scope)
+
+		got, ok := e.Lookup(scope, nk)
+		if !ok || got.Value != "fallback" || got.Revision != 0 || got.Stale {
+			t.Errorf("after the resync: got (%v, rev %d, stale %t, cached %t), want the registered default at rev 0, confirmed",
+				got.Value, got.Revision, got.Stale, ok)
+		}
+	})
 }

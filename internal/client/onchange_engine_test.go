@@ -712,3 +712,270 @@ func TestSetFromTheFirstDeliveryLands(t *testing.T) {
 		t.Errorf("Get after Start = %v, want the value the subscriber wrote", got)
 	}
 }
+
+// TestSetReportsAnEngineClosedUnderTheWrite is one half of "Set surfaces every
+// refusal the publication can still make".
+//
+// Set reads the closed flag once, on the way in, and Close runs under a lock
+// Set never takes, so a Close can land between that guard and the publication.
+// The row is persisted by then and nothing in this process will ever serve it,
+// which is the one outcome a nil return must never describe.
+func TestSetReportsAnEngineClosedUnderTheWrite(t *testing.T) {
+	s := newMemStore(false)
+	c := newSingleTenantClient(t, s)
+
+	defer func() { _ = c.Close() }()
+
+	if err := c.Register("ns", "key", "default"); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Exactly the state that race leaves behind: the Client's own guards see
+	// nothing wrong — c.closed is false, c.started is true — and the engine
+	// can no longer publish anything.
+	if err := c.engine.Close(); err != nil {
+		t.Fatalf("closing the engine under the Client: %v", err)
+	}
+
+	if err := c.Set(context.Background(), "ns", "key", "written", "actor"); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Set: got %v, want ErrClosed", err)
+	}
+
+	s.mu.Lock()
+	_, stored := s.entries[memKey("ns", "key")]
+	s.mu.Unlock()
+
+	if !stored {
+		t.Error("the row never reached the store, so this test is pinning a refusal that happened " +
+			"before the write rather than after it")
+	}
+}
+
+// TestSetReportsAPublicationTheEngineRefused is the other half, and the one no
+// sentinel covers: the engine tracks no scope to publish into, so the write
+// lands in the store and is served by nothing.
+//
+// The window is real rather than contrived. Start flips the started flag
+// BEFORE it brings the engine up — FC-11 announces every key while Start is
+// still on the stack, and a subscriber that answers by writing must not be
+// refused — and a Start that retries a scope whose first reconcile failed
+// drops that scope before rebuilding it. A write arriving in between is
+// exactly the case this branch exists for.
+func TestSetReportsAPublicationTheEngineRefused(t *testing.T) {
+	s := newMemStore(false)
+	c := newSingleTenantClient(t, s)
+
+	defer func() { _ = c.Close() }()
+
+	if err := c.Register("ns", "key", "default"); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	// The scope comes up and its first reconcile fails, which is what makes
+	// the next Start drop it.
+	s.failListOnce(errors.New("list failed"))
+
+	if err := c.Start(context.Background()); err == nil {
+		t.Fatal("Start: got nil, want the first reconcile's failure")
+	}
+
+	var (
+		fired    bool
+		setErr   error
+		readBack any
+	)
+
+	s.mu.Lock()
+	s.unsubHook = func() {
+		fired = true
+		setErr = c.Set(context.Background(), "ns", "key", "written", "actor")
+		readBack, _, _ = c.Get(context.Background(), "ns", "key")
+	}
+	s.mu.Unlock()
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("second Start: %v", err)
+	}
+
+	if !fired {
+		t.Fatal("the second Start never dropped the failed scope, so no write met an untracked engine")
+	}
+
+	if setErr == nil {
+		t.Fatal("Set: got nil for a write nothing published")
+	}
+
+	if errors.Is(setErr, ErrClosed) {
+		t.Errorf("Set: got ErrClosed, want the refusal named: %v", setErr)
+	}
+
+	if !strings.Contains(setErr.Error(), "ns/key was written but not published") {
+		t.Errorf("Set error does not name the key that was written but not published: %v", setErr)
+	}
+
+	if cause := errors.Unwrap(setErr); cause == nil || !strings.Contains(cause.Error(), "does not track") {
+		t.Errorf("Set error does not wrap the engine's own reason: %v", setErr)
+	}
+
+	if readBack != "default" {
+		t.Errorf("the read taken right after that Set served %v, want the registered default: a write "+
+			"reported as refused must not also be readable", readBack)
+	}
+
+	s.mu.Lock()
+	_, stored := s.entries[memKey("ns", "key")]
+	s.mu.Unlock()
+
+	if !stored {
+		t.Error("the row never reached the store, so this test is pinning the wrong refusal")
+	}
+}
+
+// TestRegisteredDefaultServesOneGoTypeOnly pins FC-5's shape rule end to end:
+// one key answers with ONE Go type, whether a row exists or not.
+//
+// Register used to cache and announce the caller's raw Go value while every
+// other ingress served what the store hands back, so a key registered with an
+// int was announced as int at boot, read as float64 after a Set, and int again
+// after a delete. A subscriber that type-asserts the shape its own validator
+// was told to expect panicked on the boot announcement; the panic is recovered
+// and counted, the delivery dropped, and the service boots on a configuration
+// it never applied, with no error reaching it.
+func TestRegisteredDefaultServesOneGoTypeOnly(t *testing.T) {
+	s := newMemStore(false)
+	c := newSingleTenantClientWithDebounce(t, s, 50*time.Millisecond)
+
+	defer func() { _ = c.Close() }()
+
+	if err := c.Register("ns", "num", 5); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	announced := make(chan any, 8)
+
+	unsub, err := c.OnChange("ns", "num", func(_ context.Context, ch Change) { announced <- ch.Value })
+	if err != nil {
+		t.Fatalf("OnChange: %v", err)
+	}
+
+	defer unsub()
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// FC-11: the first reconcile announces the key to a subscriber registered
+	// before Start, and this is the delivery a consumer's reload runs on.
+	boot := receiveValue(t, announced, "the boot announcement")
+	if boot != 5.0 {
+		t.Errorf("the boot announcement carries %v of type %T, want the decoded 5: a callback written "+
+			"for the shape the validator grades panics on it", boot, boot)
+	}
+
+	got, _, err := c.Get(context.Background(), "ns", "num")
+	if err != nil || got != 5.0 {
+		t.Errorf("Get with the default in force: got %v of type %T (err %v), want the decoded 5", got, got, err)
+	}
+
+	if err := c.Set(context.Background(), "ns", "num", 7, "actor"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	got, _, err = c.Get(context.Background(), "ns", "num")
+	if err != nil || got != 7.0 {
+		t.Errorf("Get with a row in force: got %v of type %T (err %v), want the decoded 7", got, got, err)
+	}
+
+	if err := c.Delete(context.Background(), "ns", "num", "actor"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	got, _, err = c.Get(context.Background(), "ns", "num")
+	if err != nil || got != 5.0 {
+		t.Errorf("Get with the default back in force: got %v of type %T (err %v), want the decoded 5",
+			got, got, err)
+	}
+}
+
+// receiveValue takes the next delivery or fails, so a missing announcement
+// reads as the assertion it is rather than as a hung test.
+func receiveValue(t *testing.T, ch <-chan any, what string) any {
+	t.Helper()
+
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+
+		return nil
+	}
+}
+
+// TestAPanickingValidatorIsRefusedNotFatal pins the two validator call sites
+// the Client owns.
+//
+// v4 grades the canonical shape everywhere, so a validator written against the
+// caller's Go type — `v.(int)` with an int default, the shape that passed on
+// v3 — now meets a float64. Unrecovered, that assertion took the consumer's
+// process down at Register, which is boot. Every ingress inside the engine
+// already turns a validator panic into a rejection; these two were the only
+// ones that did not.
+func TestAPanickingValidatorIsRefusedNotFatal(t *testing.T) {
+	t.Run("grading the registered default", func(t *testing.T) {
+		c := newSingleTenantClient(t, newMemStore(false))
+
+		defer func() { _ = c.Close() }()
+
+		err := c.Register("ns", "key", 5, WithValidator(func(v any) error {
+			_ = v.(int)
+
+			return nil
+		}))
+		if !errors.Is(err, ErrValidation) {
+			t.Fatalf("Register: got %v, want ErrValidation", err)
+		}
+	})
+
+	t.Run("grading a local write", func(t *testing.T) {
+		s := newMemStore(false)
+		c := newSingleTenantClient(t, s)
+
+		defer func() { _ = c.Close() }()
+
+		var explode atomic.Bool
+
+		err := c.Register("ns", "key", 5, WithValidator(func(any) error {
+			if explode.Load() {
+				panic("validator blew up")
+			}
+
+			return nil
+		}))
+		if err != nil {
+			t.Fatalf("Register: %v", err)
+		}
+
+		if err := c.Start(context.Background()); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+
+		explode.Store(true)
+
+		if err := c.Set(context.Background(), "ns", "key", 7, "actor"); !errors.Is(err, ErrValidation) {
+			t.Fatalf("Set: got %v, want ErrValidation", err)
+		}
+
+		s.mu.Lock()
+		_, stored := s.entries[memKey("ns", "key")]
+		s.mu.Unlock()
+
+		if stored {
+			t.Error("a write whose validator panicked was persisted anyway")
+		}
+	})
+}

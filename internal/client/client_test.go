@@ -58,6 +58,13 @@ type memStore struct {
 	// Start then waits for a resync that has to be fired by hand.
 	silent bool
 
+	// unsubHook runs at the top of the unsubscribe Subscribe handed out,
+	// before anything is unregistered, and clears itself so it fires once. It
+	// is how a test reaches the one window where the Client is started and the
+	// engine tracks no scope at all: the drop Start performs when it retries a
+	// scope whose first reconcile failed.
+	unsubHook func()
+
 	// closed is set by Close(), and afterClose collects every read that
 	// reached the store once it was. The Client promises the backend is closed
 	// last, with nothing still reading through it; an empty afterClose is the
@@ -239,6 +246,17 @@ func (m *memStore) Subscribe(_ context.Context, _ store.Scope, fn func(store.Eve
 	}
 
 	return func() {
+		// Read before any lock this fake takes, so the hook may drive the
+		// Client — a write of its own included — without deadlocking on it.
+		m.mu.Lock()
+		hook := m.unsubHook
+		m.unsubHook = nil
+		m.mu.Unlock()
+
+		if hook != nil {
+			hook()
+		}
+
 		m.subsMu.Lock()
 		delete(m.subs, id)
 		m.subsMu.Unlock()
@@ -391,8 +409,11 @@ func TestGetReturnsRegisteredDefaultWhenCacheEmpty(t *testing.T) {
 		t.Fatalf("get: %v", err)
 	}
 
-	if !ok || v.(int) != 42 {
-		t.Errorf("got (%v, %v); want (42, true)", v, ok)
+	// float64, not int: the default is served in the CANONICAL shape, the one
+	// a stored row comes back in. TestRegisteredDefaultServesOneGoTypeOnly
+	// owns why one key must not answer with two Go types.
+	if !ok || v != 42.0 {
+		t.Errorf("got (%v of type %T, %v); want (42 as a float64, true)", v, v, ok)
 	}
 }
 

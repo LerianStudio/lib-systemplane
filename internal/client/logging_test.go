@@ -134,7 +134,16 @@ func TestRefreshPanicNamesTheKey(t *testing.T) {
 	t.Cleanup(func() { _ = c.Close() })
 
 	m.mu.Lock()
-	m.getHook = func(_, _ string) (store.Entry, bool, bool) { panic("store driver blew up") }
+	// One-shot: a re-read that could not answer is retried once, so a hook
+	// that kept exploding would report the same panic twice and say nothing
+	// this single report does not.
+	m.getHook = func(_, _ string) (store.Entry, bool, bool) {
+		m.mu.Lock()
+		m.getHook = nil
+		m.mu.Unlock()
+
+		panic("store driver blew up")
+	}
 	m.mu.Unlock()
 
 	m.fire(store.Event{Op: store.OpUpsert, Namespace: "ns", Key: "k"})
