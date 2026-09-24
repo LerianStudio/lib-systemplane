@@ -529,8 +529,11 @@ func (c *Coordinator[T]) remove(id uint64) {
 // invariant it imposes on the Client is load-bearing: the seed closure reaches
 // Client.GetEntry from inside this mutex, therefore the Client must never hold
 // a lock across an OnChange dispatch, and must tolerate a subscriber calling
-// Get or GetEntry re-entrantly. Verified 2026-09-23: refreshFromStore releases
-// registryMu and cacheMu before fireSubscribers (internal/client/client.go).
+// Get or GetEntry re-entrantly. The engine holds to it: deliver
+// (internal/engine/dispatch.go) copies the subscriber slice, releases subsMu
+// and runs each callback with no engine or Client lock held, and the Client's
+// read paths (getEntry and listFromEngine, internal/client/get.go) release
+// registryMu before they call the engine.
 func (c *Coordinator[T]) seedLocked() seedOutcome {
 	if c.seed == nil || c.seedTaken || c.decode == nil || c.anyObservedLocked() {
 		return seedOutcome{}

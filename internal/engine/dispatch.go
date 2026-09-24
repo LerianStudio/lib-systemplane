@@ -188,8 +188,10 @@ func (e *Engine) dispatch(sc *scopeState, pub publication) {
 
 // workerFor returns sc's worker for nk, starting it on first use. Workers live
 // until the lifecycle context is canceled or their scope is dropped, so the
-// goroutine count is bounded by the number of (scope, key) pairs that actually
-// published a change to a subscribed key.
+// goroutine count is one parked worker per subscribed key per tracked scope:
+// FC-11 publishes every registered key at a scope's first reconcile, so from
+// that moment on every key with a subscriber has a worker, and a key nobody
+// subscribed to never gets one.
 //
 // The worker belongs to the scope state the caller resolved, not to the scope
 // VALUE: a state that has been swept never hands one out again, and the state

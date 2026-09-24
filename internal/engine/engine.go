@@ -250,11 +250,13 @@ func (e *Engine) Start(ctx context.Context) error {
 // retryFailedScope drops scope when its first reconcile is on record as having
 // FAILED, so the Start that follows brings it up again from nothing.
 //
-// It runs under the same lock as bring-up, which is what keeps two concurrent
-// Starts from dropping the scope the other has just rebuilt. A scope whose
-// first reconcile has not finished is left alone: it is still subscribed and
-// its resync is still coming, and tearing it down would throw away the
-// changefeed the caller is waiting on.
+// The check and the drop are one critical section under startMu, so two
+// concurrent retries cannot both drop. The lock is released before bringUpScope
+// takes it again, so what keeps a retry from dropping a scope another Start has
+// just rebuilt is not this lock but Client.Start, which holds its own startMu
+// across the pair. A scope whose first reconcile has not finished is left
+// alone: it is still subscribed and its resync is still coming, and tearing it
+// down would throw away the changefeed the caller is waiting on.
 func (e *Engine) retryFailedScope(scope store.Scope) {
 	e.startMu.Lock()
 	defer e.startMu.Unlock()

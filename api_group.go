@@ -35,9 +35,10 @@ type Group[T any] struct {
 	coordinator *group.Coordinator[T]
 
 	// subscribeErr is the refusal OnChange returned at Bind, reported by
-	// OnApply. A multi-tenant Client with no bound Manager refuses the
-	// subscription and must still get a working Snapshot and Set, so Bind
-	// records the error instead of failing.
+	// OnApply. A multi-tenant Client refuses the subscription until the
+	// engine-tenants lane restores per-tenant subscriptions, and it must still
+	// get a working Snapshot and Set, so Bind records the error instead of
+	// failing.
 	subscribeErr error
 }
 
@@ -53,14 +54,14 @@ type Snapshot[T any] struct {
 // row exists. validate (may be nil) becomes the key's registered validator: the
 // client runs it on the default at Bind, on every Set, and on every other
 // ingress the client validates. In single-tenant mode that includes the row
-// already in the store: the client grades it while hydrating at Start, so a row
-// that entered the store without passing the registered validator never becomes
-// the group's document — the registered defaults stay in force and
-// [Group.Snapshot] returns them with no error. In multi-tenant mode no read path
-// re-validates a tenant row — not the direct tenant-store read, and not a bound
-// Manager's warm-load or NOTIFY cache — so a row that entered the store without
-// passing the registered validator surfaces as a decode error at worst, not as
-// a validated document.
+// already in the store: the engine grades it on the reconcile that follows
+// every changefeed (re)connect, the first of which runs at Start, so a row that
+// entered the store without passing the registered validator never becomes the
+// group's document — the registered defaults stay in force and
+// [Group.Snapshot] returns them with no error. In multi-tenant mode no read
+// path re-validates a tenant row — the read goes straight through to the tenant
+// store — so a row that entered the store without passing the registered
+// validator surfaces as a decode error at worst, not as a validated document.
 // Must be called before c.Start.
 //
 // The value registered is not defaults itself but its canonical JSON document:
@@ -93,9 +94,9 @@ type Snapshot[T any] struct {
 // here, before c.Start and therefore before any publication can exist, which is
 // what lets [Group.OnApply] promise that no revision falls between its initial
 // delivery and its subscription. A Client that refuses the subscription — a
-// multi-tenant one with no bound Manager today — still yields a working handle:
-// the refusal is recorded and returned by OnApply, while [Group.Snapshot] and
-// [Group.Set] keep working.
+// multi-tenant one, until the engine-tenants lane restores per-tenant
+// subscriptions — still yields a working handle: the refusal is recorded and
+// returned by OnApply, while [Group.Snapshot] and [Group.Set] keep working.
 //
 // That subscription is never released. FC-7 gives a group no Close, so nothing
 // could ever call the unsubscribe, and the subscription therefore lives as long
@@ -268,9 +269,9 @@ func (g *Group[T]) seedCurrentEntry() (group.Publication, bool, error) {
 // never fail. A document that cannot decode into T returns an error wrapping
 // [ErrValidation] and a zero Value — never a half-filled T. In single-tenant
 // mode that path is unreachable: a document that fails to decode cannot pass
-// the group's ingress, which hydration runs over the stored row. It is reachable
-// in multi-tenant mode, where every read path (the tenant store, or a bound
-// Manager's cache) returns the tenant row ungraded.
+// the group's ingress, which the engine runs over the stored row at every
+// reconcile. It is reachable in multi-tenant mode, where the read goes straight
+// through to the tenant store and returns that row ungraded.
 //
 // A row holding a JSON null is refused the same way, unless the zero T is
 // itself nil — in which case the null IS the document and Snapshot returns that
@@ -299,9 +300,10 @@ func (g *Group[T]) Snapshot(ctx context.Context) (Snapshot[T], error) {
 	// Defence in depth behind the ingress guard: a row holding a null predates
 	// it (an older binary, another writer, a hand-edited row), and Decode turns
 	// a null into the zero T by design (D-G2). Returning that would report a
-	// wholly blank configuration as the one in force. Single-tenant hydration
-	// refuses such a row before it reaches a reader; any multi-tenant read
-	// path (tenant store or bound Manager cache) delivers it here ungraded.
+	// wholly blank configuration as the one in force. The single-tenant ingress
+	// refuses such a row at the reconcile, before it reaches a reader; a
+	// multi-tenant read goes straight to the tenant store and delivers it here
+	// ungraded.
 	if entry.Value == nil && !g.nullIsDocument {
 		var zero T
 
@@ -410,19 +412,6 @@ type ApplyStatus struct {
 // current; the engine does not retry. Before Start, OnApply registers and the
 // initial delivery happens during Start.
 //
-// That last sentence is FC-7, and it holds once the Client is engine-backed:
-// FC-11 makes the first reconcile at Start publish every stored row through
-// the ingress and the dispatch (engine-core Phase 2). Until then this Client
-// hydrates its cache at Start WITHOUT announcing anything to subscribers, so a
-// registration made before Start is handed the REGISTERED DEFAULTS as its
-// initial delivery, the stored document does not arrive during Start, and no
-// further delivery comes until the next write to the key — which for a knob
-// nobody touches again is never. Status reports that state as converged, with
-// Desired and Applied both 0 and no error, so it cannot be used to tell a
-// document in force from a document never read. Registering AFTER Start
-// delivers the document actually in force, which is the ordering to use while
-// this holds.
-//
 // fn runs with no lock held and may call [Group.Snapshot], [Group.Status],
 // [Group.Set] or OnApply for its own group. A re-entrant OnApply appends its
 // function and returns without delivering: the initial delivery is deferred to
@@ -468,19 +457,20 @@ type ApplyStatus struct {
 // releases that function's hold on the scope's applied revision. Once it has
 // returned fn is not started again, including by a fan-out already under way
 // that had not reached it; an invocation already running completes. In
-// multi-tenant mode with no bound Manager OnApply returns
-// ErrNotSupportedInMultiTenant, while [Group.Snapshot] and [Group.Set] keep
-// working. With a bound Manager it registers and returns no error, and there is
-// no initial delivery: every document belongs to a tenant, so none is in force
-// until that tenant publishes one. Each tenant's later publications then reach
-// fn with that tenant in Applied.Tenant, which is the ONLY tenant identity fn
-// receives: the delivered ctx is the one the Client published with and is not
-// tenant-scoped, so a re-read or a write-back must run under a tenant-scoped
-// context the consumer owns — the one tenant-manager middleware builds — and
-// never under the delivered one. And no publication path re-validates a tenant
-// row in that mode, so a document delivered to fn may not have passed validate;
-// that closes once engine-tenants routes tenant publications through the
-// engine's ingress. On a nil *Group it returns ErrClosed.
+// multi-tenant mode OnApply returns ErrNotSupportedInMultiTenant, while
+// [Group.Snapshot] and [Group.Set] keep working; the engine-tenants lane is the
+// one that restores per-tenant subscriptions and makes it register. Once it
+// does there is no initial delivery — every document belongs to a tenant, so
+// none is in force until that tenant publishes one — and each tenant's
+// publications reach fn with that tenant in Applied.Tenant, which is the ONLY
+// tenant identity fn receives: the delivered ctx is the one the Client
+// published with and is not tenant-scoped, so a re-read or a write-back must
+// run under a tenant-scoped context the consumer owns — the one tenant-manager
+// middleware builds — and never under the delivered one. And no multi-tenant
+// read path re-validates a tenant row, so a document delivered to fn may not
+// have passed validate; that closes once engine-tenants routes tenant
+// publications through the engine's ingress. On a nil *Group it returns
+// ErrClosed.
 // unsubscribe is never nil, so a caller may defer it before checking err.
 func (g *Group[T]) OnApply(fn func(ctx context.Context, a Applied[T]) error) (unsubscribe func(), err error) {
 	noop := func() {}

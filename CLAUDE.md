@@ -4,10 +4,10 @@ This file provides repository-specific guidance for coding agents working on `li
 
 ## Project snapshot
 
-- Module: `github.com/LerianStudio/lib-systemplane/v3`
+- Module: `github.com/LerianStudio/lib-systemplane/v4`
 - Language: Go
 - Go version: `1.26.3` (see `go.mod`)
-- Current API generation: v3.x Fiber v3 stack (extracted from `lib-commons/v5`; built on `lib-commons/v7`, `lib-observability/v4`, and `gofiber/fiber/v3`)
+- Current API generation: v4.x Fiber v3 stack (extracted from `lib-commons/v5`; built on `lib-commons/v7`, `lib-observability/v4`, and `gofiber/fiber/v3`)
 - Observability boundary: the public API accepts `systemplane.Logger` and `systemplane.Telemetry`, interfaces declared in this module from stdlib + `go.opentelemetry.io/otel` types only. `lib-observability` must never appear in an exported PARAMETER — `boundary_test.go` fails the build if it does. Returns may stay rich (`(*Client).Logger()` returns `log.Logger`). Internal packages use `lib-observability/v4` freely. See [`MIGRATION-v3.md`](MIGRATION-v3.md).
 
 ## Primary objective for changes
@@ -22,7 +22,7 @@ This file provides repository-specific guidance for coding agents working on `li
 Root (package `systemplane`):
 - Small public API facade: `api_*.go` plus `doc.go`. Public types are aliases to
   `internal/client` where practical so the root import path remains
-  `github.com/LerianStudio/lib-systemplane/v3`.
+  `github.com/LerianStudio/lib-systemplane/v4`.
 
 Subpackages:
 - `admin/` — Fiber HTTP handlers for the admin surface
@@ -51,7 +51,7 @@ Lerian shared-library boundaries are now split across four libraries:
 
 - `github.com/LerianStudio/lib-commons/v7` — non-observability shared primitives used here: `commons/tenant-manager/core`, `commons/net/http`, and `commons/backoff`.
 - `github.com/LerianStudio/lib-observability/v4` — canonical observability stack: `log`, `tracing`, redaction helpers, span helpers, telemetry lifecycle, and `runtime` panic recovery. Used **internally only**; it must not appear in an exported parameter (see the observability boundary above).
-- `github.com/LerianStudio/lib-systemplane/v3` — this module; runtime-mutable configuration with Postgres/MongoDB backends.
+- `github.com/LerianStudio/lib-systemplane/v4` — this module; runtime-mutable configuration with Postgres/MongoDB backends.
 - `github.com/LerianStudio/lib-streaming` — tenant-scoped event streaming; do not introduce it here unless a task explicitly asks for streaming integration.
 
 These are external module imports. Do not rewrite them to in-repo paths. Do not reintroduce observability imports from `lib-commons`; observability has moved to `lib-observability`.
@@ -68,13 +68,15 @@ The Client runs in one of two modes selected at construction:
 ### Storage shape
 
 - **Postgres** table `systemplane_entries`:
-  - Columns: `namespace`, `key`, `value JSONB`, `updated_at TIMESTAMPTZ`, `updated_by TEXT`.
+  - Columns: `namespace`, `key`, `value JSONB`, `revision BIGINT NOT NULL`, `updated_at TIMESTAMPTZ`, `updated_by TEXT`.
   - Primary key: `(namespace, key)`. **No `tenant_id` column.**
-  - Trigger function `systemplane_notify_v3` emits a NOTIFY with payload `{namespace, key, op}` where `op` is `"upsert"` (INSERT/UPDATE) or `"delete"`.
-  - Two triggers: one for INSERT/DELETE (fires unconditionally) and one for UPDATE (gated by `WHEN (OLD IS DISTINCT FROM NEW)`).
+  - Trigger function `systemplane_notify_v4` emits a NOTIFY with payload `{namespace, key, op, revision}` where `op` is `"upsert"` (INSERT/UPDATE) or `"delete"`.
+  - Trigger function `systemplane_bump_revision_v4` draws every revision from the table-level sequence `systemplane_revision_seq` on insert and on every value change, so it is the only caller of `nextval` and the runtime role stays DML-only.
+  - Three triggers: the BEFORE INSERT OR UPDATE revision bump, one notify for INSERT/DELETE (fires unconditionally) and one notify for UPDATE (gated by `WHEN (OLD IS DISTINCT FROM NEW)`).
 - **MongoDB** collection `systemplane_entries`:
   - Document `_id` is the compound sub-document `{namespace, key}`. No `tenant_id` field.
-  - Top-level mirrors: `namespace`, `key`, `value`, `updated_at`, `updated_by`.
+  - Top-level mirrors: `namespace`, `key`, `value`, `revision`, `updated_at`, `updated_by`, plus `deleted` on a tombstone.
+  - `Delete` rewrites the document as a tombstone rather than removing it, so a key deleted and recreated always comes back above every revision it ever had.
 
 ### Public API (root `systemplane` package)
 

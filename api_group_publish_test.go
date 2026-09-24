@@ -79,6 +79,9 @@ func TestGroupPublishCarriesEachTenantToItsOwnScope(t *testing.T) {
 		t.Fatalf("OnApply in multi-tenant mode = %v, want ErrNotSupportedInMultiTenant", err)
 	}
 
+	// The engine-tenants lane owns this poke: once multi-tenant OnChange
+	// delivers again, Bind records no refusal and this line goes with the
+	// assertion above it.
 	g.subscribeErr = nil
 
 	unsubscribe, err := g.OnApply(rec.apply)
