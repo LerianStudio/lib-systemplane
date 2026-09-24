@@ -30,26 +30,24 @@ The library supports two modes; pick at construction time:
 
 In multi-tenant mode the library does NOT hold an in-process cache. Every `Get` reads through the resolved tenant database. The lib expects the caller to wire `lib-commons/v6/commons/tenant-manager/middleware.TenantMiddleware` with `WithPG(pgManager, "<module>")` (Postgres) or `WithMB(mongoManager, "<module>")` (MongoDB) where `<module>` matches the lib's `WithModule(...)` option (default `"systemplane"`). The middleware populates the request context; the lib calls `tmcore.GetPGContext` / `tmcore.GetMBContext` to resolve the tenant database and runs the read/write against that handle.
 
-> **Provisioning (Postgres).** The library no longer creates its schema or seeds defaults at runtime. Provision `systemplane_entries` (plus the `systemplane_notify_v3()` trigger function and the NOTIFY triggers) and any defaults externally — e.g. via your migration pipeline — using the DDL published by [`SchemaSQL()` / `DefaultSeedSQL()`](#schema-provisioning). The runtime database role only needs DML (`SELECT`/`INSERT`/`UPDATE`/`DELETE`) + `LISTEN`; it does NOT need `CREATE` on the schema.
+> **Provisioning (Postgres).** The library does not create its schema at runtime. Provision `systemplane_entries` (plus its revision sequence, the `systemplane_bump_revision_v4()` and `systemplane_notify_v4()` trigger functions and their triggers) externally — e.g. via your migration pipeline — using the DDL published by [`SchemaSQL()`](#schema-provisioning). The runtime database role only needs DML (`SELECT`/`INSERT`/`UPDATE`/`DELETE`) + `LISTEN`; it does NOT need `CREATE` on the schema.
 
 ## Schema provisioning
 
-`lib-systemplane` does not run any DDL or defaults seed at runtime (single- or multi-tenant). The Postgres schema and defaults are published as importable artifacts so consumers can fold them into their own migration pipeline:
+`lib-systemplane` does not run any DDL at runtime (single- or multi-tenant). The Postgres schema is published as an importable artifact so consumers can fold it into their own migration pipeline:
 
 ```go
 // systemplane.SchemaSQL() returns the full idempotent DDL:
-//   - CREATE TABLE IF NOT EXISTS systemplane_entries (...)
-//   - CREATE OR REPLACE FUNCTION systemplane_notify_v3() ...
-//   - the INSERT/DELETE and UPDATE NOTIFY triggers on the
-//     systemplane_changes channel
+//   - CREATE TABLE IF NOT EXISTS systemplane_entries (...) with its
+//     revision column and systemplane_revision_seq
+//   - CREATE OR REPLACE FUNCTION systemplane_bump_revision_v4() and
+//     systemplane_notify_v4()
+//   - the revision trigger, and the INSERT/DELETE and UPDATE NOTIFY
+//     triggers on the systemplane_changes channel
 ddl := systemplane.SchemaSQL()
-
-// systemplane.DefaultSeedSQL() returns neutral runtime_config defaults
-// inserted with ON CONFLICT (namespace, "key") DO NOTHING.
-seed := systemplane.DefaultSeedSQL()
 ```
 
-Run both through a privileged role during provisioning (e.g. as a migration executed by your migrate-up step or by the tenant-manager during per-tenant database provisioning). At runtime the library only reads, writes values (DML), and — in single-tenant mode — runs `LISTEN`, so the runtime role can be least-privilege with no `CREATE` on the schema. If the table has not been provisioned yet when a multi-tenant `Manager` activates a tenant, warm-load logs a warning and proceeds with an empty cache rather than failing; the cache refreshes via LISTEN/poll once the migration creates the table.
+Run it through a privileged role during provisioning (e.g. as a migration executed by your migrate-up step or by the tenant-manager during per-tenant database provisioning). At runtime the library only reads, writes values (DML), and — in single-tenant mode — runs `LISTEN`, so the runtime role can be least-privilege with no `CREATE` on the schema. If the table has not been provisioned yet when a multi-tenant `Manager` activates a tenant, warm-load logs a warning and proceeds with an empty cache rather than failing; the cache refreshes via LISTEN/poll once the migration creates the table.
 
 ## Single-tenant Quickstart — PostgreSQL
 

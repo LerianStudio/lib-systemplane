@@ -219,58 +219,6 @@ func assertDropDefaultComesLast(t *testing.T, artifact, sql string) {
 	}
 }
 
-func TestDefaultSeedSQL_NonEmpty(t *testing.T) {
-	t.Parallel()
-
-	if strings.TrimSpace(systemplane.DefaultSeedSQL()) == "" {
-		t.Fatal("DefaultSeedSQL() returned empty string")
-	}
-}
-
-func TestDefaultSeedSQL_ContainsExpectedStatements(t *testing.T) {
-	t.Parallel()
-
-	sql := systemplane.DefaultSeedSQL()
-
-	if !strings.Contains(sql, `INSERT INTO systemplane_entries (namespace, "key", value, updated_at, updated_by)`) {
-		t.Error("DefaultSeedSQL() missing INSERT header")
-	}
-
-	if !strings.Contains(sql, `ON CONFLICT (namespace, "key") DO NOTHING`) {
-		t.Error("DefaultSeedSQL() missing ON CONFLICT clause")
-	}
-
-	wantKeys := []struct {
-		key   string
-		value string
-	}{
-		{"app.log_level", `'"info"'::jsonb`},
-		{"cors.allowed_origins", `'""'::jsonb`},
-		{"cors.allowed_methods", `'"GET,POST,PUT,PATCH,DELETE,OPTIONS"'::jsonb`},
-		{"cors.allowed_headers", `'"Origin,Content-Type,Accept,Authorization"'::jsonb`},
-		{"rate_limit.enabled", `'false'::jsonb`},
-		{"rate_limit.max", `'100'::jsonb`},
-		{"rate_limit.expiry_sec", `'60'::jsonb`},
-		{"idempotency.require_redis", `'false'::jsonb`},
-		{"idempotency.duplicate_guard_ttl_seconds", `'300'::jsonb`},
-	}
-
-	for _, want := range wantKeys {
-		if !strings.Contains(sql, want.key) {
-			t.Errorf("DefaultSeedSQL() missing key %q", want.key)
-		}
-
-		if !strings.Contains(sql, want.value) {
-			t.Errorf("DefaultSeedSQL() missing encoded value %q for key %q", want.value, want.key)
-		}
-	}
-
-	// Every seeded row must live in the universal runtime_config namespace.
-	if !strings.Contains(sql, "'runtime_config'") {
-		t.Error("DefaultSeedSQL() missing runtime_config namespace")
-	}
-}
-
 func TestMigrationV3ToV4SQL_NonEmpty(t *testing.T) {
 	t.Parallel()
 

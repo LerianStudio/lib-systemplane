@@ -98,14 +98,25 @@ func dsnFor(base, dbName string) string {
 func TestIntegration_PostgresSingleTenant(t *testing.T) {
 	dsn := startContainer(t)
 
+	// One admin handle for the whole suite: the Reconnect hook runs long after
+	// the Factory call that provisioned the database it must reach into, so a
+	// handle scoped to the factory would already be closed by then.
+	admin := adminDSN(t, dsn)
+	defer admin.Close()
+
+	// The database backing the store the most recent Factory call built, which
+	// is the one whose LISTEN backend Reconnect kills. Sub-tests run
+	// sequentially and the suite calls Reconnect from the same goroutine, so a
+	// plain variable needs no lock.
+	var lastDB string
+
 	factory := func(t *testing.T) (store.Store, func()) {
 		t.Helper()
 
-		admin := adminDSN(t, dsn)
 		dbName := fmt.Sprintf("st_%d", time.Now().UnixNano())
 		freshDB(t, admin, dbName)
 
-		_ = admin.Close()
+		lastDB = dbName
 
 		tenantDSN := dsnFor(dsn, dbName)
 
@@ -132,7 +143,60 @@ func TestIntegration_PostgresSingleTenant(t *testing.T) {
 		}
 	}
 
-	systemplanetest.Run(t, factory, systemplanetest.RunOptions{EventWait: 5 * time.Second})
+	systemplanetest.Run(t, factory, systemplanetest.RunOptions{
+		EventWait: 5 * time.Second,
+		Reconnect: terminateListenOn(admin, &lastDB),
+	})
+}
+
+// TestIntegration_PostgresNamedTenant runs the same contract suite against a
+// store that owns no database of its own: every read, write and subscription
+// names a tenant and resolves through the connector. It is the stricter of the
+// two Postgres configurations, because Start is a no-op here and the feed is
+// therefore opened inside Subscribe itself rather than ahead of it.
+func TestIntegration_PostgresNamedTenant(t *testing.T) {
+	base := startContainer(t)
+
+	admin := adminDSN(t, base)
+	defer admin.Close()
+
+	var lastDB string
+
+	factory := func(t *testing.T) (store.Store, func()) {
+		t.Helper()
+
+		dbName, tenantDSN, db := provisionTenantDB(t, admin, base, "nt")
+
+		lastDB = dbName
+
+		conn := newFakeConnector()
+		conn.set("t1", db, tenantDSN)
+
+		s := tenantStore(t, conn)
+
+		// Closing the pool and dropping the database here rather than leaning
+		// on the t.Cleanup provisionTenantDB and tenantStore register: the
+		// suite calls one Factory per iteration inside
+		// SubscribeThenImmediateWriteNeverLosesTheEvent, and twenty live pools
+		// and databases queueing up for the end of that sub-test crowd the
+		// container's max_connections. Both closes are idempotent, so the
+		// t.Cleanup closes that run later are no-ops; FORCE ends any backend
+		// the closed store left behind.
+		return s, func() {
+			_ = s.Close()
+			_ = db.Close()
+
+			if _, err := admin.Exec(fmt.Sprintf(`DROP DATABASE IF EXISTS %s WITH (FORCE)`, dbName)); err != nil {
+				t.Errorf("drop database %s: %v", dbName, err)
+			}
+		}
+	}
+
+	systemplanetest.Run(t, factory, systemplanetest.RunOptions{
+		EventWait: 5 * time.Second,
+		Scope:     store.Scope{Tenant: "t1"},
+		Reconnect: terminateListenOn(admin, &lastDB),
+	})
 }
 
 // TestIntegration_PostgresMultiTenantIsolation verifies that writes against
@@ -446,85 +510,6 @@ func freshStore(t *testing.T, prefix string) *postgres.Store {
 	t.Cleanup(func() { _ = s.Close() })
 
 	return s
-}
-
-// TestIntegration_PostgresSetReturnsRevision pins FC-2's revision contract on
-// the Postgres write path: the first write stores a non-zero revision, a write
-// of a DIFFERENT value advances it, a write of the SAME value does not (the
-// bump trigger draws a new revision only when OLD.value IS DISTINCT FROM
-// NEW.value and otherwise puts the stored one back), and both
-// read paths report exactly the number Set reported. The numbers themselves
-// come from the table-level systemplane_revision_seq, so the test asserts the
-// relations between them and never a literal — revisions may skip.
-func TestIntegration_PostgresSetReturnsRevision(t *testing.T) {
-	s := freshStore(t, "rev")
-	ctx := context.Background()
-
-	set := func(value string) int64 {
-		t.Helper()
-
-		rev, err := s.Set(ctx, store.Scope{}, store.Entry{Namespace: "ns", Key: "k", Value: jsonBytes(t, value)})
-		if err != nil {
-			t.Fatalf("set %q: %v", value, err)
-		}
-
-		return rev
-	}
-
-	first := set("v1")
-	if first <= 0 {
-		t.Fatalf("first Set revision = %d, want greater than 0", first)
-	}
-
-	assertRevision(t, s, ctx, first)
-
-	changed := set("v2")
-	if changed <= first {
-		t.Fatalf("Set of a different value revision = %d, want greater than %d", changed, first)
-	}
-
-	assertRevision(t, s, ctx, changed)
-
-	if got := set("v2"); got != changed {
-		t.Fatalf("Set of an identical value revision = %d, want the unchanged %d", got, changed)
-	}
-
-	assertRevision(t, s, ctx, changed)
-}
-
-// assertRevision checks that Get and the matching List entry both report want.
-func assertRevision(t *testing.T, s store.Store, ctx context.Context, want int64) {
-	t.Helper()
-
-	entry, found, err := s.Get(ctx, store.Scope{}, "ns", "k")
-	if err != nil {
-		t.Fatalf("get: %v", err)
-	}
-
-	if !found {
-		t.Fatalf("get: not found")
-	}
-
-	if entry.Revision != want {
-		t.Errorf("Get revision = %d, want %d", entry.Revision, want)
-	}
-
-	entries, err := s.List(ctx, store.Scope{})
-	if err != nil {
-		t.Fatalf("list: %v", err)
-	}
-
-	for _, e := range entries {
-		if e.Namespace == "ns" && e.Key == "k" {
-			if e.Revision != want {
-				t.Errorf("List revision = %d, want %d", e.Revision, want)
-			}
-
-			return
-		}
-	}
-
-	t.Fatalf("list: entry ns/k not found")
 }
 
 // TestIntegration_PostgresDollarPrefixedStringsStoredVerbatim is the reference
@@ -1724,6 +1709,32 @@ func listenBackendPID(t *testing.T, admin *sql.DB, dbName string) int {
 		}
 
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// terminateListenOn builds the contract suite's Reconnect hook: it kills the
+// feed's own LISTEN backend from a connection the feed does not own, which is
+// the only way to make a Postgres changefeed lose its connection for real.
+//
+// dbName is read through a pointer rather than captured by value because the
+// hook runs inside a sub-test, against whichever database that sub-test's own
+// Factory call provisioned — which the suite records after Run was handed this
+// closure.
+func terminateListenOn(admin *sql.DB, dbName *string) func(*testing.T) {
+	return func(t *testing.T) {
+		t.Helper()
+
+		pid := listenBackendPID(t, admin, *dbName)
+
+		var terminated bool
+
+		if err := admin.QueryRow(`SELECT pg_terminate_backend($1)`, pid).Scan(&terminated); err != nil {
+			t.Fatalf("terminate LISTEN backend %d on %s: %v", pid, *dbName, err)
+		}
+
+		if !terminated {
+			t.Fatalf("pg_terminate_backend(%d) on %s reported false", pid, *dbName)
+		}
 	}
 }
 

@@ -22,12 +22,12 @@
 // functions, and the three triggers that bind them (one BEFORE INSERT OR
 // UPDATE bump, two NOTIFY) MUST be provisioned externally (e.g. via the
 // consumer's migration pipeline) using the DDL published by the root
-// package's SchemaSQL() / DefaultSeedSQL(). The store only reads, writes
-// values, and — in single-tenant mode — runs LISTEN/NOTIFY. The runtime
-// database role only needs DML + LISTEN privileges, never CREATE on the
-// schema: no statement this package issues names the revision sequence, and
-// the trigger that advances it is SECURITY DEFINER, so the runtime role needs
-// no grant on it either.
+// package's SchemaSQL(). The store only reads, writes values, and — in
+// single-tenant mode — runs LISTEN/NOTIFY. The runtime database role only
+// needs DML + LISTEN privileges, never CREATE on the schema: no statement
+// this package issues names the revision sequence, and the trigger that
+// advances it is SECURITY DEFINER, so the runtime role needs no grant on it
+// either.
 //
 // # Connection budget
 //
