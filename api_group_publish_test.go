@@ -46,8 +46,9 @@ func (r *publishRecorder) all() []Applied[groupPublishDoc] {
 //
 // The test is in-package and drives (*Group).publish directly because every
 // other root test runs single-tenant: real per-tenant publications come from
-// per-tenant LISTEN goroutines a bound Manager owns, which need a live
-// backend. End to end belongs to the integration lane; this pins the hop.
+// per-tenant LISTEN goroutines the engine's per-scope feeds own (engine-tenants
+// lane), which need a live backend. End to end belongs to the integration lane;
+// this pins the hop.
 func TestGroupPublishCarriesEachTenantToItsOwnScope(t *testing.T) {
 	t.Parallel()
 

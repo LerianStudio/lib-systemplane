@@ -367,71 +367,75 @@ func TestFailedRereadIsRetriedThenReportsStale(t *testing.T) {
 	scope := store.Scope{}
 
 	t.Run("a transient failure converges on the retry", func(t *testing.T) {
-		fs := newFakeStore()
-		e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, deleteWindow)
+		forEachWindow(t, func(t *testing.T, window time.Duration) {
+			fs := newFakeStore()
+			e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, window)
 
-		fs.seed(scope, jsonRow(nk, 5, `"five"`, "ops"))
-		settled(t, e, scope)
+			fs.seed(scope, jsonRow(nk, 5, `"five"`, "ops"))
+			settled(t, e, scope)
 
-		// The row really is gone; the first re-read of the delete simply
-		// cannot say so — one pool checkout that failed.
-		fs.remove(scope, nk)
-		fs.onGet(func(store.Scope, NSKey) error {
-			fs.onGet(nil)
+			// The row really is gone; the first re-read of the delete simply
+			// cannot say so — one pool checkout that failed.
+			fs.remove(scope, nk)
+			fs.onGet(func(store.Scope, NSKey) error {
+				fs.onGet(nil)
 
-			return errors.New("pool exhausted")
+				return errors.New("pool exhausted")
+			})
+
+			e.onEvent(deleteEvent(scope, nk))
+
+			waitFor(t, hangGuard, "the retry to put the registered default in force", func() bool {
+				got, ok := e.Lookup(scope, nk)
+
+				return ok && got.Revision == 0 && got.Value == "fallback"
+			})
+
+			if got, _ := e.Lookup(scope, nk); got.Stale {
+				t.Error("the scope reports itself unconfirmed after a re-read that converged on its retry")
+			}
 		})
-
-		e.onEvent(deleteEvent(scope, nk))
-
-		waitFor(t, hangGuard, "the retry to put the registered default in force", func() bool {
-			got, ok := e.Lookup(scope, nk)
-
-			return ok && got.Revision == 0 && got.Value == "fallback"
-		})
-
-		if got, _ := e.Lookup(scope, nk); got.Stale {
-			t.Error("the scope reports itself unconfirmed after a re-read that converged on its retry")
-		}
 	})
 
 	t.Run("a failure that repeats leaves the scope stale until the next resync", func(t *testing.T) {
-		fs := newFakeStore()
-		e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, deleteWindow)
+		forEachWindow(t, func(t *testing.T, window time.Duration) {
+			fs := newFakeStore()
+			e := feedEngine(t, map[NSKey]KeyDef{nk: {Default: "fallback"}}, fs, window)
 
-		fs.seed(scope, jsonRow(nk, 5, `"five"`, "ops"))
-		settled(t, e, scope)
+			fs.seed(scope, jsonRow(nk, 5, `"five"`, "ops"))
+			settled(t, e, scope)
 
-		fs.remove(scope, nk)
-		fs.onGet(func(store.Scope, NSKey) error { return errors.New("pool exhausted") })
+			fs.remove(scope, nk)
+			fs.onGet(func(store.Scope, NSKey) error { return errors.New("pool exhausted") })
 
-		e.onEvent(deleteEvent(scope, nk))
+			e.onEvent(deleteEvent(scope, nk))
 
-		// Two failures are not a blip. The cached value still stands — a read
-		// that learned nothing is no reason to discard the last value that
-		// did — but it stands as unconfirmed, which is the one thing a caller
-		// can act on.
-		waitFor(t, hangGuard, "the scope to report itself unconfirmed", func() bool {
+			// Two failures are not a blip. The cached value still stands — a read
+			// that learned nothing is no reason to discard the last value that
+			// did — but it stands as unconfirmed, which is the one thing a caller
+			// can act on.
+			waitFor(t, hangGuard, "the scope to report itself unconfirmed", func() bool {
+				got, ok := e.Lookup(scope, nk)
+
+				return ok && got.Stale
+			})
+
+			if got, _ := e.Lookup(scope, nk); got.Value != "five" || got.Revision != 5 {
+				t.Errorf("after two failed re-reads: got (%v, rev %d), want the cached (\"five\", rev 5)",
+					got.Value, got.Revision)
+			}
+
+			// And the repair the stale flag points at actually lands.
+			fs.onGet(nil)
+			e.onEvent(resyncEvent(scope))
+			waitReconcileIdle(t, e, scope)
+
 			got, ok := e.Lookup(scope, nk)
-
-			return ok && got.Stale
+			if !ok || got.Value != "fallback" || got.Revision != 0 || got.Stale {
+				t.Errorf("after the resync: got (%v, rev %d, stale %t, cached %t), want the registered default at rev 0, confirmed",
+					got.Value, got.Revision, got.Stale, ok)
+			}
 		})
-
-		if got, _ := e.Lookup(scope, nk); got.Value != "five" || got.Revision != 5 {
-			t.Errorf("after two failed re-reads: got (%v, rev %d), want the cached (\"five\", rev 5)",
-				got.Value, got.Revision)
-		}
-
-		// And the repair the stale flag points at actually lands.
-		fs.onGet(nil)
-		e.onEvent(resyncEvent(scope))
-		waitReconcileIdle(t, e, scope)
-
-		got, ok := e.Lookup(scope, nk)
-		if !ok || got.Value != "fallback" || got.Revision != 0 || got.Stale {
-			t.Errorf("after the resync: got (%v, rev %d, stale %t, cached %t), want the registered default at rev 0, confirmed",
-				got.Value, got.Revision, got.Stale, ok)
-		}
 	})
 
 	// A reconcile whose List was taken BEFORE the delete never decides this
@@ -677,7 +681,25 @@ func TestZeroWindowRetryDoesNotHoldTheFeedGoroutine(t *testing.T) {
 
 	e.onEvent(upsertEvent(scope, nk, 2))
 
-	if elapsed := time.Since(start); elapsed > 2*stall-stall/4 {
+	elapsed := time.Since(start)
+
+	// The retry really runs, and it runs somewhere else. Without this the
+	// upper bound alone is satisfied by a retry that was never scheduled at
+	// all, which is the one regression this test exists to catch.
+	waitFor(t, hangGuard, "the retry to run off the feed goroutine", func() bool {
+		return fs.getCount() == 2
+	})
+
+	// The lower bound is the other half: the first read is the one the feed
+	// goroutine waits through, so an elapsed under one stall means it stopped
+	// being inline and the head-of-line cost this test measures is no longer
+	// the cost being measured.
+	if elapsed < stall {
+		t.Errorf("onEvent returned after %s, want at least one %s store call: the first "+
+			"re-read is no longer running inline on the changefeed goroutine", elapsed, stall)
+	}
+
+	if elapsed > 2*stall-stall/4 {
 		t.Errorf("onEvent held the changefeed goroutine for %s, want about one %s store call: "+
 			"the retry is running inline behind the first read", elapsed, stall)
 	}
