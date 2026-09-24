@@ -1,0 +1,166 @@
+//go:build unit
+
+package client
+
+import (
+	"context"
+	"encoding/json"
+	"strings"
+	"testing"
+
+	"github.com/LerianStudio/lib-observability/v4/log"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
+)
+
+// newMultiTenantClientWithLogger is newMultiTenantClient with a logger the
+// test can read back, which is the whole subject below.
+func newMultiTenantClientWithLogger(t *testing.T, s *memStore, logger log.Logger) *Client {
+	t.Helper()
+
+	cfg := defaultClientConfig()
+	cfg.multiTenantEnabled = true
+	cfg.logger = logger
+
+	return newClient(s, cfg)
+}
+
+// seedRaw plants bytes the store hands back verbatim, standing in for a row a
+// hand-edit or a foreign writer left behind.
+func seedRaw(m *memStore, ns, key string, raw []byte) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.entries[memKey(ns, key)] = store.Entry{Namespace: ns, Key: key, Value: raw}
+}
+
+// decodeErrText is what encoding/json says about raw, which is what must never
+// reach the log for a redacted key: the message quotes the row's first byte.
+func decodeErrText(t *testing.T, raw []byte) string {
+	t.Helper()
+
+	var decoded any
+
+	err := json.Unmarshal(raw, &decoded)
+	if err == nil {
+		t.Fatalf("seed %q decodes cleanly; the test needs a row that does not", raw)
+	}
+
+	return err.Error()
+}
+
+// TestMultiTenantDecodeFailureHonorsTheKeyRedaction closes the asymmetry the
+// Phase 2 review found: every single-tenant ingress renders a decode failure
+// through the engine's policy-aware detail, while the two multi-tenant
+// read-through paths rendered the raw encoding/json error. That error quotes
+// the offending byte of the row, so a key the consumer registered as redacted
+// was protected on one path and published on the other.
+func TestMultiTenantDecodeFailureHonorsTheKeyRedaction(t *testing.T) {
+	raw := []byte(rejectedSecret)
+	leak := decodeErrText(t, raw)
+
+	assertProtected := func(t *testing.T, logger *recordingLogger) {
+		t.Helper()
+
+		lines := logger.errs("failed to unmarshal stored value")
+		if len(lines) != 1 {
+			t.Fatalf("got %d ERROR lines for the undecodable row, want exactly 1: %s", len(lines), logger.rendered())
+		}
+
+		rendered := logger.rendered()
+		if strings.Contains(rendered, rejectedSecret) {
+			t.Errorf("the log carries the stored row of a redacted key: %s", rendered)
+		}
+
+		if strings.Contains(rendered, leak) {
+			t.Errorf("the log carries the json error text, which quotes the row's bytes: %s", rendered)
+		}
+
+		var detail string
+
+		for _, f := range lines[0].structured() {
+			if f.Key == "error" {
+				detail, _ = f.Value.(string)
+			}
+		}
+
+		if !strings.Contains(detail, "decode failed") {
+			t.Errorf(`the line carries error = %q; a redacted key must still say WHAT failed and its type`, detail)
+		}
+	}
+
+	t.Run("Get", func(t *testing.T) {
+		m := newMemStore(true)
+		logger := &recordingLogger{}
+		c := newMultiTenantClientWithLogger(t, m, logger)
+
+		if err := c.Register("ns", "k", "default", WithRedaction(RedactFull)); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+
+		if err := c.Start(context.Background()); err != nil {
+			t.Fatalf("start: %v", err)
+		}
+
+		t.Cleanup(func() { _ = c.Close() })
+
+		seedRaw(m, "ns", "k", raw)
+
+		if _, _, err := c.Get(context.Background(), "ns", "k"); err == nil {
+			t.Fatal("Get: want a decode error, got nil")
+		}
+
+		assertProtected(t, logger)
+	})
+
+	t.Run("List", func(t *testing.T) {
+		m := newMemStore(true)
+		logger := &recordingLogger{}
+		c := newMultiTenantClientWithLogger(t, m, logger)
+
+		if err := c.Register("ns", "k", "default", WithRedaction(RedactFull)); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+
+		if err := c.Start(context.Background()); err != nil {
+			t.Fatalf("start: %v", err)
+		}
+
+		t.Cleanup(func() { _ = c.Close() })
+
+		seedRaw(m, "ns", "k", raw)
+
+		if _, err := c.List(context.Background(), "ns"); err == nil {
+			t.Fatal("List: want a decode error, got nil")
+		}
+
+		assertProtected(t, logger)
+	})
+
+	// The policy is consulted, not applied blindly: an ordinary key keeps the
+	// cause an operator needs to debug the row.
+	t.Run("UnredactedKeyKeepsTheCause", func(t *testing.T) {
+		m := newMemStore(true)
+		logger := &recordingLogger{}
+		c := newMultiTenantClientWithLogger(t, m, logger)
+
+		if err := c.Register("ns", "k", "default"); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+
+		if err := c.Start(context.Background()); err != nil {
+			t.Fatalf("start: %v", err)
+		}
+
+		t.Cleanup(func() { _ = c.Close() })
+
+		seedRaw(m, "ns", "k", raw)
+
+		if _, _, err := c.Get(context.Background(), "ns", "k"); err == nil {
+			t.Fatal("Get: want a decode error, got nil")
+		}
+
+		if !strings.Contains(logger.rendered(), leak) {
+			t.Errorf("an unredacted key lost the decode cause: %s", logger.rendered())
+		}
+	})
+}

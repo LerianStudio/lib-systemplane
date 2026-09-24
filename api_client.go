@@ -150,9 +150,9 @@ func (c *Client) CatalogService() string {
 // goroutine: while a callback runs, a newer revision of that key replaces the
 // pending one, so a callback may skip intermediate revisions but always
 // receives the newest and never sees revisions out of order. Different keys
-// deliver independently. A callback may read the Client re-entrantly;
-// [Client.Set] and [Client.Delete] called from that first delivery return
-// ErrNotStarted when it wins the race with Start's return.
+// deliver independently. A callback may read the Client re-entrantly, and may
+// write: [Client.Set] and [Client.Delete] called from that first delivery land
+// whether or not it wins the race with Start's return.
 //
 // OnChange returns ErrUnknownKey for a key that was not registered, in both
 // modes. In multi-tenant mode it then returns ErrNotSupportedInMultiTenant for

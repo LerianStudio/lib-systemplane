@@ -48,8 +48,9 @@ func WithLogger(l Logger) Option {
 	return internalclient.WithLogger(log.Adapt(l))
 }
 
-// WithTelemetry sets the OpenTelemetry provider. A nil provider disables
-// tracing and metrics, and clears one set by an earlier option.
+// WithTelemetry sets the OpenTelemetry provider used for tracing. A nil
+// provider disables tracing and clears one set by an earlier option. Nothing
+// in v4 asks the provider for a meter yet; see [Telemetry].
 func WithTelemetry(t Telemetry) Option {
 	if log.IsNil(t) {
 		return internalclient.WithTelemetry(nil)

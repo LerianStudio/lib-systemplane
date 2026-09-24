@@ -27,10 +27,9 @@ type nskey struct {
 // Client is the runtime-config handle. Read methods are nil-receiver safe,
 // returning zero values when the Client is nil or not yet started.
 type Client struct {
-	store     store.Store
-	engine    *engine.Engine
-	logger    log.Logger
-	telemetry store.Telemetry
+	store  store.Store
+	engine *engine.Engine
+	logger log.Logger
 
 	multiTenant    bool
 	catalogService string
@@ -112,7 +111,6 @@ func newClient(s store.Store, cfg clientConfig) *Client {
 	c := &Client{
 		store:          s,
 		logger:         logger,
-		telemetry:      cfg.telemetry,
 		multiTenant:    cfg.multiTenantEnabled,
 		catalogService: cfg.catalogService,
 		registry:       make(map[nskey]keyDef),
@@ -178,17 +176,27 @@ func (c *Client) Start(ctx context.Context) error {
 		return err
 	}
 
+	// Marked started BEFORE the first reconcile, because that reconcile is
+	// what delivers the FC-11 announcement: a subscriber registered before
+	// Start is called while Start is still on the stack, and a callback that
+	// answers the announcement by writing must not be refused for a Client the
+	// consumer considers running. The scope exists by then and the write is
+	// fenced by the reconcile window exactly like a feed publication, so
+	// read-your-writes holds. Rolled back below when the engine never comes
+	// up, so a failed Start leaves the flag exactly as it found it.
+	c.started.Store(true)
+
 	// The engine subscribes before it reconciles and rolls a failed Subscribe
 	// back itself, so a write landing between the snapshot and the first feed
 	// event is still observed. A failed Start leaves the Client usable: the
 	// engine retries the scope from nothing on the next Start.
 	if !c.multiTenant {
 		if err := c.engine.Start(ctx); err != nil {
+			c.started.Store(false)
+
 			return err
 		}
 	}
-
-	c.started.Store(true)
 
 	return nil
 }

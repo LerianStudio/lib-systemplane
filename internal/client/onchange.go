@@ -29,8 +29,9 @@ import (
 //   - it may call Get, GetEntry, List and OnChange re-entrantly — no Client or
 //     engine lock is held while it runs, and Get already serves the value the
 //     delivery carries;
-//   - Set and Delete return ErrNotStarted when that first delivery wins the
-//     race with Start's return, so a callback that writes must tolerate it;
+//   - it may call Set and Delete: the Client counts itself started before the
+//     first reconcile runs, so a write from that first delivery lands on
+//     either side of Start's return rather than being refused;
 //   - Register, Start and Close block on the Client's start lock for as long
 //     as Start is still running, and during Close until the close timeout
 //     expires.

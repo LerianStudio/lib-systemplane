@@ -626,3 +626,89 @@ func TestRegisterGradesTheDefaultInCanonicalShape(t *testing.T) {
 		}
 	})
 }
+
+// TestSetFromTheFirstDeliveryLands pins the window FC-11 opened: the first
+// reconcile announces every registered key while Start is still on the stack,
+// so a subscriber's callback can run BEFORE Start returns. A callback that
+// answers that announcement by writing — the ordinary "reconcile my derived
+// state" shape — must have its write land rather than be refused for a Client
+// that is, from the consumer's point of view, already running.
+//
+// The two keys are the clock. The fake's List is sorted, so the reconcile
+// publishes "a" (queuing its delivery) and only then grades "z", whose
+// validator blocks until that delivery has finished. Start is therefore
+// provably still inside its first reconcile while the callback writes.
+func TestSetFromTheFirstDeliveryLands(t *testing.T) {
+	s := newMemStore(false)
+	seedEntryAt(t, s, "ns", "a", "stored", 3)
+	seedEntryAt(t, s, "ns", "z", "gate", 4)
+
+	c := newSingleTenantClient(t, s)
+	defer func() { _ = c.Close() }()
+
+	delivered := make(chan struct{})
+
+	var graded atomic.Int32
+
+	// Call one is Register grading the default; call two is the reconcile
+	// grading the stored row, which is where Start gets held.
+	gate := func(_ context.Context, _ any) error {
+		if graded.Add(1) == 1 {
+			return nil
+		}
+
+		select {
+		case <-delivered:
+		case <-time.After(2 * time.Second):
+			t.Error("the first delivery never reached the subscriber")
+		}
+
+		return nil
+	}
+
+	if err := c.Register("ns", "a", "default"); err != nil {
+		t.Fatalf("Register a: %v", err)
+	}
+
+	if err := c.Register("ns", "z", "default", WithContextValidator(gate)); err != nil {
+		t.Fatalf("Register z: %v", err)
+	}
+
+	setErr := make(chan error, 1)
+
+	var once sync.Once
+
+	unsub, err := c.OnChange("ns", "a", func(_ context.Context, _ Change) {
+		once.Do(func() {
+			setErr <- c.Set(context.Background(), "ns", "a", "written-by-the-subscriber", "cb")
+			close(delivered)
+		})
+	})
+	if err != nil {
+		t.Fatalf("OnChange: %v", err)
+	}
+
+	defer unsub()
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	select {
+	case err := <-setErr:
+		if err != nil {
+			t.Fatalf("Set from the first delivery: %v — the write was refused while Start was still reconciling", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the subscriber never ran")
+	}
+
+	got, ok, err := c.Get(context.Background(), "ns", "a")
+	if err != nil || !ok {
+		t.Fatalf("Get after Start: (%v, %v, %v)", got, ok, err)
+	}
+
+	if got != "written-by-the-subscriber" {
+		t.Errorf("Get after Start = %v, want the value the subscriber wrote", got)
+	}
+}

@@ -51,14 +51,15 @@ func (c *Client) singleTenantEntry(namespace, key string, def keyDef) Entry {
 	}
 
 	// A miss means the engine has published nothing for this key: before
-	// Start, or after a Start whose first reconcile confirmed nothing. The
-	// registered default is what reads serve, and it is Stale — nobody has
-	// confirmed it (FC-5). The engine's own flag covers a tracked scope; a
-	// scope it does not track at all reports the zero Entry, and the Client is
-	// the only one that knows Start has not run.
+	// Start, while Start is still bringing the scope up, or after a Start
+	// whose first reconcile confirmed nothing. The registered default is what
+	// reads serve, and it is Stale in every one of those cases — nobody has
+	// confirmed it (FC-5). A completed first reconcile publishes EVERY
+	// registered key (FC-11), so on a started, reconciled Client a registered
+	// key is never a miss and this branch is never the answer.
 	return Entry{
 		Value: engine.Clone(def.defaultValue),
-		Stale: published.Stale || !c.started.Load(),
+		Stale: true,
 	}
 }
 
@@ -103,7 +104,7 @@ func (c *Client) getEntry(ctx context.Context, namespace, key string) (Entry, bo
 		c.logError(ctx, "failed to unmarshal stored value",
 			log.String("namespace", namespace),
 			log.String("keyname", key),
-			log.Err(err),
+			errorDetail(def.redaction != RedactNone, "decode failed", err),
 		)
 
 		return Entry{}, false, fmt.Errorf("systemplane: decode value for %s/%s: %w", namespace, key, err)
@@ -248,13 +249,16 @@ func (c *Client) List(ctx context.Context, namespace string) ([]ListEntry, error
 		return nil, ErrNilContext
 	}
 
+	// One hold of registryMu for the whole call: the definition travels with
+	// the key, so neither list path takes a Client lock per key, and the
+	// snapshot both paths work from is internally consistent.
 	c.registryMu.RLock()
 
-	keys := make([]nskey, 0)
+	keys := make([]registeredKey, 0)
 
-	for nk := range c.registry {
+	for nk, def := range c.registry {
 		if nk.Namespace == namespace {
-			keys = append(keys, nk)
+			keys = append(keys, registeredKey{nskey: nk, def: def})
 		}
 	}
 
@@ -275,43 +279,44 @@ func (c *Client) List(ctx context.Context, namespace string) ([]ListEntry, error
 	return c.listFromEngine(keys), nil
 }
 
+// registeredKey is a registered key travelling with its definition, captured
+// in List's single walk of the registry.
+type registeredKey struct {
+	nskey
+
+	def keyDef
+}
+
 // listFromEngine reads every key through the engine, falling back to the
 // registered default for one the engine has published nothing for. ListEntry
 // carries no revision (FC-10), so the provenance the engine holds is dropped
 // here on purpose.
-func (c *Client) listFromEngine(keys []nskey) []ListEntry {
+//
+// The engine is read outside registryMu — it takes locks of its own and must
+// never be called under the Client's — which List already guarantees by
+// releasing the lock before it calls here.
+func (c *Client) listFromEngine(keys []registeredKey) []ListEntry {
 	entries := make([]ListEntry, 0, len(keys))
 
-	for _, nk := range keys {
-		// The engine is read OUTSIDE registryMu: it takes locks of its own and
-		// must never be called under the Client's.
-		published, ok := c.engine.Lookup(store.Scope{}, engine.NSKey{Namespace: nk.Namespace, Key: nk.Key})
-
-		c.registryMu.RLock()
-		def, registered := c.registry[nk]
-		c.registryMu.RUnlock()
+	for _, rk := range keys {
+		published, ok := c.engine.Lookup(store.Scope{}, engine.NSKey{Namespace: rk.Namespace, Key: rk.Key})
 
 		val := published.Value
-		if !ok && registered {
-			val = engine.Clone(def.defaultValue)
-		}
-
-		var desc string
-		if registered {
-			desc = def.description
+		if !ok {
+			val = engine.Clone(rk.def.defaultValue)
 		}
 
 		entries = append(entries, ListEntry{
-			Key:         nk.Key,
+			Key:         rk.Key,
 			Value:       val,
-			Description: desc,
+			Description: rk.def.description,
 		})
 	}
 
 	return entries
 }
 
-func (c *Client) listFromStore(ctx context.Context, namespace string, keys []nskey) ([]ListEntry, error) {
+func (c *Client) listFromStore(ctx context.Context, namespace string, keys []registeredKey) ([]ListEntry, error) {
 	stored, err := c.store.List(ctx, store.Scope{})
 	if err != nil {
 		return nil, fmt.Errorf("systemplane: List: %w", err)
@@ -329,32 +334,28 @@ func (c *Client) listFromStore(ctx context.Context, namespace string, keys []nsk
 
 	entries := make([]ListEntry, 0, len(keys))
 
-	c.registryMu.RLock()
-	defer c.registryMu.RUnlock()
+	for _, rk := range keys {
+		val := engine.Clone(rk.def.defaultValue)
 
-	for _, nk := range keys {
-		def := c.registry[nk]
-		val := engine.Clone(def.defaultValue)
-
-		if raw, ok := storedByKey[nk.Key]; ok {
+		if raw, ok := storedByKey[rk.Key]; ok {
 			var decoded any
 			if err := json.Unmarshal(raw, &decoded); err != nil {
 				c.logError(ctx, "failed to unmarshal stored value",
 					log.String("namespace", namespace),
-					log.String("keyname", nk.Key),
-					log.Err(err),
+					log.String("keyname", rk.Key),
+					errorDetail(rk.def.redaction != RedactNone, "decode failed", err),
 				)
 
-				return nil, fmt.Errorf("systemplane: decode value for %s/%s: %w", namespace, nk.Key, err)
+				return nil, fmt.Errorf("systemplane: decode value for %s/%s: %w", namespace, rk.Key, err)
 			}
 
 			val = decoded
 		}
 
 		entries = append(entries, ListEntry{
-			Key:         nk.Key,
+			Key:         rk.Key,
 			Value:       val,
-			Description: def.description,
+			Description: rk.def.description,
 		})
 	}
 

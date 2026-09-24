@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -161,6 +162,12 @@ func (m *memStore) List(_ context.Context, _ store.Scope) ([]store.Entry, error)
 	for _, e := range m.entries {
 		out = append(out, e)
 	}
+
+	// Sorted, unlike a map walk: a reconcile applies the snapshot in this
+	// order, so a test that needs one key applied before another can say so.
+	sort.Slice(out, func(i, j int) bool {
+		return memKey(out[i].Namespace, out[i].Key) < memKey(out[j].Namespace, out[j].Key)
+	})
 
 	return out, nil
 }

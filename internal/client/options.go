@@ -50,9 +50,9 @@ func WithLogger(l log.Logger) Option {
 	}
 }
 
-// WithTelemetry sets the OpenTelemetry provider for spans and metrics.
+// WithTelemetry sets the OpenTelemetry provider the backends trace through.
 // Last-wins, nil included: a nil provider clears one set by an earlier option
-// and disables spans and metrics.
+// and disables tracing. No code path asks it for a meter in v4.
 func WithTelemetry(t store.Telemetry) Option {
 	return func(cfg *clientConfig) {
 		cfg.telemetry = t
