@@ -377,8 +377,9 @@ authorizer or actor extractor — through `lib-observability/runtime`. Each one 
 a recording span, and increments `panic_recovered_total` with a `component`
 label (`systemplane.engine`, `systemplane` for the typed-group applier under
 the name `group.apply`, `systemplane.postgres`, `systemplane.mongodb`,
-`systemplane.debounce`, `systemplane.admin`) and a `goroutine_name` label for
-the site. The counter exists only after the host calls
+`systemplane.debounce`, `systemplane.admin`, and `log` for the consumer's
+logger itself, named by the method that panicked) and a `goroutine_name` label
+for the site. The counter exists only after the host calls
 `runtime.InitPanicMetrics(factory)` once at startup; the library never calls it,
 because the first call wins and would take the host's metrics. Production mode
 (`runtime.SetProductionMode(true)`) redacts the recovered value from the log

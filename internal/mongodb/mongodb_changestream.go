@@ -973,10 +973,7 @@ func (s *Store) startFeedReader(f *feed, stream *mongo.ChangeStream) {
 
 	go func() {
 		defer close(done)
-		// The documents this goroutine holds carry configuration VALUES. The
-		// recovered panic value is the only payload the report carries, and
-		// production mode redacts it from the log line; nothing here may add a
-		// document field to it.
+		// The report carries the panic value only, never a document field (a config value).
 		defer runtime.RecoverAndLogWithContext(context.Background(), s.cfg.Logger, recoveryComponent, "listener")
 
 		if stream == nil {

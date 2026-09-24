@@ -6,9 +6,11 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 
+	"github.com/LerianStudio/lib-observability/v4/log"
 	systemplane "github.com/LerianStudio/lib-systemplane/v4"
 	"github.com/LerianStudio/lib-systemplane/v4/admin"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/testsupport/panicmetric"
@@ -43,8 +45,7 @@ func requireNoLeak(t *testing.T, resp *http.Response) []byte {
 // denying one would be, the panic is reported under the admin component, and
 // the process survives. Without the recovery the unwind reached Fiber, and a
 // host with no recover middleware lost the process to one bad request.
-//
-// Not parallel: the panic counter is process-wide.
+// Not parallel: see panicmetric.
 func TestAdmin_PanickingAuthorizerIsForbidden(t *testing.T) {
 	c, store := setupClient(t, func(c *systemplane.Client) error {
 		return c.Register("ns", "k", "default")
@@ -70,7 +71,8 @@ func TestAdmin_PanickingAuthorizerIsForbidden(t *testing.T) {
 	admin.Mount(denyApp, c)
 
 	denyResp := doRequest(t, denyApp, http.MethodPut, "/system/ns/k", `{"value":"new"}`)
-	denyBody := requireNoLeak(t, denyResp)
+	denyBody, _ := io.ReadAll(denyResp.Body)
+	denyResp.Body.Close()
 
 	if string(body) != string(denyBody) {
 		t.Errorf("body = %s, want the default-deny body %s", body, denyBody)
@@ -89,9 +91,7 @@ func TestAdmin_PanickingAuthorizerIsForbidden(t *testing.T) {
 
 // A panicking actor extractor answers 500 and writes nothing, on both write
 // routes: the request was authorized, but no write may land without the actor
-// that attributes it.
-//
-// Not parallel: the panic counter is process-wide.
+// that attributes it. Not parallel: see panicmetric.
 func TestAdmin_PanickingActorExtractorWritesNothing(t *testing.T) {
 	for _, tc := range []struct {
 		method string
@@ -134,5 +134,50 @@ func TestAdmin_PanickingActorExtractorWritesNothing(t *testing.T) {
 
 			counter.RequireOnly(t, "systemplane.admin", "actor_extractor")
 		})
+	}
+}
+
+// deadLogger is a consumer logger that panics on every method.
+type deadLogger struct{}
+
+func (deadLogger) Log(context.Context, int, string, ...any) { panic(panicSecret) }
+func (deadLogger) Enabled(int) bool                         { panic(panicSecret) }
+func (l deadLogger) With(...any) log.Logger                 { return l }
+func (l deadLogger) WithGroup(string) log.Logger            { return l }
+func (deadLogger) Sync(context.Context) error               { panic(panicSecret) }
+
+// A panicking authorizer whose report meets a panicking consumer logger still
+// fails closed with the default-deny answer, and the authorizer panic is still
+// counted. Not parallel: see panicmetric.
+func TestAdmin_PanickingAuthorizerAndLoggerIsForbidden(t *testing.T) {
+	c, _ := setupClientWithOptions(t, []systemplane.Option{systemplane.WithLogger(deadLogger{})}, nil)
+
+	counter := panicmetric.Install(t)
+
+	app := mountAndRun(t, c, admin.WithAuthorizer(func(fiber.Ctx, string) error {
+		panic(panicSecret)
+	}))
+
+	resp := doRequest(t, app, http.MethodPut, "/system/ns/k", `{"value":"new"}`)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", resp.StatusCode)
+	}
+
+	body := requireNoLeak(t, resp)
+
+	denyApp := fiber.New()
+	admin.Mount(denyApp, c)
+
+	denyResp := doRequest(t, denyApp, http.MethodPut, "/system/ns/k", `{"value":"new"}`)
+	denyBody, _ := io.ReadAll(denyResp.Body)
+	denyResp.Body.Close()
+
+	if string(body) != string(denyBody) {
+		t.Errorf("body = %s, want the default-deny body %s", body, denyBody)
+	}
+
+	want := panicmetric.Increment{Component: "systemplane.admin", Name: "authorizer"}
+	if got := counter.Increments(); !slices.Contains(got, want) {
+		t.Errorf("panic counter increments = %+v, want one %+v", got, want)
 	}
 }

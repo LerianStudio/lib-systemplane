@@ -134,15 +134,15 @@ func Mount(router fiber.Router, c *systemplane.Client, opts ...MountOption) {
 	}
 
 	prefix := normalizePathPrefix(cfg.pathPrefix)
-	logger := c.Logger()
+	logger := log.Guard(c.Logger())
 
 	router.Get(prefix+"/:namespace", validateNamespaceParam, authorize(cfg, logger, "read"), handleList(c))
 	router.Get(prefix+"/:namespace/:key", validatePathParams, authorize(cfg, logger, "read"), handleGetOne(c))
 	router.Get(prefix+"/:namespace/*", validateWildcardPathParams, authorize(cfg, logger, "read"), handleGetOne(c))
-	router.Put(prefix+"/:namespace/:key", validatePathParams, authorize(cfg, logger, "write"), handlePut(c, cfg))
-	router.Put(prefix+"/:namespace/*", validateWildcardPathParams, authorize(cfg, logger, "write"), handlePut(c, cfg))
-	router.Delete(prefix+"/:namespace/:key", validatePathParams, authorize(cfg, logger, "write"), handleDelete(c, cfg))
-	router.Delete(prefix+"/:namespace/*", validateWildcardPathParams, authorize(cfg, logger, "write"), handleDelete(c, cfg))
+	router.Put(prefix+"/:namespace/:key", validatePathParams, authorize(cfg, logger, "write"), handlePut(c, cfg, logger))
+	router.Put(prefix+"/:namespace/*", validateWildcardPathParams, authorize(cfg, logger, "write"), handlePut(c, cfg, logger))
+	router.Delete(prefix+"/:namespace/:key", validatePathParams, authorize(cfg, logger, "write"), handleDelete(c, cfg, logger))
+	router.Delete(prefix+"/:namespace/*", validateWildcardPathParams, authorize(cfg, logger, "write"), handleDelete(c, cfg, logger))
 }
 
 // MountCatalog registers read-only catalog metadata routes on router using the
@@ -168,7 +168,7 @@ func MountCatalog(router fiber.Router, c *systemplane.Client, opts ...MountOptio
 	}
 
 	prefix := normalizePathPrefix(cfg.pathPrefix)
-	logger := c.Logger()
+	logger := log.Guard(c.Logger())
 	catalogPath := catalogPathPrefix(prefix)
 
 	router.Get(catalogPath, authorize(cfg, logger, "read"), handleCatalogList(c, prefix))
@@ -199,9 +199,8 @@ func authorize(cfg mountConfig, logger log.Logger, action string) fiber.Handler 
 }
 
 // callAuthorizer runs the consumer's authorizer and turns a panic into a
-// denial: the request fails closed, exactly as with no authorizer at all, and
-// the panic is reported instead of unwinding into Fiber, where a host without
-// its own recover middleware loses the process to it.
+// reported denial: the request fails closed, as with no authorizer at all,
+// instead of unwinding into Fiber, which can take the host process down.
 func callAuthorizer(c fiber.Ctx, cfg mountConfig, logger log.Logger, action string) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -447,7 +446,7 @@ func handleGetOne(client *systemplane.Client) fiber.Handler {
 	}
 }
 
-func handlePut(client *systemplane.Client, cfg mountConfig) fiber.Handler {
+func handlePut(client *systemplane.Client, cfg mountConfig, logger log.Logger) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		namespace, key := registeredPathParams(client, c)
 
@@ -456,7 +455,7 @@ func handlePut(client *systemplane.Client, cfg mountConfig) fiber.Handler {
 			return commonshttp.RespondError(c, http.StatusBadRequest, "bad_request", badRequestMsg)
 		}
 
-		actor, err := extractActor(c, cfg, client.Logger())
+		actor, err := extractActor(c, cfg, logger)
 		if err != nil {
 			return mapSentinelErr(c, err)
 		}
@@ -469,11 +468,11 @@ func handlePut(client *systemplane.Client, cfg mountConfig) fiber.Handler {
 	}
 }
 
-func handleDelete(client *systemplane.Client, cfg mountConfig) fiber.Handler {
+func handleDelete(client *systemplane.Client, cfg mountConfig, logger log.Logger) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		namespace, key := registeredPathParams(client, c)
 
-		actor, err := extractActor(c, cfg, client.Logger())
+		actor, err := extractActor(c, cfg, logger)
 		if err != nil {
 			return mapSentinelErr(c, err)
 		}
