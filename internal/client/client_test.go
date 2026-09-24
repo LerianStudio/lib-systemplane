@@ -12,6 +12,7 @@ import (
 	"time"
 
 	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
+	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -1777,5 +1778,260 @@ func TestSubscriberMutationDoesNotReachALaterGet(t *testing.T) {
 
 	if doc["timeout"] != "30s" {
 		t.Errorf("value: got %v, want the written document intact", doc)
+	}
+}
+
+// TestCloseReportsBothTheStuckSubscriberAndTheStoreFailure is the half
+// TestCloseReturnsTheStoreErrorWrapped cannot reach. Close has two outcomes to
+// report and one error to report them in: the engine's bounded wait for
+// in-flight callbacks, and the backend's own Close. A consumer shutting down
+// holds a subscriber that ignores the ctx it was handed AND a database that
+// refuses to close — the shape of a bad shutdown, not a hypothetical — and
+// both have to survive the join. Reporting only the first would tell an
+// operator "a callback is stuck" while a leaked connection goes unmentioned;
+// reporting only the second hides the goroutine that is still running.
+func TestCloseReportsBothTheStuckSubscriberAndTheStoreFailure(t *testing.T) {
+	backendErr := errors.New("backend refused to close")
+	s := newMemStore(false)
+	s.closeErr = backendErr
+
+	// Through the option rather than the config field: a WithCloseTimeout that
+	// silently stopped reaching the engine would leave Close waiting the 30s
+	// default, which is past a Kubernetes termination grace period.
+	cfg := defaultClientConfig()
+	cfg.debounce = 0
+
+	applyClientOptions(&cfg, []Option{WithCloseTimeout(100 * time.Millisecond)})
+
+	c := newClient(s, cfg)
+
+	if err := c.Register("ns", "k", "default"); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// Subscribed after Start, so the first reconcile's announcement is already
+	// behind us and the Set below is the one and only delivery.
+	entered := make(chan struct{})
+	returned := make(chan struct{})
+	release := make(chan struct{})
+
+	unsub, err := c.OnChange("ns", "k", func(context.Context, Change) {
+		close(entered)
+		<-release // deliberately ignores ctx: the subscriber's own leak
+		close(returned)
+	})
+	if err != nil {
+		t.Fatalf("OnChange: %v", err)
+	}
+
+	defer unsub()
+
+	if err := c.Set(context.Background(), "ns", "k", "woken", "actor"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the subscriber never ran, so Close has nothing to wait for")
+	}
+
+	closeErr := c.Close()
+
+	if !errors.Is(closeErr, ErrCloseTimeout) {
+		t.Errorf("Close: got %v, want it to report the stuck subscriber (ErrCloseTimeout)", closeErr)
+	}
+
+	if !errors.Is(closeErr, backendErr) {
+		t.Errorf("Close: got %v, want it to report the backend failure %v — the stuck subscriber must not swallow it", closeErr, backendErr)
+	}
+
+	// Release the callback and wait for it: a test that leaks on purpose fails
+	// the whole package under goleak.
+	close(release)
+
+	select {
+	case <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the released subscriber never returned")
+	}
+}
+
+// TestListBeforeStartServesEveryRegisteredDefault pins what an admin listing
+// shows while the process is still booting — before the first reconcile, the
+// engine holds nothing for any key. Dropping those keys, or listing them
+// empty, would tell an operator the knobs do not exist on a service that is
+// in fact running on their defaults. The listing also hands out copies: a
+// caller that edits a value it was given must not have edited the default the
+// binary will keep running on.
+func TestListBeforeStartServesEveryRegisteredDefault(t *testing.T) {
+	s := newMemStore(false)
+	seedEntryAt(t, s, "ns", "overridden", "from-the-store", 7)
+
+	c := newSingleTenantClient(t, s)
+	defer func() { _ = c.Close() }()
+
+	if err := c.Register("ns", "overridden", map[string]any{"mode": "a"}, WithDescription("the one an operator changed")); err != nil {
+		t.Fatalf("Register overridden: %v", err)
+	}
+
+	if err := c.Register("ns", "untouched", "default-b", WithDescription("the one nobody wrote")); err != nil {
+		t.Fatalf("Register untouched: %v", err)
+	}
+
+	entries, err := c.List(context.Background(), "ns")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+
+	if len(entries) != 2 {
+		t.Fatalf("List returned %d entries (%v), want 2 sorted by key", len(entries), entries)
+	}
+
+	if entries[0].Key != "overridden" || entries[1].Key != "untouched" {
+		t.Fatalf("List keys: got %q, %q, want them sorted", entries[0].Key, entries[1].Key)
+	}
+
+	if entries[0].Description != "the one an operator changed" || entries[1].Description != "the one nobody wrote" {
+		t.Errorf("descriptions: got %q / %q, want the registered ones", entries[0].Description, entries[1].Description)
+	}
+
+	if entries[1].Value != "default-b" {
+		t.Errorf("untouched value: got %v, want the registered default — nothing has been reconciled yet", entries[1].Value)
+	}
+
+	edited, isMap := entries[0].Value.(map[string]any)
+	if !isMap {
+		t.Fatalf("overridden value: got %T, want the registered default map", entries[0].Value)
+	}
+
+	if edited["mode"] != "a" {
+		t.Fatalf("overridden value: got %v, want the registered default", edited)
+	}
+
+	edited["mode"] = "vandalised"
+
+	again, err := c.List(context.Background(), "ns")
+	if err != nil {
+		t.Fatalf("second List: %v", err)
+	}
+
+	if got := again[0].Value.(map[string]any)["mode"]; got != "a" {
+		t.Errorf("after a caller edited the value it was handed, the default reads back as %v, want %q", got, "a")
+	}
+}
+
+// TestReadsAfterAFailedFirstReconcileServeTheDefaultAsStale pins FC-5 at its
+// least comfortable moment: the database was unreachable when the process
+// booted. The registered defaults are what the binary runs on — refusing every
+// read, or answering a zero value, would take the service down over a knob it
+// has a perfectly good default for. What callers must be able to see is that
+// nothing is confirming those values, which is what Stale says.
+func TestReadsAfterAFailedFirstReconcileServeTheDefaultAsStale(t *testing.T) {
+	s := newMemStore(false)
+	seedEntryAt(t, s, "ns", "k", "stored", 3)
+
+	c := newSingleTenantClient(t, s)
+	defer func() { _ = c.Close() }()
+
+	if err := c.Register("ns", "k", "default"); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	// Before Start the engine tracks no scope at all, so only the Client knows
+	// the values in force have never been confirmed.
+	before, ok, err := c.GetEntry(context.Background(), "ns", "k")
+	if err != nil || !ok {
+		t.Fatalf("GetEntry before Start: got (%v, %v), want the registered default", ok, err)
+	}
+
+	if before.Value != "default" || !before.Stale {
+		t.Errorf("GetEntry before Start: got %v (stale %v), want the registered default reported stale", before.Value, before.Stale)
+	}
+
+	boom := errors.New("connection refused")
+	s.failListOnce(boom)
+
+	if err := c.Start(context.Background()); !errors.Is(err, boom) {
+		t.Fatalf("Start: got %v, want the store failure wrapped", err)
+	}
+
+	got, ok, err := c.Get(context.Background(), "ns", "k")
+	if err != nil || !ok {
+		t.Fatalf("Get: got (%v, %v, %v), want the registered default", got, ok, err)
+	}
+
+	if got != "default" {
+		t.Errorf("Get: got %v, want %q — nothing was ever confirmed, so the stored row must not be served", got, "default")
+	}
+
+	entry, ok, err := c.GetEntry(context.Background(), "ns", "k")
+	if err != nil || !ok {
+		t.Fatalf("GetEntry: got (%v, %v), want the registered default", ok, err)
+	}
+
+	if !entry.Stale {
+		t.Error("GetEntry.Stale: got false, want true — no reconcile has ever confirmed this value")
+	}
+
+	if entry.Revision != 0 {
+		t.Errorf("GetEntry.Revision: got %d, want 0 — a default nobody stored has no revision", entry.Revision)
+	}
+}
+
+// TestReadsAreRefusedOnAClosedClientAndOnANilContext pins the two refusals the
+// read path owes its callers: a handle whose Close already ran reports
+// ErrClosed instead of serving values from a torn-down engine, and a nil ctx
+// is named rather than panicking somewhere deeper.
+func TestReadsAreRefusedOnAClosedClientAndOnANilContext(t *testing.T) {
+	c := newSingleTenantClient(t, newMemStore(false))
+
+	if err := c.Register("ns", "k", "default"); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	//nolint:staticcheck // SA1012: passing nil is exactly what this pins.
+	if _, _, err := c.GetEntry(nil, "ns", "k"); !errors.Is(err, ErrNilContext) {
+		t.Errorf("GetEntry(nil ctx): got %v, want ErrNilContext", err)
+	}
+
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if _, _, err := c.GetEntry(context.Background(), "ns", "k"); !errors.Is(err, ErrClosed) {
+		t.Errorf("GetEntry after Close: got %v, want ErrClosed", err)
+	}
+
+	var nilClient *Client
+
+	if _, _, err := nilClient.GetEntry(context.Background(), "ns", "k"); !errors.Is(err, ErrClosed) {
+		t.Errorf("GetEntry on a nil Client: got %v, want ErrClosed", err)
+	}
+}
+
+// TestLoggerNeverReturnsNil pins the accessor consumers reach for when they
+// want their own lines in the same stream as the library's. Handing back a nil
+// log.Logger would turn the first such line into a panic inside the consumer's
+// code, which is why the unconfigured and nil-receiver cases both answer with
+// a no-op logger rather than nothing.
+func TestLoggerNeverReturnsNil(t *testing.T) {
+	configured := log.NewNop()
+
+	c := newSingleTenantClientWithLogger(t, newMemStore(false), configured)
+	defer func() { _ = c.Close() }()
+
+	if c.Logger() != configured {
+		t.Errorf("Logger: got %v, want the configured logger", c.Logger())
+	}
+
+	var nilClient *Client
+
+	if nilClient.Logger() == nil {
+		t.Error("Logger on a nil Client: got nil, want a no-op logger")
 	}
 }
