@@ -427,3 +427,73 @@ func TestTypedGetterErrorNamesTheValueOfAnUnredactedKey(t *testing.T) {
 		t.Errorf("error %q does not name the value of an unredacted key", err)
 	}
 }
+
+// TestTypedGetterRedactionSurvivesACloseMidRead pins WHERE the typed getters
+// read the key's redaction from.
+//
+// The gate must carry the fact out of the same registry lookup that produced
+// the value. Reading it back afterwards through the public KeyRedaction
+// accessor cannot work: that accessor deliberately reports RedactNone for a
+// closed Client, so a Close landing between the read and the check degrades the
+// gate open and the rejection prints the value of a RedactFull key — on the
+// multi-tenant read-through path, where the error reaches response bodies.
+//
+// The store hook closes the Client under the read it is serving, which is the
+// race made deterministic.
+func TestTypedGetterRedactionSurvivesACloseMidRead(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		raw  string
+		leak string
+		call func(*Client) error
+	}{
+		{
+			name: "GetDuration",
+			raw:  `"` + rejectedSecret + `"`,
+			leak: rejectedSecret,
+			call: func(c *Client) error {
+				_, _, err := c.GetDuration(context.Background(), "ns", "k")
+
+				return err
+			},
+		},
+		{
+			name: "GetInt",
+			raw:  `1.5`,
+			leak: "1.5",
+			call: func(c *Client) error {
+				_, _, err := c.GetInt(context.Background(), "ns", "k")
+
+				return err
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			m := newMemStore(true)
+			c := newMultiTenantClient(t, m)
+
+			if err := c.Register("ns", "k", "1s", WithRedaction(RedactFull)); err != nil {
+				t.Fatalf("register: %v", err)
+			}
+
+			m.getHook = func(ns, key string) (store.Entry, bool, bool) {
+				_ = c.Close()
+
+				return store.Entry{Namespace: ns, Key: key, Value: []byte(tt.raw)}, true, true
+			}
+
+			err := tt.call(c)
+			if err == nil {
+				t.Fatal("want a validation error, got nil")
+			}
+
+			if strings.Contains(err.Error(), tt.leak) {
+				t.Errorf("error %q carries %q, the value of a redacted key", err, tt.leak)
+			}
+
+			if !strings.Contains(err.Error(), "value withheld") {
+				t.Errorf("error %q does not say the value was withheld", err)
+			}
+		})
+	}
+}
