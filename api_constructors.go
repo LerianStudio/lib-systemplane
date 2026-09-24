@@ -48,8 +48,9 @@ func WithLogger(l Logger) Option {
 	return internalclient.WithLogger(log.Adapt(l))
 }
 
-// WithTelemetry sets the OpenTelemetry provider. A nil provider disables
-// tracing and metrics, and clears one set by an earlier option.
+// WithTelemetry sets the OpenTelemetry provider used for tracing. A nil
+// provider disables tracing and clears one set by an earlier option. Nothing
+// in v4 asks the provider for a meter yet; see [Telemetry].
 func WithTelemetry(t Telemetry) Option {
 	if log.IsNil(t) {
 		return internalclient.WithTelemetry(nil)
@@ -66,6 +67,13 @@ func WithPollInterval(d time.Duration) Option { return internalclient.WithPollIn
 
 // WithDebounce sets the trailing-edge debounce window for change notifications.
 func WithDebounce(d time.Duration) Option { return internalclient.WithDebounce(d) }
+
+// WithCloseTimeout bounds how long Close waits for subscriber callbacks after
+// cancelling the context handed to them. It bounds the engine's wait only:
+// closing the backend store is not covered, and Close returns the engine's
+// timeout joined with the store's own error. A zero or negative value means
+// the engine default.
+func WithCloseTimeout(d time.Duration) Option { return internalclient.WithCloseTimeout(d) }
 
 // WithCollection overrides the MongoDB collection name.
 func WithCollection(name string) Option { return internalclient.WithCollection(name) }
@@ -92,21 +100,32 @@ func WithDescription(s string) KeyOption { return internalclient.WithDescription
 // sees the value alone; [WithContextValidator] sees the Set context too. Both
 // set the same single validator: a nil function is ignored, and the last
 // NON-NIL validator option applied to a key wins.
+//
+// It always grades the CANONICAL shape — what the store hands back, so float64
+// for every number, map[string]any for an object, []any for an array — on
+// every ingress, the registered default at [Client.Register] included.
 func WithValidator(fn func(any) error) KeyOption { return internalclient.WithValidator(fn) }
 
 // WithContextValidator sets a validation function invoked on every Set with
 // that Set's own context, so validation can use what the caller carried into
 // the write — a tenant, a deadline — to consult another system.
 //
-// Two callers invoke it today: [Client.Set], with the context of that write,
-// and [Client.Register], with context.Background(). A context validator must
-// therefore treat a context that lacks the scope it expects as "cannot verify"
-// and decide by its own policy — accept it, or refuse it with its own error —
-// rather than assume request scope is there to read.
+// [Client.Set] invokes it with the context of that write — once, before the
+// row is persisted, so what Set returns says whether the next read in this
+// process serves that write — and [Client.Register] with context.Background(). In single-tenant mode it also grades every value
+// read back from the store — the first reconcile at [Client.Start] and every
+// later reconcile and changefeed re-read — with a context derived from the
+// client's lifecycle, which carries no request values and no tenant. A context
+// validator must therefore treat a context that lacks the scope it expects as
+// "cannot verify" and decide by its own policy — accept it, or refuse it with
+// its own error — rather than assume request scope is there to read, and must
+// be deterministic on the same value.
 //
-// The registered default is validated at [Client.Register] time with a
-// non-nil, empty context.Background(), because registering a default is not a
-// write, and that call runs while the client holds its start lock. For the
+// The registered default is validated at [Client.Register] time in the same
+// CANONICAL shape — marshaled and decoded first, so a default of 5 arrives as
+// float64(5) — with a non-nil, empty context.Background(), because registering
+// a default is not a write, and that call runs while the client holds its
+// start lock. For the
 // registered default the function MUST NOT perform I/O or block: a validator
 // that blocks there blocks registration, [Client.Start] and [Client.Close]
 // with it. Recognise the default (or empty) value and return before any

@@ -152,7 +152,7 @@ func (c *Client) catalogDetail(nk nskey, def keyDef) CatalogKeyDetail {
 
 	return CatalogKeyDetail{
 		CatalogKeySummary: c.catalogSummary(nk, def),
-		DefaultValue:      engine.Clone(def.defaultValue),
+		DefaultValue:      engine.Clone(def.catalogDefault),
 		Schema:            meta.Schema,
 		Rules:             meta.Rules,
 		Examples:          meta.Examples,
@@ -177,7 +177,7 @@ func catalogKind(def keyDef) string {
 		return def.catalog.Kind
 	}
 
-	return inferCatalogKind(def.defaultValue)
+	return inferCatalogKind(def.catalogDefault)
 }
 
 func inferCatalogKind(value any) string {

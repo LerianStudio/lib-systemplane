@@ -5,6 +5,8 @@ package systemplane
 import (
 	"context"
 	"testing"
+
+	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
 type apiCatalogStore struct{}
@@ -19,7 +21,12 @@ func (apiCatalogStore) Delete(context.Context, TestScope, string, string, string
 	return nil
 }
 func (apiCatalogStore) List(context.Context, TestScope) ([]TestEntry, error) { return nil, nil }
-func (apiCatalogStore) Subscribe(context.Context, TestScope, func(TestEvent)) (func(), error) {
+func (apiCatalogStore) Subscribe(_ context.Context, _ TestScope, fn func(TestEvent)) (func(), error) {
+	// Announce a connected changefeed (FC-2) so the engine's first reconcile
+	// runs and Start returns. This store holds nothing, so Set stays at
+	// revision 0.
+	fn(TestEvent{Op: store.OpResync})
+
 	return func() {}, nil
 }
 

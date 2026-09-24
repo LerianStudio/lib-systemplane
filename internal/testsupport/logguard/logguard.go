@@ -31,16 +31,25 @@ const obsLogPath = "github.com/LerianStudio/lib-observability/v4/log"
 
 // fieldConstructors are the log.Field constructors whose first argument is the
 // field NAME — the string an operator greps by and the string lib-observability
-// matches its sensitive list against. Those four are every name-carrying
-// constructor the package exports: log.Err names no field, and log.Fields, in
-// alternating key/value form, would need its own reader and no production file
-// here builds one.
+// matches its sensitive list against. Those four are every single-field
+// constructor the package exports that names one; log.Err names none, and
+// log.Fields takes its names in alternating key/value form, read separately.
 var fieldConstructors = map[string]bool{
 	"String": true,
 	"Any":    true,
 	"Int":    true,
 	"Bool":   true,
 }
+
+// variadicConstructor takes alternating name/value pairs and resolves each to
+// the same Any(name, value) a single-field constructor builds, so a name is
+// redacted exactly as it would be spelled out.
+const variadicConstructor = "Fields"
+
+// fieldType is the struct a name reaches the logger inside. Written as a
+// literal it carries its name in the Key element and reaches no constructor at
+// all, which is one edit away from any line that already builds a []log.Field.
+const fieldType = "Field"
 
 // AssertNoneRedacted parses every non-test Go file in dir — "." is the package
 // directory a test binary runs in — and fails tb for each literal log field
@@ -90,7 +99,12 @@ func AssertNoneRedacted(tb testing.TB, dir string) {
 		}
 
 		ast.Inspect(file, func(n ast.Node) bool {
-			if name, lit, ok := fieldName(n, pkg); ok {
+			for _, lit := range fieldNames(n, pkg) {
+				name, err := strconv.Unquote(lit.Value)
+				if err != nil {
+					continue
+				}
+
 				found = append(found, occurrence{name: name, pos: fset.Position(lit.Pos())})
 			}
 
@@ -129,33 +143,140 @@ func logPkgName(file *ast.File) (string, bool) {
 	return "", false
 }
 
-// fieldName reports the literal field name of a <pkg>.<Constructor>("name", …)
-// call, where pkg is the local name of the log package in the file being
-// scanned, and false for every other node.
-func fieldName(n ast.Node, pkg string) (string, *ast.BasicLit, bool) {
-	call, ok := n.(*ast.CallExpr)
-	if !ok || len(call.Args) == 0 {
-		return "", nil, false
+// fieldNames reports the literal field names a node carries, each at its own
+// string literal, where pkg is the local name of the log package in the file
+// being scanned. Two of the three shapes carry more than one name, so a reader
+// that returned a single name per node would report the first and hide the
+// rest. A name that is not a string literal is not reported.
+func fieldNames(n ast.Node, pkg string) []*ast.BasicLit {
+	switch node := n.(type) {
+	case *ast.CallExpr:
+		return callFieldNames(node, pkg)
+	case *ast.CompositeLit:
+		return compositeFieldNames(node, pkg)
 	}
 
+	return nil
+}
+
+// callFieldNames reports the names a <pkg>.<Constructor>(…) call carries: the
+// first argument of a single-field constructor, and every even-indexed
+// argument of the variadic one.
+//
+// Even-indexed is where the variadic form's names sit while every element is a
+// name/value pair; an argument that consumes one element rather than two — a
+// Field, a *Field, a []Field — shifts the rest off that parity and its own
+// names are read from its literal instead, by the composite reader.
+func callFieldNames(call *ast.CallExpr, pkg string) []*ast.BasicLit {
 	sel, ok := call.Fun.(*ast.SelectorExpr)
-	if !ok || !fieldConstructors[sel.Sel.Name] {
-		return "", nil, false
+	if !ok {
+		return nil
 	}
 
 	if ident, ok := sel.X.(*ast.Ident); !ok || ident.Name != pkg {
-		return "", nil, false
+		return nil
 	}
 
-	lit, ok := call.Args[0].(*ast.BasicLit)
+	var names []*ast.BasicLit
+
+	switch {
+	case fieldConstructors[sel.Sel.Name]:
+		if len(call.Args) == 0 {
+			return nil
+		}
+
+		if lit, ok := stringLit(call.Args[0]); ok {
+			names = append(names, lit)
+		}
+
+	case sel.Sel.Name == variadicConstructor:
+		for i := 0; i < len(call.Args); i += 2 {
+			if lit, ok := stringLit(call.Args[i]); ok {
+				names = append(names, lit)
+			}
+		}
+	}
+
+	return names
+}
+
+// compositeFieldNames reports the names a composite literal carries: the Key
+// of a <pkg>.Field literal, and the Key of every element of a []<pkg>.Field
+// literal that elides its own type.
+//
+// An elided element names no type of its own, so it is only recognizable from
+// the literal that holds it; an element that spells its type out is read when
+// ast.Inspect reaches it, and is skipped here so it is reported once.
+func compositeFieldNames(lit *ast.CompositeLit, pkg string) []*ast.BasicLit {
+	if isFieldType(lit.Type, pkg) {
+		if key, ok := keyName(lit); ok {
+			return []*ast.BasicLit{key}
+		}
+
+		return nil
+	}
+
+	array, ok := lit.Type.(*ast.ArrayType)
+	if !ok || !isFieldType(array.Elt, pkg) {
+		return nil
+	}
+
+	var names []*ast.BasicLit
+
+	for _, elt := range lit.Elts {
+		inner, ok := elt.(*ast.CompositeLit)
+		if !ok || inner.Type != nil {
+			continue
+		}
+
+		if key, ok := keyName(inner); ok {
+			names = append(names, key)
+		}
+	}
+
+	return names
+}
+
+// isFieldType reports whether expr names <pkg>.Field.
+func isFieldType(expr ast.Expr, pkg string) bool {
+	sel, ok := expr.(*ast.SelectorExpr)
+	if !ok || sel.Sel.Name != fieldType {
+		return false
+	}
+
+	ident, ok := sel.X.(*ast.Ident)
+
+	return ok && ident.Name == pkg
+}
+
+// keyName reports the string literal a Field composite literal assigns to Key,
+// and false when the literal sets Key positionally or to anything the scan
+// cannot read.
+func keyName(lit *ast.CompositeLit) (*ast.BasicLit, bool) {
+	for _, elt := range lit.Elts {
+		kv, ok := elt.(*ast.KeyValueExpr)
+		if !ok {
+			continue
+		}
+
+		if ident, ok := kv.Key.(*ast.Ident); !ok || ident.Name != "Key" {
+			continue
+		}
+
+		return stringLit(kv.Value)
+	}
+
+	return nil, false
+}
+
+// stringLit reports expr as a string literal, and false for every other
+// expression — a constant, a variable, a concatenation: none is a name this
+// scan can read.
+func stringLit(expr ast.Expr) (*ast.BasicLit, bool) {
+	lit, ok := expr.(*ast.BasicLit)
 	if !ok || lit.Kind != token.STRING {
-		return "", nil, false
+		return nil, false
 	}
 
-	name, err := strconv.Unquote(lit.Value)
-	if err != nil {
-		return "", nil, false
-	}
-
-	return name, lit, true
+	return lit, true
 }

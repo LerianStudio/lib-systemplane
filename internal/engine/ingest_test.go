@@ -5,6 +5,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -24,6 +25,17 @@ func (r fakeRegistry) Lookup(namespace, key string) (KeyDef, bool) {
 	def, ok := r.defs[NSKey{Namespace: namespace, Key: key}]
 
 	return def, ok
+}
+
+// AnyRedacted scans the defs the way the Client scans its registry.
+func (r fakeRegistry) AnyRedacted() bool {
+	for _, def := range r.defs {
+		if def.Redacted {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (r fakeRegistry) Keys() []NSKey {
@@ -52,7 +64,7 @@ func engineWithRegistry(reg Registry) *Engine {
 // it made of the row is asserted where it is visible: the cache it did or did
 // not change, and the line it logged.
 func ingestRow(e *Engine, se store.Entry) {
-	e.ingest(context.Background(), e.scopeFor(store.Scope{}), se, deleteFence{})
+	_ = e.ingest(context.Background(), e.scopeFor(store.Scope{}), se, feedFence{}, false)
 }
 
 func TestIngestRejectsInvalidValueKeepingPrevious(t *testing.T) {
@@ -127,8 +139,8 @@ func TestIngestDefaultPublishesAtRevisionZero(t *testing.T) {
 	seeded := store.Entry{Namespace: nk.Namespace, Key: nk.Key, Value: []byte(`"a"`), Revision: 7, UpdatedBy: "ops"}
 	ingestRow(e, seeded)
 
-	if notify := e.ingestDefault(context.Background(), e.scopeFor(store.Scope{}), nk, true); !notify {
-		t.Error("no-row publication: notify is false, want true")
+	if notify, err := e.ingestDefault(context.Background(), e.scopeFor(store.Scope{}), nk, true); !notify || err != nil {
+		t.Errorf("no-row publication: (notify %t, err %v), want (true, nil)", notify, err)
 	}
 
 	got := cachedEntry(t, e, store.Scope{}, nk)
@@ -140,8 +152,17 @@ func TestIngestDefaultPublishesAtRevisionZero(t *testing.T) {
 		t.Errorf("provenance: got (%s, %q), want (zero time, \"\")", got.UpdatedAt, got.UpdatedBy)
 	}
 
-	if notify := e.ingestDefault(context.Background(), e.scopeFor(store.Scope{}), NSKey{Namespace: "billing", Key: "unknown"}, true); notify {
-		t.Error("no-row publication for an unregistered key: notify is true, want false")
+	// errors.Is, not merely non-nil: reconcile tells this refusal apart from
+	// the ones that mean a registered key could not be read by matching the
+	// sentinel, so a message built by hand here reads to it as a real failure.
+	notify, err := e.ingestDefault(context.Background(), e.scopeFor(store.Scope{}),
+		NSKey{Namespace: "billing", Key: "unknown"}, true)
+	if notify || !errors.Is(err, errUnregisteredKey) {
+		t.Errorf("no-row publication for an unregistered key: (notify %t, err %v), want (false, errUnregisteredKey)", notify, err)
+	}
+
+	if err != nil && !strings.Contains(err.Error(), "billing/unknown") {
+		t.Errorf("refusal message = %q, want it to name billing/unknown", err)
 	}
 }
 
@@ -150,8 +171,8 @@ func TestIngestClonesRegisteredDefault(t *testing.T) {
 	registered := map[string]any{"limit": float64(10)}
 	e := engineWithRegistry(fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: registered}}})
 
-	if notify := e.ingestDefault(context.Background(), e.scopeFor(store.Scope{}), nk, true); !notify {
-		t.Fatal("no-row publication: notify is false, want true")
+	if notify, err := e.ingestDefault(context.Background(), e.scopeFor(store.Scope{}), nk, true); !notify || err != nil {
+		t.Fatalf("no-row publication: (notify %t, err %v), want (true, nil)", notify, err)
 	}
 
 	cached, isMap := cachedEntry(t, e, store.Scope{}, nk).Value.(map[string]any)
@@ -175,8 +196,7 @@ func TestIngestClonesRegisteredDefault(t *testing.T) {
 func TestIngestRejectsPanickingValidatorWithoutLeakingPanicValue(t *testing.T) {
 	// lib-observability's production mode is a process-global switch, which is why it is
 	// restored in t.Cleanup and why this test must never run in parallel with another.
-	runtime.SetProductionMode(true)
-	t.Cleanup(func() { runtime.SetProductionMode(false) })
+	productionMode(t)
 
 	const secret = "validator-panic-sentinel-Zq7Xk"
 
@@ -267,12 +287,17 @@ func (w *markerWatcher) observations() []bool {
 	return append([]bool(nil), w.sawn...)
 }
 
-// TestIngestValidatorSeesTheWriterContextOnPublish pins the write half of the
-// per-ingress context contract: a value that arrives through Publish is
-// validated with the WRITER's context, the one the consumer handed to Set. A
-// validator that resolves a tenant, a locale or a policy from the request
-// context can only do that on the path where a request exists, and this is it.
-func TestIngestValidatorSeesTheWriterContextOnPublish(t *testing.T) {
+// TestPublishDoesNotRegradeALocalWrite pins the write half of the per-ingress
+// grading contract: a local publication has already been graded by the Client,
+// against these same canonical bytes and under the caller's own context, so
+// the engine does not run the registered validator over it a second time.
+//
+// The watcher here refuses whatever it is handed on a context carrying no
+// request marker, which is what a second grading would be handed on this path.
+// It is never called, so the write reaches the cache — and a validator whose
+// answer moved between the two calls can no longer strand a write the Client
+// already reported as landed.
+func TestPublishDoesNotRegradeALocalWrite(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 
 	var watcher markerWatcher
@@ -282,15 +307,17 @@ func TestIngestValidatorSeesTheWriterContextOnPublish(t *testing.T) {
 		Validate: watcher.validate,
 	}}, newFakeStore())
 
-	e.Publish(markedContext(), store.Scope{}, jsonRow(nk, 1, `"accepted"`, "ops"))
+	if err := e.Publish(context.Background(), store.Scope{}, jsonRow(nk, 1, `"accepted"`, "ops")); err != nil {
+		t.Fatalf("Publish: %v, want nil", err)
+	}
 
-	if got := watcher.observations(); len(got) != 1 || !got[0] {
-		t.Fatalf("validator context on the write path: saw the caller's marker = %v, want [true]", got)
+	if got := watcher.observations(); len(got) != 0 {
+		t.Fatalf("the engine graded a local write the Client had already graded: %v", got)
 	}
 
 	entry, ok := e.Lookup(store.Scope{}, nk)
 	if !ok || entry.Value != "accepted" {
-		t.Errorf("the write the validator accepted did not reach the cache: %+v (ok=%v)", entry, ok)
+		t.Errorf("the write did not reach the cache: %+v (ok=%v)", entry, ok)
 	}
 }
 
@@ -308,9 +335,10 @@ func TestIngestValidatorGetsNoTenantOnFeedAndReconcile(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 	scope := store.Scope{}
 
-	// arrange seeds the cache through the one ingress that carries a request —
-	// the write path — so both subtests start from a value that passed, and
-	// the observation recorded by that write is the leading true below.
+	// arrange seeds the cache through the write path, which the Client has
+	// already graded and the engine therefore does not grade again — so both
+	// subtests start from a value in force with no observation recorded, and
+	// the only grading either of them sees is its own read-back's.
 	arrange := func(t *testing.T) (*Engine, *fakeStore, *recordingLogger, *markerWatcher) {
 		t.Helper()
 
@@ -322,7 +350,9 @@ func TestIngestValidatorGetsNoTenantOnFeedAndReconcile(t *testing.T) {
 			Validate: watcher.validate,
 		}}, fs)
 
-		e.Publish(markedContext(), scope, jsonRow(nk, 1, `"in-force"`, "ops"))
+		if err := e.Publish(context.Background(), scope, jsonRow(nk, 1, `"in-force"`, "ops")); err != nil {
+			t.Fatalf("seeding Publish: %v", err)
+		}
 
 		// The store moves on behind the engine's back, which is what both
 		// read-back paths exist to notice.
@@ -339,9 +369,9 @@ func TestIngestValidatorGetsNoTenantOnFeedAndReconcile(t *testing.T) {
 			t.Errorf("a row the validator refused replaced the value in force: %+v (ok=%v)", entry, ok)
 		}
 
-		if got := watcher.observations(); len(got) != 2 || !got[0] || got[1] {
-			t.Errorf("validator contexts: got %v, want [true false] — the write carries the "+
-				"caller's request, the read-back carries none", got)
+		if got := watcher.observations(); len(got) != 1 || got[0] {
+			t.Errorf("validator contexts: got %v, want [false] — the only grading on either "+
+				"path is the read-back's, and it carries no request", got)
 		}
 
 		requireOneRecord(t, rec, rejection)
@@ -375,4 +405,450 @@ func TestIngestValidatorGetsNoTenantOnFeedAndReconcile(t *testing.T) {
 
 		requireValueInForce(t, e, watcher, rec)
 	})
+}
+
+// refusalEngine builds an engine tracking the single-tenant scope over a
+// registry the case may hook, the way the Client leaves it after Start.
+func refusalEngine(t *testing.T, reg Registry) *Engine {
+	t.Helper()
+
+	e := New(Config{Store: newFakeStore(), Registry: reg, Logger: log.NewNop()})
+	track(t, e, store.Scope{})
+
+	noDeliveryOutlivesTheTest(t, e)
+
+	t.Cleanup(func() {
+		if err := e.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+
+	return e
+}
+
+// requireRefusal grades one write path's return value against what the next
+// read will serve: nil only when the cache holds the write or something newer,
+// and otherwise an error an operator can both match and read.
+func requireRefusal(t *testing.T, what string, err error, wantErr error, wantText string) {
+	t.Helper()
+
+	if wantErr == nil && wantText == "" {
+		if err != nil {
+			t.Fatalf("%s: %v, want nil", what, err)
+		}
+
+		return
+	}
+
+	if err == nil {
+		t.Fatalf("%s reported success for a change the next read cannot serve", what)
+	}
+
+	if wantErr != nil && !errors.Is(err, wantErr) {
+		t.Errorf("%s: got %v, want errors.Is %v", what, err, wantErr)
+	}
+
+	if wantText != "" && !strings.Contains(err.Error(), wantText) {
+		t.Errorf("%s: %v does not name %q", what, err, wantText)
+	}
+}
+
+// closeUnderTheCall and stopScopeUnderTheCall are the two seams that reach the
+// drops publish makes AFTER the exported guard has already passed. Registry
+// lookup is consumer code and runs between the two, which is exactly the
+// window a Client's Close or a dropped scope lands in.
+func closeUnderTheCall(e *Engine) func(NSKey) {
+	return func(NSKey) { e.closed.Store(true) }
+}
+
+func stopScopeUnderTheCall(e *Engine) func(NSKey) {
+	return func(NSKey) { e.trackedScope(store.Scope{}).stopReconcileWorker() }
+}
+
+// TestPublishReportsEveryRefusalItCanStillMake pins the write path's return
+// value to what the next read will serve. A local write is graded by the
+// Client before the store sees it, so the engine grades it no second time —
+// but it can still refuse the publication, and a refusal it swallowed left the
+// Client returning nil for a write nobody could read back.
+//
+// One table rather than a subtest each, with a string every refusal must carry:
+// a refusal added without a row here fails the build of nothing, but a refusal
+// added without a MESSAGE fails this test, which is the drift that matters.
+func TestPublishReportsEveryRefusalItCanStillMake(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	foreign := NSKey{Namespace: "billing", Key: "unregistered"}
+	defs := map[NSKey]KeyDef{nk: {Default: "fallback"}}
+
+	cases := []struct {
+		name     string
+		engine   func(t *testing.T, reg *hookedRegistry) *Engine
+		scope    store.Scope
+		row      store.Entry
+		wantErr  error
+		wantText string
+	}{
+		{
+			name:   "an accepted write reports nothing",
+			engine: func(t *testing.T, reg *hookedRegistry) *Engine { return refusalEngine(t, reg) },
+			row:    jsonRow(nk, 1, `"written"`, "ops"),
+		},
+		{
+			name:     "a nil engine reports ErrClosed",
+			engine:   func(*testing.T, *hookedRegistry) *Engine { return nil },
+			row:      jsonRow(nk, 1, `"written"`, "ops"),
+			wantErr:  ErrClosed,
+			wantText: "engine is closed",
+		},
+		{
+			name: "a closed engine reports ErrClosed",
+			engine: func(t *testing.T, reg *hookedRegistry) *Engine {
+				e := refusalEngine(t, reg)
+				if err := e.Close(); err != nil {
+					t.Fatalf("Close: %v", err)
+				}
+
+				return e
+			},
+			row:      jsonRow(nk, 1, `"written"`, "ops"),
+			wantErr:  ErrClosed,
+			wantText: "engine is closed",
+		},
+		{
+			name: "an engine closed under the write reports ErrClosed",
+			engine: func(t *testing.T, reg *hookedRegistry) *Engine {
+				e := refusalEngine(t, reg)
+				reg.hookLookup(closeUnderTheCall(e))
+
+				return e
+			},
+			row:      jsonRow(nk, 1, `"written"`, "ops"),
+			wantErr:  ErrClosed,
+			wantText: "engine is closed",
+		},
+		{
+			name: "a scope stopped under the write reports the drop",
+			engine: func(t *testing.T, reg *hookedRegistry) *Engine {
+				e := refusalEngine(t, reg)
+				reg.hookLookup(stopScopeUnderTheCall(e))
+
+				return e
+			},
+			row:      jsonRow(nk, 1, `"written"`, "ops"),
+			wantErr:  ErrScopeNotTracked,
+			wantText: "does not track",
+		},
+		{
+			name:     "an untracked scope reports the drop",
+			engine:   func(t *testing.T, reg *hookedRegistry) *Engine { return refusalEngine(t, reg) },
+			scope:    store.Scope{Tenant: "acme"},
+			row:      jsonRow(nk, 1, `"written"`, "ops"),
+			wantErr:  ErrScopeNotTracked,
+			wantText: "tenant acme",
+		},
+		{
+			name:     "an unregistered key reports the skip",
+			engine:   func(t *testing.T, reg *hookedRegistry) *Engine { return refusalEngine(t, reg) },
+			row:      jsonRow(foreign, 1, `"written"`, "ops"),
+			wantText: "billing/unregistered",
+		},
+		{
+			name:     "undecodable bytes report the decode failure",
+			engine:   func(t *testing.T, reg *hookedRegistry) *Engine { return refusalEngine(t, reg) },
+			row:      jsonRow(nk, 1, `{not json`, "ops"),
+			wantText: "billing/limits",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := &hookedRegistry{Registry: fakeRegistry{defs: defs}}
+
+			err := tc.engine(t, reg).Publish(context.Background(), tc.scope, tc.row)
+
+			requireRefusal(t, "Publish", err, tc.wantErr, tc.wantText)
+		})
+	}
+}
+
+// TestPublishDeleteReportsEveryRefusalItCanStillMake is the removal's half of
+// the table above, and exists for the same reason: Client.Delete removes the
+// row and then publishes the registered default so the caller's next read
+// stops serving what it deleted, and a drop it never heard about left that
+// read serving the deleted value behind a nil error.
+func TestPublishDeleteReportsEveryRefusalItCanStillMake(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	foreign := NSKey{Namespace: "billing", Key: "unregistered"}
+	defs := map[NSKey]KeyDef{nk: {Default: "fallback"}}
+
+	cases := []struct {
+		name     string
+		engine   func(t *testing.T, reg *hookedRegistry) *Engine
+		scope    store.Scope
+		nk       NSKey
+		wantErr  error
+		wantText string
+	}{
+		{
+			name:   "an accepted delete reports nothing",
+			engine: func(t *testing.T, reg *hookedRegistry) *Engine { return refusalEngine(t, reg) },
+			nk:     nk,
+		},
+		{
+			name:     "a nil engine reports ErrClosed",
+			engine:   func(*testing.T, *hookedRegistry) *Engine { return nil },
+			nk:       nk,
+			wantErr:  ErrClosed,
+			wantText: "engine is closed",
+		},
+		{
+			name: "a closed engine reports ErrClosed",
+			engine: func(t *testing.T, reg *hookedRegistry) *Engine {
+				e := refusalEngine(t, reg)
+				if err := e.Close(); err != nil {
+					t.Fatalf("Close: %v", err)
+				}
+
+				return e
+			},
+			nk:       nk,
+			wantErr:  ErrClosed,
+			wantText: "engine is closed",
+		},
+		{
+			name: "an engine closed under the delete reports ErrClosed",
+			engine: func(t *testing.T, reg *hookedRegistry) *Engine {
+				e := refusalEngine(t, reg)
+				reg.hookLookup(closeUnderTheCall(e))
+
+				return e
+			},
+			nk:       nk,
+			wantErr:  ErrClosed,
+			wantText: "engine is closed",
+		},
+		{
+			name: "a scope stopped under the delete reports the drop",
+			engine: func(t *testing.T, reg *hookedRegistry) *Engine {
+				e := refusalEngine(t, reg)
+				reg.hookLookup(stopScopeUnderTheCall(e))
+
+				return e
+			},
+			nk:       nk,
+			wantErr:  ErrScopeNotTracked,
+			wantText: "does not track",
+		},
+		{
+			name:     "an untracked scope reports the drop",
+			engine:   func(t *testing.T, reg *hookedRegistry) *Engine { return refusalEngine(t, reg) },
+			scope:    store.Scope{Tenant: "acme"},
+			nk:       nk,
+			wantErr:  ErrScopeNotTracked,
+			wantText: "tenant acme",
+		},
+		{
+			name:     "an unregistered key reports the skip",
+			engine:   func(t *testing.T, reg *hookedRegistry) *Engine { return refusalEngine(t, reg) },
+			nk:       foreign,
+			wantText: "billing/unregistered",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := &hookedRegistry{Registry: fakeRegistry{defs: defs}}
+
+			err := tc.engine(t, reg).PublishDelete(context.Background(), tc.scope, tc.nk)
+
+			requireRefusal(t, "PublishDelete", err, tc.wantErr, tc.wantText)
+		})
+	}
+}
+
+// TestRunValidator pins the exported door the Client grades through.
+//
+// Register and Set are the two places in the library that hand a validator a
+// value without going through an ingress, so this wrapper is the only thing
+// between a consumer's panicking validator and the consumer's own process. All
+// four outcomes matter to a caller: a nil engine still grades (the Client
+// reaches here before anything confirms an engine exists), no validator
+// accepts, a returned error comes back untouched so the caller can match its
+// own sentinel, and a panic comes back as a refusal that names the panic and
+// never the value it panicked on — a configuration row is exactly where a
+// secret lives.
+func TestRunValidator(t *testing.T) {
+	// lib-observability's production mode is a process-global switch: without
+	// it the recovery pipeline prints the recovered value, which is the one
+	// thing the panic case asserts is absent.
+	productionMode(t)
+
+	const secret = "run-validator-panic-sentinel-Wq4Nb"
+
+	refused := errors.New("the scheme is not allowed")
+
+	for _, tc := range []struct {
+		name      string
+		nilEngine bool
+		validate  func(context.Context, any) error
+		check     func(t *testing.T, err error, logger *recordingLogger)
+	}{
+		{
+			name:      "a nil engine grades and survives a panic",
+			nilEngine: true,
+			validate:  func(context.Context, any) error { panic(secret) },
+			check: func(t *testing.T, err error, _ *recordingLogger) {
+				requireValidatorPanic(t, err)
+			},
+		},
+		{
+			name:     "no validator accepts every value",
+			validate: nil,
+			check: func(t *testing.T, err error, _ *recordingLogger) {
+				if err != nil {
+					t.Errorf("err = %v, want nil: an unvalidated key refuses nothing", err)
+				}
+			},
+		},
+		{
+			name:     "a returned error comes back verbatim",
+			validate: func(context.Context, any) error { return refused },
+			check: func(t *testing.T, err error, _ *recordingLogger) {
+				if !errors.Is(err, refused) {
+					t.Errorf("err = %v, want the validator's own error", err)
+				}
+
+				if err != refused { //nolint:errorlint // verbatim is the contract: no wrapping.
+					t.Errorf("err = %#v, want the validator's error unwrapped", err)
+				}
+			},
+		},
+		{
+			name:     "a panic becomes a validation refusal that never names the value",
+			validate: func(context.Context, any) error { panic(secret) },
+			check: func(t *testing.T, err error, logger *recordingLogger) {
+				requireValidatorPanic(t, err)
+
+				recovered := false
+
+				for _, entry := range logger.all() {
+					if strings.Contains(entry, "panic recovered") {
+						recovered = true
+					}
+
+					if strings.Contains(entry, secret) {
+						t.Errorf("a log entry carries the panic value: %s", entry)
+					}
+				}
+
+				if !recovered {
+					t.Errorf("no panic-recovery entry was logged, got %v", logger.all())
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logger := &recordingLogger{Logger: log.NewNop()}
+
+			var e *Engine
+			if !tc.nilEngine {
+				e = engineWithRegistry(fakeRegistry{defs: map[NSKey]KeyDef{}})
+				e.logger = logger
+			}
+
+			tc.check(t, e.RunValidator(context.Background(), store.Scope{}, NSKey{}, tc.validate, secret, false), logger)
+		})
+	}
+}
+
+// requireValidatorPanic asserts the one shape a recovered validator panic ever
+// comes back as.
+func requireValidatorPanic(t *testing.T, err error) {
+	t.Helper()
+
+	if !errors.Is(err, store.ErrValidation) {
+		t.Fatalf("err = %v, want store.ErrValidation", err)
+	}
+
+	if !strings.Contains(err.Error(), "validator panicked") {
+		t.Errorf("err = %q, want it to name the panic", err)
+	}
+}
+
+// TestValidatorPanicOnARedactedKeyWithholdsTheValue pins the one hole the
+// rejection contract still had: a validator that panics NAMING the value it
+// was handed.
+//
+// A returned error is already rendered under the key's redaction policy
+// ([safelog.ErrorDetail]), but a panic is not the engine's line to write — it goes to
+// lib-observability's canonical handler, which logs log.Any("value", panicked)
+// whenever production mode is off, and off is the shipped default. The field
+// key is "value", which is not on the sensitive-field list, so nothing
+// downstream catches it either: a RedactFull key's secret reaches ERROR in the
+// clear. Deliberately NOT run in production mode, because that mode is what
+// the old assertions leaned on and nothing ships with it.
+func TestValidatorPanicOnARedactedKeyWithholdsTheValue(t *testing.T) {
+	const secret = "redacted-validator-panic-sentinel-Rk9Tz"
+
+	nk := NSKey{Namespace: "billing", Key: "token"}
+	logger := &recordingLogger{Logger: log.NewNop()}
+	e := engineWithRegistry(fakeRegistry{defs: map[NSKey]KeyDef{
+		nk: {
+			Default:  "default",
+			Redacted: true,
+			Validate: func(_ context.Context, v any) error {
+				panic(fmt.Sprintf("refusing %v", v))
+			},
+		},
+	}})
+	e.logger = logger
+
+	ingestRow(e, store.Entry{
+		Namespace: nk.Namespace,
+		Key:       nk.Key,
+		Value:     []byte(`"` + secret + `"`),
+		Revision:  1,
+		UpdatedBy: "ops",
+	})
+
+	requirePanicWithheld(t, logger, "validator", "string", secret)
+}
+
+// requirePanicWithheld asserts the report of a panic raised by consumer code
+// over a redacted key: lib-observability's handler ran under the named source,
+// so the panic counter and the span event were recorded and not only logged;
+// the line names the panic value's dynamic type, which is enough to tell two
+// panics apart; and no entry anywhere carries the value itself.
+func requirePanicWithheld(t *testing.T, r *recordingLogger, source, wantType, secret string) {
+	t.Helper()
+
+	requirePanicAccounted(t, r, source)
+
+	value, ok := findLogged(r, panicRecoveredMsg).field("value")
+	if !ok {
+		t.Fatalf("%q carries no value field, got %v", panicRecoveredMsg, r.all())
+	}
+
+	rendered := fmt.Sprint(value.Value)
+	if !strings.Contains(rendered, "("+wantType+",") || !strings.Contains(rendered, "value withheld") {
+		t.Errorf("%q value field: got %q, want the panic value's type and no value", panicRecoveredMsg, rendered)
+	}
+
+	for _, entry := range r.all() {
+		if strings.Contains(entry, secret) {
+			t.Errorf("a log entry carries the value of a redacted key: %s", entry)
+		}
+	}
+}
+
+// productionMode turns lib-observability's production mode on for one test and
+// puts back whatever it held, rather than the literal false: the switch is
+// process-global, so a test that restores a constant silently turns the mode
+// off for every test that ran outside it.
+func productionMode(t *testing.T) {
+	t.Helper()
+
+	previous := runtime.IsProductionMode()
+	runtime.SetProductionMode(true)
+
+	t.Cleanup(func() { runtime.SetProductionMode(previous) })
 }

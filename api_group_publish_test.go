@@ -46,8 +46,9 @@ func (r *publishRecorder) all() []Applied[groupPublishDoc] {
 //
 // The test is in-package and drives (*Group).publish directly because every
 // other root test runs single-tenant: real per-tenant publications come from
-// per-tenant LISTEN goroutines a bound Manager owns, which need a live
-// backend. End to end belongs to the integration lane; this pins the hop.
+// per-tenant LISTEN goroutines the engine's per-scope feeds own (engine-tenants
+// lane), which need a live backend. End to end belongs to the integration lane;
+// this pins the hop.
 func TestGroupPublishCarriesEachTenantToItsOwnScope(t *testing.T) {
 	t.Parallel()
 
@@ -55,10 +56,6 @@ func TestGroupPublishCarriesEachTenantToItsOwnScope(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewForTesting: %v", err)
 	}
-
-	// Bound before Bind: the group takes its one subscription at Bind, and
-	// only a bound Manager makes that subscription succeed in multi-tenant mode.
-	NewManager(c, nil)
 
 	g, err := Bind(c, "billing", "limits", groupPublishDoc{Workers: 1}, nil)
 	if err != nil {
@@ -74,9 +71,23 @@ func TestGroupPublishCarriesEachTenantToItsOwnScope(t *testing.T) {
 
 	rec := &publishRecorder{}
 
+	// Multi-tenant OnChange is refused, so Bind recorded the refusal and OnApply
+	// reports it. The engine-tenants lane is the one that makes multi-tenant
+	// OnChange work again; until it lands, clearing the recorded refusal is what
+	// lets this test register an applier and pin the tenant hop that
+	// (*Group).publish owns.
+	if _, err := g.OnApply(func(context.Context, Applied[groupPublishDoc]) error { return nil }); !errors.Is(err, ErrNotSupportedInMultiTenant) {
+		t.Fatalf("OnApply in multi-tenant mode = %v, want ErrNotSupportedInMultiTenant", err)
+	}
+
+	// The engine-tenants lane owns this poke: once multi-tenant OnChange
+	// delivers again, Bind records no refusal and this line goes with the
+	// assertion above it.
+	g.subscribeErr = nil
+
 	unsubscribe, err := g.OnApply(rec.apply)
 	if err != nil {
-		t.Fatalf("OnApply with a bound Manager = %v, want no error", err)
+		t.Fatalf("OnApply after clearing the recorded refusal = %v, want no error", err)
 	}
 
 	t.Cleanup(unsubscribe)

@@ -14,13 +14,44 @@ func asInternalClient(c *Client) *internalclient.Client {
 
 // Register declares a configuration key with its default value and options.
 // Must be called before [Client.Start].
+//
+// defaultValue is stored, served and announced in its CANONICAL shape — the
+// shape a stored row comes back in: numbers as float64, objects as
+// map[string]any, arrays as []any. One key therefore answers with one Go type
+// whether a row exists or not, which is what lets a subscriber type-assert the
+// shape its validator grades without the boot announcement and every delete
+// handing it something else. A default that does not survive a JSON round trip
+// is refused with [ErrValidation].
 func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOption) error {
 	return asInternalClient(c).Register(namespace, key, defaultValue, opts...)
 }
 
-// Start hydrates registered keys from the backing store and begins consuming
-// backend change notifications. A stored value a key's validator refuses is
-// not hydrated: the registered default stays in force and a WARN is logged.
+// Start subscribes to the backend changefeed, reconciles every registered key
+// against the store and only then returns, so a read taken after Start reports
+// what is actually stored rather than the registered default.
+//
+// A stored value a key's validator refuses never comes into force: the
+// registered default stays in force and a WARN naming the key and the
+// validator's error is logged. The refused value itself is never logged.
+//
+// Every subscriber registered before Start is handed the value in force once,
+// including the keys the store had no row for and the keys whose row was
+// refused — those are announced as the registered default. A consumer can
+// therefore put its reload in [Client.OnChange] alone and be correct from
+// boot. The announcement is queued while Start runs and delivered on the key's
+// own goroutine, so a callback may run just after Start returns; what Start
+// itself guarantees is that every read taken after it already serves the value
+// that announcement carries.
+//
+// A Start that fails is retryable: the Client stays usable and subscriptions
+// registered before it survive. After a failed reconcile the next Start
+// reconciles from nothing; after a ctx expiry it waits for the reconcile
+// already pending, and [Client.Register] stays refused.
+//
+// The Client counts as started from the moment that reconcile begins, so a
+// [Client.Set] racing Start writes its row and then reports [ErrNotStarted]
+// rather than being refused before the store is touched.
+//
 // In multi-tenant mode it is a no-op beyond marking the Client started —
 // every read resolves a fresh tenant database.
 func (c *Client) Start(ctx context.Context) error {
@@ -34,17 +65,22 @@ func (c *Client) Close() error {
 
 // Get returns the current value for namespace/key.
 //
-// In single-tenant mode reads come from the in-process cache. In multi-tenant
-// mode the call resolves the per-tenant database from ctx (set by
-// tenant-manager middleware) and reads through.
+// In single-tenant mode reads are served in process from the value last
+// reconciled or written, without touching the database. In multi-tenant mode
+// the call resolves the per-tenant database from ctx (set by tenant-manager
+// middleware) and reads through.
 func (c *Client) Get(ctx context.Context, namespace, key string) (any, bool, error) {
 	return asInternalClient(c).Get(ctx, namespace, key)
 }
 
 // GetEntry resolves the caller's scope like Get. ok is false for an
 // unregistered key. Revision, UpdatedAt and UpdatedBy describe the persisted
-// row backing the cached value; only the wave-1 shim may report zeros for a
-// cached row, and engine-core removes that limitation.
+// row behind the value, and are zero when the registered default is in force
+// because no row exists or the stored one was refused. Stale is true while
+// nothing is confirming THIS key: before [Client.Start], while the changefeed
+// is disconnected or has not been reconciled since it connected, and while this
+// key could not be re-read after its last change. A sibling key that could not
+// be re-read does not make this one stale.
 func (c *Client) GetEntry(ctx context.Context, namespace, key string) (e Entry, ok bool, err error) {
 	return asInternalClient(c).GetEntry(ctx, namespace, key)
 }
@@ -75,6 +111,10 @@ func (c *Client) GetDuration(ctx context.Context, namespace, key string) (time.D
 }
 
 // Set persists a new value for namespace/key.
+//
+// A Set racing [Client.Start] can persist its row and still report
+// [ErrNotStarted], because the Client counts as started before its first
+// reconcile has brought the scope up.
 func (c *Client) Set(ctx context.Context, namespace, key string, value any, actor string) error {
 	return asInternalClient(c).Set(ctx, namespace, key, value, actor)
 }
@@ -123,13 +163,24 @@ func (c *Client) CatalogService() string {
 // single-tenant mode) and a delete delivers the registered default with
 // Revision 0.
 //
-// In this wave-1 shim the Manager path reports Change.Revision == 0 on every
-// delivery, upsert or delete, because the NOTIFY payload carries no revision
-// until the storage lane lands.
+// In single-tenant mode a subscriber registered before [Client.Start] is
+// handed the value in force once: Start queues that announcement and the key's
+// own goroutine delivers it, so it may land either side of Start's return.
+// Deliveries for one key are serialized and coalesced off the caller's
+// goroutine: while a callback runs, a newer revision of that key replaces the
+// pending one, so a callback may skip intermediate revisions but always
+// receives the newest and never sees revisions out of order. Different keys
+// deliver independently. A callback may read the Client re-entrantly, and may
+// write: [Client.Set] and [Client.Delete] called from that first delivery land
+// whether or not it wins the race with Start's return. The ctx a callback
+// receives is the engine's own lifecycle context — no request values, no
+// tenant — so a callback that needs the tenant reads Change.Tenant, not ctx.
 //
-// OnChange returns ErrUnknownKey for a key that was not registered. In
-// multi-tenant mode without a bound Manager, OnChange returns
-// ErrNotSupportedInMultiTenant; on a closed Client it returns ErrClosed.
+// OnChange returns ErrUnknownKey for a key that was not registered, in both
+// modes. In multi-tenant mode it then returns ErrNotSupportedInMultiTenant for
+// every registered key: no scope is tracked and no changefeed runs, so no
+// callback could ever fire. The wave-3 engine-tenants lane makes multi-tenant
+// OnChange work on both backends. On a closed Client it returns ErrClosed.
 func (c *Client) OnChange(namespace, key string, fn func(ctx context.Context, ch Change)) (unsubscribe func(), err error) {
 	return asInternalClient(c).OnChange(namespace, key, fn)
 }
@@ -140,6 +191,11 @@ func (c *Client) KeyDescription(namespace, key string) string {
 }
 
 // KeyRedaction returns the registered redaction policy for a key.
+//
+// A closed or nil Client reports RedactFull for every key, registered or not:
+// a Client that can no longer read its registry withholds rather than
+// discloses, and every caller uses the answer to decide what a value may show.
+// On an open Client an unregistered key reports RedactNone.
 func (c *Client) KeyRedaction(namespace, key string) RedactPolicy {
 	return RedactPolicy(asInternalClient(c).KeyRedaction(namespace, key))
 }

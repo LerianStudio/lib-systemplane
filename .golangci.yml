@@ -77,6 +77,18 @@ linters:
           deny:
             - pkg: io/ioutil
               desc: The io/ioutil package has been deprecated, see https://go.dev/doc/go1.16#ioutil
+        # internal/group sits above the engine, not beside it: the Client
+        # publishes INTO a coordinator and the coordinator never reaches back.
+        # Anything it needs from a lower layer belongs in a leaf both can
+        # import, which is what internal/safelog is.
+        group-layering:
+          files:
+            - "**/internal/group/*.go"
+          deny:
+            - pkg: github.com/LerianStudio/lib-systemplane/v4/internal/engine
+              desc: internal/group must not import internal/engine; put the shared piece in a leaf package such as internal/safelog
+            - pkg: github.com/LerianStudio/lib-systemplane/v4/internal/store
+              desc: internal/group must not import internal/store; the coordinator works on decoded documents, not store rows
     gocyclo:
       min-complexity: 16
     govet:

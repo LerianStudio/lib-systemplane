@@ -11,6 +11,16 @@ type Registry interface {
 	// Keys returns every registered key. Reconcile uses it to decide which
 	// keys are absent from a List snapshot and must fall back to default.
 	Keys() []NSKey
+	// AnyRedacted reports whether ANY registered key carries a redaction
+	// policy.
+	//
+	// It gates the one panic report that is not about a single key: a
+	// reconcile panics under a List that returned the whole scope at once, so
+	// the value the panicking code was holding may belong to any registered
+	// key and the engine cannot tell which. One redacted key anywhere in the
+	// registry therefore withholds it. That never under-redacts, and a
+	// registry with no redacted key at all keeps the verbatim report.
+	AnyRedacted() bool
 }
 
 // KeyDef is the subset of a registered key the engine needs.
@@ -21,20 +31,24 @@ type KeyDef struct {
 	Default any
 	// Validate rejects a decoded value at ingress. nil accepts anything.
 	//
-	// The context is the one the ingress itself runs under, and which context
-	// that is differs per ingress by design. A value arriving through Publish
-	// is validated with the WRITER's context — the one the consumer handed to
-	// Set — so a validator may resolve a tenant, a locale or a policy from the
-	// request that is writing. A value arriving from the changefeed re-read or
-	// from a reconcile snapshot is validated with the engine's dispatch
-	// context, which carries no tenant and no request: nothing of whatever
-	// goroutine called Start survives into it. A validator that refuses
-	// whenever the context lacks a tenant therefore refuses every stored row,
-	// and the ingress contract decides what follows — the last value that
-	// passed stays in force, or the registered default at Revision 0 when no
-	// row was ever accepted, and the rejection is logged once per ingestion
-	// attempt — so a flapping changefeed repeats that WARN once per
-	// registered key per resync, rather than once for the life of the key.
+	// The engine runs it on the READ-BACK paths only: the changefeed re-read
+	// and the reconcile snapshot, both under the engine's dispatch context,
+	// which carries no tenant and no request — nothing of whatever goroutine
+	// called Start survives into it. A validator that refuses whenever the
+	// context lacks a tenant therefore refuses every stored row, and the
+	// ingress contract decides what follows — the last value that passed stays
+	// in force, or the registered default at Revision 0 when no row was ever
+	// accepted, and the rejection is logged once per ingestion attempt — so a
+	// flapping changefeed repeats that WARN once per registered key per
+	// resync, rather than once for the life of the key.
+	//
+	// A LOCAL write is graded by the Registry's owner instead, once, before
+	// the store is written: Client.Set runs this same function against the
+	// same canonical value under the WRITER's context — the one the consumer
+	// handed to Set — so a validator may still resolve a tenant, a locale or a
+	// policy from the request that is writing. Publish then does not run it
+	// again; see its own documentation for why grading one write twice was a
+	// correctness bug rather than a redundancy.
 	Validate func(context.Context, any) error
 	// Redacted reports that the key was registered with a redaction policy
 	// other than "none": its value is sensitive and must never reach a log
@@ -74,4 +88,15 @@ func (e *Engine) registeredKeys() []NSKey {
 	}
 
 	return e.registry.Keys()
+}
+
+// anyRedacted is the scope-wide redaction gate, nil-safe for the same reason
+// lookup is: a registry that is not there has no keys, so it holds nothing
+// sensitive.
+func (e *Engine) anyRedacted() bool {
+	if e.registry == nil {
+		return false
+	}
+
+	return e.registry.AnyRedacted()
 }

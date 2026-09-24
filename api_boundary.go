@@ -51,8 +51,13 @@ type Logger interface {
 //
 // Both methods may return an error; this library then falls back to a no-op
 // tracer or leaves the affected instruments disabled. A nil Telemetry is
-// accepted, disables tracing and metrics entirely, and clears a provider set
-// by an earlier option.
+// accepted, disables tracing entirely, and clears a provider set by an earlier
+// option.
+//
+// Meter is declared but not yet called: the v3 manager was this library's only
+// meter consumer and is gone, and the FC-12 engine instruments are wired by the
+// engine-tenants lane. It stays on the interface so that wiring is not a
+// breaking change to a consumer's provider.
 type Telemetry interface {
 	Tracer(name string) (trace.Tracer, error)
 	Meter(name string) (metric.Meter, error)

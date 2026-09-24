@@ -15,8 +15,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// Telemetry is the OpenTelemetry provider contract the backends and the
-// Manager accept.
+// Telemetry is the OpenTelemetry provider contract the backends accept.
 //
 // It names only go.opentelemetry.io/otel types — a stable v1 module — so it
 // carries no other library's major version. lib-observability's

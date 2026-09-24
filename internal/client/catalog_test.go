@@ -47,7 +47,12 @@ func (s *catalogSpyStore) List(context.Context, store.Scope) ([]store.Entry, err
 	return nil, nil
 }
 
-func (s *catalogSpyStore) Subscribe(context.Context, store.Scope, func(store.Event)) (func(), error) {
+func (s *catalogSpyStore) Subscribe(_ context.Context, _ store.Scope, fn func(store.Event)) (func(), error) {
+	// Announce a connected changefeed (FC-2) so the engine's first reconcile
+	// runs and Start returns. This store persists nothing, so Set keeps
+	// reporting revision 0.
+	fn(store.Event{Op: store.OpResync})
+
 	return func() {}, nil
 }
 

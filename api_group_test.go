@@ -15,6 +15,7 @@ import (
 
 	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
 	systemplane "github.com/LerianStudio/lib-systemplane/v4"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
 // groupMemoryStore is this file's own fake store. Every helper here is
@@ -24,6 +25,10 @@ type groupMemoryStore struct {
 	mu      sync.Mutex
 	entries map[string]systemplane.TestEntry
 	sub     func(systemplane.TestEvent)
+
+	// revision is the store-assigned revision FC-2 promises from Set, so a
+	// write and its changefeed echo carry the same non-zero revision.
+	revision int64
 
 	// getErr and setErr let a test make the backend fail. They are read on the
 	// caller's goroutine and on the changefeed's, so they live under mu like
@@ -75,12 +80,15 @@ func (s *groupMemoryStore) Set(_ context.Context, _ systemplane.TestScope, e sys
 		return 0, err
 	}
 
+	s.revision++
+	rev := s.revision
+	e.Revision = rev
 	s.entries[groupMemoryKey(e.Namespace, e.Key)] = e
 	s.mu.Unlock()
 
 	s.fire(systemplane.TestEvent{Namespace: e.Namespace, Key: e.Key, Op: "upsert"})
 
-	return 0, nil
+	return rev, nil
 }
 
 func (s *groupMemoryStore) Delete(_ context.Context, _ systemplane.TestScope, namespace, key, _ string) error {
@@ -117,6 +125,11 @@ func (s *groupMemoryStore) Subscribe(_ context.Context, _ systemplane.TestScope,
 	}
 
 	s.mu.Unlock()
+
+	// Announce a connected changefeed (FC-2) directly, never through fire:
+	// fire queues while the store is holding, and a test that holds before
+	// Start would then hang Start on a resync it never delivers.
+	fn(systemplane.TestEvent{Op: store.OpResync})
 
 	// Announce outside the lock: the subscriber re-reads this store on the
 	// calling goroutine, which is exactly what makes the publication land
@@ -218,6 +231,11 @@ func newGroupClientOn(t *testing.T, s *groupMemoryStore) *systemplane.Client {
 
 // seed writes a row directly into the fake store, standing in for a document
 // an operator (or a previous process) persisted before this Client started.
+//
+// It stamps a revision from the same counter Set draws from, because every v4
+// row carries one (FC-2): a row seeded at revision 0 means "unknown" to the
+// engine's fence, which never deduplicates it, so a re-read of an unchanged
+// row would publish a second time and deliver a second Applied.
 func (s *groupMemoryStore) seed(t *testing.T, namespace, key string, value any) {
 	t.Helper()
 
@@ -229,10 +247,13 @@ func (s *groupMemoryStore) seed(t *testing.T, namespace, key string, value any) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.revision++
+
 	s.entries[groupMemoryKey(namespace, key)] = systemplane.TestEntry{
 		Namespace: namespace,
 		Key:       key,
 		Value:     data,
+		Revision:  s.revision,
 	}
 }
 
@@ -530,11 +551,11 @@ func TestGroupSnapshotReturnsStoredDocument(t *testing.T) {
 
 // TestGroupSnapshotReturnsDecodeErrorNotPartialValue keeps its name and its
 // subject — a row nothing about which decodes into the group's type — but the
-// row no longer reaches the reader: hydration runs the group's own ingress
-// validator over what it read and refuses this row, so the registered defaults
-// stay in force. A half-filled T was never the alternative; that the decoder
-// yields the zero value rather than a partial one is pinned directly on
-// internal/group.Decode.
+// row no longer reaches the reader: the first reconcile at Start runs the
+// group's own ingress validator over what it read and refuses this row, so the
+// registered defaults stay in force. A half-filled T was never the
+// alternative; that the decoder yields the zero value rather than a partial one
+// is pinned directly on internal/group.Decode.
 func TestGroupSnapshotReturnsDecodeErrorNotPartialValue(t *testing.T) {
 	t.Parallel()
 
@@ -933,7 +954,7 @@ func TestGroupDocumentIsAtomicAcrossFields(t *testing.T) {
 // would hand the consumer a T with a half-filled slice. Snapshot returns the
 // error and a zero Value instead.
 //
-// The row is now rejected before publication — hydration grades what it read
+// The row is now rejected before publication — the engine grades what it read
 // through the group's own ingress validator — so the group keeps the
 // registered defaults and no reader ever sees the half-filled document. The
 // decoder-level property (zero value, never a partial T) is pinned directly on
@@ -1094,10 +1115,10 @@ func TestGroupIngressValidatesTheCanonicalDocument(t *testing.T) {
 
 // TestGroupSnapshotRejectsANullRow is the read-side half of the null guard.
 // Ingress refuses to write a null, but a row holding one can predate this
-// binary — an older version, another writer, a hand-edited row. Hydration runs
-// that same ingress over what it reads, so the null never becomes the group's
-// document: the registered defaults stay in force, rather than a wholly blank
-// configuration being reported as the real one.
+// binary — an older version, another writer, a hand-edited row. The engine runs
+// that same ingress over every row it reads, so the null never becomes the
+// group's document: the registered defaults stay in force, rather than a wholly
+// blank configuration being reported as the real one.
 func TestGroupSnapshotRejectsANullRow(t *testing.T) {
 	t.Parallel()
 
@@ -1428,6 +1449,96 @@ func (r *applyRecorder) count() int {
 	return len(r.seen)
 }
 
+// await waits until at least n deliveries have landed and returns them.
+//
+// An engine-backed Client hands every publication to that key's dispatch
+// worker (FC-4), so a write returns BEFORE its applier has run and a delivery
+// count read on the writing goroutine is a race rather than an assertion. The
+// wait never relaxes a count: a test that wants EXACTLY n still compares the
+// length it gets back, so a spurious extra delivery fails as loudly as a
+// missing one.
+func (r *applyRecorder) await(t *testing.T, n int) []systemplane.Applied[groupConfig] {
+	t.Helper()
+
+	deadline := time.After(5 * time.Second)
+
+	for {
+		if seen := r.all(); len(seen) >= n {
+			return seen
+		}
+
+		select {
+		case <-deadline:
+			t.Fatalf("deliveries = %d after 5s, want at least %d", r.count(), n)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+// awaitLast waits until the recorder's newest delivery satisfies want, which is
+// what a test asserts when coalescing makes the delivery COUNT unpredictable
+// but the last one is pinned (FC-4).
+func (r *applyRecorder) awaitLast(t *testing.T, msg string, want func(systemplane.Applied[groupConfig]) bool) systemplane.Applied[groupConfig] {
+	t.Helper()
+
+	deadline := time.After(5 * time.Second)
+
+	for {
+		seen := r.all()
+		if len(seen) > 0 && want(seen[len(seen)-1]) {
+			return seen[len(seen)-1]
+		}
+
+		select {
+		case <-deadline:
+			t.Fatalf("%s; deliveries so far: %#v", msg, seen)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+// awaitScopes waits until the group has observed n scopes. A publication
+// reaches the group on a dispatch worker (FC-4), so the scope a write creates
+// appears in Status shortly after that write returns, not during it.
+func awaitScopes(t *testing.T, g *systemplane.Group[groupConfig], n int) []systemplane.ApplyStatus {
+	t.Helper()
+
+	deadline := time.After(5 * time.Second)
+
+	for {
+		if status := g.Status(); len(status) >= n {
+			return status
+		}
+
+		select {
+		case <-deadline:
+			t.Fatalf("Status reported %#v after 5s, want %d scopes", g.Status(), n)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+// awaitStatus polls Status until want accepts it. A delivery reaches the
+// applier before the coordinator records its outcome, so Status read right
+// after a delivery can still be stale.
+func awaitStatus(t *testing.T, g *systemplane.Group[groupConfig], want func([]systemplane.ApplyStatus) bool) []systemplane.ApplyStatus {
+	t.Helper()
+
+	deadline := time.After(5 * time.Second)
+
+	for {
+		if status := g.Status(); want(status) {
+			return status
+		}
+
+		select {
+		case <-deadline:
+			t.Fatalf("Status never reached the wanted state after 5s: %#v", g.Status())
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
 // bindGroupOn binds the standard group over c and fails the test if it cannot.
 func bindGroupOn(t *testing.T, c *systemplane.Client) *systemplane.Group[groupConfig] {
 	t.Helper()
@@ -1509,7 +1620,7 @@ func TestGroupOnApplyDeliversLaterWrites(t *testing.T) {
 		t.Fatalf("Set: %v", err)
 	}
 
-	seen := rec.all()
+	seen := rec.await(t, 2)
 	if len(seen) != 2 {
 		t.Fatalf("deliveries after one write = %d, want 2", len(seen))
 	}
@@ -1546,7 +1657,7 @@ func TestGroupOnApplyCarriesPreviousAfterTheFirstDelivery(t *testing.T) {
 		t.Fatalf("Set: %v", err)
 	}
 
-	seen := rec.all()
+	seen := rec.await(t, 2)
 	if len(seen) != 2 {
 		t.Fatalf("deliveries after one write = %d, want 2", len(seen))
 	}
@@ -1588,7 +1699,7 @@ func TestGroupOnApplyAlwaysReportsNotStale(t *testing.T) {
 		t.Fatalf("Set: %v", err)
 	}
 
-	seen := rec.all()
+	seen := rec.await(t, 2)
 	if len(seen) < 2 {
 		t.Fatalf("deliveries = %d, want the seeded one and the write", len(seen))
 	}
@@ -1605,15 +1716,17 @@ func TestGroupOnApplyAlwaysReportsNotStale(t *testing.T) {
 }
 
 // TestGroupOnApplyErrorIsVisibleInStatus pins how a rejection travels out of an
-// applier and stays visible. The wave-1 facade publishes every revision as 0
-// (D-G9), so the two revision fields cannot show the lag: both read 0 while one
-// applier keeps refusing the document. LastErr is what makes the refusal
-// visible, and it survives until that applier accepts. The revision arithmetic
-// is driven directly in internal/group's coordinator tests, which publish
-// explicit revisions. What the root proves is that the rejection reached the
-// coordinator's bookkeeping and the consumer's status surface: a rejected
-// document never becomes Previous, the rejecting applier keeps receiving later
-// documents, and a second applier is unaffected.
+// applier and stays visible: a rejected document never becomes Previous, the
+// rejecting applier keeps receiving later documents, a second applier is
+// unaffected, and LastErr survives until the refusing applier accepts.
+//
+// The engine-backed Client publishes the store's own revision, so the two
+// revision fields now show the lag instead of both reading 0 the way they did
+// while the facade published every revision as 0 (D-G9). This store hands the
+// first write revision 1, and a scope's Desired is the newest revision
+// PUBLISHED, not the newest one applied — so Desired is 1 and Applied stays 0
+// while the rejecting applier refuses it. Desired 0 would mean the write never
+// reached the coordinator at all, which is the regression this pins.
 func TestGroupOnApplyErrorIsVisibleInStatus(t *testing.T) {
 	t.Parallel()
 
@@ -1644,7 +1757,7 @@ func TestGroupOnApplyErrorIsVisibleInStatus(t *testing.T) {
 		t.Fatalf("Set: %v", err)
 	}
 
-	rejected := rejecting.all()
+	rejected := rejecting.await(t, 2)
 	if len(rejected) != 2 {
 		t.Fatalf("deliveries to the rejecting applier = %d, want 2", len(rejected))
 	}
@@ -1654,9 +1767,15 @@ func TestGroupOnApplyErrorIsVisibleInStatus(t *testing.T) {
 		t.Errorf("Previous after a rejection = %#v, want nil", rejected[1].Previous)
 	}
 
-	accepted := accepting.all()
+	accepted := accepting.await(t, 2)
 	if len(accepted) != 2 || !reflect.DeepEqual(accepted[1].Value, rolled) {
 		t.Fatalf("deliveries to the accepting applier = %#v, want the defaults then %#v", accepted, rolled)
+	}
+
+	// The write's own revision, carried to the applier. It is what Desired must
+	// report below, so a Desired read from anywhere else fails there.
+	if accepted[1].Revision != 1 {
+		t.Errorf("delivered revision = %d, want 1: the revision this store assigned the first write", accepted[1].Revision)
 	}
 
 	if accepted[1].Previous == nil {
@@ -1672,10 +1791,12 @@ func TestGroupOnApplyErrorIsVisibleInStatus(t *testing.T) {
 		t.Errorf("Status[0].Tenant = %q, want the single-tenant scope", status[0].Tenant)
 	}
 
-	// The rejecting applier has accepted nothing, so the scope is not applied
-	// however the revisions read: both are 0 on the wave-1 facade.
-	if status[0].Desired != 0 || status[0].Applied != 0 {
-		t.Errorf("Status[0] = %#v, want both revisions 0 on the wave-1 facade", status[0])
+	// The write was published at the revision the store assigned it, and one
+	// applier has accepted nothing, so the scope is desired at that revision
+	// and applied at none: Applied is the floor across every registered
+	// applier, not the high-water mark of the one that kept up.
+	if status[0].Desired != accepted[1].Revision || status[0].Applied != 0 {
+		t.Errorf("Status[0] = %#v, want revision %d desired and nothing applied", status[0], accepted[1].Revision)
 	}
 
 	if status[0].LastErr == nil {
@@ -1779,7 +1900,7 @@ func TestGroupOnApplyWithNilFunctionIsANoOp(t *testing.T) {
 	// error. A nil function that had been REGISTERED would be invoked here and
 	// recovered into a rejection, so LastErr is what makes "registers nothing"
 	// fail loudly instead of passing on the Set's own nil error.
-	status := g.Status()
+	status := awaitScopes(t, g, 1)
 	if len(status) != 1 {
 		t.Fatalf("Status after a nil OnApply = %#v, want the one observed scope", status)
 	}
@@ -1832,68 +1953,6 @@ func TestGroupOnApplyInMultiTenantReturnsErrNotSupported(t *testing.T) {
 
 	if !reflect.DeepEqual(snapshot.Value, rolled) {
 		t.Errorf("Snapshot = %#v, want %#v", snapshot.Value, rolled)
-	}
-}
-
-// TestGroupOnApplyWithABoundManagerRegistersWithoutASeed: a multi-tenant
-// Client with a bound Manager accepts the group's subscription, so OnApply
-// reaches the seed — and that mode has no single document in force to seed.
-// Every document belongs to a tenant and arrives as that tenant's own
-// publication, so the registration succeeds with no initial delivery, whether
-// a zero-scope read would have answered with a document (the fake store here)
-// or refused for want of a tenant database (every real store).
-func TestGroupOnApplyWithABoundManagerRegistersWithoutASeed(t *testing.T) {
-	t.Parallel()
-
-	cases := []struct {
-		name   string
-		getErr error
-	}{
-		{name: "the zero-scope read answers"},
-		{name: "the zero-scope read has no tenant database", getErr: systemplane.ErrTenantConnectionMissing},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			s := newGroupMemoryStore()
-
-			c, err := systemplane.NewForTesting(s, systemplane.WithMultiTenantEnabled())
-			if err != nil {
-				t.Fatalf("NewForTesting: %v", err)
-			}
-
-			t.Cleanup(func() { _ = c.Close() })
-
-			// Bound before Bind: the group takes its one subscription at Bind,
-			// and only a bound Manager makes that subscription succeed.
-			systemplane.NewManager(c, nil)
-
-			g := bindGroupOn(t, c)
-			startGroupClient(t, c)
-
-			if tc.getErr != nil {
-				s.failGets(tc.getErr)
-			}
-
-			rec := &applyRecorder{}
-
-			unsubscribe, err := g.OnApply(rec.apply)
-			if err != nil {
-				t.Fatalf("OnApply with a bound Manager = %v, want no error", err)
-			}
-
-			t.Cleanup(unsubscribe)
-
-			if got := rec.count(); got != 0 {
-				t.Errorf("deliveries at registration = %d, want 0: a multi-tenant group has no zero-scope document to seed", got)
-			}
-
-			if status := g.Status(); len(status) != 0 {
-				t.Errorf("Status at registration = %#v, want no observed scope", status)
-			}
-		})
 	}
 }
 
@@ -1950,20 +2009,30 @@ func groupBurstDocument(i int) groupConfig {
 	}
 }
 
-// TestGroupOnApplyBeforeStartIsDeliveredDuringStart pins FC-7's "Before Start,
-// OnApply registers and the initial delivery happens during Start": the store
-// announces its seeded row as Subscribe registers, which is the shape the
-// engine's first reconcile takes (FC-11), so the stored document is published
-// while Start is still running.
+// TestGroupOnApplyBeforeStartDeliversTheStartFeedAnnouncementOnce covers the
+// ingress its sibling below does not. This store announces an upsert for every
+// seeded row as the subscription registers — what a backend that was already
+// changing when the process came up looks like — so the stored document
+// reaches the applier through the FEED's re-read, inline on the Subscribe
+// goroutine, and the first reconcile then reaches the same row with the key
+// already marked as touched by that re-read and leaves its snapshot alone.
+// The sibling's store stays silent, so there the reconcile's snapshot is the
+// only thing that can publish.
 //
-// No delivery count is asserted, deliberately. On this base GetEntry reports
-// Stale false even before Start (FC-5's wave-1 shim), so OnApply's seed fires
-// at registration time with the registered DEFAULT and the stored document
-// arrives during Start — two deliveries where an engine-backed Client produces
-// one. D-G7 predicted exactly that ("the pre-Start gate cannot be exercised
-// through the facade on this lane's base"); the assertion that survives both
-// shapes is that the applier holds the current document when Start returns.
-func TestGroupOnApplyBeforeStartIsDeliveredDuringStart(t *testing.T) {
+// Two ingresses read one row here, and the applier must still see it exactly
+// once. That count is what the assertions below pin, and it is worth being
+// honest about its strength: TWO mechanisms uphold it — the touched-key skip
+// in the reconcile, and behind that the equal-revision publish fence, which
+// absorbs the reconcile's duplicate as a provenance refresh when the skip is
+// removed (D2, D3). Removing either one alone leaves this test green, so it
+// is an end-to-end guard on the guarantee rather than a detector for one
+// fence.
+//
+// The Set is a barrier, not a subject: deliveries of one key run in order on
+// one worker, so waiting for the second document proves everything Start put
+// in flight has already been delivered. A duplicate would surface as the
+// second delivery here instead of the document this test wrote.
+func TestGroupOnApplyBeforeStartDeliversTheStartFeedAnnouncementOnce(t *testing.T) {
 	t.Parallel()
 
 	s := newGroupMemoryStore()
@@ -1985,40 +2054,46 @@ func TestGroupOnApplyBeforeStartIsDeliveredDuringStart(t *testing.T) {
 
 	startGroupClient(t, c)
 
-	seen := rec.all()
-	if len(seen) == 0 {
-		t.Fatal("no delivery by the time Start returned; an OnApply registered before Start must be delivered during it")
+	rec.awaitLast(t, "the OnApply registered before Start never received the stored document",
+		func(a systemplane.Applied[groupConfig]) bool { return reflect.DeepEqual(a.Value, stored) })
+
+	barrier := groupConfig{Name: "after-start", Retries: 1, Hosts: []string{"b"}}
+	if err := g.Set(context.Background(), barrier, "operator"); err != nil {
+		t.Fatalf("Set: %v", err)
 	}
 
-	last := seen[len(seen)-1]
-	if !reflect.DeepEqual(last.Value, stored) {
-		t.Errorf("document in force when Start returned = %#v, want the stored document %#v", last.Value, stored)
+	seen := rec.await(t, 2)
+
+	if len(seen) != 2 {
+		t.Fatalf("deliveries = %d, want exactly 2: the announced document once, then the barrier write; %#v", len(seen), seen)
+	}
+
+	if !reflect.DeepEqual(seen[0].Value, stored) {
+		t.Errorf("first delivery = %#v, want the announced document %#v", seen[0].Value, stored)
+	}
+
+	if !reflect.DeepEqual(seen[1].Value, barrier) {
+		t.Errorf("second delivery = %#v, want the barrier write %#v: the feed announcement and the reconcile of the same row delivered twice", seen[1].Value, barrier)
 	}
 }
 
-// TestGroupOnApplyBeforeStartHoldsDefaultsUntilTheEnginePublishesAtStart pins
-// the limitation the sibling test above hides. That one enables the fake
-// store's announceOnSubscribe, a behaviour no real backend has: Postgres
-// NOTIFY and MongoDB change streams announce nothing as a subscription
-// registers, so a stored row reaches a pre-Start registration only if the
-// Client publishes it at Start. This Client does not: its hydrate writes the
-// cache without firing OnChange subscribers (PR #84 only graded the rows it
-// hydrates, it did not start announcing them).
+// TestGroupOnApplyBeforeStartReceivesTheStoredDocumentFromStart pins FC-11
+// through the group facade, on a store that announces NOTHING as a
+// subscription registers — which is every real backend: Postgres NOTIFY and
+// MongoDB change streams both stay silent until something changes.
 //
-// So on a real backend an OnApply registered before Start is handed the
-// REGISTERED DEFAULTS, as an observed and converged publication, and the
-// document sitting in the store never arrives until somebody writes the key
-// again. Status reports that as converged with no error, which is the sharp
-// edge: a consumer cannot tell "my document is in force" from "my document was
-// never read" by reading Status.
+// Until the Client was engine-backed, a pre-Start registration was handed the
+// REGISTERED DEFAULTS and the document sitting in the store never arrived
+// until somebody wrote the key again, while Status reported that as converged
+// with no error — so a consumer could not tell "my document is in force" from
+// "my document was never read". The first reconcile at Start now publishes
+// every stored row through the ingress and the dispatch, so the applier ends
+// up holding the stored document.
 //
-// The fix is not in this lane and not a stopgap in internal/client: it is
-// FC-11, the engine-backed Client whose first reconcile at Start publishes
-// every stored row through the ingress and the dispatch (engine-core Phase 2).
-// THIS TEST MUST GO RED WHEN THAT LANDS, and must then be inverted to assert
-// the stored document at its real revision — the red is the signal that the
-// limitation is gone, not a regression.
-func TestGroupOnApplyBeforeStartHoldsDefaultsUntilTheEnginePublishesAtStart(t *testing.T) {
+// The total delivery count is deliberately not pinned: the registration may
+// still be seeded with the registered defaults first, and the engine's
+// announcement then follows.
+func TestGroupOnApplyBeforeStartReceivesTheStoredDocumentFromStart(t *testing.T) {
 	t.Parallel()
 
 	s := newGroupMemoryStore()
@@ -2039,22 +2114,19 @@ func TestGroupOnApplyBeforeStartHoldsDefaultsUntilTheEnginePublishesAtStart(t *t
 
 	startGroupClient(t, c)
 
-	seen := rec.all()
-	if len(seen) != 1 {
-		t.Fatalf("deliveries by the time Start returned = %d, want exactly 1: the seed at registration, and nothing from Start", len(seen))
+	last := rec.awaitLast(t, "the applier never received the stored document the first reconcile published",
+		func(a systemplane.Applied[groupConfig]) bool { return reflect.DeepEqual(a.Value, stored) })
+
+	status := awaitStatus(t, g, func(st []systemplane.ApplyStatus) bool {
+		return len(st) == 1 && st[0].Applied == last.Revision
+	})
+
+	if status[0].Desired != last.Revision || status[0].Applied != last.Revision {
+		t.Errorf("Status entry = %#v, want the stored document's revision %d desired and applied", status[0], last.Revision)
 	}
 
-	if want := groupDefaults(); !reflect.DeepEqual(seen[0].Value, want) {
-		t.Errorf("delivered document = %#v, want the registered defaults %#v: without an announcing store the row %#v never reaches the applier", seen[0].Value, want, stored)
-	}
-
-	status := g.Status()
-	if len(status) != 1 {
-		t.Fatalf("Status() = %#v, want exactly one scope entry", status)
-	}
-
-	if status[0].Desired != 0 || status[0].Applied != 0 || status[0].LastErr != nil {
-		t.Errorf("Status entry = %#v, want Desired and Applied both 0 with no error: the group reports converged on a document it never read", status[0])
+	if status[0].LastErr != nil {
+		t.Errorf("LastErr = %v, want nil: the applier accepted the document", status[0].LastErr)
 	}
 }
 
@@ -2118,7 +2190,23 @@ func TestGroupOnApplyAfterStartSeedsUndeliveredPublication(t *testing.T) {
 func TestGroupOnApplyCoalescesABurst(t *testing.T) {
 	t.Parallel()
 
-	const burst = 50
+	const (
+		burst = 50
+
+		// The upper bound is DERIVED, not sampled, because a bound picked from
+		// what happened to run is a bound that also passes a facade which
+		// stopped coalescing. The registration's own delivery is the first and
+		// it blocks inside the applier for the whole burst; the coordinator
+		// refuses a second fan-out for a scope already delivering, and the
+		// debounce window is zero here so every write has reached the dispatch
+		// worker's mailbox by the time the applier unblocks. Only three
+		// publications can still be undelivered at that moment, because that is
+		// how many single slots the path holds: the newest the coordinator had
+		// already recorded, the one the worker was in the middle of handing
+		// over, and the one left in its mailbox. Newest wins in each, so the 47
+		// others are gone. One plus three.
+		maxBurstDeliveries = 4
+	)
 
 	c := newGroupHotClient(t, newGroupMemoryStore())
 	g := bindGroupOn(t, c)
@@ -2178,19 +2266,22 @@ func TestGroupOnApplyCoalescesABurst(t *testing.T) {
 	t.Cleanup(unsubscribe)
 	wg.Wait()
 
-	// Exactly two, not merely "fewer than 50". The first delivery is provably
-	// still inside the applier when every one of the writes lands, so all of
-	// them collapse into the single trailing delivery the fan-out makes once
-	// that applier unblocks. A loose bound would also pass on a facade that
-	// delivered once and then stopped hot reload altogether.
-	seen := rec.all()
-	if len(seen) != 2 {
-		t.Fatalf("deliveries for a burst of %d writes = %d, want exactly 2: the document in force at registration and the newest write", burst, len(seen))
-	}
-
+	// The newest document always arrives, and the intermediate revisions are
+	// collapsed: the first delivery is provably still inside the applier when
+	// every one of the writes lands, and both slots on the way to the applier
+	// keep only the newest (FC-4). The count is bounded on BOTH sides — at
+	// least two, so a facade that delivered once and then stopped hot reload
+	// fails, and at most the constant above, so one that queued the burst
+	// instead of coalescing it fails too. A loose upper bound (anything under
+	// 50) would pass on a facade that collapsed nothing but got lucky.
 	final := groupBurstDocument(burst - 1)
-	if last := seen[len(seen)-1]; !reflect.DeepEqual(last.Value, final) {
-		t.Errorf("last delivery = %#v, want the final document of the burst %#v", last.Value, final)
+
+	rec.awaitLast(t, "the final document of the burst never reached the applier",
+		func(a systemplane.Applied[groupConfig]) bool { return reflect.DeepEqual(a.Value, final) })
+
+	seen := rec.all()
+	if len(seen) < 2 || len(seen) > maxBurstDeliveries {
+		t.Fatalf("deliveries for a burst of %d writes = %d, want between 2 and %d", burst, len(seen), maxBurstDeliveries)
 	}
 }
 
@@ -2199,9 +2290,11 @@ func TestGroupOnApplyCoalescesABurst(t *testing.T) {
 // the applier is told — a consumer that only ever saw writes would otherwise
 // keep running a configuration nothing stores any more.
 //
-// The last delivery is asserted, never a count: a delete may legitimately
-// deliver twice under the engine-backed Client, both at Revision 0, which FC-4
-// never deduplicates.
+// The count is not asserted: a delete may legitimately deliver twice under the
+// engine-backed Client, both at Revision 0, which FC-4 never deduplicates. What
+// is asserted is both ends of the transition — the delivery in force when the
+// dust settles IS the registered default at Revision 0, and the delivery that
+// first carried it names the deleted document as its Previous.
 func TestGroupOnApplyReceivesTheDefaultAfterADelete(t *testing.T) {
 	t.Parallel()
 
@@ -2223,28 +2316,73 @@ func TestGroupOnApplyReceivesTheDefaultAfterADelete(t *testing.T) {
 		t.Fatalf("Set: %v", err)
 	}
 
+	// The write must reach the applier BEFORE the row is removed: a delete
+	// that lands while the write is still in the dispatch worker's mailbox
+	// legitimately replaces it (FC-4 coalescing), and the applier then never
+	// held the document this test is about to watch it lose.
+	rec.awaitLast(t, "the write never reached the applier",
+		func(a systemplane.Applied[groupConfig]) bool { return reflect.DeepEqual(a.Value, rolled) })
+
 	if err := c.Delete(context.Background(), "runtime", "ingest", "operator"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 
-	seen := rec.all()
-	if len(seen) == 0 {
-		t.Fatal("no delivery at all")
-	}
+	rec.awaitLast(t, "the delete never reached the applier",
+		func(a systemplane.Applied[groupConfig]) bool { return reflect.DeepEqual(a.Value, groupDefaults()) })
 
+	seen := rec.all()
+
+	// What is in force when the dust settles: the registered default, at the
+	// revision that means "no row". A facade that re-published the deleted
+	// document from an in-flight re-read would leave the written document here.
 	last := seen[len(seen)-1]
 	if !reflect.DeepEqual(last.Value, groupDefaults()) {
-		t.Errorf("delivery after the delete = %#v, want the registered defaults %#v", last.Value, groupDefaults())
+		t.Errorf("last delivery = %#v, want the registered defaults %#v", last.Value, groupDefaults())
 	}
 
-	if last.Previous == nil || !reflect.DeepEqual(last.Previous.Value, rolled) {
-		t.Errorf("Previous on the delete delivery = %#v, want the deleted document %#v", last.Previous, rolled)
+	if last.Revision != 0 {
+		t.Errorf("last delivery carried Revision %d, want 0: no row exists after the delete", last.Revision)
 	}
 
-	status := g.Status()
-	if len(status) != 1 {
-		t.Fatalf("Status entries = %d, want 1", len(status))
+	// Previous is asserted on the TRANSITION delivery — the first default after
+	// the last delivery of the written document — and not on the last one,
+	// because a delete may legitimately deliver twice (the Client's own
+	// publication and the changefeed echo, both at Revision 0, which FC-4 never
+	// deduplicates) and a second delete delivery carries the defaults as its
+	// Previous: that is what the applier accepted a moment earlier.
+	written := -1
+
+	for i, a := range seen {
+		if reflect.DeepEqual(a.Value, rolled) {
+			written = i
+		}
 	}
+
+	if written < 0 {
+		t.Fatalf("the written document never reached the applier: %#v", seen)
+	}
+
+	transition := -1
+
+	for i := written + 1; i < len(seen); i++ {
+		if reflect.DeepEqual(seen[i].Value, groupDefaults()) {
+			transition = i
+
+			break
+		}
+	}
+
+	if transition < 0 {
+		t.Fatalf("no delivery of the registered defaults after the write: %#v", seen)
+	}
+
+	if prev := seen[transition].Previous; prev == nil || !reflect.DeepEqual(prev.Value, rolled) {
+		t.Errorf("Previous on the delete delivery = %#v, want the deleted document %#v", prev, rolled)
+	}
+
+	status := awaitStatus(t, g, func(st []systemplane.ApplyStatus) bool {
+		return len(st) == 1 && st[0].Applied == 0
+	})
 
 	if status[0].Desired != 0 || status[0].Applied != 0 {
 		t.Errorf("Status after the delete = Desired %d, Applied %d, want 0 and 0: a delete publishes Revision 0 and that is convergence", status[0].Desired, status[0].Applied)
@@ -2255,17 +2393,17 @@ func TestGroupOnApplyReceivesTheDefaultAfterADelete(t *testing.T) {
 	}
 }
 
-// TestGroupOnApplyNeverSeesANullRowRefusedAtHydrate pins where a stored JSON
-// null dies: at the Client, not at the group. Since PR #84 the client grades
-// the stored row while hydrating at Start, so a null is refused there — one
-// WARN naming namespace, key and error, registered defaults left in force —
-// and the applier is handed those defaults instead of a wholly blank document
-// (empty name, zero retries, no hosts) applied as if an operator had written
-// it. The group's own null guard in decodePublished is now unreachable through
-// this facade and stays as a defensive check; the coordinator half of that
-// rule is pinned by
+// TestGroupOnApplyNeverSeesANullRowRefusedAtTheFirstReconcile pins where a
+// stored JSON null dies: at the Client, not at the group. The engine grades
+// every stored row it reads, so the first reconcile at Start refuses the null
+// there — one WARN naming namespace, key and error, registered defaults left
+// in force (FC-11) — and the applier is handed those defaults instead of a
+// wholly blank document (empty name, zero retries, no hosts) applied as if an
+// operator had written it. The group's own null guard in decodePublished is
+// now unreachable through this facade and stays as a defensive check; the
+// coordinator half of that rule is pinned by
 // TestCoordinatorNullValueIsRejectedByTheCodecAndNeverDelivered.
-func TestGroupOnApplyNeverSeesANullRowRefusedAtHydrate(t *testing.T) {
+func TestGroupOnApplyNeverSeesANullRowRefusedAtTheFirstReconcile(t *testing.T) {
 	t.Parallel()
 
 	s := newGroupMemoryStore()
@@ -2284,7 +2422,7 @@ func TestGroupOnApplyNeverSeesANullRowRefusedAtHydrate(t *testing.T) {
 
 	t.Cleanup(unsubscribe)
 
-	delivered := rec.all()
+	delivered := rec.await(t, 1)
 	if len(delivered) != 1 {
 		t.Fatalf("the applier ran %d times, want exactly 1: the seeded delivery of what is in force", len(delivered))
 	}
@@ -2331,9 +2469,22 @@ func TestGroupOnApplySetFromInsideAnApplierIsDeliveredAfterIt(t *testing.T) {
 
 	written := groupConfig{Name: "written-by-the-hook", Retries: 4, Hosts: []string{"inner"}}
 
-	// depth, nested, scopes and setErr are deliberately unguarded: every
-	// delivery here must run on this goroutine, so -race reports it if the echo
-	// of the re-entrant write arrives on another one.
+	// depth, nested, scopes and setErr are unguarded on purpose, and are safe
+	// for a reason that is ordering rather than affinity: the seeded delivery
+	// runs on the registering goroutine and the echo may run on that key's
+	// dispatch worker instead, and the coordinator takes its state mutex
+	// around the bookkeeping on either side of every invocation, so whatever
+	// one delivery writes here happens-before the next delivery reads it,
+	// whichever goroutine runs it.
+	//
+	// They are NOT a -race detector. This applier returns immediately, so two
+	// deliveries of this scope do not overlap in wall-clock time even when the
+	// ordering that would make an overlap legal is taken away, and -race stays
+	// quiet either way. What catches the defect is nested, plus the delivery
+	// sequence pinned at the bottom of this test: exactly two, the registered
+	// defaults and then the hook's own write carrying those defaults as
+	// Previous. Duplicating every delivery inside the coordinator makes those
+	// assertions fail.
 	var (
 		rec    applyRecorder
 		once   sync.Once
@@ -2345,6 +2496,7 @@ func TestGroupOnApplySetFromInsideAnApplierIsDeliveredAfterIt(t *testing.T) {
 
 	applier := func(ctx context.Context, a systemplane.Applied[groupConfig]) error {
 		depth++
+
 		if depth > 1 {
 			nested = true
 		}
@@ -2370,6 +2522,12 @@ func TestGroupOnApplySetFromInsideAnApplierIsDeliveredAfterIt(t *testing.T) {
 
 	t.Cleanup(unsubscribe)
 
+	// await is the happens-before edge for the reads below: it returns only
+	// after taking the recorder's mutex on a delivery the applier had already
+	// recorded, which orders whatever that delivery wrote ahead of this
+	// goroutine's reads however it was scheduled.
+	seen := rec.await(t, 2)
+
 	if setErr != nil {
 		t.Fatalf("Set from inside the apply hook: %v", setErr)
 	}
@@ -2382,7 +2540,6 @@ func TestGroupOnApplySetFromInsideAnApplierIsDeliveredAfterIt(t *testing.T) {
 		t.Errorf("Status from inside the apply hook reported %d scopes, want 1", scopes)
 	}
 
-	seen := rec.all()
 	if len(seen) != 2 {
 		t.Fatalf("deliveries = %d, want exactly 2: the document in force at registration and the hook's own write", len(seen))
 	}
@@ -2435,7 +2592,7 @@ func TestGroupOnApplyAfterCloseRegistersAndReplays(t *testing.T) {
 
 		t.Cleanup(unsubscribe)
 
-		if got := first.count(); got != 1 {
+		if got := len(first.await(t, 1)); got != 1 {
 			t.Fatalf("deliveries to the first hook = %d, want 1", got)
 		}
 
@@ -2452,7 +2609,7 @@ func TestGroupOnApplyAfterCloseRegistersAndReplays(t *testing.T) {
 
 		t.Cleanup(unsubscribeAfter)
 
-		seen := second.all()
+		seen := second.await(t, 1)
 		if len(seen) != 1 {
 			t.Fatalf("deliveries to a hook registered after Close = %d, want 1: the last observed document is replayed", len(seen))
 		}
@@ -2466,6 +2623,16 @@ func TestGroupOnApplyAfterCloseRegistersAndReplays(t *testing.T) {
 		}
 	})
 
+	// The Client is deliberately NEVER started, and the missing Start is the
+	// subject rather than an omission. FC-11 makes the first reconcile at Start
+	// announce every registered key, so a started Client has always observed a
+	// publication by the time it closes: verified by mutation — put the Start
+	// back and this subtest fails with OnApply returning nil, because the
+	// registration replays that announcement instead of reading. The sibling
+	// subtest above covers exactly that started path. A Client closed before
+	// Start is the one state where nothing was ever observed and the seed read
+	// is the only source left, which is what makes the READ's failure, and not
+	// the empty scope, the thing reaching the caller here.
 	t.Run("returns the error of a seed it cannot read", func(t *testing.T) {
 		t.Parallel()
 
@@ -2474,7 +2641,6 @@ func TestGroupOnApplyAfterCloseRegistersAndReplays(t *testing.T) {
 
 		c := newGroupHotClient(t, s)
 		g := bindGroupOn(t, c)
-		startGroupClient(t, c)
 
 		if err := c.Close(); err != nil {
 			t.Fatalf("Close: %v", err)
@@ -2504,11 +2670,11 @@ func TestGroupOnApplyAfterCloseRegistersAndReplays(t *testing.T) {
 }
 
 // TestGroupSnapshotOverAnUngradedTenantRow is the multi-tenant half of the two
-// tests above. Single-tenant hydration grades a stored row through the group's
-// own ingress, so an undecodable or null row never reaches a reader there.
-// Multi-tenant mode has no hydration: the tenant row is read through on every
-// Snapshot, ungraded, and the decode guard is what stands between it and a
-// half-filled or wholly blank document reported as the one in force.
+// tests above. In single-tenant mode the engine grades a stored row through the
+// group's own ingress, so an undecodable or null row never reaches a reader
+// there. Multi-tenant mode has no engine scope: the tenant row is read through
+// on every Snapshot, ungraded, and the decode guard is what stands between it
+// and a half-filled or wholly blank document reported as the one in force.
 func TestGroupSnapshotOverAnUngradedTenantRow(t *testing.T) {
 	t.Parallel()
 

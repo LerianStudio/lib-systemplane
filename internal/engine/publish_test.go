@@ -4,6 +4,7 @@ package engine
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"reflect"
 	"sync"
@@ -49,10 +50,16 @@ func emptyEngine() *Engine {
 // what every production caller of publish does: resolve the scope once, then
 // hand the state down. Tests address a publication by its scope alone, so the
 // resolve lives here rather than in every case.
-func (e *Engine) publishInto(pub publication) (notify bool) {
+//
+// It reports the refusal as well as the fence outcome, because notify alone
+// conflates two opposite facts: a publication the fence deduplicated, which is
+// the engine working, and one dropped because the engine tracks no such scope,
+// which in most of these tests would mean the fixture never came up. A caller
+// asserting on notify has to be able to tell them apart.
+func (e *Engine) publishInto(pub publication) (notify bool, err error) {
 	sc := e.trackedScope(pub.Scope)
 	if sc == nil {
-		return false
+		return false, fmt.Errorf("%w: %s", ErrScopeNotTracked, scopeLabel(pub.Scope))
 	}
 
 	return e.publish(sc, pub)
@@ -247,10 +254,17 @@ func TestPublishFence(t *testing.T) {
 			e := emptyEngine()
 
 			for _, seed := range tt.seed {
-				e.publishInto(seed)
+				if _, err := e.publishInto(seed); err != nil {
+					t.Fatalf("seeding %+v: %v", seed.NSKey, err)
+				}
 			}
 
-			if notify := e.publishInto(tt.candidate); notify != tt.wantNotify {
+			notify, err := e.publishInto(tt.candidate)
+			if err != nil {
+				t.Fatalf("publishInto: %v", err)
+			}
+
+			if notify != tt.wantNotify {
 				t.Errorf("notify: got %t, want %t", notify, tt.wantNotify)
 			}
 
@@ -303,8 +317,13 @@ func TestPublishRefusesAnUntrackedScope(t *testing.T) {
 	scope := store.Scope{Tenant: "t1"}
 
 	e := emptyEngine()
-	if notify := e.publishInto(publication{Scope: scope, NSKey: nk, Revision: 1, Value: "a"}); notify {
+	notify, err := e.publishInto(publication{Scope: scope, NSKey: nk, Revision: 1, Value: "a"})
+	if notify {
 		t.Error("publish into an untracked scope: notify is true, want false")
+	}
+
+	if !errors.Is(err, ErrScopeNotTracked) {
+		t.Errorf("publish into an untracked scope: got %v, want errors.Is ErrScopeNotTracked", err)
 	}
 
 	if _, ok := e.Lookup(scope, nk); ok {

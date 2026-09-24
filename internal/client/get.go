@@ -10,7 +10,7 @@ import (
 
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/engine"
-	"github.com/LerianStudio/lib-systemplane/v4/internal/manager"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/safelog"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -23,32 +23,69 @@ type ListEntry struct {
 
 // Get returns the current value for (namespace, key).
 //
-// In single-tenant mode it returns the cached value (or the registered
-// default when the cache is empty). In multi-tenant mode it resolves the
-// tenant database from ctx and reads through, returning the registered
-// default when the row is absent.
+// In single-tenant mode it returns the value the engine has published (or the
+// registered default when the engine has published nothing for the key yet).
+// In multi-tenant mode it resolves the tenant database from ctx and reads
+// through, returning the registered default when the row is absent.
 func (c *Client) Get(ctx context.Context, namespace, key string) (any, bool, error) {
-	e, ok, err := c.getEntry(ctx, namespace, key)
+	e, _, ok, err := c.getEntry(ctx, namespace, key)
 
 	return e.Value, ok, err
 }
 
 // GetEntry resolves the caller's scope like Get. ok is false for an
 // unregistered key. Revision, UpdatedAt and UpdatedBy describe the persisted
-// row backing the cached value; only the wave-1 shim may report zeros for a
-// cached row, and engine-core removes that limitation.
+// row backing the value in force, and Stale reports whether anything is
+// currently confirming THIS key: true while the changefeed is disconnected or
+// has not been reconciled since it connected, and true while this key could not
+// be re-read after its last change. A sibling key nobody could re-read leaves
+// this one confirmed (FC-5).
 func (c *Client) GetEntry(ctx context.Context, namespace, key string) (e Entry, ok bool, err error) {
-	return c.getEntry(ctx, namespace, key)
+	e, _, ok, err = c.getEntry(ctx, namespace, key)
+
+	return e, ok, err
+}
+
+// singleTenantEntry serves a registered key from the engine's published state.
+func (c *Client) singleTenantEntry(namespace, key string, def keyDef) Entry {
+	published, ok := c.engine.Lookup(store.Scope{}, engine.NSKey{Namespace: namespace, Key: key})
+	if ok {
+		// Returned verbatim: Entry is an alias of the engine's, the value is
+		// already a private clone, and the revision and provenance are the
+		// row's.
+		return published
+	}
+
+	// A miss means the engine has published nothing for this key: before
+	// Start, while Start is still bringing the scope up, or after a Start
+	// whose first reconcile confirmed nothing. The registered default is what
+	// reads serve, and it is Stale in every one of those cases — nobody has
+	// confirmed it (FC-5). A completed first reconcile publishes EVERY
+	// registered key (FC-11), so on a started, reconciled Client a registered
+	// key is never a miss and this branch is never the answer.
+	return Entry{
+		Value: engine.Clone(def.defaultValue),
+		Stale: true,
+	}
 }
 
 // getEntry is the single read path behind Get and GetEntry.
-func (c *Client) getEntry(ctx context.Context, namespace, key string) (Entry, bool, error) {
+//
+// The redaction policy is the key's registration speaking, read under the same
+// registryMu hold that produced the value. It travels with the value because a
+// caller that grades the value — the typed getters — must never look the fact
+// up a second time: [Client.KeyRedaction] answers from the registration alone,
+// and once the Client is closed it answers without reading it at all, so a
+// getter that looked the fact up after its read would be grading a value
+// against a policy the read never produced. It is RedactNone whenever ok is
+// false.
+func (c *Client) getEntry(ctx context.Context, namespace, key string) (Entry, RedactPolicy, bool, error) {
 	if c == nil || c.closed.Load() {
-		return Entry{}, false, ErrClosed
+		return Entry{}, RedactNone, false, ErrClosed
 	}
 
 	if ctx == nil {
-		return Entry{}, false, ErrNilContext
+		return Entry{}, RedactNone, false, ErrNilContext
 	}
 
 	nk := nskey{Namespace: namespace, Key: key}
@@ -58,40 +95,26 @@ func (c *Client) getEntry(ctx context.Context, namespace, key string) (Entry, bo
 	c.registryMu.RUnlock()
 
 	if !registered {
-		return Entry{}, false, nil
+		return Entry{}, RedactNone, false, nil
 	}
+
+	policy := def.redaction
+	redacted := policy != RedactNone
 
 	if !c.multiTenant {
-		c.cacheMu.RLock()
-		v, inCache := c.cache[nk]
-		c.cacheMu.RUnlock()
-
-		if inCache {
-			return Entry{Value: engine.Clone(v)}, true, nil
-		}
-
-		return Entry{Value: engine.Clone(def.defaultValue)}, true, nil
+		return c.singleTenantEntry(namespace, key, def), policy, true, nil
 	}
 
-	// Multi-tenant: try the bound Manager's per-tenant cache first; fall
-	// through to a tenant-DB read on miss. Without a bound Manager this
-	// preserves v1.4.0 behaviour (DB roundtrip on every Get).
-	tenantID := manager.TenantIDFromContext(ctx)
-
-	mgr := c.boundManager()
-	if mgr != nil && tenantID != "" {
-		if v, hit, lookupErr := mgr.Lookup(ctx, tenantID, namespace, key); lookupErr == nil && hit {
-			return Entry{Value: engine.Clone(v)}, true, nil
-		}
-	}
-
+	// Multi-tenant: resolve the tenant database from ctx and read through.
+	// There is no in-process cache on this path, so a read always reflects
+	// what the tenant row holds right now, including this caller's own write.
 	entry, found, err := c.store.Get(ctx, store.Scope{}, namespace, key)
 	if err != nil {
-		return Entry{}, false, fmt.Errorf("systemplane: Get: %w", err)
+		return Entry{}, RedactNone, false, fmt.Errorf("systemplane: Get: %w", err)
 	}
 
 	if !found {
-		return Entry{Value: engine.Clone(def.defaultValue)}, true, nil
+		return Entry{Value: engine.Clone(def.defaultValue)}, policy, true, nil
 	}
 
 	var decoded any
@@ -99,17 +122,10 @@ func (c *Client) getEntry(ctx context.Context, namespace, key string) (Entry, bo
 		c.logError(ctx, "failed to unmarshal stored value",
 			log.String("namespace", namespace),
 			log.String("keyname", key),
-			log.Err(err),
+			safelog.ErrorDetail(redacted, "decode failed", err),
 		)
 
-		return Entry{}, false, fmt.Errorf("systemplane: decode value for %s/%s: %w", namespace, key, err)
-	}
-
-	// Populate the per-tenant cache so subsequent reads bypass the DB.
-	// Populate is a no-op for tenants that have never been activated, so it
-	// will never seed state behind the lifecycle handlers' back.
-	if mgr != nil && tenantID != "" {
-		mgr.Populate(ctx, tenantID, namespace, key, decoded)
+		return Entry{}, RedactNone, false, decodeErr(ctx, namespace, key, redacted, err)
 	}
 
 	return Entry{
@@ -117,7 +133,23 @@ func (c *Client) getEntry(ctx context.Context, namespace, key string) (Entry, bo
 		Revision:  entry.Revision,
 		UpdatedAt: entry.UpdatedAt,
 		UpdatedBy: entry.UpdatedBy,
-	}, true, nil
+	}, policy, true, nil
+}
+
+// withheldValueErr is a typed getter's rejection for a key registered redacted:
+// what the value failed to be and its dynamic type, never the value itself.
+//
+// GetInt and GetDuration are the two getters whose message needs the value to
+// be useful — which number is not whole, which string is not a duration — and
+// they are the two that leaked it. An error travels further than a log line,
+// into response bodies, error trackers and retry logs, so the same policy that
+// keeps a value off a log line keeps it out of here, exactly as [decodeErr]
+// does for an undecodable row. time.ParseDuration's own error quotes its input,
+// so it is not wrapped either. The shape-mismatch branches never had the
+// problem: they print %T and stop.
+func withheldValueErr(namespace, key, want string, v any) error {
+	return fmt.Errorf("%w: %s/%s: stored value is not %s (%T, value withheld: key registered redacted)",
+		ErrValidation, namespace, key, want, v)
 }
 
 // GetString returns the value as a string.
@@ -142,25 +174,29 @@ func (c *Client) GetString(ctx context.Context, namespace, key string) (string, 
 
 // GetInt returns the value as an int64.
 //
-// Accepts int, int64, and integer-valued float64 (JSON-decoded numbers).
-// Fractional float64 values, strings, and other types fail conversion and
-// return (0, false, ErrValidation). This avoids silently truncating
-// fractional input or returning 0 for a malformed value.
+// Accepts integer-valued float64, the only shape a number ever reaches a
+// reader in: every value in force has been through JSON, whether it came from
+// a store row or from the registered default Register canonicalises.
+// Fractional float64 values, strings and other types return
+// (0, false, ErrValidation), so a malformed value neither truncates silently
+// nor reads as 0.
 func (c *Client) GetInt(ctx context.Context, namespace, key string) (int64, bool, error) {
-	v, ok, err := c.Get(ctx, namespace, key)
+	e, policy, ok, err := c.getEntry(ctx, namespace, key)
 	if err != nil || !ok {
 		return 0, ok, err
 	}
 
+	v := e.Value
+
 	switch n := v.(type) {
-	case int:
-		return int64(n), true, nil
-	case int64:
-		return n, true, nil
 	case float64:
 		// JSON decodes all numbers as float64. Reject any value that would
 		// lose precision when truncated to int64 (NaN, Inf, fractional).
 		if n != float64(int64(n)) {
+			if policy != RedactNone {
+				return 0, false, withheldValueErr(namespace, key, "an integer", v)
+			}
+
 			return 0, false, fmt.Errorf("%w: %s/%s: stored value %v is not an integer", ErrValidation, namespace, key, n)
 		}
 
@@ -199,10 +235,6 @@ func (c *Client) GetFloat64(ctx context.Context, namespace, key string) (float64
 	switch n := v.(type) {
 	case float64:
 		return n, true, nil
-	case int:
-		return float64(n), true, nil
-	case int64:
-		return float64(n), true, nil
 	default:
 		return 0, false, fmt.Errorf("%w: %s/%s: stored value is %T, want float64", ErrValidation, namespace, key, v)
 	}
@@ -210,21 +242,27 @@ func (c *Client) GetFloat64(ctx context.Context, namespace, key string) (float64
 
 // GetDuration returns the value as a time.Duration.
 //
-// Accepts time.Duration, parseable duration string (e.g. "30s"), and integer
-// float64 nanoseconds. All other shapes — including unparseable strings —
-// return (0, false, ErrValidation).
+// Accepts a parseable duration string (e.g. "30s") and float64 nanoseconds,
+// which are the only two shapes a value ever reaches a reader in: every value
+// in force has been through JSON, whether it came from a store row or from the
+// registered default Register canonicalises. All other shapes — including
+// unparseable strings — return (0, false, ErrValidation).
 func (c *Client) GetDuration(ctx context.Context, namespace, key string) (time.Duration, bool, error) {
-	v, ok, err := c.Get(ctx, namespace, key)
+	e, policy, ok, err := c.getEntry(ctx, namespace, key)
 	if err != nil || !ok {
 		return 0, ok, err
 	}
 
+	v := e.Value
+
 	switch d := v.(type) {
-	case time.Duration:
-		return d, true, nil
 	case string:
 		parsed, parseErr := time.ParseDuration(d)
 		if parseErr != nil {
+			if policy != RedactNone {
+				return 0, false, withheldValueErr(namespace, key, "a parseable duration", v)
+			}
+
 			return 0, false, fmt.Errorf("%w: %s/%s: cannot parse %q as duration: %w",
 				ErrValidation, namespace, key, d, parseErr)
 		}
@@ -240,8 +278,8 @@ func (c *Client) GetDuration(ctx context.Context, namespace, key string) (time.D
 // List returns all registered entries in namespace sorted by key.
 //
 // In multi-tenant mode List resolves the tenant database from ctx; in
-// single-tenant mode it serves from the in-process cache and registered
-// defaults.
+// single-tenant mode it serves what the engine has published, falling back to
+// the registered defaults.
 func (c *Client) List(ctx context.Context, namespace string) ([]ListEntry, error) {
 	if c == nil || c.closed.Load() {
 		return nil, ErrClosed
@@ -251,13 +289,16 @@ func (c *Client) List(ctx context.Context, namespace string) ([]ListEntry, error
 		return nil, ErrNilContext
 	}
 
+	// One hold of registryMu for the whole call: the definition travels with
+	// the key, so neither list path takes a Client lock per key, and the
+	// snapshot both paths work from is internally consistent.
 	c.registryMu.RLock()
 
-	keys := make([]nskey, 0)
+	keys := make([]registeredKey, 0, len(c.registry))
 
-	for nk := range c.registry {
+	for nk, def := range c.registry {
 		if nk.Namespace == namespace {
-			keys = append(keys, nk)
+			keys = append(keys, registeredKey{nskey: nk, def: def})
 		}
 	}
 
@@ -275,42 +316,47 @@ func (c *Client) List(ctx context.Context, namespace string) ([]ListEntry, error
 		return c.listFromStore(ctx, namespace, keys)
 	}
 
-	return c.listFromCache(keys), nil
+	return c.listFromEngine(keys), nil
 }
 
-func (c *Client) listFromCache(keys []nskey) []ListEntry {
+// registeredKey is a registered key travelling with its definition, captured
+// in List's single walk of the registry.
+type registeredKey struct {
+	nskey
+
+	def keyDef
+}
+
+// listFromEngine reads every key through the engine, falling back to the
+// registered default for one the engine has published nothing for. ListEntry
+// carries no revision (FC-10), so the provenance the engine holds is dropped
+// here on purpose.
+//
+// The engine is read outside registryMu — it takes locks of its own and must
+// never be called under the Client's — which List already guarantees by
+// releasing the lock before it calls here.
+func (c *Client) listFromEngine(keys []registeredKey) []ListEntry {
 	entries := make([]ListEntry, 0, len(keys))
 
-	c.registryMu.RLock()
-	c.cacheMu.RLock()
+	for _, rk := range keys {
+		published, ok := c.engine.Lookup(store.Scope{}, engine.NSKey{Namespace: rk.Namespace, Key: rk.Key})
 
-	for _, nk := range keys {
-		val, inCache := c.cache[nk]
-
-		def, registered := c.registry[nk]
-		if !inCache && registered {
-			val = def.defaultValue
-		}
-
-		var desc string
-		if registered {
-			desc = def.description
+		val := published.Value
+		if !ok {
+			val = engine.Clone(rk.def.defaultValue)
 		}
 
 		entries = append(entries, ListEntry{
-			Key:         nk.Key,
-			Value:       engine.Clone(val),
-			Description: desc,
+			Key:         rk.Key,
+			Value:       val,
+			Description: rk.def.description,
 		})
 	}
-
-	c.cacheMu.RUnlock()
-	c.registryMu.RUnlock()
 
 	return entries
 }
 
-func (c *Client) listFromStore(ctx context.Context, namespace string, keys []nskey) ([]ListEntry, error) {
+func (c *Client) listFromStore(ctx context.Context, namespace string, keys []registeredKey) ([]ListEntry, error) {
 	stored, err := c.store.List(ctx, store.Scope{})
 	if err != nil {
 		return nil, fmt.Errorf("systemplane: List: %w", err)
@@ -328,32 +374,28 @@ func (c *Client) listFromStore(ctx context.Context, namespace string, keys []nsk
 
 	entries := make([]ListEntry, 0, len(keys))
 
-	c.registryMu.RLock()
-	defer c.registryMu.RUnlock()
+	for _, rk := range keys {
+		val := engine.Clone(rk.def.defaultValue)
 
-	for _, nk := range keys {
-		def := c.registry[nk]
-		val := engine.Clone(def.defaultValue)
-
-		if raw, ok := storedByKey[nk.Key]; ok {
+		if raw, ok := storedByKey[rk.Key]; ok {
 			var decoded any
 			if err := json.Unmarshal(raw, &decoded); err != nil {
 				c.logError(ctx, "failed to unmarshal stored value",
 					log.String("namespace", namespace),
-					log.String("keyname", nk.Key),
-					log.Err(err),
+					log.String("keyname", rk.Key),
+					safelog.ErrorDetail(rk.def.redaction != RedactNone, "decode failed", err),
 				)
 
-				return nil, fmt.Errorf("systemplane: decode value for %s/%s: %w", namespace, nk.Key, err)
+				return nil, decodeErr(ctx, namespace, rk.Key, rk.def.redaction != RedactNone, err)
 			}
 
 			val = decoded
 		}
 
 		entries = append(entries, ListEntry{
-			Key:         nk.Key,
+			Key:         rk.Key,
 			Value:       val,
-			Description: def.description,
+			Description: rk.def.description,
 		})
 	}
 
@@ -380,9 +422,22 @@ func (c *Client) KeyDescription(namespace, key string) string {
 }
 
 // KeyRedaction returns the redaction policy for a registered key.
+//
+// A closed Client reports RedactFull, not RedactNone. The short-circuit stays
+// — a closed Client answers from nothing — but it answers the safe way round,
+// because every caller uses the policy to decide what a value may SHOW. The
+// admin GET and list handlers look it up after their read, so a Close landing
+// in that window would otherwise render a RedactFull key's value in clear into
+// an HTTP response body, and Bind reads it once to decide whether a group's
+// document may reach a log line. Widening disclosure is never the right answer
+// to "this Client is gone".
+//
+// On an open Client, an unregistered key still reports RedactNone: nothing
+// registered it, so nothing declared it sensitive, and there is no value of it
+// to disclose.
 func (c *Client) KeyRedaction(namespace, key string) RedactPolicy {
 	if c == nil || c.closed.Load() {
-		return RedactNone
+		return RedactFull
 	}
 
 	nk := nskey{Namespace: namespace, Key: key}
