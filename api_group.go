@@ -204,9 +204,8 @@ func (g *Group[T]) publish(ctx context.Context, ch Change) {
 }
 
 // decodePublished is the codec the coordinator decodes every publication with.
-// It is not bare group.Decode: it repeats Snapshot's null rule, so a published
-// null for a group whose zero T is not nil is recorded as a rejection instead
-// of blanking the whole document through an applier.
+// It is not bare group.Decode: a published null for a group whose zero T is not
+// nil is recorded as a rejection instead of blanking the whole document.
 func (g *Group[T]) decodePublished(value any) (T, error) {
 	if value == nil && !g.nullIsDocument {
 		var zero T
@@ -273,19 +272,14 @@ func (g *Group[T]) seedCurrentEntry() (group.Publication, bool, error) {
 // with the revision and freshness of the value in force. Before any write it
 // returns the registered defaults at Revision 0.
 //
-// Snapshot does NOT run the consumer's validate: whatever is in force already
-// passed it on ingress, so a second call would be a callback per read that can
-// never fail. A document that cannot decode into T returns an error wrapping
-// [ErrValidation] and a zero Value — never a half-filled T. In single-tenant
-// mode that path is unreachable: a document that fails to decode cannot pass
-// the group's ingress, which the engine runs over the stored row at every
-// reconcile. It is reachable in multi-tenant mode, where the read goes straight
-// through to the tenant store and returns that row ungraded.
+// Snapshot does NOT run the consumer's validate: every document it returns
+// already passed the group's ingress, in force or graded on a per-request read,
+// so a second call would be a callback per read that can never fail. A row the
+// ingress refuses, a stored null included, reads as the registered defaults.
 //
-// A row holding a JSON null is refused the same way, unless the zero T is
-// itself nil — in which case the null IS the document and Snapshot returns that
-// nil Value with no error, so a caller of a pointer-, map- or slice-shaped
-// group must guard Value rather than dereference it.
+// A JSON null is the document only when the zero T is itself nil. Snapshot then
+// returns that nil Value with no error, so a caller of a pointer-, map- or
+// slice-shaped group must guard Value rather than dereference it.
 //
 // Tenant is the tenant id carried by ctx, "" in single-tenant mode. Snapshot on
 // a nil *Group returns ErrClosed; errors from the Client ([ErrClosed],
@@ -304,19 +298,6 @@ func (g *Group[T]) Snapshot(ctx context.Context) (Snapshot[T], error) {
 	// group's own key is registered by construction, so this cannot fire.
 	if !ok {
 		return Snapshot[T]{}, fmt.Errorf("%w: %s/%s", ErrUnknownKey, g.namespace, g.key)
-	}
-
-	// Defence in depth behind the ingress guard: a row holding a null predates
-	// it (an older binary, another writer, a hand-edited row), and Decode turns
-	// a null into the zero T by design (D-G2). Returning that would report a
-	// wholly blank configuration as the one in force. The single-tenant ingress
-	// refuses such a row at the reconcile, before it reaches a reader; a
-	// multi-tenant read goes straight to the tenant store and delivers it here
-	// ungraded.
-	if entry.Value == nil && !g.nullIsDocument {
-		var zero T
-
-		return Snapshot[T]{}, fmt.Errorf("%w: %s/%s holds a null document, which is not a %T", ErrValidation, g.namespace, g.key, zero)
 	}
 
 	value, err := group.Decode[T](entry.Value)
@@ -465,21 +446,16 @@ type ApplyStatus struct {
 // unsubscribe is idempotent, is safe to call from inside fn itself, and
 // releases that function's hold on the scope's applied revision. Once it has
 // returned fn is not started again, including by a fan-out already under way
-// that had not reached it; an invocation already running completes. In
-// multi-tenant mode OnApply returns ErrNotSupportedInMultiTenant, while
-// [Group.Snapshot] and [Group.Set] keep working; the engine-tenants lane is the
-// one that restores per-tenant subscriptions and makes it register. Once it
-// does there is no initial delivery — every document belongs to a tenant, so
-// none is in force until that tenant publishes one — and each tenant's
-// publications reach fn with that tenant in Applied.Tenant, which is the ONLY
-// tenant identity fn receives: the delivered ctx is the one the Client
-// published with and is not tenant-scoped, so a re-read or a write-back must
-// run under a tenant-scoped context the consumer owns — the one tenant-manager
-// middleware builds — and never under the delivered one. And no multi-tenant
-// read path re-validates a tenant row, so a document delivered to fn may not
-// have passed validate; that closes once engine-tenants routes tenant
-// publications through the engine's ingress. On a nil *Group it returns
-// ErrClosed.
+// that had not reached it; an invocation already running completes. A
+// multi-tenant Client without a tenant manager returns
+// ErrNotSupportedInMultiTenant, while [Group.Snapshot] and [Group.Set] keep
+// working. On a tenant-managed Client nothing is seeded, because every
+// document belongs to a tenant: fn gets the replay of each tenant already
+// active, then every tenant's publications, with the tenant in
+// Applied.Tenant, the ONLY tenant identity fn receives. The delivered ctx
+// carries no tenant, so a re-read or a write-back runs under a tenant-scoped
+// context the consumer owns, the one tenant-manager middleware builds. On a nil
+// *Group it returns ErrClosed.
 // unsubscribe is never nil, so a caller may defer it before checking err.
 func (g *Group[T]) OnApply(fn func(ctx context.Context, a Applied[T]) error) (unsubscribe func(), err error) {
 	noop := func() {}

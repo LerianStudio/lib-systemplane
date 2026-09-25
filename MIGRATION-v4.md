@@ -53,7 +53,7 @@ has to be read even where your code compiles unchanged.
 |---|---|
 | `WithCloseTimeout`, `ErrCloseTimeout` | Bound the wait `Close` gives subscriber callbacks (default 30s) and name the (scope, key) still running when the bound elapses. |
 | `GetEntry`, `Entry` | Read the value together with its revision, `UpdatedAt`, `UpdatedBy` and a per-key `Stale` flag. |
-| `Bind`, `Group[T]`, `Snapshot[T]`, `Applied[T]`, `ApplyStatus`, `Group.Snapshot`, `Group.Set`, `Group.OnApply`, `Group.Status`, `ErrApplyPanicked` | Declare a whole typed configuration document as one key, read it as `T`, and apply it through a serialized hook that records what is desired, what is applied and what last failed. `Bind`, `Snapshot` and `Set` work in both modes; on a multi-tenant Client `OnApply` returns `ErrNotSupportedInMultiTenant` and `Snapshot` reads through ungraded. |
+| `Bind`, `Group[T]`, `Snapshot[T]`, `Applied[T]`, `ApplyStatus`, `Group.Snapshot`, `Group.Set`, `Group.OnApply`, `Group.Status`, `ErrApplyPanicked` | Declare a whole typed configuration document as one key, read it as `T`, and apply it through a serialized hook that records what is desired, what is applied and what last failed. `Bind`, `Snapshot` and `Set` work in both modes; on a multi-tenant Client without a tenant manager `OnApply` returns `ErrNotSupportedInMultiTenant`, and `Snapshot` reads through graded like `Get`. |
 | `MigrationV3ToV4SQL()` | The v3 → v4 Postgres delta as an importable artifact for your migration pipeline. See § The database and operator contract. |
 | `WithContextValidator` | Validate a value against the `Set` caller's context, so a validator can use the tenant that call carried. The registered default is still validated with `context.Background()`. |
 | `TestScope` | The scope every `TestStore` method now takes: `TestScope{Tenant}`, with `Tenant` `""` for the single-tenant scope. |
@@ -140,9 +140,8 @@ next time the process boots — with nothing failing at build time to say so.
 refuse. Those keys revert to their registered default on the next start, so fix
 the rows or widen the validator first.
 
-Multi-tenant per-request reads (`Get`, `List`) still read through ungraded.
-
-<!-- NOT-YET(engine-tenants): tenant scopes graded at ingress -->
+Multi-tenant per-request reads (`Get`, `List`, `Snapshot`) are graded too: a
+refused row reads as the registered default.
 
 ### Validators and defaults see the canonical JSON shape
 

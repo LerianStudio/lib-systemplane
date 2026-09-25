@@ -466,6 +466,47 @@ func TestMultiTenantPerRequestReadIsGraded(t *testing.T) {
 	}
 }
 
+// TestConnectorlessMultiTenantReadIsGraded pins that a read with no tenant
+// manager grades the row as Set would, on Get and on List alike.
+func TestConnectorlessMultiTenantReadIsGraded(t *testing.T) {
+	s := newTenantStore()
+	s.seed(t, "t1", "ns", "k", rejectedSecret, 7, "alice")
+
+	logger := &recordingLogger{}
+
+	c, err := NewForTesting(s, WithMultiTenantEnabled(), WithLogger(logger))
+	if err != nil {
+		t.Fatalf("NewForTesting: %v", err)
+	}
+
+	t.Cleanup(func() { _ = c.Close() })
+
+	refuse := func(v any) error {
+		if v == rejectedSecret {
+			return errors.New("value refused")
+		}
+
+		return nil
+	}
+
+	if err := c.Register("ns", "k", "safe", WithValidator(refuse)); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	if e := mustEntry(t, c, tenantCtx("t1"), "ns", "k"); !reflect.DeepEqual(e, Entry{Value: "safe"}) {
+		t.Fatalf("Get = %+v, want the registered default", e)
+	}
+
+	list, err := c.List(tenantCtx("t1"), "ns")
+	if err != nil || len(list) != 1 || list[0].Value != "safe" {
+		t.Fatalf("List = %+v, %v, want the registered default", list, err)
+	}
+
+	if strings.Contains(logger.rendered(), rejectedSecret) {
+		t.Error("a log line carries the refused value")
+	}
+}
+
 func TestTenantReadBackValidatorSeesTheTenant(t *testing.T) {
 	s := newTenantStore()
 	s.seed(t, "t1", "ns", "k", "stored", 5, "alice")

@@ -107,9 +107,9 @@ func WithCloseTimeout(d time.Duration) Option {
 //
 //   - The db / mongo client passed to NewPostgres / NewMongoDB MAY be nil.
 //   - Without WithPostgresTenantManager / WithMongoTenantManager there is no
-//     cache and no changefeed: Get hits the resolved tenant DB on every call,
-//     ungraded, and OnChange returns ErrNotSupportedInMultiTenant. With one, a
-//     tenant's first read activates its cached scope.
+//     cache and no changefeed: Get hits the resolved tenant DB on every call
+//     and OnChange returns ErrNotSupportedInMultiTenant. With one, a tenant's
+//     first read activates its cached scope.
 //   - Schema bootstrap runs lazily on first access per resolved tenant
 //     database.
 func WithMultiTenantEnabled() Option {
@@ -250,10 +250,8 @@ func WithValidator(fn func(any) error) KeyOption {
 // valid was ever accepted) or the value already in force, and logs a WARN
 // carrying the error and never the value.
 //
-// A per-request read grades with the reader's context and serves the
-// registered default for a refused row. Without a tenant manager multi-tenant
-// reads are ungraded, so a consumer that must not act on a value the write path
-// would refuse checks what it reads.
+// A multi-tenant per-request read grades with the reader's context and serves
+// the registered default for a refused row.
 //
 // Every reconcile and re-read gets a context derived from the client's own
 // lifecycle, never the one passed to [Client.Start] and never a caller's: it

@@ -68,10 +68,10 @@ func (c *Client) Close() error {
 // In single-tenant mode reads are served in process from the value last
 // reconciled or written, without touching the database. In multi-tenant mode
 // the call resolves the per-tenant database from ctx (set by tenant-manager
-// middleware) and reads through; with [WithPostgresTenantManager] or
-// [WithMongoTenantManager] that read activates the tenant's scope, later
-// reads are served in process like single-tenant ones, and the validator
-// grades the per-request read too.
+// middleware) and reads through, graded by the validator; with
+// [WithPostgresTenantManager] or [WithMongoTenantManager] that read activates
+// the tenant's scope and later reads are served in process like single-tenant
+// ones.
 func (c *Client) Get(ctx context.Context, namespace, key string) (any, bool, error) {
 	return asInternalClient(c).Get(ctx, namespace, key)
 }

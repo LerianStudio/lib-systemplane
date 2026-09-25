@@ -147,9 +147,9 @@ func (c *Client) tenantEntry(ctx context.Context, nk nskey, def keyDef) (Entry, 
 	}, true, nil
 }
 
-// readThrough decodes a row read per request and, on a tenant-managed Client,
-// grades it as the tenant's cache would, so a key never flips value as that
-// cache warms. A refusal serves the registered default with accepted false.
+// readThrough decodes a row read per request and grades it as every ingress
+// does, so a read never serves a value Set refuses and a key never flips value
+// as a tenant's cache warms. A refusal serves the registered default, accepted false.
 func (c *Client) readThrough(ctx context.Context, scope store.Scope, nk nskey, def keyDef, raw []byte) (value any, accepted bool, err error) {
 	var decoded any
 	if err := json.Unmarshal(raw, &decoded); err != nil {
@@ -160,10 +160,6 @@ func (c *Client) readThrough(ctx context.Context, scope store.Scope, nk nskey, d
 		)
 
 		return nil, false, decodeErr(ctx, nk.Namespace, nk.Key, err)
-	}
-
-	if !c.tenantManaged {
-		return decoded, true, nil
 	}
 
 	if err := c.engine.RunValidator(ctx, scope, engine.NSKey(nk), def.validator, decoded); err != nil {
