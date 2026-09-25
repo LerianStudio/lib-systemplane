@@ -5,7 +5,7 @@ Parts of this README, its code samples included, still describe the v3 line; the
 schema section is already v4. Until it is rewritten, take
 [MIGRATION-v4.md](MIGRATION-v4.md) as the source of truth for anything that differs.
 
-Dual-backend (PostgreSQL / MongoDB) hot-reload runtime configuration for Lerian services. Register operational knobs (log levels, feature flags, rate limits, circuit-breaker thresholds, worker intervals) at startup, mutate them at runtime without a pod restart, and — in single-tenant mode — subscribe to change events through a LISTEN/NOTIFY (Postgres) or change-stream (MongoDB) backed subscription. First-class support for the Lerian database-per-tenant model via the `lib-commons/v7` tenant-manager dispatch layer.
+Dual-backend (PostgreSQL / MongoDB) hot-reload runtime configuration for Lerian services. Register operational knobs (log levels, feature flags, rate limits, circuit-breaker thresholds, worker intervals) at startup, mutate them at runtime without a pod restart, and — in single-tenant mode — subscribe to change events through subscriptions backed by Postgres LISTEN/NOTIFY or MongoDB change streams. First-class support for the Lerian database-per-tenant model via the `lib-commons/v7` tenant-manager dispatch layer.
 
 This library was extracted from `lib-commons/v5/commons/systemplane`. The v4 line targets the Fiber v3 stack (`lib-commons/v7`) and uses `lib-observability/v4` internally for logging, tracing, telemetry, redaction, and panic recovery.
 

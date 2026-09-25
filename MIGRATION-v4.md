@@ -213,9 +213,13 @@ narrow case worth knowing: a `Set` racing `Start` can persist its row and still
 report `ErrNotStarted`, because the Client counts as started from the moment
 its first reconcile begins.
 
-**Do:** read a non-nil error from `Set` or `Delete` as "persisted, but this
-process does not serve it yet", never as "not persisted". What it asks for is
-that you stop reporting the write as lost, not that you retry it.
+**Do:** classify the error by cause.
+`ErrValidation`, `ErrUnknownKey`, `ErrNilContext` and `ErrTenantConnectionMissing`
+are returned before the store is touched: nothing was persisted. `ErrClosed` and
+`ErrNotStarted` come from either side of the write, so they do not say whether it
+landed. Any other error is a store failure (outcome unknown) or a publication
+failure (persisted); no sentinel tells the two apart. Where it matters, re-read
+with `Get` or retry: `Set` is last-write-wins and `Delete` is idempotent.
 
 ### A write's own changefeed echo no longer fires a callback
 
@@ -673,8 +677,7 @@ Same as br-consignado-gw.
 
 1. Mount `admin.MountCatalog` before the tenant-manager middleware, `admin.Mount` after it, so value reads and writes receive the resolved tenant database and catalog metadata does not need one.
 2. Render `revision`, `updatedAt` (JSON null when no row backs the value) and `updatedBy` from every admin GET and list response as the Console's provenance fields. `stale` is always false on this shape.
-3. Run MongoDB as a replica set, or pass `WithPollInterval` to fall back to a timer. Change streams need the replica set; the fallback costs latency, not correctness.
-4. Filter `deleted: {$ne: true}` in **every** direct read of `systemplane_entries`. A delete writes a tombstone rather than removing the document; see [§ MongoDB](#mongodb).
+3. Filter `deleted: {$ne: true}` in **every** direct read of `systemplane_entries`. A delete writes a tombstone rather than removing the document; see [§ MongoDB](#mongodb).
 
 <!-- NOT-YET(engine-tenants): WithMongoTenantManager wiring, connector-resolved createCollection, shared-collection refusal -->
 
