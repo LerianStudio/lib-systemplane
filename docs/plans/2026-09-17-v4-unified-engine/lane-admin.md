@@ -29,7 +29,7 @@ Create the worktree with `agent new lib-systemplane v4-admin`, then `git checkou
 
 | Phase | Milestone | Epics | Status |
 |-------|-----------|-------|--------|
-| 1 | Both read routes return `{value, revision, updatedAt, updatedBy, stale}`, redaction unchanged, writes unchanged, PR merged | 1.1, 1.2 | Detailed |
+| 1 | Both read routes return `{value, revision, updatedAt, updatedBy, stale}`, values in clear, writes unchanged, PR merged | 1.1, 1.2 | Detailed |
 
 ---
 
@@ -92,6 +92,7 @@ Tests, written RED first, in `admin/admin_test.go`. All three fail before the ch
    `GET /system/runtime/name` → 200, decode into `map[string]any`, assert `value == "stored"`, `revision == float64(11)`, `updatedAt == "2026-09-17T12:00:00Z"`, `updatedBy == "operator"`, and `stale == false` **with the key present in the map** (a plain struct decode cannot tell an absent `stale` from a false one, which is exactly the regression this test must catch).
 2. `TestAdmin_GetOneDefaultInForceRendersZeroRevision` — the existing single-tenant `setupClient` helper, key registered, no row anywhere. `GET /system/ns/k` → 200 with `revision == float64(0)`, `updatedAt` present and JSON `null`, `updatedBy == ""`, `stale == false`. This pins the "no row" rendering that FC-5 reserves Revision 0 for, and it stays true after engine-core lands.
 3. `TestAdmin_GetOneRedactsValueWithProvenance` — same multi-tenant seeding as (1) but the key registered with `systemplane.WithRedaction(systemplane.RedactFull)`. Assert the raw body string never contains the seeded secret, that `value` equals `obsconstants.ObfuscatedValue` (already imported by this test file), and that `revision` still renders `11`: revision and provenance are metadata about the row, never redacted, while the value still is.
+   Retired by D12: the admin serves values in clear.
 
 Seeding needs a helper the file does not have yet: add `setupSeededMultiTenantClient(t *testing.T, seed []systemplane.TestEntry, register func(*systemplane.Client) error) (*systemplane.Client, *fakeStore)` that builds `newFakeStore()`, writes the seed entries straight into its `entries` map through `fakeKey`, calls `systemplane.NewForTesting(store, systemplane.WithMultiTenantEnabled())`, runs `register`, `Start`s and registers the `Close` cleanup. Do NOT change the signatures of `setupClient` (`admin/admin_test.go:136`) or `setupClientWithOptions` (`admin/admin_test.go:142`) — churn on their existing callers buys nothing.
 
