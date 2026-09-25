@@ -244,13 +244,13 @@ func WithValidator(fn func(any) error) KeyOption {
 // The same function also grades every value read back from the store: in
 // single-tenant mode the first reconcile at [Client.Start], and every later
 // reconcile and changefeed re-read; on a tenant-managed Client each tenant's
-// reconcile and re-read too, and every per-request read. A row can predate
-// the key's validator, or be written by an older binary, or written straight
-// into the table, so a value never graded there would be one the write path
-// refuses while it is already in force. A refusal — a returned error or a panic, which is treated
-// as a refusal rather than propagated — keeps the registered default (nothing
-// valid was ever accepted) or the value already in force, and logs a WARN
-// carrying the error and never the value.
+// reconcile and re-read too; and every multi-tenant per-request read. A row can
+// predate the key's validator, or be written by an older binary, or written
+// straight into the table, so a value never graded there would be one the write
+// path refuses while it is already in force. A refusal — a returned error or a
+// panic, which is treated as a refusal rather than propagated — keeps the
+// registered default (nothing valid was ever accepted) or the value already in
+// force, and logs a WARN carrying the error and never the value.
 //
 // A multi-tenant per-request read grades with the reader's context and serves
 // the registered default for a refused row.
@@ -264,8 +264,9 @@ func WithValidator(fn func(any) error) KeyOption {
 // [Client.Close]. The no-I/O restriction stated above for the registered
 // default binds on the first reconcile too: [Client.Start] waits for it while
 // holding the start lock, so a validator that blocks there blocks
-// [Client.Close] with it. A re-read is the one read-back call site where a
-// validator may do I/O.
+// [Client.Close] with it. A re-read and a multi-tenant per-request read are
+// the read-back call sites where a validator may do I/O; the per-request one
+// pays it, and logs any refusal, on every read it serves.
 //
 // A read-back is graded on every ingress, so the function must be
 // deterministic on the same value: one that answers differently across calls

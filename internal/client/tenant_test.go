@@ -502,6 +502,10 @@ func TestConnectorlessMultiTenantReadIsGraded(t *testing.T) {
 		t.Fatalf("List = %+v, %v, want the registered default", list, err)
 	}
 
+	if n := len(logger.warns("stored value rejected by validator, serving the registered default")); n != 2 {
+		t.Errorf("%d rejection WARNs, want one per read", n)
+	}
+
 	if strings.Contains(logger.rendered(), rejectedSecret) {
 		t.Error("a log line carries the refused value")
 	}

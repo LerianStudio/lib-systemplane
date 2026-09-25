@@ -295,12 +295,12 @@ func (e *Engine) ingestDefault(ctx context.Context, sc *scopeState, nk NSKey, de
 }
 
 // RunValidator runs a consumer's registered validator under exactly the
-// recovery every engine ingress uses. It exists for the Client's own two
-// direct call sites — grading a registered default, and grading a local write
-// — which are the only places in the library that hand a validator a value
-// without going through an ingress, and which therefore used to let a
-// validator's panic take the consumer's process down instead of coming back as
-// a validation error. Nil-receiver safe, so a Client whose engine was never
+// recovery every engine ingress uses. It exists for the Client's own direct
+// call sites — grading a registered default, a local write, and a multi-tenant
+// per-request read — which are the only places in the library that hand a
+// validator a value without going through an ingress, and which therefore used
+// to let a validator's panic take the consumer's process down instead of coming
+// back as a validation error. Nil-receiver safe, so a Client whose engine was never
 // built still grades rather than crashes.
 //
 // scope and nk are that key's identity, carried so a panic here reports the

@@ -2393,10 +2393,7 @@ func TestGroupOnApplyReceivesTheDefaultAfterADelete(t *testing.T) {
 // there — one WARN naming namespace, key and error, registered defaults left
 // in force (FC-11) — and the applier is handed those defaults instead of a
 // wholly blank document (empty name, zero retries, no hosts) applied as if an
-// operator had written it. The group's own null guard in decodePublished is
-// now unreachable through this facade and stays as a defensive check; the
-// coordinator half of that rule is pinned by
-// TestCoordinatorNullValueIsRejectedByTheCodecAndNeverDelivered.
+// operator had written it.
 func TestGroupOnApplyNeverSeesANullRowRefusedAtTheFirstReconcile(t *testing.T) {
 	t.Parallel()
 

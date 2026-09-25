@@ -23,22 +23,15 @@ type Group[T any] struct {
 	namespace string
 	key       string
 
-	// nullIsDocument records whether a JSON null is a legitimate document for
-	// T, which is true exactly when the zero T is itself nil. Ingress refuses a
-	// null for every other T; Snapshot refuses to decode one, so a row that
-	// predates the guard cannot be read back as a wholly blank configuration.
-	nullIsDocument bool
-
 	// coordinator holds the per-scope publication cache and the registered
 	// apply functions. It is built at Bind, so it is never nil on a group the
 	// caller holds.
 	coordinator *group.Coordinator[T]
 
 	// subscribeErr is the refusal OnChange returned at Bind, reported by
-	// OnApply. A multi-tenant Client refuses the subscription until the
-	// engine-tenants lane restores per-tenant subscriptions, and it must still
-	// get a working Snapshot and Set, so Bind records the error instead of
-	// failing.
+	// OnApply. A multi-tenant Client without a tenant manager refuses the
+	// subscription and must still get a working Snapshot and Set, so Bind
+	// records the error instead of failing.
 	subscribeErr error
 }
 
@@ -58,10 +51,9 @@ type Snapshot[T any] struct {
 // every changefeed (re)connect, the first of which runs at Start, so a row that
 // entered the store without passing the registered validator never becomes the
 // group's document — the registered defaults stay in force and
-// [Group.Snapshot] returns them with no error. In multi-tenant mode no read
-// path re-validates a tenant row — the read goes straight through to the tenant
-// store — so a row that entered the store without passing the registered
-// validator surfaces as a decode error at worst, not as a validated document.
+// [Group.Snapshot] returns them with no error. A multi-tenant per-request read
+// grades the tenant row the same way and serves the registered defaults for a
+// refused one.
 // Must be called before c.Start.
 //
 // The value registered is not defaults itself but its canonical JSON document:
@@ -94,8 +86,7 @@ type Snapshot[T any] struct {
 // here, before c.Start and therefore before any publication can exist, which is
 // what lets [Group.OnApply] promise that no revision falls between its initial
 // delivery and its subscription. A Client that refuses the subscription — a
-// multi-tenant one, until the engine-tenants lane restores per-tenant
-// subscriptions — still yields a working handle: the refusal is recorded and
+// multi-tenant one without a tenant manager — still yields a working handle: the refusal is recorded and
 // returned by OnApply, while [Group.Snapshot] and [Group.Set] keep working.
 //
 // That subscription is never released. FC-7 gives a group no Close, so nothing
@@ -170,7 +161,7 @@ func Bind[T any](c *Client, namespace, key string, defaults T, validate func(T) 
 		return nil, err
 	}
 
-	g := &Group[T]{client: c, namespace: namespace, key: key, nullIsDocument: nullIsDocument}
+	g := &Group[T]{client: c, namespace: namespace, key: key}
 
 	// The Client's mode decides the tenant stamp on the coordinator's reports.
 	// Register above succeeded, so CatalogKey knows the key and TenantScoped
@@ -178,7 +169,7 @@ func Bind[T any](c *Client, namespace, key string, defaults T, validate func(T) 
 	detail, _ := c.CatalogKey(namespace, key)
 
 	g.coordinator = group.NewCoordinator[T](c.Logger(), g.namespace, g.key, detail.TenantScoped,
-		g.decodePublished, g.seedCurrentEntry)
+		group.Decode[T], g.seedCurrentEntry)
 
 	// The group's one subscription, taken here — before Start, and therefore
 	// before any publication can exist. That is the structural half of FC-7's
@@ -201,19 +192,6 @@ func Bind[T any](c *Client, namespace, key string, defaults T, validate func(T) 
 // testable in-package without a live multi-tenant feed.
 func (g *Group[T]) publish(ctx context.Context, ch Change) {
 	g.coordinator.Publish(ctx, group.Publication{Tenant: ch.Tenant, Revision: ch.Revision, Value: ch.Value})
-}
-
-// decodePublished is the codec the coordinator decodes every publication with.
-// It is not bare group.Decode: a published null for a group whose zero T is not
-// nil is recorded as a rejection instead of blanking the whole document.
-func (g *Group[T]) decodePublished(value any) (T, error) {
-	if value == nil && !g.nullIsDocument {
-		var zero T
-
-		return zero, fmt.Errorf("%w: %s/%s published a null document, which is not a %T", ErrValidation, g.namespace, g.key, zero)
-	}
-
-	return group.Decode[T](value)
 }
 
 // seedCurrentEntry reads the scope's current entry for a registration that
@@ -275,7 +253,9 @@ func (g *Group[T]) seedCurrentEntry() (group.Publication, bool, error) {
 // Snapshot does NOT run the consumer's validate: every document it returns
 // already passed the group's ingress, in force or graded on a per-request read,
 // so a second call would be a callback per read that can never fail. A row the
-// ingress refuses, a stored null included, reads as the registered defaults.
+// ingress refuses, a stored null included, leaves the last valid document in
+// force, or the registered defaults when there is none; a per-request read
+// serves the defaults.
 //
 // A JSON null is the document only when the zero T is itself nil. Snapshot then
 // returns that nil Value with no error, so a caller of a pointer-, map- or
@@ -450,8 +430,9 @@ type ApplyStatus struct {
 // multi-tenant Client without a tenant manager returns
 // ErrNotSupportedInMultiTenant, while [Group.Snapshot] and [Group.Set] keep
 // working. On a tenant-managed Client nothing is seeded, because every
-// document belongs to a tenant: fn gets the replay of each tenant already
-// active, then every tenant's publications, with the tenant in
+// document belongs to a tenant: fn gets the replay of every tenant this group
+// has observed, one the Client has since dropped included, then every
+// tenant's publications, with the tenant in
 // Applied.Tenant, the ONLY tenant identity fn receives. The delivered ctx
 // carries no tenant, so a re-read or a write-back runs under a tenant-scoped
 // context the consumer owns, the one tenant-manager middleware builds. On a nil
