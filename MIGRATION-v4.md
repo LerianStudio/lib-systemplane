@@ -451,7 +451,11 @@ took a `Get` or a `List` with it. `Logger()` still hands back the logger you
 passed, unwrapped. Multi-tenant error lines stamp `tenant.id` from the context,
 or `unresolved` when the context carries none.
 
-<!-- NOT-YET(panic-posture): every recovered panic reported with a log line, panic_recovered_total and a span event; the counter needs runtime.InitPanicMetrics in the host -->
+Every panic the library recovers is reported the same way: a `panic recovered`
+line at ERROR, a span event when the context carries a recording span, and an
+increment of `panic_recovered_total`. The counter exists only after your host
+calls `runtime.InitPanicMetrics(factory)` once at startup; the library never
+calls it. Components and names: [README § Panic recovery](README.md#panic-recovery).
 
 **Do:** nothing, unless a panicking callback was what failed your boot. It no
 longer does.
