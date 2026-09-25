@@ -1009,7 +1009,7 @@ The decision, verbatim: "devemos retirar 100% o tema de segredos mascarados. nao
 **Goal:** No key carries a redaction policy, and no code path renders, masks or withholds a value because of one. The admin surface returns every value in clear, and the catalog stops reporting a `redaction` field.
 **Scope:** `admin/`; root `api_group.go`, `api_client.go`, `api_constants.go`, `api_constructors.go`, `api_types.go` and their tests; `internal/group/`; `internal/engine/`; `internal/safelog/`; `internal/client/`; README.md, CLAUDE.md, MIGRATION-v4.md, `docs/PROJECT_RULES.md`, `.env.reference`.
 **Dependencies:** after PR #96, #97, #95 and the docs Phase 1 PR merge; branch `refactor/v4-drop-redaction`. Engine-tenants Task 1.2.2 rebases onto this epic, never the reverse (see its merge note).
-**Status:** Pending
+**Status:** Doing
 
 **Order.** Leaves first, so the repo builds and `make test-unit` is green at every task: 3.1.1 (admin) and 3.1.2 (groups) touch disjoint files and may run in parallel; 3.1.3 (engine and safelog) needs 3.1.2, because it deletes the two `safelog` helpers the group coordinator calls; 3.1.4 (core and root) needs 3.1.1, 3.1.2 and 3.1.3, because it deletes the symbols all three stop calling; 3.1.5 (docs) needs 3.1.4.
 
@@ -1022,7 +1022,7 @@ The decision, verbatim: "devemos retirar 100% o tema de segredos mascarados. nao
 
 #### Task 3.1.1: Admin serves values in clear
 
-- [ ] Done
+- [x] Done
 
 **Context:** Three handlers mask on the key's policy. `handleList` looks the policy up per entry (`admin/admin.go:295-300`); `handleCatalogDetail` rebuilds a policy from the catalog's string field and masks the registered default (`admin/admin.go:331-332`) through `catalogRedactionPolicy` (`admin/admin.go:409-418`); `handleGetOne` does the same as the list (`admin/admin.go:433-439`). `admin/admin_responses.go` has no redaction field of its own: the catalog detail response embeds `CatalogKeyDetail`, whose `Redaction` field is deleted by Task 3.1.4.
 
@@ -1040,7 +1040,7 @@ The decision, verbatim: "devemos retirar 100% o tema de segredos mascarados. nao
 
 #### Task 3.1.2: Groups stop gating on redaction
 
-- [ ] Done
+- [x] Done
 
 **Context:** `Bind` reads the key's policy once and hands the coordinator a bool (`api_group.go:174-182`, passed at `:189`), with a comment promising FC-13 would widen the gate. `seedCurrentEntry`'s doc comment (`api_group.go:262-265`) promises that the groups-redaction lane replaces its `CatalogKey` mode probe with a direct one; that lane no longer exists. In `internal/group/coordinator.go` the `redacted` field (`:183-191`, doc at `:176-182`) gates the two decode lines (`:279`, `:433`), the apply-rejection line (`:846`) and the panic report (`reportPanic`, `:880-882`, doc `:864-874`); `NewCoordinator` takes it as a parameter (`:225`, doc `:213-215`, assigned `:238`). `ErrApplyPanicked`'s and `invoke`'s doc comments (`:794`, `:814-818`, `:831-833`) describe the redaction policy.
 
@@ -1059,7 +1059,7 @@ The decision, verbatim: "devemos retirar 100% o tema de segredos mascarados. nao
 
 #### Task 3.1.3: Engine and safelog report without a redaction gate
 
-- [ ] Done
+- [x] Done
 
 **Context:** The engine's registry port carries the fact twice: `Registry.AnyRedacted` (`internal/engine/registry.go:14-23`) and `KeyDef.Redacted` (`:53-58`), read through `anyRedacted` (`:93-102`). It gates: the decode and validator-rejection lines (`internal/engine/ingest.go:187`, `:196-197`, `logValidatorRejection` `:215-235`); `RunValidator` / `runValidator` (`:306-324`, `:361-385`), whose `redacted` parameter reaches `reportConsumerPanic` (`:395-443`), which swaps the panic value for `safelog.WithheldPanic` (`:438-440`); the OnChange recovery, which looks the key up only to read the bit (`internal/engine/dispatch.go:365-375`, `:390-392`); the changefeed re-read recovery (`internal/engine/feed.go:421-425`, `:470-472`); the reconcile recovery, whose inner `defer safelog.Swallow()` exists only because `AnyRedacted` could panic (`internal/engine/reconcile.go:180-190`). `internal/engine/doc.go:19` lists redaction among the Client's concerns. `internal/safelog/safelog.go` holds `WithheldPanic` (`:26-45`) and `ErrorDetail` (`:58-83`); after Task 3.1.2 their only callers are the engine and `internal/client`. The Client side of the port: `Lookup` fills `Redacted` (`internal/client/registry.go:17-20`, `:37`), `AnyRedacted` (`:41-62`), `RunValidator`'s last argument at `internal/client/register.go:109-111` and `internal/client/set.go:85-86`, and `ErrorDetail` at `internal/client/get.go:125` and `:386`.
 
@@ -1078,7 +1078,7 @@ The decision, verbatim: "devemos retirar 100% o tema de segredos mascarados. nao
 
 #### Task 3.1.4: Core and root drop the redaction policy
 
-- [ ] Done
+- [x] Done
 
 **Context:** The policy type and its renderer are `internal/client/redact.go` (`RedactPolicy`, `RedactNone|RedactMask|RedactFull`, `ApplyRedaction`, `(RedactPolicy).String`). The registry stores it (`internal/client/register.go:36` field `redaction`, default at `:75`); `WithRedaction` sets it (`internal/client/options.go:296-302`). Reads: `getEntry` returns it as a second value (`internal/client/get.go:74-82` doc and signature, `:84-131` returns, `:101-102` locals), consumed by `GetInt` (`:184`, `:196-198`) and `GetDuration` (`:251`, `:262-264`) through `withheldValueErr` (`:139-153`); `List` passes it to `decodeErr` (`:389`); `KeyRedaction` (`:424-454`) fails closed on a closed Client. `decodeErr` takes a `redacted` parameter (`internal/client/client_telemetry.go:77-96`). The catalog reports it (`internal/client/catalog.go:32` field `Redaction` with JSON `redaction`, filled at `:169`; comment at `:57`). `internal/client/doc.go:4` lists redaction among the package's concerns. Root: type `RedactPolicy` (`api_types.go:42-43`, and the "not redacted" sentence at `:38`), the three constants and `String` (`api_constants.go:8-20`), `WithRedaction` and `ApplyRedaction` (`api_constructors.go:140-143`, `:151-154`), `(*Client).KeyRedaction` (`api_client.go:193-201`).
 
