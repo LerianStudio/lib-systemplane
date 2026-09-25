@@ -29,7 +29,6 @@ type CatalogKeySummary struct {
 	Kind         string `json:"kind,omitempty"`
 	TenantScoped bool   `json:"tenantScoped"`
 	RuntimeClass string `json:"runtimeClass,omitempty"`
-	Redaction    string `json:"redaction"`
 	HasValidator bool   `json:"hasValidator"`
 	Description  string `json:"description,omitempty"`
 	DetailURL    string `json:"detailUrl,omitempty"`
@@ -54,8 +53,7 @@ type CatalogKeyMetadata struct {
 }
 
 // CatalogExample documents one accepted value shape for a registered key.
-// Values are operator-facing examples and are not redacted; never include
-// secrets or credentials.
+// Examples are emitted as provided; never include secrets or credentials.
 type CatalogExample struct {
 	Name  string `json:"name"`
 	Value any    `json:"value"`
@@ -166,7 +164,6 @@ func (c *Client) catalogSummary(nk nskey, def keyDef) CatalogKeySummary {
 		Kind:         catalogKind(def),
 		TenantScoped: c.multiTenant,
 		RuntimeClass: def.catalog.RuntimeClass,
-		Redaction:    def.redaction.String(),
 		HasValidator: def.validator != nil,
 		Description:  def.description,
 	}

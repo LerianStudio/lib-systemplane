@@ -172,23 +172,12 @@ type delivery[T any] struct {
 // returns nil.
 type Coordinator[T any] struct {
 	logger log.Logger
-	// namespace and key name the group every report below is about. They are
-	// carried rather than derived because a redacted group's report withholds
-	// the document, which would otherwise have been the only thing saying
-	// which group stopped being applied. Same two field names the engine's
-	// twin reports emit: "namespace" and "keyname" — never "key", which is an
-	// exact entry in lib-observability's sensitive-field list.
+	// namespace and key name the group every report below is about: a report
+	// that cannot be traced to a group is not actionable. Same two field names
+	// the engine's twin reports emit: "namespace" and "keyname" — never "key",
+	// which is an exact entry in lib-observability's sensitive-field list.
 	namespace string
 	key       string
-	// redacted is the group key's registration speaking: true when the key
-	// carries any redaction policy, and the only reason this package knows
-	// anything about redaction at all. A panicking applier is routinely
-	// holding the decoded document, and the canonical panic handler logs it,
-	// so the fact has to travel from Bind down to the recovery — and to the
-	// three lines that report a cause somebody else wrote: a returned apply
-	// error and the two decode failures name the document as freely as a panic
-	// does, so all four withhold it together or the gate is decorative.
-	redacted bool
 	// multiTenant is the Client's mode, and decides the tenant stamp on every
 	// report: a single-tenant scope has no tenant, so its reports carry no
 	// tenant field; a multi-tenant one names the publication's tenant, or
@@ -209,10 +198,8 @@ type Coordinator[T any] struct {
 // failures and applier panics, and is guarded here so every site that logs
 // through it — including lib-observability's panic handler, which logs before
 // it counts — is safe from a consumer logger that panics; namespace and key
-// name the group, and every line this package writes carries them, because a
-// redacted group withholds the document that would otherwise have identified
-// it; redacted says the group's key is registered with a redaction policy,
-// which withholds a panicking applier's value from the report; multiTenant is
+// name the group, and every line this package writes carries them, so every
+// report says which group stopped being applied; multiTenant is
 // the Client's mode, which decides whether a report names a tenant; decode
 // converts a published document into T; seed reads the group's current entry
 // through the Client and reports ok=false when the Client does not yet track
@@ -222,7 +209,7 @@ type Coordinator[T any] struct {
 func NewCoordinator[T any](
 	logger log.Logger,
 	namespace, key string,
-	redacted, multiTenant bool,
+	multiTenant bool,
 	decode func(any) (T, error),
 	seed func() (Publication, bool, error),
 ) *Coordinator[T] {
@@ -235,7 +222,6 @@ func NewCoordinator[T any](
 		logger:      log.Guard(logger),
 		namespace:   namespace,
 		key:         key,
-		redacted:    redacted,
 		multiTenant: multiTenant,
 		decode:      decode,
 		seed:        seed,
@@ -276,7 +262,7 @@ func (c *Coordinator[T]) Publish(ctx context.Context, pub Publication) {
 	// cannot be parsed is named exactly once.
 	if err != nil {
 		c.logError(ctx, "systemplane.group: published document failed to decode", pub.Tenant,
-			safelog.ErrorDetail(c.redacted, "decode failed", err),
+			log.Err(err),
 			log.String("namespace", c.namespace), log.String("keyname", c.key),
 			log.Any("revision", pub.Revision))
 
@@ -430,7 +416,7 @@ func (c *Coordinator[T]) Register(fn ApplyFunc[T]) (func(), error) {
 	id, observed, seeded := c.add(fn)
 	if seeded.decodeErr != nil {
 		c.logError(ctx, "systemplane.group: seeded document failed to decode", seeded.pub.Tenant,
-			safelog.ErrorDetail(c.redacted, "decode failed", seeded.decodeErr),
+			log.Err(seeded.decodeErr),
 			log.String("namespace", c.namespace), log.String("keyname", c.key),
 			log.Any("revision", seeded.pub.Revision))
 	}
@@ -787,21 +773,17 @@ func (c *Coordinator[T]) pendingLocked(sc *scope[T], observed observation[T]) []
 }
 
 // ErrApplyPanicked is the error an apply function's panic becomes. It carries
-// no part of the recovered value: a panic value is whatever the panicking hook
-// was holding, routinely the decoded document with its endpoints and its
-// credentials, and this error is a field operators read and log. Where the
-// value and the stack go is the panic handler's business and the key's
-// redaction policy's — a redacted group's document goes nowhere — so this
-// sentinel does not advertise a log line that may deliberately be missing it.
+// no part of the recovered value: this sentinel is what FC-7's Status reports
+// in LastErr, and where the panic value and the stack go is the panic
+// handler's business, not this error's.
 var ErrApplyPanicked = errors.New("systemplane/group: apply function panicked")
 
 // invoke runs one applier and turns every failure mode into an error: a
 // returned error passes through, and a panic is recovered into one. The recover
 // is the coordinator's own because the RecoverAndLog family swallows the
 // recovered value and FC-7 needs a rejection in the scope's LastErr; the value
-// itself never goes into that error — a panic value is whatever the panicking
-// hook was holding, routinely the decoded document with its endpoints and
-// credentials, and LastErr is a field operators read and log. The value is
+// itself never goes into that error — LastErr is a field operators read and
+// log, and where a panic value goes is the panic handler's business. It is
 // handed to runtime.HandlePanicValue, which is built for a panic recovered
 // elsewhere and does not recover itself. That is what keeps a panicking
 // hot-reload hook on the fleet's panic counter, on the publication's span and
@@ -811,11 +793,8 @@ var ErrApplyPanicked = errors.New("systemplane/group: apply function panicked")
 // Both failure modes are logged here, at error level, naming the scope and the
 // revision: Status is a surface somebody has to think to read, while a
 // configuration that stopped being applied is something an operator needs told.
-// A returned error is rendered under the key's redaction policy for the same
-// reason its panicking twin is: an apply hook that refuses a document names it
-// — fmt.Errorf("cannot apply %+v", a.Value) — and for a redacted group that put
-// the whole document at ERROR. FC-7's Status keeps the error untouched; that is
-// the consumer's own surface, not a log sink.
+// The line carries the applier's error and nothing this package adds to it;
+// FC-7's Status keeps the same error untouched.
 func (c *Coordinator[T]) invoke(
 	ctx context.Context,
 	fn ApplyFunc[T],
@@ -827,11 +806,9 @@ func (c *Coordinator[T]) invoke(
 			err = ErrApplyPanicked
 
 			// Two lines, because HandlePanicValue carries the recovered value
-			// and the stack but neither the tenant nor the revision, and
-			// redacts both in production mode: without this one the log says
-			// something panicked and never says what stopped being applied.
-			// The recovered value stays out of it — redaction lives with the
-			// handler.
+			// and the stack but neither the tenant nor the revision: without
+			// this one the log says something panicked and never says what
+			// stopped being applied.
 			c.logError(ctx, "systemplane.group: apply function panicked", current.Tenant,
 				log.String("namespace", c.namespace), log.String("keyname", c.key),
 				log.Any("revision", current.Revision))
@@ -843,7 +820,7 @@ func (c *Coordinator[T]) invoke(
 	err = fn(ctx, current, previous)
 	if err != nil {
 		c.logError(ctx, "systemplane.group: apply function rejected the published document", current.Tenant,
-			safelog.ErrorDetail(c.redacted, "apply rejected the document", err),
+			log.Err(err),
 			log.String("namespace", c.namespace), log.String("keyname", c.key),
 			log.Any("revision", current.Revision))
 	}
@@ -861,27 +838,13 @@ func (c *Coordinator[T]) invoke(
 // and the span event and the error reporter, all of them consumer code nothing
 // can wrap.
 //
-// A redacted group's document never reaches the report. HandlePanicValue logs
-// log.Any("value", recovered) and stamps the same rendering on the span event
-// whenever production mode is off, and off is what lib-observability ships, so
-// an apply hook that panics naming what it could not apply —
-// panic(fmt.Sprintf("cannot apply %+v", doc)) — would publish a RedactFull
-// group's whole document at ERROR. The matcher pilot keeps hmac_secret,
-// secret_access_key and a tenant API key in exactly such a group. For those
-// the handler receives safelog's sentence instead: what panicked and the panic
-// value's dynamic type, which tells two panics apart and can never carry a
-// byte of a secret. Same handler either way, so the counter, the span event
-// and the error report are recorded exactly as before; only what they carry
-// changes.
+// The value goes to the handler as it was raised: what it renders, and
+// whether production mode withholds it, is lib-observability's decision, not
+// this package's.
 func (c *Coordinator[T]) reportPanic(ctx context.Context, recovered any) {
 	defer safelog.Swallow()
 
-	reported := recovered
-	if c.redacted {
-		reported = safelog.WithheldPanic("apply function panicked", recovered)
-	}
-
-	runtime.HandlePanicValue(ctx, c.logger, reported, "systemplane", "group.apply")
+	runtime.HandlePanicValue(ctx, c.logger, recovered, "systemplane", "group.apply")
 }
 
 // logError writes one line through the guarded logger. The guard makes the

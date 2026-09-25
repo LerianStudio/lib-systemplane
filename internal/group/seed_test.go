@@ -33,7 +33,7 @@ func (s *seeder) read() (Publication, bool, error) {
 func newSeedingCoordinator(t *testing.T, seed *seeder) *Coordinator[coordDoc] {
 	t.Helper()
 
-	return NewCoordinator[coordDoc](nil, coordNamespace, coordKey, false, false, Decode[coordDoc], seed.read)
+	return NewCoordinator[coordDoc](nil, coordNamespace, coordKey, false, Decode[coordDoc], seed.read)
 }
 
 func TestCoordinatorSeedsWhenNothingWasObserved(t *testing.T) {
@@ -214,22 +214,12 @@ func TestCoordinatorNeverSeedsAScopeItAlreadyObserved(t *testing.T) {
 }
 
 // TestCoordinatorSeedThatFailsToDecodeIsRecorded pins the seeded twin of the
-// published decode failure: the same recording, the same single log line, and
-// the same rendering under the group's redaction policy.
+// published decode failure: the same recording, the same single log line and
+// the same rendering.
 func TestCoordinatorSeedThatFailsToDecodeIsRecorded(t *testing.T) {
-	for _, tc := range decodeRedactionCases {
-		t.Run(tc.name, func(t *testing.T) {
-			seedDecodeFailure(t, tc.redacted)
-		})
-	}
-}
-
-func seedDecodeFailure(t *testing.T, redacted bool) {
-	t.Helper()
-
-	seed := &seeder{pub: publication("t1", 7, redactionMarker), ok: true}
+	seed := &seeder{pub: publication("t1", 7, payloadMarker), ok: true}
 	logger := newRecordingLogger()
-	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, redacted, false, rejectingDecode(redactionMarker), seed.read)
+	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, false, rejectingDecode(payloadMarker), seed.read)
 
 	var rec recorder
 
@@ -250,7 +240,7 @@ func seedDecodeFailure(t *testing.T, redacted bool) {
 		t.Fatalf("logged = %v, want the decode failure at error level", lines)
 	}
 
-	assertDecodeFailureRendering(t, logger, redacted)
+	assertDecodeFailureRendering(t, logger)
 
 	// A6 parity with the published-document branch: the rejection IS an
 	// observation, so the observed flag and not just the spent-seed flag says
@@ -365,7 +355,7 @@ func TestCoordinatorDeliversAfterASeedItCannotProveIdentical(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			seed := &seeder{pub: Publication{Tenant: "t1", Revision: 1, Value: tc.seeded}, ok: true}
-			c := NewCoordinator[coordDoc](nil, coordNamespace, coordKey, false, false, decodeRefusing, seed.read)
+			c := NewCoordinator[coordDoc](nil, coordNamespace, coordKey, false, decodeRefusing, seed.read)
 
 			var rec recorder
 

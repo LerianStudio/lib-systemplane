@@ -128,18 +128,8 @@ func WithContextValidator(fn func(ctx context.Context, value any) error) KeyOpti
 	return internalclient.WithContextValidator(fn)
 }
 
-// WithRedaction sets the redaction policy.
-func WithRedaction(policy RedactPolicy) KeyOption {
-	return internalclient.WithRedaction(internalclient.RedactPolicy(policy))
-}
-
 // WithCatalogMetadata attaches operator-facing catalog metadata to a key.
 // Examples are emitted as provided; do not include secrets or credentials.
 func WithCatalogMetadata(meta CatalogKeyMetadata) KeyOption {
 	return internalclient.WithCatalogMetadata(meta)
-}
-
-// ApplyRedaction returns the value rendered per policy.
-func ApplyRedaction(value any, policy RedactPolicy) any {
-	return internalclient.ApplyRedaction(value, internalclient.RedactPolicy(policy))
 }

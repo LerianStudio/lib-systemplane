@@ -4,6 +4,8 @@ package client
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -193,14 +195,9 @@ func TestRefreshPanicNamesTheKey(t *testing.T) {
 	}
 }
 
-// TestMultiTenantDecodeFailureNamesTheTenant pins the one identifier a
-// multi-tenant read-through failure used to withhold. The line named the
-// namespace and the key, which on a multi-tenant deployment is the same
-// namespace and the same key for every tenant in the fleet: an operator
-// reading it learned that SOMEBODY's row was unreadable and had no way to tell
-// whose. The tenant travels on the caller's context, so it is stamped centrally
-// on every ERROR the Client logs in multi-tenant mode, and named in the error
-// the caller receives beside the namespace and key.
+// TestMultiTenantDecodeFailureNamesTheTenant pins that a multi-tenant
+// read-through failure names the tenant from the caller's context, on the
+// ERROR line and in the returned error, beside the namespace and key.
 func TestMultiTenantDecodeFailureNamesTheTenant(t *testing.T) {
 	m := newMemStore(true)
 	logger := &recordingLogger{}
@@ -250,55 +247,58 @@ func TestMultiTenantDecodeFailureNamesTheTenant(t *testing.T) {
 // keys, so a read can resolve a database while carrying no id. An empty
 // tenant.id on the line reads exactly like a single-tenant line, and `in
 // tenant ""` in the error reads like a tenant named nothing; both must say the
-// tenant was unresolved instead, for an ordinary key and a redacted one alike.
+// tenant was unresolved instead.
 func TestMultiTenantDecodeFailureWithNoTenantIDSaysSo(t *testing.T) {
-	for _, policy := range []RedactPolicy{RedactNone, RedactFull} {
-		t.Run(policy.String(), func(t *testing.T) {
-			m := newMemStore(true)
-			logger := &recordingLogger{}
-			c := newMultiTenantClientWithLogger(t, m, logger)
+	m := newMemStore(true)
+	logger := &recordingLogger{}
+	c := newMultiTenantClientWithLogger(t, m, logger)
 
-			if err := c.Register("ns", "k", "default", WithRedaction(policy)); err != nil {
-				t.Fatalf("Register: %v", err)
-			}
+	if err := c.Register("ns", "k", "default"); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
 
-			if err := c.Start(context.Background()); err != nil {
-				t.Fatalf("Start: %v", err)
-			}
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
 
-			t.Cleanup(func() { _ = c.Close() })
+	t.Cleanup(func() { _ = c.Close() })
 
-			seedRaw(m, "ns", "k", []byte(`{not json`))
+	seedRaw(m, "ns", "k", []byte(`{not json`))
 
-			// The memStore resolves a tenant store for any ctx, which is the
-			// resolved-database-without-an-id shape this test is about.
-			_, _, err := c.Get(context.Background(), "ns", "k")
-			if err == nil {
-				t.Fatal("Get: want a decode error, got nil")
-			}
+	// The memStore resolves a tenant store for any ctx, which is the
+	// resolved-database-without-an-id shape this test is about.
+	_, _, err := c.Get(context.Background(), "ns", "k")
+	if err == nil {
+		t.Fatal("Get: want a decode error, got nil")
+	}
 
-			if !strings.Contains(err.Error(), "in an unresolved tenant") || strings.Contains(err.Error(), `in tenant ""`) {
-				t.Errorf("the decode error does not say the tenant was unresolved: %v", err)
-			}
+	if !strings.Contains(err.Error(), "in an unresolved tenant") || strings.Contains(err.Error(), `in tenant ""`) {
+		t.Errorf("the decode error does not say the tenant was unresolved: %v", err)
+	}
 
-			lines := logger.errs("failed to unmarshal stored value")
-			if len(lines) != 1 {
-				t.Fatalf("got %d ERROR lines for the undecodable row, want exactly 1: %s", len(lines), logger.rendered())
-			}
+	// Nothing here masks a value, so the json cause that locates the bad byte
+	// stays in the chain for the caller debugging the row.
+	var syntax *json.SyntaxError
+	if !errors.As(err, &syntax) {
+		t.Errorf("the json cause callers debug the row with is gone: %v", err)
+	}
 
-			var tenant any
+	lines := logger.errs("failed to unmarshal stored value")
+	if len(lines) != 1 {
+		t.Fatalf("got %d ERROR lines for the undecodable row, want exactly 1: %s", len(lines), logger.rendered())
+	}
 
-			for _, f := range lines[0].structured() {
-				if f.Key == constants.AttrKeyTenantID {
-					tenant = f.Value
-				}
-			}
+	var tenant any
 
-			if tenant != "unresolved" {
-				t.Errorf("the line carries %s = %v, want \"unresolved\": %s",
-					constants.AttrKeyTenantID, tenant, logger.rendered())
-			}
-		})
+	for _, f := range lines[0].structured() {
+		if f.Key == constants.AttrKeyTenantID {
+			tenant = f.Value
+		}
+	}
+
+	if tenant != "unresolved" {
+		t.Errorf("the line carries %s = %v, want \"unresolved\": %s",
+			constants.AttrKeyTenantID, tenant, logger.rendered())
 	}
 }
 

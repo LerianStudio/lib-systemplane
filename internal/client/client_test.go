@@ -728,22 +728,15 @@ func TestCloseIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestKeyDescriptionAndRedaction(t *testing.T) {
+func TestKeyDescription(t *testing.T) {
 	c := newSingleTenantClient(t, newMemStore(false))
 
-	if err := c.Register("ns", "k", 1,
-		WithDescription("hello"),
-		WithRedaction(RedactMask),
-	); err != nil {
+	if err := c.Register("ns", "k", 1, WithDescription("hello")); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
 	if got := c.KeyDescription("ns", "k"); got != "hello" {
 		t.Errorf("description = %q, want hello", got)
-	}
-
-	if got := c.KeyRedaction("ns", "k"); got != RedactMask {
-		t.Errorf("redaction = %v, want RedactMask", got)
 	}
 }
 
@@ -987,8 +980,8 @@ func TestGetIntRejectsFractionalFloat(t *testing.T) {
 		t.Errorf("ok = true, want false for fractional value (got %v)", v)
 	}
 
-	if !errors.Is(err, ErrValidation) {
-		t.Errorf("err = %v, want ErrValidation", err)
+	if !errors.Is(err, ErrValidation) || !strings.Contains(err.Error(), "1.5") {
+		t.Errorf("err = %v, want ErrValidation naming the rejected value", err)
 	}
 }
 
@@ -1071,8 +1064,8 @@ func TestGetDurationRejectsUnparseableString(t *testing.T) {
 		t.Error("ok = true, want false for unparseable string")
 	}
 
-	if !errors.Is(err, ErrValidation) {
-		t.Errorf("err = %v, want ErrValidation", err)
+	if !errors.Is(err, ErrValidation) || !strings.Contains(err.Error(), "not-a-duration") {
+		t.Errorf("err = %v, want ErrValidation naming the rejected value", err)
 	}
 }
 

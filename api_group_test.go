@@ -1179,9 +1179,8 @@ func TestGroupSnapshotAcceptsANullRowForANilableType(t *testing.T) {
 }
 
 // TestGroupBindForwardsKeyOptions pins that the options a caller hands Bind
-// still reach the registered key. A dropped WithRedaction is the expensive one:
-// a credential group would then render in plaintext on the admin surface and in
-// logs, with nothing failing.
+// still reach the registered key: Bind appends its own validator to them, and
+// a slip there drops the caller's.
 func TestGroupBindForwardsKeyOptions(t *testing.T) {
 	t.Parallel()
 
@@ -1189,7 +1188,6 @@ func TestGroupBindForwardsKeyOptions(t *testing.T) {
 
 	_, err := systemplane.Bind(c, "runtime", "ingest", groupDefaults(), nil,
 		systemplane.WithDescription("ingest pipeline settings"),
-		systemplane.WithRedaction(systemplane.RedactFull),
 	)
 	if err != nil {
 		t.Fatalf("Bind: %v", err)
@@ -1197,10 +1195,6 @@ func TestGroupBindForwardsKeyOptions(t *testing.T) {
 
 	if got := c.KeyDescription("runtime", "ingest"); got != "ingest pipeline settings" {
 		t.Fatalf("KeyDescription = %q, want the description passed to Bind", got)
-	}
-
-	if got := c.KeyRedaction("runtime", "ingest"); got != systemplane.RedactFull {
-		t.Fatalf("KeyRedaction = %v, want RedactFull", got)
 	}
 }
 

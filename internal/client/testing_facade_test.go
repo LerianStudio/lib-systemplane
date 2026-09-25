@@ -184,15 +184,3 @@ func TestNewForTestingRejectsNilStores(t *testing.T) {
 		t.Fatalf("typed nil store error = %v, want ErrNilBackend", err)
 	}
 }
-
-func TestRedactionHelpers(t *testing.T) {
-	if got := ApplyRedaction("visible", RedactNone); got != "visible" {
-		t.Fatalf("ApplyRedaction none = %#v", got)
-	}
-	if got := ApplyRedaction("secret", RedactMask); got == "secret" {
-		t.Fatalf("ApplyRedaction mask = %#v, want obfuscated", got)
-	}
-	if got := RedactPolicy(99).String(); got != "none" {
-		t.Fatalf("unknown RedactPolicy string = %q", got)
-	}
-}

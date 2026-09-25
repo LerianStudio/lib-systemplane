@@ -292,12 +292,9 @@ func handleList(client *systemplane.Client) fiber.Handler {
 				continue
 			}
 
-			policy := client.KeyRedaction(namespace, e.Key)
-			redacted := systemplane.ApplyRedaction(entry.Value, policy)
-
 			resp.Entries = append(resp.Entries, entryResponse{
 				Key:         e.Key,
-				Value:       redacted,
+				Value:       entry.Value,
 				Description: e.Description,
 				Revision:    entry.Revision,
 				UpdatedAt:   nilIfZeroTime(entry.UpdatedAt),
@@ -328,8 +325,6 @@ func handleCatalogDetail(client *systemplane.Client, prefix string) fiber.Handle
 			return commonshttp.RespondError(c, http.StatusNotFound, "not_found", "systemplane catalog entry not found")
 		}
 
-		policy := catalogRedactionPolicy(detail.Redaction)
-		detail.DefaultValue = systemplane.ApplyRedaction(detail.DefaultValue, policy)
 		detail.DetailURL = catalogDetailPath(prefix, namespace, key)
 
 		return c.Status(fiber.StatusOK).JSON(catalogDetailResponse{
@@ -406,17 +401,6 @@ func pathParamCandidates(raw string) []string {
 	return []string{raw, decoded}
 }
 
-func catalogRedactionPolicy(redaction string) systemplane.RedactPolicy {
-	switch redaction {
-	case systemplane.RedactMask.String():
-		return systemplane.RedactMask
-	case systemplane.RedactFull.String():
-		return systemplane.RedactFull
-	default:
-		return systemplane.RedactNone
-	}
-}
-
 func handleGetOne(client *systemplane.Client) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		namespace, key := registeredPathParams(client, c)
@@ -430,13 +414,10 @@ func handleGetOne(client *systemplane.Client) fiber.Handler {
 			return commonshttp.RespondError(c, http.StatusNotFound, "not_found", "key not found")
 		}
 
-		policy := client.KeyRedaction(namespace, key)
-		redacted := systemplane.ApplyRedaction(e.Value, policy)
-
 		return c.Status(fiber.StatusOK).JSON(getResponse{
 			Namespace:   namespace,
 			Key:         key,
-			Value:       redacted,
+			Value:       e.Value,
 			Description: client.KeyDescription(namespace, key),
 			Revision:    e.Revision,
 			UpdatedAt:   nilIfZeroTime(e.UpdatedAt),

@@ -9,7 +9,6 @@ import (
 	"github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/runtime"
-	"github.com/LerianStudio/lib-systemplane/v4/internal/safelog"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -418,23 +417,9 @@ func (e *Engine) trackedRefresh(scope store.Scope, nk NSKey, deleted bool) {
 //
 // HandlePanicValue rather than a re-panic into that net, so the panic is
 // counted once, under this site. It is reached through reportConsumerPanic,
-// which emits the identity line and, for a key registered redacted, withholds
-// the recovered value: a driver that panics naming the row it was decoding is
-// holding that key's value, and the handler prints it unless production mode
-// is on.
+// which emits the identity line naming the tenant, namespace and key before
+// the handler reports what was raised.
 func (e *Engine) recoverRefresh(scope store.Scope, nk NSKey, deleted, retried bool, state **scopeState, origin *feedFence) {
-	// The two lines at the bottom are the CONSUMER's observability: its
-	// logger, and whatever lib-observability's handler reaches through
-	// InitPanicMetrics — a metrics recorder, and the raw logger the consumer
-	// handed that call, neither of which this engine wraps. A panic raised in
-	// there unwinds out of this recovery, and every goroutine a re-read can
-	// run on has an outer net that would then report the SAME broken logger's
-	// failure through that same logger. Swallowing it here ends the line one
-	// frame from where it started. Same guard, same reason, as
-	// internal/group's own panic handler. It is registered FIRST so it runs
-	// LAST: the repair below still runs on the way out.
-	defer safelog.Swallow()
-
 	recovered := recover()
 	if recovered == nil {
 		return
@@ -463,13 +448,7 @@ func (e *Engine) recoverRefresh(scope store.Scope, nk NSKey, deleted, retried bo
 
 	defer e.retryRefresh(sc, nk, fence, deleted, retried)
 
-	// After the repair is deferred, because this reads the registry and the
-	// registry is the consumer's: a Lookup that panics unwinds through the
-	// deferred retry above and dies in safelog.Swallow, rather than costing the
-	// key its re-read.
-	def, _ := e.lookup(nk.Namespace, nk.Key)
-
-	e.reportConsumerPanic(ctx, scope, nk, recovered, def.Redacted, "changefeed re-read panicked", "refresh")
+	e.reportConsumerPanic(ctx, scope, nk, recovered, "changefeed re-read panicked", "refresh")
 }
 
 // scopeForEvent resolves the scope a changefeed event, a reconcile or a
