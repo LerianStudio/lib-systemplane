@@ -235,24 +235,13 @@ func (e *Engine) workerFor(sc *scopeState, nk NSKey) *dispatchWorker {
 		"systemplane.engine", "dispatch", runtime.KeepRunning,
 		func(ctx context.Context) {
 			defer e.dispatchWG.Done()
-			defer e.reapWorker(w)
+			// Runs before the WaitGroup release, so Close never sees a finished worker as running.
+			defer e.running.Delete(w)
 
 			e.runWorker(ctx, wk, w)
 		})
 
 	return w
-}
-
-// reapWorker clears a finished worker's running mark. The worker map is not
-// its to touch: a scope's drop clears its entries, and Close refuses every
-// lookup, both under workersMu.
-//
-// It is deferred INSIDE the launch closure, registered after the WaitGroup
-// release so it runs before it: a Close waiting on that WaitGroup must not be
-// released while this worker is still named in running, or it reports a
-// delivery nobody is running.
-func (e *Engine) reapWorker(w *dispatchWorker) {
-	e.running.Delete(w)
 }
 
 // runWorker is the one goroutine that invokes subscribers of wk. It exits when
@@ -329,9 +318,6 @@ func (e *Engine) runWorker(ctx context.Context, wk workerKey, w *dispatchWorker)
 // kills neither the worker nor the process and is counted and recorded on the
 // span rather than merely logged; the subscriber list is copied before any
 // callback runs, so a callback may unsubscribe itself without deadlocking.
-//
-// The registry is not read here at all, on the hot path or off it: a panicking
-// callback is reported with the value it was raised with, whatever the key.
 func (e *Engine) deliver(ctx context.Context, scope store.Scope, nk NSKey, ch Change) {
 	e.subsMu.RLock()
 	subs := make([]subscription, len(e.subscribers[nk]))

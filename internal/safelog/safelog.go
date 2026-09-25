@@ -3,9 +3,8 @@
 // tenant-less multi-tenant report carries, and the swallow that ends a
 // panicking logger's report one frame from where it started.
 //
-// It is a leaf — the standard library, nothing else — because both
-// internal/engine and internal/group need it, and a group that reached into
-// the engine for it inverted the layering the two packages are meant to keep.
+// It is a leaf because both internal/engine and internal/group need it, and a
+// group that reached into the engine for it inverted their layering.
 package safelog
 
 // UnresolvedTenant is the tenant.id a multi-tenant line carries when it has

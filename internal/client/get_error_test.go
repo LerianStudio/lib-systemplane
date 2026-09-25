@@ -44,7 +44,7 @@ func seedRaw(m *memStore, ns, key string, raw []byte) {
 // same path is pinned by TestMultiTenantDecodeFailureWithNoTenantIDSaysSo.
 func TestMultiTenantListDecodeErrorWrapsTheCause(t *testing.T) {
 	m := newMemStore(true)
-	c := newMultiTenantClientWithLogger(t, m, &recordingLogger{})
+	c := newMultiTenantClient(t, m)
 
 	if err := c.Register("ns", "k", "default"); err != nil {
 		t.Fatalf("register: %v", err)
@@ -69,61 +69,5 @@ func TestMultiTenantListDecodeErrorWrapsTheCause(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "ns") || !strings.Contains(err.Error(), "k") {
 		t.Errorf("the error names neither namespace nor key: %v", err)
-	}
-}
-
-// TestTypedGetterErrorNamesTheValue pins the other half: GetDuration and GetInt
-// are the two getters whose rejection is actionable only when it says which
-// value it rejected, and they say it for every key.
-func TestTypedGetterErrorNamesTheValue(t *testing.T) {
-	const unparseable = "4 fortnights"
-
-	for _, tt := range []struct {
-		name  string
-		value any
-		call  func(*Client) error
-		names string
-	}{
-		{
-			name:  "GetDuration",
-			value: unparseable,
-			call: func(c *Client) error {
-				_, _, err := c.GetDuration(context.Background(), "ns", "k")
-
-				return err
-			},
-			names: unparseable,
-		},
-		{
-			name:  "GetInt",
-			value: 1.5,
-			call: func(c *Client) error {
-				_, _, err := c.GetInt(context.Background(), "ns", "k")
-
-				return err
-			},
-			names: "1.5",
-		},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			c := newSingleTenantClient(t, newMemStore(false))
-
-			if err := c.Register("ns", "k", tt.value); err != nil {
-				t.Fatalf("register: %v", err)
-			}
-
-			err := tt.call(c)
-			if err == nil {
-				t.Fatal("want a validation error, got nil")
-			}
-
-			if !errors.Is(err, ErrValidation) {
-				t.Errorf("error %v does not wrap ErrValidation", err)
-			}
-
-			if !strings.Contains(err.Error(), tt.names) {
-				t.Errorf("error %q does not name the value it rejected", err)
-			}
-		})
 	}
 }

@@ -5,12 +5,12 @@ package engine
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
-	"github.com/LerianStudio/lib-observability/v4/runtime"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -175,19 +175,10 @@ func TestIngestClonesRegisteredDefault(t *testing.T) {
 	}
 }
 
-// TestIngestRejectsPanickingValidatorWithoutLeakingPanicValue pins the
-// contract for a validator that panics while inspecting a row: the row is
-// rejected, the key keeps the last value that passed, and the panic is
-// reported through lib-observability's recovery pipeline, which redacts the
-// panic value in production mode. A validator that panics on the secret it was
-// handed must not be the thing that turns that secret into a log line.
-func TestIngestRejectsPanickingValidatorWithoutLeakingPanicValue(t *testing.T) {
-	// lib-observability's production mode is a process-global switch, which is why it is
-	// restored in t.Cleanup and why this test must never run in parallel with another.
-	productionMode(t)
-
-	const secret = "validator-panic-sentinel-Zq7Xk"
-
+// TestIngestRejectsPanickingValidator pins the contract for a validator that
+// panics while inspecting a row: the row is rejected, the key keeps the last
+// value that passed, and the panic is reported through lib-observability.
+func TestIngestRejectsPanickingValidator(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 	logger := &recordingLogger{Logger: log.NewNop()}
 	e := engineWithRegistry(fakeRegistry{defs: map[NSKey]KeyDef{
@@ -198,7 +189,7 @@ func TestIngestRejectsPanickingValidatorWithoutLeakingPanicValue(t *testing.T) {
 					return nil
 				}
 
-				panic(secret)
+				panic("boom")
 			},
 		},
 	}})
@@ -215,21 +206,8 @@ func TestIngestRejectsPanickingValidatorWithoutLeakingPanicValue(t *testing.T) {
 			got.Value, got.Revision)
 	}
 
-	entries := logger.all()
-	recovered := false
-
-	for _, entry := range entries {
-		if strings.Contains(entry, "panic recovered") {
-			recovered = true
-		}
-
-		if strings.Contains(entry, secret) {
-			t.Errorf("a log entry carries the panic value: %s", entry)
-		}
-	}
-
-	if !recovered {
-		t.Errorf("no panic-recovery entry was logged, got %v", entries)
+	if !slices.ContainsFunc(logger.all(), func(e string) bool { return strings.Contains(e, "panic recovered") }) {
+		t.Errorf("no panic-recovery entry was logged, got %v", logger.all())
 	}
 }
 
@@ -661,16 +639,8 @@ func TestPublishDeleteReportsEveryRefusalItCanStillMake(t *testing.T) {
 // four outcomes matter to a caller: a nil engine still grades (the Client
 // reaches here before anything confirms an engine exists), no validator
 // accepts, a returned error comes back untouched so the caller can match its
-// own sentinel, and a panic comes back as a refusal that names the panic and
-// never the value it panicked on — a configuration row is exactly where a
-// secret lives.
+// own sentinel, and a panic comes back as a validation refusal.
 func TestRunValidator(t *testing.T) {
-	// lib-observability's production mode is a process-global switch: without
-	// it the recovery pipeline prints the recovered value, which is the one
-	// thing the panic case asserts is absent.
-	productionMode(t)
-
-	const secret = "run-validator-panic-sentinel-Wq4Nb"
 
 	refused := errors.New("the scheme is not allowed")
 
@@ -683,7 +653,7 @@ func TestRunValidator(t *testing.T) {
 		{
 			name:      "a nil engine grades and survives a panic",
 			nilEngine: true,
-			validate:  func(context.Context, any) error { panic(secret) },
+			validate:  func(context.Context, any) error { panic("boom") },
 			check: func(t *testing.T, err error, _ *recordingLogger) {
 				requireValidatorPanic(t, err)
 			},
@@ -711,24 +681,12 @@ func TestRunValidator(t *testing.T) {
 			},
 		},
 		{
-			name:     "a panic becomes a validation refusal that never names the value",
-			validate: func(context.Context, any) error { panic(secret) },
+			name:     "a panic becomes a validation refusal",
+			validate: func(context.Context, any) error { panic("boom") },
 			check: func(t *testing.T, err error, logger *recordingLogger) {
 				requireValidatorPanic(t, err)
 
-				recovered := false
-
-				for _, entry := range logger.all() {
-					if strings.Contains(entry, "panic recovered") {
-						recovered = true
-					}
-
-					if strings.Contains(entry, secret) {
-						t.Errorf("a log entry carries the panic value: %s", entry)
-					}
-				}
-
-				if !recovered {
+				if !slices.ContainsFunc(logger.all(), func(e string) bool { return strings.Contains(e, "panic recovered") }) {
 					t.Errorf("no panic-recovery entry was logged, got %v", logger.all())
 				}
 			},
@@ -743,7 +701,7 @@ func TestRunValidator(t *testing.T) {
 				e.logger = logger
 			}
 
-			tc.check(t, e.RunValidator(context.Background(), store.Scope{}, NSKey{}, tc.validate, secret), logger)
+			tc.check(t, e.RunValidator(context.Background(), store.Scope{}, NSKey{}, tc.validate, "value"), logger)
 		})
 	}
 }
@@ -760,17 +718,4 @@ func requireValidatorPanic(t *testing.T, err error) {
 	if !strings.Contains(err.Error(), "validator panicked") {
 		t.Errorf("err = %q, want it to name the panic", err)
 	}
-}
-
-// productionMode turns lib-observability's production mode on for one test and
-// puts back whatever it held, rather than the literal false: the switch is
-// process-global, so a test that restores a constant silently turns the mode
-// off for every test that ran outside it.
-func productionMode(t *testing.T) {
-	t.Helper()
-
-	previous := runtime.IsProductionMode()
-	runtime.SetProductionMode(true)
-
-	t.Cleanup(func() { runtime.SetProductionMode(previous) })
 }

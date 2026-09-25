@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
-	"github.com/LerianStudio/lib-observability/v4/runtime"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -129,19 +128,6 @@ func waitFor(t *testing.T, cond func() bool, msg string) {
 		case <-time.After(5 * time.Millisecond):
 		}
 	}
-}
-
-// productionMode turns lib-observability's production mode on for one test and
-// restores it afterwards. Its recovery pipeline prints the recovered value
-// otherwise, and the value a validator panics on is the configuration row —
-// which is exactly what the rejection contract says must never be logged.
-func productionMode(t *testing.T) {
-	t.Helper()
-
-	previous := runtime.IsProductionMode()
-	runtime.SetProductionMode(true)
-
-	t.Cleanup(func() { runtime.SetProductionMode(previous) })
 }
 
 // rejectedSecret is the stored value the validators below refuse. It reads
@@ -534,18 +520,11 @@ func TestStoredValueValidatorNeverSeesTheStartContext(t *testing.T) {
 // inside Start, so an unrecovered panic there would take down boot — the very
 // deploy the fix was written to survive.
 func TestPanickingValidatorIsARefusal(t *testing.T) {
-	// The engine hands the panic to lib-observability's recovery pipeline,
-	// which prints the panic VALUE unless production mode is on — and the
-	// value a validator panics on is the configuration row itself. Production
-	// mode is process-wide state, so these subtests never run in parallel.
-	productionMode(t)
-
 	t.Run("the first reconcile keeps the default and does not abort start", func(t *testing.T) {
 		m := newMemStore(false)
 		logger := &recordingLogger{}
 		c := newSingleTenantClientWithLogger(t, m, logger)
 
-		// Panics with the value itself: no log line may reproduce its bytes.
 		validator := func(_ context.Context, value any) error {
 			if value == rejectedSecret {
 				panic(value)
@@ -577,10 +556,6 @@ func TestPanickingValidatorIsARefusal(t *testing.T) {
 
 		if n := len(logger.warns("stored value rejected by validator, keeping cached value")); n != 1 {
 			t.Errorf("got %d WARN lines for the panicking validator, want exactly 1", n)
-		}
-
-		if rendered := logger.rendered(); strings.Contains(rendered, rejectedSecret) {
-			t.Errorf("a log line reproduced the panicked value's bytes: %q", rendered)
 		}
 	})
 

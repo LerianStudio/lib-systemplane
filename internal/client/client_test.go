@@ -980,8 +980,8 @@ func TestGetIntRejectsFractionalFloat(t *testing.T) {
 		t.Errorf("ok = true, want false for fractional value (got %v)", v)
 	}
 
-	if !errors.Is(err, ErrValidation) {
-		t.Errorf("err = %v, want ErrValidation", err)
+	if !errors.Is(err, ErrValidation) || !strings.Contains(err.Error(), "1.5") {
+		t.Errorf("err = %v, want ErrValidation naming the rejected value", err)
 	}
 }
 
@@ -1064,8 +1064,8 @@ func TestGetDurationRejectsUnparseableString(t *testing.T) {
 		t.Error("ok = true, want false for unparseable string")
 	}
 
-	if !errors.Is(err, ErrValidation) {
-		t.Errorf("err = %v, want ErrValidation", err)
+	if !errors.Is(err, ErrValidation) || !strings.Contains(err.Error(), "not-a-duration") {
+		t.Errorf("err = %v, want ErrValidation naming the rejected value", err)
 	}
 }
 

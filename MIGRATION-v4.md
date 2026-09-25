@@ -43,7 +43,7 @@ has to be read even where your code compiles unchanged.
 | `(*Manager).IsClosed` | No replacement. Calls on a closed `Client` return `ErrClosed`; that is the answer the flag was read for. |
 | `(*Manager).OnTenantActivated`, `OnTenantSuspended`, `OnTenantDeleted`, `OnTenantCredentialsRotated`, `HandleTenantLifecycle` | No replacement yet: tenant lifecycle handling does not exist on the v4 Client, so a process that depends on it cannot take this upgrade. <!-- NOT-YET(engine-tenants): Client.HandleTenantLifecycle, WithAggregateTenantThreshold, tenant-scope teardown in Close --> |
 | `DefaultSeedSQL` | No replacement. Defaults live in code, at `Register` / `Bind`. A value an operator must be able to override before first boot is a row your own migration pipeline inserts, not something this library seeds. |
-| `RedactPolicy`, `RedactNone`, `RedactMask`, `RedactFull` | No replacement. systemplane holds runtime knobs, never secrets; move a secret to environment variables or a secret manager. |
+| `RedactPolicy`, `RedactNone`, `RedactMask`, `RedactFull` | No replacement. |
 | `WithRedaction`, `ApplyRedaction`, `(*Client).KeyRedaction` | No replacement; drop the option from every `Register` / `Bind` call, including `WithRedaction(RedactNone)`. |
 | `WithTable`, `WithListenChannel`, `WithCollection` | No replacement: the names are fixed, and v4 reads nothing else. Postgres: rename or copy a custom table to `systemplane_entries` first, then apply `MigrationV3ToV4SQL()`, which names the table unqualified, refuses when `search_path` reaches none, and recreates the notification triggers on `systemplane_changes`, so a custom channel needs no step of its own. MongoDB: copy a custom collection to `systemplane_entries` before starting v4; v4 moves no data. |
 
@@ -246,9 +246,8 @@ the catalog loses its `redaction` field. Values are served in clear to every
 caller the admin authorizer allows, so mount `/system` behind an
 operator/admin permission. Typed-getter errors quote the stored value they
 could not convert; decode and validator lines carry the error as produced, and
-a panic report carries the panic value. With production mode off, a recovered
-panic value is logged in full; a validator or apply hook that panics naming a
-value puts that value in the log.
+a panic report carries the panic value
+([README § Panic recovery](README.md#panic-recovery)).
 
 **Do:** drop every `WithRedaction` call; a value that stays here is served in
 clear.

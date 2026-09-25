@@ -195,14 +195,9 @@ func TestRefreshPanicNamesTheKey(t *testing.T) {
 	}
 }
 
-// TestMultiTenantDecodeFailureNamesTheTenant pins the one identifier a
-// multi-tenant read-through failure used to withhold. The line named the
-// namespace and the key, which on a multi-tenant deployment is the same
-// namespace and the same key for every tenant in the fleet: an operator
-// reading it learned that SOMEBODY's row was unreadable and had no way to tell
-// whose. The tenant travels on the caller's context, so it is stamped centrally
-// on every ERROR the Client logs in multi-tenant mode, and named in the error
-// the caller receives beside the namespace and key.
+// TestMultiTenantDecodeFailureNamesTheTenant pins that a multi-tenant
+// read-through failure names the tenant from the caller's context, on the
+// ERROR line and in the returned error, beside the namespace and key.
 func TestMultiTenantDecodeFailureNamesTheTenant(t *testing.T) {
 	m := newMemStore(true)
 	logger := &recordingLogger{}

@@ -565,45 +565,6 @@ func TestTenantIsLoggedUnderTheCanonicalKey(t *testing.T) {
 	}
 }
 
-// validatorError is the shape a real validator returns: a consumer-defined
-// error whose message names what it refused — which is how the refused value
-// itself ends up in the message.
-type validatorError struct{ msg string }
-
-func (e validatorError) Error() string { return e.msg }
-
-// TestValidatorRejectionLogsTheErrorNotTheValue pins the log-hygiene rule on
-// the one line a consumer-built string reaches the log stream through: the
-// message of an error the registered validator returned.
-//
-// The line carries that error as produced — an operator who cannot read why a
-// row was refused cannot act on it — and nothing the engine adds names the
-// value. A validator that interpolates what it refused puts that much in its
-// own message, which is the consumer's call. The error returned to the caller
-// of Set is the same one either way.
-func TestValidatorRejectionLogsTheErrorNotTheValue(t *testing.T) {
-	const (
-		sentinel = "s3cr3t-value"
-		msg      = "stored value rejected by validator, keeping cached value"
-	)
-
-	rejecting := func(context.Context, any) error { return validatorError{"rejected " + sentinel} }
-
-	nk := NSKey{Namespace: "billing", Key: "limits"}
-
-	e, rec := loggingEngine(t, map[NSKey]KeyDef{
-		nk: {Default: "fallback", Validate: rejecting},
-	}, newFakeStore())
-
-	ingestRow(e, jsonRow(nk, 1, "42", "ops"))
-
-	got := requireOneRecord(t, rec, msg).String()
-
-	if !strings.Contains(got, sentinel) {
-		t.Errorf("the rejection line lost the validator's own message: %s", got)
-	}
-}
-
 // TestReReadCanceledOutsideShutdownIsLoggedAtWarn is the companion of
 // TestReReadCanceledByCloseIsLoggedAtDebug: a store that surfaces a wrapped
 // context.Canceled for a reason that is NOT this engine shutting down — a

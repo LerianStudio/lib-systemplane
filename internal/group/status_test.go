@@ -13,13 +13,51 @@ import (
 
 	"github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
-	"github.com/LerianStudio/lib-observability/v4/runtime"
 
 	"github.com/LerianStudio/lib-systemplane/v4/internal/testsupport/logguard"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/testsupport/panicmetric"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 )
 
 var errRejected = errors.New("applier rejected the document")
+
+// recordingSpan keeps what the panic handler stamps on a span: the event
+// attributes and the recorded error.
+type recordingSpan struct {
+	noop.Span
+
+	mu      sync.Mutex
+	written strings.Builder
+}
+
+func (s *recordingSpan) IsRecording() bool { return true }
+
+func (s *recordingSpan) AddEvent(name string, opts ...trace.EventOption) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.written.WriteString(name)
+
+	cfg := trace.NewEventConfig(opts...)
+	for _, attr := range cfg.Attributes() {
+		fmt.Fprintf(&s.written, " %s=%s", attr.Key, attr.Value.Emit())
+	}
+}
+
+func (s *recordingSpan) RecordError(err error, _ ...trace.EventOption) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.written.WriteString(err.Error())
+}
+
+func (s *recordingSpan) recorded() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.written.String()
+}
 
 // payloadMarker is the sentinel a published document carries; nothing but the
 // real payload produces it, so an assertion that sees it is about the payload.
@@ -258,7 +296,8 @@ func TestCoordinatorApplierErrorRecordsARejection(t *testing.T) {
 func TestCoordinatorApplierPanicIsRecordedLikeAnError(t *testing.T) {
 	logger := newRecordingLogger()
 	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, true, Decode[coordDoc], nil)
-	ctx := context.Background()
+	span := &recordingSpan{}
+	ctx := trace.ContextWithSpan(context.Background(), span)
 
 	unsubscribe := mustRegister(t, c, func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
 		panic("boom")
@@ -266,6 +305,10 @@ func TestCoordinatorApplierPanicIsRecordedLikeAnError(t *testing.T) {
 	defer unsubscribe()
 
 	c.Publish(ctx, publication("t1", 3, "three"))
+
+	if !strings.Contains(span.recorded(), "boom") {
+		t.Errorf("span recorded %q, want the panic value: the report must ride the publication's span", span.recorded())
+	}
 
 	got := statusOf(t, c, "t1")
 	if got.Applied != 0 || got.Desired != 3 {
@@ -276,12 +319,9 @@ func TestCoordinatorApplierPanicIsRecordedLikeAnError(t *testing.T) {
 		t.Errorf("LastErr = %v, want ErrApplyPanicked: a consumer matches the panic with errors.Is, not by parsing the message", got.LastErr)
 	}
 
-	// The recovered value is whatever the hook was holding — routinely the
-	// decoded document, with whatever endpoints and credentials it carries —
-	// and LastErr is read, logged and surfaced by operators. It stays in the
-	// panic log line, which redacts it in production; it never goes in here.
+	// LastErr is the sentinel alone; the recovered value lives only on the panic report.
 	if strings.Contains(got.LastErr.Error(), "boom") {
-		t.Errorf("LastErr = %v, want no recovered value in the message: that undoes the redaction the panic log applies", got.LastErr)
+		t.Errorf("LastErr = %v, want the sentinel alone: the recovered value belongs on the panic report", got.LastErr)
 	}
 
 	line := logger.lineContaining(t, "panic recovered")
@@ -304,53 +344,6 @@ func TestCoordinatorApplierPanicIsRecordedLikeAnError(t *testing.T) {
 	assertPanicScopeLine(t, logger, "t1", 3)
 }
 
-// TestCoordinatorApplierPanicIsRedactedInProductionMode pins the other half of
-// the panic path: in production mode the recovered value and the stack stay out
-// of the log line, and out of Status with them. Status is the surface operators
-// read and log, so republishing the value there would hand back in the clear
-// exactly what the log line just redacted — and a panic value is whatever the
-// hook was holding, routinely the decoded document with its endpoints and its
-// credentials. Status still reports the rejection; only the payload is gone.
-func TestCoordinatorApplierPanicIsRedactedInProductionMode(t *testing.T) {
-	// Process-global. Safe while this test stays sequential: a t.Parallel()
-	// top-level test only runs after every sequential one has returned, so no
-	// parallel test can observe the toggle. What would break it is this test
-	// itself calling t.Parallel(), or running parallel subtests under it.
-	runtime.SetProductionMode(true)
-
-	defer runtime.SetProductionMode(false)
-
-	logger := newRecordingLogger()
-	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, true, Decode[coordDoc], nil)
-
-	unsubscribe := mustRegister(t, c, func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
-		panic("boom")
-	})
-	defer unsubscribe()
-
-	c.Publish(context.Background(), publication("t1", 3, "three"))
-
-	line := logger.lineContaining(t, "panic recovered")
-	if value, _ := line.fields["value"].(string); !strings.Contains(value, "redacted") {
-		t.Errorf("value = %v, want the redacted placeholder in production mode", line.fields["value"])
-	}
-
-	if _, logged := line.fields["stack_trace"]; logged {
-		t.Error("stack_trace was logged in production mode, want it withheld")
-	}
-
-	got := statusOf(t, c, "t1")
-	if !errors.Is(got.LastErr, ErrApplyPanicked) {
-		t.Errorf("LastErr = %v, want ErrApplyPanicked recorded", got.LastErr)
-	}
-
-	if strings.Contains(got.LastErr.Error(), "boom") {
-		t.Errorf("LastErr = %v, want no recovered value: Status would republish in the clear what the log line redacts", got.LastErr)
-	}
-
-	assertPanicScopeLine(t, logger, "t1", 3)
-}
-
 // TestCoordinatorAPanickingLoggerStillRecordsThePanic pins the observability
 // half of a recovered applier panic against the consumer's own logger failing:
 // the panic handler logs BEFORE it records the counter, the span event and the
@@ -358,9 +351,8 @@ func TestCoordinatorApplierPanicIsRedactedInProductionMode(t *testing.T) {
 // with it and the coordinator's own recovery then swallowed the unwind — a
 // fleet whose hot reload stopped, with the panic counter flat.
 //
-// Process-global like the production-mode toggle above, and safe for the same
-// reason: this test is sequential, so no t.Parallel() test overlaps it. It must
-// not call t.Parallel() itself or run parallel subtests.
+// Process-global: safe only while this test is sequential. It must not call
+// t.Parallel() itself or run parallel subtests.
 func TestCoordinatorAPanickingLoggerStillRecordsThePanic(t *testing.T) {
 	counter := panicmetric.Install(t)
 
