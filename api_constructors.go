@@ -84,6 +84,10 @@ func WithMultiTenantEnabled() Option { return internalclient.WithMultiTenantEnab
 // [WithMultiTenantEnabled]; [NewMongoDB] refuses it with
 // [ErrTenantManagerBackendMismatch]. A nil mgr only switches the mode.
 //
+// mgr must be the Manager the tenant-manager middleware registers under the
+// [WithModule] name: writes and uncached reads use the database the middleware
+// resolved, cached reads use mgr's, so two Managers split one tenant in two.
+//
 // Each tenant needs its own database. An active tenant holds one LISTEN
 // connection per replica on top of mgr's pool, so size max_connections against
 // active tenants × replicas. Revisions are opaque: they may skip, and start at
@@ -102,7 +106,8 @@ func WithPostgresTenantManager(mgr *tmpostgres.Manager) Option {
 
 // WithMongoTenantManager is [WithPostgresTenantManager]'s twin for
 // [NewMongoDB], which [NewPostgres] refuses with
-// [ErrTenantManagerBackendMismatch]. A nil mgr only switches the mode.
+// [ErrTenantManagerBackendMismatch]. A nil mgr only switches the mode, and mgr
+// must be the Manager the middleware registers, as on Postgres.
 //
 // A change stream watches one collection of one database, so tenants on
 // distinct databases of one server never see each other's writes. Two tenants

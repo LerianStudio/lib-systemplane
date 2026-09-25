@@ -120,7 +120,8 @@ func WithMultiTenantEnabled() Option {
 
 // WithPostgresTenantManager gives NewPostgres a tenant connector built from
 // mgr and implies WithMultiTenantEnabled. Last-wins, nil included: a nil mgr
-// still declares multi-tenant intent and leaves the connector unset.
+// still declares multi-tenant intent and leaves the connector unset. mgr must be
+// the Manager the tenant-manager middleware registers under the module name.
 func WithPostgresTenantManager(mgr *tmpostgres.Manager) Option {
 	return func(cfg *clientConfig) {
 		cfg.pgTenantManager = mgr
@@ -128,7 +129,8 @@ func WithPostgresTenantManager(mgr *tmpostgres.Manager) Option {
 	}
 }
 
-// WithMongoTenantManager is WithPostgresTenantManager's twin for NewMongoDB.
+// WithMongoTenantManager is WithPostgresTenantManager's twin for NewMongoDB,
+// with the same one-Manager rule.
 func WithMongoTenantManager(mgr *tmmongo.Manager) Option {
 	return func(cfg *clientConfig) {
 		cfg.mbTenantManager = mgr
