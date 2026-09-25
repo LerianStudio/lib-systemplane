@@ -730,11 +730,7 @@ func TestOverlappingReconcilesKeepFeedValue(t *testing.T) {
 
 	// Its List must be under way before the row exists: a List that started
 	// after the row committed would see it.
-	select {
-	case <-entered:
-	case <-time.After(hangGuard):
-		t.Fatal("the older reconcile never reached its List")
-	}
+	mustReceive(t, entered, "the older reconcile's List")
 
 	// The world moves on behind that photograph: the row is created and the
 	// reconnected feed publishes it.
