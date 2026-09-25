@@ -172,21 +172,12 @@ func Bind[T any](c *Client, namespace, key string, defaults T, validate func(T) 
 
 	g := &Group[T]{client: c, namespace: namespace, key: key, nullIsDocument: nullIsDocument}
 
-	// Register above has already resolved the options, so the public accessor
-	// answers with the policy this key was actually registered under. The
-	// coordinator needs the fact, not the policy: masking and hiding are the
-	// same decision to a log stream, so both collapse to true and a panicking
-	// applier's document is withheld from the panic report either way.
-	// Key-level only: when the groups-redaction lane adds its field-level
-	// accessor, it widens this gate with `|| <field-level redaction present>` (FC-13).
-	redacted := c.KeyRedaction(namespace, key) != RedactNone
-
 	// The Client's mode decides the tenant stamp on the coordinator's reports.
 	// Register above succeeded, so CatalogKey knows the key and TenantScoped
 	// reports the mode verbatim.
 	detail, _ := c.CatalogKey(namespace, key)
 
-	g.coordinator = group.NewCoordinator[T](c.Logger(), g.namespace, g.key, redacted, detail.TenantScoped,
+	g.coordinator = group.NewCoordinator[T](c.Logger(), g.namespace, g.key, detail.TenantScoped,
 		g.decodePublished, g.seedCurrentEntry)
 
 	// The group's one subscription, taken here — before Start, and therefore
@@ -260,9 +251,7 @@ func (g *Group[T]) decodePublished(value any) (T, error) {
 // invoke it and an unregistered key never reaches here. And a multi-tenant
 // Client that falls through does not serve the zero scope: its GetEntry fails
 // closed with ErrTenantConnectionMissing, because context.Background()
-// carries no tenant database. FC-13's Phase 3 reworks the catalog, and the
-// groups-redaction lane replaces this with a direct probe of the Client's mode
-// then.
+// carries no tenant database.
 func (g *Group[T]) seedCurrentEntry() (group.Publication, bool, error) {
 	if detail, known := g.client.CatalogKey(g.namespace, g.key); known && detail.TenantScoped {
 		return group.Publication{}, false, nil

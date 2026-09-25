@@ -124,12 +124,11 @@ const (
 )
 
 // assertNamesTheGroup pins the two fields that say WHICH group a coordinator
-// report is about. Without them a redacted group's report names only the
-// tenant and the revision — "apply function panicked tenant.id=t1 revision=0"
-// — and an operator has nothing to act on, because the document that would
-// have identified the group is exactly what redaction withheld. "keyname", not
-// "key": the latter is an exact entry in lib-observability's sensitive-field
-// list, and it is the same field name the engine's twin reports emit.
+// report is about. Without them a report reads "apply function panicked
+// tenant.id=t1 revision=0" and an operator has nothing to act on. "keyname",
+// not "key": the latter is an exact entry in lib-observability's
+// sensitive-field list, and it is the same field name the engine's twin
+// reports emit.
 //
 // It hangs off the recorder rather than taking a bare line so that a miss can
 // dump every line with its fields. One run in twenty of the unit suite once
@@ -164,65 +163,24 @@ func (r *recordingLogger) assertNamesTheGroup(t *testing.T, line logLine, namesp
 	}
 }
 
-// decodeRedactionCases is the axis both decode-failure tests run on. A group
-// registered redacted and one registered plain reach the same log line through
-// different renderings, and only the redacted row can tell them apart.
-var decodeRedactionCases = []struct {
-	name     string
-	redacted bool
-}{
-	{name: "plain", redacted: false},
-	{name: "redacted", redacted: true},
-}
-
-// assertDecodeFailureRendering pins what a document nobody could parse costs a
-// redacted group: the document itself. The cause of a decode failure carries
-// the row in its message by construction — encoding/json needs no help,
-// "invalid character 'h' looking for beginning of value" quotes the first byte
-// — so a redacted group's report names only what refused the document and the
-// cause's dynamic type, while a plain group's keeps the error verbatim.
-//
-// Both coordinator call sites route through safelog.ErrorDetail for exactly
-// this reason, and without the redacted row both could be written log.Err(err)
-// with nothing in the repository turning red.
-func assertDecodeFailureRendering(t *testing.T, logger *recordingLogger, redacted bool) {
+// assertDecodeFailureRendering pins how a document nobody could parse is
+// reported: the decode cause as produced, naming the group. The library adds
+// nothing to the line and withholds nothing from it.
+func assertDecodeFailureRendering(t *testing.T, logger *recordingLogger) {
 	t.Helper()
 
 	line := logger.lineContaining(t, "failed to decode")
 	logger.assertNamesTheGroup(t, line, coordNamespace, coordKey)
 
-	detail := fmt.Sprint(line.fields["error"])
-
-	if !redacted {
-		if !strings.Contains(detail, redactionMarker) {
-			t.Errorf("error = %q, want the decode cause verbatim for an unredacted group", detail)
-		}
-
-		return
-	}
-
-	for _, recorded := range logger.recorded() {
-		for key, value := range recorded.fields {
-			if text := fmt.Sprint(value); strings.Contains(text, redactionMarker) {
-				t.Errorf("log field %s carries the document of a redacted group: %s", key, text)
-			}
-		}
-
-		if strings.Contains(recorded.msg, redactionMarker) {
-			t.Errorf("a log message carries the document of a redacted group: %s", recorded.msg)
-		}
-	}
-
-	if !strings.Contains(detail, "decode failed") || !strings.Contains(detail, "*errors.errorString") {
-		t.Errorf("error = %q, want what refused the document and the cause's dynamic type, and no more", detail)
+	if detail := fmt.Sprint(line.fields["error"]); !strings.Contains(detail, payloadMarker) {
+		t.Errorf("error = %q, want the decode cause verbatim", detail)
 	}
 }
 
 // TestNoLoggedFieldNameIsRedacted reads this package's own source and refuses
-// any field name lib-observability erases. The coordinator's reports are the
-// only thing naming a redacted group whose document is withheld, so a
-// log.String("key", …) slipping in here would hand an operator
-// namespace=grpns key=[REDACTED] and nothing else.
+// any field name lib-observability erases. The coordinator's reports are what
+// name the group that stopped being applied, so a log.String("key", …)
+// slipping in here would hand an operator namespace=grpns key=[REDACTED].
 // It runs in parallel: it only parses this package's source. Go pauses a
 // t.Parallel() top-level test and resumes it only after every sequential
 // top-level test in the package has returned, so it can never overlap the
@@ -295,7 +253,7 @@ func TestCoordinatorApplierErrorRecordsARejection(t *testing.T) {
 
 func TestCoordinatorApplierPanicIsRecordedLikeAnError(t *testing.T) {
 	logger := newRecordingLogger()
-	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, false, true, Decode[coordDoc], nil)
+	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, true, Decode[coordDoc], nil)
 	ctx := context.Background()
 
 	unsubscribe := mustRegister(t, c, func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
@@ -359,7 +317,7 @@ func TestCoordinatorApplierPanicIsRedactedInProductionMode(t *testing.T) {
 	defer runtime.SetProductionMode(false)
 
 	logger := newRecordingLogger()
-	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, false, true, Decode[coordDoc], nil)
+	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, true, Decode[coordDoc], nil)
 
 	unsubscribe := mustRegister(t, c, func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
 		panic("boom")
@@ -402,7 +360,7 @@ func TestCoordinatorApplierPanicIsRedactedInProductionMode(t *testing.T) {
 func TestCoordinatorAPanickingLoggerStillRecordsThePanic(t *testing.T) {
 	counter := panicmetric.Install(t)
 
-	c := NewCoordinator[coordDoc](&alwaysPanickingLogger{NopLogger: &log.NopLogger{}}, coordNamespace, coordKey, false, false, Decode[coordDoc], nil)
+	c := NewCoordinator[coordDoc](&alwaysPanickingLogger{NopLogger: &log.NopLogger{}}, coordNamespace, coordKey, false, Decode[coordDoc], nil)
 
 	unsubscribe := mustRegister(t, c, func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
 		panic("the apply function exploded")
@@ -428,89 +386,48 @@ func TestCoordinatorAPanickingLoggerStillRecordsThePanic(t *testing.T) {
 // TestCoordinatorApplierErrorIsLogged pins the operational half of a rejection:
 // Status is a pull surface nobody reads at 3am, so an applier refusing a
 // configuration must also reach the consumer's logger, naming the scope, the
-// revision and the error — the error rendered under the group's own redaction
-// policy.
-//
-// It runs redacted as well as plain because the redacted row is the only thing
-// standing between a RedactFull group's document and an ERROR record. An apply
-// hook that refuses a document names it — fmt.Errorf("cannot apply %+v",
-// doc) — so the rejection's cause carries the whole document by construction,
-// exactly as a decode failure's does. Without this row the call site could be
-// written log.Err(err) with nothing in the repository turning red.
+// revision and the error the applier returned.
 func TestCoordinatorApplierErrorIsLogged(t *testing.T) {
-	for _, tc := range decodeRedactionCases {
-		t.Run(tc.name, func(t *testing.T) {
-			logger := newRecordingLogger()
-			c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, tc.redacted, true, Decode[coordDoc], nil)
+	logger := newRecordingLogger()
+	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, true, Decode[coordDoc], nil)
 
-			// The applier names what it refused, which is what a consumer's
-			// apply hook does when it wants the log to be actionable.
-			rejection := fmt.Errorf("refused %s", redactionMarker)
+	// The applier names what it refused, which is what a consumer's
+	// apply hook does when it wants the log to be actionable.
+	rejection := fmt.Errorf("refused %s", payloadMarker)
 
-			unsubscribe := mustRegister(t, c, func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
-				return rejection
-			})
-			defer unsubscribe()
+	unsubscribe := mustRegister(t, c, func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error {
+		return rejection
+	})
+	defer unsubscribe()
 
-			c.Publish(context.Background(), publication("t1", 5, "five"))
+	c.Publish(context.Background(), publication("t1", 5, "five"))
 
-			line := logger.lineContaining(t, "rejected")
-			if line.level != log.LevelError {
-				t.Errorf("the rejection logged at %s level, want error", log.LevelName(line.level))
-			}
-
-			if got := line.fields[constants.AttrKeyTenantID]; got != "t1" {
-				t.Errorf("%s = %v, want the rejecting scope", constants.AttrKeyTenantID, got)
-			}
-
-			if revision, _ := line.fields["revision"].(int64); revision != 5 {
-				t.Errorf("revision = %v, want 5", line.fields["revision"])
-			}
-
-			logger.assertNamesTheGroup(t, line, coordNamespace, coordKey)
-			assertRejectionRendering(t, logger, tc.redacted, rejection)
-		})
+	line := logger.lineContaining(t, "rejected")
+	if line.level != log.LevelError {
+		t.Errorf("the rejection logged at %s level, want error", log.LevelName(line.level))
 	}
+
+	if got := line.fields[constants.AttrKeyTenantID]; got != "t1" {
+		t.Errorf("%s = %v, want the rejecting scope", constants.AttrKeyTenantID, got)
+	}
+
+	if revision, _ := line.fields["revision"].(int64); revision != 5 {
+		t.Errorf("revision = %v, want 5", line.fields["revision"])
+	}
+
+	logger.assertNamesTheGroup(t, line, coordNamespace, coordKey)
+	assertRejectionRendering(t, logger, rejection)
 }
 
 // assertRejectionRendering is assertDecodeFailureRendering's twin for the cause
-// an APPLIER returns: verbatim for a plain group, and for a redacted one only
-// what refused the document and the cause's dynamic type, with the document
-// itself nowhere in the log.
-//
-// FC-7's Status keeps the error untouched either way — that is the consumer's
-// own surface, not a log sink — so only what the log carries changes.
-func assertRejectionRendering(t *testing.T, logger *recordingLogger, redacted bool, rejection error) {
+// an APPLIER returns: the rejection itself, which is also the error FC-7's
+// Status keeps.
+func assertRejectionRendering(t *testing.T, logger *recordingLogger, rejection error) {
 	t.Helper()
 
 	line := logger.lineContaining(t, "rejected")
-	detail := fmt.Sprint(line.fields["error"])
-
-	if !redacted {
-		if err, _ := line.fields["error"].(error); !errors.Is(err, rejection) {
-			t.Errorf("error = %v, want the applier's rejection verbatim for an unredacted group",
-				line.fields["error"])
-		}
-
-		return
-	}
-
-	for _, recorded := range logger.recorded() {
-		for key, value := range recorded.fields {
-			if text := fmt.Sprint(value); strings.Contains(text, redactionMarker) {
-				t.Errorf("log field %s carries the document of a redacted group: %s", key, text)
-			}
-		}
-
-		if strings.Contains(recorded.msg, redactionMarker) {
-			t.Errorf("a log message carries the document of a redacted group: %s", recorded.msg)
-		}
-	}
-
-	if !strings.Contains(detail, "apply rejected the document") ||
-		!strings.Contains(detail, fmt.Sprintf("%T", rejection)) {
-		t.Errorf("error = %q, want what refused the document and the cause's dynamic type, and no more",
-			detail)
+	if err, _ := line.fields["error"].(error); !errors.Is(err, rejection) {
+		t.Errorf("error = %v, want the applier's rejection verbatim", line.fields["error"])
 	}
 }
 
@@ -580,63 +497,59 @@ func TestCoordinatorRejectionIsNeverRetried(t *testing.T) {
 // TestCoordinatorDecodeFailureIsRecordedAndNeverDelivered pins a published
 // document nobody could parse: it never reaches an applier, the last good one
 // stays replayable, the scope keeps reporting the failure, and the log names
-// the group exactly once — under the group's own redaction policy.
+// the group exactly once.
 func TestCoordinatorDecodeFailureIsRecordedAndNeverDelivered(t *testing.T) {
-	for _, tc := range decodeRedactionCases {
-		t.Run(tc.name, func(t *testing.T) {
-			logger := newRecordingLogger()
-			c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, tc.redacted, false, rejectingDecode(redactionMarker), nil)
-			ctx := context.Background()
+	logger := newRecordingLogger()
+	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, false, rejectingDecode(payloadMarker), nil)
+	ctx := context.Background()
 
-			var rec recorder
+	var rec recorder
 
-			unsubscribe := mustRegister(t, c, rec.apply)
-			defer unsubscribe()
+	unsubscribe := mustRegister(t, c, rec.apply)
+	defer unsubscribe()
 
-			c.Publish(ctx, publication("t1", 1, "good"))
-			c.Publish(ctx, publication("t1", 2, redactionMarker))
+	c.Publish(ctx, publication("t1", 1, "good"))
+	c.Publish(ctx, publication("t1", 2, payloadMarker))
 
-			if got := rec.names(); len(got) != 1 || got[0] != "good" {
-				t.Errorf("deliveries = %v, want only the decodable document: garbage must never reach an applier", got)
-			}
+	if got := rec.names(); len(got) != 1 || got[0] != "good" {
+		t.Errorf("deliveries = %v, want only the decodable document: garbage must never reach an applier", got)
+	}
 
-			got := statusOf(t, c, "t1")
-			if got.Desired != 2 {
-				t.Errorf("Desired = %d, want 2: a revision rejected at decode still advances Desired", got.Desired)
-			}
+	got := statusOf(t, c, "t1")
+	if got.Desired != 2 {
+		t.Errorf("Desired = %d, want 2: a revision rejected at decode still advances Desired", got.Desired)
+	}
 
-			if got.Applied != 1 {
-				t.Errorf("Applied = %d, want 1: the last good revision stays applied", got.Applied)
-			}
+	if got.Applied != 1 {
+		t.Errorf("Applied = %d, want 1: the last good revision stays applied", got.Applied)
+	}
 
-			if got.LastErr == nil {
-				t.Error("LastErr = nil, want the decode failure")
-			}
+	if got.LastErr == nil {
+		t.Error("LastErr = nil, want the decode failure")
+	}
 
-			assertDecodeFailureRendering(t, logger, tc.redacted)
+	assertDecodeFailureRendering(t, logger)
 
-			// The last good publication must stay replayable for a later Register.
-			var late recorder
+	// The last good publication must stay replayable for a later Register.
+	var late recorder
 
-			unsubscribeLate := mustRegister(t, c, late.apply)
-			defer unsubscribeLate()
+	unsubscribeLate := mustRegister(t, c, late.apply)
+	defer unsubscribeLate()
 
-			if names := late.names(); len(names) != 1 || names[0] != "good" {
-				t.Errorf("replay = %v, want the last decodable document", names)
-			}
+	if names := late.names(); len(names) != 1 || names[0] != "good" {
+		t.Errorf("replay = %v, want the last decodable document", names)
+	}
 
-			// The replay hands revision 1 to a second applier, and that acceptance must
-			// not read as convergence: the newest thing the scope observed is the
-			// malformed revision 2, which nobody applied.
-			got = statusOf(t, c, "t1")
-			if got.Desired != 2 {
-				t.Errorf("Desired after the replay = %d, want 2: the malformed revision is still the newest observation", got.Desired)
-			}
+	// The replay hands revision 1 to a second applier, and that acceptance must
+	// not read as convergence: the newest thing the scope observed is the
+	// malformed revision 2, which nobody applied.
+	got = statusOf(t, c, "t1")
+	if got.Desired != 2 {
+		t.Errorf("Desired after the replay = %d, want 2: the malformed revision is still the newest observation", got.Desired)
+	}
 
-			if got.LastErr == nil {
-				t.Error("LastErr after the replay = nil, want the decode failure: replaying an older revision is not an acceptance of the newest one")
-			}
-		})
+	if got.LastErr == nil {
+		t.Error("LastErr after the replay = nil, want the decode failure: replaying an older revision is not an acceptance of the newest one")
 	}
 }
 
@@ -671,7 +584,7 @@ func TestCoordinatorSupersededDecodeFailureIsStillLogged(t *testing.T) {
 		return doc, nil
 	}
 
-	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, false, true, decode, nil)
+	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, true, decode, nil)
 	ctx := context.Background()
 
 	var rec recorder
@@ -733,7 +646,7 @@ func TestCoordinatorDecodeFailureOnAFreshScopeIsObserved(t *testing.T) {
 		return Publication{}, false, nil
 	}
 
-	c := NewCoordinator[coordDoc](newRecordingLogger(), coordNamespace, coordKey, false, false, rejectingDecode("bad"), seed)
+	c := NewCoordinator[coordDoc](newRecordingLogger(), coordNamespace, coordKey, false, rejectingDecode("bad"), seed)
 
 	c.Publish(context.Background(), publication("t1", 4, "bad"))
 
@@ -796,7 +709,7 @@ func TestCoordinatorNullValueIsRejectedByTheCodecAndNeverDelivered(t *testing.T)
 		return Decode[coordDoc](value)
 	}
 
-	c := NewCoordinator[coordDoc](newRecordingLogger(), coordNamespace, coordKey, false, false, refuseNull, nil)
+	c := NewCoordinator[coordDoc](newRecordingLogger(), coordNamespace, coordKey, false, refuseNull, nil)
 	ctx := context.Background()
 
 	var rec recorder
@@ -966,7 +879,7 @@ func TestCoordinatorUnsubscribeStopsDeliveryAndReleasesStatus(t *testing.T) {
 // nobody is applying is healthy. LastErr clears when an applier ACCEPTS, and
 // leaving is not accepting.
 func TestCoordinatorUnsubscribingTheLastApplierKeepsTheRejection(t *testing.T) {
-	c := NewCoordinator[coordDoc](newRecordingLogger(), coordNamespace, coordKey, false, false, rejectingDecode("bad"), nil)
+	c := NewCoordinator[coordDoc](newRecordingLogger(), coordNamespace, coordKey, false, rejectingDecode("bad"), nil)
 
 	c.Publish(context.Background(), publication("t1", 4, "bad"))
 
@@ -1152,7 +1065,7 @@ func TestCoordinatorLastApplierRejectingAndLeavingKeepsTheRejection(t *testing.T
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			c := NewCoordinator[coordDoc](tc.logger, coordNamespace, coordKey, false, false, Decode[coordDoc], nil)
+			c := NewCoordinator[coordDoc](tc.logger, coordNamespace, coordKey, false, Decode[coordDoc], nil)
 
 			var (
 				unsubscribe func()
@@ -1226,7 +1139,7 @@ func TestMultiTenantGroupReportsNameTheTenant(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			logger := newRecordingLogger()
-			c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, false, true, rejectingDecode("bad"),
+			c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, true, rejectingDecode("bad"),
 				seedOf(publication(tc.tenant, 1, "bad")))
 
 			driveEveryGroupReport(t, c, tc.tenant)
@@ -1247,7 +1160,7 @@ func TestMultiTenantGroupReportsNameTheTenant(t *testing.T) {
 // may carry the key at all.
 func TestSingleTenantGroupReportsCarryNoTenant(t *testing.T) {
 	logger := newRecordingLogger()
-	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, false, false, rejectingDecode("bad"), seedOf(publication("", 1, "bad")))
+	c := NewCoordinator[coordDoc](logger, coordNamespace, coordKey, false, rejectingDecode("bad"), seedOf(publication("", 1, "bad")))
 
 	driveEveryGroupReport(t, c, "")
 
