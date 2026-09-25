@@ -260,7 +260,7 @@ func (e *Engine) workerFor(sc *scopeState, nk NSKey) *dispatchWorker {
 // subscriber inside deliver, and the report deliver then makes cannot unwind
 // out either: reportConsumerPanic hands it to reportRecovered, which swallows
 // a panic raised by the consumer's own recorder or error reporter, and the
-// consumer's logger is wrapped at construction by safelog.Guard. It is kept
+// consumer's logger is wrapped at construction by log.Guard. It is kept
 // as defence in depth, the way ingestDefault keeps its unregistered-key
 // branch: a future delivery step that panics outside deliver's recovery is
 // repaired here rather than left in the map. Left in place, that dead worker

@@ -13,7 +13,6 @@ import (
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/runtime"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/debounce"
-	"github.com/LerianStudio/lib-systemplane/v4/internal/safelog"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -122,14 +121,14 @@ type Config struct {
 // The logger is guarded ONCE, here, rather than at each of the sites that hand
 // it to a recovery handler or a goroutine launcher: every one of them reads
 // e.logger, and the debouncer is handed the same wrapped value, so the guard
-// covers the whole engine and nothing new has to remember it. safelog.Guard is
+// covers the whole engine and nothing new has to remember it. log.Guard is
 // idempotent, so a Client that guarded the same logger already pays for one
 // wrapper, not two.
 //
 // It opens no connection and starts no goroutine — Start does that — so a
 // Client that is constructed and never started leaves nothing behind.
 func New(cfg Config) *Engine {
-	logger := safelog.Guard(cfg.Logger)
+	logger := log.Guard(cfg.Logger)
 
 	closeTimeout := cfg.CloseTimeout
 	if closeTimeout <= 0 {

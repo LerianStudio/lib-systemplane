@@ -18,6 +18,7 @@ import (
 	obsconstants "github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/testsupport/panicmetric"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -672,6 +673,9 @@ func TestMongoSubscribe_JoinerIsToldTheFeedState(t *testing.T) {
 // completes.
 func TestMongoSubscribe_PanickingCallbackDoesNotEscapeOrHoldLock(t *testing.T) {
 	s := newSubscribeStore()
+	logger := &captureLogger{}
+	s.cfg.Logger = logger
+	counter := panicmetric.Install(t)
 
 	f, err := s.zeroFeed()
 	if err != nil {
@@ -717,6 +721,8 @@ func TestMongoSubscribe_PanickingCallbackDoesNotEscapeOrHoldLock(t *testing.T) {
 	if got[0].Op != store.OpResync || got[0].Scope != f.scope {
 		t.Fatalf("joining event = %+v, want {Scope:%+v Op:%q}", got[0], f.scope, store.OpResync)
 	}
+
+	requirePanicReported(t, logger, counter, "handler")
 
 	// sub.mu must be free again: a second delivery has to complete rather than
 	// block forever on a mutex the panicking callback unwound past.

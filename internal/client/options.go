@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
-	"github.com/LerianStudio/lib-systemplane/v4/internal/safelog"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -148,10 +147,10 @@ func applyClientOptions(cfg *clientConfig, opts []Option) {
 	// the caller cannot recover, so a logger that panics kills the process
 	// from any of them. Guarding at each of those call sites is a rule the
 	// next one has to remember; guarding the value they all read is not.
-	// safelog.Guard is idempotent, so engine.New guarding again costs one
+	// log.Guard is idempotent, so engine.New guarding again costs one
 	// wrapper rather than two, and a nil logger becomes a no-op one.
 	cfg.consumerLogger = cfg.logger
-	cfg.logger = safelog.Guard(cfg.logger)
+	cfg.logger = log.Guard(cfg.logger)
 }
 
 // KeyOption configures a single key at registration time.

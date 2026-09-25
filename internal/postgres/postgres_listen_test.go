@@ -21,6 +21,7 @@ import (
 	obsconstants "github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/testsupport/panicmetric"
 	"go.uber.org/goleak"
 )
 
@@ -245,11 +246,13 @@ func TestPostgresFeed_CloseRacingConnectionLoss_EmitsNoDisconnect(t *testing.T) 
 // the joining callback panics, and a second delivery to the same subscription
 // still completes.
 func TestPostgresSubscribe_PanickingCallbackDoesNotEscapeOrHoldLock(t *testing.T) {
-	s := newSubscribeStore()
+	s, logger := loggingStore()
 	f, err := s.zeroFeedForStart()
 	if err != nil {
 		t.Fatalf("zeroFeedForStart: %v", err)
 	}
+
+	counter := panicmetric.Install(t)
 
 	f.beginResync() // mark the feed connected, as a successful LISTEN does
 
@@ -290,6 +293,8 @@ func TestPostgresSubscribe_PanickingCallbackDoesNotEscapeOrHoldLock(t *testing.T
 	if got[0].Op != store.OpResync || got[0].Scope != f.scope {
 		t.Fatalf("joining event = %+v, want {Scope:%+v Op:%q}", got[0], f.scope, store.OpResync)
 	}
+
+	requirePanicReported(t, logger, counter, "handler")
 
 	// sub.mu must be free again: a second delivery has to complete rather than
 	// block forever on a mutex the panicking callback unwound past.
@@ -1228,6 +1233,26 @@ func (e captureEntry) field(t *testing.T, key string) any {
 	t.Fatalf("log entry %q carries no %q field (%+v)", e.msg, key, e.fields)
 
 	return nil
+}
+
+// requirePanicReported asserts the whole report of the one panic recovered so
+// far: the ERROR "panic recovered" line naming source, and one increment of the
+// panic counter under this package's component and that same source. The line
+// alone is not enough — the bare recovery the store used before logged it too,
+// and counted nothing.
+func requirePanicReported(t *testing.T, logger *captureLogger, counter *panicmetric.Recorder, source string) {
+	t.Helper()
+
+	e := logger.only(t, log.LevelError, "recovered panic")
+	if e.msg != "panic recovered" {
+		t.Errorf("ERROR line = %q, want %q", e.msg, "panic recovered")
+	}
+
+	if got := e.field(t, "source"); got != source {
+		t.Errorf("panic line source = %v, want %q", got, source)
+	}
+
+	counter.RequireOnly(t, "systemplane.postgres", source)
 }
 
 // loggingStore builds the Store of newSubscribeStore with a capturing logger.

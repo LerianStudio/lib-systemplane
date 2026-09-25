@@ -482,7 +482,7 @@ Key API contracts that must be preserved:
 | Lifecycle | Construct → `Register`/`RegisterTenantScoped` → `Start(ctx)` → runtime ops → `Close()`. `Register` after `Start` returns `ErrRegisterAfterStart`. |
 | Read paths | `Get`, `GetString`, `GetInt`, `GetBool`, `GetFloat64`, `GetDuration` are nil-receiver safe and return zero values on miss. |
 | Write path | `Set(ctx, ns, key, value, actor)` — last-write-wins with write-through cache; subscribers fire via changefeed echo, not synchronously. |
-| Subscriptions | `OnChange(ns, key, fn)` returns an `unsubscribe` func. Callbacks invoked serially with panic recovery via `lib-observability/runtime.RecoverAndLog`. |
+| Subscriptions | `OnChange(ns, key, fn)` returns an `unsubscribe` func. Callbacks invoked serially with panics reported via `lib-observability/runtime.HandlePanicValue` (component `systemplane.engine`, name `onchange`). |
 | Tenant-scoped keys | `RegisterTenantScoped` declares per-tenant eligibility; legacy `Get`/`OnChange`/`List` continue observing only the shared `_global` row (non-breaking addition). |
 | Tenant access | `GetForTenant`, `SetForTenant`, `DeleteForTenant`, `ListTenantsForKey`, `OnTenantChange` plus typed accessor mirrors. Fail-closed — no silent fallback to global. |
 | Tenant validation | Tenant ID extracted via `core.GetTenantIDContext`, validated by `core.IsValidTenantID`. `_global` is reserved and rejected as a tenant ID. |

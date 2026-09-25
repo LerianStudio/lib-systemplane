@@ -15,6 +15,7 @@ import (
 	obsconstants "github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/testsupport/panicmetric"
 	"github.com/bxcodec/dbresolver/v2"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"go.opentelemetry.io/otel/attribute"
@@ -156,8 +157,8 @@ func TestStore_ClosedAndNilPaths(t *testing.T) {
 	}
 }
 
+// Not parallel: see panicmetric.
 func TestNotifyPayloadParsingAndDispatch(t *testing.T) {
-	t.Parallel()
 
 	valid, ok := parseNotifyPayload(`{"namespace":"ns","key":"k","op":"upsert"}`)
 	if !ok || valid.Namespace != "ns" || valid.Key != "k" || valid.Op != store.OpUpsert {
@@ -204,11 +205,13 @@ func TestNotifyPayloadParsingAndDispatch(t *testing.T) {
 		t.Fatalf("truncateString exact = %q, want abc", got)
 	}
 
-	s := newSubscribeStore()
+	s, logger := loggingStore()
 	f, err := s.zeroFeedForStart()
 	if err != nil {
 		t.Fatalf("zeroFeedForStart: %v", err)
 	}
+
+	counter := panicmetric.Install(t)
 
 	var got []store.Event
 	f.subs[1] = &subscription{fn: func(store.Event) { panic("handler panic must be recovered") }}
@@ -218,6 +221,8 @@ func TestNotifyPayloadParsingAndDispatch(t *testing.T) {
 	if len(got) != 1 || got[0] != valid {
 		t.Fatalf("dispatch events = %#v, want %#v", got, []store.Event{valid})
 	}
+
+	requirePanicReported(t, logger, counter, "handler")
 
 	// The parser leaves Scope zero on purpose — it is a pure function of the
 	// payload, and a payload cannot name its own scope. dispatch is the single

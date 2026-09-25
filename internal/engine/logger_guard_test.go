@@ -34,8 +34,8 @@ func (deadLogger) Sync(context.Context) error { return nil }
 // logger — the reconcile worker, the debounced changefeed re-read, and a
 // delivery worker — and the one question the engine asks that logger OUTSIDE
 // every recovery: the DEBUG level check the changefeed goroutine runs per
-// event for an unregistered key. Nothing but safelog.Guard's Enabled
-// stands between that check and the process.
+// event for an unregistered key. Nothing but log.Guard stands between that
+// check and the process.
 //
 // Each of them recovers consumer code — a registered validator, a subscriber
 // callback — and then REPORTS that recovery through the logger the consumer

@@ -39,6 +39,7 @@ import (
 
 	commonshttp "github.com/LerianStudio/lib-commons/v7/commons/net/http"
 	"github.com/LerianStudio/lib-observability/v4/log"
+	"github.com/LerianStudio/lib-observability/v4/runtime"
 	systemplane "github.com/LerianStudio/lib-systemplane/v4"
 	"github.com/gofiber/fiber/v3"
 )
@@ -48,6 +49,17 @@ const (
 	maxKeyLen            = 512
 	catalogMetaNamespace = "-"
 	catalogKey           = "catalog"
+
+	// recoveryComponent is the component a panic in a consumer function is
+	// counted under on panic_recovered_total.
+	recoveryComponent = "systemplane.admin"
+)
+
+// A panicking consumer function becomes one of these errors: the authorizer's
+// is a denial, the actor extractor's a generic 500. Neither carries the value.
+var (
+	errAuthorizerPanicked     = errors.New("admin: authorizer panicked")
+	errActorExtractorPanicked = errors.New("admin: actor extractor panicked")
 )
 
 // mountConfig holds options applied by MountOption functions.
@@ -82,6 +94,7 @@ func WithPathPrefix(p string) MountOption {
 // WithAuthorizer sets an authorization check called before each handler. The
 // action argument is "read" for GET requests and "write" for PUT/DELETE
 // requests. Return a non-nil error to reject the request with 403 Forbidden.
+// A panic in fn is recovered, reported, and answered with 403 as well.
 func WithAuthorizer(fn func(fiber.Ctx, string) error) MountOption {
 	return func(cfg *mountConfig) {
 		if fn != nil {
@@ -92,7 +105,9 @@ func WithAuthorizer(fn func(fiber.Ctx, string) error) MountOption {
 
 // WithActorExtractor sets a function that extracts the actor identity from
 // the request context; the returned string is passed as the actor argument
-// to [systemplane.Client.Set] and [systemplane.Client.Delete].
+// to [systemplane.Client.Set] and [systemplane.Client.Delete]. A panic in fn
+// is recovered and reported; the request is answered with 500 and nothing is
+// written.
 func WithActorExtractor(fn func(fiber.Ctx) string) MountOption {
 	return func(cfg *mountConfig) {
 		if fn != nil {
@@ -119,15 +134,15 @@ func Mount(router fiber.Router, c *systemplane.Client, opts ...MountOption) {
 	}
 
 	prefix := normalizePathPrefix(cfg.pathPrefix)
-	logger := c.Logger()
+	logger := log.Guard(c.Logger())
 
 	router.Get(prefix+"/:namespace", validateNamespaceParam, authorize(cfg, logger, "read"), handleList(c))
 	router.Get(prefix+"/:namespace/:key", validatePathParams, authorize(cfg, logger, "read"), handleGetOne(c))
 	router.Get(prefix+"/:namespace/*", validateWildcardPathParams, authorize(cfg, logger, "read"), handleGetOne(c))
-	router.Put(prefix+"/:namespace/:key", validatePathParams, authorize(cfg, logger, "write"), handlePut(c, cfg))
-	router.Put(prefix+"/:namespace/*", validateWildcardPathParams, authorize(cfg, logger, "write"), handlePut(c, cfg))
-	router.Delete(prefix+"/:namespace/:key", validatePathParams, authorize(cfg, logger, "write"), handleDelete(c, cfg))
-	router.Delete(prefix+"/:namespace/*", validateWildcardPathParams, authorize(cfg, logger, "write"), handleDelete(c, cfg))
+	router.Put(prefix+"/:namespace/:key", validatePathParams, authorize(cfg, logger, "write"), handlePut(c, cfg, logger))
+	router.Put(prefix+"/:namespace/*", validateWildcardPathParams, authorize(cfg, logger, "write"), handlePut(c, cfg, logger))
+	router.Delete(prefix+"/:namespace/:key", validatePathParams, authorize(cfg, logger, "write"), handleDelete(c, cfg, logger))
+	router.Delete(prefix+"/:namespace/*", validateWildcardPathParams, authorize(cfg, logger, "write"), handleDelete(c, cfg, logger))
 }
 
 // MountCatalog registers read-only catalog metadata routes on router using the
@@ -153,7 +168,7 @@ func MountCatalog(router fiber.Router, c *systemplane.Client, opts ...MountOptio
 	}
 
 	prefix := normalizePathPrefix(cfg.pathPrefix)
-	logger := c.Logger()
+	logger := log.Guard(c.Logger())
 	catalogPath := catalogPathPrefix(prefix)
 
 	router.Get(catalogPath, authorize(cfg, logger, "read"), handleCatalogList(c, prefix))
@@ -170,7 +185,7 @@ func normalizePathPrefix(prefix string) string {
 
 func authorize(cfg mountConfig, logger log.Logger, action string) fiber.Handler {
 	return func(c fiber.Ctx) error {
-		if err := cfg.authorizer(c, action); err != nil {
+		if err := callAuthorizer(c, cfg, logger, action); err != nil {
 			logger.Log(c.Context(), log.LevelDebug, "admin: authorizer denied",
 				log.String("action", action),
 				log.Err(err),
@@ -181,6 +196,35 @@ func authorize(cfg mountConfig, logger log.Logger, action string) fiber.Handler 
 
 		return c.Next()
 	}
+}
+
+// callAuthorizer runs the consumer's authorizer and turns a panic into a
+// reported denial: the request fails closed, as with no authorizer at all,
+// instead of unwinding into Fiber, which can take the host process down.
+func callAuthorizer(c fiber.Ctx, cfg mountConfig, logger log.Logger, action string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			runtime.HandlePanicValue(c.Context(), logger, r, recoveryComponent, "authorizer")
+
+			err = errAuthorizerPanicked
+		}
+	}()
+
+	return cfg.authorizer(c, action)
+}
+
+// extractActor runs the consumer's actor extractor. A panic is reported and
+// returned as an error: no write may land without the actor that attributes it.
+func extractActor(c fiber.Ctx, cfg mountConfig, logger log.Logger) (actor string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			runtime.HandlePanicValue(c.Context(), logger, r, recoveryComponent, "actor_extractor")
+
+			err = errActorExtractorPanicked
+		}
+	}()
+
+	return cfg.actorExtractor(c), nil
 }
 
 func validateNamespaceParam(c fiber.Ctx) error {
@@ -402,7 +446,7 @@ func handleGetOne(client *systemplane.Client) fiber.Handler {
 	}
 }
 
-func handlePut(client *systemplane.Client, cfg mountConfig) fiber.Handler {
+func handlePut(client *systemplane.Client, cfg mountConfig, logger log.Logger) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		namespace, key := registeredPathParams(client, c)
 
@@ -411,7 +455,10 @@ func handlePut(client *systemplane.Client, cfg mountConfig) fiber.Handler {
 			return commonshttp.RespondError(c, http.StatusBadRequest, "bad_request", badRequestMsg)
 		}
 
-		actor := cfg.actorExtractor(c)
+		actor, err := extractActor(c, cfg, logger)
+		if err != nil {
+			return mapSentinelErr(c, err)
+		}
 
 		if err := client.Set(c.Context(), namespace, key, value, actor); err != nil {
 			return mapSentinelErr(c, err)
@@ -421,11 +468,14 @@ func handlePut(client *systemplane.Client, cfg mountConfig) fiber.Handler {
 	}
 }
 
-func handleDelete(client *systemplane.Client, cfg mountConfig) fiber.Handler {
+func handleDelete(client *systemplane.Client, cfg mountConfig, logger log.Logger) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		namespace, key := registeredPathParams(client, c)
 
-		actor := cfg.actorExtractor(c)
+		actor, err := extractActor(c, cfg, logger)
+		if err != nil {
+			return mapSentinelErr(c, err)
+		}
 
 		if err := client.Delete(c.Context(), namespace, key, actor); err != nil {
 			return mapSentinelErr(c, err)
