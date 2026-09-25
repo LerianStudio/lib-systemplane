@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"sync"
 	"time"
 
@@ -226,6 +227,13 @@ type scopeState struct {
 	// Guarded by mu, alongside unconfirmed, and created lazily for the same
 	// reason.
 	retrying map[retryKey]struct{}
+	// inflight holds the keys with a tracked re-read running; again, the keys
+	// notified meanwhile, each owed one trailing read that is a delete if any
+	// notification it stands for was. Guarded by mu.
+	inflight map[NSKey]bool
+	again    map[NSKey]bool
+	// getSem holds one token per Store.Get this scope's re-reads have in flight.
+	getSem chan struct{}
 	// disconnectGen is bumped on every OpDisconnect. A reconcile records it
 	// when it starts and clears stale only if it is unchanged at completion,
 	// so a reconcile that spans a new disconnect cannot clear the flag that
@@ -300,6 +308,11 @@ type scopeState struct {
 	unsubscribe func()
 }
 
+// refreshGetLimit caps the Store.Get calls one scope's re-reads hold at once, so
+// a bulk delete of K keys queues K reads instead of checking out K connections.
+// ponytail: fixed per-scope cap; an option if a consumer's pool sizing needs it
+const refreshGetLimit = 8
+
 // newScopeState begins tracking scope.
 //
 // The scope starts stale: until its first reconcile completes, nothing has
@@ -314,6 +327,9 @@ func newScopeState(scope store.Scope) *scopeState {
 		scope:              scope,
 		entries:            make(map[NSKey]entry),
 		fences:             make(map[NSKey]keyFence),
+		inflight:           make(map[NSKey]bool),
+		again:              make(map[NSKey]bool),
+		getSem:             make(chan struct{}, refreshGetLimit),
 		workers:            make(map[NSKey]*dispatchWorker),
 		stale:              true,
 		firstReconcileDone: make(chan struct{}),
@@ -410,6 +426,51 @@ func (sc *scopeState) endRetry(rk retryKey) {
 	defer sc.mu.Unlock()
 
 	delete(sc.retrying, rk)
+}
+
+// beginRefresh claims nk's tracked re-read, reporting false when one is already
+// running: that one then owes a trailing read, a delete if deleted.
+func (sc *scopeState) beginRefresh(nk NSKey, deleted bool) bool {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	if sc.inflight[nk] {
+		sc.again[nk] = sc.again[nk] || deleted
+
+		return false
+	}
+
+	sc.inflight[nk] = true
+
+	return true
+}
+
+// endRefresh reports whether nk owes a trailing read and whether it is a
+// delete, releasing the claim beginRefresh took when it owes none.
+func (sc *scopeState) endRefresh(nk NSKey) (again, deleted bool) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	if deleted, again = sc.again[nk]; again {
+		delete(sc.again, nk)
+
+		return true, deleted
+	}
+
+	delete(sc.inflight, nk)
+
+	return false, false
+}
+
+// acquireGet takes one of the scope's Store.Get slots, or reports false once
+// ctx ends, so Close never waits on a full cap.
+func (sc *scopeState) acquireGet(ctx context.Context) bool {
+	select {
+	case sc.getSem <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // armReconcile opens a reconcile window and puts it in the scope's single-slot
