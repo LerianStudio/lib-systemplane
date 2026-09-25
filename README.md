@@ -394,7 +394,7 @@ panics answers 500 and writes nothing.
 
 ## Scope
 
-Systemplane is intended for **runtime-mutable knobs only**. Bootstrap-only configuration (DB DSNs, secrets, TLS material, telemetry endpoints, server identity) and any credential-like runtime value belongs in environment variables or a secret manager — not here. Nothing in systemplane masks a value: a value stored here is readable by every caller the admin authorizer allows, and appears in logs and errors, so mount `/system` behind an operator/admin permission.
+Systemplane is intended for **runtime-mutable knobs only**. Bootstrap-only configuration (DB DSNs, secrets, TLS material, telemetry endpoints, server identity) and any credential-like runtime value belongs in environment variables or a secret manager — not here. Nothing in systemplane masks a value: a value stored here is readable by every caller the admin authorizer allows, so mount `/system` behind an operator/admin permission.
 
 ## License
 

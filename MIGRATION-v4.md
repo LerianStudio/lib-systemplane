@@ -244,9 +244,8 @@ every operator who can reach the admin surface.
 Admin GET, list and catalog detail return values and defaults in clear, and
 the catalog loses its `redaction` field. Values are served in clear to every
 caller the admin authorizer allows, so mount `/system` behind an
-operator/admin permission. Typed-getter errors quote the stored value they
-could not convert; decode and validator lines carry the error as produced, and
-a panic report carries the panic value
+operator/admin permission. Decode and validator lines carry the error as
+produced, and a panic report carries the panic value
 ([README § Panic recovery](README.md#panic-recovery)).
 
 **Do:** drop every `WithRedaction` call; a value that stays here is served in
@@ -620,7 +619,7 @@ drop the option from each call ([§ The surface diff](#the-surface-diff)).
 3. Rewrite each `OnChange` callback to `func(ctx context.Context, ch Change)`; namespace, key, revision and value all come off `ch`.
 4. Audit every validator for Go-type assertions — a whole number arrives as `float64` — and for a dependency on request scope.
 5. Stop reading a non-nil `Set`/`Delete` error as "not persisted".
-6. Drop `WithRedaction` from the four `RedactFull` keys. Their values now serve in clear, so gate `/system` behind an operator permission.
+6. Drop `WithRedaction` from the four `RedactFull` keys.
 
 Moving matcher's glue — the code that decodes a namespace of scalar keys into a
 struct, validates it and re-applies it on change — onto `Bind`, `Group[T]` and
