@@ -43,12 +43,8 @@ type Engine struct {
 	scopesMu sync.RWMutex
 	scopes   map[store.Scope]*scopeState
 
-	// activationsMu guards which scopes Activate is bringing up and when each
-	// last failed to; it is never held across Store.Subscribe or a reconcile.
-	activationsMu        sync.Mutex
-	activating           map[store.Scope]struct{}
-	failedAt             map[store.Scope]time.Time
-	activationRetryDelay time.Duration
+	// activations is what Activate, Block and Reactivate share (activate.go).
+	activations
 
 	// subscribers is keyed by NSKey alone, never by scope: OnChange covers
 	// that key in every scope the engine tracks and Change.Tenant names the
@@ -141,20 +137,18 @@ func New(cfg Config) *Engine {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &Engine{
-		store:                cfg.Store,
-		registry:             cfg.Registry,
-		logger:               logger,
-		debouncer:            debounce.New(cfg.Debounce, debounce.WithLogger[scopeNSKey](logger)),
-		debounceAsync:        cfg.Debounce > 0,
-		scopes:               make(map[store.Scope]*scopeState),
-		activating:           make(map[store.Scope]struct{}),
-		failedAt:             make(map[store.Scope]time.Time),
-		activationRetryDelay: defaultActivationRetryDelay,
-		subscribers:          make(map[NSKey][]subscription),
-		closeTimeout:         closeTimeout,
-		reconcileTimeout:     defaultReconcileTimeout,
-		lifecycleCtx:         ctx,
-		lifecycleCancel:      cancel,
+		store:            cfg.Store,
+		registry:         cfg.Registry,
+		logger:           logger,
+		debouncer:        debounce.New(cfg.Debounce, debounce.WithLogger[scopeNSKey](logger)),
+		debounceAsync:    cfg.Debounce > 0,
+		scopes:           make(map[store.Scope]*scopeState),
+		activations:      newActivations(),
+		subscribers:      make(map[NSKey][]subscription),
+		closeTimeout:     closeTimeout,
+		reconcileTimeout: defaultReconcileTimeout,
+		lifecycleCtx:     ctx,
+		lifecycleCancel:  cancel,
 	}
 }
 

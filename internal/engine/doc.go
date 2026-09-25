@@ -16,7 +16,8 @@
 // calls into.
 //
 // A tenant scope comes up through Activate: in the background, single-flight
-// per scope, dropped whole on any failure and retried only after a cooldown.
+// per scope, dropped whole on any failure and retried only after a cooldown. A
+// blocked scope is one the engine refuses to rebuild until Unblock.
 //
 // The engine never imports internal/client: the key registry, options and
 // catalog stay there and reach the engine through ports declared here.

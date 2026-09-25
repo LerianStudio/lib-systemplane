@@ -272,3 +272,217 @@ func TestCloseDuringActivationLeavesNothingRunning(t *testing.T) {
 		t.Errorf("live subscriptions = %d after Close, want 0", n)
 	}
 }
+
+// mustActivate brings scope up and waits until it serves a settled read.
+func mustActivate(t *testing.T, e *Engine, scope store.Scope) {
+	t.Helper()
+
+	if !e.Activate(scope) {
+		t.Fatal("Activate on an untracked tenant started nothing")
+	}
+
+	activationDone(t, e, scope)
+
+	if got, ok := e.Lookup(scope, activateKey); !ok || got.Stale {
+		t.Fatalf("Lookup = %+v, %v after activation; want a settled scope", got, ok)
+	}
+}
+
+// requireDropped asserts scope serves no cached read and holds no subscription.
+func requireDropped(t *testing.T, e *Engine, fs *fakeStore, scope store.Scope) {
+	t.Helper()
+
+	if got, ok := e.Lookup(scope, activateKey); ok {
+		t.Errorf("Lookup = %+v, true; want the scope dropped", got)
+	}
+
+	if n := fs.liveSubscriptions(); n != 0 {
+		t.Errorf("live subscriptions = %d, want 0", n)
+	}
+}
+
+func TestBlockDropsTheScopeAndRefusesActivate(t *testing.T) {
+	tenant, unseen := store.Scope{Tenant: "t1"}, store.Scope{Tenant: "t2"}
+	fs := newFakeStore()
+	e := activationEngine(t, fs)
+	mustActivate(t, e, tenant)
+
+	e.Block(tenant)
+	e.Block(tenant) // suspended, then deleted: two events
+	e.Block(unseen)
+
+	requireDropped(t, e, fs, tenant)
+
+	if n := fs.unsubscribeCount(); n != 1 {
+		t.Errorf("unsubscribe calls = %d, want 1", n)
+	}
+
+	lowerRetryDelay(e)
+
+	if e.Activate(tenant) {
+		t.Error("Activate brought a blocked tenant back")
+	}
+
+	if e.Activate(unseen) {
+		t.Error("Activate brought up a tenant blocked before its first read")
+	}
+
+	if n := fs.subscribeCount(); n != 1 {
+		t.Errorf("Subscribe calls = %d, want 1", n)
+	}
+}
+
+func TestUnblockAllowsActivateAgain(t *testing.T) {
+	tenant := store.Scope{Tenant: "t1"}
+	fs := newFakeStore()
+	fs.onSubscribe(func(store.Scope) error { return errSubscribe })
+
+	e := activationEngine(t, fs)
+
+	e.Activate(tenant)
+	activationDone(t, e, tenant)
+	fs.onSubscribe(nil)
+
+	e.Block(tenant)
+	e.Unblock(tenant)
+	e.Unblock(tenant)
+
+	if n := fs.subscribeCount(); n != 1 {
+		t.Errorf("Subscribe calls = %d after Unblock, want 1: Unblock must not activate", n)
+	}
+
+	// Inside the cooldown the failed activation started: Unblock lifts both.
+	mustActivate(t, e, tenant)
+}
+
+func TestReactivateRebuildsAnActiveScope(t *testing.T) {
+	tenant := store.Scope{Tenant: "t1"}
+	fs := newFakeStore()
+	fs.seed(tenant, jsonRow(activateKey, 7, `"stored"`, "alice"))
+
+	e := activationEngine(t, fs)
+	mustActivate(t, e, tenant)
+
+	if !e.Reactivate(tenant) {
+		t.Fatal("Reactivate of an active tenant started nothing")
+	}
+
+	activationDone(t, e, tenant)
+
+	if got, ok := e.Lookup(tenant, activateKey); !ok || got.Value != "stored" || got.Revision != 7 || got.Stale {
+		t.Errorf("Lookup = %+v, %v; want the stored row at revision 7, not stale", got, ok)
+	}
+
+	if n := fs.subscribeCount(); n != 2 {
+		t.Errorf("Subscribe calls = %d, want 2", n)
+	}
+
+	if n, u := fs.liveSubscriptions(), fs.unsubscribeCount(); n != 1 || u != 1 {
+		t.Errorf("live subscriptions = %d, unsubscribe calls = %d; want the first released, one live", n, u)
+	}
+}
+
+func TestReactivateOnABlockedScopeChangesNothing(t *testing.T) {
+	tenant := store.Scope{Tenant: "t1"}
+	fs := newFakeStore()
+	e := activationEngine(t, fs)
+	mustActivate(t, e, tenant)
+	e.Block(tenant)
+
+	if e.Reactivate(tenant) {
+		t.Error("Reactivate of a blocked tenant reported a start")
+	}
+
+	requireDropped(t, e, fs, tenant)
+	lowerRetryDelay(e)
+
+	if e.Activate(tenant) {
+		t.Error("Activate after Reactivate brought a blocked tenant back")
+	}
+
+	if n := fs.subscribeCount(); n != 1 {
+		t.Errorf("Subscribe calls = %d, want 1", n)
+	}
+}
+
+func TestReactivateOnAnUntrackedScopeOnlyClearsTheCooldown(t *testing.T) {
+	tenant := store.Scope{Tenant: "t1"}
+	fs := newFakeStore()
+	fs.onSubscribe(func(store.Scope) error { return errSubscribe })
+
+	e := activationEngine(t, fs)
+
+	e.Activate(tenant)
+	activationDone(t, e, tenant)
+	fs.onSubscribe(nil)
+
+	if e.Reactivate(tenant) {
+		t.Error("Reactivate brought up a tenant nothing had activated")
+	}
+
+	if n := fs.subscribeCount(); n != 1 {
+		t.Errorf("Subscribe calls = %d after Reactivate, want 1", n)
+	}
+
+	mustActivate(t, e, tenant)
+}
+
+func TestBlockRacingAnActivationLeavesNothingTracked(t *testing.T) {
+	tenant := store.Scope{Tenant: "t1"}
+	fs := newFakeStore()
+	e := activationEngine(t, fs)
+
+	entered, release := parkSubscribe(fs, tenant)
+	defer release()
+
+	if !e.Activate(tenant) {
+		t.Fatal("Activate on an untracked tenant started nothing")
+	}
+
+	mustReceive(t, entered, "the tenant's Subscribe to park")
+	e.Block(tenant)
+	release()
+
+	waitFor(t, hangGuard, "the blocked activation to release its subscription", func() bool {
+		return fs.unsubscribeCount() == 1
+	})
+	activationDone(t, e, tenant)
+
+	requireDropped(t, e, fs, tenant)
+
+	if n := fs.subscribeCount(); n != 1 {
+		t.Errorf("Subscribe calls = %d, want 1: a blocked tenant must not be rebuilt", n)
+	}
+}
+
+func TestReactivateRacingAnActivationRebuildsIt(t *testing.T) {
+	tenant := store.Scope{Tenant: "t1"}
+	fs := newFakeStore()
+	e := activationEngine(t, fs)
+
+	entered, release := parkSubscribe(fs, tenant)
+	defer release()
+
+	if !e.Activate(tenant) {
+		t.Fatal("Activate on an untracked tenant started nothing")
+	}
+
+	mustReceive(t, entered, "the tenant's Subscribe to park")
+
+	if e.Reactivate(tenant) {
+		t.Error("Reactivate reported starting a bring-up another call owns")
+	}
+
+	release()
+
+	waitFor(t, hangGuard, "the rebuild to subscribe", func() bool { return fs.subscribeCount() == 2 })
+	activationDone(t, e, tenant)
+
+	if got, ok := e.Lookup(tenant, activateKey); !ok || got.Stale {
+		t.Errorf("Lookup = %+v, %v after the rebuild; want a settled scope", got, ok)
+	}
+
+	if n, u := fs.liveSubscriptions(), fs.unsubscribeCount(); n != 1 || u != 1 {
+		t.Errorf("live subscriptions = %d, unsubscribe calls = %d; want the superseded one released, one live", n, u)
+	}
+}
