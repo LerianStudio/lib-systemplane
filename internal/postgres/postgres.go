@@ -44,7 +44,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"regexp"
 	"sync"
 	"time"
 
@@ -61,28 +60,12 @@ import (
 // Compile-time interface satisfaction check.
 var _ store.Store = (*Store)(nil)
 
-// safeIdentifierRe validates a BARE SQL identifier — one interpolated UNQUOTED
-// into a statement (the table name, e.g. "... FROM <table>"). SQL statements
-// cannot parameterize identifiers, so a bare-interpolated name must pass this
-// strict check first; hyphens/dots are illegal because they would break the
-// unquoted SQL.
-var safeIdentifierRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
-
-// safeChannelRe validates the LISTEN/NOTIFY channel name. Unlike the table, the
-// channel is always DOUBLE-QUOTED at use (LISTEN "<channel>" via quoteIdentifier),
-// so it may safely contain hyphens — the common case for an ApplicationName-prefixed
-// channel such as "my-service_systemplane_changes". It still rejects quotes,
-// whitespace and other breakout characters; quoteIdentifier additionally escapes any
-// embedded double quote, so the quoted channel is injection-safe regardless.
-// Length is enforced separately in normalizeConfig: Postgres truncates identifiers
-// to 63 bytes (NAMEDATALEN-1), so over-length channels are rejected outright.
-var safeChannelRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_-]*$`)
+// channelName is the one LISTEN channel; SchemaSQL's triggers NOTIFY on it.
+const channelName = "systemplane_changes"
 
 const (
-	tracerName     = "systemplane.postgres"
-	defaultChannel = "systemplane_changes"
-	defaultTable   = "systemplane_entries"
-	defaultModule  = "systemplane"
+	tracerName    = "systemplane.postgres"
+	defaultModule = "systemplane"
 )
 
 // dbExecutor is the minimal interface the CRUD helpers need. Both *sql.DB and
@@ -108,25 +91,6 @@ type Config struct {
 	// ListenDSN is the connection string used by pgx.Connect to establish a
 	// dedicated LISTEN connection. Required in single-tenant mode.
 	ListenDSN string
-
-	// Channel is the Postgres LISTEN/NOTIFY channel name.
-	// Default: "systemplane_changes". Hyphens are allowed (validated by
-	// safeChannelRe) — the channel is double-quoted at LISTEN time.
-	//
-	// COUPLING: this is only the LISTEN side. The matching NOTIFY side lives in
-	// the trigger DDL the consumer provisions (SchemaSQL() binds the reference
-	// trigger to the default "systemplane_changes" via TG_ARGV[0]). A consumer
-	// that sets a NON-default Channel here MUST bind the SAME name in its trigger
-	// DDL, otherwise the store LISTENs on one channel while the trigger NOTIFYs
-	// on another and no events are delivered.
-	Channel string
-
-	// ChannelExplicit suppresses the default-channel collision warning when
-	// the caller deliberately selected the channel name.
-	ChannelExplicit bool
-
-	// Table is the Postgres table name. Default: "systemplane_entries".
-	Table string
 
 	// MultiTenantEnabled selects the tmcore-driven dispatch path. When true,
 	// DB and ListenDSN may be empty; every method resolves the tenant
@@ -389,10 +353,7 @@ func (s *Store) List(ctx context.Context, scope store.Scope) ([]store.Entry, err
 	ctx, span, finish := s.startSpan(ctx, "systemplane.postgres.list", scopeAttrs(scope)...)
 	defer finish()
 
-	query := fmt.Sprintf( // #nosec G201 -- table validated as a Postgres identifier
-		`SELECT namespace, key, value, revision, updated_at, updated_by FROM %s ORDER BY namespace, key`,
-		s.cfg.Table,
-	)
+	const query = `SELECT namespace, key, value, revision, updated_at, updated_by FROM systemplane_entries ORDER BY namespace, key`
 
 	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
@@ -442,10 +403,7 @@ func (s *Store) Get(ctx context.Context, scope store.Scope, namespace, key strin
 	)...)
 	defer finish()
 
-	query := fmt.Sprintf( // #nosec G201 -- table validated as a Postgres identifier
-		`SELECT namespace, key, value, revision, updated_at, updated_by FROM %s WHERE namespace = $1 AND key = $2`,
-		s.cfg.Table,
-	)
+	const query = `SELECT namespace, key, value, revision, updated_at, updated_by FROM systemplane_entries WHERE namespace = $1 AND key = $2`
 
 	var e store.Entry
 
@@ -501,14 +459,11 @@ func (s *Store) Set(ctx context.Context, scope store.Scope, e store.Entry) (int6
 	)...)
 	defer finish()
 
-	query := fmt.Sprintf( // #nosec G201 -- table validated as a Postgres identifier
-		`INSERT INTO %s (namespace, key, value, updated_at, updated_by)
+	const query = `INSERT INTO systemplane_entries (namespace, key, value, updated_at, updated_by)
 VALUES ($1, $2, $3, $4, $5)
 ON CONFLICT (namespace, key) DO UPDATE
 SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by
-RETURNING revision`,
-		s.cfg.Table,
-	)
+RETURNING revision`
 
 	var revision int64
 
@@ -555,10 +510,7 @@ func (s *Store) Delete(ctx context.Context, scope store.Scope, namespace, key, a
 	)...)
 	defer finish()
 
-	query := fmt.Sprintf( // #nosec G201 -- table validated as a Postgres identifier
-		`DELETE FROM %s WHERE namespace = $1 AND key = $2`,
-		s.cfg.Table,
-	)
+	const query = `DELETE FROM systemplane_entries WHERE namespace = $1 AND key = $2`
 
 	if _, err := db.ExecContext(ctx, query, namespace, key); err != nil {
 		tracing.HandleSpanError(span, "delete failed", err)

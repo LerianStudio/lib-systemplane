@@ -104,7 +104,7 @@ func TestIntegration_MongoSharedCollectionIsRefusedAcrossClients(t *testing.T) {
 	s.feeds["t1"] = live
 	s.feedsMu.Unlock()
 
-	if err := s.claimFeedColl(ctx, live, first.Database("shared").Collection(defaultCollection)); err != nil {
+	if err := s.claimFeedColl(ctx, live, first.Database("shared").Collection(collectionName)); err != nil {
 		t.Fatalf("the first feed was refused its own collection: %v", err)
 	}
 
@@ -143,7 +143,7 @@ func TestIntegration_MongoTwoDatabasesOnOneServerAreAdmitted(t *testing.T) {
 	s.feeds["t1"] = live
 	s.feedsMu.Unlock()
 
-	if err := s.claimFeedColl(ctx, live, first.Database("t1db").Collection(defaultCollection)); err != nil {
+	if err := s.claimFeedColl(ctx, live, first.Database("t1db").Collection(collectionName)); err != nil {
 		t.Fatalf("the first feed was refused its own collection: %v", err)
 	}
 
@@ -174,11 +174,11 @@ func TestIntegration_MongoFeedReopenRefusesAContestedCollection(t *testing.T) {
 	s.feeds["t1"] = live
 	s.feedsMu.Unlock()
 
-	if err := s.claimFeedColl(ctx, live, first.Database("shared").Collection(defaultCollection)); err != nil {
+	if err := s.claimFeedColl(ctx, live, first.Database("shared").Collection(collectionName)); err != nil {
 		t.Fatalf("the first feed was refused its own collection: %v", err)
 	}
 
-	own := second.Database("t2own").Collection(defaultCollection)
+	own := second.Database("t2own").Collection(collectionName)
 	reopening := newFeed(store.Scope{Tenant: "t2"}, own)
 
 	if err := s.refreshFeedColl(ctx, reopening); !errors.Is(err, ErrSharedDatabaseUnsupported) {
