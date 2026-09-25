@@ -341,7 +341,7 @@ Do not reintroduce observability packages from `lib-commons`; they are being rem
 ### Credential Handling
 
 1. **Never hardcode credentials** - Use environment variables
-2. **Never log a stored value** - The library adds no value to a log line of its own; a validator refusal logs the validator's error, never the value
+2. **Never log a stored value** - The library adds no value to a log line of its own; a validator refusal logs the validator's error as produced, so a validator that quotes its input puts that input in the log
 3. **Name a key field `keyname`, never `key`** - `key` is in lib-observability's default sensitive-field list and renders as `key=[REDACTED]`
 
 ### Input Validation

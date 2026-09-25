@@ -67,7 +67,7 @@ func TestMultiTenantListDecodeErrorWrapsTheCause(t *testing.T) {
 		t.Errorf("the json cause callers debug the row with is gone: %v", err)
 	}
 
-	if !strings.Contains(err.Error(), "ns") || !strings.Contains(err.Error(), "k") {
-		t.Errorf("the error names neither namespace nor key: %v", err)
+	if !strings.Contains(err.Error(), "ns/k") {
+		t.Errorf("the error does not name the namespace/key pair: %v", err)
 	}
 }
