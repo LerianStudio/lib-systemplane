@@ -54,10 +54,10 @@ func run() error {
 
 	client, err := systemplane.NewMongoDB(mc, "app", systemplane.WithCloseTimeout(5*time.Second))
 	if err != nil {
-		return errors.Join(err, mc.Disconnect(context.Background()))
+		return errors.Join(err, mc.Disconnect(ctx))
 	}
 
-	return errors.Join(raiseDailyCount(ctx, client), client.Close(), mc.Disconnect(context.Background()))
+	return errors.Join(raiseDailyCount(ctx, client), client.Close(), mc.Disconnect(ctx))
 }
 
 func raiseDailyCount(ctx context.Context, client *systemplane.Client) error {
