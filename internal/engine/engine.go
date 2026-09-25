@@ -46,6 +46,7 @@ type Engine struct {
 
 	// activations is what Activate, Block and Reactivate share (activate.go).
 	activations
+	metrics *metrics // FC-12's instruments (metrics.go); nil records nothing
 
 	// subscribers is keyed by NSKey alone, never by scope: OnChange covers
 	// that key in every scope the engine tracks and Change.Tenant names the
@@ -115,21 +116,21 @@ type Config struct {
 	// ValidatorContext derives a tenant scope's read-back validator context
 	// from the dispatch one. nil, and the zero scope, keep the dispatch one.
 	ValidatorContext func(ctx context.Context, scope store.Scope) context.Context
+	// Telemetry feeds FC-12's instruments, AggregateTenantThreshold FC-10's collapse.
+	Telemetry                store.Telemetry
+	AggregateTenantThreshold int
 }
 
 // New builds an engine from cfg, defaulting everything that has a sensible
 // default: a nil logger becomes a no-op, a zero CloseTimeout becomes 30s, and
 // a zero Debounce disables debouncing rather than dropping notifications.
 //
-// The logger is guarded ONCE, here, rather than at each of the sites that hand
-// it to a recovery handler or a goroutine launcher: every one of them reads
-// e.logger, and the debouncer is handed the same wrapped value, so the guard
-// covers the whole engine and nothing new has to remember it. log.Guard is
-// idempotent, so a Client that guarded the same logger already pays for one
-// wrapper, not two.
+// The logger is guarded ONCE, here: every engine site and the debouncer read
+// this one wrapped value, so nothing new has to remember the guard. log.Guard is
+// idempotent, so a logger the Client already guarded is wrapped once, not twice.
 //
-// It opens no connection and starts no goroutine — Start does that — so a
-// Client that is constructed and never started leaves nothing behind.
+// It opens no connection and starts no goroutine — Start does that. With a
+// meter it registers FC-12's gauge callback, which Close unregisters.
 func New(cfg Config) *Engine {
 	logger := log.Guard(cfg.Logger)
 
@@ -140,7 +141,7 @@ func New(cfg Config) *Engine {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	return &Engine{
+	e := &Engine{
 		store:            cfg.Store,
 		registry:         cfg.Registry,
 		logger:           logger,
@@ -155,6 +156,9 @@ func New(cfg Config) *Engine {
 		lifecycleCtx:     ctx,
 		lifecycleCancel:  cancel,
 	}
+	e.metrics = newMetrics(cfg.Telemetry, cfg.AggregateTenantThreshold, logger, e.trackedScopes)
+
+	return e
 }
 
 // Start brings up the single-tenant scope and returns once its first reconcile
@@ -303,7 +307,7 @@ func (e *Engine) bringUpScope(scope store.Scope) (*scopeState, error) {
 		return sc, nil
 	}
 
-	unsubscribe, err := e.store.Subscribe(e.dispatchContext(), scope, e.onEvent)
+	unsubscribe, err := e.store.Subscribe(e.dispatchContext(), scope, e.feedCallback())
 	if err != nil {
 		e.dropScope(scope)
 
@@ -388,6 +392,7 @@ func (e *Engine) dropScope(scope store.Scope) {
 	e.scopesMu.Lock()
 	sc := e.scopes[scope]
 	delete(e.scopes, scope)
+	e.metrics.countTenant(sc, -1)
 	e.scopesMu.Unlock()
 
 	// Already dropped, or never tracked: the drop that removed it swept its
@@ -594,22 +599,13 @@ func (e *Engine) writeScope(ctx context.Context, scope store.Scope, nk NSKey) (*
 // scopeState.unconfirmed). Both are read under the same lock as the entry, so
 // one Lookup is an atomic read of value and freshness.
 //
-// The second half is per key because that is the size of what was lost: one
-// row nobody could re-read. Reading the whole unconfirmed set instead put every
-// sibling of that key on a Stale with no release — the record is taken back
-// only by an ingress that DECIDES that key, so a key never written again held
-// the scope's every value stale for the life of a process whose connection
-// never drops. FC-5 freezes Stale as a field of one Entry, and an Entry is one
-// key's: narrowing the field to the key it is returned with is what the
-// contract already describes.
+// The second half is per key because what was lost is one row: FC-5 freezes
+// Stale as a field of one key's Entry. A miss inside a tracked scope still
+// carries it, so a default served after a first reconcile that published
+// nothing is never reported as confirmed; only an untracked scope reports the
+// zero Entry.
 //
-// A miss inside a tracked scope still carries that key's Stale, and only the
-// scope the engine does not track at all reports the zero Entry. Discarding
-// staleness on the miss path was a silent lie: after a first reconcile that
-// published nothing — a transient List failure at Start — every registered key
-// is a miss, so every read is answered by the caller's registered default, and
-// dropping Stale reported each of those defaults as a value the store had
-// confirmed (FC-5).
+// Every call counts one systemplane.cache_reads_total, hit or miss (FC-12).
 func (e *Engine) Lookup(scope store.Scope, nk NSKey) (Entry, bool) {
 	if e == nil {
 		return Entry{}, false
@@ -617,6 +613,7 @@ func (e *Engine) Lookup(scope store.Scope, nk NSKey) (Entry, bool) {
 
 	sc := e.trackedScope(scope)
 	if sc == nil {
+		e.metrics.recordRead(scope, false)
 		return Entry{}, false
 	}
 
@@ -625,6 +622,7 @@ func (e *Engine) Lookup(scope store.Scope, nk NSKey) (Entry, bool) {
 	_, unconfirmed := sc.unconfirmed[nk]
 	stale := sc.stale || unconfirmed
 	sc.mu.RUnlock()
+	e.metrics.recordRead(scope, ok)
 
 	if !ok {
 		return Entry{Stale: stale}, false
@@ -675,6 +673,7 @@ func (e *Engine) Close() error {
 
 	e.closeOnce.Do(func() {
 		e.closed.Store(true)
+		e.metrics.unregister(e.logger)
 
 		if e.lifecycleCancel != nil {
 			e.lifecycleCancel()
