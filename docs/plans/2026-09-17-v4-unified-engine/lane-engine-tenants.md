@@ -93,11 +93,11 @@ Elaborated 2026-09-24 against `develop` `0ecdf9e` (after PR #93). `file:line` re
 **Scope:** `internal/engine/activate.go` (new), `internal/engine/activate_test.go` (new), `internal/engine/engine.go`, `internal/engine/doc.go`, `internal/engine/fakestore_test.go`.
 **Dependencies:** engine-core Phase 2 merged (PR #93: `Engine.PublishDelete` exported at `internal/engine/feed.go:617`; staleness is per key on `Lookup`'s returned `Entry.Stale`, `internal/engine/engine.go:618-651`, and there is no `Engine.Stale`).
 **Done when:** `Activate` on an untracked, unblocked scope returns at once and brings the scope up in the background; concurrent `Activate` calls for one scope open exactly one subscription; a failed `Subscribe` or first reconcile leaves no scope, no subscription and no marker, and the first `Activate` after `activationRetryDelay` retries from scratch; `Block` drops a scope and refuses every later `Activate` until `Unblock`; `Reactivate` rebuilds an unblocked scope and changes nothing for a blocked one; a slow tenant's bring-up delays no other scope; `Close` racing an activation leaves no goroutine; `go test -tags=unit -race -count=1 ./internal/engine/...` is green under goleak.
-**Status:** Pending
+**Status:** Done
 
 #### Task 1.1.1: Per-scope single-flight activation; take startMu out of bring-up
 
-- [ ] Done
+- [x] Done
 
 **Context:**
 - `bringUpScope` (`internal/engine/engine.go:294-359`) creates the scope through `scopeFor` (`internal/engine/publish.go:238-270`), calls `Store.Subscribe(e.dispatchContext(), scope, e.onEvent)` (`engine.go:311`), drops the scope on failure, and rechecks `closed` under `sc.mu` before storing the unsubscribe handle (`engine.go:346-357`). It holds the engine-wide `startMu` across all of it (`engine.go:295-296`).
@@ -153,7 +153,7 @@ Tests in `internal/engine/activate_test.go` (`//go:build unit`): `TestActivateBr
 
 #### Task 1.1.2: Block, Unblock and Reactivate
 
-- [ ] Done
+- [x] Done
 
 **Context:** D7 (index.md): Suspended and Deleted drop the scope and leave a `blocked` marker; a read never re-activates a blocked tenant; only Activated clears it; CredentialsRotated on a blocked tenant keeps the marker and re-activates nothing. Without the marker, Task 1.2.2's lazy activation would reopen a suspended tenant on the next read. Rotation needs a primitive because a check-then-drop-then-activate composition lets a Suspended event land between steps and leave a live feed for a blocked tenant. The connector side already lands on new credentials when a later `Subscribe` builds a fresh feed (storage Tasks 1.4.3 and 2.3.3). Lifecycle events are routed in Phase 2; this task ships the verbs so Phase 2 is routing only.
 
@@ -202,11 +202,11 @@ Tests extending `internal/engine/activate_test.go`: `TestBlockDropsTheScopeAndRe
 **Scope:** `internal/client/options.go`, `client.go`, `get.go`, `set.go`, `onchange.go`, `errors.go`, `doc.go`, `internal/client/tenant_test.go` (new); root `api_constructors.go`, `api_client.go`, `api_errors.go`, `api_client_test.go`; `internal/engine/engine.go` and `ingest.go` (the read-back validator context). `internal/client/tenant.go` is NOT created in Phase 1: `scopeFor` (`internal/client/client_telemetry.go:61-67`) already derives the tenant scope.
 **Dependencies:** Epic 1.1; Epic 1.0; engine-core Phase 2 (engine built in `newClient`, `internal/client/client.go:138-178`; no `internal/manager` package remains); storage Phases 1-3 (`postgres.NewTenantManagerConnector` `internal/postgres/connector.go:193`, `postgres.Config.Connector` `internal/postgres/postgres.go:140`, `mongodb.NewTenantManagerConnector` `internal/mongodb/connector.go:81`, `mongodb.Config.Connector` `internal/mongodb/mongodb.go:89`).
 **Done when:** `WithPostgresTenantManager` / `WithMongoTenantManager` exist per FC-6, each implies multi-tenant mode, and a mismatch is a construction error; the first `Get` for `t1` is served per-request, graded, and starts the activation, and a later `Get` returns the cached value with the row's revision, `UpdatedAt` and `UpdatedBy`; `GetEntry` for a tenant whose feed is disconnected reports `Stale: true`; one `OnChange` registration fires separately for `t1` and `t2` with `Change.Tenant` set; `Set` then `Get` for a cached tenant returns the new value with no feed event; the existing unit suite is green.
-**Status:** Pending
+**Status:** Done
 
 #### Task 1.2.1: WithPostgresTenantManager / WithMongoTenantManager, the mismatch sentinel, Connector wiring
 
-- [ ] Done
+- [x] Done
 
 **Context:**
 - FC-6 fixes both signatures, says each implies `WithMultiTenantEnabled()`, and freezes `ErrTenantManagerBackendMismatch` and its text (D-T7(1)).
@@ -257,7 +257,7 @@ Tests: `TestWithPostgresTenantManagerImpliesMultiTenant` (nil `*sql.DB` plus the
 
 #### Task 1.2.2: Lazy activation on read, graded per-request fall-through, tenant-carrying read-back ctx
 
-- [ ] Done
+- [x] Done
 
 **Merge note:** the redaction removal (PR #99, develop `7a33f38`, decision D12 in index.md) is on this branch. `getEntry`, `listFromStore` and `Set` no longer gate on redaction, so the `internal/client` line numbers below predate it; the symbol governs.
 
@@ -308,7 +308,7 @@ Tests in `internal/client/tenant_test.go`, with a per-scope fake store implement
 
 #### Task 1.2.3: Multi-tenant OnChange for a tenant-managed Client
 
-- [ ] Done
+- [x] Done
 
 **Context:**
 - The refusal is `if c.multiTenant { return noop, ErrNotSupportedInMultiTenant }` (`internal/client/onchange.go:63-65`); the engine registration is `onchange.go:74`; the doc naming the wave-3 lane is `onchange.go:42-45`, and the public doc `api_client.go:179-183`.
@@ -338,7 +338,7 @@ Tests in `internal/client/tenant_test.go`, receiving on a buffered channel, neve
 
 #### Task 1.2.4: Publish multi-tenant writes into the tenant scope
 
-- [ ] Done
+- [x] Done
 
 **Context:**
 - `Set` and `Delete` guard publication with `if !c.multiTenant` (`internal/client/set.go:113-137`, `:181-196`).
@@ -374,11 +374,11 @@ Tests in `internal/client/tenant_test.go`: `TestMultiTenantSetThenGetReturnsTheN
 **Scope:** `internal/engine/feed.go`, `internal/engine/scope.go`, `internal/engine/refresh_bound_test.go` (new).
 **Dependencies:** Task 1.1.1 (tenant scopes exist to multiply the cost).
 **Done when:** Task 1.3.1 is checked. Both handoffs land before `v4.0.0` (Fred, 2026-09-24).
-**Status:** Pending
+**Status:** Done
 
 #### Task 1.3.1: Coalescing per-(scope, key) re-read single-flight plus a per-scope Store.Get semaphore
 
-- [ ] Done
+- [x] Done
 
 **Context:**
 - The debouncer bounds pending timers, not the reads they start: `trackedRefresh` (`internal/engine/feed.go:368`; its godoc `:345-367` says there is no semaphore), `submitRefresh` (`feed.go:212`), `retryRefresh` (`feed.go:282`), `refreshKey` (`feed.go:686`). In-flight re-reads for one key approach `feedTimeout` / debounce window (~50 at defaults), and a bulk delete of K keys is K concurrent `Store.Get` calls.
