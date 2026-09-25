@@ -14,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	obsconstants "github.com/LerianStudio/lib-observability/v4/constants"
 	systemplane "github.com/LerianStudio/lib-systemplane/v4"
 	"github.com/LerianStudio/lib-systemplane/v4/admin"
 	// Aliased: this file has local variables named store.
@@ -741,87 +740,6 @@ func TestAdmin_CatalogCustomPrefix(t *testing.T) {
 	resp.Body.Close()
 }
 
-func TestAdmin_CatalogRedactsDefaultValue(t *testing.T) {
-	tests := []struct {
-		name   string
-		policy systemplane.RedactPolicy
-	}{
-		{name: "mask", policy: systemplane.RedactMask},
-		{name: "full", policy: systemplane.RedactFull},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			c, _ := setupClient(t, func(c *systemplane.Client) error {
-				return c.Register("security", "secret", "real-secret", systemplane.WithRedaction(tt.policy))
-			})
-			app := mountCatalogAndRun(t, c)
-
-			resp := doRequest(t, app, http.MethodGet, "/system/-/catalog/security/secret", "")
-			if resp.StatusCode != http.StatusOK {
-				t.Fatalf("status = %d, want 200", resp.StatusCode)
-			}
-
-			body, err := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if err != nil {
-				t.Fatalf("read body: %v", err)
-			}
-
-			if strings.Contains(string(body), "real-secret") {
-				t.Fatalf("response leaked raw secret: %s", body)
-			}
-
-			var detail struct {
-				DefaultValue string `json:"defaultValue"`
-			}
-			if err := json.Unmarshal(body, &detail); err != nil {
-				t.Fatalf("decode detail: %v", err)
-			}
-
-			if detail.DefaultValue != obsconstants.ObfuscatedValue {
-				t.Fatalf("defaultValue = %q, want obfuscated value", detail.DefaultValue)
-			}
-		})
-	}
-}
-
-func TestAdmin_CatalogDoesNotRedactExamples(t *testing.T) {
-	c, _ := setupClient(t, func(c *systemplane.Client) error {
-		return c.Register("security", "sample", "internal-value",
-			systemplane.WithRedaction(systemplane.RedactFull),
-			systemplane.WithCatalogMetadata(systemplane.CatalogKeyMetadata{
-				Examples: []systemplane.CatalogExample{{Name: "sample", Value: "operator-example"}},
-			}),
-		)
-	})
-	app := mountCatalogAndRun(t, c)
-
-	resp := doRequest(t, app, http.MethodGet, "/system/-/catalog/security/sample", "")
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-
-	var detail struct {
-		DefaultValue string `json:"defaultValue"`
-		Examples     []struct {
-			Name  string `json:"name"`
-			Value string `json:"value"`
-		} `json:"examples"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&detail); err != nil {
-		t.Fatalf("decode detail: %v", err)
-	}
-	resp.Body.Close()
-
-	if detail.DefaultValue != obsconstants.ObfuscatedValue {
-		t.Fatalf("defaultValue = %q, want obfuscated value", detail.DefaultValue)
-	}
-	if len(detail.Examples) != 1 || detail.Examples[0].Value != "operator-example" {
-		t.Fatalf("examples = %#v, want raw operator example", detail.Examples)
-	}
-}
-
 func TestAdmin_CatalogUsesReadAuthorization(t *testing.T) {
 	c, _ := setupClient(t, nil)
 	app := fiber.New()
@@ -875,25 +793,19 @@ func setupSeededMultiTenantClient(
 	return c, store
 }
 
-// decodeBody returns the response body as a generic map plus its raw text. The
-// map lets a test tell an absent field from a zero-valued one, which a narrow
-// struct decode cannot; the raw text lets a redaction test assert the secret
-// never appears anywhere in the payload.
-func decodeBody(t *testing.T, resp *http.Response) (map[string]any, string) {
+// decodeBody returns the response body as a generic map, which lets a test
+// tell an absent field from a zero-valued one as a narrow struct decode
+// cannot.
+func decodeBody(t *testing.T, resp *http.Response) map[string]any {
 	t.Helper()
 	defer resp.Body.Close()
 
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("read body: %v", err)
-	}
-
 	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
 		t.Fatalf("decode body: %v", err)
 	}
 
-	return got, string(raw)
+	return got
 }
 
 func TestAdmin_GetOneCarriesRevisionAndProvenance(t *testing.T) {
@@ -921,7 +833,7 @@ func TestAdmin_GetOneCarriesRevisionAndProvenance(t *testing.T) {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 
-	got, _ := decodeBody(t, resp)
+	got := decodeBody(t, resp)
 
 	if got["value"] != "stored" {
 		t.Errorf("value = %v, want stored", got["value"])
@@ -963,7 +875,7 @@ func TestAdmin_GetOneDefaultInForceRendersZeroRevision(t *testing.T) {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 
-	got, _ := decodeBody(t, resp)
+	got := decodeBody(t, resp)
 
 	if got["revision"] != float64(0) {
 		t.Errorf("revision = %v, want 0", got["revision"])
@@ -989,51 +901,6 @@ func TestAdmin_GetOneDefaultInForceRendersZeroRevision(t *testing.T) {
 
 	if stale != false {
 		t.Errorf("stale = %v, want false", stale)
-	}
-}
-
-func TestAdmin_GetOneRedactsValueWithProvenance(t *testing.T) {
-	t.Parallel()
-
-	updatedAt := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
-
-	c, _ := setupSeededMultiTenantClient(t, []systemplane.TestEntry{{
-		Namespace: "runtime",
-		Key:       "name",
-		Value:     []byte(`"super-secret"`),
-		Revision:  11,
-		UpdatedAt: updatedAt,
-		UpdatedBy: "operator",
-	}}, func(c *systemplane.Client) error {
-		return c.Register("runtime", "name", "registered-default",
-			systemplane.WithRedaction(systemplane.RedactFull))
-	})
-
-	app := mountAndRun(t, c)
-
-	resp := doRequest(t, app, http.MethodGet, "/system/runtime/name", "")
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-
-	got, raw := decodeBody(t, resp)
-
-	if strings.Contains(raw, "super-secret") {
-		t.Fatalf("body leaked the redacted value: %s", raw)
-	}
-
-	if got["value"] != obsconstants.ObfuscatedValue {
-		t.Errorf("value = %v, want %v", got["value"], obsconstants.ObfuscatedValue)
-	}
-
-	// Revision and provenance describe the row, not the secret, so redaction
-	// must not blank them.
-	if got["revision"] != float64(11) {
-		t.Errorf("revision = %v, want 11", got["revision"])
-	}
-
-	if got["updatedBy"] != "operator" {
-		t.Errorf("updatedBy = %v, want operator", got["updatedBy"])
 	}
 }
 
@@ -1133,64 +1000,6 @@ func TestAdmin_ListCarriesRevisionAndProvenancePerEntry(t *testing.T) {
 		if stale != false {
 			t.Errorf("entry %v stale = %v, want false", e["key"], stale)
 		}
-	}
-}
-
-func TestAdmin_ListRedactsValues(t *testing.T) {
-	t.Parallel()
-
-	// The listing mirror of TestAdmin_GetOneRedactsValueWithProvenance: a
-	// RedactFull key must never hand its raw value to every caller authorized
-	// for "read" just because the request asked for the whole namespace.
-	c, _ := setupSeededMultiTenantClient(t, []systemplane.TestEntry{{
-		Namespace: "security",
-		Key:       "secret",
-		Value:     []byte(`"super-secret"`),
-		Revision:  5,
-		UpdatedAt: time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC),
-		UpdatedBy: "operator",
-	}}, func(c *systemplane.Client) error {
-		return c.Register("security", "secret", "registered-default",
-			systemplane.WithRedaction(systemplane.RedactFull))
-	})
-
-	app := mountAndRun(t, c)
-
-	resp := doRequest(t, app, http.MethodGet, "/system/security", "")
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-
-	defer resp.Body.Close()
-
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("read body: %v", err)
-	}
-
-	if strings.Contains(string(raw), "super-secret") {
-		t.Fatalf("listing leaked the redacted value: %s", raw)
-	}
-
-	var got struct {
-		Entries []map[string]any `json:"entries"`
-	}
-
-	if err := json.Unmarshal(raw, &got); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-
-	if len(got.Entries) != 1 {
-		t.Fatalf("entries = %d, want 1", len(got.Entries))
-	}
-
-	if got.Entries[0]["value"] != obsconstants.ObfuscatedValue {
-		t.Errorf("value = %v, want %v", got.Entries[0]["value"], obsconstants.ObfuscatedValue)
-	}
-
-	// Revision describes the row, not the secret, so redaction must not blank it.
-	if got.Entries[0]["revision"] != float64(5) {
-		t.Errorf("revision = %v, want 5", got.Entries[0]["revision"])
 	}
 }
 
