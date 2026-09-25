@@ -9,7 +9,6 @@ import (
 	"github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/runtime"
-	"github.com/LerianStudio/lib-systemplane/v4/internal/safelog"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -421,18 +420,6 @@ func (e *Engine) trackedRefresh(scope store.Scope, nk NSKey, deleted bool) {
 // which emits the identity line naming the tenant, namespace and key before
 // the handler reports what was raised.
 func (e *Engine) recoverRefresh(scope store.Scope, nk NSKey, deleted, retried bool, state **scopeState, origin *feedFence) {
-	// The two lines at the bottom are the CONSUMER's observability: its
-	// logger, and whatever lib-observability's handler reaches through
-	// InitPanicMetrics — a metrics recorder, and the raw logger the consumer
-	// handed that call, neither of which this engine wraps. A panic raised in
-	// there unwinds out of this recovery, and every goroutine a re-read can
-	// run on has an outer net that would then report the SAME broken logger's
-	// failure through that same logger. Swallowing it here ends the line one
-	// frame from where it started. Same guard, same reason, as
-	// internal/group's own panic handler. It is registered FIRST so it runs
-	// LAST: the repair below still runs on the way out.
-	defer safelog.Swallow()
-
 	recovered := recover()
 	if recovered == nil {
 		return
