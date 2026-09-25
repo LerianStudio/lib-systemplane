@@ -25,9 +25,10 @@ const defaultCloseTimeout = 30 * time.Second
 // scopes: the zero store.Scope is the single-tenant scope, every tenant is
 // another key in the same map.
 type Engine struct {
-	store    store.Store
-	registry Registry
-	logger   log.Logger
+	store            store.Store
+	registry         Registry
+	logger           log.Logger
+	validatorContext func(context.Context, store.Scope) context.Context
 
 	// debouncer collapses a burst of changefeed notifications for one key in
 	// one scope into a single store re-read. It is keyed by scope as well as
@@ -111,6 +112,9 @@ type Config struct {
 	// CloseTimeout bounds how long Close waits for subscriber callbacks that
 	// have been canceled. Zero means defaultCloseTimeout.
 	CloseTimeout time.Duration
+	// ValidatorContext derives a tenant scope's read-back validator context
+	// from the dispatch one. nil, and the zero scope, keep the dispatch one.
+	ValidatorContext func(ctx context.Context, scope store.Scope) context.Context
 }
 
 // New builds an engine from cfg, defaulting everything that has a sensible
@@ -140,6 +144,7 @@ func New(cfg Config) *Engine {
 		store:            cfg.Store,
 		registry:         cfg.Registry,
 		logger:           logger,
+		validatorContext: cfg.ValidatorContext,
 		debouncer:        debounce.New(cfg.Debounce, debounce.WithLogger[scopeNSKey](logger)),
 		debounceAsync:    cfg.Debounce > 0,
 		scopes:           make(map[store.Scope]*scopeState),

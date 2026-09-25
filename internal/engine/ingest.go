@@ -193,7 +193,12 @@ func (e *Engine) prepare(ctx context.Context, scope store.Scope, se store.Entry,
 	nk := NSKey{Namespace: se.Namespace, Key: se.Key}
 
 	if !pregraded {
-		if err := e.runValidator(ctx, scope, nk, def.Validate, decoded); err != nil {
+		validatorCtx := ctx
+		if e.validatorContext != nil && scope != (store.Scope{}) {
+			validatorCtx = e.validatorContext(ctx, scope)
+		}
+
+		if err := e.runValidator(validatorCtx, scope, nk, def.Validate, decoded); err != nil {
 			e.logValidatorRejection(ctx, scope.Tenant, nk, err)
 
 			return publication{}, err
@@ -329,9 +334,10 @@ func (e *Engine) recoveryLogger() log.Logger {
 //
 // ctx is the ingress's own context and is handed straight to the validator, so
 // which context a validator sees is decided by which ingress ran: the writer's
-// on Publish, the engine's dispatch context — no tenant, no request — on the
-// changefeed re-read and on a reconcile. KeyDef.Validate states the contract
-// and what a refusal leaves in force.
+// on Publish, the engine's dispatch context — no request, and a tenant only
+// through Config.ValidatorContext — on the changefeed re-read and on a
+// reconcile. KeyDef.Validate states the contract and what a refusal leaves in
+// force.
 //
 // The validator is consumer code, and v4 is the first version that runs it on
 // engine-owned goroutines: the reconcile, and the changefeed re-read. v3 only
