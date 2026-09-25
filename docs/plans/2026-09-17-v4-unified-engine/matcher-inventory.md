@@ -2,6 +2,8 @@
 
 # matcher — lib-systemplane & Environment Inventory
 
+2026-09-25: redaction leaves the lib in v4 (D12); matcher drops its `WithRedaction` calls when it bumps the pin, and the four secrets stay in systemplane in clear per Fred (memory systemplane-no-redaction-decision).
+
 Repo: `/Users/fredamaral/repos/lerianstudio/matcher` (read-only). Dependency today: `github.com/LerianStudio/lib-systemplane/v2 v2.0.0` (vendored; comments and `cmd/systemplane-ddl:libVersion` still say "v1.6.0"/"v5", a stale naming layer).
 
 **Measured counts** (from grep/wc, not estimates):

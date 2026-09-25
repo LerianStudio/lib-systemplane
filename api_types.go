@@ -35,12 +35,8 @@ type CatalogKeyDetail = internalclient.CatalogKeyDetail
 type CatalogKeyMetadata = internalclient.CatalogKeyMetadata
 
 // CatalogExample documents one accepted value shape for a registered key.
-// Values are operator-facing examples and are not redacted; never include
-// secrets or credentials.
+// Examples are emitted as provided; never include secrets or credentials.
 type CatalogExample = internalclient.CatalogExample
-
-// RedactPolicy controls how a key's value is rendered in admin endpoints and logs.
-type RedactPolicy int
 
 // Option configures a Client at construction time.
 type Option = internalclient.Option

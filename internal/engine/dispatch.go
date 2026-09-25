@@ -212,9 +212,6 @@ func (e *Engine) dispatch(sc *scopeState, pub publication) {
 // same reason: the sweep that ended the scope's workers marked its state, so a
 // publisher that slipped past publish's refusal cannot start a replacement the
 // drop will never come back to stop. The caller discards the publication.
-//
-// A worker whose goroutine ends reaps itself out of the map on the way out, so
-// what this hands back is never a worker nobody is draining.
 func (e *Engine) workerFor(sc *scopeState, nk NSKey) *dispatchWorker {
 	e.workersMu.Lock()
 	defer e.workersMu.Unlock()
@@ -238,53 +235,13 @@ func (e *Engine) workerFor(sc *scopeState, nk NSKey) *dispatchWorker {
 		"systemplane.engine", "dispatch", runtime.KeepRunning,
 		func(ctx context.Context) {
 			defer e.dispatchWG.Done()
-			defer e.reapWorker(sc, nk, w)
+			// Runs before the WaitGroup release, so Close never sees a finished worker as running.
+			defer e.running.Delete(w)
 
 			e.runWorker(ctx, wk, w)
 		})
 
 	return w
-}
-
-// reapWorker forgets a worker whose goroutine has ended, so the next
-// publication for its (scope, key) starts a replacement instead of filling a
-// mailbox nobody drains.
-//
-// Every ordinary exit leaves nothing to repair — the scope's stop and the
-// engine's both sweep the map and refuse replacements under this same lock —
-// so this exists for the one exit neither can see: a panic that escaped
-// runWorker, which the launcher's policy recovers and returns from without
-// restarting.
-//
-// No production path reaches that today. A callback panic is recovered per
-// subscriber inside deliver, and the report deliver then makes cannot unwind
-// out either: reportConsumerPanic hands it to reportRecovered, which swallows
-// a panic raised by the consumer's own recorder or error reporter, and the
-// consumer's logger is wrapped at construction by safelog.Guard. It is kept
-// as defence in depth, the way ingestDefault keeps its unregistered-key
-// branch: a future delivery step that panics outside deliver's recovery is
-// repaired here rather than left in the map. Left in place, that dead worker
-// goes on being handed every later Change for its key, silently, until the
-// scope is dropped or the engine closes, and its marker makes a timed-out
-// Close name a subscriber that has not been running since.
-//
-// The map entry goes only when it is still THIS worker. A scope dropped and
-// brought back up, or a worker already swept and replaced, owns the slot now,
-// and reaping by key alone would take a live worker's mailbox with it.
-//
-// It is deferred INSIDE the launch closure, registered after the WaitGroup
-// release so it runs before it: a Close waiting on that WaitGroup must not be
-// released while this worker is still named in running, or it reports a
-// delivery nobody is running.
-func (e *Engine) reapWorker(sc *scopeState, nk NSKey, w *dispatchWorker) {
-	e.running.Delete(w)
-
-	e.workersMu.Lock()
-	defer e.workersMu.Unlock()
-
-	if sc.workers[nk] == w {
-		delete(sc.workers, nk)
-	}
 }
 
 // runWorker is the one goroutine that invokes subscribers of wk. It exits when
@@ -361,17 +318,6 @@ func (e *Engine) runWorker(ctx context.Context, wk workerKey, w *dispatchWorker)
 // kills neither the worker nor the process and is counted and recorded on the
 // span rather than merely logged; the subscriber list is copied before any
 // callback runs, so a callback may unsubscribe itself without deadlocking.
-//
-// The key's redaction policy is read only when a callback actually panics,
-// and then once per panicking callback. A callback is consumer code holding
-// the decoded value and a panic naming it —
-// panic(fmt.Sprintf("cannot apply %v", ch.Value)) — is reported by that same
-// recovery, which prints the panic value unless production mode is on, so the
-// bit is needed there and nowhere else. Reading it before the fan-out took the
-// registry's lock on every delivery of every subscribed key, contending with
-// Register and with every ingress, to answer a question almost no delivery
-// asks. An unregistered key reports false, which is the honest answer: nothing
-// registered it, so nothing declared it sensitive.
 func (e *Engine) deliver(ctx context.Context, scope store.Scope, nk NSKey, ch Change) {
 	e.subsMu.RLock()
 	subs := make([]subscription, len(e.subscribers[nk]))
@@ -386,9 +332,7 @@ func (e *Engine) deliver(ctx context.Context, scope store.Scope, nk NSKey, ch Ch
 		func() {
 			defer func() {
 				if recovered := recover(); recovered != nil {
-					def, _ := e.lookup(nk.Namespace, nk.Key)
-
-					e.reportConsumerPanic(ctx, scope, nk, recovered, def.Redacted,
+					e.reportConsumerPanic(ctx, scope, nk, recovered,
 						"onchange callback panicked", "onchange")
 				}
 			}()

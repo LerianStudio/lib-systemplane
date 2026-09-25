@@ -199,7 +199,7 @@ func TestIntegration_PollOnce_SameMsDifferentValue_EmitsBoth(t *testing.T) {
 		t.Fatalf("zero feed: %v", err)
 	}
 
-	coll := client.Database(dbName).Collection(defaultCollection)
+	coll := client.Database(dbName).Collection(collectionName)
 
 	// Step 1: write v1 at time T (truncated to ms boundary).
 	t0 := time.Now().UTC().Truncate(time.Millisecond)
@@ -292,7 +292,7 @@ func TestIntegration_PollOnce_SameMsSameValue_EmitsOnce(t *testing.T) {
 		t.Fatalf("zero feed: %v", err)
 	}
 
-	coll := client.Database(dbName).Collection(defaultCollection)
+	coll := client.Database(dbName).Collection(collectionName)
 
 	t0 := time.Now().UTC().Truncate(time.Millisecond)
 	rawUpsert(t, coll, "ns", "k", `"vSame"`, t0)
@@ -689,7 +689,7 @@ func TestIntegration_MongoPollingIndexesCreatedForTenantCollection(t *testing.T)
 		t.Fatalf("New: %v", err)
 	}
 
-	coll := db.Collection(defaultCollection)
+	coll := db.Collection(collectionName)
 
 	if err := s.runSchema(context.Background(), coll, "", true); err != nil {
 		t.Fatalf("runSchema: %v", err)
@@ -723,7 +723,7 @@ func TestIntegration_MongoPollingIndexesCreatedForSingleTenantCollection(t *test
 		t.Fatalf("New: %v", err)
 	}
 
-	coll := db.Collection(defaultCollection)
+	coll := db.Collection(collectionName)
 
 	if err := s.runSchema(context.Background(), coll, "", false); err != nil {
 		t.Fatalf("runSchema: %v", err)
@@ -795,7 +795,7 @@ func TestIntegration_MongoPollingFirstRoundAnnouncesBeforeKeyEvents(t *testing.T
 	// Stamped ahead of the watermark the first round anchors at time.Now(), so
 	// the round is guaranteed to READ this row rather than race the clock for
 	// it.
-	rawUpsert(t, db.Collection(defaultCollection), "ns", "k", `{"a":1}`, time.Now().Add(time.Minute))
+	rawUpsert(t, db.Collection(collectionName), "ns", "k", `{"a":1}`, time.Now().Add(time.Minute))
 
 	s, err := New(Config{Client: client, Database: dbName, PollInterval: 50 * time.Millisecond})
 	if err != nil {
@@ -900,7 +900,7 @@ func TestIntegration_MongoPollingIndexCreationDeniedStillStarts(t *testing.T) {
 	// Created by the privileged account, the way an external provisioning
 	// pipeline would: the restricted role below cannot create it, and the test
 	// is about the index grant, not about implicit collection creation.
-	if err := adminDB.CreateCollection(ctx, defaultCollection); err != nil {
+	if err := adminDB.CreateCollection(ctx, collectionName); err != nil {
 		t.Fatalf("create collection as root: %v", err)
 	}
 
@@ -910,7 +910,7 @@ func TestIntegration_MongoPollingIndexCreationDeniedStillStarts(t *testing.T) {
 		{Key: "privileges", Value: bson.A{bson.D{
 			{Key: "resource", Value: bson.D{
 				{Key: "db", Value: dbName},
-				{Key: "collection", Value: defaultCollection},
+				{Key: "collection", Value: collectionName},
 			}},
 			{Key: "actions", Value: bson.A{"find", "insert", "update", "remove", "listIndexes"}},
 		}}},
@@ -961,7 +961,7 @@ func TestIntegration_MongoPollingIndexCreationDeniedStillStarts(t *testing.T) {
 	// Proves the warn branch was actually taken rather than the grant being
 	// wider than intended — without this the test would pass on a role that
 	// could create the indexes after all.
-	assertNoPollingIndexes(t, lp.Database(dbName).Collection(defaultCollection))
+	assertNoPollingIndexes(t, lp.Database(dbName).Collection(collectionName))
 
 	if _, err := s.Set(ctx, store.Scope{}, store.Entry{
 		Namespace: "ns",
@@ -1036,7 +1036,7 @@ func TestIntegration_MongoTenantPollingIndexConflictStillServes(t *testing.T) {
 
 	t.Cleanup(func() { _ = db.Drop(context.Background()) })
 
-	if _, err := db.Collection(defaultCollection).Indexes().CreateOne(ctx, mongo.IndexModel{
+	if _, err := db.Collection(collectionName).Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys:    pollingIndexes()[0].Keys,
 		Options: options.Index().SetName("operator_owned"),
 	}); err != nil {

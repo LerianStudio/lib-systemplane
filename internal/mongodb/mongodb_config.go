@@ -41,10 +41,6 @@ func New(cfg Config) (*Store, error) {
 		cfg.Telemetry = nil
 	}
 
-	if cfg.Collection == "" {
-		cfg.Collection = defaultCollection
-	}
-
 	if cfg.Module == "" {
 		cfg.Module = defaultModule
 	}
@@ -77,7 +73,7 @@ func New(cfg Config) (*Store, error) {
 	}
 
 	if !cfg.MultiTenantEnabled {
-		s.coll = cfg.Client.Database(cfg.Database).Collection(cfg.Collection)
+		s.coll = cfg.Client.Database(cfg.Database).Collection(collectionName)
 	}
 
 	return s, nil

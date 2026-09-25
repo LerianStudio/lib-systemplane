@@ -59,9 +59,6 @@ func WithTelemetry(t Telemetry) Option {
 	return internalclient.WithTelemetry(t)
 }
 
-// WithListenChannel overrides the Postgres LISTEN/NOTIFY channel name.
-func WithListenChannel(name string) Option { return internalclient.WithListenChannel(name) }
-
 // WithPollInterval enables polling mode for MongoDB instead of change streams.
 func WithPollInterval(d time.Duration) Option { return internalclient.WithPollInterval(d) }
 
@@ -74,12 +71,6 @@ func WithDebounce(d time.Duration) Option { return internalclient.WithDebounce(d
 // timeout joined with the store's own error. A zero or negative value means
 // the engine default.
 func WithCloseTimeout(d time.Duration) Option { return internalclient.WithCloseTimeout(d) }
-
-// WithCollection overrides the MongoDB collection name.
-func WithCollection(name string) Option { return internalclient.WithCollection(name) }
-
-// WithTable overrides the Postgres table name.
-func WithTable(name string) Option { return internalclient.WithTable(name) }
 
 // WithMultiTenantEnabled enables tenant-manager dispatch: every read/write
 // resolves the per-tenant database from ctx via tmcore.GetPGContext /
@@ -137,18 +128,8 @@ func WithContextValidator(fn func(ctx context.Context, value any) error) KeyOpti
 	return internalclient.WithContextValidator(fn)
 }
 
-// WithRedaction sets the redaction policy.
-func WithRedaction(policy RedactPolicy) KeyOption {
-	return internalclient.WithRedaction(internalclient.RedactPolicy(policy))
-}
-
 // WithCatalogMetadata attaches operator-facing catalog metadata to a key.
 // Examples are emitted as provided; do not include secrets or credentials.
 func WithCatalogMetadata(meta CatalogKeyMetadata) KeyOption {
 	return internalclient.WithCatalogMetadata(meta)
-}
-
-// ApplyRedaction returns the value rendered per policy.
-func ApplyRedaction(value any, policy RedactPolicy) any {
-	return internalclient.ApplyRedaction(value, internalclient.RedactPolicy(policy))
 }

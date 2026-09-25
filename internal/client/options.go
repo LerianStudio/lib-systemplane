@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
-	"github.com/LerianStudio/lib-systemplane/v4/internal/safelog"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
@@ -21,12 +20,9 @@ type clientConfig struct {
 	logger         log.Logger
 	consumerLogger log.Logger
 	telemetry      store.Telemetry
-	listenChannel  string
 	pollInterval   time.Duration
 	debounce       time.Duration
 	closeTimeout   time.Duration
-	collection     string
-	table          string
 	catalogService string
 
 	multiTenantEnabled bool
@@ -35,11 +31,8 @@ type clientConfig struct {
 
 func defaultClientConfig() clientConfig {
 	return clientConfig{
-		listenChannel: "systemplane_changes",
-		debounce:      100 * time.Millisecond,
-		collection:    "systemplane_entries",
-		table:         "systemplane_entries",
-		module:        "systemplane",
+		debounce: 100 * time.Millisecond,
+		module:   "systemplane",
 	}
 }
 
@@ -64,16 +57,6 @@ func WithLogger(l log.Logger) Option {
 func WithTelemetry(t store.Telemetry) Option {
 	return func(cfg *clientConfig) {
 		cfg.telemetry = t
-	}
-}
-
-// WithListenChannel overrides the Postgres LISTEN/NOTIFY channel name.
-// Ignored by MongoDB backends and in multi-tenant mode.
-func WithListenChannel(name string) Option {
-	return func(cfg *clientConfig) {
-		if name != "" {
-			cfg.listenChannel = name
-		}
 	}
 }
 
@@ -108,26 +91,6 @@ func WithDebounce(d time.Duration) Option {
 func WithCloseTimeout(d time.Duration) Option {
 	return func(cfg *clientConfig) {
 		cfg.closeTimeout = d
-	}
-}
-
-// WithCollection overrides the MongoDB collection name.
-// Default: "systemplane_entries". Ignored by Postgres backends.
-func WithCollection(name string) Option {
-	return func(cfg *clientConfig) {
-		if name != "" {
-			cfg.collection = name
-		}
-	}
-}
-
-// WithTable overrides the Postgres table name.
-// Default: "systemplane_entries". Ignored by MongoDB backends.
-func WithTable(name string) Option {
-	return func(cfg *clientConfig) {
-		if name != "" {
-			cfg.table = name
-		}
 	}
 }
 
@@ -184,10 +147,10 @@ func applyClientOptions(cfg *clientConfig, opts []Option) {
 	// the caller cannot recover, so a logger that panics kills the process
 	// from any of them. Guarding at each of those call sites is a rule the
 	// next one has to remember; guarding the value they all read is not.
-	// safelog.Guard is idempotent, so engine.New guarding again costs one
+	// log.Guard is idempotent, so engine.New guarding again costs one
 	// wrapper rather than two, and a nil logger becomes a no-op one.
 	cfg.consumerLogger = cfg.logger
-	cfg.logger = safelog.Guard(cfg.logger)
+	cfg.logger = log.Guard(cfg.logger)
 }
 
 // KeyOption configures a single key at registration time.
@@ -291,14 +254,6 @@ func WithContextValidator(fn func(ctx context.Context, value any) error) KeyOpti
 		if fn != nil {
 			k.validator = fn
 		}
-	}
-}
-
-// WithRedaction sets the redaction policy for admin and log output.
-// Default: RedactNone.
-func WithRedaction(policy RedactPolicy) KeyOption {
-	return func(k *keyDef) {
-		k.redaction = policy
 	}
 }
 

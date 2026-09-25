@@ -15,6 +15,6 @@
 // coalescing worker per (scope, key), never by the goroutine the changefeed
 // calls into.
 //
-// The engine never imports internal/client: the key registry, options, catalog
-// and redaction stay there and reach the engine through ports declared here.
+// The engine never imports internal/client: the key registry, options and
+// catalog stay there and reach the engine through ports declared here.
 package engine

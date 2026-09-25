@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/testsupport/panicmetric"
 )
 
 // recordingLogger captures the fields lib-observability's panic recovery
@@ -149,12 +150,13 @@ func TestDebouncer_NilReceiverSafe(t *testing.T) {
 	d.Close()
 }
 
+// Not parallel: see panicmetric.
 func TestDebouncer_PanicInFnRecovered(t *testing.T) {
-	t.Parallel()
-
 	rec := &recordingLogger{Logger: log.NewNop()}
 	d := New[string](testWindow, WithLogger[string](rec))
 	t.Cleanup(d.Close)
+
+	counter := panicmetric.Install(t)
 
 	var secondFired atomic.Int32
 
@@ -170,23 +172,22 @@ func TestDebouncer_PanicInFnRecovered(t *testing.T) {
 		t.Fatal("debouncer broke after panic; second submit did not fire")
 	}
 
-	// The recovery component is a constant, never the key. Arguments to a
-	// deferred call are evaluated at defer time, so rendering the key into it
-	// would charge a Sprintf to every debounced invocation, panic or not.
-	// What that costs in identity, and who pays it back, is the recoveryComponent
-	// constant's godoc in debounce.go:
-	// RecoverAndLog captures no context, so it records neither the panic metric
-	// nor a span event, and in production mode its line carries source and a
-	// redacted value and no stack at all. A caller whose submitted function
-	// must be identifiable recovers first and logs its own identity.
+	// The recovery names a constant site, never the key: arguments to a
+	// deferred call are evaluated at defer time, so rendering the key into
+	// them would charge a Sprintf to every debounced invocation, panic or not.
+	// What that costs in identity, and who pays it back, is the
+	// recoveryComponent godoc in debounce.go. The report itself is whole: the
+	// line names the site and the panic is counted under the package.
 	source, ok := rec.field("source")
 	if !ok {
 		t.Fatalf("panic recovery logged no source field: %v", rec.snapshot())
 	}
 
-	if source.Value != "debounce" {
-		t.Errorf("panic recovery source: got %v, want %q", source.Value, "debounce")
+	if source.Value != "invoke" {
+		t.Errorf("panic recovery source: got %v, want %q", source.Value, "invoke")
 	}
+
+	counter.RequireOnly(t, "systemplane.debounce", "invoke")
 }
 
 func TestDebouncer_ZeroWindowInvokesSync(t *testing.T) {

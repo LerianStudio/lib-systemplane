@@ -1,6 +1,6 @@
 # Project Rules - lib-systemplane
 
-This document defines the coding standards, architecture patterns, and development guidelines for `lib-systemplane` — a standalone Go library providing dual-backend (PostgreSQL / MongoDB) hot-reload runtime configuration, with LISTEN/NOTIFY and change-stream subscriptions, admin HTTP routes, and tenant-scoped overrides.
+This document defines the coding standards, architecture patterns, and development guidelines for `lib-systemplane` — a standalone Go library providing dual-backend (PostgreSQL / MongoDB) hot-reload runtime configuration, with a convergent engine behind LISTEN/NOTIFY and change-stream changefeeds, typed group documents, and admin HTTP routes.
 
 ## Table of Contents
 
@@ -21,18 +21,7 @@ This document defines the coding standards, architecture patterns, and developme
 
 ### Package Structure
 
-```text
-lib-systemplane/
-├── (root package: systemplane)     # Small public API facade (api_*.go)
-├── admin/                          # Fiber HTTP handlers for runtime config management
-├── systemplanetest/                # Backend-equivalence contract test suite
-└── internal/
-    ├── client/                     # Client lifecycle, register/get/set, subscribers, tenant APIs
-    ├── store/                      # Backend-agnostic Store interface (private)
-    ├── postgres/                   # PostgreSQL LISTEN/NOTIFY implementation
-    ├── mongodb/                    # MongoDB change-stream (+ polling fallback) implementation
-    └── debounce/                   # Trailing-edge debouncer for changefeed coalescing
-```
+The package tree, annotated, is in [`CLAUDE.md`](../CLAUDE.md) § Repository shape.
 
 ### Package Design Principles
 
@@ -62,7 +51,7 @@ lib-systemplane/
 
 - **Minimum**: Go 1.26.3
 - Keep `go.mod` updated with latest stable Go version
-- Module path: `github.com/LerianStudio/lib-systemplane/v3`
+- Module path: `github.com/LerianStudio/lib-systemplane/v4`
 
 ### Build Tags
 
@@ -322,9 +311,9 @@ func (c *Client) Connect(ctx context.Context) error {
 
 Lerian shared-library ownership is split intentionally:
 
-- `github.com/LerianStudio/lib-commons/v6` — non-observability shared primitives. This repo uses `commons/tenant-manager/core`, `commons/net/http`, and `commons/backoff`.
-- `github.com/LerianStudio/lib-observability/v4` — canonical observability stack. This repo uses `log`, `tracing`, and `runtime` for structured logging, telemetry, span helpers, redaction, and panic recovery. **Internally only:** no exported parameter may name a type from it. The public boundary is `systemplane.Logger` and `systemplane.Telemetry`, declared in this module from stdlib + `go.opentelemetry.io/otel` types, and `boundary_test.go` enforces it. Rationale and the v2 → v3 move: [`MIGRATION-v3.md`](../MIGRATION-v3.md).
-- `github.com/LerianStudio/lib-systemplane/v3` — runtime-mutable configuration. Do not duplicate its functionality in service repositories.
+- `github.com/LerianStudio/lib-commons/v7` — non-observability shared primitives. This repo uses `commons/tenant-manager/{core,postgres,mongo}`, `commons/net/http`, and `commons/backoff`.
+- `github.com/LerianStudio/lib-observability/v4` — canonical observability stack. This repo uses `log`, `tracing`, and `runtime` for structured logging, telemetry, span helpers, and panic recovery. **Internally only:** no exported parameter may name a type from it. The public boundary is `systemplane.Logger` and `systemplane.Telemetry`, declared in this module from stdlib + `go.opentelemetry.io/otel` types, and `boundary_test.go` enforces it. Rationale and the v2 → v3 move: [`MIGRATION-v3.md`](../MIGRATION-v3.md); the v3 → v4 move: [`MIGRATION-v4.md`](../MIGRATION-v4.md).
+- `github.com/LerianStudio/lib-systemplane/v4` — runtime-mutable configuration. Do not duplicate its functionality in service repositories.
 - `github.com/LerianStudio/lib-streaming` — tenant-scoped event streaming. Do not add it to this repo unless a task explicitly requires streaming integration.
 
 Do not reintroduce observability packages from `lib-commons`; they are being removed from that module. New observability code must use `lib-observability`.
@@ -334,9 +323,7 @@ Do not reintroduce observability packages from `lib-commons`; they are being rem
 - `github.com/gofiber/fiber/v3` — HTTP framework for the admin routes
 - `github.com/jackc/pgx/v5` — PostgreSQL driver with LISTEN/NOTIFY support
 - `go.mongodb.org/mongo-driver/v2` — MongoDB driver with change streams
-- `github.com/hashicorp/golang-lru/v2` — Bounded LRU for lazy tenant cache
-- `github.com/google/uuid` — UUID generation
-- `github.com/stretchr/testify` — Test assertions and suites
+- `github.com/bxcodec/dbresolver/v2` — read/write resolver; a resolver-supplied Postgres handle is pinned to its primary
 - `github.com/testcontainers/testcontainers-go` — Ephemeral containers for integration tests
 - OpenTelemetry SDK — tracing and metrics instrumentation, normally reached through `lib-observability`
 
@@ -354,20 +341,8 @@ Do not reintroduce observability packages from `lib-commons`; they are being rem
 ### Credential Handling
 
 1. **Never hardcode credentials** - Use environment variables
-2. **Never log credentials** - Use the `Redactor` for sensitive fields
-3. **Mask in errors** - Never include credentials in error messages
-
-```go
-// Use the built-in lib-observability Redactor for sensitive data
-redactor := tracing.NewDefaultRedactor()
-safeValue := redactor.Redact(sensitiveField)
-```
-
-### Sensitive Field Detection
-
-- Use `lib-observability/tracing.Redactor` with `RedactionRule` patterns for telemetry attributes
-- Use `lib-observability/log` safe logging helpers when emitting external errors
-- Constructors: `NewDefaultRedactor()` and `NewRedactor(rules, mask)`
+2. **Never log a stored value** - The library adds no value to a log line of its own; a validator refusal logs the validator's error as produced, so a validator that quotes its input puts that input in the log
+3. **Name a key field `keyname`, never `key`** - `key` is in lib-observability's default sensitive-field list and renders as `key=[REDACTED]`
 
 ### Input Validation
 
@@ -474,30 +449,9 @@ make clean                 # Clean all build artifacts
 
 ## API Invariants
 
-Key API contracts that must be preserved:
-
-| Area | Invariant |
-|------|-----------|
-| Client construction | `NewPostgres(db, listenDSN, opts...) (*Client, error)` and `NewMongoDB(client, database, opts...) (*Client, error)` — consumer picks backend at construction time. |
-| Lifecycle | Construct → `Register`/`RegisterTenantScoped` → `Start(ctx)` → runtime ops → `Close()`. `Register` after `Start` returns `ErrRegisterAfterStart`. |
-| Read paths | `Get`, `GetString`, `GetInt`, `GetBool`, `GetFloat64`, `GetDuration` are nil-receiver safe and return zero values on miss. |
-| Write path | `Set(ctx, ns, key, value, actor)` — last-write-wins with write-through cache; subscribers fire via changefeed echo, not synchronously. |
-| Subscriptions | `OnChange(ns, key, fn)` returns an `unsubscribe` func. Callbacks invoked serially with panic recovery via `lib-observability/runtime.RecoverAndLog`. |
-| Tenant-scoped keys | `RegisterTenantScoped` declares per-tenant eligibility; legacy `Get`/`OnChange`/`List` continue observing only the shared `_global` row (non-breaking addition). |
-| Tenant access | `GetForTenant`, `SetForTenant`, `DeleteForTenant`, `ListTenantsForKey`, `OnTenantChange` plus typed accessor mirrors. Fail-closed — no silent fallback to global. |
-| Tenant validation | Tenant ID extracted via `core.GetTenantIDContext`, validated by `core.IsValidTenantID`. `_global` is reserved and rejected as a tenant ID. |
-| Resolution order | `GetForTenant`: per-tenant cache → legacy global cache → registered default. |
-| Delete semantics | Idempotent. Removing an existing row fires `OnTenantChange` with `newValue = registered default`. No-op delete emits no changefeed event. |
-| Tenant ctx propagation | `OnTenantChange` callback ctx is pre-scoped to `tenantID` via `core.ContextWithTenantID` — subscribers can directly call tenant-aware facilities (DLQ, idempotency, webhook). |
-| Admin HTTP surface | `Mount(router, client, opts...)` registers six routes (three legacy global, three tenant-scoped) at a configurable prefix (default `/system`). |
-| Admin authorization | `WithAuthorizer` covers legacy routes only. Tenant routes require `WithTenantAuthorizer` — default-deny when absent. Library does NOT silently fall back. |
-| Storage evolution | Postgres: `tenant_id TEXT NOT NULL DEFAULT '_global'` with composite unique index on `(namespace, key, tenant_id)`. MongoDB: compound `_id` `{namespace, key, tenant_id}` with idempotent backfill migration run during `NewMongoDB` (inside `ensureSchema`). |
-| Internal Store | `internal/store` defines the backend-agnostic contract. `internal/postgres` (LISTEN/NOTIFY, pgx/v5) and `internal/mongodb` (change streams + polling fallback, mongo-driver/v2) implement it. Both satisfy `systemplanetest.Run(t, factory)`. |
-| Sentinel errors | `ErrClosed`, `ErrNotStarted`, `ErrRegisterAfterStart`, `ErrUnknownKey`, `ErrValidation`, `ErrDuplicateKey`, `ErrNilContext`, `ErrMissingTenantContext`, `ErrInvalidTenantID`, `ErrTenantScopeNotRegistered`, `ErrTenantSchemaNotEnabled`. |
-| Test helper | `NewForTesting(s TestStore, opts...)` is an explicit out-of-package test helper, not a promised production API. |
-| Scope | Runtime-mutable knobs only. Bootstrap-only config (DB DSNs, secrets, TLS paths, telemetry init, server identity) should live in env vars / secret manager, not systemplane. |
-
----
+The public API contract — operating modes, storage shape, read and write paths,
+subscriptions, typed groups, the admin surface, sentinel errors — is written
+once, in [`CLAUDE.md`](../CLAUDE.md) § API invariants to respect.
 
 ## Checklist
 

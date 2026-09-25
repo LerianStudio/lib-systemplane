@@ -560,7 +560,7 @@ func (s *Store) createFeed(ctx context.Context, f *feed) error {
 		return s.retractFeed(f, fmt.Errorf("systemplane/mongodb: resolve tenant %s: %w", tenant, store.ErrTenantConnectorMissing))
 	}
 
-	coll := db.Collection(s.cfg.Collection)
+	coll := db.Collection(collectionName)
 
 	// Refused before anything is created or opened: a collection another live
 	// scope already watches would deliver that scope's writes to this one too.
@@ -745,7 +745,7 @@ func (s *Store) Subscribe(ctx context.Context, scope store.Scope, fn func(store.
 			// Same guard the reader goroutine carries: teardown releases the
 			// feed, and a panic here would take the process down from a
 			// goroutine no caller can recover for.
-			defer runtime.RecoverAndLog(s.cfg.Logger, "systemplane.mongodb.subscriber")
+			defer runtime.RecoverAndLogWithContext(ctx, s.cfg.Logger, recoveryComponent, "subscriber")
 
 			select {
 			case <-ctx.Done():
@@ -876,7 +876,7 @@ func (s *Store) openWatch(ctx context.Context, f *feed) (*mongo.ChangeStream, er
 	}
 
 	s.logInfo(ctx, "change stream established",
-		log.String("collection", s.cfg.Collection),
+		log.String("collection", collectionName),
 		log.String(obsconstants.AttrKeyTenantID, f.scope.Tenant),
 	)
 
@@ -973,7 +973,8 @@ func (s *Store) startFeedReader(f *feed, stream *mongo.ChangeStream) {
 
 	go func() {
 		defer close(done)
-		defer runtime.RecoverAndLog(s.cfg.Logger, "systemplane.mongodb.listener")
+		// The report carries the panic value only, never a document field (a config value).
+		defer runtime.RecoverAndLogWithContext(context.Background(), s.cfg.Logger, recoveryComponent, "listener")
 
 		if stream == nil {
 			s.pollForever(f, f.pollStart)
@@ -1050,7 +1051,7 @@ func (s *Store) consumeUntilFailure(f *feed, stream *mongo.ChangeStream) (consum
 	defer cancel()
 
 	go func() {
-		defer runtime.RecoverAndLog(s.cfg.Logger, "systemplane.mongodb.observer")
+		defer runtime.RecoverAndLogWithContext(ctx, s.cfg.Logger, recoveryComponent, "observer")
 
 		select {
 		case <-f.stop:
@@ -1232,7 +1233,7 @@ func (s *Store) refreshFeedColl(ctx context.Context, f *feed) error {
 		return fmt.Errorf("systemplane/mongodb: resolve tenant %s: %w", f.scope.Tenant, store.ErrTenantConnectorMissing)
 	}
 
-	coll := db.Collection(s.cfg.Collection)
+	coll := db.Collection(collectionName)
 
 	// The tenant may have been moved onto a collection another live scope
 	// watches; re-claiming keeps the identity the refusal is decided on honest

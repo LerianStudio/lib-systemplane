@@ -59,8 +59,8 @@ Only these paths. A task that appears to need anything else states what it needs
 - `internal/debounce/**`
 - `internal/testsupport/**` (new, added 2026-09-23 in the Phase 1 fix pass; test-only helpers shared
   by `internal/engine`, `internal/client` and `internal/manager`. This lane owns it after merge)
-- `internal/safelog/**` (new, created 2026-09-24 in Phase 2 fix pass 4; the leaf package that guards a
-  consumer logger and renders a redacted key's error cause and panic value, shared by
+- `internal/safelog/**` (new, created 2026-09-24 in Phase 2 fix pass 4; the leaf package holding the tenant
+  stamp for an unresolved tenant and the swallow for a panicking consumer logger, shared by
   `internal/engine`, `internal/client` and `internal/group` so that `internal/group` never imports the
   engine. This lane owns it after merge)
 - Two files outside every list above were edited in Phase 2 and are recorded here (2026-09-24): `.golangci.yml`
@@ -1509,7 +1509,7 @@ every gate in the verification list exits 0 on the branch head.
 **Scope:** `internal/client/options.go`, `internal/client/testing_facade_test.go`, root `api_constructors.go`, `api_client_test.go`
 **Dependencies:** Phase 2
 **Done when:** `WithTable`, `WithListenChannel` and `WithCollection` do not exist in `internal/client` or the root package; the Client stops setting `Table`, `Channel` and `Collection` on the backend configs and the backends' own defaults take effect; every test that passed one of those options is updated; `go build ./...` and `make test-unit` are green.
-**Status:** Pending
+**Status:** Done
 
 ### Epic 3.2: Gate sweep on the reduced surface
 

@@ -1,5 +1,7 @@
 # Migrating to lib-systemplane v3
 
+This document covers v2 → v3 only. For v4, see [MIGRATION-v4.md](MIGRATION-v4.md).
+
 v3 has one job: **stop lib-observability's major version from propagating
 through this library's public API.**
 

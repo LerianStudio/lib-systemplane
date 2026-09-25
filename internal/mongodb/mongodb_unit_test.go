@@ -13,6 +13,7 @@ import (
 	obsconstants "github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/testsupport/panicmetric"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -217,9 +218,6 @@ func TestNew_ConfigValidationAndDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New multi-tenant: %v", err)
 	}
-	if s.cfg.Collection != defaultCollection {
-		t.Fatalf("collection = %q, want %q", s.cfg.Collection, defaultCollection)
-	}
 	if s.cfg.Module != defaultModule {
 		t.Fatalf("module = %q, want %q", s.cfg.Module, defaultModule)
 	}
@@ -319,8 +317,8 @@ func TestStore_ClosedAndNilPaths(t *testing.T) {
 // missing either half of its identifier is dropped, and fan-out is the one
 // place an event learns its scope. The classification rules themselves live in
 // TestChangeEventDecodesTombstoneAsDelete.
+// Not parallel: see panicmetric.
 func TestChangeEventAndDispatch(t *testing.T) {
-	t.Parallel()
 
 	for _, ce := range []changeEvent{
 		{},
@@ -348,7 +346,10 @@ func TestChangeEventAndDispatch(t *testing.T) {
 	// Fan-out runs on the feed, which is also the one place an event learns
 	// its scope: a change stream cannot name it.
 	s := newSubscribeStore()
+	logger := &captureLogger{}
+	s.cfg.Logger = logger
 	f := newFeed(store.Scope{}, nil)
+	counter := panicmetric.Install(t)
 
 	var got []store.Event
 
@@ -363,6 +364,8 @@ func TestChangeEventAndDispatch(t *testing.T) {
 	if len(got) != 1 || got[0] != want {
 		t.Fatalf("dispatch events = %#v, want %#v", got, []store.Event{want})
 	}
+
+	requirePanicReported(t, logger, counter, "handler")
 }
 
 func TestIsNamespaceExists(t *testing.T) {
@@ -541,18 +544,18 @@ func TestSchemaCacheKey_DistinguishesTenants(t *testing.T) {
 	clusterA := &mongo.Client{}
 	clusterB := &mongo.Client{}
 
-	same := schemaCacheKey("t1", clusterA.Database("systemplane").Collection(defaultCollection))
-	if again := schemaCacheKey("t1", clusterA.Database("systemplane").Collection(defaultCollection)); again != same {
+	same := schemaCacheKey("t1", clusterA.Database("systemplane").Collection(collectionName))
+	if again := schemaCacheKey("t1", clusterA.Database("systemplane").Collection(collectionName)); again != same {
 		t.Fatalf("two handles onto the same tenant database key differently: %q vs %q", same, again)
 	}
 
-	if other := schemaCacheKey("t2", clusterB.Database("systemplane").Collection(defaultCollection)); other == same {
+	if other := schemaCacheKey("t2", clusterB.Database("systemplane").Collection(collectionName)); other == same {
 		t.Fatalf("two tenants sharing a database name share the key %q", same)
 	}
 
 	// The same tenant on a client it was re-resolved through keys the same: the
 	// bootstrap it already ran is its own, whatever handle reaches it now.
-	if moved := schemaCacheKey("t1", clusterB.Database("systemplane").Collection(defaultCollection)); moved != same {
+	if moved := schemaCacheKey("t1", clusterB.Database("systemplane").Collection(collectionName)); moved != same {
 		t.Fatalf("one tenant keyed two ways across client handles: %q vs %q", same, moved)
 	}
 
@@ -560,7 +563,7 @@ func TestSchemaCacheKey_DistinguishesTenants(t *testing.T) {
 		t.Fatalf("two collections share the key %q", same)
 	}
 
-	if other := schemaCacheKey("t1", clusterA.Database("other").Collection(defaultCollection)); other == same {
+	if other := schemaCacheKey("t1", clusterA.Database("other").Collection(collectionName)); other == same {
 		t.Fatalf("two databases share the key %q", same)
 	}
 }
@@ -571,12 +574,12 @@ func TestSchemaCacheKey_DistinguishesTenants(t *testing.T) {
 // nothing tenant-shaped on the single-tenant scope.
 func TestScopeAttrs_NamesTheTenant(t *testing.T) {
 	key := attribute.String(fieldKey, "k")
-	coll := (&mongo.Client{}).Database("sysplane").Collection(defaultCollection)
+	coll := (&mongo.Client{}).Database("sysplane").Collection(collectionName)
 
 	dbAttrs := []attribute.KeyValue{
 		attribute.String(obsconstants.AttrDBSystem, obsconstants.DBSystemMongoDB),
 		attribute.String(obsconstants.AttrDBName, "sysplane"),
-		attribute.String(obsconstants.AttrDBMongoDBCollection, defaultCollection),
+		attribute.String(obsconstants.AttrDBMongoDBCollection, collectionName),
 	}
 
 	want := append(append([]attribute.KeyValue{}, dbAttrs...), key)

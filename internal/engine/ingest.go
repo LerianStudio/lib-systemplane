@@ -184,7 +184,7 @@ func (e *Engine) prepare(ctx context.Context, scope store.Scope, se store.Entry,
 			log.String(constants.AttrKeyTenantID, scope.Tenant),
 			log.String("namespace", se.Namespace),
 			log.String("keyname", se.Key),
-			safelog.ErrorDetail(def.Redacted, "decode failed", err),
+			log.Err(err),
 		)
 
 		return publication{}, fmt.Errorf("systemplane: decode value for %s/%s: %w", se.Namespace, se.Key, err)
@@ -193,8 +193,8 @@ func (e *Engine) prepare(ctx context.Context, scope store.Scope, se store.Entry,
 	nk := NSKey{Namespace: se.Namespace, Key: se.Key}
 
 	if !pregraded {
-		if err := e.runValidator(ctx, scope, nk, def.Validate, decoded, def.Redacted); err != nil {
-			e.logValidatorRejection(ctx, scope.Tenant, nk, def.Redacted, err)
+		if err := e.runValidator(ctx, scope, nk, def.Validate, decoded); err != nil {
+			e.logValidatorRejection(ctx, scope.Tenant, nk, err)
 
 			return publication{}, err
 		}
@@ -211,26 +211,21 @@ func (e *Engine) prepare(ctx context.Context, scope store.Scope, se store.Entry,
 	}, nil
 }
 
-// logValidatorRejection reports a row the registered validator refused, with
-// the key's registered redaction policy applied to the ERROR TEXT by
-// [safelog.ErrorDetail].
+// logValidatorRejection reports a row the registered validator refused.
 //
-// The validator is consumer code and its message is a consumer-built string,
-// so it is the one place a configuration value reaches the log stream having
-// passed no redaction at all: a validator that names what it refused —
-// "token %q is too short" — publishes that token at WARN, into whatever ships
-// the logs. For a key registered as redacted the line therefore carries only
-// the error's dynamic type, which is enough to tell two rejections apart and
-// never enough to carry a value.
+// The line carries the validator's own error and never the value it refused:
+// this engine adds no value to a log line of its own. A validator that names
+// what it refused — "token %q is too short" — puts that much in the message
+// itself, which is the consumer's call to make.
 //
-// The error returned to the caller of Set is unchanged in both cases. This is
-// the log stream, not the API.
-func (e *Engine) logValidatorRejection(ctx context.Context, tenant string, nk NSKey, redacted bool, err error) {
+// The error returned to the caller of Set is unchanged. This is the log
+// stream, not the API.
+func (e *Engine) logValidatorRejection(ctx context.Context, tenant string, nk NSKey, err error) {
 	e.logWarn(ctx, "stored value rejected by validator, keeping cached value",
 		log.String(constants.AttrKeyTenantID, tenant),
 		log.String("namespace", nk.Namespace),
 		log.String("keyname", nk.Key),
-		safelog.ErrorDetail(redacted, "validation failed", err),
+		log.Err(err),
 	)
 }
 
@@ -303,11 +298,6 @@ func (e *Engine) ingestDefault(ctx context.Context, sc *scopeState, nk NSKey, de
 // a validation error. Nil-receiver safe, so a Client whose engine was never
 // built still grades rather than crashes.
 //
-// redacted is the key's registered redaction policy collapsed to a fact, the
-// same one KeyDef carries: both call sites grade the value of a key they
-// looked up, and a panic over a redacted one must report no more than every
-// other path does.
-//
 // scope and nk are that key's identity, carried so a panic here reports the
 // tenant, namespace and key like every other recovered consumer panic. The
 // write path builds the scope the way the Client's own multi-tenant lines name
@@ -319,9 +309,8 @@ func (e *Engine) RunValidator(
 	nk NSKey,
 	validate func(context.Context, any) error,
 	value any,
-	redacted bool,
 ) error {
-	return e.runValidator(ctx, scope, nk, validate, value, redacted)
+	return e.runValidator(ctx, scope, nk, validate, value)
 }
 
 // recoveryLogger is the logger the panic handlers below write through. A nil
@@ -355,34 +344,31 @@ func (e *Engine) recoveryLogger() log.Logger {
 //
 // The panic itself is reported through lib-observability's recovery pipeline,
 // never by this package: that is what truncates the stack, counts the panic
-// metric and records the span event. The value a validator panics on is a
-// value it was handed — a configuration row, which is exactly where a secret
-// can be — so the error returned here names only that the validator panicked,
-// and for a redacted key reportConsumerPanic withholds the panic value from
-// the report as well. Interpolating the panic value into the error would put
-// that row's contents into a WARN line the redaction never sees.
+// metric and records the span event. The error returned here names only that
+// the validator panicked, because this engine adds no value to a line of its
+// own — interpolating the panic value would put the row's contents into a WARN
+// line the ingress never meant to write.
 func (e *Engine) runValidator(
 	ctx context.Context,
 	scope store.Scope,
 	nk NSKey,
 	validate func(context.Context, any) error,
 	value any,
-	redacted bool,
 ) (err error) {
 	if validate == nil {
 		return nil
 	}
 
 	// Recovered here rather than by RecoverAndLogWithContext, because the
-	// report is what has to change for a redacted key and that helper reports
-	// what it recovered. The rejection is raised in the same place, so a panic
-	// still comes back as a validation error and nothing reaches the caller's
-	// goroutine.
+	// report has to name the key first and that helper reports what it
+	// recovered and nothing else. The rejection is raised in the same place, so
+	// a panic still comes back as a validation error and nothing reaches the
+	// caller's goroutine.
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			err = fmt.Errorf("%w: validator panicked", store.ErrValidation)
 
-			e.reportConsumerPanic(ctx, scope, nk, recovered, redacted, "validator panicked", "validator")
+			e.reportConsumerPanic(ctx, scope, nk, recovered, "validator panicked", "validator")
 		}
 	}()
 
@@ -392,8 +378,8 @@ func (e *Engine) runValidator(
 // reportConsumerPanic is the one place the engine reports a recovered panic:
 // consumer code — a registered validator, an OnChange callback — and the store
 // calls the engine makes on its own goroutines alike. It names what the panic
-// was about before handing it to lib-observability's canonical handler, and
-// withholds the panic value for a key registered redacted.
+// was about, then hands the panic value to lib-observability's canonical
+// handler exactly as it was raised.
 //
 // The identity line comes first and is emitted here rather than at each call
 // site, because a report that says only "something under the engine panicked"
@@ -401,31 +387,11 @@ func (e *Engine) runValidator(
 // and one key serve every tenant of a multi-tenant fleet, so a panic naming
 // neither sends an operator through every tenant's logs. A reconcile passes
 // the zero key, since a whole-scope snapshot is about no single one.
-//
-// HandlePanicValue logs log.Any("value", recovered) whenever production mode
-// is off, and off is lib-observability's shipped default. So a validator or a
-// callback that panics NAMING the value it was handed —
-// panic(fmt.Sprintf("bad token %q", v)) — publishes that value at ERROR for a
-// key whose entire registration says it must never reach a log line, and
-// nothing downstream catches it: "value" is not on lib-observability's
-// sensitive-field list. For a redacted key the handler therefore receives a
-// sentence in place of the value: what panicked, and the panic value's dynamic
-// type, which is enough to tell two panics apart and can never carry a byte of
-// a secret — the same trade safelog.ErrorDetail makes for a rejection's message.
-//
-// The sentence itself lives in internal/safelog, shared with internal/group's
-// applier recovery, so the two sites that can report a withheld panic word it
-// identically and one test pins the wording.
-//
-// It is the same handler either way, so the panic counter, the span event and
-// the error report are recorded exactly as before; only what they carry
-// changes. An unredacted key is reported verbatim.
 func (e *Engine) reportConsumerPanic(
 	ctx context.Context,
 	scope store.Scope,
 	nk NSKey,
 	recovered any,
-	redacted bool,
 	what, name string,
 ) {
 	e.logError(ctx, "systemplane.engine: "+what,
@@ -434,12 +400,7 @@ func (e *Engine) reportConsumerPanic(
 		log.String("keyname", nk.Key),
 	)
 
-	reported := recovered
-	if redacted {
-		reported = safelog.WithheldPanic(what, recovered)
-	}
-
-	e.reportRecovered(ctx, reported, name)
+	e.reportRecovered(ctx, recovered, name)
 }
 
 // reportRecovered hands a recovered panic to lib-observability's canonical

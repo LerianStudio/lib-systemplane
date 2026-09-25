@@ -14,10 +14,7 @@ var _ engine.Registry = (*Client)(nil)
 //
 // The default is returned as it is stored, not copied: the port's contract
 // says the engine never mutates what it receives and clones before caching or
-// delivering, so a copy here would buy nothing and cost one per read. Redacted
-// collapses RedactMask and RedactFull alike to true — the engine needs the
-// fact that a value must never reach a log line, not the policy for rendering
-// it, which stays here.
+// delivering, so a copy here would buy nothing and cost one per read.
 func (c *Client) Lookup(namespace, key string) (engine.KeyDef, bool) {
 	if c == nil {
 		return engine.KeyDef{}, false
@@ -34,31 +31,7 @@ func (c *Client) Lookup(namespace, key string) (engine.KeyDef, bool) {
 	return engine.KeyDef{
 		Default:  def.defaultValue,
 		Validate: def.validator,
-		Redacted: def.redaction != RedactNone,
 	}, true
-}
-
-// AnyRedacted reports whether any registered key carries a redaction policy.
-//
-// Scanned rather than counted: it is read only when the engine recovers a
-// panic under a whole-scope snapshot, which is rare, and a counter maintained
-// beside the map would have to be kept correct by every future writer of it
-// for a saving nothing measures.
-func (c *Client) AnyRedacted() bool {
-	if c == nil {
-		return false
-	}
-
-	c.registryMu.RLock()
-	defer c.registryMu.RUnlock()
-
-	for _, def := range c.registry {
-		if def.redaction != RedactNone {
-			return true
-		}
-	}
-
-	return false
 }
 
 // Keys returns every registered key, in no particular order.

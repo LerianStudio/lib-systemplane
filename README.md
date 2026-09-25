@@ -1,8 +1,13 @@
 # lib-systemplane
 
-Dual-backend (PostgreSQL / MongoDB) hot-reload runtime configuration for Lerian services. Register operational knobs (log levels, feature flags, rate limits, circuit-breaker thresholds, worker intervals) at startup, mutate them at runtime without a pod restart, and — in single-tenant mode — subscribe to change events through a LISTEN/NOTIFY (Postgres) or change-stream (MongoDB) backed subscription. First-class support for the Lerian database-per-tenant model via the `lib-commons/v6` tenant-manager dispatch layer.
+The module is `github.com/LerianStudio/lib-systemplane/v4`, built on `lib-commons/v7`.
+Parts of this README, its code samples included, still describe the v3 line; the
+schema section is already v4. Until it is rewritten, take
+[MIGRATION-v4.md](MIGRATION-v4.md) as the source of truth for anything that differs.
 
-This library was extracted from `lib-commons/v5/commons/systemplane`. The v3 line targets the Fiber v3 stack (`lib-commons/v6`) and uses `lib-observability/v4` internally for logging, tracing, telemetry, redaction, and panic recovery.
+Dual-backend (PostgreSQL / MongoDB) hot-reload runtime configuration for Lerian services. Register operational knobs (log levels, feature flags, rate limits, circuit-breaker thresholds, worker intervals) at startup, mutate them at runtime without a pod restart, and — in single-tenant mode — subscribe to change events through subscriptions backed by Postgres LISTEN/NOTIFY or MongoDB change streams. First-class support for the Lerian database-per-tenant model via the `lib-commons/v7` tenant-manager dispatch layer.
+
+This library was extracted from `lib-commons/v5/commons/systemplane`. The v4 line targets the Fiber v3 stack (`lib-commons/v7`) and uses `lib-observability/v4` internally for logging, tracing, telemetry, and panic recovery.
 
 The public API names none of that. `WithLogger` and `WithTelemetry` take interfaces declared by this library from stdlib and OpenTelemetry types only, so a logger or telemetry provider built against **any** lib-observability major satisfies them — see [`MIGRATION-v3.md`](MIGRATION-v3.md) for the v2 → v3 move.
 
@@ -11,7 +16,7 @@ The public API names none of that. `WithLogger` and `WithTelemetry` take interfa
 - Go `1.26.3` or newer
 - PostgreSQL 13+ **or** MongoDB 4.4+ (replica set required for change streams; polling fallback available for standalone MongoDB)
 - `github.com/LerianStudio/lib-commons/v6` for tenant-manager context, admin HTTP helpers, and backoff
-- `github.com/LerianStudio/lib-observability/v4` for logging, tracing, telemetry, redaction, and panic recovery
+- `github.com/LerianStudio/lib-observability/v4` for logging, tracing, telemetry, and panic recovery
 
 ## Installation
 
@@ -324,7 +329,7 @@ In multi-tenant mode, authenticate before tenant resolution, then mount the tena
 
 ### Catalog routes
 
-The catalog surface exposes registration metadata, not current persisted values. It is useful for operators and consoles that need to discover the canonical key set, descriptions, redaction policy, schemas, examples, and write path.
+The catalog surface exposes registration metadata, not current persisted values. It is useful for operators and consoles that need to discover the canonical key set, descriptions, schemas, examples, and write path.
 
 Mount it separately from value routes:
 
@@ -366,11 +371,30 @@ admin.Mount(app, client,
 
 Fiber applies `app.Use` middleware only to routes registered *after* the `Use` call. Registering `myJWTAuthMiddleware` after `MountCatalog` leaves the catalog routes outside the authentication chain, so `myAuthFn` would run on an unauthenticated request. Keep the auth middleware above both mounts, or have `myAuthFn` authenticate independently.
 
-Catalog detail includes the registered default value. Admin HTTP responses obfuscate defaults for keys registered with `RedactMask` or `RedactFull`. Catalog examples are operator-facing documentation and are emitted as provided; do not put secrets, credentials, DSNs, tokens, or other sensitive material in registered defaults, persisted values, schemas, rules, or examples. Systemplane is not a secret store.
+Catalog detail includes the registered default value, as registered. Catalog examples are operator-facing documentation and are emitted as provided; do not put secrets, credentials, DSNs, tokens, or other sensitive material in registered defaults, persisted values, schemas, rules, or examples. Systemplane is not a secret store.
+
+## Panic recovery
+
+The library recovers every panic it can catch — in an `OnChange` callback, a
+typed-group applier, a changefeed goroutine, the debouncer, or an admin
+authorizer or actor extractor — through `lib-observability/runtime`. Each one logs a
+`panic recovered` line at ERROR, records a span event when the context carries
+a recording span, and increments `panic_recovered_total` with a `component`
+label (`systemplane.engine`, `systemplane` for the typed-group applier under
+the name `group.apply`, `systemplane.postgres`, `systemplane.mongodb`,
+`systemplane.debounce`, `systemplane.admin`, and `log` for the consumer's
+logger itself, named by the method that panicked) and a `goroutine_name` label
+for the site. The counter exists only after the host calls
+`runtime.InitPanicMetrics(factory)` once at startup; the library never calls it,
+because the first call wins and would take the host's metrics. Production mode
+(`runtime.SetProductionMode(true)`) omits the recovered value from the log
+line. With production mode off, a recovered panic value is logged in full; a
+validator or apply hook that panics naming a value puts that value in the log. An admin authorizer that panics answers 403; an actor extractor that
+panics answers 500 and writes nothing.
 
 ## Scope
 
-Systemplane is intended for **runtime-mutable knobs only**. Bootstrap-only configuration (DB DSNs, secrets, TLS material, telemetry endpoints, server identity) and any credential-like runtime value belongs in environment variables or a secret manager — not here. Redaction is an admin/log obfuscation aid, not permission to store secrets in systemplane.
+Systemplane is intended for **runtime-mutable knobs only**. Bootstrap-only configuration (DB DSNs, secrets, TLS material, telemetry endpoints, server identity) and any credential-like runtime value belongs in environment variables or a secret manager — not here. Nothing in systemplane masks a value: a value stored here is readable by every caller the admin authorizer allows, so mount `/system` behind an operator/admin permission.
 
 ## License
 

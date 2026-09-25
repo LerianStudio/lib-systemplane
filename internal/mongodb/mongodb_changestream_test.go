@@ -18,6 +18,7 @@ import (
 	obsconstants "github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/testsupport/panicmetric"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -29,7 +30,7 @@ import (
 // Subscribe path itself doesn't touch the client.
 func newSubscribeStore() *Store {
 	return &Store{
-		cfg:      Config{Collection: defaultCollection, Module: defaultModule},
+		cfg:      Config{Module: defaultModule},
 		feeds:    make(map[string]*feed),
 		closedCh: make(chan struct{}),
 	}
@@ -672,6 +673,9 @@ func TestMongoSubscribe_JoinerIsToldTheFeedState(t *testing.T) {
 // completes.
 func TestMongoSubscribe_PanickingCallbackDoesNotEscapeOrHoldLock(t *testing.T) {
 	s := newSubscribeStore()
+	logger := &captureLogger{}
+	s.cfg.Logger = logger
+	counter := panicmetric.Install(t)
 
 	f, err := s.zeroFeed()
 	if err != nil {
@@ -717,6 +721,8 @@ func TestMongoSubscribe_PanickingCallbackDoesNotEscapeOrHoldLock(t *testing.T) {
 	if got[0].Op != store.OpResync || got[0].Scope != f.scope {
 		t.Fatalf("joining event = %+v, want {Scope:%+v Op:%q}", got[0], f.scope, store.OpResync)
 	}
+
+	requirePanicReported(t, logger, counter, "handler")
 
 	// sub.mu must be free again: a second delivery has to complete rather than
 	// block forever on a mutex the panicking callback unwound past.
@@ -1019,7 +1025,7 @@ func TestMongoStore_RefreshFeedCollReresolvesNamedScope(t *testing.T) {
 
 	defer func() { _ = s.Close() }()
 
-	f := newFeed(store.Scope{Tenant: "t1"}, first.Collection(defaultCollection))
+	f := newFeed(store.Scope{Tenant: "t1"}, first.Collection(collectionName))
 
 	if err := s.refreshFeedColl(context.Background(), f); err != nil {
 		t.Fatalf("refreshFeedColl: %v", err)
@@ -1030,7 +1036,7 @@ func TestMongoStore_RefreshFeedCollReresolvesNamedScope(t *testing.T) {
 	}
 
 	// The zero scope keeps the constructor handle: nobody else closes it.
-	zero := newFeed(store.Scope{}, first.Collection(defaultCollection))
+	zero := newFeed(store.Scope{}, first.Collection(collectionName))
 
 	if err := s.refreshFeedColl(context.Background(), zero); err != nil {
 		t.Fatalf("refreshFeedColl on the zero scope: %v", err)
@@ -1071,7 +1077,7 @@ func TestMongoStore_RefreshFeedCollRefusesNilDatabase(t *testing.T) {
 // reopen fails instead, retryably, and the feed keeps both the handle and the
 // claim it already had until a probe succeeds.
 func TestMongoStore_RefreshFeedCollKeepsHandleWhenProbeFails(t *testing.T) {
-	held := collIdentity{server: "rs:rs0/mongo-a:27017", db: "tenant_before", coll: defaultCollection}
+	held := collIdentity{server: "rs:rs0/mongo-a:27017", db: "tenant_before", coll: collectionName}
 
 	// A handle that resolves locally but whose hello cannot reach a server.
 	unreachable := offlineCollection(t, "tenant_after").Database()
@@ -1084,7 +1090,7 @@ func TestMongoStore_RefreshFeedCollKeepsHandleWhenProbeFails(t *testing.T) {
 
 	defer func() { _ = s.Close() }()
 
-	before := (&mongo.Client{}).Database("tenant_before").Collection(defaultCollection)
+	before := (&mongo.Client{}).Database("tenant_before").Collection(collectionName)
 
 	f := newFeed(store.Scope{Tenant: "t1"}, before)
 	f.collID = held
@@ -1712,7 +1718,7 @@ func TestMongoFeed_ClaimRefusesOnlyASharedCollection(t *testing.T) {
 		anotherServer = "proc:6ab3ebc6c112ecf032990511"
 	)
 
-	held := collIdentity{server: oneServer, db: "systemplane", coll: defaultCollection}
+	held := collIdentity{server: oneServer, db: "systemplane", coll: collectionName}
 
 	cases := []struct {
 		name    string
@@ -1720,9 +1726,9 @@ func TestMongoFeed_ClaimRefusesOnlyASharedCollection(t *testing.T) {
 		refused bool
 	}{
 		{"the same collection of the same database on the same server", held, true},
-		{"another database on the same server", collIdentity{server: oneServer, db: "other", coll: defaultCollection}, false},
+		{"another database on the same server", collIdentity{server: oneServer, db: "other", coll: collectionName}, false},
 		{"another collection of the same database", collIdentity{server: oneServer, db: "systemplane", coll: "other"}, false},
-		{"the same database name on another server", collIdentity{server: anotherServer, db: "systemplane", coll: defaultCollection}, false},
+		{"the same database name on another server", collIdentity{server: anotherServer, db: "systemplane", coll: collectionName}, false},
 		{"a server that would not identify itself", collIdentity{}, false},
 	}
 
@@ -1768,7 +1774,7 @@ func TestMongoFeed_ClaimRefusesOnlyASharedCollection(t *testing.T) {
 // The refusal is about a collection being WATCHED, not about its name: the
 // moment the holder leaves the feeds map its collection is free again.
 func TestMongoFeed_ReleasedCollectionIsClaimableAgain(t *testing.T) {
-	id := collIdentity{server: "rs:rs0/mongo-a:27017", db: "systemplane", coll: defaultCollection}
+	id := collIdentity{server: "rs:rs0/mongo-a:27017", db: "systemplane", coll: collectionName}
 
 	s := newSubscribeStore()
 
@@ -1802,7 +1808,7 @@ func TestMongoFeed_ReleasedCollectionIsClaimableAgain(t *testing.T) {
 // re-claim. A claim is released by the feed leaving the feeds map or by a
 // SUCCESSFUL re-claim that replaces it.
 func TestMongoFeed_ClaimSurvivesAProbeThatCouldNotAnswer(t *testing.T) {
-	id := collIdentity{server: "rs:rs0/mongo-a:27017", db: "systemplane", coll: defaultCollection}
+	id := collIdentity{server: "rs:rs0/mongo-a:27017", db: "systemplane", coll: collectionName}
 
 	s := newSubscribeStore()
 
@@ -1963,7 +1969,7 @@ func offlineCollection(t *testing.T, database string) *mongo.Collection {
 
 	t.Cleanup(func() { _ = cl.Disconnect(context.Background()) })
 
-	return cl.Database(database).Collection(defaultCollection)
+	return cl.Database(database).Collection(collectionName)
 }
 
 // answeringProbe stands in for the hello collIdentityOf asks, which no offline

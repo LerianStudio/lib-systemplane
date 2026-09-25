@@ -115,11 +115,8 @@ func TestNewForTestingAdapterAndOptions(t *testing.T) {
 	}}}
 
 	c, err := NewForTesting(backend,
-		WithListenChannel("custom_channel"),
 		WithPollInterval(time.Second),
 		WithDebounce(time.Millisecond),
-		WithCollection("custom_collection"),
-		WithTable("custom_table"),
 		WithModule("custom_module"),
 		WithCatalogService("custom_service"),
 	)
@@ -185,17 +182,5 @@ func TestNewForTestingRejectsNilStores(t *testing.T) {
 	var typedNil *facadeTestStore
 	if _, err := NewForTesting(typedNil); !errors.Is(err, store.ErrNilBackend) {
 		t.Fatalf("typed nil store error = %v, want ErrNilBackend", err)
-	}
-}
-
-func TestRedactionHelpers(t *testing.T) {
-	if got := ApplyRedaction("visible", RedactNone); got != "visible" {
-		t.Fatalf("ApplyRedaction none = %#v", got)
-	}
-	if got := ApplyRedaction("secret", RedactMask); got == "secret" {
-		t.Fatalf("ApplyRedaction mask = %#v, want obfuscated", got)
-	}
-	if got := RedactPolicy(99).String(); got != "none" {
-		t.Fatalf("unknown RedactPolicy string = %q", got)
 	}
 }

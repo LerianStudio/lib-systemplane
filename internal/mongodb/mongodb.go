@@ -47,7 +47,7 @@ import (
 )
 
 const (
-	defaultCollection  = "systemplane_entries"
+	collectionName     = "systemplane_entries"
 	defaultModule      = "systemplane"
 	reconnectBaseDelay = 500 * time.Millisecond
 	reconnectMaxDelay  = 30 * time.Second
@@ -66,9 +66,6 @@ type Config struct {
 	// Database is the database name for single-tenant mode. MAY be empty
 	// when MultiTenantEnabled is true.
 	Database string
-
-	// Collection is the collection name. Default: "systemplane_entries".
-	Collection string
 
 	// PollInterval enables polling mode when positive. A zero value uses
 	// change streams (which require a replica set). Polling serves every
@@ -298,7 +295,7 @@ func (s *Store) resolveCollection(ctx context.Context, scope store.Scope) (*mong
 			return nil, fmt.Errorf("systemplane/mongodb: resolve tenant %s: %w", scope.Tenant, store.ErrTenantConnectorMissing)
 		}
 
-		coll := db.Collection(s.cfg.Collection)
+		coll := db.Collection(collectionName)
 		if err := s.ensureSchema(ctx, scope.Tenant, coll, true); err != nil {
 			return nil, err
 		}
@@ -321,7 +318,7 @@ func (s *Store) resolveCollection(ctx context.Context, scope store.Scope) (*mong
 	// is possible — the two are independent context keys — and ensureSchema
 	// answers it by skipping the memo rather than sharing one entry between
 	// those two tenants.
-	coll := db.Collection(s.cfg.Collection)
+	coll := db.Collection(collectionName)
 	if err := s.ensureSchema(ctx, tmcore.GetTenantIDContext(ctx), coll, true); err != nil {
 		return nil, err
 	}

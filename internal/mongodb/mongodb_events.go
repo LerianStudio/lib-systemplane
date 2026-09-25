@@ -1,6 +1,7 @@
 package mongodb
 
 import (
+	"context"
 	"hash/fnv"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
@@ -185,12 +186,16 @@ func (f *feed) joiningOpLocked() string {
 	}
 }
 
-// deliverLocked runs fn under runtime.RecoverAndLog. The caller MUST already
-// hold sub.mu; deliver is the variant that takes it. Both routes are
-// panic-safe, and every caller unlocks through defer, so a panicking callback
-// can never leave sub.mu held.
+// recoveryComponent is the component every panic recovered in this package is
+// counted under on panic_recovered_total; the goroutine_name label says which
+// site recovered it.
+const recoveryComponent = "systemplane.mongodb"
+
+// deliverLocked runs fn under panic recovery (logged and counted; no span, the
+// Subscribe ctx never carries one). The caller MUST hold sub.mu and unlock it
+// through defer; deliver is the variant that takes it.
 func (sub *subscription) deliverLocked(logger log.Logger, evt store.Event) {
-	defer runtime.RecoverAndLog(logger, "systemplane.mongodb.handler")
+	defer runtime.RecoverAndLogWithContext(context.Background(), logger, recoveryComponent, "handler")
 
 	sub.fn(evt)
 }

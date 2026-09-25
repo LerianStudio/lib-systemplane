@@ -131,37 +131,6 @@ func (s *apiMemoryStore) Subscribe(_ context.Context, _ TestScope, fn func(TestE
 	}, nil
 }
 
-// TestPublicKeyRedactionFailsClosed pins the exported accessor's delegation:
-// a nil Client and a closed one answer RedactFull for every key, registered or
-// not, because every caller uses the answer to decide what a value may show.
-func TestPublicKeyRedactionFailsClosed(t *testing.T) {
-	t.Parallel()
-
-	var nilClient *Client
-	if got := nilClient.KeyRedaction("runtime", "name"); got != RedactFull {
-		t.Errorf("KeyRedaction on a nil Client = %v, want RedactFull", got)
-	}
-
-	c, err := NewForTesting(newAPIMemoryStore())
-	if err != nil {
-		t.Fatalf("NewForTesting: %v", err)
-	}
-
-	if err := c.Register("runtime", "name", "default"); err != nil {
-		t.Fatalf("register name: %v", err)
-	}
-
-	if err := c.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-
-	for _, key := range []string{"name", "never-registered"} {
-		if got := c.KeyRedaction("runtime", key); got != RedactFull {
-			t.Errorf("KeyRedaction(%q) on a closed Client = %v, want RedactFull", key, got)
-		}
-	}
-}
-
 func TestPublicClientFacadeRuntimeMethods(t *testing.T) {
 	t.Parallel()
 
@@ -196,9 +165,6 @@ func TestPublicClientFacadeRuntimeMethods(t *testing.T) {
 	}
 	if got := c.KeyDescription("runtime", "name"); got != "service name" {
 		t.Fatalf("KeyDescription = %q", got)
-	}
-	if got := c.KeyRedaction("runtime", "name"); got != RedactNone {
-		t.Fatalf("KeyRedaction = %v, want RedactNone", got)
 	}
 
 	ctx := context.Background()
@@ -279,25 +245,11 @@ func TestPublicConstructorsAndOptions(t *testing.T) {
 	if _, err := NewMongoDB(nil, ""); err == nil {
 		t.Fatal("NewMongoDB nil backend: expected error, got nil")
 	}
-	if _, err := NewPostgres(nil, "", WithMultiTenantEnabled(), WithListenChannel("custom_channel"), WithTable("custom_table"), WithModule("runtime")); err != nil {
+	if _, err := NewPostgres(nil, "", WithMultiTenantEnabled(), WithModule("runtime")); err != nil {
 		t.Fatalf("NewPostgres multi-tenant: %v", err)
 	}
-	if _, err := NewMongoDB(nil, "", WithMultiTenantEnabled(), WithCollection("custom_collection"), WithPollInterval(time.Second), WithDebounce(time.Millisecond)); err != nil {
+	if _, err := NewMongoDB(nil, "", WithMultiTenantEnabled(), WithPollInterval(time.Second), WithDebounce(time.Millisecond)); err != nil {
 		t.Fatalf("NewMongoDB multi-tenant: %v", err)
-	}
-
-	if got := ApplyRedaction("secret", RedactNone); got != "secret" {
-		t.Fatalf("ApplyRedaction none = %#v", got)
-	}
-	masked := ApplyRedaction("secret", RedactMask)
-	if masked == "secret" {
-		t.Fatalf("ApplyRedaction mask = %#v, want obfuscated value", masked)
-	}
-	if got := ApplyRedaction("secret", RedactFull); got != masked {
-		t.Fatalf("ApplyRedaction full = %#v, want same obfuscated value as mask %#v", got, masked)
-	}
-	if got := RedactPolicy(99).String(); got != "none" {
-		t.Fatalf("unknown redaction string = %q", got)
 	}
 
 	c, err := NewForTesting(newAPIMemoryStore())
