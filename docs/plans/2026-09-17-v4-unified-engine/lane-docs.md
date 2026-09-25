@@ -144,7 +144,7 @@ grep -nE 'internal/safelog|safelog\.Guard|RecoverAndLog|changes an import line a
 **Goal:** One document that answers, for every consumer in the matrix, "what breaks, what replaces it, and what do I have to do to my database", true against `develop` today and explicit about what is still landing.
 **Scope:** `MIGRATION-v4.md` (new), one pointer line in `MIGRATION-v3.md`.
 **Dependencies:** none for Tasks 1.1.1-1.1.4; Task 1.1.5 is finished after engine-tenants merges.
-**Done when:** `MIGRATION-v4.md` exists with the seven `##` sections of Task 1.1.1; every FC-10 removed symbol appears with its replacement or its placeholder; every entry of `index.md` § "Behaviour changes MIGRATION-v4.md must name" is covered by Task 1.1.2a, 1.1.2b, 1.1.3 or (as a placeholder) 1.1.5; the ten matrix rows each have a `###` section; both § Phase 1 checks and § The link check pass.
+**Done when:** `MIGRATION-v4.md` exists with six `##` sections (Task 1.1.1's seven minus § Why the module path moved, deleted in review); every FC-10 removed symbol appears with its replacement or its placeholder; every entry of `index.md` § "Behaviour changes MIGRATION-v4.md must name" is covered by Task 1.1.2a, 1.1.2b, 1.1.3 or (as a placeholder) 1.1.5; nine matrix rows each have a `###` section and plugin-br-pix-lerian is one line in the § Per consumer intro; both § Phase 1 checks and § The link check pass.
 **Status:** Pending
 
 #### Task 1.1.1: Create `MIGRATION-v4.md` — framing, surface diff, module hop
@@ -190,7 +190,7 @@ git diff --numstat MIGRATION-v3.md       # expected: added 1 or 2 (one line plus
 
 plus both § Phase 1 checks (no output) and § The link check over `MIGRATION-v4.md MIGRATION-v3.md` (exit 0).
 
-**Done when:** seven sections exist, 1, 2, 3 and 7 written; the v3 → v4 row says module path only; every removed symbol is named with its replacement or placeholder; three placeholders; `MIGRATION-v3.md` gained one line.
+**Done when:** six sections exist, 1, 2 and 3 written (7 was deleted in review); the v3 → v4 row says module path only; every removed symbol is named with its replacement or placeholder; three placeholders; `MIGRATION-v3.md` gained one line.
 
 #### Task 1.1.2a: Write § Behaviour changes — reads, writes and validation
 
@@ -351,13 +351,14 @@ grep -c 'NOT-YET(' MIGRATION-v4.md   # expected: 10
 
 ~~~bash
 for c in matcher billing-worker finance-hub br-consignado-gw go-boilerplate-ddd \
-         plugin-br-pix-lerian product-console; do
+         product-console; do
   grep -q "^### .*$c" MIGRATION-v4.md || echo "MISSING SECTION: $c"
 done                                  # expected: no output
+grep -q '^plugin-br-pix-lerian has no section' MIGRATION-v4.md || echo "MISSING INTRO LINE"
 grep -c 'NOT-YET(' MIGRATION-v4.md    # expected: 12
 ~~~
 
-**Done when:** seven sections with the spine; `DefaultSeedSQL` removal named for billing-worker and finance-hub; `WithListenChannel` removal is a placeholder; the Fiber precondition is in finance-hub; go-boilerplate-ddd says update last; plugin-br-pix-lerian says nothing to do.
+**Done when:** six sections with the spine; `DefaultSeedSQL` removal named for billing-worker and finance-hub; `WithListenChannel` removal is a placeholder; the Fiber precondition is in finance-hub; go-boilerplate-ddd says same as br-consignado-gw; plugin-br-pix-lerian is one line in the § Per consumer intro.
 
 #### Task 1.1.5: Write the per-consumer sections for the three Manager users
 
@@ -551,7 +552,7 @@ Two facts to carry into elaboration rather than rediscover. First, the added CI 
 | No product document mentions `lib-commons/v6`, `Manager`, `NewManager`, `DefaultSeedSQL`, `WithTable`, `WithListenChannel` | Tasks 1.2.1, 1.2.2, Epic 2.2; scoped absence grep in each verification |
 | … nor `Slice`, `WithLazyTenantLoad`, `WithTenantAuthorizer`, `WithTenantSchemaEnabled` | Task 1.2.2 (the last three live only in `docs/PROJECT_RULES.md` and `.env.reference`); `Slice N` is **not** a docs-lane token — verified, it appears only in `internal/manager/**`, which `engine-core` deletes, and the repo-wide check belongs to the `integration` lane under lane-cut rule 4 |
 | `CHANGELOG.md` and `docs/plans/` out of scope | § What this lane owns lists both as must-not-touch |
-| `MIGRATION-v4.md` has one section per consumer in the matrix | Tasks 1.1.4 (seven) and 1.1.5 (three) — ten of ten rows |
+| `MIGRATION-v4.md` has one section per consumer in the matrix | Tasks 1.1.4 (six sections plus the plugin-br-pix-lerian intro line) and 1.1.5 (three) — ten of ten rows |
 | … plus a behaviour-change section (FC-11, coalesced delivery, `Change` signature, removed options) | Task 1.1.2b items 7, 9, 8 and the § The surface diff table from Task 1.1.1 (name-override options as a `NOT-YET(engine-core-p3)` placeholder) |
 | Three examples build in CI, each demonstrating a value changing at runtime | Epics 2.1 and 2.3 |
 | `CLAUDE.md` API invariants match the facade | Task 1.2.1 |
