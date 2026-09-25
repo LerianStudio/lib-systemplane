@@ -139,10 +139,11 @@ func WithValidator(fn func(any) error) KeyOption { return internalclient.WithVal
 //
 // [Client.Set] invokes it with the context of that write — once, before the
 // row is persisted, so what Set returns says whether the next read in this
-// process serves that write — and [Client.Register] with context.Background(). In single-tenant mode it also grades every value
+// process serves that write — and [Client.Register] with context.Background(). It also grades every value
 // read back from the store — the first reconcile at [Client.Start] and every
-// later reconcile and changefeed re-read — with a context derived from the
-// client's lifecycle, which carries no request values and no tenant. A context
+// later reconcile and changefeed re-read, and a tenant's own under a tenant
+// manager — with a context derived from the client's lifecycle, which carries
+// no request values and a tenant only for a tenant's scope. A context
 // validator must therefore treat a context that lacks the scope it expects as
 // "cannot verify" and decide by its own policy — accept it, or refuse it with
 // its own error — rather than assume request scope is there to read, and must

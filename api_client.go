@@ -52,8 +52,8 @@ func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOp
 // [Client.Set] racing Start writes its row and then reports [ErrNotStarted]
 // rather than being refused before the store is touched.
 //
-// In multi-tenant mode it is a no-op beyond marking the Client started —
-// every read resolves a fresh tenant database.
+// In multi-tenant mode it is a no-op beyond marking the Client started: a
+// tenant's scope is activated by that tenant's first read.
 func (c *Client) Start(ctx context.Context) error {
 	return asInternalClient(c).Start(ctx)
 }
@@ -68,7 +68,10 @@ func (c *Client) Close() error {
 // In single-tenant mode reads are served in process from the value last
 // reconciled or written, without touching the database. In multi-tenant mode
 // the call resolves the per-tenant database from ctx (set by tenant-manager
-// middleware) and reads through.
+// middleware) and reads through; with [WithPostgresTenantManager] or
+// [WithMongoTenantManager] that read activates the tenant's scope, later
+// reads are served in process like single-tenant ones, and the validator
+// grades the per-request read too.
 func (c *Client) Get(ctx context.Context, namespace, key string) (any, bool, error) {
 	return asInternalClient(c).Get(ctx, namespace, key)
 }

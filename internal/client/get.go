@@ -24,8 +24,10 @@ type ListEntry struct {
 //
 // In single-tenant mode it returns the value the engine has published (or the
 // registered default when the engine has published nothing for the key yet).
-// In multi-tenant mode it resolves the tenant database from ctx and reads
-// through, returning the registered default when the row is absent.
+// In multi-tenant mode it reads through the tenant database resolved from ctx,
+// returning the registered default when the row is absent; on a tenant-managed
+// Client that read also activates the tenant's scope, and later reads are
+// served from it.
 func (c *Client) Get(ctx context.Context, namespace, key string) (any, bool, error) {
 	e, ok, err := c.getEntry(ctx, namespace, key)
 
@@ -92,10 +94,33 @@ func (c *Client) getEntry(ctx context.Context, namespace, key string) (Entry, bo
 		return c.singleTenantEntry(namespace, key, def), true, nil
 	}
 
-	// Multi-tenant: resolve the tenant database from ctx and read through.
-	// There is no in-process cache on this path, so a read always reflects
-	// what the tenant row holds right now, including this caller's own write.
-	entry, found, err := c.store.Get(ctx, store.Scope{}, namespace, key)
+	return c.tenantEntry(ctx, nk, def)
+}
+
+// tenantScope is the scope a multi-tenant read may be cached in, and whether
+// there is one: only a tenant-managed Client caches, and only a named tenant.
+func (c *Client) tenantScope(ctx context.Context) (store.Scope, bool) {
+	scope := c.scopeFor(ctx)
+
+	return scope, c.tenantManaged && scope.Tenant != ""
+}
+
+// tenantEntry serves a multi-tenant read from the tenant's cached scope, or
+// per request while it is not cached, starting its activation on the way.
+func (c *Client) tenantEntry(ctx context.Context, nk nskey, def keyDef) (Entry, bool, error) {
+	scope, cacheable := c.tenantScope(ctx)
+	if cacheable {
+		if e, ok := c.engine.Lookup(scope, engine.NSKey(nk)); ok {
+			return e, true, nil
+		}
+
+		c.engine.Activate(scope)
+	}
+
+	// The zero scope, never the tenant's: the middleware-resolved database the
+	// request was authorized (or refused, for a suspended tenant) against, which
+	// the connector behind a named scope would bypass (D7).
+	entry, found, err := c.store.Get(ctx, store.Scope{}, nk.Namespace, nk.Key)
 	if err != nil {
 		return Entry{}, false, fmt.Errorf("systemplane: Get: %w", err)
 	}
@@ -104,23 +129,54 @@ func (c *Client) getEntry(ctx context.Context, namespace, key string) (Entry, bo
 		return Entry{Value: engine.Clone(def.defaultValue)}, true, nil
 	}
 
-	var decoded any
-	if err := json.Unmarshal(entry.Value, &decoded); err != nil {
-		c.logError(ctx, "failed to unmarshal stored value",
-			log.String("namespace", namespace),
-			log.String("keyname", key),
-			log.Err(err),
-		)
-
-		return Entry{}, false, decodeErr(ctx, namespace, key, err)
+	value, accepted, err := c.readThrough(ctx, scope, nk, def, entry.Value)
+	if err != nil {
+		return Entry{}, false, err
 	}
 
+	if !accepted {
+		return Entry{Value: value}, true, nil
+	}
+
+	// Stale stays false: this is the live row, read just now.
 	return Entry{
-		Value:     decoded,
+		Value:     value,
 		Revision:  entry.Revision,
 		UpdatedAt: entry.UpdatedAt,
 		UpdatedBy: entry.UpdatedBy,
 	}, true, nil
+}
+
+// readThrough decodes a row read per request and, on a tenant-managed Client,
+// grades it as the tenant's cache would, so a key never flips value as that
+// cache warms. A refusal serves the registered default with accepted false.
+func (c *Client) readThrough(ctx context.Context, scope store.Scope, nk nskey, def keyDef, raw []byte) (value any, accepted bool, err error) {
+	var decoded any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		c.logRead(ctx, log.LevelError, "failed to unmarshal stored value",
+			log.String("namespace", nk.Namespace),
+			log.String("keyname", nk.Key),
+			log.Err(err),
+		)
+
+		return nil, false, decodeErr(ctx, nk.Namespace, nk.Key, err)
+	}
+
+	if !c.tenantManaged {
+		return decoded, true, nil
+	}
+
+	if err := c.engine.RunValidator(ctx, scope, engine.NSKey(nk), def.validator, decoded); err != nil {
+		c.logRead(ctx, log.LevelWarn, "stored value rejected by validator, serving the registered default",
+			log.String("namespace", nk.Namespace),
+			log.String("keyname", nk.Key),
+			log.Err(err),
+		)
+
+		return engine.Clone(def.defaultValue), false, nil
+	}
+
+	return decoded, true, nil
 }
 
 // GetString returns the value as a string.
@@ -240,9 +296,9 @@ func (c *Client) GetDuration(ctx context.Context, namespace, key string) (time.D
 
 // List returns all registered entries in namespace sorted by key.
 //
-// In multi-tenant mode List resolves the tenant database from ctx; in
-// single-tenant mode it serves what the engine has published, falling back to
-// the registered defaults.
+// It serves what the engine has published for the caller's scope, falling back
+// to the registered defaults; a multi-tenant scope that is not cached is read
+// through the tenant database resolved from ctx, exactly as Get reads it.
 func (c *Client) List(ctx context.Context, namespace string) ([]ListEntry, error) {
 	if c == nil || c.closed.Load() {
 		return nil, ErrClosed
@@ -275,11 +331,22 @@ func (c *Client) List(ctx context.Context, namespace string) ([]ListEntry, error
 		return keys[i].Key < keys[j].Key
 	})
 
-	if c.multiTenant {
-		return c.listFromStore(ctx, namespace, keys)
+	if !c.multiTenant {
+		entries, _ := c.listFromEngine(store.Scope{}, keys)
+
+		return entries, nil
 	}
 
-	return c.listFromEngine(keys), nil
+	scope, cacheable := c.tenantScope(ctx)
+	if cacheable {
+		if entries, cached := c.listFromEngine(scope, keys); cached {
+			return entries, nil
+		}
+
+		c.engine.Activate(scope)
+	}
+
+	return c.listFromStore(ctx, scope, namespace, keys)
 }
 
 // registeredKey is a registered key travelling with its definition, captured
@@ -290,23 +357,25 @@ type registeredKey struct {
 	def keyDef
 }
 
-// listFromEngine reads every key through the engine, falling back to the
-// registered default for one the engine has published nothing for. ListEntry
-// carries no revision (FC-10), so the provenance the engine holds is dropped
-// here on purpose.
+// listFromEngine reads every key of scope through the engine, falling back to
+// the registered default for one the engine has published nothing for, and
+// reports whether every key was cached. ListEntry carries no revision (FC-10),
+// so the provenance the engine holds is dropped here on purpose.
 //
 // The engine is read outside registryMu — it takes locks of its own and must
 // never be called under the Client's — which List already guarantees by
 // releasing the lock before it calls here.
-func (c *Client) listFromEngine(keys []registeredKey) []ListEntry {
-	entries := make([]ListEntry, 0, len(keys))
+func (c *Client) listFromEngine(scope store.Scope, keys []registeredKey) (entries []ListEntry, cached bool) {
+	entries = make([]ListEntry, 0, len(keys))
+	cached = true
 
 	for _, rk := range keys {
-		published, ok := c.engine.Lookup(store.Scope{}, engine.NSKey{Namespace: rk.Namespace, Key: rk.Key})
+		published, ok := c.engine.Lookup(scope, engine.NSKey(rk.nskey))
 
 		val := published.Value
 		if !ok {
 			val = engine.Clone(rk.def.defaultValue)
+			cached = false
 		}
 
 		entries = append(entries, ListEntry{
@@ -316,10 +385,12 @@ func (c *Client) listFromEngine(keys []registeredKey) []ListEntry {
 		})
 	}
 
-	return entries
+	return entries, cached
 }
 
-func (c *Client) listFromStore(ctx context.Context, namespace string, keys []registeredKey) ([]ListEntry, error) {
+// listFromStore reads namespace per request, through the zero scope for the
+// reason tenantEntry states, and grades each row like tenantEntry does.
+func (c *Client) listFromStore(ctx context.Context, scope store.Scope, namespace string, keys []registeredKey) ([]ListEntry, error) {
 	stored, err := c.store.List(ctx, store.Scope{})
 	if err != nil {
 		return nil, fmt.Errorf("systemplane: List: %w", err)
@@ -341,18 +412,10 @@ func (c *Client) listFromStore(ctx context.Context, namespace string, keys []reg
 		val := engine.Clone(rk.def.defaultValue)
 
 		if raw, ok := storedByKey[rk.Key]; ok {
-			var decoded any
-			if err := json.Unmarshal(raw, &decoded); err != nil {
-				c.logError(ctx, "failed to unmarshal stored value",
-					log.String("namespace", namespace),
-					log.String("keyname", rk.Key),
-					log.Err(err),
-				)
-
-				return nil, decodeErr(ctx, namespace, rk.Key, err)
+			var err error
+			if val, _, err = c.readThrough(ctx, scope, rk.nskey, rk.def, raw); err != nil {
+				return nil, err
 			}
-
-			val = decoded
 		}
 
 		entries = append(entries, ListEntry{

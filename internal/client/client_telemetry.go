@@ -12,8 +12,8 @@ import (
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
-// logError reports a read-through failure, stamped with the tenant it happened
-// for.
+// logRead reports a read-through failure at level, stamped with the tenant it
+// happened for.
 //
 // The stamp is here rather than at the call sites because it is the same fact
 // on every one of them and missing it costs the same everywhere: a
@@ -26,7 +26,7 @@ import (
 // The guard survives although every call site today is multi-tenant: it is
 // what keeps an empty tenant.id — noise that reads like a missing value — off
 // the single-tenant lines the wave-3 engine-tenants lane adds.
-func (c *Client) logError(ctx context.Context, msg string, fields ...log.Field) {
+func (c *Client) logRead(ctx context.Context, level int, msg string, fields ...log.Field) {
 	if c == nil || c.guarded == nil {
 		return
 	}
@@ -40,7 +40,7 @@ func (c *Client) logError(ctx context.Context, msg string, fields ...log.Field) 
 		fields = append(fields, log.String(constants.AttrKeyTenantID, tenant))
 	}
 
-	c.guarded.Log(ctx, log.LevelError, msg, fields)
+	c.guarded.Log(ctx, level, msg, fields)
 }
 
 // tenantOf returns the tenant id ctx carries and whether it carries one.
@@ -51,7 +51,7 @@ func tenantOf(ctx context.Context) (string, bool) {
 }
 
 // scopeFor names the tenant a report about this call belongs to, and is the
-// same rule logError applies above: the tenant travels on the caller's own
+// same rule logRead applies above: the tenant travels on the caller's own
 // context, and a single-tenant Client has none, so it reports the zero scope
 // rather than an empty tenant.id that reads like a missing value.
 //

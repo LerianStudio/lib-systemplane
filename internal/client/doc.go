@@ -12,10 +12,12 @@
 //     drives refresh and reconcile, and the engine delivers to OnChange
 //     subscribers off the changefeed goroutine.
 //
-//   - Multi-tenant: every read/write resolves a per-request tenant
-//     database from ctx via lib-commons tenant-manager. No tracked scope,
-//     no cache, no changefeed; OnChange returns ErrNotSupportedInMultiTenant
-//     until the engine-tenants lane restores per-tenant subscriptions.
+//   - Multi-tenant: every write, and every read of a scope that is not
+//     cached, resolves a per-request tenant database from ctx via lib-commons
+//     tenant-manager. With a tenant manager a tenant's first read activates
+//     its own tracked scope, which serves its later reads; without one there
+//     is no cache and no changefeed. OnChange returns
+//     ErrNotSupportedInMultiTenant.
 //
 // The root systemplane package exposes the public facade; this internal
 // package remains the implementation boundary.

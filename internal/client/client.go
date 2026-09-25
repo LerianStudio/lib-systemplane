@@ -11,6 +11,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
+	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/engine"
 	mongoDB "github.com/LerianStudio/lib-systemplane/v4/internal/mongodb"
@@ -32,7 +33,7 @@ type Client struct {
 	// logger is the consumer's own, unwrapped, because Logger() hands it back.
 	// Nothing in this package logs through it: guarded is what every line goes
 	// out on, so a consumer logger that panics cannot unwind out of a library
-	// call — logError runs on the CALLER's goroutine in multi-tenant mode, so
+	// call — logRead runs on the CALLER's goroutine in multi-tenant mode, so
 	// an unguarded one took a Get or a List down with it.
 	logger  log.Logger
 	guarded log.Logger
@@ -195,6 +196,11 @@ func newClient(s store.Store, cfg clientConfig) *Client {
 		// Left zero when the caller set no WithCloseTimeout, so the engine's
 		// own default is the single place that names a duration.
 		CloseTimeout: cfg.closeTimeout,
+
+		// A tenant scope's read-back grades under its tenant, as a Set for it does.
+		ValidatorContext: func(ctx context.Context, scope store.Scope) context.Context {
+			return tmcore.ContextWithTenantID(ctx, scope.Tenant)
+		},
 	})
 
 	return c
@@ -207,8 +213,8 @@ func newClient(s store.Store, cfg clientConfig) *Client {
 // also queues the FC-11 announcement for every subscriber registered
 // beforehand; the delivery runs on the key's own goroutine, so it may land
 // just after Start returns. In multi-tenant mode it only marks the Client
-// started; schema bootstrap and reads run lazily against the per-request
-// tenant DB.
+// started; schema bootstrap and each tenant's activation happen lazily, on
+// that tenant's first read.
 //
 // The Client counts as started from the moment that first reconcile begins
 // rather than from when it ends, so a [Client.Set] racing Start inside that
