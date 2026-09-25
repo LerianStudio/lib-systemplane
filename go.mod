@@ -4,7 +4,7 @@ go 1.26.3
 
 require (
 	github.com/LerianStudio/lib-commons/v7 v7.0.0
-	github.com/LerianStudio/lib-observability/v4 v4.5.0-beta.10
+	github.com/LerianStudio/lib-observability/v4 v4.6.0
 	github.com/bxcodec/dbresolver/v2 v2.3.0
 	github.com/gofiber/fiber/v3 v3.5.0
 	github.com/jackc/pgx/v5 v5.10.0
