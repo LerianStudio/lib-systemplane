@@ -531,8 +531,9 @@ finish `endActivation` `activate.go:184-186` when `up`. v3's implementation for 
 `d42a72e^:internal/manager/metrics.go` (do not port its `recordCacheEntries` delta bug).
 
 **Implementation vision:** create `internal/engine/metrics.go` holding a `metrics` value on the
-Engine, built lazily through `sync.Once` from `Config.Telemetry.Meter("systemplane.engine")`; a nil
-Telemetry, a Meter error or an instrument error leaves the instruments nil and logs DEBUG once.
+Engine, built once in `New` from `Config.Telemetry.Meter("systemplane.engine")` (Config is fixed at
+construction, so no `sync.Once` is needed); a nil Telemetry, a Meter error or an instrument error
+leaves the instruments nil and logs DEBUG once.
 Instruments, names verbatim from FC-12: `systemplane.scopes_active` and `systemplane.cache_entries`
 (`Int64ObservableGauge`, one callback, E-6), `systemplane.changefeed_events_total`,
 `systemplane.changefeed_disconnects_total`, `systemplane.cache_reads_total` with attribute `result`
@@ -744,3 +745,4 @@ Every item above is answered in `index.md`; implementation may start on the affe
 - Epic 2.1's Done-when says `EventTenantActivated` "activates idempotently". FC-6 says Activated "clears a blocked marker" and that "lazy activation on first read already covers it". E-1 follows FC-6: the handler only unblocks.
 - `MIGRATION-v4.md` is the `docs` lane's. Its plan lets "the owning lane" replace its own text, so Tasks 2.1.1 and 2.2.2 rewrite the surface-diff rows `:41` and `:44` and add the FC-12 name table (E-9). Every other `NOT-YET(engine-tenants)` line and the per-consumer sections stay for the `docs` lane.
 - `go.mod` changes by one `// indirect` marker (E-8), and `api_boundary.go` gets its `Meter` godoc corrected (Task 2.2.2). The lane owns neither file, and nothing else in either file changes.
+- Epic 2.2's Done-when builds the instruments "lazily through `sync.Once`". `engine.Config` is fixed at `New`, so Task 2.2.1 builds them once there; the intent (no telemetry, no instruments, no live `MeterProvider` in a test) is unchanged.
