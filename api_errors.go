@@ -28,7 +28,7 @@ var (
 	ErrDuplicateKey = internalclient.ErrDuplicateKey
 
 	// ErrNotSupportedInMultiTenant is returned by OnChange in multi-tenant
-	// mode — there is no shared process-wide changefeed.
+	// mode with no tenant manager — no scope is tracked, so no feed runs.
 	ErrNotSupportedInMultiTenant = internalclient.ErrNotSupportedInMultiTenant
 
 	// ErrCloseTimeout is returned by Close when a subscriber callback was
@@ -44,4 +44,9 @@ var (
 	// multi-tenant mode and the caller's context carries no tenant database
 	// for the configured module.
 	ErrTenantConnectionMissing = internalclient.ErrTenantConnectionMissing
+
+	// ErrTenantManagerBackendMismatch is returned by [NewPostgres] handed
+	// [WithMongoTenantManager], and by [NewMongoDB] handed
+	// [WithPostgresTenantManager].
+	ErrTenantManagerBackendMismatch = internalclient.ErrTenantManagerBackendMismatch
 )

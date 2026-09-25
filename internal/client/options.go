@@ -5,6 +5,8 @@ import (
 	"context"
 	"time"
 
+	tmmongo "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/mongo"
+	tmpostgres "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/postgres"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
@@ -27,6 +29,8 @@ type clientConfig struct {
 
 	multiTenantEnabled bool
 	module             string
+	pgTenantManager    *tmpostgres.Manager
+	mbTenantManager    *tmmongo.Manager
 }
 
 func defaultClientConfig() clientConfig {
@@ -61,7 +65,8 @@ func WithTelemetry(t store.Telemetry) Option {
 }
 
 // WithPollInterval enables polling mode for MongoDB instead of change streams.
-// Ignored by Postgres backends and in multi-tenant mode.
+// Ignored by Postgres backends. In multi-tenant mode it applies to the tenant
+// feeds WithMongoTenantManager opens.
 func WithPollInterval(d time.Duration) Option {
 	return func(cfg *clientConfig) {
 		if d > 0 {
@@ -95,18 +100,40 @@ func WithCloseTimeout(d time.Duration) Option {
 }
 
 // WithMultiTenantEnabled switches the Client to the lib-commons tenant-manager
-// dispatch path. Every read/write resolves a per-tenant database from ctx via
-// tmcore.GetPGContext / tmcore.GetMBContext using the configured module name.
+// dispatch path. Every write, and every read not served from a cached tenant
+// scope, resolves a per-tenant database from ctx via tmcore.GetPGContext /
+// tmcore.GetMBContext using the configured module name.
 // In this mode:
 //
 //   - The db / mongo client passed to NewPostgres / NewMongoDB MAY be nil.
-//   - The in-process cache and process-wide changefeed are disabled. Get
-//     hits the resolved tenant DB on every call.
-//   - OnChange returns ErrNotSupportedInMultiTenant.
+//   - Without WithPostgresTenantManager / WithMongoTenantManager there is no
+//     cache and no changefeed: Get hits the resolved tenant DB on every call
+//     and OnChange returns ErrNotSupportedInMultiTenant. With one, a tenant's
+//     first read activates its cached scope.
 //   - Schema bootstrap runs lazily on first access per resolved tenant
 //     database.
 func WithMultiTenantEnabled() Option {
 	return func(cfg *clientConfig) {
+		cfg.multiTenantEnabled = true
+	}
+}
+
+// WithPostgresTenantManager gives NewPostgres a tenant connector built from
+// mgr and implies WithMultiTenantEnabled. Last-wins, nil included: a nil mgr
+// still declares multi-tenant intent and leaves the connector unset. mgr must be
+// the Manager the tenant-manager middleware registers under the module name.
+func WithPostgresTenantManager(mgr *tmpostgres.Manager) Option {
+	return func(cfg *clientConfig) {
+		cfg.pgTenantManager = mgr
+		cfg.multiTenantEnabled = true
+	}
+}
+
+// WithMongoTenantManager is WithPostgresTenantManager's twin for NewMongoDB,
+// with the same one-Manager rule.
+func WithMongoTenantManager(mgr *tmmongo.Manager) Option {
+	return func(cfg *clientConfig) {
+		cfg.mbTenantManager = mgr
 		cfg.multiTenantEnabled = true
 	}
 }
@@ -192,10 +219,9 @@ func WithValidator(fn func(any) error) KeyOption {
 // the write — a tenant, a deadline, a trace — and consult another system with
 // it.
 //
-// Four callers invoke it today: [Client.Set], with the context of that write;
-// [Client.Register], with context.Background(); and, in single-tenant mode,
-// the first reconcile at [Client.Start] and each changefeed refresh, with the
-// contexts described below. A write is graded ONCE, at [Client.Set], before
+// [Client.Set] invokes it with the context of that write, [Client.Register]
+// with context.Background(), and every read-back described below with the
+// contexts named there. A write is graded ONCE, at [Client.Set], before
 // the row is persisted: what [Client.Set] returns therefore says whether the
 // next read in this process serves that write. A context validator must therefore treat a context
 // that lacks the scope it expects as "cannot verify" and decide by its own policy —
@@ -215,32 +241,32 @@ func WithValidator(fn func(any) error) KeyOption {
 // [Client.Register] fail with the wrapped validation error, so the key is not
 // registered.
 //
-// In SINGLE-TENANT mode the same function also grades every value read back
-// from the store: the first reconcile at [Client.Start], and every later
-// reconcile and changefeed re-read. A row can predate the key's validator, or
-// be written by an older binary, or written straight into the table, so a
-// value never graded there would be one the write path refuses while it is
-// already in force. A refusal — a returned error or a panic, which is treated
-// as a refusal rather than propagated — keeps the registered default (nothing
-// valid was ever accepted) or the value already in force, and logs a WARN
-// carrying the error and never the value.
+// The same function also grades every value read back from the store: in
+// single-tenant mode the first reconcile at [Client.Start], and every later
+// reconcile and changefeed re-read; on a tenant-managed Client each tenant's
+// reconcile and re-read too; and every multi-tenant per-request read. A row can
+// predate the key's validator, or be written by an older binary, or written
+// straight into the table, so a value never graded there would be one the write
+// path refuses while it is already in force. A refusal — a returned error or a
+// panic, which is treated as a refusal rather than propagated — keeps the
+// registered default (nothing valid was ever accepted) or the value already in
+// force, and logs a WARN carrying the error and never the value.
 //
-// Multi-tenant reads are ungraded: [Client.Get] and [Client.List] read the
-// tenant row through and do not run this function, so a multi-tenant consumer
-// that must not act on a value the write path would refuse checks what it
-// reads.
+// A multi-tenant per-request read grades with the reader's context and serves
+// the registered default for a refused row.
 //
-// Every read-back call gets a context derived from the client's own lifecycle,
-// never the one passed to [Client.Start] and never a caller's: it carries no
-// request values and no tenant, so a function that expects request scope
-// should apply there the same "cannot verify" policy it applies at
-// registration. The first reconcile's context carries no deadline; a
-// changefeed re-read's carries a bounded one. Both are cancelled by
+// Every reconcile and re-read gets a context derived from the client's own
+// lifecycle, never the one passed to [Client.Start] and never a caller's: it
+// carries no request values, and a tenant only for a tenant's scope, so a
+// function that expects request scope should apply there the same "cannot
+// verify" policy it applies at registration. The first reconcile's context
+// carries no deadline; a changefeed re-read's carries a bounded one. Both are cancelled by
 // [Client.Close]. The no-I/O restriction stated above for the registered
 // default binds on the first reconcile too: [Client.Start] waits for it while
 // holding the start lock, so a validator that blocks there blocks
-// [Client.Close] with it. A re-read is the one read-back call site where a
-// validator may do I/O.
+// [Client.Close] with it. A re-read and a multi-tenant per-request read are
+// the read-back call sites where a validator may do I/O; the per-request one
+// pays it, and logs any refusal, on every read it serves.
 //
 // A read-back is graded on every ingress, so the function must be
 // deterministic on the same value: one that answers differently across calls

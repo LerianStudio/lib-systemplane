@@ -707,7 +707,7 @@ func TestOverlappingReconcilesKeepFeedValue(t *testing.T) {
 	// Two Lists, each held: the older reconcile's is released first, so if it
 	// applies its snapshot at all it does so while the newer one is still
 	// waiting for its own photograph. Nothing here is a timing accident.
-	first, second := make(chan struct{}), make(chan struct{})
+	first, second, entered := make(chan struct{}), make(chan struct{}), make(chan struct{})
 
 	fs.onList(func(store.Scope) error {
 		fs.onList(func(store.Scope) error {
@@ -716,6 +716,7 @@ func TestOverlappingReconcilesKeepFeedValue(t *testing.T) {
 
 			return nil
 		})
+		close(entered)
 		<-first
 
 		return nil
@@ -726,6 +727,10 @@ func TestOverlappingReconcilesKeepFeedValue(t *testing.T) {
 
 	e.onEvent(disconnectEvent(scope))
 	e.onEvent(resyncEvent(scope))
+
+	// Its List must be under way before the row exists: a List that started
+	// after the row committed would see it.
+	mustReceive(t, entered, "the older reconcile's List")
 
 	// The world moves on behind that photograph: the row is created and the
 	// reconnected feed publishes it.

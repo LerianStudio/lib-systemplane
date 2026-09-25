@@ -692,8 +692,7 @@ func TestCoordinatorDecodeFailureOnAFreshScopeIsObserved(t *testing.T) {
 
 // TestCoordinatorNullValueIsRejectedByTheCodecAndNeverDelivered pins the
 // coordinator half of the typed group's null rule: a published null reaches
-// the codec as a nil value, and a codec that refuses it (which is what the
-// group's own decodePublished does for a struct-shaped document) turns that
+// the codec as a nil value, and a codec that refuses it turns that
 // publication into a recorded rejection rather than a blank document handed to
 // an applier. The coordinator itself never special-cases nil.
 func TestCoordinatorNullValueIsRejectedByTheCodecAndNeverDelivered(t *testing.T) {

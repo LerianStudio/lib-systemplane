@@ -23,14 +23,15 @@ type KeyDef struct {
 	//
 	// The engine runs it on the READ-BACK paths only: the changefeed re-read
 	// and the reconcile snapshot, both under the engine's dispatch context,
-	// which carries no tenant and no request — nothing of whatever goroutine
-	// called Start survives into it. A validator that refuses whenever the
-	// context lacks a tenant therefore refuses every stored row, and the
-	// ingress contract decides what follows — the last value that passed stays
-	// in force, or the registered default at Revision 0 when no row was ever
-	// accepted, and the rejection is logged once per ingestion attempt — so a
-	// flapping changefeed repeats that WARN once per registered key per
-	// resync, rather than once for the life of the key.
+	// which carries no request — nothing of whatever goroutine called Start
+	// survives into it — and a tenant only as Config.ValidatorContext adds it
+	// for a tenant scope. A validator that refuses whenever the context lacks
+	// a tenant therefore refuses every stored row that reaches it without one,
+	// and the ingress contract decides what follows — the last value that
+	// passed stays in force, or the registered default at Revision 0 when no
+	// row was ever accepted, and the rejection is logged once per ingestion
+	// attempt — so a flapping changefeed repeats that WARN once per registered
+	// key per resync, rather than once for the life of the key.
 	//
 	// A LOCAL write is graded by the Registry's owner instead, once, before
 	// the store is written: Client.Set runs this same function against the

@@ -1087,11 +1087,12 @@ func TestASecondFailedEventForOneKeyStartsNoSecondRetry(t *testing.T) {
 
 		base := fs.getCount()
 
-		// Both first attempts are held open until the second one has arrived,
-		// so neither can fail — and arm its retry — before the other is in
-		// flight. Without the gate the two failures are separated by a real
-		// quiet window rather than by the microseconds the dedupe is about,
-		// and a slow machine turns the assertion into a coin flip.
+		// The first attempt is held open until the second event has arrived —
+		// inline at WithDebounce(0), coalesced behind it under a real window —
+		// so neither failure can arm its retry before the other is owed.
+		// Without the gate the two failures are separated by a real quiet
+		// window rather than by the microseconds the dedupe is about, and a
+		// slow machine turns the assertion into a coin flip.
 		gate := make(chan struct{})
 
 		var reads atomic.Int64
@@ -1127,8 +1128,8 @@ func TestASecondFailedEventForOneKeyStartsNoSecondRetry(t *testing.T) {
 			e.onEvent(upsertEvent(scope, nk, 7))
 		}()
 
-		waitFor(t, hangGuard, "the second event's re-read to reach the store", func() bool {
-			return reads.Load() >= 2
+		waitFor(t, hangGuard, "the second event's re-read to reach the store or be owed", func() bool {
+			return reads.Load() >= 2 || rereadOwed(e, scope, nk)
 		})
 
 		close(gate)
@@ -1305,8 +1306,8 @@ func upsertThenFailedDelete(t *testing.T, window time.Duration, repairFails bool
 		e.onEvent(deleteEvent(scope, nk))
 	}()
 
-	waitFor(t, hangGuard, "the delete's re-read to reach the store", func() bool {
-		return reads.Load() >= 2
+	waitFor(t, hangGuard, "the delete's re-read to reach the store or be owed", func() bool {
+		return reads.Load() >= 2 || rereadOwed(e, scope, nk)
 	})
 
 	releaseUpsert()

@@ -2393,10 +2393,7 @@ func TestGroupOnApplyReceivesTheDefaultAfterADelete(t *testing.T) {
 // there — one WARN naming namespace, key and error, registered defaults left
 // in force (FC-11) — and the applier is handed those defaults instead of a
 // wholly blank document (empty name, zero retries, no hosts) applied as if an
-// operator had written it. The group's own null guard in decodePublished is
-// now unreachable through this facade and stays as a defensive check; the
-// coordinator half of that rule is pinned by
-// TestCoordinatorNullValueIsRejectedByTheCodecAndNeverDelivered.
+// operator had written it.
 func TestGroupOnApplyNeverSeesANullRowRefusedAtTheFirstReconcile(t *testing.T) {
 	t.Parallel()
 
@@ -2663,13 +2660,11 @@ func TestGroupOnApplyAfterCloseRegistersAndReplays(t *testing.T) {
 	})
 }
 
-// TestGroupSnapshotOverAnUngradedTenantRow is the multi-tenant half of the two
-// tests above. In single-tenant mode the engine grades a stored row through the
-// group's own ingress, so an undecodable or null row never reaches a reader
-// there. Multi-tenant mode has no engine scope: the tenant row is read through
-// on every Snapshot, ungraded, and the decode guard is what stands between it
-// and a half-filled or wholly blank document reported as the one in force.
-func TestGroupSnapshotOverAnUngradedTenantRow(t *testing.T) {
+// TestGroupSnapshotOverARefusedTenantRow is the multi-tenant half of the two
+// tests above: with no tenant manager the row is read through on every
+// Snapshot, and the group's ingress grades it there, so an undecodable, partial
+// or null row reads as the registered defaults at revision 0.
+func TestGroupSnapshotOverARefusedTenantRow(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
@@ -2707,13 +2702,12 @@ func TestGroupSnapshotOverAnUngradedTenantRow(t *testing.T) {
 			s.seed(t, "runtime", "ingest", tc.row)
 
 			snap, err := g.Snapshot(ctx)
-			if !errors.Is(err, systemplane.ErrValidation) {
-				t.Fatalf("Snapshot of an ungraded %s tenant row = %v, want ErrValidation", tc.name, err)
+			if err != nil {
+				t.Fatalf("Snapshot of a refused %s tenant row: %v", tc.name, err)
 			}
 
-			var zero groupConfig
-			if !reflect.DeepEqual(snap.Value, zero) {
-				t.Fatalf("Snapshot.Value = %#v, want the zero value — never a half-filled document", snap.Value)
+			if !reflect.DeepEqual(snap.Value, groupDefaults()) || snap.Revision != 0 {
+				t.Fatalf("Snapshot = %#v at revision %d, want the registered defaults at 0", snap.Value, snap.Revision)
 			}
 		})
 	}

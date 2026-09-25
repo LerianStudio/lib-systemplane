@@ -11,6 +11,7 @@ import (
 
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
+	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/engine"
 	mongoDB "github.com/LerianStudio/lib-systemplane/v4/internal/mongodb"
@@ -32,12 +33,15 @@ type Client struct {
 	// logger is the consumer's own, unwrapped, because Logger() hands it back.
 	// Nothing in this package logs through it: guarded is what every line goes
 	// out on, so a consumer logger that panics cannot unwind out of a library
-	// call — logError runs on the CALLER's goroutine in multi-tenant mode, so
+	// call — logRead runs on the CALLER's goroutine in multi-tenant mode, so
 	// an unguarded one took a Get or a List down with it.
 	logger  log.Logger
 	guarded log.Logger
 
-	multiTenant    bool
+	multiTenant bool
+	// tenantManaged: a tenant manager was configured, so named scopes resolve
+	// through a connector.
+	tenantManaged  bool
 	catalogService string
 
 	registryMu sync.RWMutex
@@ -65,6 +69,10 @@ func NewPostgres(db *sql.DB, listenDSN string, opts ...Option) (*Client, error) 
 	cfg := defaultClientConfig()
 	applyClientOptions(&cfg, opts)
 
+	if cfg.mbTenantManager != nil {
+		return nil, fmt.Errorf("%w: WithMongoTenantManager passed to NewPostgres", ErrTenantManagerBackendMismatch)
+	}
+
 	if !cfg.multiTenantEnabled && db == nil {
 		return nil, store.ErrNilBackend
 	}
@@ -85,6 +93,10 @@ func NewMongoDB(client *mongo.Client, database string, opts ...Option) (*Client,
 	cfg := defaultClientConfig()
 	applyClientOptions(&cfg, opts)
 
+	if cfg.pgTenantManager != nil {
+		return nil, fmt.Errorf("%w: WithPostgresTenantManager passed to NewMongoDB", ErrTenantManagerBackendMismatch)
+	}
+
 	if !cfg.multiTenantEnabled && client == nil {
 		return nil, store.ErrNilBackend
 	}
@@ -98,7 +110,9 @@ func NewMongoDB(client *mongo.Client, database string, opts ...Option) (*Client,
 }
 
 // postgresConfig builds the Postgres backend's configuration from the
-// Client's own. It and mongoConfig below exist for one field.
+// Client's own. It and mongoConfig below exist for two fields: the logger, and
+// a Connector set only for a non-nil tenant manager, so a nil one leaves the
+// backend refusing named scopes with store.ErrTenantConnectorMissing.
 //
 // cfg.logger is the GUARDED logger — the backends log from their changefeed
 // goroutines, where a consumer logger that panics takes the process down — and
@@ -108,7 +122,7 @@ func NewMongoDB(client *mongo.Client, database string, opts ...Option) (*Client,
 // because no unit test runs a live changefeed. Named, it is one value a test
 // can assert is already guarded.
 func postgresConfig(db *sql.DB, listenDSN string, cfg clientConfig) postgres.Config {
-	return postgres.Config{
+	pc := postgres.Config{
 		DB:                 db,
 		ListenDSN:          listenDSN,
 		Logger:             cfg.logger,
@@ -116,12 +130,18 @@ func postgresConfig(db *sql.DB, listenDSN string, cfg clientConfig) postgres.Con
 		MultiTenantEnabled: cfg.multiTenantEnabled,
 		Module:             cfg.module,
 	}
+
+	if cfg.pgTenantManager != nil {
+		pc.Connector = postgres.NewTenantManagerConnector(cfg.pgTenantManager)
+	}
+
+	return pc
 }
 
 // mongoConfig is postgresConfig's twin for the MongoDB backend, and carries
 // the same guarded logger for the same reason.
 func mongoConfig(client *mongo.Client, database string, cfg clientConfig) mongoDB.Config {
-	return mongoDB.Config{
+	mc := mongoDB.Config{
 		Client:             client,
 		Database:           database,
 		PollInterval:       cfg.pollInterval,
@@ -130,6 +150,12 @@ func mongoConfig(client *mongo.Client, database string, cfg clientConfig) mongoD
 		MultiTenantEnabled: cfg.multiTenantEnabled,
 		Module:             cfg.module,
 	}
+
+	if cfg.mbTenantManager != nil {
+		mc.Connector = mongoDB.NewTenantManagerConnector(cfg.mbTenantManager)
+	}
+
+	return mc
 }
 
 func newClient(s store.Store, cfg clientConfig) *Client {
@@ -152,6 +178,7 @@ func newClient(s store.Store, cfg clientConfig) *Client {
 		logger:         own,
 		guarded:        guarded,
 		multiTenant:    cfg.multiTenantEnabled,
+		tenantManaged:  cfg.pgTenantManager != nil || cfg.mbTenantManager != nil,
 		catalogService: cfg.catalogService,
 		registry:       make(map[nskey]keyDef),
 	}
@@ -169,6 +196,11 @@ func newClient(s store.Store, cfg clientConfig) *Client {
 		// Left zero when the caller set no WithCloseTimeout, so the engine's
 		// own default is the single place that names a duration.
 		CloseTimeout: cfg.closeTimeout,
+
+		// A tenant scope's read-back grades under its tenant, as a Set for it does.
+		ValidatorContext: func(ctx context.Context, scope store.Scope) context.Context {
+			return tmcore.ContextWithTenantID(ctx, scope.Tenant)
+		},
 	})
 
 	return c
@@ -181,8 +213,8 @@ func newClient(s store.Store, cfg clientConfig) *Client {
 // also queues the FC-11 announcement for every subscriber registered
 // beforehand; the delivery runs on the key's own goroutine, so it may land
 // just after Start returns. In multi-tenant mode it only marks the Client
-// started; schema bootstrap and reads run lazily against the per-request
-// tenant DB.
+// started; schema bootstrap and each tenant's activation happen lazily, on
+// that tenant's first read.
 //
 // The Client counts as started from the moment that first reconcile begins
 // rather than from when it ends, so a [Client.Set] racing Start inside that

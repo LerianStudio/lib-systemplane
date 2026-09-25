@@ -10,6 +10,9 @@ import (
 	"testing"
 	"time"
 
+	tmmongo "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/mongo"
+	tmpostgres "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/postgres"
+
 	// Aliased: this file has local variables named store.
 	internalstore "github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
@@ -273,6 +276,38 @@ func TestPublicConstructorsAndOptions(t *testing.T) {
 
 	if err := c.Set(context.Background(), "ns", "k", "bad", "actor"); !errors.Is(err, ErrValidation) {
 		t.Fatalf("Set invalid error = %v, want ErrValidation", err)
+	}
+}
+
+// TestPublicTenantManagerOptionsExist pins FC-6 at the facade: each option
+// constructs its own backend with a nil handle (multi-tenant implied) and is
+// refused with ErrTenantManagerBackendMismatch on the other.
+func TestPublicTenantManagerOptionsExist(t *testing.T) {
+	t.Parallel()
+
+	pg := tmpostgres.NewManager(nil, "svc")
+	mb := tmmongo.NewManager(nil, "svc")
+
+	c, err := NewPostgres(nil, "", WithPostgresTenantManager(pg))
+	if err != nil {
+		t.Fatalf("NewPostgres with its tenant manager: %v", err)
+	}
+
+	_ = c.Close()
+
+	c, err = NewMongoDB(nil, "", WithMongoTenantManager(mb))
+	if err != nil {
+		t.Fatalf("NewMongoDB with its tenant manager: %v", err)
+	}
+
+	_ = c.Close()
+
+	if _, err := NewPostgres(nil, "", WithMongoTenantManager(mb)); !errors.Is(err, ErrTenantManagerBackendMismatch) {
+		t.Errorf("NewPostgres with a Mongo tenant manager: err = %v, want ErrTenantManagerBackendMismatch", err)
+	}
+
+	if _, err := NewMongoDB(nil, "", WithPostgresTenantManager(pg)); !errors.Is(err, ErrTenantManagerBackendMismatch) {
+		t.Errorf("NewMongoDB with a Postgres tenant manager: err = %v, want ErrTenantManagerBackendMismatch", err)
 	}
 }
 

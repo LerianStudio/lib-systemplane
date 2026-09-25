@@ -341,29 +341,8 @@ func (e *Engine) retryRefresh(sc *scopeState, nk NSKey, fence feedFence, deleted
 // that loses the race to Close is dropped whole rather than reaching a store
 // the Client is about to close.
 //
-// These re-reads run concurrently, one goroutine per key whose quiet window
-// closed, and nothing bounds how many are in flight at once. What the
-// debouncer bounds is PENDING TIMERS — at most one per (scope, key), the feed
-// having dropped unregistered keys before the debouncer ever sees them. It
-// does not bound the work those timers start: Debouncer.fire deletes the timer
-// entry BEFORE it invokes fn, so a notification arriving while the re-read is
-// still inside Store.Get arms a fresh timer and the two overlap.
-//
-// How many overlap is how long one re-read lives divided by the window, and a
-// re-read is not only its store call: refreshKey hands the row to the ingress,
-// which runs the CONSUMER's registered validator, bounded by nothing. So under
-// sustained notifications on one key the in-flight count for that single key
-// approaches (feedTimeout PLUS the validator's runtime) divided by the window
-// — about 50 at the 5s and 100ms defaults is the FLOOR, what the store call
-// alone produces, and a validator that blocks raises it without limit.
-//
-// There is no semaphore. The two halves size different things, so a consumer
-// reads them apart: connections are held for the store call only, so a
-// *sql.DB pool takes registered keys times tracked scopes as its floor plus
-// the feedTimeout share of that overlap for as many keys as a degraded store
-// can be hot on at once, while the validator's share adds goroutines and the
-// values they hold rather than connections — a slow validator therefore shows
-// up as goroutine growth under a flapping feed, not as pool exhaustion.
+// A key's re-reads never overlap: a notification landing mid-read owes one trailing
+// read, never dropped (the running Get may predate its write), a delete if any was.
 func (e *Engine) trackedRefresh(scope store.Scope, nk NSKey, deleted bool) {
 	if !e.beginWork() {
 		return
@@ -371,7 +350,14 @@ func (e *Engine) trackedRefresh(scope store.Scope, nk NSKey, deleted bool) {
 
 	defer e.dispatchWG.Done()
 
-	e.refreshKey(scope, nk, feedFence{}, deleted, false)
+	sc := e.scopeForEvent(scope, nk)
+	if sc == nil || !sc.beginRefresh(nk, deleted) {
+		return
+	}
+
+	for again := true; again; again, deleted = sc.endRefresh(nk) {
+		e.refreshKey(scope, nk, feedFence{}, deleted, false)
+	}
 }
 
 // recoverRefresh reports a panic raised under a changefeed re-read, naming the
@@ -691,7 +677,7 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey, origin feedFence, delet
 	ctx, cancel := context.WithTimeout(e.dispatchContext(), feedTimeout)
 	defer cancel()
 
-	se, found, err := e.store.Get(ctx, scope, nk.Namespace, nk.Key)
+	se, found, err := e.getRow(ctx, sc, nk)
 	if err != nil {
 		e.recordFeedOutcome(sc, nk, false)
 
@@ -790,6 +776,20 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey, origin feedFence, delet
 	// A changefeed row is graded here and nowhere else, so the outcome is the
 	// ingress's own business: no caller is waiting to be told.
 	_ = e.ingest(ctx, sc, se, fence, false)
+}
+
+// getRow is refreshKey's Store.Get under one of the scope's slots, freed even on
+// a store panic; a full cap is waited on only until ctx ends, never past Close.
+func (e *Engine) getRow(ctx context.Context, sc *scopeState, nk NSKey) (store.Entry, bool, error) {
+	select {
+	case sc.getSem <- struct{}{}:
+	case <-ctx.Done():
+		return store.Entry{}, false, ctx.Err()
+	}
+
+	defer func() { <-sc.getSem }()
+
+	return e.store.Get(ctx, sc.scope, nk.Namespace, nk.Key)
 }
 
 // publishAbsentDelete puts the registered default in force at revision 0 for a

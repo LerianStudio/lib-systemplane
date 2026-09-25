@@ -373,6 +373,80 @@ func TestIngestValidatorGetsNoTenantOnFeedAndReconcile(t *testing.T) {
 	})
 }
 
+// tenantKey is where the ValidatorContext hook below writes the scope's
+// tenant, standing in for the Client's tenant-manager carrier.
+type tenantKey struct{}
+
+// TestValidatorContextCarriesTheScopeOnReadBack pins the hook a tenant-aware
+// validator depends on: a tenant scope's reconcile and changefeed re-read grade
+// under the context the hook derived for that scope, so a row accepted on Set
+// is accepted on read-back. The zero scope stays tenant-less; a nil hook
+// changes nothing.
+func TestValidatorContextCarriesTheScopeOnReadBack(t *testing.T) {
+	nk := NSKey{Namespace: "billing", Key: "limits"}
+	withTenant := func(ctx context.Context, scope store.Scope) context.Context {
+		return context.WithValue(ctx, tenantKey{}, scope.Tenant)
+	}
+
+	cases := []struct {
+		name  string
+		hook  func(context.Context, store.Scope) context.Context
+		scope store.Scope
+		want  any
+	}{
+		{name: "tenant scope", hook: withTenant, scope: store.Scope{Tenant: "t1"}, want: "t1"},
+		{name: "zero scope", hook: withTenant, scope: store.Scope{}, want: nil},
+		{name: "nil hook", hook: nil, scope: store.Scope{Tenant: "t1"}, want: nil},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				mu   sync.Mutex
+				seen []any
+			)
+
+			fs := newFakeStore()
+			fs.seed(tc.scope, jsonRow(nk, 1, `"reconciled"`, "ops"))
+
+			e := New(Config{Store: fs, ValidatorContext: tc.hook, Registry: fakeRegistry{defs: map[NSKey]KeyDef{nk: {
+				Default: "fallback",
+				Validate: func(ctx context.Context, _ any) error {
+					mu.Lock()
+					defer mu.Unlock()
+
+					seen = append(seen, ctx.Value(tenantKey{}))
+
+					return nil
+				},
+			}}}})
+
+			noDeliveryOutlivesTheTest(t, e)
+			t.Cleanup(func() {
+				if err := e.Close(); err != nil {
+					t.Errorf("Close: %v", err)
+				}
+			})
+
+			settled(t, e, tc.scope)
+
+			fs.seed(tc.scope, jsonRow(nk, 2, `"re-read"`, "ops"))
+			e.onEvent(upsertEvent(tc.scope, nk, 2))
+
+			if entry, ok := e.Lookup(tc.scope, nk); !ok || entry.Value != "re-read" || entry.Revision != 2 {
+				t.Errorf("after the re-read: %+v (ok=%v), want (\"re-read\", rev 2)", entry, ok)
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+
+			if want := []any{tc.want, tc.want}; !slices.Equal(seen, want) {
+				t.Errorf("tenant the validator saw on (reconcile, re-read): got %v, want %v", seen, want)
+			}
+		})
+	}
+}
+
 // refusalEngine builds an engine tracking the single-tenant scope over a
 // registry the case may hook, the way the Client leaves it after Start.
 func refusalEngine(t *testing.T, reg Registry) *Engine {

@@ -53,7 +53,7 @@ has to be read even where your code compiles unchanged.
 |---|---|
 | `WithCloseTimeout`, `ErrCloseTimeout` | Bound the wait `Close` gives subscriber callbacks (default 30s) and name the (scope, key) still running when the bound elapses. |
 | `GetEntry`, `Entry` | Read the value together with its revision, `UpdatedAt`, `UpdatedBy` and a per-key `Stale` flag. |
-| `Bind`, `Group[T]`, `Snapshot[T]`, `Applied[T]`, `ApplyStatus`, `Group.Snapshot`, `Group.Set`, `Group.OnApply`, `Group.Status`, `ErrApplyPanicked` | Declare a whole typed configuration document as one key, read it as `T`, and apply it through a serialized hook that records what is desired, what is applied and what last failed. `Bind`, `Snapshot` and `Set` work in both modes; on a multi-tenant Client `OnApply` returns `ErrNotSupportedInMultiTenant` and `Snapshot` reads through ungraded. |
+| `Bind`, `Group[T]`, `Snapshot[T]`, `Applied[T]`, `ApplyStatus`, `Group.Snapshot`, `Group.Set`, `Group.OnApply`, `Group.Status`, `ErrApplyPanicked` | Declare a whole typed configuration document as one key, read it as `T`, and apply it through a serialized hook that records what is desired, what is applied and what last failed. `Bind`, `Snapshot` and `Set` work in both modes; on a multi-tenant Client without a tenant manager `OnApply` returns `ErrNotSupportedInMultiTenant`, and `Snapshot` reads through graded like `Get`. |
 | `MigrationV3ToV4SQL()` | The v3 → v4 Postgres delta as an importable artifact for your migration pipeline. See § The database and operator contract. |
 | `WithContextValidator` | Validate a value against the `Set` caller's context, so a validator can use the tenant that call carried. The registered default is still validated with `context.Background()`. |
 | `TestScope` | The scope every `TestStore` method now takes: `TestScope{Tenant}`, with `Tenant` `""` for the single-tenant scope. |
@@ -123,7 +123,7 @@ breaks no build and can change what your process serves on its next boot.
 
 ### A stored row your validator rejects no longer reaches a read
 
-**Affects:** every single-tenant consumer that registered a validator.
+**Affects:** every consumer that registered a validator: single-tenant, and multi-tenant on every per-request read.
 
 v3 handed a stored row straight to `Get`. v4 grades every value on the way in —
 the first reconcile at `Start`, every later reconcile, every changefeed re-read
@@ -136,13 +136,14 @@ So a row an older binary wrote, or an operator wrote by hand, or that a
 validator you have since tightened would now refuse, stops being served the
 next time the process boots — with nothing failing at build time to say so.
 
+Multi-tenant per-request reads (`Get`, `List`, `Snapshot`) are graded too, with
+the reader's own context: a refused row reads as the registered default, and
+every such read logs the WARN.
+
 **Do:** before deploying, query the store for rows your validators would
-refuse. Those keys revert to their registered default on the next start, so fix
-the rows or widen the validator first.
-
-Multi-tenant per-request reads (`Get`, `List`) still read through ungraded.
-
-<!-- NOT-YET(engine-tenants): tenant scopes graded at ingress -->
+refuse. Those keys revert to their registered default on the next start, or on
+the first multi-tenant read after the deploy, so fix the rows or widen the
+validator first.
 
 ### Validators and defaults see the canonical JSON shape
 
@@ -185,12 +186,13 @@ row, instead of unwinding into the caller's goroutine: it comes back as
 `ErrValidation`, and the panic is reported through lib-observability's recovery
 pipeline.
 
-`WithContextValidator` sees the `Set` caller's own context on a write, but
-read-back grades with the client's lifecycle context: no request values, no
-tenant. A context validator that refuses when it cannot find a tenant therefore
-refuses every stored row on read-back and pins the last valid value in force.
-Treat a context that lacks the scope you expect as "cannot verify" and decide
-by your own policy.
+`WithContextValidator` sees the `Set` caller's own context on a write, and a
+multi-tenant per-request read grades with the reader's. Every other read-back
+grades with the client's lifecycle context: no request values, and a tenant
+only on a tenant-managed Client's tenant scope. A context validator that
+refuses when it cannot find a tenant therefore refuses every single-tenant row
+on read-back and pins the last valid value in force. Treat a context that lacks
+the scope you expect as "cannot verify" and decide by your own policy.
 
 **Do:** audit every validator for Go-type assertions and for a dependency on
 request scope.

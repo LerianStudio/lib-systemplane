@@ -37,8 +37,8 @@ var (
 	ErrDuplicateKey = errors.New("systemplane: duplicate key")
 
 	// ErrNotSupportedInMultiTenant is returned by OnChange (and any other
-	// process-wide changefeed primitive) when the Client was constructed with
-	// WithMultiTenantEnabled().
+	// process-wide changefeed primitive) on a multi-tenant Client with no
+	// tenant manager.
 	ErrNotSupportedInMultiTenant = store.ErrNotSupportedInMultiTenant
 
 	// ErrCloseTimeout is returned by Close when a subscriber callback was
@@ -51,4 +51,8 @@ var (
 	// mode and the caller's context carries no tenant database for the
 	// configured module.
 	ErrTenantConnectionMissing = store.ErrTenantConnectionMissing
+
+	// ErrTenantManagerBackendMismatch is returned by a constructor handed the
+	// tenant manager of the other backend.
+	ErrTenantManagerBackendMismatch = errors.New("systemplane: tenant manager does not match the client backend")
 )

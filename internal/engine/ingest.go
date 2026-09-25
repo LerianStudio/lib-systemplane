@@ -193,7 +193,12 @@ func (e *Engine) prepare(ctx context.Context, scope store.Scope, se store.Entry,
 	nk := NSKey{Namespace: se.Namespace, Key: se.Key}
 
 	if !pregraded {
-		if err := e.runValidator(ctx, scope, nk, def.Validate, decoded); err != nil {
+		validatorCtx := ctx
+		if e.validatorContext != nil && scope != (store.Scope{}) {
+			validatorCtx = e.validatorContext(ctx, scope)
+		}
+
+		if err := e.runValidator(validatorCtx, scope, nk, def.Validate, decoded); err != nil {
 			e.logValidatorRejection(ctx, scope.Tenant, nk, err)
 
 			return publication{}, err
@@ -290,12 +295,12 @@ func (e *Engine) ingestDefault(ctx context.Context, sc *scopeState, nk NSKey, de
 }
 
 // RunValidator runs a consumer's registered validator under exactly the
-// recovery every engine ingress uses. It exists for the Client's own two
-// direct call sites — grading a registered default, and grading a local write
-// — which are the only places in the library that hand a validator a value
-// without going through an ingress, and which therefore used to let a
-// validator's panic take the consumer's process down instead of coming back as
-// a validation error. Nil-receiver safe, so a Client whose engine was never
+// recovery every engine ingress uses. It exists for the Client's own direct
+// call sites — grading a registered default, a local write, and a multi-tenant
+// per-request read — which are the only places in the library that hand a
+// validator a value without going through an ingress, and which therefore used
+// to let a validator's panic take the consumer's process down instead of coming
+// back as a validation error. Nil-receiver safe, so a Client whose engine was never
 // built still grades rather than crashes.
 //
 // scope and nk are that key's identity, carried so a panic here reports the
@@ -329,9 +334,10 @@ func (e *Engine) recoveryLogger() log.Logger {
 //
 // ctx is the ingress's own context and is handed straight to the validator, so
 // which context a validator sees is decided by which ingress ran: the writer's
-// on Publish, the engine's dispatch context — no tenant, no request — on the
-// changefeed re-read and on a reconcile. KeyDef.Validate states the contract
-// and what a refusal leaves in force.
+// on Publish, the engine's dispatch context — no request, and a tenant only
+// through Config.ValidatorContext — on the changefeed re-read and on a
+// reconcile. KeyDef.Validate states the contract and what a refusal leaves in
+// force.
 //
 // The validator is consumer code, and v4 is the first version that runs it on
 // engine-owned goroutines: the reconcile, and the changefeed re-read. v3 only
