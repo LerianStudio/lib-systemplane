@@ -289,9 +289,13 @@ Client built with `WithTelemetry`, single-tenant ones included.
 | `systemplane.manager.warmload_latency_seconds` | `systemplane.activation_latency_seconds` |
 | `systemplane.manager.get_cache_hits_total` | `systemplane.cache_reads_total`, attribute `result` = `hit` \| `miss` |
 
-A tenant scope's points carry `tenant_id`, which reads the literal `aggregate`
-for every tenant once more than `WithAggregateTenantThreshold` tenant scopes are
-active, and the single-tenant scope's points carry no `tenant_id`.
+`systemplane.scopes_active` is one unlabelled count, as `tenants_active` was.
+On every other instrument a tenant scope's points carry `tenant_id`, which reads
+the literal `aggregate` for every tenant once more than
+`WithAggregateTenantThreshold` tenant scopes are active, and the single-tenant
+scope's points carry no `tenant_id`. `systemplane.cache_reads_total` counts
+reads of an active scope's cache only: a tenant read served per request counts
+nothing, as in v3.
 
 ### Every callback registered before `Start` fires once at `Start`
 

@@ -210,9 +210,9 @@ func (c *Client) OnChange(namespace, key string, fn func(ctx context.Context, ch
 // [WithPostgresTenantManager] or [WithMongoTenantManager] return nil. The
 // scope work runs in the background, so the only errors are [ErrClosed] after
 // [Client.Close] and [ErrValidation] for an event with no TenantID; a failed
-// activation is logged and retried by a later read. v3's Manager returned nil
-// for everything. The tenant-manager listener logs a returned error and moves
-// on; a dispatcher of your own that stops on an error must handle these two.
+// activation is logged and retried by a later read. The tenant-manager
+// listener logs a returned error and moves on; a dispatcher of your own that
+// stops on an error must handle these two.
 //
 // Chain it after the tenant-manager dispatcher's own HandleEvent: on a
 // rotation the dispatcher closes and reloads the tenant's pools, and a rebuild

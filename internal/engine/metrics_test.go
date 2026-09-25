@@ -136,7 +136,7 @@ func TestMetricsReportEachInstrumentAfterItsEngineEvent(t *testing.T) {
 
 	e.Lookup(zero, activateKey)
 	e.Lookup(zero, NSKey{Namespace: "billing", Key: "unregistered"})
-	e.Lookup(tenant, activateKey) // untracked: a miss
+	e.Lookup(tenant, activateKey) // untracked: no cache, so no read counted
 
 	e.Activate(tenant)
 	activationDone(t, e, tenant)
@@ -148,13 +148,13 @@ func TestMetricsReportEachInstrumentAfterItsEngineEvent(t *testing.T) {
 	activationDone(t, e, tenant)
 
 	wantPoints(t, reader, metricReads, counter, "", map[string]int64{
-		"result=hit": 1, "result=miss": 1, "result=miss,tenant_id=t1": 1, "result=hit,tenant_id=t1": 1,
+		"result=hit": 1, "result=miss": 1, "result=hit,tenant_id=t1": 1,
 	})
 	// Each Subscribe's resync, plus the tenant's disconnect.
 	wantPoints(t, reader, metricEvents, counter, "", map[string]int64{"": 1, "tenant_id=t1": 3})
 	wantPoints(t, reader, metricDisconnects, counter, "", map[string]int64{"tenant_id=t1": 1})
 	wantPoints(t, reader, metricActivation, histogram, "s", map[string]int64{"tenant_id=t1": 1})
-	wantPoints(t, reader, metricScopesActive, gauge, "", map[string]int64{"": 1, "tenant_id=t1": 1})
+	wantPoints(t, reader, metricScopesActive, gauge, "", map[string]int64{"": 2})
 	wantPoints(t, reader, metricCacheEntries, gauge, "", map[string]int64{"": 1, "tenant_id=t1": 1})
 
 	if err := e.Close(); err != nil {
@@ -192,7 +192,7 @@ func TestMetricsCollapseTenantIDAboveTheThreshold(t *testing.T) {
 				reads["result=hit,"+label] = n
 			}
 
-			wantPoints(t, reader, metricScopesActive, gauge, "", tc.want)
+			wantPoints(t, reader, metricScopesActive, gauge, "", map[string]int64{"": 2})
 			wantPoints(t, reader, metricCacheEntries, gauge, "", tc.want)
 			wantPoints(t, reader, metricReads, counter, "", reads)
 		})

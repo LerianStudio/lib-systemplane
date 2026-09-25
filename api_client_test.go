@@ -280,17 +280,22 @@ func TestPublicConstructorsAndOptions(t *testing.T) {
 	}
 }
 
-// TestPublicTenantManagerOptionsExist pins FC-6 at the facade: each option
-// constructs its own backend with a nil handle (multi-tenant implied) and is
-// refused with ErrTenantManagerBackendMismatch on the other, and the lifecycle
-// handler registers as a tmevent.EventHandler.
+// TestPublicTenantManagerOptionsExist pins FC-6 and FC-10 at the facade: each
+// option constructs its own backend with a nil handle (multi-tenant implied)
+// and is refused with ErrTenantManagerBackendMismatch on the other, the
+// lifecycle handler registers as a tmevent.EventHandler, and the aggregate
+// threshold option exists with its frozen default of 1000.
 func TestPublicTenantManagerOptionsExist(t *testing.T) {
 	t.Parallel()
+
+	if DefaultAggregateTenantThreshold != 1000 {
+		t.Errorf("DefaultAggregateTenantThreshold = %d, want 1000", DefaultAggregateTenantThreshold)
+	}
 
 	pg := tmpostgres.NewManager(nil, "svc")
 	mb := tmmongo.NewManager(nil, "svc")
 
-	c, err := NewPostgres(nil, "", WithPostgresTenantManager(pg))
+	c, err := NewPostgres(nil, "", WithPostgresTenantManager(pg), WithAggregateTenantThreshold(1))
 	if err != nil {
 		t.Fatalf("NewPostgres with its tenant manager: %v", err)
 	}
@@ -318,23 +323,6 @@ func TestPublicTenantManagerOptionsExist(t *testing.T) {
 	if _, err := NewMongoDB(nil, "", WithPostgresTenantManager(pg)); !errors.Is(err, ErrTenantManagerBackendMismatch) {
 		t.Errorf("NewMongoDB with a Postgres tenant manager: err = %v, want ErrTenantManagerBackendMismatch", err)
 	}
-}
-
-// TestPublicAggregateTenantThresholdExists pins FC-10 at the facade: the
-// threshold option and its frozen default of 1000.
-func TestPublicAggregateTenantThresholdExists(t *testing.T) {
-	t.Parallel()
-
-	if DefaultAggregateTenantThreshold != 1000 {
-		t.Errorf("DefaultAggregateTenantThreshold = %d, want 1000", DefaultAggregateTenantThreshold)
-	}
-
-	c, err := NewPostgres(nil, "", WithMultiTenantEnabled(), WithAggregateTenantThreshold(1))
-	if err != nil {
-		t.Fatalf("NewPostgres with WithAggregateTenantThreshold: %v", err)
-	}
-
-	_ = c.Close()
 }
 
 // TestPublicGetEntryCarriesRevisionAndProvenance pins FC-5 at the facade: the

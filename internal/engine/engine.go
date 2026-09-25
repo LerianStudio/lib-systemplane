@@ -307,7 +307,7 @@ func (e *Engine) bringUpScope(scope store.Scope) (*scopeState, error) {
 		return sc, nil
 	}
 
-	unsubscribe, err := e.store.Subscribe(e.dispatchContext(), scope, e.feedCallback())
+	unsubscribe, err := e.store.Subscribe(e.dispatchContext(), scope, e.onEvent)
 	if err != nil {
 		e.dropScope(scope)
 
@@ -605,7 +605,8 @@ func (e *Engine) writeScope(ctx context.Context, scope store.Scope, nk NSKey) (*
 // nothing is never reported as confirmed; only an untracked scope reports the
 // zero Entry.
 //
-// Every call counts one systemplane.cache_reads_total, hit or miss (FC-12).
+// A call on a tracked scope counts one systemplane.cache_reads_total, hit or
+// miss (FC-12); an untracked scope has no cache to read.
 func (e *Engine) Lookup(scope store.Scope, nk NSKey) (Entry, bool) {
 	if e == nil {
 		return Entry{}, false
@@ -613,7 +614,6 @@ func (e *Engine) Lookup(scope store.Scope, nk NSKey) (Entry, bool) {
 
 	sc := e.trackedScope(scope)
 	if sc == nil {
-		e.metrics.recordRead(scope, false)
 		return Entry{}, false
 	}
 
@@ -622,7 +622,7 @@ func (e *Engine) Lookup(scope store.Scope, nk NSKey) (Entry, bool) {
 	_, unconfirmed := sc.unconfirmed[nk]
 	stale := sc.stale || unconfirmed
 	sc.mu.RUnlock()
-	e.metrics.recordRead(scope, ok)
+	e.metrics.recordRead(sc, ok)
 
 	if !ok {
 		return Entry{Stale: stale}, false

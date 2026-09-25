@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
+	obsmetrics "github.com/LerianStudio/lib-observability/v4/metrics"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -21,12 +22,17 @@ const aggregateTenant = "aggregate"
 type metrics struct {
 	threshold int64
 	// tenants counts the tenant scopes in e.scopes; it decides the collapse.
-	tenants atomic.Int64
+	tenants   atomic.Int64
+	aggregate readOptions // what every tenant scope reads under while collapsed
 
 	events, disconnects, reads metric.Int64Counter
 	activation                 metric.Float64Histogram
 	gauges                     metric.Registration
 }
+
+// readOptions are one tenant_id's cache_reads_total options, built once so a
+// metered read allocates nothing.
+type readOptions struct{ hit, miss []metric.AddOption }
 
 // newMetrics builds the instruments from meter systemplane.engine, or returns
 // nil when there is no telemetry or the meter refuses any of them. scopes is
@@ -44,6 +50,7 @@ func newMetrics(t store.Telemetry, threshold int, logger log.Logger, scopes func
 	}
 
 	m := &metrics{threshold: int64(threshold)}
+	m.aggregate = m.readOptions(aggregateTenant)
 
 	var errEvents, errDisconnects, errReads, errActivation, errGauges error
 
@@ -55,7 +62,7 @@ func newMetrics(t store.Telemetry, threshold int, logger log.Logger, scopes func
 		metric.WithDescription("Cached reads, per scope and result (hit or miss)"))
 	m.activation, errActivation = meter.Float64Histogram("systemplane.activation_latency_seconds", metric.WithUnit("s"),
 		metric.WithDescription("From a tenant's first activating read until its scope is fresh"),
-		metric.WithExplicitBucketBoundaries(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10))
+		metric.WithExplicitBucketBoundaries(obsmetrics.DefaultLatencyBuckets...))
 	active, errActive := meter.Int64ObservableGauge("systemplane.scopes_active",
 		metric.WithDescription("Scopes the engine tracks"))
 	entries, errEntries := meter.Int64ObservableGauge("systemplane.cache_entries",
@@ -76,33 +83,36 @@ func newMetrics(t store.Telemetry, threshold int, logger log.Logger, scopes func
 	return m
 }
 
-// observe reports both gauges summed per attribute set after the collapse, so
-// an aggregated tenant_id carries every tenant's share.
+// observe reports scopes_active as one count, as v3's tenants_active was, and
+// cache_entries summed per tenant_id under one collapse decision, so aggregate
+// carries every tenant's share.
 func (m *metrics) observe(o metric.Observer, active, entries metric.Int64Observable, scopes []*scopeState) {
-	type tally struct{ scopes, entries int64 }
+	o.ObserveInt64(active, int64(len(scopes)))
 
-	sums := make(map[string]tally, len(scopes))
+	collapsed := m.collapsed()
+	sums := make(map[string]int64, len(scopes))
 
 	for _, sc := range scopes {
 		sc.mu.RLock()
-		n := int64(len(sc.entries))
+		sums[tenantID(sc.scope, collapsed)] += int64(len(sc.entries))
 		sc.mu.RUnlock()
-
-		label := m.label(sc.scope)
-		sum := sums[label]
-		sums[label] = tally{scopes: sum.scopes + 1, entries: sum.entries + n}
 	}
 
-	for label, sum := range sums {
-		o.ObserveInt64(active, sum.scopes, withTenant(label))
-		o.ObserveInt64(entries, sum.entries, withTenant(label))
+	for label, n := range sums {
+		o.ObserveInt64(entries, n, withTenant(label))
 	}
 }
 
-// label is scope's tenant_id: none for the single-tenant scope, the literal
-// aggregate while more tenant scopes are active than a positive threshold.
-func (m *metrics) label(scope store.Scope) string {
-	if scope.Tenant != "" && m.threshold > 0 && m.tenants.Load() > m.threshold {
+// collapsed reports that more tenant scopes are active than a positive
+// threshold allows, so every one of them reports tenant_id=aggregate.
+func (m *metrics) collapsed() bool {
+	return m.threshold > 0 && m.tenants.Load() > m.threshold
+}
+
+// tenantID is scope's tenant_id: none for the single-tenant scope, the literal
+// aggregate for a tenant scope while collapsed.
+func tenantID(scope store.Scope, collapsed bool) string {
+	if scope.Tenant != "" && collapsed {
 		return aggregateTenant
 	}
 
@@ -117,6 +127,19 @@ func withTenant(label string, kv ...attribute.KeyValue) metric.MeasurementOption
 	return metric.WithAttributes(kv...)
 }
 
+// readOptions builds label's cache_reads_total options; a nil *metrics builds
+// none, as it records none.
+func (m *metrics) readOptions(label string) readOptions {
+	if m == nil {
+		return readOptions{}
+	}
+
+	return readOptions{
+		hit:  []metric.AddOption{withTenant(label, attribute.String("result", "hit"))},
+		miss: []metric.AddOption{withTenant(label, attribute.String("result", "miss"))},
+	}
+}
+
 // countTenant moves the active tenant count as a tenant scope enters (+1) or
 // leaves (-1) e.scopes; the caller holds scopesMu. A nil sc was never tracked.
 func (m *metrics) countTenant(sc *scopeState, delta int64) {
@@ -125,42 +148,43 @@ func (m *metrics) countTenant(sc *scopeState, delta int64) {
 	}
 }
 
-// feedCallback is what bringUpScope hands Store.Subscribe: onEvent, counting
-// every event the changefeed delivers (a disconnect twice over) given a meter.
-func (e *Engine) feedCallback() func(store.Event) {
-	m := e.metrics
-	if m == nil {
-		return e.onEvent
-	}
-
-	return func(evt store.Event) {
-		opt := withTenant(m.label(evt.Scope))
-		m.events.Add(context.Background(), 1, opt)
-
-		if evt.Op == store.OpDisconnect {
-			m.disconnects.Add(context.Background(), 1, opt)
-		}
-
-		e.onEvent(evt)
-	}
-}
-
-func (m *metrics) recordRead(scope store.Scope, hit bool) {
+// recordEvent counts one changefeed event, and a disconnect twice over.
+func (m *metrics) recordEvent(evt store.Event) {
 	if m == nil {
 		return
 	}
 
-	result := "miss"
-	if hit {
-		result = "hit"
+	opt := withTenant(tenantID(evt.Scope, m.collapsed()))
+	m.events.Add(context.Background(), 1, opt)
+
+	if evt.Op == store.OpDisconnect {
+		m.disconnects.Add(context.Background(), 1, opt)
+	}
+}
+
+// recordRead counts one read of tracked scope sc with the options built as sc
+// entered the engine.
+func (m *metrics) recordRead(sc *scopeState, hit bool) {
+	if m == nil {
+		return
 	}
 
-	m.reads.Add(context.Background(), 1, withTenant(m.label(scope), attribute.String("result", result)))
+	opts := sc.reads
+	if sc.scope.Tenant != "" && m.collapsed() {
+		opts = m.aggregate
+	}
+
+	read := opts.miss
+	if hit {
+		read = opts.hit
+	}
+
+	m.reads.Add(context.Background(), 1, read...)
 }
 
 func (m *metrics) recordActivation(scope store.Scope, begun time.Time) {
 	if m != nil {
-		m.activation.Record(context.Background(), time.Since(begun).Seconds(), withTenant(m.label(scope)))
+		m.activation.Record(context.Background(), time.Since(begun).Seconds(), withTenant(tenantID(scope, m.collapsed())))
 	}
 }
 
