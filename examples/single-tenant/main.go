@@ -2,8 +2,9 @@
 // Client: it registers a key, subscribes, starts, writes a new value and waits
 // until its subscriber receives the revision that write produced.
 //
-//	SYSTEMPLANE_POSTGRES_DSN='postgres://app:secret@localhost:5432/app?sslmode=disable' \
-//	  go run ./examples/single-tenant
+//	export SYSTEMPLANE_POSTGRES_DSN='postgres://app:secret@localhost:5432/app?sslmode=disable'
+//	psql "$SYSTEMPLANE_POSTGRES_DSN" -f ddl/schema.sql  # once; a service runs it in its migrations
+//	go run ./examples/single-tenant
 package main
 
 import (
@@ -44,12 +45,6 @@ func run() error {
 	}
 	defer db.Close()
 
-	// A service applies SchemaSQL in its migration pipeline, so its runtime role
-	// needs DML and LISTEN only. The DDL is idempotent, so the example applies it.
-	if _, err := db.ExecContext(ctx, systemplane.SchemaSQL()); err != nil {
-		return fmt.Errorf("apply schema: %w", err)
-	}
-
 	client, err := systemplane.NewPostgres(db, dsn, systemplane.WithCloseTimeout(5*time.Second))
 	if err != nil {
 		return err
@@ -67,7 +62,8 @@ func changeFee(ctx context.Context, client *systemplane.Client) error {
 	}
 
 	// Deliveries for one key are serialized, so a callback that blocks holds back
-	// only this key. Close cancels ctx, which releases a send nobody receives.
+	// only this key. Close cancels the engine context the callback receives, which
+	// releases a send nobody receives.
 	changes := make(chan systemplane.Change)
 
 	unsubscribe, err := client.OnChange(namespace, key, func(ctx context.Context, ch systemplane.Change) {

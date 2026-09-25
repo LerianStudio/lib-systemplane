@@ -57,9 +57,7 @@ func run() error {
 		return errors.Join(err, mc.Disconnect(context.Background()))
 	}
 
-	err = raiseDailyCount(ctx, client)
-
-	return errors.Join(err, closeClient(client), mc.Disconnect(context.Background()))
+	return errors.Join(raiseDailyCount(ctx, client), client.Close(), mc.Disconnect(context.Background()))
 }
 
 func raiseDailyCount(ctx context.Context, client *systemplane.Client) error {
@@ -70,8 +68,8 @@ func raiseDailyCount(ctx context.Context, client *systemplane.Client) error {
 		return err
 	}
 
-	// An error from the applier rejects that revision: the previous document
-	// stays in force and Status reports the rejection in LastErr.
+	// An error rejects the revision for this applier only: Status keeps Applied at
+	// the previous revision and reports LastErr, while Snapshot already returns it.
 	unsubscribe, err := limits.OnApply(func(_ context.Context, a systemplane.Applied[Limits]) error {
 		fmt.Printf("applying %+v at revision %d\n", a.Value, a.Revision)
 
@@ -115,7 +113,7 @@ func waitApplied(ctx context.Context, limits *systemplane.Group[Limits], revisio
 
 	for {
 		for _, st := range limits.Status() {
-			if st.Applied >= revision && st.LastErr == nil {
+			if st.Applied >= revision {
 				fmt.Printf("revision %d is in force\n", st.Applied)
 
 				return nil
@@ -128,15 +126,4 @@ func waitApplied(ctx context.Context, limits *systemplane.Group[Limits], revisio
 			return fmt.Errorf("revision %d was not applied: %w", revision, ctx.Err())
 		}
 	}
-}
-
-// closeClient reports an applier still running after WithCloseTimeout as its
-// own failure: Close has cancelled that applier's context and returned anyway.
-func closeClient(client *systemplane.Client) error {
-	err := client.Close()
-	if errors.Is(err, systemplane.ErrCloseTimeout) {
-		return fmt.Errorf("an applier outlived the close timeout: %w", err)
-	}
-
-	return err
 }
