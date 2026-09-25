@@ -43,6 +43,13 @@ type Engine struct {
 	scopesMu sync.RWMutex
 	scopes   map[store.Scope]*scopeState
 
+	// activationsMu guards which scopes Activate is bringing up and when each
+	// last failed to; it is never held across Store.Subscribe or a reconcile.
+	activationsMu        sync.Mutex
+	activating           map[store.Scope]struct{}
+	failedAt             map[store.Scope]time.Time
+	activationRetryDelay time.Duration
+
 	// subscribers is keyed by NSKey alone, never by scope: OnChange covers
 	// that key in every scope the engine tracks and Change.Tenant names the
 	// one that fired. nextSubID makes each subscription removable by identity.
@@ -70,12 +77,8 @@ type Engine struct {
 	dispatchWG    sync.WaitGroup
 	running       sync.Map // *dispatchWorker -> workerKey
 
-	// startMu serializes scope bring-up so two concurrent Starts open one
-	// subscription instead of two. It is held across Store.Subscribe and,
-	// inside that, across the scope's own lock while the unsubscribe handle is
-	// stored — that nesting is what settles the race with Close over the
-	// handle. It is never acquired while a scope lock is already held, so the
-	// order is one-way and cannot deadlock against it.
+	// startMu makes Start's retry and bring-up one step, so two Starts open one
+	// subscription; a tenant's activating slot does that per scope instead.
 	startMu sync.Mutex
 
 	// closed refuses new scopes, publications and subscriptions from the
@@ -138,17 +141,20 @@ func New(cfg Config) *Engine {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &Engine{
-		store:            cfg.Store,
-		registry:         cfg.Registry,
-		logger:           logger,
-		debouncer:        debounce.New(cfg.Debounce, debounce.WithLogger[scopeNSKey](logger)),
-		debounceAsync:    cfg.Debounce > 0,
-		scopes:           make(map[store.Scope]*scopeState),
-		subscribers:      make(map[NSKey][]subscription),
-		closeTimeout:     closeTimeout,
-		reconcileTimeout: defaultReconcileTimeout,
-		lifecycleCtx:     ctx,
-		lifecycleCancel:  cancel,
+		store:                cfg.Store,
+		registry:             cfg.Registry,
+		logger:               logger,
+		debouncer:            debounce.New(cfg.Debounce, debounce.WithLogger[scopeNSKey](logger)),
+		debounceAsync:        cfg.Debounce > 0,
+		scopes:               make(map[store.Scope]*scopeState),
+		activating:           make(map[store.Scope]struct{}),
+		failedAt:             make(map[store.Scope]time.Time),
+		activationRetryDelay: defaultActivationRetryDelay,
+		subscribers:          make(map[NSKey][]subscription),
+		closeTimeout:         closeTimeout,
+		reconcileTimeout:     defaultReconcileTimeout,
+		lifecycleCtx:         ctx,
+		lifecycleCancel:      cancel,
 	}
 }
 
@@ -222,9 +228,11 @@ func (e *Engine) Start(ctx context.Context) error {
 
 	scope := store.Scope{}
 
+	e.startMu.Lock()
 	e.retryFailedScope(scope)
-
 	sc, err := e.bringUpScope(scope)
+	e.startMu.Unlock()
+
 	if err != nil {
 		return err
 	}
@@ -252,19 +260,10 @@ func (e *Engine) Start(ctx context.Context) error {
 }
 
 // retryFailedScope drops scope when its first reconcile is on record as having
-// FAILED, so the Start that follows brings it up again from nothing.
-//
-// The check and the drop are one critical section under startMu, so two
-// concurrent retries cannot both drop. The lock is released before bringUpScope
-// takes it again, so what keeps a retry from dropping a scope another Start has
-// just rebuilt is not this lock but Client.Start, which holds its own startMu
-// across the pair. A scope whose first reconcile has not finished is left
-// alone: it is still subscribed and its resync is still coming, and tearing it
-// down would throw away the changefeed the caller is waiting on.
+// FAILED, so the Start that follows brings it up again from nothing. A scope
+// whose first reconcile has not finished is left alone: it is still subscribed
+// and its resync is still coming.
 func (e *Engine) retryFailedScope(scope store.Scope) {
-	e.startMu.Lock()
-	defer e.startMu.Unlock()
-
 	sc := e.trackedScope(scope)
 	if sc == nil {
 		return
@@ -285,15 +284,13 @@ func (e *Engine) retryFailedScope(scope store.Scope) {
 	}
 }
 
-// bringUpScope creates scope's state and opens its changefeed, exactly once.
+// bringUpScope creates scope's state and opens its changefeed, once per holder
+// of scope's exclusion: Start's lock, or a tenant's activating slot.
 //
 // The subscription is opened on the engine's lifecycle context rather than the
 // caller's: the feed must outlive Start and die with Close. A failed Subscribe
 // drops the scope rather than leaving a half-built one behind.
 func (e *Engine) bringUpScope(scope store.Scope) (*scopeState, error) {
-	e.startMu.Lock()
-	defer e.startMu.Unlock()
-
 	sc := e.scopeFor(scope)
 	if sc == nil {
 		return nil, store.ErrClosed

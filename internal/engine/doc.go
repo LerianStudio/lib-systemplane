@@ -15,6 +15,9 @@
 // coalescing worker per (scope, key), never by the goroutine the changefeed
 // calls into.
 //
+// A tenant scope comes up through Activate: in the background, single-flight
+// per scope, dropped whole on any failure and retried only after a cooldown.
+//
 // The engine never imports internal/client: the key registry, options and
 // catalog stay there and reach the engine through ports declared here.
 package engine
