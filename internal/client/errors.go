@@ -37,8 +37,8 @@ var (
 	ErrDuplicateKey = errors.New("systemplane: duplicate key")
 
 	// ErrNotSupportedInMultiTenant is returned by OnChange (and any other
-	// process-wide changefeed primitive) when the Client was constructed with
-	// WithMultiTenantEnabled().
+	// process-wide changefeed primitive) on a multi-tenant Client with no
+	// tenant manager.
 	ErrNotSupportedInMultiTenant = store.ErrNotSupportedInMultiTenant
 
 	// ErrCloseTimeout is returned by Close when a subscriber callback was

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
 	tmmongo "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/mongo"
@@ -537,4 +538,145 @@ func TestTenantReadBackValidatorSeesTheTenant(t *testing.T) {
 	if e := mustEntry(t, c, tenantCtx("t1"), "ns", "k"); e.Value != "stored" || e.Revision != 5 {
 		t.Fatalf("cached read = %+v, want the row the tenant-aware validator accepts", e)
 	}
+}
+
+// receiveChanges takes the next n deliveries keyed by by, or fails.
+func receiveChanges(t *testing.T, changes <-chan Change, n int, by func(Change) string) map[string]Change {
+	t.Helper()
+
+	got := make(map[string]Change, n)
+
+	for range n {
+		select {
+		case ch := <-changes:
+			got[by(ch)] = ch
+		case <-time.After(2 * time.Second):
+			t.Fatalf("received %d of %d changes: %+v", len(got), n, got)
+		}
+	}
+
+	return got
+}
+
+func subscribe(changes chan<- Change, ns string, keys ...string) func(*Client) error {
+	return func(c *Client) error {
+		for _, key := range keys {
+			if _, err := c.OnChange(ns, key, func(_ context.Context, ch Change) { changes <- ch }); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	}
+}
+
+func TestMultiTenantOnChangeFiresPerTenant(t *testing.T) {
+	s := newTenantStore()
+	s.seed(t, "t1", "ns", "k", "one", 1, "a")
+	s.seed(t, "t2", "ns", "k", "two", 1, "b")
+	c := newTenantClient(t, s, registerKey("ns", "k", "default"))
+
+	for _, tenant := range []string{"t1", "t2"} {
+		mustEntry(t, c, tenantCtx(tenant), "ns", "k")
+		waitSettled(t, c, tenant, "ns", "k")
+	}
+
+	changes := make(chan Change, 8)
+	if err := subscribe(changes, "ns", "k")(c); err != nil {
+		t.Fatalf("OnChange on a tenant-managed Client: %v", err)
+	}
+
+	for tenant, value := range map[string]string{"t1": "one-2", "t2": "two-2"} {
+		s.seed(t, tenant, "ns", "k", value, 2, "c")
+		s.fire(tenant, store.OpResync)
+	}
+
+	got := receiveChanges(t, changes, 2, func(ch Change) string { return ch.Tenant })
+	want := map[string]Change{
+		"t1": {Tenant: "t1", Namespace: "ns", Key: "k", Revision: 2, Value: "one-2"},
+		"t2": {Tenant: "t2", Namespace: "ns", Key: "k", Revision: 2, Value: "two-2"},
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("deliveries = %+v, want one per tenant naming it: %+v", got, want)
+	}
+}
+
+func TestMultiTenantOnChangeRefusedWithoutATenantManager(t *testing.T) {
+	c := newTenantClient(t, newTenantStore(), registerKey("ns", "k", "default"), WithPostgresTenantManager(nil))
+
+	if _, err := c.OnChange("ns", "k", func(context.Context, Change) {}); !errors.Is(err, ErrNotSupportedInMultiTenant) {
+		t.Fatalf("OnChange with a nil tenant manager = %v, want ErrNotSupportedInMultiTenant", err)
+	}
+}
+
+// TestOnChangeRegisteredBeforeActivationFiresAtActivation is br-sfn's shape:
+// callbacks registered before Start, then announced per tenant at activation.
+func TestOnChangeRegisteredBeforeActivationFiresAtActivation(t *testing.T) {
+	s := newTenantStore()
+	s.seed(t, "t1", "ns", "a", "stored", 4, "alice")
+
+	changes := make(chan Change, 8)
+	c := newTenantClient(t, s, func(c *Client) error {
+		return errors.Join(c.Register("ns", "a", "da"), c.Register("ns", "b", "db"), subscribe(changes, "ns", "a", "b")(c))
+	})
+
+	mustEntry(t, c, tenantCtx("t1"), "ns", "a")
+
+	got := receiveChanges(t, changes, 2, func(ch Change) string { return ch.Key })
+	want := map[string]Change{
+		"a": {Tenant: "t1", Namespace: "ns", Key: "a", Revision: 4, Value: "stored"},
+		"b": {Tenant: "t1", Namespace: "ns", Key: "b", Revision: 0, Value: "db"},
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("activation announced %+v, want every registered key once: %+v", got, want)
+	}
+}
+
+// TestDroppedTenantDeliversNothing: a read never brings a blocked tenant back,
+// and the registration survives its drop to deliver after Unblock.
+func TestDroppedTenantDeliversNothing(t *testing.T) {
+	s := newTenantStore()
+	s.seed(t, "t1", "ns", "k", "one", 1, "a")
+
+	changes := make(chan Change, 8)
+	c := newTenantClient(t, s, func(c *Client) error {
+		return errors.Join(c.Register("ns", "k", "default"), subscribe(changes, "ns", "k")(c))
+	})
+
+	mustEntry(t, c, tenantCtx("t1"), "ns", "k")
+	waitForChange(t, changes, "one", 1)
+
+	scope, nk := store.Scope{Tenant: "t1"}, engine.NSKey{Namespace: "ns", Key: "k"}
+	c.engine.Block(scope)
+
+	// Block defers the drop to an activation still finishing.
+	waitFor(t, func() bool {
+		_, ok := c.engine.Lookup(scope, nk)
+
+		return !ok
+	}, "the blocked tenant's scope was never dropped")
+
+	s.seed(t, "t1", "ns", "k", "two", 2, "b")
+
+	if e := mustEntry(t, c, tenantCtx("t1"), "ns", "k"); e.Value != "two" {
+		t.Fatalf("blocked tenant read = %+v, want the row per request", e)
+	}
+
+	select {
+	case ch := <-changes:
+		t.Fatalf("a blocked tenant delivered %+v", ch)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	c.engine.Unblock(scope)
+	waitFor(t, func() bool {
+		mustEntry(t, c, tenantCtx("t1"), "ns", "k")
+		e, ok := c.engine.Lookup(scope, nk)
+
+		return ok && !e.Stale
+	}, "an unblocked tenant never came back on a read")
+
+	waitForChange(t, changes, "two", 2)
 }

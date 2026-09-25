@@ -28,7 +28,7 @@ var (
 	ErrDuplicateKey = internalclient.ErrDuplicateKey
 
 	// ErrNotSupportedInMultiTenant is returned by OnChange in multi-tenant
-	// mode — there is no shared process-wide changefeed.
+	// mode with no tenant manager — no scope is tracked, so no feed runs.
 	ErrNotSupportedInMultiTenant = internalclient.ErrNotSupportedInMultiTenant
 
 	// ErrCloseTimeout is returned by Close when a subscriber callback was

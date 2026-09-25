@@ -179,11 +179,15 @@ func (c *Client) CatalogService() string {
 // receives is the engine's own lifecycle context — no request values, no
 // tenant — so a callback that needs the tenant reads Change.Tenant, not ctx.
 //
+// With [WithPostgresTenantManager] or [WithMongoTenantManager] one
+// subscription covers every tenant: a tenant announces every registered key
+// once, when its first read activates it, then delivers its own changes,
+// serialized and coalesced per (tenant, key).
+//
 // OnChange returns ErrUnknownKey for a key that was not registered, in both
-// modes. In multi-tenant mode it then returns ErrNotSupportedInMultiTenant for
-// every registered key: no scope is tracked and no changefeed runs, so no
-// callback could ever fire. The wave-3 engine-tenants lane makes multi-tenant
-// OnChange work on both backends. On a closed Client it returns ErrClosed.
+// modes. A multi-tenant Client with no tenant manager then returns
+// ErrNotSupportedInMultiTenant for every registered key: no scope is tracked,
+// so no callback could ever fire. On a closed Client it returns ErrClosed.
 func (c *Client) OnChange(namespace, key string, fn func(ctx context.Context, ch Change)) (unsubscribe func(), err error) {
 	return asInternalClient(c).OnChange(namespace, key, fn)
 }

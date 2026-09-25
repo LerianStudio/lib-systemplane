@@ -14,11 +14,11 @@ import (
 // subscription could never deliver anything, so refusing it surfaces the typo
 // instead of hiding it behind a callback that never fires.
 //
-// In single-tenant mode deliveries are COALESCED per key and serialized, off
-// the changefeed goroutine: while fn runs, a newer revision of the same key
+// Deliveries are COALESCED and serialized per (tenant, key), off the
+// changefeed goroutine: while fn runs, a newer revision of the same key
 // replaces the pending one, so fn may skip intermediate revisions but always
-// receives the newest and never sees revisions out of order. Different keys
-// deliver independently.
+// receives the newest and never sees revisions out of order. Different keys,
+// and one key in different tenants, deliver independently.
 //
 // A subscriber registered before [Client.Start] is handed the value in force
 // once, as the first reconcile publishes every registered key (FC-11). The
@@ -39,10 +39,10 @@ import (
 //     as Start is still running, and during Close until the close timeout
 //     expires.
 //
-// In multi-tenant mode OnChange returns ErrNotSupportedInMultiTenant for every
-// registered key: no scope is tracked and no changefeed runs, so no callback
-// could ever fire. The wave-3 engine-tenants lane makes multi-tenant OnChange
-// work on both backends, delivering per-tenant changes with Change.Tenant set.
+// On a tenant-managed Client one subscription covers every tenant: a tenant's
+// activation announces every registered key as Start does, and a dropped tenant
+// delivers nothing until it is activated again. A multi-tenant Client with no
+// tenant manager returns ErrNotSupportedInMultiTenant: it tracks no scope.
 func (c *Client) OnChange(namespace, key string, fn func(ctx context.Context, ch Change)) (func(), error) {
 	noop := func() {}
 
@@ -60,7 +60,7 @@ func (c *Client) OnChange(namespace, key string, fn func(ctx context.Context, ch
 		return noop, fmt.Errorf("%w: %s/%s", ErrUnknownKey, namespace, key)
 	}
 
-	if c.multiTenant {
+	if c.multiTenant && !c.tenantManaged {
 		return noop, ErrNotSupportedInMultiTenant
 	}
 

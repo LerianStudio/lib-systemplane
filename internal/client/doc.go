@@ -15,9 +15,9 @@
 //   - Multi-tenant: every write, and every read of a scope that is not
 //     cached, resolves a per-request tenant database from ctx via lib-commons
 //     tenant-manager. With a tenant manager a tenant's first read activates
-//     its own tracked scope, which serves its later reads; without one there
-//     is no cache and no changefeed. OnChange returns
-//     ErrNotSupportedInMultiTenant.
+//     its own tracked scope, which serves its later reads and delivers to
+//     OnChange subscribers; without one there is no cache and no changefeed,
+//     and OnChange returns ErrNotSupportedInMultiTenant.
 //
 // The root systemplane package exposes the public facade; this internal
 // package remains the implementation boundary.

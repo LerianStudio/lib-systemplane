@@ -108,8 +108,8 @@ func WithCloseTimeout(d time.Duration) Option {
 //   - The db / mongo client passed to NewPostgres / NewMongoDB MAY be nil.
 //   - Without WithPostgresTenantManager / WithMongoTenantManager there is no
 //     cache and no changefeed: Get hits the resolved tenant DB on every call,
-//     ungraded. With one, a tenant's first read activates its cached scope.
-//   - OnChange returns ErrNotSupportedInMultiTenant.
+//     ungraded, and OnChange returns ErrNotSupportedInMultiTenant. With one, a
+//     tenant's first read activates its cached scope.
 //   - Schema bootstrap runs lazily on first access per resolved tenant
 //     database.
 func WithMultiTenantEnabled() Option {
