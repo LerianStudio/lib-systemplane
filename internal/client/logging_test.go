@@ -4,6 +4,8 @@ package client
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -277,6 +279,13 @@ func TestMultiTenantDecodeFailureWithNoTenantIDSaysSo(t *testing.T) {
 
 	if !strings.Contains(err.Error(), "in an unresolved tenant") || strings.Contains(err.Error(), `in tenant ""`) {
 		t.Errorf("the decode error does not say the tenant was unresolved: %v", err)
+	}
+
+	// Nothing here masks a value, so the json cause that locates the bad byte
+	// stays in the chain for the caller debugging the row.
+	var syntax *json.SyntaxError
+	if !errors.As(err, &syntax) {
+		t.Errorf("the json cause callers debug the row with is gone: %v", err)
 	}
 
 	lines := logger.errs("failed to unmarshal stored value")

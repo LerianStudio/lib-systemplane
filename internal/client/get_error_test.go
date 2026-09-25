@@ -37,56 +37,38 @@ func seedRaw(m *memStore, ns, key string, raw []byte) {
 	m.entries[memKey(ns, key)] = store.Entry{Namespace: ns, Key: key, Value: raw}
 }
 
-// TestMultiTenantDecodeErrorWrapsTheCause pins the read-through rejection for
-// an undecodable row: the encoding/json failure stays in the chain, offset and
-// all, for every key. Nothing in this library masks a value, so the caller
-// debugging the row keeps the one detail that locates it.
-func TestMultiTenantDecodeErrorWrapsTheCause(t *testing.T) {
-	raw := []byte(rejectedSecret)
+// TestMultiTenantListDecodeErrorWrapsTheCause pins List's read-through
+// rejection for an undecodable row: the encoding/json failure stays in the
+// chain, offset and all. Nothing in this library masks a value, so the caller
+// debugging the row keeps the one detail that locates it. Get's half of the
+// same path is pinned by TestMultiTenantDecodeFailureWithNoTenantIDSaysSo.
+func TestMultiTenantListDecodeErrorWrapsTheCause(t *testing.T) {
+	m := newMemStore(true)
+	c := newMultiTenantClientWithLogger(t, m, &recordingLogger{})
 
-	read := map[string]func(*Client) error{
-		"Get": func(c *Client) error {
-			_, _, err := c.Get(context.Background(), "ns", "k")
-
-			return err
-		},
-		"List": func(c *Client) error {
-			_, err := c.List(context.Background(), "ns")
-
-			return err
-		},
+	if err := c.Register("ns", "k", "default"); err != nil {
+		t.Fatalf("register: %v", err)
 	}
 
-	for name, call := range read {
-		t.Run(name, func(t *testing.T) {
-			m := newMemStore(true)
-			c := newMultiTenantClientWithLogger(t, m, &recordingLogger{})
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
 
-			if err := c.Register("ns", "k", "default"); err != nil {
-				t.Fatalf("register: %v", err)
-			}
+	t.Cleanup(func() { _ = c.Close() })
+	seedRaw(m, "ns", "k", []byte(rejectedSecret))
 
-			if err := c.Start(context.Background()); err != nil {
-				t.Fatalf("start: %v", err)
-			}
+	_, err := c.List(context.Background(), "ns")
+	if err == nil {
+		t.Fatal("want a decode error, got nil")
+	}
 
-			t.Cleanup(func() { _ = c.Close() })
-			seedRaw(m, "ns", "k", raw)
+	var syntax *json.SyntaxError
+	if !errors.As(err, &syntax) {
+		t.Errorf("the json cause callers debug the row with is gone: %v", err)
+	}
 
-			err := call(c)
-			if err == nil {
-				t.Fatal("want a decode error, got nil")
-			}
-
-			var syntax *json.SyntaxError
-			if !errors.As(err, &syntax) {
-				t.Errorf("the json cause callers debug the row with is gone: %v", err)
-			}
-
-			if !strings.Contains(err.Error(), "ns") || !strings.Contains(err.Error(), "k") {
-				t.Errorf("the error names neither namespace nor key: %v", err)
-			}
-		})
+	if !strings.Contains(err.Error(), "ns") || !strings.Contains(err.Error(), "k") {
+		t.Errorf("the error names neither namespace nor key: %v", err)
 	}
 }
 

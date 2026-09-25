@@ -782,9 +782,8 @@ var ErrApplyPanicked = errors.New("systemplane/group: apply function panicked")
 // returned error passes through, and a panic is recovered into one. The recover
 // is the coordinator's own because the RecoverAndLog family swallows the
 // recovered value and FC-7 needs a rejection in the scope's LastErr; the value
-// itself never goes into that error — a panic value is whatever the panicking
-// hook was holding, routinely the decoded document with its endpoints and
-// credentials, and LastErr is a field operators read and log. The value is
+// itself never goes into that error — LastErr is a field operators read and
+// log, and where a panic value goes is the panic handler's business. It is
 // handed to runtime.HandlePanicValue, which is built for a panic recovered
 // elsewhere and does not recover itself. That is what keeps a panicking
 // hot-reload hook on the fleet's panic counter, on the publication's span and

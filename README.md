@@ -324,7 +324,7 @@ In multi-tenant mode, authenticate before tenant resolution, then mount the tena
 
 ### Catalog routes
 
-The catalog surface exposes registration metadata, not current persisted values. It is useful for operators and consoles that need to discover the canonical key set, descriptions, redaction policy, schemas, examples, and write path.
+The catalog surface exposes registration metadata, not current persisted values. It is useful for operators and consoles that need to discover the canonical key set, descriptions, schemas, examples, and write path.
 
 Mount it separately from value routes:
 
@@ -366,7 +366,7 @@ admin.Mount(app, client,
 
 Fiber applies `app.Use` middleware only to routes registered *after* the `Use` call. Registering `myJWTAuthMiddleware` after `MountCatalog` leaves the catalog routes outside the authentication chain, so `myAuthFn` would run on an unauthenticated request. Keep the auth middleware above both mounts, or have `myAuthFn` authenticate independently.
 
-Catalog detail includes the registered default value. Admin HTTP responses obfuscate defaults for keys registered with `RedactMask` or `RedactFull`. Catalog examples are operator-facing documentation and are emitted as provided; do not put secrets, credentials, DSNs, tokens, or other sensitive material in registered defaults, persisted values, schemas, rules, or examples. Systemplane is not a secret store.
+Catalog detail includes the registered default value, as registered. Catalog examples are operator-facing documentation and are emitted as provided; do not put secrets, credentials, DSNs, tokens, or other sensitive material in registered defaults, persisted values, schemas, rules, or examples. Systemplane is not a secret store.
 
 ## Panic recovery
 
@@ -388,7 +388,7 @@ panics answers 500 and writes nothing.
 
 ## Scope
 
-Systemplane is intended for **runtime-mutable knobs only**. Bootstrap-only configuration (DB DSNs, secrets, TLS material, telemetry endpoints, server identity) and any credential-like runtime value belongs in environment variables or a secret manager — not here. Redaction is an admin/log obfuscation aid, not permission to store secrets in systemplane.
+Systemplane is intended for **runtime-mutable knobs only**. Bootstrap-only configuration (DB DSNs, secrets, TLS material, telemetry endpoints, server identity) and any credential-like runtime value belongs in environment variables or a secret manager — not here. The library masks nothing: a registered default and a stored value reach the admin surface and the catalog as they are.
 
 ## License
 

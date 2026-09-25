@@ -1,9 +1,10 @@
 // Package client implements the systemplane runtime-configuration client.
 //
 // It owns lifecycle management, the key registry, options, the catalog and the
-// facade the root package exposes. It holds no cache of its own: internal/engine serves the reads, takes the writes, runs the reconcile
-// that follows every changefeed (re)connect, and dispatches to OnChange
-// subscribers. Two operating modes share the same surface:
+// facade the root package exposes. It holds no cache of its own: internal/engine
+// serves the reads, takes the writes, runs the reconcile that follows every
+// changefeed (re)connect, and dispatches to OnChange subscribers. Two operating
+// modes share the same surface:
 //
 //   - Single-tenant: the Client tracks the zero scope in the engine. Reads
 //     serve from the engine's cache; a write upserts through the store and

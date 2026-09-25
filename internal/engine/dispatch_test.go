@@ -129,15 +129,6 @@ func (l *panicLogger) Log(context.Context, int, string, ...any) {
 	}
 }
 
-// currentWorker reads the worker a scope would hand the next publication of
-// nk, under the lock that starts and sweeps one.
-func currentWorker(e *Engine, sc *scopeState, nk NSKey) *dispatchWorker {
-	e.workersMu.Lock()
-	defer e.workersMu.Unlock()
-
-	return sc.workers[nk]
-}
-
 func pub(nk NSKey, revision int64, value any) publication {
 	return publication{NSKey: nk, Revision: revision, Value: value}
 }
@@ -1040,12 +1031,8 @@ func (r *countingRegistry) Lookup(namespace, key string) (KeyDef, bool) {
 }
 
 // TestDeliveryNeverReadsTheRegistry pins the cost of a delivery on the hot
-// path: zero registry lookups, whether the callback returns or panics.
-//
-// deliver used to read one bit off the registry to decide what a panic report
-// could carry. Nothing masks a value any more, so the report carries what was
-// raised and the fan-out takes the registry's lock
-// never, rather than contending with Register and with every other ingress.
+// path: zero registry lookups, whether the callback returns or panics, so the
+// fan-out never contends with Register for the registry's lock.
 func TestDeliveryNeverReadsTheRegistry(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}
 	reg := &countingRegistry{fakeRegistry: fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: "fallback"}}}}
