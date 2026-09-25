@@ -232,7 +232,7 @@ func NewCoordinator[T any](
 		// package writes runs either on a publishing goroutine the consumer
 		// cannot recover on or inside an applier's recovery. Guard answers nil
 		// with a no-op logger, so the field is never nil below.
-		logger:      safelog.Guard(logger),
+		logger:      log.Guard(logger),
 		namespace:   namespace,
 		key:         key,
 		redacted:    redacted,

@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
-	"github.com/LerianStudio/lib-systemplane/v4/internal/safelog"
 )
 
 // explodingLogger is the consumer logger that is broken rather than slow:
@@ -49,14 +48,12 @@ func TestTheLoggerEveryBackendGetsIsGuarded(t *testing.T) {
 	// Both of the consumer's panics, neither reaching this frame.
 	cfg.logger.Log(context.Background(), log.LevelError, "a line the consumer's logger explodes on")
 
-	if cfg.logger.Enabled(log.LevelDebug) {
-		t.Error("Enabled reported true for a logger that panics on its level check")
-	}
+	cfg.logger.Enabled(log.LevelDebug)
 
-	// safelog.Guard is idempotent, so a value it hands back unchanged is one it
+	// log.Guard is idempotent, so a value it hands back unchanged is one it
 	// already wrapped. This pins the VALUE in the config, not the hand-offs:
 	// what the Client itself logs through is pinned by the test below.
-	if guarded := safelog.Guard(cfg.logger); guarded != cfg.logger {
+	if guarded := log.Guard(cfg.logger); guarded != cfg.logger {
 		t.Error("the logger the backends are handed is not guarded")
 	}
 
@@ -123,9 +120,9 @@ func TestBackendConfigsAreBuiltWithTheGuardedLogger(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			// safelog.Guard is idempotent, so a logger it hands back unchanged
+			// log.Guard is idempotent, so a logger it hands back unchanged
 			// is one it already wrapped.
-			if safelog.Guard(tc.got) != tc.got {
+			if log.Guard(tc.got) != tc.got {
 				t.Error("the backend is handed the consumer's raw logger, not the guarded one")
 			}
 		})

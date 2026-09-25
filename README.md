@@ -372,6 +372,24 @@ Fiber applies `app.Use` middleware only to routes registered *after* the `Use` c
 
 Catalog detail includes the registered default value. Admin HTTP responses obfuscate defaults for keys registered with `RedactMask` or `RedactFull`. Catalog examples are operator-facing documentation and are emitted as provided; do not put secrets, credentials, DSNs, tokens, or other sensitive material in registered defaults, persisted values, schemas, rules, or examples. Systemplane is not a secret store.
 
+## Panic recovery
+
+The library recovers every panic it can catch — in an `OnChange` callback, a
+typed-group applier, a changefeed goroutine, the debouncer, or an admin
+authorizer or actor extractor — through `lib-observability/runtime`. Each one logs a
+`panic recovered` line at ERROR, records a span event when the context carries
+a recording span, and increments `panic_recovered_total` with a `component`
+label (`systemplane.engine`, `systemplane` for the typed-group applier under
+the name `group.apply`, `systemplane.postgres`, `systemplane.mongodb`,
+`systemplane.debounce`, `systemplane.admin`, and `log` for the consumer's
+logger itself, named by the method that panicked) and a `goroutine_name` label
+for the site. The counter exists only after the host calls
+`runtime.InitPanicMetrics(factory)` once at startup; the library never calls it,
+because the first call wins and would take the host's metrics. Production mode
+(`runtime.SetProductionMode(true)`) redacts the recovered value from the log
+line. An admin authorizer that panics answers 403; an actor extractor that
+panics answers 500 and writes nothing.
+
 ## Scope
 
 Systemplane is intended for **runtime-mutable knobs only**. Bootstrap-only configuration (DB DSNs, secrets, TLS material, telemetry endpoints, server identity) and any credential-like runtime value belongs in environment variables or a secret manager — not here. Redaction is an admin/log obfuscation aid, not permission to store secrets in systemplane.

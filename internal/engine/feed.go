@@ -380,14 +380,9 @@ func (e *Engine) trackedRefresh(scope store.Scope, nk NSKey, deleted bool) {
 //
 // It is deferred by refreshKey rather than by the one caller that wraps it, so
 // both re-read paths carry the identity: the tracked one, and the inline one a
-// consumer on WithDebounce(0) takes. The debouncer's own guard would catch a
-// panic on either, and that is what this replaces at the top of the stack
-// rather than duplicates:
-// runtime.RecoverAndLog logs source="debounce" and nothing else, and in
-// production mode the value and the stack are redacted out of that line, so an
-// operator learns something under the debouncer blew up and never which
-// tenant, namespace or key. The debouncer's guard stays the outer net —
-// including for a consumer logger that panics on the line below.
+// consumer on WithDebounce(0) takes. The debouncer's guard reports a panic
+// with the full posture but cannot name the tenant, namespace or key; it stays
+// the outer net, including for a consumer logger that panics below.
 //
 // Sitting inside refreshKey is also what orders it against Close. On the
 // tracked path trackedRefresh releases the WaitGroup with a defer of its own,
@@ -421,9 +416,8 @@ func (e *Engine) trackedRefresh(scope store.Scope, nk NSKey, deleted bool) {
 // read the empty fence and publish the default over a live value, which is
 // precisely the reset the fence exists to prevent.
 //
-// HandlePanicValue rather than a re-panic into that net because only it
-// records panic_recovered_total and the span event: RecoverAndLog takes no
-// context and records neither. It is reached through reportConsumerPanic,
+// HandlePanicValue rather than a re-panic into that net, so the panic is
+// counted once, under this site. It is reached through reportConsumerPanic,
 // which emits the identity line and, for a key registered redacted, withholds
 // the recovered value: a driver that panics naming the row it was decoding is
 // holding that key's value, and the handler prints it unless production mode
