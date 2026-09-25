@@ -1009,7 +1009,7 @@ The decision, verbatim: "devemos retirar 100% o tema de segredos mascarados. nao
 **Goal:** No key carries a redaction policy, and no code path renders, masks or withholds a value because of one. The admin surface returns every value in clear, and the catalog stops reporting a `redaction` field.
 **Scope:** `admin/`; root `api_group.go`, `api_client.go`, `api_constants.go`, `api_constructors.go`, `api_types.go` and their tests; `internal/group/`; `internal/engine/`; `internal/safelog/`; `internal/client/`; README.md, CLAUDE.md, MIGRATION-v4.md, `docs/PROJECT_RULES.md`, `.env.reference`.
 **Dependencies:** after PR #96, #97, #95 and the docs Phase 1 PR merge; branch `refactor/v4-drop-redaction`. Engine-tenants Task 1.2.2 rebases onto this epic, never the reverse (see its merge note).
-**Status:** Doing
+**Status:** Done
 
 **Order.** Leaves first, so the repo builds and `make test-unit` is green at every task: 3.1.1 (admin) and 3.1.2 (groups) touch disjoint files and may run in parallel; 3.1.3 (engine and safelog) needs 3.1.2, because it deletes the two `safelog` helpers the group coordinator calls; 3.1.4 (core and root) needs 3.1.1, 3.1.2 and 3.1.3, because it deletes the symbols all three stop calling; 3.1.5 (docs) needs 3.1.4.
 
@@ -1097,7 +1097,7 @@ The decision, verbatim: "devemos retirar 100% o tema de segredos mascarados. nao
 
 #### Task 3.1.5: Docs drop redaction
 
-- [ ] Done
+- [x] Done
 
 **Context:** On `develop` at `07ba7fb`: `CLAUDE.md` names `KeyRedaction` among the listing accessors (`:87`) and the redaction policy and `WithRedaction` among key options (`:89`), plus "redaction" as a lib-observability capability (`:16`, `:53`) and a `internal/client` concern (`:31`); `README.md` names redaction as a lib-observability capability (`:5`, `:14`), the catalog's "redaction policy" (`:327`), admin obfuscation of defaults (`:369`), production mode "redacts" the recovered value (`:385`), and "Redaction is an admin/log obfuscation aid" (`:391`); `docs/PROJECT_RULES.md` names redaction as a lib-observability capability (`:326`) and prescribes the `tracing.Redactor` (`:357-370`), which this repo never calls; `.env.reference:171` lists `WithRedaction` among code-only options. `doc.go` and `MIGRATION-v3.md` carry no mention on `develop`. The docs Phase 1 PR (branch `docs/v4-lane-docs-phase1`) moves these lines and adds `CLAUDE.md`'s `internal/safelog/` bullet ("the redaction-safe renderings …", `:42-43` on that branch) and the fail-closed `KeyRedaction` sentence (`:93`); its `MIGRATION-v4.md` mentions redaction in: § The surface diff, the "Everything else in the facade is unchanged" paragraph (`KeyRedaction`, `WithRedaction`, lines 70 and 72 on that branch); § Behaviour changes › Validators and defaults see the canonical JSON shape (line 180, the redacted-key panic clause); the whole § Behaviour changes › Redaction fails closed (lines 227-246); § Behaviour changes › Panics, and your logger (line 444, the redacted-key report sentence). Its § Operational: primary pinning and the `keyname` log field (line 264, `key=[REDACTED]`) is lib-observability's field-name redaction and stays.
 
