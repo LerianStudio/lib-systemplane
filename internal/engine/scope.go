@@ -462,9 +462,16 @@ func (sc *scopeState) endRefresh(nk NSKey) (again, deleted bool) {
 	return false, false
 }
 
-// acquireGet takes one of the scope's Store.Get slots, or reports false once
-// ctx ends, so Close never waits on a full cap.
+// acquireGet takes one of the scope's Store.Get slots. A free slot is taken even
+// after ctx ends, so the store reports the shutdown; a full cap is waited on only
+// until ctx ends, so Close never waits on one.
 func (sc *scopeState) acquireGet(ctx context.Context) bool {
+	select {
+	case sc.getSem <- struct{}{}:
+		return true
+	default:
+	}
+
 	select {
 	case sc.getSem <- struct{}{}:
 		return true
