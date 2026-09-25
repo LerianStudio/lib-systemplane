@@ -425,7 +425,7 @@ Phase 1 leaves a tenant's scope alive for the life of the process once a read ha
 **Scope:** `internal/client/tenant.go` (the handler and its routing), `internal/client/tenant_test.go`, root `api_client.go` (the public delegation), `api_client_test.go`.
 **Dependencies:** Epic 1.1 (`Block`, `Unblock`, `Reactivate`), Epic 1.2 (the Client knows whether it is tenant-managed).
 **Done when:** `Client.HandleTenantLifecycle` has FC-6's `tmevent.EventHandler` signature so it registers directly with the dispatcher; `EventTenantActivated` clears the marker and activates idempotently; `EventTenantSuspended` and `EventTenantDeleted` drop the scope and block it, and a following read does NOT re-activate it — it falls through to the per-request path; `EventTenantCredentialsRotated` re-activates an active tenant on a fresh connector resolution and is a no-op for a blocked one, leaving the marker in place; a Suspended-then-CredentialsRotated-then-read sequence still ends per-request with no subscription; every other event type is ignored; **errors are returned, not swallowed** (FC-6 says so explicitly, and this is the one behaviour change against `internal/manager.HandleTenantLifecycle`, which logged and returned nil — `MIGRATION-v4.md` must name it, and a consumer whose dispatcher treats a returned error as fatal is the reason it must be named); a FAILED activation leaves no marker and is retried on the next read; the handler is nil-receiver safe and is a no-op on a Client with no tenant manager configured.
-**Status:** Pending
+**Status:** Done
 
 ### Phase 2 decisions (elaborated 2026-09-25 against `develop` `58a8125`, PR #103 merged)
 
@@ -466,7 +466,7 @@ Every anchor below is on `develop` `58a8125`. Decisions made at elaboration:
 
 #### Task 2.1.1: `Client.HandleTenantLifecycle` routes the four lifecycle events
 
-- [ ] Done
+- [x] Done
 
 **Context:** FC-6 (`index.md:272-280`) freezes the signature
 `func (c *Client) HandleTenantLifecycle(ctx context.Context, event tmevent.TenantLifecycleEvent) error`,
@@ -515,11 +515,11 @@ returns `ErrClosed`. RED captured before GREEN.
 **Scope:** `internal/engine/metrics.go` (new), `internal/engine/metrics_test.go` (new), `internal/engine/engine.go` (`Config.Telemetry`, `Config.AggregateTenantThreshold`, the record call sites), `internal/client/options.go` (`WithAggregateTenantThreshold`), `internal/client/client.go` (pass both into `engine.Config`), root `api_constructors.go`.
 **Dependencies:** Epic 1.1, Epic 2.1.
 **Done when:** the engine accepts `store.Telemetry` through `Config` — the same interface the Client already carries, declared from `go.opentelemetry.io/otel` types only, so no lib-observability type reaches an exported parameter and `boundary_test.go` stays green; instruments are created lazily through `sync.Once` so an engine built without telemetry is a no-op and no test needs a live `MeterProvider`; the engine records active scopes, cached entries per scope, changefeed disconnects per scope, changefeed events per scope, activation latency and cache hit/miss, each labelled `tenant_id`; the label collapses to the constant `aggregate` once the active-scope count exceeds the threshold, exactly as `metrics.tenantLabel` did; `WithAggregateTenantThreshold(n int) Option` exists on the public Client per FC-10's stated replacement for `WithManagerAggregateTenantThreshold`, defaults to 1000 (`DefaultAggregateTenantThreshold`), and a non-positive value keeps per-tenant labels regardless of cardinality; every `recordXxx` is nil-receiver safe; the metric NAMES are whatever the orchestrator freezes (see § DEVIATIONS — `systemplane.manager.*` names an object that no longer exists, and renaming them breaks every existing dashboard, so it is not this lane's call).
-**Status:** Pending
+**Status:** Done
 
 #### Task 2.2.1: The engine emits FC-12's instruments
 
-- [ ] Done
+- [x] Done
 
 **Context:** FC-12 (`index.md:503-505`) freezes meter `systemplane.engine` and six instruments;
 FC-10 (`index.md:501`) the aggregate rule. `engine.Config` is `engine.go:104-118` (no telemetry
@@ -559,7 +559,7 @@ the perf gate passes unchanged. RED captured before GREEN.
 
 #### Task 2.2.2: `WithAggregateTenantThreshold` and telemetry reach the engine
 
-- [ ] Done
+- [x] Done
 
 **Depends on:** Task 2.2.1 (the two `engine.Config` fields).
 
