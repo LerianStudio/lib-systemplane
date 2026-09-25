@@ -8,8 +8,8 @@ github.com/DATA-DOG/go-sqlmock v1.5.2 h1:OcvFkGmslmlZibjAjaHm3L//6LiuBgolP7Oputl
 github.com/DATA-DOG/go-sqlmock v1.5.2/go.mod h1:88MAG/4G7SMwSE3CeA0ZKzrT5CiOU3OJ+JlNzwDqpNU=
 github.com/LerianStudio/lib-commons/v7 v7.0.0 h1:nZL/fXRyBlXTMcIvMzwAqbQTG4HRNDVi4SoKRY8V1LA=
 github.com/LerianStudio/lib-commons/v7 v7.0.0/go.mod h1:/iFJVftWWVryRxO9YGDW59UIAHMrGJB6EMKJlFeEiKM=
-github.com/LerianStudio/lib-observability/v4 v4.5.0-beta.10 h1:SPLdLo5PmJdvjGbiTQuNjZuZRlh13uj9YyP5VNmAYwI=
-github.com/LerianStudio/lib-observability/v4 v4.5.0-beta.10/go.mod h1:1lyiF3+b0TpUrJvhs5y6NFDFr4czEZCD3wiVGeuGPto=
+github.com/LerianStudio/lib-observability/v4 v4.6.0 h1:arGS9QYsJU22Is71nyvyiTJBB0yJC9kDn7wj/GjjykM=
+github.com/LerianStudio/lib-observability/v4 v4.6.0/go.mod h1:1lyiF3+b0TpUrJvhs5y6NFDFr4czEZCD3wiVGeuGPto=
 github.com/Microsoft/go-winio v0.6.2 h1:F2VQgta7ecxGYO8k3ZZz3RS8fVIXVxONVUPlNERoyfY=
 github.com/Microsoft/go-winio v0.6.2/go.mod h1:yd8OoFMLzJbo9gZq8j5qaps8bJ9aShtEA8Ipt1oGCvU=
 github.com/XSAM/otelsql v0.43.0 h1:ZIhXqRoMhILXQwBQoq/Dl6Taap/KEFQXZrWjYV1L8X8=
