@@ -21,6 +21,10 @@ import (
 
 var errRejected = errors.New("applier rejected the document")
 
+// payloadMarker is the sentinel a published document carries; nothing but the
+// real payload produces it, so an assertion that sees it is about the payload.
+const payloadMarker = "probe-payload-Vt71Qm"
+
 // logLine is one line the coordinator wrote. The fields are normalized through
 // log.Fields because the two call sites shape them differently: the coordinator
 // hands one []log.Field, while the panic handler in lib-observability passes
