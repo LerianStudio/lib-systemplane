@@ -68,11 +68,11 @@ Elaborated 2026-09-24 against `develop` `0ecdf9e` (after PR #93). `file:line` re
 **Scope:** none written by this lane; rebase only.
 **Dependencies:** engine-core Epic 3.1, shipped as its own PR on `refactor/v4-drop-storage-naming-options`.
 **Done when:** Task 1.0.1 is checked.
-**Status:** Pending
+**Status:** Done (PR #97 merged as develop `8084607`; the branch merged develop `7a33f38` on 2026-09-25)
 
 #### Task 1.0.1: Rebase onto engine-core Epic 3.1
 
-- [ ] Done
+- [x] Done
 
 **Context:** Engine-core Epic 3.1 (lane-engine-core.md, Epic 3.1) removes the three name options and ships in parallel as PR `refactor/v4-drop-storage-naming-options`, a `refactor(client)!` with a `BREAKING CHANGE:` footer. Its call sites at `0ecdf9e`: `clientConfig.listenChannel`, `.collection`, `.table` (`internal/client/options.go:24, :28-29`) and their defaults (`:38-41`); `WithListenChannel` (`:70-78`), `WithCollection` (`:114-122`), `WithTable` (`:124-132`); `postgresConfig` / `mongoConfig` passing `Channel`, `Table`, `Collection` (`internal/client/client.go:114, :115, :129`); root delegations (`api_constructors.go:62-63, :78-82`); tests (`api_client_test.go:282, :285`, `internal/client/testing_facade_test.go:118-122`). Task 1.2.1 edits the same `clientConfig` and the same two config builders.
 
@@ -259,13 +259,13 @@ Tests: `TestWithPostgresTenantManagerImpliesMultiTenant` (nil `*sql.DB` plus the
 
 - [ ] Done
 
-**Merge note:** the redaction removal (groups Phase 3, branch `refactor/v4-drop-redaction`, decision D12 in index.md) lands first; rebase onto it before this task. The four shared lines (`internal/client/get.go:102`, `:386`, `:389`, `internal/client/set.go:86`) no longer gate on redaction after it, so re-anchor them by symbol.
+**Merge note:** the redaction removal (PR #99, develop `7a33f38`, decision D12 in index.md) is on this branch. `getEntry`, `listFromStore` and `Set` no longer gate on redaction, so the `internal/client` line numbers below predate it; the symbol governs.
 
 **Context:**
 - The multi-tenant branch of `getEntry` (`internal/client/get.go:108-135`) is a bare `store.Get(ctx, store.Scope{}, …)` plus `json.Unmarshal`, ungraded. `List`'s multi-tenant branch (`get.go:315`) goes to `listFromStore` (`get.go:359-403`), also ungraded; single-tenant goes to `listFromEngine` (`get.go:338-357`).
 - `scopeFor` (`internal/client/client_telemetry.go:61-67`) returns `store.Scope{Tenant: tmcore.GetTenantIDContext(ctx)}` in multi-tenant mode and the zero scope otherwise; `Set` already uses it (`internal/client/set.go:85`).
 - `Engine.Lookup` returns a caller-owned deep copy with `Stale` (`internal/engine/engine.go:618-651`); a tracked scope starts with an empty entries map, so a Lookup before its first reconcile misses (`internal/engine/scope.go:305-311`).
-- `Engine.RunValidator(ctx, scope, nk, validate, value, redacted)` is exported (`internal/engine/ingest.go:316`) and recovers a validator panic. The read-back ingress `prepare` (`ingest.go:154-212`) runs the validator on the dispatch ctx, which carries no tenant.
+- `Engine.RunValidator(ctx, scope, nk, validate, value)` is exported (`internal/engine/ingest.go:306`) and recovers a validator panic. The read-back ingress `prepare` (`ingest.go:154-212`) runs the validator on the dispatch ctx, which carries no tenant.
 - D1 names "validator skipped on per-request read" as a defect v4 closes. The behaviour-change list (`index.md:620-629`) marks the tenant read-back ctx PROVISIONAL, to be decided here; groups Epic 3.3 (lane-groups.md:1016-1030) waits on it.
 - Stale docs this task invalidates: `WithMultiTenantEnabled` godoc (`internal/client/options.go:134-149`), `WithContextValidator` "Multi-tenant reads are ungraded" (`options.go:265-268`) and its read-back ctx paragraph (`options.go:270-272`), `internal/client/doc.go:15-18`, root `api_client.go:55-56` (Start) and `:66-70` (Get).
 
