@@ -225,12 +225,16 @@ func (f *feed) joiningOpLocked() string {
 	}
 }
 
-// deliverLocked runs fn under runtime.RecoverAndLog. The caller MUST already
-// hold sub.mu; deliver is the variant that takes it. Both routes are
-// panic-safe, and every caller unlocks through defer, so a panicking callback
-// can never leave sub.mu held.
+// recoveryComponent is the component every panic recovered in this package is
+// counted under on panic_recovered_total; the goroutine_name label says which
+// site recovered it.
+const recoveryComponent = "systemplane.postgres"
+
+// deliverLocked runs fn under panic recovery (logged and counted; no span, the
+// Subscribe ctx never carries one). The caller MUST hold sub.mu and unlock it
+// through defer; deliver is the variant that takes it.
 func (sub *subscription) deliverLocked(logger log.Logger, evt store.Event) {
-	defer runtime.RecoverAndLog(logger, "systemplane.postgres.handler")
+	defer runtime.RecoverAndLogWithContext(context.Background(), logger, recoveryComponent, "handler")
 
 	sub.fn(evt)
 }
@@ -704,7 +708,7 @@ func (s *Store) Subscribe(ctx context.Context, scope store.Scope, fn func(store.
 	// subscriber slot goes with it.
 	if ctx != nil && ctx.Done() != nil {
 		go func() {
-			defer runtime.RecoverAndLog(s.cfg.Logger, "systemplane.postgres.subscriber")
+			defer runtime.RecoverAndLogWithContext(ctx, s.cfg.Logger, recoveryComponent, "subscriber")
 
 			select {
 			case <-ctx.Done():
@@ -801,7 +805,7 @@ func (s *Store) startFeedReader(f *feed, conn *pgx.Conn) {
 
 	go func() {
 		defer close(done)
-		defer runtime.RecoverAndLog(s.cfg.Logger, "systemplane.postgres.listener")
+		defer runtime.RecoverAndLogWithContext(context.Background(), s.cfg.Logger, recoveryComponent, "listener")
 
 		s.runFeed(f, conn)
 	}()
@@ -1030,7 +1034,7 @@ func (s *Store) consumeUntilFailure(f *feed, conn *pgx.Conn) (consumed bool) {
 	defer cancel()
 
 	go func() {
-		defer runtime.RecoverAndLog(s.cfg.Logger, "systemplane.postgres.observer")
+		defer runtime.RecoverAndLogWithContext(ctx, s.cfg.Logger, recoveryComponent, "observer")
 
 		select {
 		case <-f.stop:

@@ -111,12 +111,8 @@ func TestNoLoggedFieldNameIsRedacted(t *testing.T) {
 // TestRefreshPanicNamesTheKey pins the identity line a panicking store driver
 // leaves behind under the single-tenant changefeed.
 //
-// The debouncer's guard catches the panic either way, and that is what it
-// cannot say: runtime.RecoverAndLog logs source="debounce" and nothing else,
-// and in production mode the recovered value and the stack are redacted out of
-// that line (lib-observability/v4 runtime/recover.go logPanicWithStack), so an
-// operator learns something under the debouncer blew up and never which
-// namespace or key. The guard is now the engine's, so the line is its own.
+// The debouncer's guard would count and trace the panic too, but under its own
+// name and without the key; the engine's recovery is what names the key.
 //
 // source on the accounting line stays "refresh": runtime.HandlePanicValue puts
 // its NAME argument there and its component nowhere on the line, so "refresh"
@@ -177,11 +173,8 @@ func TestRefreshPanicNamesTheKey(t *testing.T) {
 
 	// The identity line says which key; this one says the panic was COUNTED.
 	// runtime.HandlePanicValue is what records panic_recovered_total and the
-	// span event, and it is also what logs this line, so the line is the only
-	// in-process evidence the counter moved: a recoverRefresh that re-panicked
-	// into the debouncer's RecoverAndLog instead would leave the identity line
-	// standing above and the counter at zero, and nothing else here would
-	// notice.
+	// span event, and it is also what logs this line: source "refresh" proves the
+	// engine counted it, not the debouncer's guard (source "invoke").
 	accounted := logger.errs("panic recovered")
 	if len(accounted) != 1 {
 		t.Fatalf("got %d ERROR lines accounting for the panic, want exactly 1: %s", len(accounted), logger.rendered())

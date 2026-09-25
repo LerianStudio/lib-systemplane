@@ -883,11 +883,8 @@ func requirePanicAccounted(t *testing.T, r *recordingLogger, source string) {
 // TestReReadPanicNamesTheKey pins the identity on the one panic the debouncer
 // alone would report anonymously.
 //
-// runtime.RecoverAndLog, the debouncer's generic guard, logs source="debounce"
-// and — in production mode — a redacted value with no stack, so an operator
-// paged by it learns something under the debouncer blew up and never which
-// tenant, namespace or key. The engine's own recovery is what turns that into
-// an actionable line.
+// The debouncer's guard reports with the full posture but under its own name,
+// never the tenant, namespace or key; the engine's recovery adds them.
 //
 // Both quiet windows are covered because they reach the recovery by different
 // routes: zero runs the re-read inline on the changefeed goroutine — a

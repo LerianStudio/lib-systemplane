@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/testsupport/panicmetric"
 )
 
 // captureLogger records what the store logs so a test can pin the LEVEL a line
@@ -100,4 +101,47 @@ func (e captureEntry) field(t *testing.T, key string) any {
 	t.Fatalf("log entry %q carries no %q field (%+v)", e.msg, key, e.fields)
 
 	return nil
+}
+
+// only returns the single entry logged at level, failing when the count is not
+// exactly one.
+func (c *captureLogger) only(t *testing.T, level int, what string) captureEntry {
+	t.Helper()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var found []captureEntry
+
+	for _, e := range c.entries {
+		if e.level == level {
+			found = append(found, e)
+		}
+	}
+
+	if len(found) != 1 {
+		t.Fatalf("%s: logged %d entries at level %d, want exactly 1 (%+v)", what, len(found), level, c.entries)
+	}
+
+	return found[0]
+}
+
+// requirePanicReported asserts the whole report of the one panic recovered so
+// far: the ERROR "panic recovered" line naming source, and one increment of the
+// panic counter under this package's component and that same source. The line
+// alone is not enough — the bare recovery the store used before logged it too,
+// and counted nothing.
+func requirePanicReported(t *testing.T, logger *captureLogger, counter *panicmetric.Recorder, source string) {
+	t.Helper()
+
+	e := logger.only(t, log.LevelError, "recovered panic")
+	if e.msg != "panic recovered" {
+		t.Errorf("ERROR line = %q, want %q", e.msg, "panic recovered")
+	}
+
+	if got := e.field(t, "source"); got != source {
+		t.Errorf("panic line source = %v, want %q", got, source)
+	}
+
+	counter.RequireOnly(t, "systemplane.mongodb", source)
 }

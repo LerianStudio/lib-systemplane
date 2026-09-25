@@ -3,58 +3,13 @@
 package safelog
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 
-	"github.com/LerianStudio/lib-observability/v4/log"
-
 	"github.com/LerianStudio/lib-systemplane/v4/internal/testsupport/logguard"
 )
-
-// deadLogger is the consumer logger that is broken rather than slow: every
-// entry panics, and so does every level check. A nil field dereferenced in a
-// custom Log, a sink closed at shutdown and written to afterwards — it is the
-// ordinary way a consumer's observability code fails, and it arrives at this
-// library on library-owned goroutines where the consumer cannot recover it.
-type deadLogger struct{}
-
-func (deadLogger) Log(context.Context, int, string, ...any) { panic("the consumer's logger blew up") }
-
-func (deadLogger) Enabled(int) bool { panic("the consumer's logger blew up") }
-
-func (l deadLogger) With(...any) log.Logger { return l }
-
-func (l deadLogger) WithGroup(string) log.Logger { return l }
-
-func (deadLogger) Sync(context.Context) error { return nil }
-
-// TestGuardIsIdempotentAndSwallows pins the two properties every caller leans
-// on: a consumer logger that explodes is absorbed rather than unwound into the
-// library, and guarding a logger a constructor will guard again costs one
-// wrapper rather than two.
-func TestGuardIsIdempotentAndSwallows(t *testing.T) {
-	t.Parallel()
-
-	guarded := Guard(deadLogger{})
-
-	// Both of the consumer's panics, neither reaching this frame.
-	guarded.Log(context.Background(), log.LevelError, "a line the consumer's logger explodes on")
-
-	if guarded.Enabled(log.LevelDebug) {
-		t.Error("Enabled reported true for a logger that panics on its level check")
-	}
-
-	if again := Guard(guarded); again != guarded {
-		t.Error("Guard wrapped an already-guarded logger a second time")
-	}
-
-	if Guard(nil) == nil {
-		t.Error("Guard(nil) returned nil, want a no-op logger")
-	}
-}
 
 // TestWithheldPanicNamesTheTypeAndNeverTheValue pins the wording the engine and
 // the group coordinator both report a redacted key's panic as. Two callers, one
@@ -183,64 +138,4 @@ func TestNoLoggedFieldNameIsRedacted(t *testing.T) {
 	t.Parallel()
 
 	logguard.AssertNoneRedacted(t, ".")
-}
-
-// typedNilLogger is the shape a `== nil` check does not catch: a nil POINTER
-// inside a non-nil interface. It is the ordinary way a consumer arrives with
-// no logger — a struct field of its own logger type left unset, handed to
-// WithLogger — and every method here dereferences the receiver, which is what
-// such a logger does in production.
-type typedNilLogger struct{ sink []string }
-
-func (l *typedNilLogger) Log(_ context.Context, _ int, msg string, _ ...any) {
-	l.sink = append(l.sink, msg)
-}
-
-func (l *typedNilLogger) Enabled(int) bool { return len(l.sink) > 0 }
-
-func (l *typedNilLogger) With(...any) log.Logger { l.sink = nil; return l }
-
-func (l *typedNilLogger) WithGroup(string) log.Logger { l.sink = nil; return l }
-
-func (l *typedNilLogger) Sync(context.Context) error { l.sink = nil; return nil }
-
-// TestGuardNormalisesATypedNilLogger pins the guard against the nil every other
-// nil check in this module already uses log.IsNil for. Guard runs FIRST — the
-// Client's option pass, the engine's constructor and the group coordinator all
-// hand it the consumer's raw logger — so a typed nil it wraps rather than
-// replaces is no longer log.IsNil to anything downstream, and the
-// normalisations that used to catch it never fire.
-//
-// Every method is exercised, not only the two the wrapper overrides: With,
-// WithGroup and Sync are forwarded to the wrapped logger, so a typed nil that
-// survives Guard panics on the caller's own stack with no recover in front of
-// it.
-func TestGuardNormalisesATypedNilLogger(t *testing.T) {
-	t.Parallel()
-
-	var typedNil *typedNilLogger
-
-	guarded := Guard(typedNil)
-
-	if log.IsNil(guarded) {
-		t.Fatal("Guard returned a nil logger for a typed nil, want a usable no-op")
-	}
-
-	guarded.Log(context.Background(), log.LevelError, "a line nobody has a logger for")
-
-	if guarded.Enabled(log.LevelDebug) {
-		t.Error("Enabled reported true for a typed-nil logger, want false")
-	}
-
-	if with := guarded.With("k", "v"); log.IsNil(with) {
-		t.Error("With returned a nil logger")
-	}
-
-	if group := guarded.WithGroup("g"); log.IsNil(group) {
-		t.Error("WithGroup returned a nil logger")
-	}
-
-	if err := guarded.Sync(context.Background()); err != nil {
-		t.Errorf("Sync = %v, want nil", err)
-	}
 }

@@ -4,7 +4,7 @@ go 1.26.3
 
 require (
 	github.com/LerianStudio/lib-commons/v7 v7.0.0
-	github.com/LerianStudio/lib-observability/v4 v4.5.0-beta.7
+	github.com/LerianStudio/lib-observability/v4 v4.5.0-beta.10
 	github.com/bxcodec/dbresolver/v2 v2.3.0
 	github.com/gofiber/fiber/v3 v3.5.0
 	github.com/jackc/pgx/v5 v5.10.0
@@ -14,7 +14,6 @@ require (
 	go.mongodb.org/mongo-driver/v2 v2.9.0
 	go.opentelemetry.io/otel v1.46.0
 	go.opentelemetry.io/otel/metric v1.46.0
-	go.opentelemetry.io/otel/sdk/metric v1.46.0
 	go.opentelemetry.io/otel/trace v1.46.0
 	go.uber.org/goleak v1.3.0
 )
@@ -74,8 +73,6 @@ require (
 	github.com/opencontainers/image-spec v1.1.1 // indirect
 	github.com/philhofer/fwd v1.2.0 // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
-	github.com/rabbitmq/amqp091-go v1.13.0 // indirect
-	github.com/redis/go-redis/v9 v9.22.0 // indirect
 	github.com/shirou/gopsutil v3.21.11+incompatible // indirect
 	github.com/shirou/gopsutil/v4 v4.26.6 // indirect
 	github.com/shopspring/decimal v1.4.0 // indirect
@@ -102,8 +99,8 @@ require (
 	go.opentelemetry.io/otel/log v0.22.0 // indirect
 	go.opentelemetry.io/otel/sdk v1.46.0 // indirect
 	go.opentelemetry.io/otel/sdk/log v0.22.0 // indirect
+	go.opentelemetry.io/otel/sdk/metric v1.46.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.11.0 // indirect
-	go.uber.org/atomic v1.11.0 // indirect
 	go.uber.org/mock v0.6.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
