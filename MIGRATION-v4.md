@@ -11,10 +11,9 @@ freshness flag, an error on a write that landed but was not published.
 v3 implemented one policy twice. The single-tenant `Client` kept an in-process
 cache fed by one changefeed loop; the multi-tenant `Manager` kept a second cache
 fed by a second loop, with its own warm load, its own NOTIFY handling and its
-own callback dispatch. Two code paths answered the same questions — what does a
-delete publish, what happens when the connection drops, what does a callback
-receive — and answered them differently. Every defect the 2026-09 audit raised
-was one bug that existed in one engine and had already been fixed in the other.
+own callback dispatch. The two engines answered the same questions — what does
+a delete publish, what happens when the connection drops, what does a callback
+receive — differently.
 
 v4 has one engine. It tracks scopes (the single-tenant scope is one of them),
 reconciles a whole scope against the store after every changefeed connect and
@@ -44,7 +43,7 @@ has to be read even where your code compiles unchanged.
 | `(*Manager).IsClosed` | No replacement. Calls on a closed `Client` return `ErrClosed`; that is the answer the flag was read for. |
 | `(*Manager).OnTenantActivated`, `OnTenantSuspended`, `OnTenantDeleted`, `OnTenantCredentialsRotated`, `HandleTenantLifecycle` | No replacement yet: tenant lifecycle handling does not exist on the v4 Client, so a process that depends on it cannot take this upgrade. <!-- NOT-YET(engine-tenants): Client.HandleTenantLifecycle, WithAggregateTenantThreshold, tenant-scope teardown in Close --> |
 | `DefaultSeedSQL` | No replacement. Defaults live in code, at `Register` / `Bind`. A value an operator must be able to override before first boot is a row your own migration pipeline inserts, not something this library seeds. |
-| `WithTable`, `WithListenChannel`, `WithCollection` | No replacement: the names are fixed, and v4 reads nothing else. Postgres: rename or copy a custom table to `systemplane_entries` first, then apply `MigrationV3ToV4SQL()`, which names the table unqualified, refuses when `search_path` reaches none, and recreates the notification triggers on `systemplane_changes`, so a custom channel needs no step of its own. MongoDB: copy a custom collection to `systemplane_entries` before starting v4; the bootstrap creates the collection and its indexes but moves no data. |
+| `WithTable`, `WithListenChannel`, `WithCollection` | No replacement: the names are fixed, and v4 reads nothing else. Postgres: rename or copy a custom table to `systemplane_entries` first, then apply `MigrationV3ToV4SQL()`, which names the table unqualified, refuses when `search_path` reaches none, and recreates the notification triggers on `systemplane_changes`, so a custom channel needs no step of its own. MongoDB: copy a custom collection to `systemplane_entries` before starting v4; v4 moves no data. |
 
 **Added.**
 
@@ -55,6 +54,7 @@ has to be read even where your code compiles unchanged.
 | `Bind`, `Group[T]`, `Snapshot[T]`, `Applied[T]`, `ApplyStatus`, `Group.Snapshot`, `Group.Set`, `Group.OnApply`, `Group.Status`, `ErrApplyPanicked` | Declare a whole typed configuration document as one key, read it as `T`, and apply it through a serialized hook that records what is desired, what is applied and what last failed. `Bind`, `Snapshot` and `Set` work in both modes; on a multi-tenant Client `OnApply` returns `ErrNotSupportedInMultiTenant` and `Snapshot` reads through ungraded. |
 | `MigrationV3ToV4SQL()` | The v3 → v4 Postgres delta as an importable artifact for your migration pipeline. See § The database and operator contract. |
 | `WithContextValidator` | Validate a value against the `Set` caller's context, so a validator can use the tenant that call carried. The registered default is still validated with `context.Background()`. |
+| `TestScope` | The scope every `TestStore` method now takes: `TestScope{Tenant}`, with `Tenant` `""` for the single-tenant scope. |
 
 **Changed shape.**
 
@@ -63,9 +63,12 @@ has to be read even where your code compiles unchanged.
 | `OnChange` callback | `func(ctx context.Context, ns, key string, newValue any)` | `func(ctx context.Context, ch Change)`, where `Change{Tenant, Namespace, Key, Revision, Value}`. `Tenant` is `""` in single-tenant mode; `Revision` is 0 when no row exists and `Value` is then the registered default. |
 | `Close` | `func() error`, returned once the backend was released | Same signature. It now cancels the callback context and waits for callbacks, bounded by `WithCloseTimeout`, before returning. |
 | `SchemaSQL()` | v3 DDL | v4 DDL: the revision column, its sequence and the three triggers. |
+| `TestStore`, the store `NewForTesting` takes | `Get(ctx, ns, key)`, `Set(ctx, e) error`, `Delete(ctx, ns, key, actor)`, `List(ctx)`, `Subscribe(ctx, fn)` | Every method but `Start` and `Close` takes a `TestScope` after `ctx`, and `Set` returns `(int64, error)`: the revision the store assigned. |
+| `TestEntry` | `{Namespace, Key, Value, UpdatedAt, UpdatedBy}` | Gains `Revision`. |
+| `TestEvent` | `{Namespace, Key, Op}` | Gains `Scope` and `Revision`. |
 
 Everything else in the facade is unchanged: `NewPostgres`, `NewMongoDB`,
-`NewForTesting`, `Register`, `Start`, `Close`, `Get`, `GetString`, `GetInt`,
+`Register`, `Start`, `Close`, `Get`, `GetString`, `GetInt`,
 `GetBool`, `GetFloat64`, `GetDuration`, `Set`, `Delete`, `List`, `Catalog`,
 `CatalogKey`, `CatalogService`, `KeyDescription`, `KeyRedaction`,
 `IsRegistered`, `Logger`, the key options `WithDescription`, `WithValidator`,
@@ -74,10 +77,12 @@ Everything else in the facade is unchanged: `NewPostgres`, `NewMongoDB`,
 `WithMultiTenantEnabled`, `WithModule`, `WithCatalogService`, and
 `admin.Mount` / `admin.MountCatalog` with their options.
 
-So a single-tenant consumer that registers keys and reads them edits its import
-line — and then reads § Behaviour changes, because numeric defaults and
-validators now see `float64` rather than `int`, and `Set` and `Delete` can
-return errors they never returned in v3.
+So a single-tenant consumer that registers keys and reads them applies
+`MigrationV3ToV4SQL()` (Postgres: v4 reads and writes the `revision` column, so
+without it the first `Start` fails), edits its import line, and then reads
+§ Behaviour changes, because numeric defaults and validators now see `float64`
+rather than `int`, and `Set` and `Delete` can return errors they never returned
+in v3.
 
 ---
 
@@ -112,8 +117,7 @@ to whatever this library requires. Do not pin it yourself.
 ## Behaviour changes
 
 These are ordered by how quietly each one changes a running service: the first
-breaks no build and can change what your process serves on its next boot; the
-last is a log query.
+breaks no build and can change what your process serves on its next boot.
 
 ### A stored row your validator rejects no longer reaches a read
 
@@ -195,8 +199,8 @@ request scope.
 **Affects:** every caller that reads a nil error as "persisted".
 
 A single-tenant `Set` persists the row and then publishes it into this
-process's own cache. v3 returned nil when that publication was dropped. v4
-returns an error, with the row already in the store:
+process's own cache. v3 wrote its cache directly and could not fail after
+persisting. v4 returns an error, with the row already in the store:
 
 - `ErrClosed`, when the Client closed under the write;
 - an error wrapping `ErrNotStarted` that names the key and says it "was
@@ -250,9 +254,9 @@ and stop parsing values back out of these errors and log lines.
 **Affects:** operators, and anyone running Postgres behind a resolver that
 carries replicas.
 
-Where a resolver supplies the handle — multi-tenant mode, or a tenant
-connector — every systemplane statement is pinned to the primary, reads
-included, and to the first primary deterministically when a resolver reports several. A standby
+Where a resolver supplies the handle — multi-tenant mode, or a tenant connector
+— every systemplane statement is pinned to the primary, reads included, and to
+the first primary deterministically when a resolver reports several. A standby
 could otherwise serve a revision older than the one `Set` just returned, and
 older than the NOTIFY the changefeed is reconciling against, since the feed
 LISTENs on the primary DSN. What this gives up is read spreading, and only on a
@@ -322,9 +326,9 @@ tenant-scoped context and handed over the LISTEN goroutine's. Cancellation is
 the one thing to read out of it, and honouring it is what lets `Close` finish.
 
 `OnChange` for a key nothing registered returns `ErrUnknownKey` in both modes,
-where v3 logged a debug line and handed back a no-op unsubscribe — a
-subscription that could never deliver anything now surfaces the typo at wiring
-time. In multi-tenant mode a registered key then returns
+where v3 logged a debug line (single-tenant) and handed back a no-op unsubscribe
+— a subscription that could never deliver anything now surfaces the typo at
+wiring time. In multi-tenant mode a registered key then returns
 `ErrNotSupportedInMultiTenant`: no scope is tracked and no changefeed runs, so
 nothing could fire. For a consumer that only reads per-request configuration
 that refusal is permanent, and reading through on each request is the whole
@@ -348,7 +352,7 @@ else. v3's `Manager` ran every callback synchronously on the LISTEN goroutine,
 where one slow subscriber stalled every key of every tenant.
 
 Two deliveries are suppressed rather than coalesced. A row republished at the
-same non-zero revision with the same bytes refreshes `UpdatedAt` and
+same non-zero revision with an equal decoded value refreshes `UpdatedAt` and
 `UpdatedBy` and fires no callback — that is how a `Set`'s own changefeed echo
 is absorbed. `Revision 0` is never deduplicated, so a delete always delivers.
 
@@ -369,11 +373,8 @@ ignores it survives `Close`, which returns `ErrCloseTimeout` naming every
 `single-tenant`. That goroutine is the subscriber's leak, reported rather than
 hidden.
 
-An `ErrCloseTimeout` that names no key at all is a different diagnosis, not a
-missing one: no callback is running, so what held shutdown is engine work
-inside the store — a reconcile whose `List` has not answered, or a debounced
-re-read. That is a backend or network fault, and looking for it in consumer
-code wastes the outage.
+An `ErrCloseTimeout` that names no key means engine work inside the store held
+shutdown — a reconcile whose `List` has not answered, or a debounced re-read.
 
 `WithCloseTimeout` bounds the engine's wait alone. Releasing the backend is not
 covered by it, and `Close` returns the engine's timeout joined with the store's
@@ -474,9 +475,9 @@ function is `SECURITY DEFINER`; once the DDL finishes the column carries no
 that applied the DDL, and **the runtime role needs plain DML on
 `systemplane_entries` and no grant at all on `systemplane_revision_seq`**.
 
-**Upgrade an existing install with `MigrationV3ToV4SQL()`, never
-`SchemaSQL()`.** It adds `revision` at 1 for every row already stored, creates
-and seeds the sequence past the highest revision present, installs
+**Prefer `MigrationV3ToV4SQL()` for an existing install: it creates no table, so
+it cannot fork one.** It adds `revision` at 1 for every row already stored,
+creates and seeds the sequence past the highest revision present, installs
 `systemplane_bump_revision_v4()` and `systemplane_notify_v4()`, drops
 `systemplane_notify_v3()`, and installs three triggers: the new
 `systemplane_bump_revision_trigger`, plus `systemplane_notify_trigger` and
@@ -484,7 +485,9 @@ and seeds the sequence past the highest revision present, installs
 NOTIFY payload gains a fourth field — `{namespace, key, op, revision}` — and a
 delete publishes `revision: 0`. It creates no table, so it upgrades the install
 wherever `search_path` finds it; it is idempotent; and lib-systemplane never
-executes it for you. `SchemaSQL()` is for a database that has no install yet.
+executes it for you. `SchemaSQL()` is also idempotent and upgrades a v3 table in
+place, but its `CREATE TABLE IF NOT EXISTS` lands in the first schema of
+`search_path`; it is the artifact for a database that has no install yet.
 
 The pipeline needs the SQL, not the library. Print it from a throwaway `main`:
 
@@ -500,9 +503,22 @@ import (
 func main() { fmt.Print(systemplane.MigrationV3ToV4SQL()) }
 ~~~
 
-`go run ./cmd/print-ddl > 004_systemplane_v4.sql` hands the pipeline its file.
-Fetching the module to emit SQL is not deploying it: the migration runs first,
-the binary boots after.
+Save it as `cmd/print-ddl/main.go`; `go run ./cmd/print-ddl >
+004_systemplane_v4.sql` then hands the pipeline its file. Fetching the module to
+emit SQL is not deploying it: the migration runs first, the binary boots after.
+
+**The rolling-deploy window, and rollback.** A v1.6, v2 or v3 binary keeps
+working on the migrated schema, so pods still on the old binary need not drain
+first: their `INSERT` and `UPDATE` name no `revision`, and the
+`BEFORE INSERT OR UPDATE` trigger fills that `NOT NULL` column on every write;
+their reads name their own columns; and they decode the NOTIFY payload into
+three fields and ignore the fourth. Rolling the binary back is therefore safe,
+on the migrated schema; the migration has no down step and needs none for
+that. Two exceptions. A pod listening on a custom channel goes deaf the moment
+the migration runs, because the recreated triggers notify `systemplane_changes`
+only: it keeps serving its cache, unrefreshed, until it is replaced. And a pod
+reading a custom table fails once that table is renamed to
+`systemplane_entries`, so the rename and the new binary land in one deploy.
 
 The migration guards itself, because every statement in it names
 `systemplane_entries` unqualified. It refuses when `search_path` reaches no
@@ -586,6 +602,7 @@ to be created by its first write.
 Find your row and read only it. Every section below assumes § Behaviour changes
 has already been read: it is where the changes that break a service without
 breaking its build are written down, and no per-consumer section repeats them.
+plugin-br-pix-lerian has no section: it does not depend on this library.
 
 ### matcher
 
@@ -600,9 +617,12 @@ breaking its build are written down, and no per-consumer section repeats them.
 4. Audit every validator for Go-type assertions — a whole number arrives as `float64` — and for a dependency on request scope.
 5. Stop reading a non-nil `Set`/`Delete` error as "not persisted".
 
-The glue that decodes a namespace of scalar keys into a struct, validates it and
-re-applies it on change is what `Bind`, `Group[T]` and `Group.OnApply` replace;
-see [§ The surface diff](#the-surface-diff).
+Moving matcher's glue — the code that decodes a namespace of scalar keys into a
+struct, validates it and re-applies it on change — onto `Bind`, `Group[T]` and
+`Group.OnApply` is optional and not part of the v4 hop. `Bind` stores the whole
+document under one new key, so it changes the storage shape: without a data
+migration from the scalar rows into the group row, every operator override
+reverts to its default. Keep the scalar keys, or migrate the rows first.
 
 ### billing-worker
 
@@ -612,7 +632,7 @@ see [§ The surface diff](#the-surface-diff).
 **Do:**
 
 1. Delete the seed-DDL generator. Defaults belong at `Register` / `Bind` in code; a row an operator must be able to override before first boot is one your own migration pipeline inserts.
-2. Drop the table and channel overrides. The table is `systemplane_entries` and the channel is `systemplane_changes`, both fixed; a name collision is now a reason for the install to have its own database, not a reason to rename an object.
+2. Rename the table to `systemplane_entries` ([§ The surface diff](#the-surface-diff)), then drop the table and channel overrides. `MigrationV3ToV4SQL()` refuses when it finds no `systemplane_entries`, so skipping the rename fails loudly, not silently. The table is `systemplane_entries` and the channel is `systemplane_changes`, both fixed; a name collision is now a reason for the install to have its own database, not a reason to rename an object.
 3. Apply `MigrationV3ToV4SQL()` per tenant database, then bump the three module paths.
 4. Audit the validators for the canonical shape, and the `Set`/`Delete` call sites for the new errors.
 
@@ -642,19 +662,7 @@ runs, so no callback could fire.
 
 ### go-boilerplate-ddd
 
-**From:** v2.0.0 — `/v2`, lib-commons `/v6`, lib-observability `/v2`.
-**Mode:** single-tenant template.
-**Breaks:** the same as br-consignado-gw.
-**Do:** the same steps. It is the shape every new service starts from, so it
-should copy a recipe that has already run against a real database.
-
-### plugin-br-pix-lerian
-
-**From:** no dependency on this library in `go.mod`.
-**Mode:** not a consumer; it carries a mount helper only.
-**Breaks:** nothing. v4 asks nothing of it.
-**Do:** nothing. If it ever takes the dependency, take `/v4` directly and read
-[§ Behaviour changes](#behaviour-changes) before registering the first key.
+Same as br-consignado-gw.
 
 ### product-console
 
@@ -678,14 +686,13 @@ changefeed, and `OnChange` refused with `ErrNotSupportedInMultiTenant`.
 
 **From:** v1.6.1 — unsuffixed module, Fiber v2, lib-commons v5, lib-observability v1, and a `Manager`.
 **Mode:** multi-tenant, Postgres.
-**Breaks:** the v1.6.x row of [§ The module and dependency hop](#the-module-and-dependency-hop), and the `Manager` on top of it: `NewManager`, `WithManagerLogger`, `WithManagerTelemetry`, the four `OnTenant*` handlers and `Drain` all stop existing in the same change. The two cannot be split — one import line cannot be on v1.6.x and on `/v4` at once — which makes this the largest single upgrade in the matrix. Budget it as two.
+**Breaks:** blocked until engine-tenants if you use tenant lifecycle handling: the four `OnTenant*` handlers have no replacement yet, and a process that depends on them cannot take this upgrade. Beyond that, the v1.6.x row of [§ The module and dependency hop](#the-module-and-dependency-hop), and the `Manager` on top of it: `NewManager`, `WithManagerLogger`, `WithManagerTelemetry`, the four `OnTenant*` handlers and `Drain` all stop existing in the same change. The two cannot be split — one import line cannot be on v1.6.x and on `/v4` at once — which makes this the largest single upgrade in the matrix. Budget it as two.
 **Do:**
 
 1. Fiber v2 → v3 first, as its own change, then the observability boundary. Both are in the hop table above.
 2. Delete the `Manager`. One `Client` carries what it configured: `WithMultiTenantEnabled()`, `WithModule(...)`, `WithLogger`, `WithTelemetry`.
 3. Replace `Drain(ctx)` with `Close()`, which takes no context — see [§ `Close` is bounded, and names the callback that would not stop](#close-is-bounded-and-names-the-callback-that-would-not-stop).
 4. Budget for every multi-tenant read reaching the tenant database. The per-tenant cache belonged to the `Manager` and left with it.
-5. The four `OnTenant*` handlers have no replacement yet: a process that depends on tenant lifecycle handling cannot take this upgrade.
 
 ~~~go
 // v1.6.1 — construction, lifecycle registration, shutdown
@@ -702,18 +709,17 @@ defer m.Drain(ctx)
 
 **From:** v3.0.0 — `/v3`, already on lib-commons `/v7` and lib-observability `/v4`.
 **Mode:** multi-tenant, Postgres.
-**Breaks:** the `Manager` — `NewManager`, `Drain`, and `HandleTenantLifecycle` as a method on it; the `DefaultSeedSQL()` DDL generator; the table and channel overrides.
+**Breaks:** blocked until engine-tenants if you use tenant lifecycle handling: `HandleTenantLifecycle` has no replacement yet, and a process that depends on it cannot take this upgrade. Beyond that, the `Manager` — `NewManager`, `Drain`, and `HandleTenantLifecycle` as a method on it; the `DefaultSeedSQL()` DDL generator; the channel override.
 **Do:**
 
 1. Bump the module path. That is the whole dependency hop for this consumer — the `/v3` row of the hop table, no lib-commons and no lib-observability move.
-2. Delete the seed-DDL generator and the name overrides; the name-override row of [§ The surface diff](#the-surface-diff) says what each needs.
+2. Delete the seed-DDL generator and the channel override; the name-override row of [§ The surface diff](#the-surface-diff) says what each needs.
 3. Apply `MigrationV3ToV4SQL()` to every tenant database before the new binary boots.
 4. Replace `Drain(ctx)` with `Close()` — the same contrast notifications carries above.
-5. `HandleTenantLifecycle` has no replacement yet: a process that depends on tenant lifecycle handling cannot take this upgrade.
 
 ~~~go
 // v3.0.0 — construction, lifecycle registration, shutdown
-c, err := systemplane.NewPostgres(db, listenDSN, systemplane.WithMultiTenantEnabled()) // plus the pix_jd_changes channel override
+c, err := systemplane.NewPostgres(db, listenDSN, systemplane.WithMultiTenantEnabled()) // plus a WithListenChannel call (set to the default name)
 m := systemplane.NewManager(c, pgMgr)
 // m.HandleTenantLifecycle registered as the tmevent handler
 defer m.Drain(ctx)
@@ -725,13 +731,12 @@ defer m.Drain(ctx)
 
 **From:** v3.0.0-beta.2 — `/v3`, already on lib-commons `/v7` and lib-observability `/v4`.
 **Mode:** multi-tenant, Postgres, with 17 `OnChange` callbacks registered before `Start`.
-**Breaks:** all 17. v3 dispatched them through the bound `Manager`, once per NOTIFY across any active tenant, with the tenant on the callback's context. v4 has no `Manager`, and multi-tenant `OnChange` answers `ErrNotSupportedInMultiTenant` for every registered key — so the 17 callbacks have **no delivery path in multi-tenant mode**. Rewrite them and land the rest of the upgrade; none of them fires in this mode.
-**Do:**
+**Breaks:** cannot take this upgrade until engine-tenants lands. v3 dispatched the 17 callbacks through the bound `Manager`, once per NOTIFY across any active tenant, on the LISTEN goroutine's context and never with the tenant on it. v4 has no `Manager`, and multi-tenant `OnChange` returns `ErrNotSupportedInMultiTenant` for every registered key, so on v4 the 17 hot-reloads either fail at boot, where the error is checked, or silently stop, where it is discarded.
+**Do, when engine-tenants lands:**
 
 1. Bump the module path; nothing else in `go.mod`.
 2. Apply `MigrationV3ToV4SQL()` to every tenant database.
-3. Rewrite the 17 callbacks to `func(ctx context.Context, ch Change)` — mechanical work, and worth doing now. Namespace, key, revision and value come off `ch`. The ctx is the engine's own lifecycle context and carries no request values and no tenant, where the v3 godoc promised the tenant scope on it.
-4. Expect each callback to fire once at `Start` with the value in force, including for a key with no row ([§ Every callback registered before `Start` fires once at `Start`](#every-callback-registered-before-start-fires-once-at-start)), and to skip intermediate revisions under load ([§ Deliveries are coalesced per key and independent across keys](#deliveries-are-coalesced-per-key-and-independent-across-keys)). Seventeen subscribers is also where v3's single synchronous LISTEN goroutine stopped being free.
+3. Rewrite the 17 callbacks to `func(ctx context.Context, ch Change)`. Namespace, key, revision and value come off `ch`; the ctx is the engine's own lifecycle context and carries no request values and no tenant.
 
 ~~~go
 // v3.0.0-beta.2 — construction, subscriptions, shutdown
@@ -742,15 +747,4 @@ m := systemplane.NewManager(c, pgMgr)
 defer m.Drain(ctx)
 ~~~
 
-<!-- NOT-YET(engine-tenants): the 17 callbacks fire once per tenant at activation and Change.Tenant names the tenant -->
-
----
-
-## Why the module path moved in the same commit as the break
-
-This repository does not auto-major: `.releaserc.yml` maps a breaking commit to
-a **minor** bump, guarded in both directions by `admin/release_policy_test.go`,
-because a `major` rule on a `/vN` line computes a `/vN+1` version whose tag Go
-cannot consume and whose release run dies at `git tag`. The path rename and the
-API break are therefore one change, since Go rejects a module whose path says
-`/v4` under a `v3.x` tag outright.
+<!-- NOT-YET(engine-tenants): the upgrade itself — the 17 callbacks fire once per tenant at activation, Change.Tenant names the tenant, and deliveries coalesce per key as § Deliveries describes -->

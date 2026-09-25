@@ -312,7 +312,7 @@ func (c *Client) Connect(ctx context.Context) error {
 Lerian shared-library ownership is split intentionally:
 
 - `github.com/LerianStudio/lib-commons/v7` — non-observability shared primitives. This repo uses `commons/tenant-manager/{core,postgres,mongo}`, `commons/net/http`, and `commons/backoff`.
-- `github.com/LerianStudio/lib-observability/v4` — canonical observability stack. This repo uses `log`, `tracing`, and `runtime` for structured logging, telemetry, span helpers, redaction, and panic recovery. **Internally only:** no exported parameter may name a type from it. The public boundary is `systemplane.Logger` and `systemplane.Telemetry`, declared in this module from stdlib + `go.opentelemetry.io/otel` types, and `boundary_test.go` enforces it. Rationale and the v2 → v3 move: [`MIGRATION-v3.md`](../MIGRATION-v3.md); the v3 → v4 move: `MIGRATION-v4.md`.
+- `github.com/LerianStudio/lib-observability/v4` — canonical observability stack. This repo uses `log`, `tracing`, and `runtime` for structured logging, telemetry, span helpers, redaction, and panic recovery. **Internally only:** no exported parameter may name a type from it. The public boundary is `systemplane.Logger` and `systemplane.Telemetry`, declared in this module from stdlib + `go.opentelemetry.io/otel` types, and `boundary_test.go` enforces it. Rationale and the v2 → v3 move: [`MIGRATION-v3.md`](../MIGRATION-v3.md); the v3 → v4 move: [`MIGRATION-v4.md`](../MIGRATION-v4.md).
 - `github.com/LerianStudio/lib-systemplane/v4` — runtime-mutable configuration. Do not duplicate its functionality in service repositories.
 - `github.com/LerianStudio/lib-streaming` — tenant-scoped event streaming. Do not add it to this repo unless a task explicitly requires streaming integration.
 
