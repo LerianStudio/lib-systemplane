@@ -259,7 +259,7 @@ Tests: `TestWithPostgresTenantManagerImpliesMultiTenant` (nil `*sql.DB` plus the
 
 - [ ] Done
 
-**Merge note:** groups Phase 3 lands first; rebase onto it before this task (shared lines `internal/client/get.go:102`, `:386`, `:389`, `internal/client/set.go:86`).
+**Merge note:** the redaction removal (groups Phase 3, branch `refactor/v4-drop-redaction`, decision D12 in index.md) lands first; rebase onto it before this task. The four shared lines (`internal/client/get.go:102`, `:386`, `:389`, `internal/client/set.go:86`) no longer gate on redaction after it, so re-anchor them by symbol.
 
 **Context:**
 - The multi-tenant branch of `getEntry` (`internal/client/get.go:108-135`) is a bare `store.Get(ctx, store.Scope{}, …)` plus `json.Unmarshal`, ungraded. `List`'s multi-tenant branch (`get.go:315`) goes to `listFromStore` (`get.go:359-403`), also ungraded; single-tenant goes to `listFromEngine` (`get.go:338-357`).
