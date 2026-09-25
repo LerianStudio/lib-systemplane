@@ -626,9 +626,9 @@ func TestPanickingValidatorIsARefusal(t *testing.T) {
 			t.Fatalf("got %d WARN lines for the panicking validator, want exactly 1", len(warns))
 		}
 
-		// What the validator panicked WITH stays out of this line: it is a
-		// value the validator was handed, so the ingress reports only that it
-		// panicked and leaves the value to the redacting recovery pipeline.
+		// What the validator panicked WITH stays out of this line: the ingress
+		// reports only that it panicked and leaves the value to
+		// lib-observability's recovery pipeline.
 		if rendered := fmt.Sprintf("%v", warns[0]); !strings.Contains(rendered, "validator panicked") {
 			t.Errorf("WARN line %q does not report that the validator panicked", rendered)
 		}

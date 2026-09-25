@@ -362,16 +362,8 @@ func (e *Engine) runWorker(ctx context.Context, wk workerKey, w *dispatchWorker)
 // span rather than merely logged; the subscriber list is copied before any
 // callback runs, so a callback may unsubscribe itself without deadlocking.
 //
-// The key's redaction policy is read only when a callback actually panics,
-// and then once per panicking callback. A callback is consumer code holding
-// the decoded value and a panic naming it —
-// panic(fmt.Sprintf("cannot apply %v", ch.Value)) — is reported by that same
-// recovery, which prints the panic value unless production mode is on, so the
-// bit is needed there and nowhere else. Reading it before the fan-out took the
-// registry's lock on every delivery of every subscribed key, contending with
-// Register and with every ingress, to answer a question almost no delivery
-// asks. An unregistered key reports false, which is the honest answer: nothing
-// registered it, so nothing declared it sensitive.
+// The registry is not read here at all, on the hot path or off it: a panicking
+// callback is reported with the value it was raised with, whatever the key.
 func (e *Engine) deliver(ctx context.Context, scope store.Scope, nk NSKey, ch Change) {
 	e.subsMu.RLock()
 	subs := make([]subscription, len(e.subscribers[nk]))
@@ -386,9 +378,7 @@ func (e *Engine) deliver(ctx context.Context, scope store.Scope, nk NSKey, ch Ch
 		func() {
 			defer func() {
 				if recovered := recover(); recovered != nil {
-					def, _ := e.lookup(nk.Namespace, nk.Key)
-
-					e.reportConsumerPanic(ctx, scope, nk, recovered, def.Redacted,
+					e.reportConsumerPanic(ctx, scope, nk, recovered,
 						"onchange callback panicked", "onchange")
 				}
 			}()

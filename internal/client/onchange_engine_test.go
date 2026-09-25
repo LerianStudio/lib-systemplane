@@ -1103,61 +1103,43 @@ func TestAPanickingValidatorIsRefusedNotFatal(t *testing.T) {
 	})
 }
 
-// panicSentinel is the value a redacted key holds in the test below. It stands
-// in for the thing a RedactFull registration exists to keep off a log line.
-const panicSentinel = "probe-redacted-value-Qz71"
+// panicSentinel is the value the validator below panics naming. Nothing in
+// this library masks a value, so it must reach the report as it was raised.
+const panicSentinel = "probe-panic-value-Qz71"
 
-// TestAPanickingValidatorOnARedactedKeyWithholdsTheValue pins the redaction
-// fact the Client hands engine.RunValidator at BOTH of its call sites.
+// TestAPanickingValidatorReportsTheValueItPanickedWith pins both of the
+// Client's direct engine.RunValidator call sites — grading a registered
+// default, and grading a local write.
 //
 // A validator that panics naming the value it was handed —
 // panic(fmt.Sprintf("refusing %v", v)) is the ordinary shape — reaches
-// lib-observability's recovery pipeline, which logs log.Any("value", recovered)
-// at ERROR whenever production mode is off, and off is its shipped default. For
-// a key registered RedactFull that publishes, at ERROR, the exact bytes the
-// registration says must never appear on a log line.
-//
-// The engine withholds it, but only when the Client tells it the key is
-// redacted, and both call sites pass that bit from a registry field no test
-// read: replacing either with a literal false left the whole unit suite green.
-// So this test drives each site with a redacted key and asserts the sentinel
-// reaches no line at all.
-func TestAPanickingValidatorOnARedactedKeyWithholdsTheValue(t *testing.T) {
-	// What the report carries in the sentinel's place: enough to tell two
-	// panics apart, never a byte of the value.
-	const withheld = "validator panicked (string, value withheld: key registered redacted)"
-
+// lib-observability's recovery pipeline, which logs log.Any("value",
+// recovered). The report carries what was raised for every key, including one
+// registered with a redaction policy this library no longer acts on.
+func TestAPanickingValidatorReportsTheValueItPanickedWith(t *testing.T) {
 	explode := func(v any) error { panic(fmt.Sprintf("refusing %v", v)) }
 
-	assertWithheld := func(t *testing.T, logger *recordingLogger) {
+	assertReported := func(t *testing.T, logger *recordingLogger) {
 		t.Helper()
-
-		if rendered := logger.rendered(); strings.Contains(rendered, panicSentinel) {
-			t.Errorf("a redacted key's value reached the log through a panicking validator: %s", rendered)
-		}
 
 		reports := logger.errs("panic recovered")
 		if len(reports) != 1 {
 			t.Fatalf("got %d panic reports, want exactly 1: %s", len(reports), logger.rendered())
 		}
 
-		var named bool
-
 		for _, f := range reports[0].structured() {
 			if f.Key != "value" {
 				continue
 			}
 
-			named = true
-
-			if f.Value != withheld {
-				t.Errorf("panic report value = %v, want %q", f.Value, withheld)
+			if got := fmt.Sprint(f.Value); !strings.Contains(got, panicSentinel) {
+				t.Errorf("panic report value = %q, want the value the validator panicked with", got)
 			}
+
+			return
 		}
 
-		if !named {
-			t.Errorf(`the panic report carries no "value" field: %v`, reports[0])
-		}
+		t.Errorf(`the panic report carries no "value" field: %v`, reports[0])
 	}
 
 	t.Run("grading the registered default", func(t *testing.T) {
@@ -1172,7 +1154,7 @@ func TestAPanickingValidatorOnARedactedKeyWithholdsTheValue(t *testing.T) {
 			t.Fatalf("Register: got %v, want ErrValidation", err)
 		}
 
-		assertWithheld(t, logger)
+		assertReported(t, logger)
 	})
 
 	t.Run("grading a local write", func(t *testing.T) {
@@ -1205,7 +1187,7 @@ func TestAPanickingValidatorOnARedactedKeyWithholdsTheValue(t *testing.T) {
 			t.Fatalf("Set: got %v, want ErrValidation", err)
 		}
 
-		assertWithheld(t, logger)
+		assertReported(t, logger)
 	})
 }
 

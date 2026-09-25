@@ -108,7 +108,7 @@ func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOp
 	// is no tenant to name in the report a panic here produces.
 	if err := c.engine.RunValidator(context.Background(), store.Scope{},
 		engine.NSKey{Namespace: namespace, Key: key},
-		def.validator, canonical, def.redaction != RedactNone); err != nil {
+		def.validator, canonical); err != nil {
 		// Already labelled when the validator panicked — see the same branch
 		// on the write path — so only the context this call adds is wrapped.
 		if errors.Is(err, ErrValidation) {

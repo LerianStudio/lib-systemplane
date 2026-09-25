@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -573,116 +572,41 @@ type validatorError struct{ msg string }
 
 func (e validatorError) Error() string { return e.msg }
 
-// TestValidatorErrorIsRedactedByKeyPolicy pins the one place a consumer-built
-// string reaches the log stream carrying a configuration value: the message of
-// an error the registered validator returned. A validator that interpolates
-// the value it refused ("password %q is too short") publishes that value at
-// WARN, past every redaction the key was registered with.
+// TestValidatorRejectionLogsTheErrorNotTheValue pins the log-hygiene rule on
+// the one line a consumer-built string reaches the log stream through: the
+// message of an error the registered validator returned.
 //
-// The error returned to the caller of Set is unchanged in both cases; only the
-// log line is redacted.
-func TestValidatorErrorIsRedactedByKeyPolicy(t *testing.T) {
+// The line carries that error as produced — an operator who cannot read why a
+// row was refused cannot act on it — and nothing the engine adds names the
+// value. A validator that interpolates what it refused puts that much in its
+// own message, which is the consumer's call. The error returned to the caller
+// of Set is the same one either way.
+func TestValidatorRejectionLogsTheErrorNotTheValue(t *testing.T) {
 	const (
 		sentinel = "s3cr3t-value"
+		stored   = "42"
 		msg      = "stored value rejected by validator, keeping cached value"
 	)
 
 	rejecting := func(context.Context, any) error { return validatorError{"rejected " + sentinel} }
 
-	visible := NSKey{Namespace: "billing", Key: "limits"}
-	secret := NSKey{Namespace: "billing", Key: "apitoken"}
+	nk := NSKey{Namespace: "billing", Key: "limits"}
 
-	t.Run("RedactNone keeps the validator's own message", func(t *testing.T) {
-		e, rec := loggingEngine(t, map[NSKey]KeyDef{
-			visible: {Default: "fallback", Validate: rejecting},
-		}, newFakeStore())
+	e, rec := loggingEngine(t, map[NSKey]KeyDef{
+		nk: {Default: "fallback", Validate: rejecting},
+	}, newFakeStore())
 
-		ingestRow(e, jsonRow(visible, 1, `42`, "ops"))
+	ingestRow(e, jsonRow(nk, 1, stored, "ops"))
 
-		got := requireOneRecord(t, rec, msg)
+	got := requireOneRecord(t, rec, msg).String()
 
-		if !strings.Contains(got.String(), sentinel) {
-			t.Errorf("a key registered without redaction lost its validator's message: %s", got)
-		}
-	})
+	if !strings.Contains(got, sentinel) {
+		t.Errorf("the rejection line lost the validator's own message: %s", got)
+	}
 
-	t.Run("RedactFull withholds it", func(t *testing.T) {
-		e, rec := loggingEngine(t, map[NSKey]KeyDef{
-			secret: {Default: "fallback", Validate: rejecting, Redacted: true},
-		}, newFakeStore())
-
-		ingestRow(e, jsonRow(secret, 1, `42`, "ops"))
-
-		got := requireOneRecord(t, rec, msg)
-
-		if strings.Contains(got.String(), sentinel) {
-			t.Errorf("a redacted key published its value through the validator's error message: %s", got)
-		}
-
-		if !strings.Contains(got.String(), "engine.validatorError") {
-			t.Errorf("the redacted line names no error type, so an operator cannot tell the rejections apart: %s", got)
-		}
-	})
-}
-
-// TestUndecodableValueIsRedactedByKeyPolicy pins the SECOND place a
-// configuration value reaches the log stream: the message of the decode error
-// itself. encoding/json reports an unparsable row as "invalid character 'h'
-// looking for beginning of value", quoting the offending byte — so a key
-// registered RedactFull whose row is a raw secret publishes that secret's
-// first byte at WARN, past every redaction the key was registered with.
-//
-// It is reachable rather than theoretical: the MongoDB backend stores value as
-// a BSON string it never validates as JSON, so a foreign writer or a
-// hand-edited document produces exactly this error.
-//
-// The error returned to the caller is unchanged in both cases; only the log
-// line is redacted.
-func TestUndecodableValueIsRedactedByKeyPolicy(t *testing.T) {
-	const (
-		secret = "hunter2-s3cret"
-		msg    = "failed to unmarshal stored value, keeping cached value"
-	)
-
-	visible := NSKey{Namespace: "billing", Key: "limits"}
-	sensitive := NSKey{Namespace: "billing", Key: "apitoken"}
-
-	t.Run("RedactNone keeps the decoder's own message", func(t *testing.T) {
-		e, rec := loggingEngine(t, map[NSKey]KeyDef{visible: {Default: "fallback"}}, newFakeStore())
-
-		ingestRow(e, jsonRow(visible, 1, secret, "ops"))
-
-		got := requireOneRecord(t, rec, msg)
-
-		if !strings.Contains(got.String(), "invalid character") {
-			t.Errorf("a key registered without redaction lost the decoder's message: %s", got)
-		}
-	})
-
-	t.Run("RedactFull withholds every byte of the value", func(t *testing.T) {
-		e, rec := loggingEngine(t, map[NSKey]KeyDef{
-			sensitive: {Default: "fallback", Redacted: true},
-		}, newFakeStore())
-
-		ingestRow(e, jsonRow(sensitive, 1, secret, "ops"))
-
-		got := requireOneRecord(t, rec, msg)
-
-		rendered := fmt.Sprint(got.fields())
-
-		// The first byte, the prefix it starts, the whole value and its
-		// length: a decode error that carries any of them tells a log reader
-		// something about the secret it was not entitled to.
-		for _, leak := range []string{secret, "hunter", "'h'", strconv.Itoa(len(secret))} {
-			if strings.Contains(rendered, leak) {
-				t.Errorf("the redacted decode line carries %q from the stored value: %s", leak, rendered)
-			}
-		}
-
-		if !strings.Contains(rendered, "json.SyntaxError") {
-			t.Errorf("the redacted line names no error type, so an operator cannot tell the failures apart: %s", rendered)
-		}
-	})
+	if strings.Contains(got, stored) {
+		t.Errorf("the rejection line carries the stored value the validator never named: %s", got)
+	}
 }
 
 // TestReReadCanceledOutsideShutdownIsLoggedAtWarn is the companion of
@@ -1505,24 +1429,15 @@ func TestPublishDeleteLogsUnderTheCallerContext(t *testing.T) {
 // was holding when it exploded is exactly what the engine does not know.
 const reconcilePanicMsg = "systemplane.engine: reconcile panicked"
 
-// TestReReadPanicOnARedactedKeyWithholdsTheValue closes the second half of the
-// hole the validator report already closed.
-//
-// A changefeed re-read hands the store a key and gets back its row. A driver
-// that panics naming what it was decoding — pgx and the mongo driver both
-// interpolate the document into their panics — is therefore holding the value
-// of a key whose entire registration says it must never reach a log line, and
-// the report went to lib-observability's handler verbatim: log.Any("value",
-// recovered) at ERROR, and the same rendering stamped on the span event,
-// whenever production mode is off, which is its shipped default.
-//
-// The identity is asserted in the same test on purpose: withholding the value
-// must not cost the operator the tenant, namespace and key, which are the only
-// thing left to act on.
-func TestReReadPanicOnARedactedKeyWithholdsTheValue(t *testing.T) {
-	const secret = "reread-panic-sentinel-Qv3Ly"
+// TestReconcilePanicIsReportedWithTheValue pins the report a store or driver
+// panic under a whole-scope snapshot produces: the identity line with the zero
+// key — a snapshot is about no single one — and lib-observability's handler
+// reached with the value the panic was raised with, so the panic counter and
+// the span event are recorded and not only logged.
+func TestReconcilePanicIsReportedWithTheValue(t *testing.T) {
+	const probeMarker = "reconcile-panic-sentinel-Nw8Br"
 
-	nk := NSKey{Namespace: "billing", Key: "token"}
+	nk := NSKey{Namespace: "billing", Key: "limits"}
 	scope := store.Scope{Tenant: "acme"}
 
 	fs := newFakeStore()
@@ -1530,72 +1445,8 @@ func TestReReadPanicOnARedactedKeyWithholdsTheValue(t *testing.T) {
 
 	e := New(Config{
 		Store:    fs,
-		Registry: fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: "fallback", Redacted: true}}},
+		Registry: fakeRegistry{defs: map[NSKey]KeyDef{nk: {Default: "fallback"}}},
 		Logger:   rec,
-	})
-	track(t, e, scope)
-
-	t.Cleanup(func() {
-		if err := e.Close(); err != nil {
-			t.Errorf("Close after a panicking re-read: %v, want nil", err)
-		}
-	})
-
-	// One-shot, so the retry the panic schedules converges instead of
-	// reporting the same panic a second time.
-	fs.onGet(func(_ store.Scope, k NSKey) error {
-		fs.onGet(nil)
-
-		panic(fmt.Sprintf("driver exploded decoding %s/%s = %q", k.Namespace, k.Key, secret))
-	})
-
-	e.onEvent(upsertEvent(scope, nk, 1))
-
-	waitFor(t, hangGuard, "the panicking re-read to be reported and accounted", func() bool {
-		var reported, accounted bool
-
-		for _, r := range rec.snapshot() {
-			switch r.Msg {
-			case rereadPanicMsg:
-				reported = true
-			case panicRecoveredMsg:
-				accounted = true
-			}
-		}
-
-		return reported && accounted
-	})
-
-	requireLogged(t, rec, log.LevelError, rereadPanicMsg, scope, nk)
-	requirePanicWithheld(t, rec, "refresh", "string", secret)
-}
-
-// TestReconcilePanicOnARedactedRegistryWithholdsTheValue pins the last engine
-// report that still printed whatever the panicking code was holding.
-//
-// A reconcile's List returns every row of the scope at once, so a store or
-// driver panic under it can be holding any of them — including a key the
-// consumer registered redacted. The engine cannot tell which, so the gate is
-// the registry as a whole: one redacted key anywhere in it withholds the value
-// from the report. That never under-redacts, and a deployment with no redacted
-// key at all keeps the verbatim panic it had.
-func TestReconcilePanicOnARedactedRegistryWithholdsTheValue(t *testing.T) {
-	const probeMarker = "reconcile-panic-sentinel-Nw8Br"
-
-	plain := NSKey{Namespace: "billing", Key: "limits"}
-	hidden := NSKey{Namespace: "billing", Key: "token"}
-	scope := store.Scope{Tenant: "acme"}
-
-	fs := newFakeStore()
-	rec := &recordingLogger{Logger: log.NewNop()}
-
-	e := New(Config{
-		Store: fs,
-		Registry: fakeRegistry{defs: map[NSKey]KeyDef{
-			plain:  {Default: "fallback"},
-			hidden: {Default: "default", Redacted: true},
-		}},
-		Logger: rec,
 	})
 	track(t, e, scope)
 
@@ -1608,7 +1459,7 @@ func TestReconcilePanicOnARedactedRegistryWithholdsTheValue(t *testing.T) {
 	fs.onList(func(store.Scope) error {
 		fs.onList(nil)
 
-		panic(fmt.Sprintf("driver exploded scanning %s/%s = %q", hidden.Namespace, hidden.Key, probeMarker))
+		panic(probeMarker)
 	})
 
 	e.onEvent(resyncEvent(scope))
@@ -1629,5 +1480,14 @@ func TestReconcilePanicOnARedactedRegistryWithholdsTheValue(t *testing.T) {
 	})
 
 	requireLogged(t, rec, log.LevelError, reconcilePanicMsg, scope, NSKey{})
-	requirePanicWithheld(t, rec, "reconcile", "string", probeMarker)
+	requirePanicAccounted(t, rec, "reconcile")
+
+	value, ok := findLogged(rec, panicRecoveredMsg).field("value")
+	if !ok {
+		t.Fatalf("%q carries no value field, got %v", panicRecoveredMsg, rec.all())
+	}
+
+	if got := fmt.Sprint(value.Value); !strings.Contains(got, probeMarker) {
+		t.Errorf("%q value field = %q, want the value the reconcile panicked with", panicRecoveredMsg, got)
+	}
 }

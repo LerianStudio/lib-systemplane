@@ -83,7 +83,7 @@ func (c *Client) Set(ctx context.Context, namespace, key string, value any, acto
 		// into the caller's request goroutine — reported naming the tenant,
 		// the namespace and the key, the way every other engine panic is.
 		if err := c.engine.RunValidator(ctx, c.scopeFor(ctx), engine.NSKey{Namespace: namespace, Key: key},
-			def.validator, canonical, def.redaction != RedactNone); err != nil {
+			def.validator, canonical); err != nil {
 			// A validator that PANICKED comes back already labelled: the
 			// engine's recovery wraps the store's validation sentinel, which
 			// is the value this package exports as ErrValidation. Labelling it
