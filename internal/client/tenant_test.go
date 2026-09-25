@@ -145,6 +145,8 @@ type tenantStore struct {
 	gets       int
 	lists      int
 	subscribes int
+	// afterList, when set, runs once after List took its snapshot, unlocked.
+	afterList func()
 }
 
 func newTenantStore() *tenantStore {
@@ -175,6 +177,7 @@ func (s *tenantStore) seed(t *testing.T, tenant, ns, key string, value any, revi
 	}
 
 	s.rows[tenant][memKey(ns, key)] = TestEntry{Namespace: ns, Key: key, Value: raw, Revision: revision, UpdatedBy: by}
+	s.revision = max(s.revision, revision)
 }
 
 func (s *tenantStore) Start(context.Context) error { return nil }
@@ -217,7 +220,6 @@ func (s *tenantStore) Delete(ctx context.Context, scope TestScope, ns, key, _ st
 
 func (s *tenantStore) List(ctx context.Context, scope TestScope) ([]TestEntry, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	s.lists++
 
@@ -226,6 +228,14 @@ func (s *tenantStore) List(ctx context.Context, scope TestScope) ([]TestEntry, e
 
 	for _, e := range rows {
 		out = append(out, e)
+	}
+
+	after := s.afterList
+	s.afterList = nil
+	s.mu.Unlock()
+
+	if after != nil {
+		after()
 	}
 
 	return out, nil
@@ -679,4 +689,158 @@ func TestDroppedTenantDeliversNothing(t *testing.T) {
 	}, "an unblocked tenant never came back on a read")
 
 	waitForChange(t, changes, "two", 2)
+}
+
+func mustSet(t *testing.T, c *Client, ctx context.Context, ns, key string, value any) {
+	t.Helper()
+
+	if err := c.Set(ctx, ns, key, value, "bob"); err != nil {
+		t.Fatalf("Set(%s/%s) = %v", ns, key, err)
+	}
+}
+
+func TestMultiTenantSetThenGetReturnsTheNewValue(t *testing.T) {
+	s := newTenantStore()
+	s.seed(t, "t1", "ns", "k", "old", 1, "alice")
+	c := newTenantClient(t, s, registerKey("ns", "k", "default"))
+
+	mustEntry(t, c, tenantCtx("t1"), "ns", "k")
+	waitSettled(t, c, "t1", "ns", "k")
+
+	gets, _, _ := s.counts()
+
+	// The fake store emits no feed event for a write: only the publication can make it readable.
+	mustSet(t, c, tenantCtx("t1"), "ns", "k", "new")
+
+	if e := mustEntry(t, c, tenantCtx("t1"), "ns", "k"); e.Value != "new" || e.Revision != 2 || e.UpdatedBy != "bob" {
+		t.Fatalf("read after Set = %+v, want the write at the revision the store returned", e)
+	}
+
+	if g, _, _ := s.counts(); g != gets {
+		t.Fatalf("read after Set reached the store (gets %d->%d), want it served from the tenant's cache", gets, g)
+	}
+}
+
+func TestMultiTenantDeletePublishesTheDefault(t *testing.T) {
+	s := newTenantStore()
+	s.seed(t, "t1", "ns", "k", "stored", 7, "alice")
+	c := newTenantClient(t, s, registerKey("ns", "k", "default"))
+
+	mustEntry(t, c, tenantCtx("t1"), "ns", "k")
+	waitSettled(t, c, "t1", "ns", "k")
+
+	if err := c.Delete(tenantCtx("t1"), "ns", "k", "bob"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	e, ok := c.engine.Lookup(store.Scope{Tenant: "t1"}, engine.NSKey{Namespace: "ns", Key: "k"})
+	if !ok || !reflect.DeepEqual(e, Entry{Value: "default"}) {
+		t.Fatalf("t1 cache after Delete = (%+v, %v), want the registered default at Revision 0", e, ok)
+	}
+}
+
+// TestMultiTenantWriteDuringActivationOutlivesItsReconcile: the activation's
+// List predates a write that creates the row, and its absent-key default must
+// not overwrite that write.
+func TestMultiTenantWriteDuringActivationOutlivesItsReconcile(t *testing.T) {
+	s := newTenantStore()
+	listed, release := make(chan struct{}), make(chan struct{})
+	s.afterList = func() {
+		close(listed)
+		<-release
+	}
+
+	c := newTenantClient(t, s, registerKey("ns", "k", "default"))
+	mustEntry(t, c, tenantCtx("t1"), "ns", "k")
+
+	select {
+	case <-listed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the first read never started the tenant's activation")
+	}
+
+	mustSet(t, c, tenantCtx("t1"), "ns", "k", "new")
+	close(release)
+	waitSettled(t, c, "t1", "ns", "k")
+
+	if e := mustEntry(t, c, tenantCtx("t1"), "ns", "k"); e.Value != "new" || e.Revision != 1 {
+		t.Fatalf("read after the activation settled = %+v, want the write made during it", e)
+	}
+}
+
+func TestMultiTenantWriteForAnUnactivatedTenantCachesNothing(t *testing.T) {
+	cases := map[string]struct {
+		tenant string
+		setup  func(*Client)
+	}{
+		"unactivated tenant": {tenant: "t1"},
+		"blocked tenant":     {tenant: "t1", setup: func(c *Client) { c.engine.Block(store.Scope{Tenant: "t1"}) }},
+		"no tenant in ctx":   {},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			s := newTenantStore()
+			c := newTenantClient(t, s, registerKey("ns", "k", "default"))
+
+			if tc.setup != nil {
+				tc.setup(c)
+			}
+
+			ctx := tmcore.ContextWithTenantID(context.Background(), tc.tenant)
+			scope, nk := store.Scope{Tenant: tc.tenant}, engine.NSKey{Namespace: "ns", Key: "k"}
+
+			mustSet(t, c, ctx, "ns", "k", "written")
+
+			if _, ok := c.engine.Lookup(scope, nk); ok {
+				t.Fatal("a write for an untracked scope was cached")
+			}
+
+			if e := mustEntry(t, c, ctx, "ns", "k"); e.Value != "written" {
+				t.Fatalf("read after Set = %+v, want the persisted row", e)
+			}
+
+			if gets, _, _ := s.counts(); gets != 1 {
+				t.Fatalf("read after Set reached the store %d times, want 1", gets)
+			}
+
+			if err := c.Delete(ctx, "ns", "k", "bob"); err != nil {
+				t.Fatalf("Delete for an untracked scope = %v, want nil", err)
+			}
+
+			if e := mustEntry(t, c, ctx, "ns", "k"); e.Value != "default" {
+				t.Fatalf("read after Delete = %+v, want the registered default", e)
+			}
+		})
+	}
+}
+
+func TestMultiTenantWriteForOneTenantDoesNotTouchAnother(t *testing.T) {
+	s := newTenantStore()
+	s.seed(t, "t1", "ns", "k", "one", 1, "a")
+	s.seed(t, "t2", "ns", "k", "two", 2, "b")
+	c := newTenantClient(t, s, registerKey("ns", "k", "default"))
+
+	for _, tenant := range []string{"t1", "t2"} {
+		mustEntry(t, c, tenantCtx(tenant), "ns", "k")
+		waitSettled(t, c, tenant, "ns", "k")
+	}
+
+	mustSet(t, c, tenantCtx("t1"), "ns", "k", "one-2")
+
+	if e := mustEntry(t, c, tenantCtx("t1"), "ns", "k"); e.Value != "one-2" {
+		t.Fatalf("t1 read after its Set = %+v, want its write", e)
+	}
+
+	if err := c.Delete(tenantCtx("t1"), "ns", "k", "bob"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	if e := mustEntry(t, c, tenantCtx("t1"), "ns", "k"); e.Value != "default" || e.Revision != 0 {
+		t.Fatalf("t1 read after its Delete = %+v, want the registered default", e)
+	}
+
+	if e := mustEntry(t, c, tenantCtx("t2"), "ns", "k"); e.Value != "two" || e.Revision != 2 || e.UpdatedBy != "b" {
+		t.Fatalf("t2 read after t1's writes = %+v, want its own row untouched", e)
+	}
 }
