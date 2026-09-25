@@ -51,4 +51,8 @@ var (
 	// mode and the caller's context carries no tenant database for the
 	// configured module.
 	ErrTenantConnectionMissing = store.ErrTenantConnectionMissing
+
+	// ErrTenantManagerBackendMismatch is returned by a constructor handed the
+	// tenant manager of the other backend.
+	ErrTenantManagerBackendMismatch = errors.New("systemplane: tenant manager does not match the client backend")
 )

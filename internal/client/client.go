@@ -37,7 +37,10 @@ type Client struct {
 	logger  log.Logger
 	guarded log.Logger
 
-	multiTenant    bool
+	multiTenant bool
+	// tenantManaged: a tenant manager was configured, so named scopes resolve
+	// through a connector.
+	tenantManaged  bool
 	catalogService string
 
 	registryMu sync.RWMutex
@@ -65,6 +68,10 @@ func NewPostgres(db *sql.DB, listenDSN string, opts ...Option) (*Client, error) 
 	cfg := defaultClientConfig()
 	applyClientOptions(&cfg, opts)
 
+	if cfg.mbTenantManager != nil {
+		return nil, fmt.Errorf("%w: WithMongoTenantManager passed to NewPostgres", ErrTenantManagerBackendMismatch)
+	}
+
 	if !cfg.multiTenantEnabled && db == nil {
 		return nil, store.ErrNilBackend
 	}
@@ -85,6 +92,10 @@ func NewMongoDB(client *mongo.Client, database string, opts ...Option) (*Client,
 	cfg := defaultClientConfig()
 	applyClientOptions(&cfg, opts)
 
+	if cfg.pgTenantManager != nil {
+		return nil, fmt.Errorf("%w: WithPostgresTenantManager passed to NewMongoDB", ErrTenantManagerBackendMismatch)
+	}
+
 	if !cfg.multiTenantEnabled && client == nil {
 		return nil, store.ErrNilBackend
 	}
@@ -98,7 +109,9 @@ func NewMongoDB(client *mongo.Client, database string, opts ...Option) (*Client,
 }
 
 // postgresConfig builds the Postgres backend's configuration from the
-// Client's own. It and mongoConfig below exist for one field.
+// Client's own. It and mongoConfig below exist for two fields: the logger, and
+// a Connector set only for a non-nil tenant manager, so a nil one leaves the
+// backend refusing named scopes with store.ErrTenantConnectorMissing.
 //
 // cfg.logger is the GUARDED logger — the backends log from their changefeed
 // goroutines, where a consumer logger that panics takes the process down — and
@@ -108,7 +121,7 @@ func NewMongoDB(client *mongo.Client, database string, opts ...Option) (*Client,
 // because no unit test runs a live changefeed. Named, it is one value a test
 // can assert is already guarded.
 func postgresConfig(db *sql.DB, listenDSN string, cfg clientConfig) postgres.Config {
-	return postgres.Config{
+	pc := postgres.Config{
 		DB:                 db,
 		ListenDSN:          listenDSN,
 		Logger:             cfg.logger,
@@ -116,12 +129,18 @@ func postgresConfig(db *sql.DB, listenDSN string, cfg clientConfig) postgres.Con
 		MultiTenantEnabled: cfg.multiTenantEnabled,
 		Module:             cfg.module,
 	}
+
+	if cfg.pgTenantManager != nil {
+		pc.Connector = postgres.NewTenantManagerConnector(cfg.pgTenantManager)
+	}
+
+	return pc
 }
 
 // mongoConfig is postgresConfig's twin for the MongoDB backend, and carries
 // the same guarded logger for the same reason.
 func mongoConfig(client *mongo.Client, database string, cfg clientConfig) mongoDB.Config {
-	return mongoDB.Config{
+	mc := mongoDB.Config{
 		Client:             client,
 		Database:           database,
 		PollInterval:       cfg.pollInterval,
@@ -130,6 +149,12 @@ func mongoConfig(client *mongo.Client, database string, cfg clientConfig) mongoD
 		MultiTenantEnabled: cfg.multiTenantEnabled,
 		Module:             cfg.module,
 	}
+
+	if cfg.mbTenantManager != nil {
+		mc.Connector = mongoDB.NewTenantManagerConnector(cfg.mbTenantManager)
+	}
+
+	return mc
 }
 
 func newClient(s store.Store, cfg clientConfig) *Client {
@@ -152,6 +177,7 @@ func newClient(s store.Store, cfg clientConfig) *Client {
 		logger:         own,
 		guarded:        guarded,
 		multiTenant:    cfg.multiTenantEnabled,
+		tenantManaged:  cfg.pgTenantManager != nil || cfg.mbTenantManager != nil,
 		catalogService: cfg.catalogService,
 		registry:       make(map[nskey]keyDef),
 	}

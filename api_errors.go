@@ -44,4 +44,9 @@ var (
 	// multi-tenant mode and the caller's context carries no tenant database
 	// for the configured module.
 	ErrTenantConnectionMissing = internalclient.ErrTenantConnectionMissing
+
+	// ErrTenantManagerBackendMismatch is returned by [NewPostgres] handed
+	// [WithMongoTenantManager], and by [NewMongoDB] handed
+	// [WithPostgresTenantManager].
+	ErrTenantManagerBackendMismatch = internalclient.ErrTenantManagerBackendMismatch
 )

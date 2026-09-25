@@ -5,6 +5,8 @@ import (
 	"context"
 	"time"
 
+	tmmongo "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/mongo"
+	tmpostgres "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/postgres"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
@@ -27,6 +29,8 @@ type clientConfig struct {
 
 	multiTenantEnabled bool
 	module             string
+	pgTenantManager    *tmpostgres.Manager
+	mbTenantManager    *tmmongo.Manager
 }
 
 func defaultClientConfig() clientConfig {
@@ -61,7 +65,8 @@ func WithTelemetry(t store.Telemetry) Option {
 }
 
 // WithPollInterval enables polling mode for MongoDB instead of change streams.
-// Ignored by Postgres backends and in multi-tenant mode.
+// Ignored by Postgres backends. In multi-tenant mode it applies to the tenant
+// feeds WithMongoTenantManager opens.
 func WithPollInterval(d time.Duration) Option {
 	return func(cfg *clientConfig) {
 		if d > 0 {
@@ -107,6 +112,24 @@ func WithCloseTimeout(d time.Duration) Option {
 //     database.
 func WithMultiTenantEnabled() Option {
 	return func(cfg *clientConfig) {
+		cfg.multiTenantEnabled = true
+	}
+}
+
+// WithPostgresTenantManager gives NewPostgres a tenant connector built from
+// mgr and implies WithMultiTenantEnabled. Last-wins, nil included: a nil mgr
+// still declares multi-tenant intent and leaves the connector unset.
+func WithPostgresTenantManager(mgr *tmpostgres.Manager) Option {
+	return func(cfg *clientConfig) {
+		cfg.pgTenantManager = mgr
+		cfg.multiTenantEnabled = true
+	}
+}
+
+// WithMongoTenantManager is WithPostgresTenantManager's twin for NewMongoDB.
+func WithMongoTenantManager(mgr *tmmongo.Manager) Option {
+	return func(cfg *clientConfig) {
+		cfg.mbTenantManager = mgr
 		cfg.multiTenantEnabled = true
 	}
 }

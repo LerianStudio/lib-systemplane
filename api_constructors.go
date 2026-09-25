@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"time"
 
+	tmmongo "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/mongo"
+	tmpostgres "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/postgres"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	internalclient "github.com/LerianStudio/lib-systemplane/v4/internal/client"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -76,6 +78,40 @@ func WithCloseTimeout(d time.Duration) Option { return internalclient.WithCloseT
 // resolves the per-tenant database from ctx via tmcore.GetPGContext /
 // tmcore.GetMBContext using the configured module name.
 func WithMultiTenantEnabled() Option { return internalclient.WithMultiTenantEnabled() }
+
+// WithPostgresTenantManager resolves each tenant's database through mgr, so a
+// tenant scope can be cached and pushed like the single-tenant one. It implies
+// [WithMultiTenantEnabled]; [NewMongoDB] refuses it with
+// [ErrTenantManagerBackendMismatch]. A nil mgr only switches the mode.
+//
+// Each tenant needs its own database. An active tenant holds one LISTEN
+// connection per replica on top of mgr's pool, so size max_connections against
+// active tenants × replicas. Revisions are opaque: they may skip, and start at
+// 2 on a fresh database.
+//
+// NOTIFY is database-wide, so a tenant feed whose DSN reaches a database
+// another live feed of this Client already listens on (schema-per-tenant, or a
+// connector handing two tenants one connection string) is refused when it
+// opens: that tenant's activation logs a WARN and its reads stay per-request.
+// A pinned search_path alone is not refused, and two processes sharing one
+// database cannot see each other, so one database per tenant stays the
+// operator's responsibility beyond this process.
+func WithPostgresTenantManager(mgr *tmpostgres.Manager) Option {
+	return internalclient.WithPostgresTenantManager(mgr)
+}
+
+// WithMongoTenantManager is [WithPostgresTenantManager]'s twin for
+// [NewMongoDB], which [NewPostgres] refuses with
+// [ErrTenantManagerBackendMismatch]. A nil mgr only switches the mode.
+//
+// A change stream watches one collection of one database, so tenants on
+// distinct databases of one server never see each other's writes. Two tenants
+// resolved to one database share its collection, and the second feed is
+// refused when it opens, as on Postgres. Change streams need a replica set;
+// against a standalone server pass [WithPollInterval].
+func WithMongoTenantManager(mgr *tmmongo.Manager) Option {
+	return internalclient.WithMongoTenantManager(mgr)
+}
 
 // WithModule sets the tenant-manager module name used by ctx dispatch.
 // Default: "systemplane".
