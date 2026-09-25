@@ -13,6 +13,7 @@ import (
 	"time"
 
 	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
+	tmevent "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/event"
 	tmmongo "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/mongo"
 	tmpostgres "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/postgres"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/engine"
@@ -207,6 +208,15 @@ func (s *tenantStore) counts() (gets, lists, subscribes int) {
 	defer s.mu.Unlock()
 
 	return s.gets, s.lists, s.subscribes
+}
+
+func (s *tenantStore) feedOpen(tenant string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, ok := s.feeds[tenant]
+
+	return ok
 }
 
 func (s *tenantStore) namedReads() int {
@@ -818,5 +828,134 @@ func TestMultiTenantWriteForOneTenantDoesNotTouchAnother(t *testing.T) {
 
 	if e := mustEntry(t, c, tenantCtx("t2"), "ns", "k"); e.Value != "two" || e.Revision != 2 || e.UpdatedBy != "b" {
 		t.Fatalf("t2 read after t1's writes = %+v, want its own row untouched", e)
+	}
+}
+
+// t1Events builds one lifecycle event per type, each for tenant t1.
+func t1Events(types ...string) []tmevent.TenantLifecycleEvent {
+	events := make([]tmevent.TenantLifecycleEvent, len(types))
+	for i, eventType := range types {
+		events[i] = tmevent.TenantLifecycleEvent{EventType: eventType, TenantID: "t1"}
+	}
+
+	return events
+}
+
+// TestHandleTenantLifecycle sends each row's events to target, a tenant-managed
+// Client serving t1's ns/k from its first feed unless the row builds another.
+func TestHandleTenantLifecycle(t *testing.T) {
+	const (
+		untouched  = iota // t1 still served from its first feed
+		perRequest        // t1 dropped: a read goes per request and opens no feed
+		rebuilt           // t1 served from a second feed
+	)
+
+	cases := map[string]struct {
+		target  func(t *testing.T, s *tenantStore) *Client
+		events  []tmevent.TenantLifecycleEvent
+		wantErr error
+		want    int
+	}{
+		"suspended drops the scope":                {events: t1Events(tmevent.EventTenantSuspended), want: perRequest},
+		"deleted drops the scope":                  {events: t1Events(tmevent.EventTenantDeleted), want: perRequest},
+		"activated after suspended lets a read in": {events: t1Events(tmevent.EventTenantSuspended, tmevent.EventTenantActivated), want: rebuilt},
+		"rotation rebuilds an active scope":        {events: t1Events(tmevent.EventTenantCredentialsRotated), want: rebuilt},
+		"rotation leaves a blocked tenant blocked": {events: t1Events(tmevent.EventTenantSuspended, tmevent.EventTenantCredentialsRotated), want: perRequest},
+		"an unrouted type changes nothing":         {events: t1Events(tmevent.EventTenantServiceSuspended)},
+		"activated opens no feed for an unread tenant": {
+			events: []tmevent.TenantLifecycleEvent{{EventType: tmevent.EventTenantActivated, TenantID: "t2"}},
+		},
+		"an event with no tenant id is refused": {
+			events:  []tmevent.TenantLifecycleEvent{{EventType: tmevent.EventTenantSuspended}},
+			wantErr: ErrValidation,
+		},
+		"a nil client ignores the event": {
+			target: func(*testing.T, *tenantStore) *Client { return nil },
+			events: t1Events(tmevent.EventTenantSuspended),
+		},
+		"a client without a tenant manager ignores the event": {
+			target: func(t *testing.T, s *tenantStore) *Client {
+				c, err := NewForTesting(s, WithMultiTenantEnabled())
+				if err != nil {
+					t.Fatalf("NewForTesting: %v", err)
+				}
+
+				t.Cleanup(func() { _ = c.Close() })
+
+				return c
+			},
+			events: t1Events(tmevent.EventTenantSuspended),
+		},
+		"an event after close is refused": {
+			target: func(t *testing.T, s *tenantStore) *Client {
+				c := newTenantClient(t, s, registerKey("ns", "k", "default"))
+				_ = c.Close()
+
+				return c
+			},
+			events:  t1Events(tmevent.EventTenantSuspended),
+			wantErr: ErrClosed,
+		},
+	}
+
+	scope, nk := store.Scope{Tenant: "t1"}, engine.NSKey{Namespace: "ns", Key: "k"}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			s := newTenantStore()
+			s.seed(t, "t1", "ns", "k", "stored", 1, "a")
+			c := newTenantClient(t, s, registerKey("ns", "k", "default"))
+
+			mustEntry(t, c, tenantCtx("t1"), "ns", "k")
+			waitSettled(t, c, "t1", "ns", "k")
+
+			target := c
+			if tc.target != nil {
+				target = tc.target(t, s)
+			}
+
+			for _, event := range tc.events {
+				if err := target.HandleTenantLifecycle(context.Background(), event); !errors.Is(err, tc.wantErr) {
+					t.Fatalf("HandleTenantLifecycle(%s) = %v, want %v", event.EventType, err, tc.wantErr)
+				}
+
+				if tc.want != untouched && (event.EventType == tmevent.EventTenantSuspended || event.EventType == tmevent.EventTenantDeleted) {
+					waitFor(t, func() bool {
+						_, ok := c.engine.Lookup(scope, nk)
+
+						return !ok && !s.feedOpen("t1")
+					}, event.EventType+" never dropped t1's scope and closed its feed")
+				}
+			}
+
+			switch tc.want {
+			case rebuilt:
+				waitFor(t, func() bool {
+					mustEntry(t, c, tenantCtx("t1"), "ns", "k")
+					e, ok := c.engine.Lookup(scope, nk)
+					_, _, subscribes := s.counts()
+
+					return ok && !e.Stale && subscribes == 2
+				}, "t1 never served from a second feed")
+			case perRequest:
+				gets, _, _ := s.counts()
+				named := s.namedReads()
+
+				mustEntry(t, c, tenantCtx("t1"), "ns", "k")
+				time.Sleep(100 * time.Millisecond) // a read that re-activated t1 has listed it by now
+
+				if g, _, subscribes := s.counts(); g != gets+1 || s.namedReads() != named || subscribes != 1 {
+					t.Fatalf("zero-scope gets %d->%d, named reads %d->%d, %d feeds; want the read per request and no feed",
+						gets, g, named, s.namedReads(), subscribes)
+				}
+			default:
+				time.Sleep(100 * time.Millisecond) // a verb the event wrongly reached has acted by now
+
+				e, ok := c.engine.Lookup(scope, nk)
+				if _, _, subscribes := s.counts(); !ok || e.Stale || subscribes != 1 {
+					t.Fatalf("t1 cached = (%+v, %v) over %d feeds, want it untouched on its first feed", e, ok, subscribes)
+				}
+			}
+		})
 	}
 }

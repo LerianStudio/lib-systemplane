@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	tmevent "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/event"
 	tmmongo "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/mongo"
 	tmpostgres "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/postgres"
 
@@ -281,7 +282,8 @@ func TestPublicConstructorsAndOptions(t *testing.T) {
 
 // TestPublicTenantManagerOptionsExist pins FC-6 at the facade: each option
 // constructs its own backend with a nil handle (multi-tenant implied) and is
-// refused with ErrTenantManagerBackendMismatch on the other.
+// refused with ErrTenantManagerBackendMismatch on the other, and the lifecycle
+// handler registers as a tmevent.EventHandler.
 func TestPublicTenantManagerOptionsExist(t *testing.T) {
 	t.Parallel()
 
@@ -293,7 +295,14 @@ func TestPublicTenantManagerOptionsExist(t *testing.T) {
 		t.Fatalf("NewPostgres with its tenant manager: %v", err)
 	}
 
+	var handle tmevent.EventHandler = c.HandleTenantLifecycle
+
 	_ = c.Close()
+
+	event := tmevent.TenantLifecycleEvent{EventType: tmevent.EventTenantSuspended, TenantID: "t1"}
+	if err := handle(context.Background(), event); !errors.Is(err, ErrClosed) {
+		t.Errorf("HandleTenantLifecycle after Close: err = %v, want ErrClosed", err)
+	}
 
 	c, err = NewMongoDB(nil, "", WithMongoTenantManager(mb))
 	if err != nil {
