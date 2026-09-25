@@ -279,10 +279,10 @@ func TestPublicConstructorsAndOptions(t *testing.T) {
 	if _, err := NewMongoDB(nil, ""); err == nil {
 		t.Fatal("NewMongoDB nil backend: expected error, got nil")
 	}
-	if _, err := NewPostgres(nil, "", WithMultiTenantEnabled(), WithListenChannel("custom_channel"), WithTable("custom_table"), WithModule("runtime")); err != nil {
+	if _, err := NewPostgres(nil, "", WithMultiTenantEnabled(), WithModule("runtime")); err != nil {
 		t.Fatalf("NewPostgres multi-tenant: %v", err)
 	}
-	if _, err := NewMongoDB(nil, "", WithMultiTenantEnabled(), WithCollection("custom_collection"), WithPollInterval(time.Second), WithDebounce(time.Millisecond)); err != nil {
+	if _, err := NewMongoDB(nil, "", WithMultiTenantEnabled(), WithPollInterval(time.Second), WithDebounce(time.Millisecond)); err != nil {
 		t.Fatalf("NewMongoDB multi-tenant: %v", err)
 	}
 

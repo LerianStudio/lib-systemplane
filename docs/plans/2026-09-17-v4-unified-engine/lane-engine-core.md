@@ -1509,7 +1509,7 @@ every gate in the verification list exits 0 on the branch head.
 **Scope:** `internal/client/options.go`, `internal/client/testing_facade_test.go`, root `api_constructors.go`, `api_client_test.go`
 **Dependencies:** Phase 2
 **Done when:** `WithTable`, `WithListenChannel` and `WithCollection` do not exist in `internal/client` or the root package; the Client stops setting `Table`, `Channel` and `Collection` on the backend configs and the backends' own defaults take effect; every test that passed one of those options is updated; `go build ./...` and `make test-unit` are green.
-**Status:** Pending
+**Status:** Done
 
 ### Epic 3.2: Gate sweep on the reduced surface
 
