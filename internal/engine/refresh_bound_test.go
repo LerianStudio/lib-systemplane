@@ -292,12 +292,20 @@ func TestRefreshSemaphoreReleasesOnClose(t *testing.T) {
 
 	waitFor(t, hangGuard, "every slot to be held", func() bool { return g.parked() == refreshGetLimit })
 
-	queued := inBackground(func() {
-		e.trackedRefresh(scope, NSKey{Namespace: "bulk", Key: fmt.Sprintf("k%d", refreshGetLimit)}, false)
-	})
+	queuedKey := NSKey{Namespace: "bulk", Key: fmt.Sprintf("k%d", refreshGetLimit)}
+	queued := inBackground(func() { e.trackedRefresh(scope, queuedKey, false) })
 
-	// Let the tracked re-read reach the full semaphore.
-	time.Sleep(20 * time.Millisecond)
+	// Claimed, the tracked re-read is work Close waits for, headed for the full cap.
+	waitFor(t, hangGuard, "the tracked re-read to claim its key", func() bool {
+		sc := e.trackedScope(scope)
+
+		sc.mu.RLock()
+		defer sc.mu.RUnlock()
+
+		_, running := sc.inflight[queuedKey]
+
+		return running
+	})
 
 	if err := e.Close(); err != nil {
 		t.Errorf("Close() = %v with a re-read queued on a full semaphore, want nil", err)

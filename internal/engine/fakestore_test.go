@@ -28,6 +28,8 @@ type fakeStore struct {
 	getHook       func(scope store.Scope, nk NSKey) error
 	listHook      func(scope store.Scope) error
 	subscribeHook func(scope store.Scope) error
+	// unsubscribeHook runs, unlocked, before every unsubscribe call is served.
+	unsubscribeHook func()
 
 	// autoResync makes Subscribe emit store.OpResync the way a real backend
 	// does once its connection is up. It is off by default so a test can model
@@ -116,6 +118,13 @@ func (f *fakeStore) onSubscribe(hook func(scope store.Scope) error) {
 	defer f.mu.Unlock()
 
 	f.subscribeHook = hook
+}
+
+func (f *fakeStore) onUnsubscribe(hook func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.unsubscribeHook = hook
 }
 
 // freezeNextList makes the next List return entries instead of the live table,
@@ -359,7 +368,12 @@ func (f *fakeStore) Subscribe(ctx context.Context, scope store.Scope, fn func(st
 	unsubscribe := func() {
 		f.mu.Lock()
 		f.unsubCalls++
+		hook := f.unsubscribeHook
 		f.mu.Unlock()
+
+		if hook != nil {
+			hook()
+		}
 
 		once.Do(func() {
 			f.mu.Lock()

@@ -252,21 +252,22 @@ func TestCloseDuringActivationLeavesNothingRunning(t *testing.T) {
 	tenant := store.Scope{Tenant: "t1"}
 	fs := newFakeStore()
 	e := activationEngine(t, fs)
+	fs.autoResync = false // subscribed, the activation waits on a first reconcile only Close can end
 
-	entered, release := parkSubscribe(fs, tenant)
-	defer release()
+	e.Activate(tenant)
+	waitFor(t, hangGuard, "the activation to hold its feed", func() bool {
+		sc := e.trackedScope(tenant)
+		if sc == nil {
+			return false
+		}
 
-	if !e.Activate(tenant) {
-		t.Fatal("Activate on an untracked tenant started nothing")
-	}
+		sc.mu.RLock()
+		defer sc.mu.RUnlock()
 
-	mustReceive(t, entered, "the tenant's Subscribe to park")
+		return sc.unsubscribe != nil
+	})
 
-	closed := closeInBackground(e)
-	waitFor(t, hangGuard, "Close to begin", e.closed.Load)
-
-	release()
-	mustCloseCleanly(t, closed)
+	mustCloseCleanly(t, closeInBackground(e))
 
 	if n := fs.liveSubscriptions(); n != 0 {
 		t.Errorf("live subscriptions = %d after Close, want 0", n)
@@ -310,6 +311,7 @@ func TestBlockDropsTheScopeAndRefusesActivate(t *testing.T) {
 	e.Block(tenant)
 	e.Block(tenant) // suspended, then deleted: two events
 	e.Block(unseen)
+	activationDone(t, e, tenant)
 
 	requireDropped(t, e, fs, tenant)
 
@@ -363,10 +365,7 @@ func TestReactivateRebuildsAnActiveScope(t *testing.T) {
 	e := activationEngine(t, fs)
 	mustActivate(t, e, tenant)
 
-	if !e.Reactivate(tenant) {
-		t.Fatal("Reactivate of an active tenant started nothing")
-	}
-
+	e.Reactivate(tenant)
 	activationDone(t, e, tenant)
 
 	if got, ok := e.Lookup(tenant, activateKey); !ok || got.Value != "stored" || got.Revision != 7 || got.Stale {
@@ -388,10 +387,8 @@ func TestReactivateOnABlockedScopeChangesNothing(t *testing.T) {
 	e := activationEngine(t, fs)
 	mustActivate(t, e, tenant)
 	e.Block(tenant)
-
-	if e.Reactivate(tenant) {
-		t.Error("Reactivate of a blocked tenant reported a start")
-	}
+	e.Reactivate(tenant)
+	activationDone(t, e, tenant)
 
 	requireDropped(t, e, fs, tenant)
 	lowerRetryDelay(e)
@@ -416,9 +413,8 @@ func TestReactivateOnAnUntrackedScopeOnlyClearsTheCooldown(t *testing.T) {
 	activationDone(t, e, tenant)
 	fs.onSubscribe(nil)
 
-	if e.Reactivate(tenant) {
-		t.Error("Reactivate brought up a tenant nothing had activated")
-	}
+	e.Reactivate(tenant)
+	activationDone(t, e, tenant)
 
 	if n := fs.subscribeCount(); n != 1 {
 		t.Errorf("Subscribe calls = %d after Reactivate, want 1", n)
@@ -468,11 +464,7 @@ func TestReactivateRacingAnActivationRebuildsIt(t *testing.T) {
 	}
 
 	mustReceive(t, entered, "the tenant's Subscribe to park")
-
-	if e.Reactivate(tenant) {
-		t.Error("Reactivate reported starting a bring-up another call owns")
-	}
-
+	e.Reactivate(tenant)
 	release()
 
 	waitFor(t, hangGuard, "the rebuild to subscribe", func() bool { return fs.subscribeCount() == 2 })
@@ -484,5 +476,46 @@ func TestReactivateRacingAnActivationRebuildsIt(t *testing.T) {
 
 	if n, u := fs.liveSubscriptions(), fs.unsubscribeCount(); n != 1 || u != 1 {
 		t.Errorf("live subscriptions = %d, unsubscribe calls = %d; want the superseded one released, one live", n, u)
+	}
+}
+
+// TestNoReadActivatesWhileADropReleasesTheOldFeed: a backend reattaches a new
+// Subscribe to a feed still being released, so a read landing mid-drop would
+// keep the old connection string alive under the rebuilt scope.
+func TestNoReadActivatesWhileADropReleasesTheOldFeed(t *testing.T) {
+	for name, drop := range map[string]func(*Engine, store.Scope){
+		"reactivate":         (*Engine).Reactivate,
+		"block then unblock": (*Engine).Block,
+	} {
+		t.Run(name, func(t *testing.T) {
+			tenant := store.Scope{Tenant: "t1"}
+			fs := newFakeStore()
+			e := activationEngine(t, fs)
+			mustActivate(t, e, tenant)
+
+			entered := make(chan struct{})
+			parked, release := gate()
+			fs.onUnsubscribe(sync.OnceFunc(func() {
+				close(entered)
+				<-parked
+			}))
+
+			defer release()
+
+			drop(e, tenant)
+			mustReceive(t, entered, "the drop to park inside unsubscribe")
+			e.Unblock(tenant)
+
+			if e.Activate(tenant) {
+				t.Error("a read started an activation while the old feed was still being released")
+			}
+
+			release()
+			activationDone(t, e, tenant)
+
+			if n, live := fs.subscribeCount(), fs.liveSubscriptions(); n != 2 || live != 1 {
+				t.Errorf("Subscribe calls = %d, live = %d; want the old feed released and one rebuilt", n, live)
+			}
+		})
 	}
 }

@@ -341,9 +341,8 @@ func (e *Engine) retryRefresh(sc *scopeState, nk NSKey, fence feedFence, deleted
 // that loses the race to Close is dropped whole rather than reaching a store
 // the Client is about to close.
 //
-// A key's re-reads never overlap: a notification landing while one runs is
-// coalesced into one trailing read, never dropped (it may announce a write the
-// running Get read too early to see), and that read is a delete if any was.
+// A key's re-reads never overlap: a notification landing mid-read owes one trailing
+// read, never dropped (the running Get may predate its write), a delete if any was.
 func (e *Engine) trackedRefresh(scope store.Scope, nk NSKey, deleted bool) {
 	if !e.beginWork() {
 		return
@@ -675,12 +674,6 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey, origin feedFence, delet
 		origin = fence
 	}
 
-	// The slot is waited for on the lifecycle alone, so Close never waits on a
-	// full cap and a queued read keeps its whole feedTimeout for the store.
-	if !sc.acquireGet(e.dispatchContext()) {
-		return
-	}
-
 	ctx, cancel := context.WithTimeout(e.dispatchContext(), feedTimeout)
 	defer cancel()
 
@@ -785,8 +778,15 @@ func (e *Engine) refreshKey(scope store.Scope, nk NSKey, origin feedFence, delet
 	_ = e.ingest(ctx, sc, se, fence, false)
 }
 
-// getRow is refreshKey's Store.Get, returning its slot even when the store panics.
+// getRow is refreshKey's Store.Get under one of the scope's slots, freed even on
+// a store panic; a full cap is waited on only until ctx ends, never past Close.
 func (e *Engine) getRow(ctx context.Context, sc *scopeState, nk NSKey) (store.Entry, bool, error) {
+	select {
+	case sc.getSem <- struct{}{}:
+	case <-ctx.Done():
+		return store.Entry{}, false, ctx.Err()
+	}
+
 	defer func() { <-sc.getSem }()
 
 	return e.store.Get(ctx, sc.scope, nk.Namespace, nk.Key)

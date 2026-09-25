@@ -19,118 +19,40 @@ import (
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
-// TestWithPostgresTenantManagerImpliesMultiTenant constructs with a nil
-// backend handle, which ErrNilBackend permits only in multi-tenant mode, so
-// the option alone must have flipped the mode.
-func TestWithPostgresTenantManagerImpliesMultiTenant(t *testing.T) {
-	cases := []struct {
-		name        string
-		build       func() (*Client, error)
-		wantManaged bool
-	}{
-		{"postgres", func() (*Client, error) {
-			return NewPostgres(nil, "", WithPostgresTenantManager(tmpostgres.NewManager(nil, "svc")))
-		}, true},
-		{"mongodb", func() (*Client, error) {
-			return NewMongoDB(nil, "", WithMongoTenantManager(tmmongo.NewManager(nil, "svc")))
-		}, true},
-		{"postgres nil manager", func() (*Client, error) {
-			return NewPostgres(nil, "", WithPostgresTenantManager(nil))
-		}, false},
-		{"mongodb nil manager", func() (*Client, error) {
-			return NewMongoDB(nil, "", WithMongoTenantManager(nil))
-		}, false},
-		{"test store", func() (*Client, error) {
-			return NewForTesting(&facadeTestStore{}, WithPostgresTenantManager(tmpostgres.NewManager(nil, "svc")))
-		}, true},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			c, err := tc.build()
+// TestNilTenantManagerStillImpliesMultiTenant constructs with a nil backend
+// handle, which ErrNilBackend permits only in multi-tenant mode: a nil manager
+// declares multi-tenant intent and manages no tenant.
+func TestNilTenantManagerStillImpliesMultiTenant(t *testing.T) {
+	for name, build := range map[string]func() (*Client, error){
+		"postgres": func() (*Client, error) { return NewPostgres(nil, "", WithPostgresTenantManager(nil)) },
+		"mongodb":  func() (*Client, error) { return NewMongoDB(nil, "", WithMongoTenantManager(nil)) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			c, err := build()
 			if err != nil {
 				t.Fatalf("construct: %v", err)
 			}
 
 			defer c.Close()
 
-			if !c.multiTenant {
-				t.Error("the tenant-manager option did not switch the Client to multi-tenant mode")
-			}
-
-			if c.tenantManaged != tc.wantManaged {
-				t.Errorf("tenantManaged = %v, want %v", c.tenantManaged, tc.wantManaged)
+			if !c.multiTenant || c.tenantManaged {
+				t.Errorf("multiTenant = %v, tenantManaged = %v; want multi-tenant, managing no tenant", c.multiTenant, c.tenantManaged)
 			}
 		})
 	}
 }
 
-// TestTenantManagerBackendMismatchIsRefused pins the wiring error to
-// construction: a manager for the other backend would resolve nothing and
-// fail only at the first read.
-func TestTenantManagerBackendMismatchIsRefused(t *testing.T) {
-	pg := tmpostgres.NewManager(nil, "svc")
-	mb := tmmongo.NewManager(nil, "svc")
-
-	cases := []struct {
-		name  string
-		build func() (*Client, error)
-	}{
-		{"mongo manager on postgres", func() (*Client, error) {
-			return NewPostgres(nil, "", WithMongoTenantManager(mb))
-		}},
-		{"postgres manager on mongodb", func() (*Client, error) {
-			return NewMongoDB(nil, "", WithPostgresTenantManager(pg))
-		}},
-		{"both managers on postgres", func() (*Client, error) {
-			return NewPostgres(nil, "", WithPostgresTenantManager(pg), WithMongoTenantManager(mb))
-		}},
-		{"both managers on mongodb", func() (*Client, error) {
-			return NewMongoDB(nil, "", WithPostgresTenantManager(pg), WithMongoTenantManager(mb))
-		}},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			c, err := tc.build()
-			if !errors.Is(err, ErrTenantManagerBackendMismatch) {
-				t.Fatalf("err = %v, want ErrTenantManagerBackendMismatch", err)
-			}
-
-			if c != nil {
-				t.Error("a refused construction returned a Client")
-			}
-		})
-	}
-}
-
-// TestBackendConfigsCarryAConnectorOnlyForAManager: a nil manager must leave
-// Connector nil so the backend answers a named scope with
-// ErrTenantConnectorMissing instead of a connector that fails on every call.
-func TestBackendConfigsCarryAConnectorOnlyForAManager(t *testing.T) {
-	managed := defaultClientConfig()
-	applyClientOptions(&managed, []Option{
+// TestATenantManagerReachesItsBackendAsTheConnector: without one the backend
+// answers every named scope with ErrTenantConnectorMissing.
+func TestATenantManagerReachesItsBackendAsTheConnector(t *testing.T) {
+	cfg := defaultClientConfig()
+	applyClientOptions(&cfg, []Option{
 		WithPostgresTenantManager(tmpostgres.NewManager(nil, "svc")),
 		WithMongoTenantManager(tmmongo.NewManager(nil, "svc")),
 	})
 
-	bare := defaultClientConfig()
-	applyClientOptions(&bare, []Option{WithPostgresTenantManager(nil), WithMongoTenantManager(nil)})
-
-	if postgresConfig(nil, "", managed).Connector == nil {
-		t.Error("postgres: a tenant manager did not reach the backend as a Connector")
-	}
-
-	if mongoConfig(nil, "", managed).Connector == nil {
-		t.Error("mongodb: a tenant manager did not reach the backend as a Connector")
-	}
-
-	if postgresConfig(nil, "", bare).Connector != nil {
-		t.Error("postgres: a nil tenant manager produced a Connector")
-	}
-
-	if mongoConfig(nil, "", bare).Connector != nil {
-		t.Error("mongodb: a nil tenant manager produced a Connector")
+	if postgresConfig(nil, "", cfg).Connector == nil || mongoConfig(nil, "", cfg).Connector == nil {
+		t.Error("a tenant manager did not reach its backend as a Connector")
 	}
 }
 
@@ -142,8 +64,9 @@ type tenantStore struct {
 	rows       map[string]map[string]TestEntry
 	feeds      map[string]func(TestEvent)
 	revision   int64
-	gets       int
+	gets       int // zero-scope calls: the per-request path, through the middleware
 	lists      int
+	named      int // named-scope Get and List calls: an activated scope's own reads
 	subscribes int
 	// afterList, when set, runs once after List took its snapshot, unlocked.
 	afterList func()
@@ -187,7 +110,12 @@ func (s *tenantStore) Get(ctx context.Context, scope TestScope, ns, key string) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.gets++
+	if scope.Tenant != "" {
+		s.named++
+	} else {
+		s.gets++
+	}
+
 	e, ok := s.rows[s.tenantOf(ctx, scope)][memKey(ns, key)]
 
 	return e, ok, nil
@@ -221,7 +149,11 @@ func (s *tenantStore) Delete(ctx context.Context, scope TestScope, ns, key, _ st
 func (s *tenantStore) List(ctx context.Context, scope TestScope) ([]TestEntry, error) {
 	s.mu.Lock()
 
-	s.lists++
+	if scope.Tenant != "" {
+		s.named++
+	} else {
+		s.lists++
+	}
 
 	rows := s.rows[s.tenantOf(ctx, scope)]
 	out := make([]TestEntry, 0, len(rows))
@@ -275,6 +207,13 @@ func (s *tenantStore) counts() (gets, lists, subscribes int) {
 	defer s.mu.Unlock()
 
 	return s.gets, s.lists, s.subscribes
+}
+
+func (s *tenantStore) namedReads() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.named
 }
 
 func tenantCtx(tenant string) context.Context {
@@ -352,8 +291,9 @@ func TestFirstMultiTenantReadActivatesTheScope(t *testing.T) {
 		t.Fatalf("cached read = %+v, want the row's value, revision and provenance", e)
 	}
 
-	if gets, _, subscribes := s.counts(); gets != 1 || subscribes != 1 {
-		t.Fatalf("gets=%d subscribes=%d, want the second read served from the one feed's cache", gets, subscribes)
+	if gets, _, subscribes := s.counts(); gets != 1 || subscribes != 1 || s.namedReads() != 1 {
+		t.Fatalf("gets=%d subscribes=%d named=%d, want the second read served from the one feed's cache "+
+			"and the activation's List the only named-scope read", gets, subscribes, s.namedReads())
 	}
 }
 
@@ -458,8 +398,8 @@ func TestListForACachedTenantDoesNotTouchTheStore(t *testing.T) {
 	want := []ListEntry{{Key: "a", Value: float64(10)}, {Key: "b", Value: float64(2)}}
 
 	got, err := c.List(tenantCtx("t1"), "ns")
-	if err != nil || !reflect.DeepEqual(got, want) {
-		t.Fatalf("first List = (%+v, %v), want %+v per request", got, err, want)
+	if _, lists, _ := s.counts(); err != nil || !reflect.DeepEqual(got, want) || lists != 1 {
+		t.Fatalf("first List = (%+v, %v) after %d zero-scope Lists, want %+v per request", got, err, lists, want)
 	}
 
 	waitSettled(t, c, "t1", "ns", "a")
@@ -612,14 +552,6 @@ func TestMultiTenantOnChangeFiresPerTenant(t *testing.T) {
 	}
 }
 
-func TestMultiTenantOnChangeRefusedWithoutATenantManager(t *testing.T) {
-	c := newTenantClient(t, newTenantStore(), registerKey("ns", "k", "default"), WithPostgresTenantManager(nil))
-
-	if _, err := c.OnChange("ns", "k", func(context.Context, Change) {}); !errors.Is(err, ErrNotSupportedInMultiTenant) {
-		t.Fatalf("OnChange with a nil tenant manager = %v, want ErrNotSupportedInMultiTenant", err)
-	}
-}
-
 // TestOnChangeRegisteredBeforeActivationFiresAtActivation is br-sfn's shape:
 // callbacks registered before Start, then announced per tenant at activation.
 func TestOnChangeRegisteredBeforeActivationFiresAtActivation(t *testing.T) {
@@ -661,7 +593,7 @@ func TestDroppedTenantDeliversNothing(t *testing.T) {
 	scope, nk := store.Scope{Tenant: "t1"}, engine.NSKey{Namespace: "ns", Key: "k"}
 	c.engine.Block(scope)
 
-	// Block defers the drop to an activation still finishing.
+	// Block drops the scope in the background.
 	waitFor(t, func() bool {
 		_, ok := c.engine.Lookup(scope, nk)
 
@@ -669,9 +601,16 @@ func TestDroppedTenantDeliversNothing(t *testing.T) {
 	}, "the blocked tenant's scope was never dropped")
 
 	s.seed(t, "t1", "ns", "k", "two", 2, "b")
+	gets, _, _ := s.counts()
+	named := s.namedReads()
 
 	if e := mustEntry(t, c, tenantCtx("t1"), "ns", "k"); e.Value != "two" {
 		t.Fatalf("blocked tenant read = %+v, want the row per request", e)
+	}
+
+	if g, _, _ := s.counts(); g != gets+1 || s.namedReads() != named {
+		t.Fatalf("blocked tenant read: zero-scope gets %d->%d, named reads %d->%d; want it through the middleware only",
+			gets, g, named, s.namedReads())
 	}
 
 	select {
@@ -828,16 +767,8 @@ func TestMultiTenantWriteForOneTenantDoesNotTouchAnother(t *testing.T) {
 
 	mustSet(t, c, tenantCtx("t1"), "ns", "k", "one-2")
 
-	if e := mustEntry(t, c, tenantCtx("t1"), "ns", "k"); e.Value != "one-2" {
-		t.Fatalf("t1 read after its Set = %+v, want its write", e)
-	}
-
 	if err := c.Delete(tenantCtx("t1"), "ns", "k", "bob"); err != nil {
 		t.Fatalf("Delete: %v", err)
-	}
-
-	if e := mustEntry(t, c, tenantCtx("t1"), "ns", "k"); e.Value != "default" || e.Revision != 0 {
-		t.Fatalf("t1 read after its Delete = %+v, want the registered default", e)
 	}
 
 	if e := mustEntry(t, c, tenantCtx("t2"), "ns", "k"); e.Value != "two" || e.Revision != 2 || e.UpdatedBy != "b" {

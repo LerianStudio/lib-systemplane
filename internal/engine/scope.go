@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"context"
 	"sync"
 	"time"
 
@@ -230,7 +229,7 @@ type scopeState struct {
 	// inflight holds the keys with a tracked re-read running; again, the keys
 	// notified meanwhile, each owed one trailing read that is a delete if any
 	// notification it stands for was. Guarded by mu.
-	inflight map[NSKey]bool
+	inflight map[NSKey]struct{}
 	again    map[NSKey]bool
 	// getSem holds one token per Store.Get this scope's re-reads have in flight.
 	getSem chan struct{}
@@ -327,7 +326,7 @@ func newScopeState(scope store.Scope) *scopeState {
 		scope:              scope,
 		entries:            make(map[NSKey]entry),
 		fences:             make(map[NSKey]keyFence),
-		inflight:           make(map[NSKey]bool),
+		inflight:           make(map[NSKey]struct{}),
 		again:              make(map[NSKey]bool),
 		getSem:             make(chan struct{}, refreshGetLimit),
 		workers:            make(map[NSKey]*dispatchWorker),
@@ -434,13 +433,13 @@ func (sc *scopeState) beginRefresh(nk NSKey, deleted bool) bool {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 
-	if sc.inflight[nk] {
+	if _, running := sc.inflight[nk]; running {
 		sc.again[nk] = sc.again[nk] || deleted
 
 		return false
 	}
 
-	sc.inflight[nk] = true
+	sc.inflight[nk] = struct{}{}
 
 	return true
 }
@@ -460,24 +459,6 @@ func (sc *scopeState) endRefresh(nk NSKey) (again, deleted bool) {
 	delete(sc.inflight, nk)
 
 	return false, false
-}
-
-// acquireGet takes one of the scope's Store.Get slots. A free slot is taken even
-// after ctx ends, so the store reports the shutdown; a full cap is waited on only
-// until ctx ends, so Close never waits on one.
-func (sc *scopeState) acquireGet(ctx context.Context) bool {
-	select {
-	case sc.getSem <- struct{}{}:
-		return true
-	default:
-	}
-
-	select {
-	case sc.getSem <- struct{}{}:
-		return true
-	case <-ctx.Done():
-		return false
-	}
 }
 
 // armReconcile opens a reconcile window and puts it in the scope's single-slot

@@ -22,10 +22,6 @@ import (
 // row is unreadable and nothing about whose. The tenant travels on the
 // caller's own context, which is the context every one of these lines is
 // already logged with.
-//
-// The guard survives although every call site today is multi-tenant: it is
-// what keeps an empty tenant.id — noise that reads like a missing value — off
-// the single-tenant lines the wave-3 engine-tenants lane adds.
 func (c *Client) logRead(ctx context.Context, level int, msg string, fields ...log.Field) {
 	if c == nil || c.guarded == nil {
 		return
