@@ -312,7 +312,7 @@ func (c *Client) Connect(ctx context.Context) error {
 Lerian shared-library ownership is split intentionally:
 
 - `github.com/LerianStudio/lib-commons/v7` — non-observability shared primitives. This repo uses `commons/tenant-manager/{core,postgres,mongo}`, `commons/net/http`, and `commons/backoff`.
-- `github.com/LerianStudio/lib-observability/v4` — canonical observability stack. This repo uses `log`, `tracing`, and `runtime` for structured logging, telemetry, span helpers, redaction, and panic recovery. **Internally only:** no exported parameter may name a type from it. The public boundary is `systemplane.Logger` and `systemplane.Telemetry`, declared in this module from stdlib + `go.opentelemetry.io/otel` types, and `boundary_test.go` enforces it. Rationale and the v2 → v3 move: [`MIGRATION-v3.md`](../MIGRATION-v3.md); the v3 → v4 move: [`MIGRATION-v4.md`](../MIGRATION-v4.md).
+- `github.com/LerianStudio/lib-observability/v4` — canonical observability stack. This repo uses `log`, `tracing`, and `runtime` for structured logging, telemetry, span helpers, and panic recovery. **Internally only:** no exported parameter may name a type from it. The public boundary is `systemplane.Logger` and `systemplane.Telemetry`, declared in this module from stdlib + `go.opentelemetry.io/otel` types, and `boundary_test.go` enforces it. Rationale and the v2 → v3 move: [`MIGRATION-v3.md`](../MIGRATION-v3.md); the v3 → v4 move: [`MIGRATION-v4.md`](../MIGRATION-v4.md).
 - `github.com/LerianStudio/lib-systemplane/v4` — runtime-mutable configuration. Do not duplicate its functionality in service repositories.
 - `github.com/LerianStudio/lib-streaming` — tenant-scoped event streaming. Do not add it to this repo unless a task explicitly requires streaming integration.
 
@@ -341,20 +341,8 @@ Do not reintroduce observability packages from `lib-commons`; they are being rem
 ### Credential Handling
 
 1. **Never hardcode credentials** - Use environment variables
-2. **Never log credentials** - Use the `Redactor` for sensitive fields
-3. **Mask in errors** - Never include credentials in error messages
-
-```go
-// Use the built-in lib-observability Redactor for sensitive data
-redactor := tracing.NewDefaultRedactor()
-safeValue := redactor.Redact(sensitiveField)
-```
-
-### Sensitive Field Detection
-
-- Use `lib-observability/tracing.Redactor` with `RedactionRule` patterns for telemetry attributes
-- Use `lib-observability/log` safe logging helpers when emitting external errors
-- Constructors: `NewDefaultRedactor()` and `NewRedactor(rules, mask)`
+2. **Never log a stored value** - The library adds no value to a log line of its own; a validator refusal logs the validator's error, never the value
+3. **Name a key field `keyname`, never `key`** - `key` is in lib-observability's default sensitive-field list and renders as `key=[REDACTED]`
 
 ### Input Validation
 

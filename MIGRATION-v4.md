@@ -43,6 +43,8 @@ has to be read even where your code compiles unchanged.
 | `(*Manager).IsClosed` | No replacement. Calls on a closed `Client` return `ErrClosed`; that is the answer the flag was read for. |
 | `(*Manager).OnTenantActivated`, `OnTenantSuspended`, `OnTenantDeleted`, `OnTenantCredentialsRotated`, `HandleTenantLifecycle` | No replacement yet: tenant lifecycle handling does not exist on the v4 Client, so a process that depends on it cannot take this upgrade. <!-- NOT-YET(engine-tenants): Client.HandleTenantLifecycle, WithAggregateTenantThreshold, tenant-scope teardown in Close --> |
 | `DefaultSeedSQL` | No replacement. Defaults live in code, at `Register` / `Bind`. A value an operator must be able to override before first boot is a row your own migration pipeline inserts, not something this library seeds. |
+| `RedactPolicy`, `RedactNone`, `RedactMask`, `RedactFull` | No replacement. systemplane holds runtime knobs, never secrets; move a secret to environment variables or a secret manager. |
+| `WithRedaction`, `ApplyRedaction`, `(*Client).KeyRedaction` | No replacement; drop the option from every `Register` / `Bind` call, including `WithRedaction(RedactNone)`. |
 | `WithTable`, `WithListenChannel`, `WithCollection` | No replacement: the names are fixed, and v4 reads nothing else. Postgres: rename or copy a custom table to `systemplane_entries` first, then apply `MigrationV3ToV4SQL()`, which names the table unqualified, refuses when `search_path` reaches none, and recreates the notification triggers on `systemplane_changes`, so a custom channel needs no step of its own. MongoDB: copy a custom collection to `systemplane_entries` before starting v4; v4 moves no data. |
 
 **Added.**
@@ -70,9 +72,9 @@ has to be read even where your code compiles unchanged.
 Everything else in the facade is unchanged: `NewPostgres`, `NewMongoDB`,
 `Register`, `Start`, `Close`, `Get`, `GetString`, `GetInt`,
 `GetBool`, `GetFloat64`, `GetDuration`, `Set`, `Delete`, `List`, `Catalog`,
-`CatalogKey`, `CatalogService`, `KeyDescription`, `KeyRedaction`,
+`CatalogKey`, `CatalogService`, `KeyDescription`,
 `IsRegistered`, `Logger`, the key options `WithDescription`, `WithValidator`,
-`WithRedaction`, `WithCatalogMetadata`, the client options `WithLogger`,
+`WithCatalogMetadata`, the client options `WithLogger`,
 `WithTelemetry`, `WithDebounce`, `WithPollInterval`,
 `WithMultiTenantEnabled`, `WithModule`, `WithCatalogService`, and
 `admin.Mount` / `admin.MountCatalog` with their options.
@@ -181,8 +183,7 @@ that same shape and a validator answering differently on that pass pins the
 last valid value. And a validator that **panics** refuses the write, or the
 row, instead of unwinding into the caller's goroutine: it comes back as
 `ErrValidation`, and the panic is reported through lib-observability's recovery
-pipeline — for a key registered redacted, carrying the panic value's dynamic
-type rather than the value.
+pipeline.
 
 `WithContextValidator` sees the `Set` caller's own context on a write, but
 read-back grades with the client's lifecycle context: no request values, no
@@ -235,26 +236,22 @@ same revision and is deduplicated — refreshing provenance, firing no callback.
 In v3 the echo fired the subscriber. **Do:** move anything a writer relied on
 that callback for onto the write path itself.
 
-### Redaction fails closed
+### Nothing is masked any more
 
-**Affects:** consumers that render configuration values, and anything that
-reads `KeyRedaction`.
+**Affects:** every consumer that registered a key with `WithRedaction`, and
+every operator who can reach the admin surface.
 
-`KeyRedaction` reports `RedactFull` for a closed or nil Client, where v3
-reported `RedactNone`. A Client that can no longer read its own registry
-withholds rather than discloses: the admin GET and list handlers look the
-policy up after their read, so a `Close` landing in that window would otherwise
-render a redacted key in clear into a response body. On an open Client an
-unregistered key still reports `RedactNone`.
+Admin GET, list and catalog detail return values and defaults in clear, and
+the catalog loses its `redaction` field. Values are served in clear to every
+caller the admin authorizer allows, so mount `/system` behind an
+operator/admin permission. Typed-getter errors quote the stored value they
+could not convert; decode and validator lines carry the error as produced, and
+a panic report carries the panic value. With production mode off, a recovered
+panic value is logged in full; a validator or apply hook that panics naming a
+value puts that value in the log.
 
-A redacted key's value is also withheld from every report it could ride out on:
-the decode-failure and validator-rejection log lines, a validator or apply-hook
-panic, the typed getters' errors (`GetInt` and `GetDuration` used to quote the
-value they could not convert) and the group decode and apply lines. Each
-carries what failed and the value's dynamic type instead.
-
-**Do:** expect masked output wherever a consumer renders values after `Close`,
-and stop parsing values back out of these errors and log lines.
+**Do:** drop every `WithRedaction` call; a value that stays here is served in
+clear.
 
 ### Operational: primary pinning and the `keyname` log field
 
@@ -449,8 +446,7 @@ action, or answering a health endpoint. `Get` is unchanged for everything else.
 An `OnChange` callback that panics is recovered per subscriber: the other
 subscribers of that key still run, the delivery worker survives, and the panic
 is reported through lib-observability's recovery pipeline under component
-`systemplane.engine`, name `onchange`. For a key registered redacted the report
-carries the panic value's dynamic type instead of the value.
+`systemplane.engine`, name `onchange`.
 
 The logger you pass in is guarded. A logger that panics can neither take a
 library goroutine down nor unwind out of a library call — in multi-tenant mode
@@ -610,6 +606,8 @@ Find your row and read only it. Every section below assumes § Behaviour changes
 has already been read: it is where the changes that break a service without
 breaking its build are written down, and no per-consumer section repeats them.
 plugin-br-pix-lerian has no section: it does not depend on this library.
+Every consumer below but product-console registers keys with `WithRedaction`:
+drop the option from each call ([§ The surface diff](#the-surface-diff)).
 
 ### matcher
 
@@ -623,6 +621,7 @@ plugin-br-pix-lerian has no section: it does not depend on this library.
 3. Rewrite each `OnChange` callback to `func(ctx context.Context, ch Change)`; namespace, key, revision and value all come off `ch`.
 4. Audit every validator for Go-type assertions — a whole number arrives as `float64` — and for a dependency on request scope.
 5. Stop reading a non-nil `Set`/`Delete` error as "not persisted".
+6. Drop `WithRedaction` from the four `RedactFull` keys. Their values now serve in clear, so gate `/system` behind an operator permission.
 
 Moving matcher's glue — the code that decodes a namespace of scalar keys into a
 struct, validates it and re-applies it on change — onto `Bind`, `Group[T]` and

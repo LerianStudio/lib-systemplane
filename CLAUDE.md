@@ -55,7 +55,7 @@ Scaffolding:
 Lerian shared-library boundaries are now split across four libraries:
 
 - `github.com/LerianStudio/lib-commons/v7` — non-observability shared primitives used here: `commons/tenant-manager/{core,postgres,mongo}`, `commons/net/http`, and `commons/backoff`.
-- `github.com/LerianStudio/lib-observability/v4` — canonical observability stack: `log`, `tracing`, redaction helpers, span helpers, telemetry lifecycle, and `runtime` panic recovery. Used **internally only**; it must not appear in an exported parameter (see the observability boundary above).
+- `github.com/LerianStudio/lib-observability/v4` — canonical observability stack: `log`, `tracing`, span helpers, telemetry lifecycle, and `runtime` panic recovery. Used **internally only**; it must not appear in an exported parameter (see the observability boundary above).
 - `github.com/LerianStudio/lib-systemplane/v4` — this module; runtime-mutable configuration with Postgres/MongoDB backends.
 - `github.com/LerianStudio/lib-streaming` — tenant-scoped event streaming; do not introduce it here unless a task explicitly asks for streaming integration.
 

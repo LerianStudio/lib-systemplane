@@ -7,7 +7,7 @@ schema section is already v4. Until it is rewritten, take
 
 Dual-backend (PostgreSQL / MongoDB) hot-reload runtime configuration for Lerian services. Register operational knobs (log levels, feature flags, rate limits, circuit-breaker thresholds, worker intervals) at startup, mutate them at runtime without a pod restart, and — in single-tenant mode — subscribe to change events through subscriptions backed by Postgres LISTEN/NOTIFY or MongoDB change streams. First-class support for the Lerian database-per-tenant model via the `lib-commons/v7` tenant-manager dispatch layer.
 
-This library was extracted from `lib-commons/v5/commons/systemplane`. The v4 line targets the Fiber v3 stack (`lib-commons/v7`) and uses `lib-observability/v4` internally for logging, tracing, telemetry, redaction, and panic recovery.
+This library was extracted from `lib-commons/v5/commons/systemplane`. The v4 line targets the Fiber v3 stack (`lib-commons/v7`) and uses `lib-observability/v4` internally for logging, tracing, telemetry, and panic recovery.
 
 The public API names none of that. `WithLogger` and `WithTelemetry` take interfaces declared by this library from stdlib and OpenTelemetry types only, so a logger or telemetry provider built against **any** lib-observability major satisfies them — see [`MIGRATION-v3.md`](MIGRATION-v3.md) for the v2 → v3 move.
 
@@ -16,7 +16,7 @@ The public API names none of that. `WithLogger` and `WithTelemetry` take interfa
 - Go `1.26.3` or newer
 - PostgreSQL 13+ **or** MongoDB 4.4+ (replica set required for change streams; polling fallback available for standalone MongoDB)
 - `github.com/LerianStudio/lib-commons/v6` for tenant-manager context, admin HTTP helpers, and backoff
-- `github.com/LerianStudio/lib-observability/v4` for logging, tracing, telemetry, redaction, and panic recovery
+- `github.com/LerianStudio/lib-observability/v4` for logging, tracing, telemetry, and panic recovery
 
 ## Installation
 
@@ -387,13 +387,14 @@ logger itself, named by the method that panicked) and a `goroutine_name` label
 for the site. The counter exists only after the host calls
 `runtime.InitPanicMetrics(factory)` once at startup; the library never calls it,
 because the first call wins and would take the host's metrics. Production mode
-(`runtime.SetProductionMode(true)`) redacts the recovered value from the log
-line. An admin authorizer that panics answers 403; an actor extractor that
+(`runtime.SetProductionMode(true)`) omits the recovered value from the log
+line. With production mode off, a recovered panic value is logged in full; a
+validator or apply hook that panics naming a value puts that value in the log. An admin authorizer that panics answers 403; an actor extractor that
 panics answers 500 and writes nothing.
 
 ## Scope
 
-Systemplane is intended for **runtime-mutable knobs only**. Bootstrap-only configuration (DB DSNs, secrets, TLS material, telemetry endpoints, server identity) and any credential-like runtime value belongs in environment variables or a secret manager — not here. The library masks nothing: a registered default and a stored value reach the admin surface and the catalog as they are.
+Systemplane is intended for **runtime-mutable knobs only**. Bootstrap-only configuration (DB DSNs, secrets, TLS material, telemetry endpoints, server identity) and any credential-like runtime value belongs in environment variables or a secret manager — not here. Nothing in systemplane masks a value: a value stored here is readable by every caller the admin authorizer allows, and appears in logs and errors, so mount `/system` behind an operator/admin permission.
 
 ## License
 
