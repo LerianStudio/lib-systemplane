@@ -218,10 +218,11 @@ its first reconcile begins.
 are returned before the store is touched: nothing was persisted. `ErrClosed` and
 `ErrNotStarted` come from either side of the write, so they do not say whether it
 landed. Any other error is a store failure (outcome unknown) or a publication
-failure (persisted); no sentinel tells the two apart. Where it matters, re-read
-with `Get` before acting. Retry blindly only when the side effect is acceptable:
-a retried `Set` overwrites any newer write (last-write-wins), and a retried
-`Delete` removes a key recreated since the first attempt.
+failure (persisted); no sentinel tells the two apart, and `Get` cannot settle it:
+in single-tenant mode it reports what this process serves, the published value,
+not the row. Treat the outcome as unresolved. Retry only when the side effect is
+acceptable: a retried `Set` overwrites any newer write (last-write-wins), and a
+retried `Delete` removes a key recreated since the first attempt.
 
 ### A write's own changefeed echo no longer fires a callback
 
