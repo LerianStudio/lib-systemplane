@@ -218,9 +218,6 @@ func TestNew_ConfigValidationAndDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New multi-tenant: %v", err)
 	}
-	if s.cfg.Collection != defaultCollection {
-		t.Fatalf("collection = %q, want %q", s.cfg.Collection, defaultCollection)
-	}
 	if s.cfg.Module != defaultModule {
 		t.Fatalf("module = %q, want %q", s.cfg.Module, defaultModule)
 	}
@@ -547,18 +544,18 @@ func TestSchemaCacheKey_DistinguishesTenants(t *testing.T) {
 	clusterA := &mongo.Client{}
 	clusterB := &mongo.Client{}
 
-	same := schemaCacheKey("t1", clusterA.Database("systemplane").Collection(defaultCollection))
-	if again := schemaCacheKey("t1", clusterA.Database("systemplane").Collection(defaultCollection)); again != same {
+	same := schemaCacheKey("t1", clusterA.Database("systemplane").Collection(collectionName))
+	if again := schemaCacheKey("t1", clusterA.Database("systemplane").Collection(collectionName)); again != same {
 		t.Fatalf("two handles onto the same tenant database key differently: %q vs %q", same, again)
 	}
 
-	if other := schemaCacheKey("t2", clusterB.Database("systemplane").Collection(defaultCollection)); other == same {
+	if other := schemaCacheKey("t2", clusterB.Database("systemplane").Collection(collectionName)); other == same {
 		t.Fatalf("two tenants sharing a database name share the key %q", same)
 	}
 
 	// The same tenant on a client it was re-resolved through keys the same: the
 	// bootstrap it already ran is its own, whatever handle reaches it now.
-	if moved := schemaCacheKey("t1", clusterB.Database("systemplane").Collection(defaultCollection)); moved != same {
+	if moved := schemaCacheKey("t1", clusterB.Database("systemplane").Collection(collectionName)); moved != same {
 		t.Fatalf("one tenant keyed two ways across client handles: %q vs %q", same, moved)
 	}
 
@@ -566,7 +563,7 @@ func TestSchemaCacheKey_DistinguishesTenants(t *testing.T) {
 		t.Fatalf("two collections share the key %q", same)
 	}
 
-	if other := schemaCacheKey("t1", clusterA.Database("other").Collection(defaultCollection)); other == same {
+	if other := schemaCacheKey("t1", clusterA.Database("other").Collection(collectionName)); other == same {
 		t.Fatalf("two databases share the key %q", same)
 	}
 }
@@ -577,12 +574,12 @@ func TestSchemaCacheKey_DistinguishesTenants(t *testing.T) {
 // nothing tenant-shaped on the single-tenant scope.
 func TestScopeAttrs_NamesTheTenant(t *testing.T) {
 	key := attribute.String(fieldKey, "k")
-	coll := (&mongo.Client{}).Database("sysplane").Collection(defaultCollection)
+	coll := (&mongo.Client{}).Database("sysplane").Collection(collectionName)
 
 	dbAttrs := []attribute.KeyValue{
 		attribute.String(obsconstants.AttrDBSystem, obsconstants.DBSystemMongoDB),
 		attribute.String(obsconstants.AttrDBName, "sysplane"),
-		attribute.String(obsconstants.AttrDBMongoDBCollection, defaultCollection),
+		attribute.String(obsconstants.AttrDBMongoDBCollection, collectionName),
 	}
 
 	want := append(append([]attribute.KeyValue{}, dbAttrs...), key)

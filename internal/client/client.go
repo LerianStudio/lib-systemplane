@@ -111,8 +111,6 @@ func postgresConfig(db *sql.DB, listenDSN string, cfg clientConfig) postgres.Con
 	return postgres.Config{
 		DB:                 db,
 		ListenDSN:          listenDSN,
-		Channel:            cfg.listenChannel,
-		Table:              cfg.table,
 		Logger:             cfg.logger,
 		Telemetry:          cfg.telemetry,
 		MultiTenantEnabled: cfg.multiTenantEnabled,
@@ -126,7 +124,6 @@ func mongoConfig(client *mongo.Client, database string, cfg clientConfig) mongoD
 	return mongoDB.Config{
 		Client:             client,
 		Database:           database,
-		Collection:         cfg.collection,
 		PollInterval:       cfg.pollInterval,
 		Logger:             cfg.logger,
 		Telemetry:          cfg.telemetry,

@@ -30,7 +30,7 @@ import (
 // constructor validates DB/DSN; Subscribe itself doesn't touch either.
 func newSubscribeStore() *Store {
 	return &Store{
-		cfg:      Config{Channel: defaultChannel, Table: defaultTable, Module: defaultModule},
+		cfg:      Config{Module: defaultModule},
 		feeds:    map[string]*feed{"": newFeed(store.Scope{}, "")},
 		closedCh: make(chan struct{}),
 	}
@@ -993,7 +993,7 @@ func TestPostgresStart_SchemaPinnedListenDSNStillDials(t *testing.T) {
 			}
 
 			s := &Store{
-				cfg:      Config{Channel: defaultChannel, Table: defaultTable, Module: defaultModule, ListenDSN: tc.dsn},
+				cfg:      Config{Module: defaultModule, ListenDSN: tc.dsn},
 				feeds:    map[string]*feed{},
 				closedCh: make(chan struct{}),
 			}
@@ -1024,7 +1024,7 @@ func TestPostgresStart_SchemaPinnedListenDSNStillDials(t *testing.T) {
 // answers on, not parsed out of the DSN text, so pgx is the only parser left.
 func TestPostgresStart_UnparseableListenDSNIsRefused(t *testing.T) {
 	s := &Store{
-		cfg:      Config{Channel: defaultChannel, Table: defaultTable, Module: defaultModule, ListenDSN: "postgres://%zz"},
+		cfg:      Config{Module: defaultModule, ListenDSN: "postgres://%zz"},
 		feeds:    map[string]*feed{},
 		closedCh: make(chan struct{}),
 	}

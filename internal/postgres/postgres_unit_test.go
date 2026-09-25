@@ -43,21 +43,6 @@ func TestNew_ConfigValidationAndDefaults(t *testing.T) {
 			wantErr: errors.New("ListenDSN"),
 		},
 		{
-			name:    "rejects unsafe channel",
-			cfg:     Config{DB: &sql.DB{}, ListenDSN: "postgres://example", Channel: "bad channel"},
-			wantErr: errors.New("unsafe channel"),
-		},
-		{
-			name:    "rejects channel exceeding 63 bytes",
-			cfg:     Config{DB: &sql.DB{}, ListenDSN: "postgres://example", Channel: strings.Repeat("a", 64)},
-			wantErr: errors.New("63 bytes"),
-		},
-		{
-			name:    "rejects unsafe table",
-			cfg:     Config{DB: &sql.DB{}, ListenDSN: "postgres://example", Table: "bad.table"},
-			wantErr: errors.New("unsafe table"),
-		},
-		{
 			name: "multi tenant permits nil db and empty dsn",
 			cfg:  Config{MultiTenantEnabled: true},
 		},
@@ -87,34 +72,10 @@ func TestNew_ConfigValidationAndDefaults(t *testing.T) {
 			if err != nil {
 				t.Fatalf("New: %v", err)
 			}
-			if s.cfg.Channel != defaultChannel {
-				t.Fatalf("channel = %q, want %q", s.cfg.Channel, defaultChannel)
-			}
-			if s.cfg.Table != defaultTable {
-				t.Fatalf("table = %q, want %q", s.cfg.Table, defaultTable)
-			}
 			if s.cfg.Module != defaultModule {
 				t.Fatalf("module = %q, want %q", s.cfg.Module, defaultModule)
 			}
 		})
-	}
-}
-
-// TestNew_AcceptsHyphenatedChannel locks the fix: a channel prefixed with a
-// hyphenated ApplicationName (e.g. "my-service_systemplane_changes") is accepted
-// because the channel is double-quoted at LISTEN time. The table, interpolated
-// unquoted, stays strict (see the "rejects unsafe table" case with a dot).
-func TestNew_AcceptsHyphenatedChannel(t *testing.T) {
-	t.Parallel()
-
-	const hyphenated = "br-consignado-gw_systemplane_changes"
-
-	s, err := New(Config{DB: &sql.DB{}, ListenDSN: "postgres://example", Channel: hyphenated})
-	if err != nil {
-		t.Fatalf("New with hyphenated channel: unexpected error %v", err)
-	}
-	if s.cfg.Channel != hyphenated {
-		t.Fatalf("channel = %q, want %q", s.cfg.Channel, hyphenated)
 	}
 }
 
@@ -242,14 +203,6 @@ func TestNotifyPayloadParsingAndDispatch(t *testing.T) {
 	}
 	if got := truncateString("abc", 3); got != "abc" {
 		t.Fatalf("truncateString exact = %q, want abc", got)
-	}
-	if got := quoteIdentifier("systemplane_entries"); got != `"systemplane_entries"` {
-		t.Fatalf("quoteIdentifier = %q", got)
-	}
-	// Embedded double quotes are doubled (canonical PG quoting) so the identifier
-	// cannot break out of its quoted context.
-	if got := quoteIdentifier(`a"b`); got != `"a""b"` {
-		t.Fatalf("quoteIdentifier embedded-quote escaping = %q, want %q", got, `"a""b"`)
 	}
 
 	s, logger := loggingStore()
