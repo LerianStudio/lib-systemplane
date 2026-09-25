@@ -33,7 +33,6 @@ type keyDef struct {
 	catalogDefault any
 	description    string
 	validator      func(context.Context, any) error
-	redaction      RedactPolicy
 	catalog        CatalogKeyMetadata
 }
 
@@ -70,10 +69,7 @@ func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOp
 
 	nk := nskey{Namespace: namespace, Key: key}
 
-	def := keyDef{
-		catalogDefault: engine.Clone(defaultValue),
-		redaction:      RedactNone,
-	}
+	def := keyDef{catalogDefault: engine.Clone(defaultValue)}
 
 	applyKeyOptions(&def, opts)
 

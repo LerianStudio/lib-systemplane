@@ -74,24 +74,13 @@ func (c *Client) scopeFor(ctx context.Context) store.Scope {
 // way to find. Only the read-through paths use it: the single-tenant ingress
 // decodes rows the engine already holds by scope.
 //
-// redacted keeps the cause out of the chain: encoding/json reports what it
-// choked on by quoting the byte —
-// `invalid character 's' looking for beginning of value` — and carries the
-// offset on the *json.SyntaxError for anyone who unwraps, so for a key whose
-// registration says its value must never be printed the cause is named by its
-// dynamic type instead and left out of the chain. An error travels further
-// than a log line, into response bodies and error trackers, so withholding it
-// there matters at least as much. An ordinary key keeps the json error
-// wrapped, which is what a caller debugging the row reaches for.
-func decodeErr(ctx context.Context, namespace, key string, redacted bool, err error) error {
+// The cause stays wrapped: encoding/json reports what it choked on by quoting
+// the byte and carries the offset on the *json.SyntaxError, which is what a
+// caller debugging the row reaches for.
+func decodeErr(ctx context.Context, namespace, key string, err error) error {
 	where := "in an unresolved tenant"
 	if tenant, ok := tenantOf(ctx); ok {
 		where = fmt.Sprintf("in tenant %q", tenant)
-	}
-
-	if redacted {
-		return fmt.Errorf("systemplane: decode value for %s/%s %s failed (%T, cause withheld: key registered redacted)",
-			namespace, key, where, err)
 	}
 
 	return fmt.Errorf("systemplane: decode value for %s/%s %s: %w",

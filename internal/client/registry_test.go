@@ -10,51 +10,40 @@ import (
 )
 
 func TestRegistryLookupReportsTheRegisteredDefinition(t *testing.T) {
-	for _, tt := range []struct {
-		name   string
-		policy RedactPolicy
-	}{
-		{name: "none", policy: RedactNone},
-		{name: "mask", policy: RedactMask},
-		{name: "full", policy: RedactFull},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			c := newSingleTenantClient(t, newMemStore(false))
+	c := newSingleTenantClient(t, newMemStore(false))
 
-			calls := 0
-			validator := func(_ context.Context, _ any) error {
-				calls++
+	calls := 0
+	validator := func(_ context.Context, _ any) error {
+		calls++
 
-				return nil
-			}
+		return nil
+	}
 
-			if err := c.Register("ns", "k", "default", WithContextValidator(validator), WithRedaction(tt.policy)); err != nil {
-				t.Fatalf("register: %v", err)
-			}
+	if err := c.Register("ns", "k", "default", WithContextValidator(validator)); err != nil {
+		t.Fatalf("register: %v", err)
+	}
 
-			afterRegister := calls
+	afterRegister := calls
 
-			def, ok := c.Lookup("ns", "k")
-			if !ok {
-				t.Fatal("lookup of a registered key reported not found")
-			}
+	def, ok := c.Lookup("ns", "k")
+	if !ok {
+		t.Fatal("lookup of a registered key reported not found")
+	}
 
-			if def.Default != "default" {
-				t.Errorf("default: got %v, want %q", def.Default, "default")
-			}
+	if def.Default != "default" {
+		t.Errorf("default: got %v, want %q", def.Default, "default")
+	}
 
-			if def.Validate == nil {
-				t.Fatal("validate: got nil, want the registered validator")
-			}
+	if def.Validate == nil {
+		t.Fatal("validate: got nil, want the registered validator")
+	}
 
-			if err := def.Validate(context.Background(), "x"); err != nil {
-				t.Fatalf("validate: %v", err)
-			}
+	if err := def.Validate(context.Background(), "x"); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
 
-			if calls != afterRegister+1 {
-				t.Errorf("validator calls: got %d, want %d — Lookup did not return the registered function", calls, afterRegister+1)
-			}
-		})
+	if calls != afterRegister+1 {
+		t.Errorf("validator calls: got %d, want %d — Lookup did not return the registered function", calls, afterRegister+1)
 	}
 }
 

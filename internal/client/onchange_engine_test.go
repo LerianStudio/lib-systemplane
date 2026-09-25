@@ -1114,8 +1114,7 @@ const panicSentinel = "probe-panic-value-Qz71"
 // A validator that panics naming the value it was handed —
 // panic(fmt.Sprintf("refusing %v", v)) is the ordinary shape — reaches
 // lib-observability's recovery pipeline, which logs log.Any("value",
-// recovered). The report carries what was raised for every key, including one
-// registered with a redaction policy this library no longer acts on.
+// recovered). The report carries what was raised, for every key.
 func TestAPanickingValidatorReportsTheValueItPanickedWith(t *testing.T) {
 	explode := func(v any) error { panic(fmt.Sprintf("refusing %v", v)) }
 
@@ -1148,8 +1147,7 @@ func TestAPanickingValidatorReportsTheValueItPanickedWith(t *testing.T) {
 
 		defer func() { _ = c.Close() }()
 
-		err := c.Register("ns", "key", panicSentinel,
-			WithValidator(explode), WithRedaction(RedactFull))
+		err := c.Register("ns", "key", panicSentinel, WithValidator(explode))
 		if !errors.Is(err, ErrValidation) {
 			t.Fatalf("Register: got %v, want ErrValidation", err)
 		}
@@ -1165,7 +1163,7 @@ func TestAPanickingValidatorReportsTheValueItPanickedWith(t *testing.T) {
 
 		var armed atomic.Bool
 
-		err := c.Register("ns", "key", "default", WithRedaction(RedactFull),
+		err := c.Register("ns", "key", "default",
 			WithValidator(func(v any) error {
 				if armed.Load() {
 					return explode(v)

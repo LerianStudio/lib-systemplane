@@ -38,7 +38,6 @@ func TestPublicCatalogFacade(t *testing.T) {
 
 	if err := c.Register("ns", "k", 1,
 		WithDescription("description"),
-		WithRedaction(RedactFull),
 		WithCatalogMetadata(CatalogKeyMetadata{
 			Kind:         "integer",
 			RuntimeClass: "read_live",
@@ -60,7 +59,7 @@ func TestPublicCatalogFacade(t *testing.T) {
 	if c.CatalogService() != "public-service" {
 		t.Fatalf("CatalogService = %q, want public-service", c.CatalogService())
 	}
-	if len(catalog.Keys) != 1 || catalog.Keys[0].Redaction != RedactFull.String() {
+	if len(catalog.Keys) != 1 {
 		t.Fatalf("catalog keys = %#v", catalog.Keys)
 	}
 

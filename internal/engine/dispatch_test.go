@@ -1042,9 +1042,9 @@ func (r *countingRegistry) Lookup(namespace, key string) (KeyDef, bool) {
 // TestDeliveryNeverReadsTheRegistry pins the cost of a delivery on the hot
 // path: zero registry lookups, whether the callback returns or panics.
 //
-// deliver used to read one bit — is this key registered redacted — to decide
-// what a panic report could carry. Nothing masks a value any more, so the
-// report carries what was raised and the fan-out takes the registry's lock
+// deliver used to read one bit off the registry to decide what a panic report
+// could carry. Nothing masks a value any more, so the report carries what was
+// raised and the fan-out takes the registry's lock
 // never, rather than contending with Register and with every other ingress.
 func TestDeliveryNeverReadsTheRegistry(t *testing.T) {
 	nk := NSKey{Namespace: "billing", Key: "limits"}

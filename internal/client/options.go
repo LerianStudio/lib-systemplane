@@ -257,14 +257,6 @@ func WithContextValidator(fn func(ctx context.Context, value any) error) KeyOpti
 	}
 }
 
-// WithRedaction sets the redaction policy for admin and log output.
-// Default: RedactNone.
-func WithRedaction(policy RedactPolicy) KeyOption {
-	return func(k *keyDef) {
-		k.redaction = policy
-	}
-}
-
 // WithCatalogMetadata attaches operator-facing catalog metadata to a key.
 // Examples are emitted as provided; do not include secrets or credentials.
 func WithCatalogMetadata(meta CatalogKeyMetadata) KeyOption {

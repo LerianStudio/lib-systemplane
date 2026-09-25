@@ -98,7 +98,6 @@ func TestCatalogReturnsRegisteredMetadataBeforeStart(t *testing.T) {
 
 	if err := c.Register("runtime", "z", map[string]any{"nested": map[string]any{"value": "default"}},
 		WithDescription("runtime key"),
-		WithRedaction(RedactMask),
 		WithValidator(func(any) error { return nil }),
 		WithCatalogMetadata(meta),
 	); err != nil {
@@ -137,8 +136,8 @@ func TestCatalogReturnsRegisteredMetadataBeforeStart(t *testing.T) {
 	if summary.Namespace != "runtime" || summary.Key != "z" {
 		t.Fatalf("second key = %s/%s, want runtime/z", summary.Namespace, summary.Key)
 	}
-	if summary.Kind != "json" || summary.RuntimeClass != "read_live" || summary.Redaction != "mask" {
-		t.Fatalf("summary metadata = kind %q runtime %q redaction %q", summary.Kind, summary.RuntimeClass, summary.Redaction)
+	if summary.Kind != "json" || summary.RuntimeClass != "read_live" {
+		t.Fatalf("summary metadata = kind %q runtime %q", summary.Kind, summary.RuntimeClass)
 	}
 	if !summary.HasValidator {
 		t.Fatal("summary HasValidator = false, want true")
