@@ -44,7 +44,7 @@
 
 | Phase | Milestone | Epics | Status |
 |-------|-----------|-------|--------|
-| 1 | A multi-tenant Client with a tenant manager configured activates a tenant's scope on that tenant's first read, serves every later read of it from the cached scope with real revision and provenance, fires one `OnChange` per tenant with `Change.Tenant` set, and reads back its own multi-tenant writes — on Postgres and on MongoDB, proven against fakes | 1.0, 1.1, 1.2, 1.3 | Detailed |
+| 1 | A multi-tenant Client with a tenant manager configured activates a tenant's scope on that tenant's first read, serves every later read of it from the cached scope with real revision and provenance, fires one `OnChange` per tenant with `Change.Tenant` set, and reads back its own multi-tenant writes — on Postgres and on MongoDB, proven against fakes | 1.0, 1.1, 1.2, 1.3 | Complete |
 | 2 | Tenant-manager lifecycle events drive the same engine: `Client.HandleTenantLifecycle` activates, drops, blocks and rotates, a suspended or deleted tenant never re-activates from a read, and per-tenant metrics carry `tenant_id` up to `WithAggregateTenantThreshold` and `aggregate` above it | 2.1, 2.2 | Epic-level |
 | 3 | The whole path is proven on live backends: testcontainers Postgres and a Mongo replica set, two tenant databases each, activation gap, feed loss per tenant, tenant isolation, `-race` and goleak clean | 3.1, 3.2, 3.3 | Epic-level |
 
@@ -565,3 +565,24 @@ Every item above is answered in `index.md`; implementation may start on the affe
 - **D-T6** the docs lane's godoc sweep is read-only against root `api_*.go`; the `WithPostgresTenantManager` godoc is this lane's, and it must state: own database per tenant, one LISTEN backend per active tenant per replica, opaque revisions, and the shared-database refusal exactly as the code states it: a second feed whose DSN names a database another live feed of the same Store already listens on (the signature of schema-per-tenant, or of a connector handing two tenants one connection string) is refused at `Subscribe` with `ErrSharedDatabaseUnsupported`, because NOTIFY is database-wide; a pinned `search_path` alone is not refused, and two processes sharing one database cannot see each other, so one database per tenant stays the operator's responsibility beyond this one process (`ErrSharedDatabaseUnsupported` is defined by storage in `internal/postgres/connector.go`; this lane exports the root alias in `api_errors.go`).
 - **D-T7** frozen: (1) `ErrTenantManagerBackendMismatch = errors.New("systemplane: tenant manager does not match the client backend")` in FC-6; (2) `WithAggregateTenantThreshold(n int) Option`, `DefaultAggregateTenantThreshold = 1000`, non-positive disables the collapse, in FC-10; (3) multi-tenant `OnChange` without a tenant manager returns `ErrNotSupportedInMultiTenant`, in FC-4; (4) metric names as proposed, meter `systemplane.engine`, in the new FC-12.
 - Tenant identity in ctx: read `tmcore.GetTenantIDContext(ctx)`, set `tmcore.ContextWithTenantID(ctx, id)` (lib-commons/v7 `commons/tenant-manager/core/context.go`). The acceptance suite uses the same carrier.
+
+## Phase 1 close (2026-09-25)
+
+- The harness returned PASS. Three Mediums it left to the orchestrator are fixed on the branch:
+  a multi-tenant Client with no tenant manager now grades every per-request read with the
+  registered validator, as the tenant-managed fall-through already did (`c9805e0`); both
+  tenant-manager options state that `mgr` must be the Manager the tenant-manager middleware
+  registers under the `WithModule` name, since writes use the middleware's database and cached
+  reads use `mgr`'s (`7ecf20f`); a reconcile test waits through `mustReceive` (`b4cce28`).
+- An independent review (PASS, seven Lows) and a contrarian (one Medium: a false Snapshot
+  sentence this delta wrote) ran over that delta; `fd17605` fixes the Medium and the Lows it
+  kept. Snapshot's null guard and `decodePublished`'s were both unreachable once every read is
+  graded, and both are deleted.
+- **Deviation from § What this lane MUST NOT touch.** Grading the connector-less read made
+  sentences false in `api_group.go`, `api_group_test.go`, `api_group_publish_test.go`,
+  `internal/group/status_test.go`, `CLAUDE.md` and `MIGRATION-v4.md`, so this lane edited them.
+  No lane that owns them runs now: `groups` is merged, and `docs` Phase 2 waits for this merge.
+- Left stale for the `docs` lane (Epic 2.2 README rebuild, Epic 2.3 godoc sweep): CLAUDE.md's
+  multi-tenant bullet ("No in-process cache. No LISTEN/NOTIFY."), `doc.go:23-25` and
+  `README.md:34-36` still describe multi-tenant mode without the tenant manager.
+
