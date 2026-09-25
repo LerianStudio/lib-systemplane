@@ -54,10 +54,9 @@ type Logger interface {
 // accepted, disables tracing entirely, and clears a provider set by an earlier
 // option.
 //
-// Meter is declared but not yet called: the v3 manager was this library's only
-// meter consumer and is gone, and the FC-12 engine instruments are wired by the
-// engine-tenants lane. It stays on the interface so that wiring is not a
-// breaking change to a consumer's provider.
+// The engine asks Meter for meter systemplane.engine, which reports tracked
+// scopes, cached entries, changefeed events and disconnects, cache reads (hit or
+// miss) and a tenant's first-activation latency; a nil Telemetry records none.
 type Telemetry interface {
 	Tracer(name string) (trace.Tracer, error)
 	Meter(name string) (metric.Meter, error)

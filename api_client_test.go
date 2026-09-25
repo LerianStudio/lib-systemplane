@@ -320,6 +320,23 @@ func TestPublicTenantManagerOptionsExist(t *testing.T) {
 	}
 }
 
+// TestPublicAggregateTenantThresholdExists pins FC-10 at the facade: the
+// threshold option and its frozen default of 1000.
+func TestPublicAggregateTenantThresholdExists(t *testing.T) {
+	t.Parallel()
+
+	if DefaultAggregateTenantThreshold != 1000 {
+		t.Errorf("DefaultAggregateTenantThreshold = %d, want 1000", DefaultAggregateTenantThreshold)
+	}
+
+	c, err := NewPostgres(nil, "", WithMultiTenantEnabled(), WithAggregateTenantThreshold(1))
+	if err != nil {
+		t.Fatalf("NewPostgres with WithAggregateTenantThreshold: %v", err)
+	}
+
+	_ = c.Close()
+}
+
 // TestPublicGetEntryCarriesRevisionAndProvenance pins FC-5 at the facade: the
 // exported Entry carries the stored revision and provenance of the row backing
 // the value, and an unregistered key reports not ok.

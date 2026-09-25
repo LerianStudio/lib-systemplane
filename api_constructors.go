@@ -50,15 +50,27 @@ func WithLogger(l Logger) Option {
 	return internalclient.WithLogger(log.Adapt(l))
 }
 
-// WithTelemetry sets the OpenTelemetry provider used for tracing. A nil
-// provider disables tracing and clears one set by an earlier option. Nothing
-// in v4 asks the provider for a meter yet; see [Telemetry].
+// WithTelemetry sets the OpenTelemetry provider the backends trace through and
+// the engine records its metrics on, under meter systemplane.engine. A nil
+// provider disables both and clears one set by an earlier option; see [Telemetry].
 func WithTelemetry(t Telemetry) Option {
 	if log.IsNil(t) {
 		return internalclient.WithTelemetry(nil)
 	}
 
 	return internalclient.WithTelemetry(t)
+}
+
+// DefaultAggregateTenantThreshold is the tenant scope count above which the
+// engine's metrics report tenant_id=aggregate when no
+// [WithAggregateTenantThreshold] is passed.
+const DefaultAggregateTenantThreshold = internalclient.DefaultAggregateTenantThreshold
+
+// WithAggregateTenantThreshold makes the engine's metrics report tenant_id as
+// the literal aggregate once more than n tenant scopes are active, bounding its
+// cardinality. Last-wins; a non-positive n keeps per-tenant ids at any count.
+func WithAggregateTenantThreshold(n int) Option {
+	return internalclient.WithAggregateTenantThreshold(n)
 }
 
 // WithPollInterval enables polling mode for MongoDB instead of change streams.
