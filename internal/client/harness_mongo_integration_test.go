@@ -13,10 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/LerianStudio/lib-commons/v7/commons"
+	tmclient "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/client"
 	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
 	tmmongo "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/mongo"
-	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/client"
 	"github.com/testcontainers/testcontainers-go"
 	mongocontainer "github.com/testcontainers/testcontainers-go/modules/mongodb"
@@ -124,14 +123,10 @@ func (s *mongoServer) awaitWritablePrimary(ctx context.Context) error {
 	}
 }
 
-// mongoTenantEnv is a tenant-managed MongoDB Client on srv with one
-// registered string key, wired to a fake tenant manager through the real
-// lib-commons client and manager.
+// mongoTenantEnv is a tenant-managed MongoDB Client on srv.
 type mongoTenantEnv struct {
-	c   *client.Client
+	*tenantEnv
 	srv *mongoServer
-	tm  *fakeTenantManager
-	log *captureLogger
 }
 
 // newMongoTenantClient is a started newMongoTenantEnv on the replica set.
@@ -150,61 +145,30 @@ func newMongoTenantEnv(t *testing.T, srv *mongoServer, opts ...client.Option) *m
 
 	srv.start(t)
 
-	// lib-commons refuses a plaintext tenant connection unless told otherwise;
-	// the container serves no TLS.
-	t.Setenv(commons.EnvAllowInsecureTLS, "true")
+	env := &mongoTenantEnv{srv: srv, tenantEnv: newTenantEnv(t, func(tmc *tmclient.Client, all ...client.Option) (*client.Client, error) {
+		mgr := tmmongo.NewManager(tmc, "systemplane-it",
+			tmmongo.WithModule(tenantModule),
+			tmmongo.WithConnectionsCheckInterval(0),
+		)
+		closeAtEnd(t, mgr)
 
-	tm := newFakeTenantManager(t)
+		return client.NewMongoDB(nil, "", append(all, client.WithMongoTenantManager(mgr))...)
+	}, opts...)}
 
-	mgr := tmmongo.NewManager(tm.client(t), "systemplane-it",
-		tmmongo.WithModule(tenantModule),
-		tmmongo.WithConnectionsCheckInterval(0),
-	)
-	t.Cleanup(func() {
-		if err := mgr.Close(context.Background()); err != nil {
-			t.Errorf("close mongo tenant manager: %v", err)
-		}
-	})
+	env.add = func(t *testing.T, id string) liveTenant {
+		m := env.tenant(t, id)
 
-	logger := &captureLogger{}
-
-	c, err := client.NewMongoDB(nil, "", append([]client.Option{
-		client.WithMultiTenantEnabled(),
-		client.WithMongoTenantManager(mgr),
-		client.WithLogger(logger),
-	}, opts...)...)
-	if err != nil {
-		t.Fatalf("NewMongoDB: %v", err)
+		return liveTenant{m.tenantRef, func(t *testing.T, v string) client.Entry { return m.write(t, tenantKey, v, 1) }, m.stored}
 	}
 
-	t.Cleanup(func() {
-		if err := c.Close(); err != nil {
-			t.Errorf("close client: %v", err)
-		}
-	})
-
-	if err := c.Register(tenantNS, tenantKey, "default"); err != nil {
-		t.Fatalf("Register: %v", err)
-	}
-
-	return &mongoTenantEnv{c: c, srv: srv, tm: tm, log: logger}
+	return env
 }
 
-func (e *mongoTenantEnv) start(t *testing.T) {
-	t.Helper()
-
-	if err := e.c.Start(t.Context()); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-}
-
-// mongoTenant is one tenant: a database name nothing else uses, the test's
-// own handle on it, and the request ctx the middleware would build.
+// mongoTenant is one tenant: a database name nothing else uses and the
+// test's own handle on it.
 type mongoTenant struct {
-	id     string
-	dbName string
-	db     *mongo.Database
-	ctx    context.Context
+	tenantRef
+	db *mongo.Database
 }
 
 func (e *mongoTenantEnv) tenant(t *testing.T, id string) mongoTenant {
@@ -218,20 +182,7 @@ func (e *mongoTenantEnv) tenant(t *testing.T, id string) mongoTenant {
 	ctx := tmcore.ContextWithTenantID(t.Context(), id)
 	ctx = tmcore.ContextWithMB(ctx, db, tenantModule)
 
-	return mongoTenant{id: id, dbName: name, db: db, ctx: ctx}
-}
-
-// cacheOnly carries the tenant id and no database: a per-request read through
-// it fails with ErrTenantConnectionMissing, so only the tenant's cached scope answers.
-func (m mongoTenant) cacheOnly(t *testing.T) context.Context {
-	return tmcore.ContextWithTenantID(t.Context(), m.id)
-}
-
-// seed writes value for the knob at revision 1; see write.
-func (m mongoTenant) seed(t *testing.T, value string) client.Entry {
-	t.Helper()
-
-	return m.write(t, tenantKey, value, 1)
+	return mongoTenant{tenantRef: tenantRef{id: id, dbName: name, ctx: ctx}, db: db}
 }
 
 // write upserts value for key at revision straight into the tenant's
@@ -266,13 +217,15 @@ func (m mongoTenant) write(t *testing.T, key string, value any, revision int64) 
 	return want
 }
 
-// stored reads the key's value and revision back from the tenant's collection.
+// stored reads the key's document from the tenant's collection as a read reports it.
 func (m mongoTenant) stored(t *testing.T) client.Entry {
 	t.Helper()
 
 	var doc struct {
-		Value    string `bson:"value"`
-		Revision int64  `bson:"revision"`
+		Value     string    `bson:"value"`
+		Revision  int64     `bson:"revision"`
+		UpdatedAt time.Time `bson:"updated_at"`
+		UpdatedBy string    `bson:"updated_by"`
 	}
 
 	if err := m.db.Collection(entriesColl).FindOne(t.Context(), bson.D{{Key: "_id", Value: bson.D{
@@ -281,32 +234,12 @@ func (m mongoTenant) stored(t *testing.T) client.Entry {
 		t.Fatalf("read row on %s: %v", m.dbName, err)
 	}
 
-	e := client.Entry{Revision: doc.Revision}
+	e := client.Entry{Revision: doc.Revision, UpdatedAt: doc.UpdatedAt, UpdatedBy: doc.UpdatedBy}
 	if err := json.Unmarshal([]byte(doc.Value), &e.Value); err != nil {
 		t.Fatalf("decode row on %s: %v", m.dbName, err)
 	}
 
 	return e
-}
-
-// activate reads once through each tenant's ctx and waits for its scope to come up.
-func (e *mongoTenantEnv) activate(t *testing.T, tenants ...mongoTenant) {
-	t.Helper()
-
-	for _, tn := range tenants {
-		if _, _, err := e.c.Get(tn.ctx, tenantNS, tenantKey); err != nil {
-			t.Fatalf("%s first read: %v", tn.id, err)
-		}
-
-		e.log.waitFor(t, log.LevelInfo, msgScopeActivated, tn.id)
-	}
-}
-
-// servesCached reports whether tn's cached scope serves want's value at want's revision.
-func (e *mongoTenantEnv) servesCached(t *testing.T, tn mongoTenant, want client.Entry) bool {
-	got, ok, err := e.c.GetEntry(tn.cacheOnly(t), tenantNS, tenantKey)
-
-	return err == nil && ok && got.Value == want.Value && got.Revision == want.Revision
 }
 
 // changeStreamIDs lists the change-stream cursors open on dbName's collection
@@ -363,18 +296,14 @@ func killChangeStream(t *testing.T, dbName string) {
 	}
 }
 
-// requireChangeStreams asserts dbName reaches want change streams and holds
-// that count for censusHold, inside the activation retry cooldown.
-func requireChangeStreams(t *testing.T, dbName string, want int) {
-	t.Helper()
+// changeStreams counts dbName's change-stream cursors, idle ones included, so
+// a cursor between two getMores still counts (P3-6).
+func changeStreams(t *testing.T, dbName string) int {
+	return len(changeStreamIDs(t, dbName, true))
+}
 
-	eventually(t, fmt.Sprintf("%d change streams on %s", want, dbName), func() bool {
-		return len(changeStreamIDs(t, dbName, true)) == want
-	})
-
-	for deadline := time.Now().Add(censusHold); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
-		if got := len(changeStreamIDs(t, dbName, true)); got != want {
-			t.Fatalf("%s: %d change streams during the hold, want %d", dbName, got, want)
-		}
-	}
+// inFlightChangeStreams counts only those in a getMore: a live feed is almost
+// always in one, and a stopped one leaves its cursor idle on the server.
+func inFlightChangeStreams(t *testing.T, dbName string) int {
+	return len(changeStreamIDs(t, dbName, false))
 }

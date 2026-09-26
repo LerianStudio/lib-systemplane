@@ -32,13 +32,15 @@ import (
 )
 
 const (
-	tenantNS      = "it"
-	tenantKey     = "knob"
-	tenantModule  = "systemplane"
-	signalTimeout = 15 * time.Second
-	censusHold    = time.Second
+	tenantNS         = "it"
+	tenantKey        = "knob"
+	tenantModule     = "systemplane"
+	signalTimeout    = 15 * time.Second
+	censusHold       = time.Second
+	deliveryDebounce = 50 * time.Millisecond
 
-	msgScopeActivated = "scope activated"
+	msgScopeActivated   = "scope activated"
+	msgActivationFailed = "scope activation failed; reads stay per-request until a later attempt"
 )
 
 // The one Postgres server of this binary; each test isolates itself with
@@ -207,22 +209,27 @@ func (l *captureLogger) WithGroup(string) log.Logger { return l }
 func (l *captureLogger) Enabled(int) bool            { return true }
 func (l *captureLogger) Sync(context.Context) error  { return nil }
 
+// count reports how many times msg was logged at level for tenant.
+func (l *captureLogger) count(level int, msg, tenant string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	n := 0
+
+	for _, e := range l.entries {
+		if e.level == level && e.msg == msg && e.tenant == tenant {
+			n++
+		}
+	}
+
+	return n
+}
+
 // waitFor blocks until msg was logged at level for tenant.
 func (l *captureLogger) waitFor(t *testing.T, level int, msg, tenant string) {
 	t.Helper()
 
-	eventually(t, fmt.Sprintf("%q for tenant %s", msg, tenant), func() bool {
-		l.mu.Lock()
-		defer l.mu.Unlock()
-
-		for _, e := range l.entries {
-			if e.level == level && e.msg == msg && e.tenant == tenant {
-				return true
-			}
-		}
-
-		return false
-	})
+	eventually(t, fmt.Sprintf("%q for tenant %s", msg, tenant), func() bool { return l.count(level, msg, tenant) > 0 })
 }
 
 // eventually polls cond until it holds, failing after signalTimeout.
@@ -240,45 +247,31 @@ func eventually(t *testing.T, what string, cond func() bool) {
 	}
 }
 
-// pgTenantEnv is a started, tenant-managed Postgres Client with one registered
-// string key, wired to a fake tenant manager through the real lib-commons
-// client and manager.
-type pgTenantEnv struct {
+// tenantEnv is a tenant-managed Client of either store with one registered
+// string key, wired to a fake tenant manager through the real lib-commons client.
+type tenantEnv struct {
 	c   *client.Client
 	tm  *fakeTenantManager
 	log *captureLogger
+	// add gives the Client a fresh tenant of its store (P3-8).
+	add func(t *testing.T, id string) liveTenant
 }
 
-func newPGTenantClient(t *testing.T, opts ...client.Option) *pgTenantEnv {
+// newTenantEnv registers the key on the Client open builds over the fake
+// manager's client with opts, and leaves Start to the caller.
+func newTenantEnv(t *testing.T, open func(*tmclient.Client, ...client.Option) (*client.Client, error), opts ...client.Option) *tenantEnv {
 	t.Helper()
-
-	sharedPG(t)
 
 	// lib-commons refuses a plaintext tenant connection unless told otherwise;
 	// the container serves no TLS.
 	t.Setenv(commons.EnvAllowInsecureTLS, "true")
 
 	tm := newFakeTenantManager(t)
-
-	mgr := tmpostgres.NewManager(tm.client(t), "systemplane-it",
-		tmpostgres.WithModule(tenantModule),
-		tmpostgres.WithConnectionsCheckInterval(0),
-	)
-	t.Cleanup(func() {
-		if err := mgr.Close(context.Background()); err != nil {
-			t.Errorf("close postgres tenant manager: %v", err)
-		}
-	})
-
 	logger := &captureLogger{}
 
-	c, err := client.NewPostgres(nil, "", append([]client.Option{
-		client.WithMultiTenantEnabled(),
-		client.WithPostgresTenantManager(mgr),
-		client.WithLogger(logger),
-	}, opts...)...)
+	c, err := open(tm.client(t), append([]client.Option{client.WithMultiTenantEnabled(), client.WithLogger(logger)}, opts...)...)
 	if err != nil {
-		t.Fatalf("NewPostgres: %v", err)
+		t.Fatalf("open client: %v", err)
 	}
 
 	t.Cleanup(func() {
@@ -291,20 +284,163 @@ func newPGTenantClient(t *testing.T, opts ...client.Option) *pgTenantEnv {
 		t.Fatalf("Register: %v", err)
 	}
 
-	if err := c.Start(t.Context()); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-
-	return &pgTenantEnv{c: c, tm: tm, log: logger}
+	return &tenantEnv{c: c, tm: tm, log: logger}
 }
 
-// pgTenant is one tenant: its own database with the schema applied, the
-// test's own handle on it, and the request ctx the middleware would build.
-type pgTenant struct {
+// closeAtEnd closes a tenant manager once the test ends: open registers it
+// before newTenantEnv registers the Client, so it closes after the Client.
+func closeAtEnd(t *testing.T, mgr interface{ Close(context.Context) error }) {
+	t.Cleanup(func() {
+		if err := mgr.Close(context.Background()); err != nil {
+			t.Errorf("close tenant manager: %v", err)
+		}
+	})
+}
+
+func (e *tenantEnv) start(t *testing.T) {
+	t.Helper()
+
+	if err := e.c.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+}
+
+// activate reads once through each tenant's ctx and waits for its scope to come up.
+func (e *tenantEnv) activate(t *testing.T, tenants ...interface{ ref() tenantRef }) {
+	t.Helper()
+
+	for _, tn := range tenants {
+		r := tn.ref()
+
+		if _, _, err := e.c.Get(r.ctx, tenantNS, tenantKey); err != nil {
+			t.Fatalf("%s first read: %v", r.id, err)
+		}
+
+		e.log.waitFor(t, log.LevelInfo, msgScopeActivated, r.id)
+	}
+}
+
+// tenantRef is what a tenant of either store carries: its id, its database's
+// name and the request ctx the middleware would build (P3-5).
+type tenantRef struct {
 	id     string
 	dbName string
-	db     *sql.DB
 	ctx    context.Context
+}
+
+func (r tenantRef) ref() tenantRef { return r }
+
+// cacheOnly carries the tenant id and no database: a per-request read through
+// it fails with ErrTenantConnectionMissing, so only the tenant's cached scope answers.
+func (r tenantRef) cacheOnly(t *testing.T) context.Context {
+	return tmcore.ContextWithTenantID(t.Context(), r.id)
+}
+
+// liveTenant is a tenant as the scenarios both stores share drive it: seed
+// writes the key's row behind the Client, stored reads it back as a read reports it.
+type liveTenant struct {
+	tenantRef
+	seed   func(t *testing.T, value string) client.Entry
+	stored func(t *testing.T) client.Entry
+}
+
+// readEntry is the read through ctx; the key is registered, so it answers or fails.
+func readEntry(t *testing.T, c *client.Client, ctx context.Context, what string) client.Entry {
+	t.Helper()
+
+	got, ok, err := c.GetEntry(ctx, tenantNS, tenantKey)
+	if err != nil || !ok {
+		t.Fatalf("%s: GetEntry = ok %v, err %v", what, ok, err)
+	}
+
+	return got
+}
+
+func sameEntry(got, want client.Entry) bool {
+	return got.Value == want.Value && got.Revision == want.Revision && got.UpdatedAt.Equal(want.UpdatedAt) &&
+		got.UpdatedBy == want.UpdatedBy && got.Stale == want.Stale
+}
+
+// requireEntry asserts the read through ctx serves want, provenance and Stale included.
+func requireEntry(t *testing.T, c *client.Client, ctx context.Context, want client.Entry, what string) {
+	t.Helper()
+
+	if got := readEntry(t, c, ctx, what); !sameEntry(got, want) {
+		t.Fatalf("%s: GetEntry = %+v, want %+v", what, got, want)
+	}
+}
+
+// awaitEntry polls the read through ctx until it serves want.
+func awaitEntry(t *testing.T, c *client.Client, ctx context.Context, want client.Entry, what string) {
+	t.Helper()
+
+	var got client.Entry
+
+	defer func() {
+		if t.Failed() {
+			t.Logf("%s: last GetEntry = %+v, want %+v", what, got, want)
+		}
+	}()
+
+	eventually(t, what, func() bool {
+		got = readEntry(t, c, ctx, what)
+
+		return sameEntry(got, want)
+	})
+}
+
+// census counts the feeds open on a tenant database from the backend's own
+// inventory (P3-6).
+type census func(t *testing.T, dbName string) int
+
+// requireFeeds asserts dbName's census reaches want and holds it for
+// censusHold, inside the activation retry cooldown.
+func requireFeeds(t *testing.T, feeds census, dbName string, want int) {
+	t.Helper()
+
+	eventually(t, fmt.Sprintf("%d feeds on %s", want, dbName), func() bool { return feeds(t, dbName) == want })
+
+	for deadline := time.Now().Add(censusHold); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		if got := feeds(t, dbName); got != want {
+			t.Fatalf("%s: %d feeds during the hold, want %d", dbName, got, want)
+		}
+	}
+}
+
+// pgTenantEnv is a started tenant-managed Postgres Client.
+type pgTenantEnv struct{ *tenantEnv }
+
+func newPGTenantClient(t *testing.T, opts ...client.Option) *pgTenantEnv {
+	t.Helper()
+
+	sharedPG(t)
+
+	env := &pgTenantEnv{newTenantEnv(t, func(tmc *tmclient.Client, all ...client.Option) (*client.Client, error) {
+		mgr := tmpostgres.NewManager(tmc, "systemplane-it",
+			tmpostgres.WithModule(tenantModule),
+			tmpostgres.WithConnectionsCheckInterval(0),
+		)
+		closeAtEnd(t, mgr)
+
+		return client.NewPostgres(nil, "", append(all, client.WithPostgresTenantManager(mgr))...)
+	}, opts...)}
+
+	env.add = func(t *testing.T, id string) liveTenant {
+		p := env.tenant(t, id)
+
+		return liveTenant{p.tenantRef, func(t *testing.T, v string) client.Entry { return writeRow(t, p.db, v) }, p.stored}
+	}
+
+	env.start(t)
+
+	return env
+}
+
+// pgTenant is one tenant: its own database with the schema applied and the
+// test's own handle on it.
+type pgTenant struct {
+	tenantRef
+	db *sql.DB
 }
 
 func (e *pgTenantEnv) tenant(t *testing.T, id string) pgTenant {
@@ -348,12 +484,15 @@ func (e *pgTenantEnv) tenant(t *testing.T, id string) pgTenant {
 	ctx := tmcore.ContextWithTenantID(t.Context(), id)
 	ctx = tmcore.ContextWithPG(ctx, dbresolver.New(dbresolver.WithPrimaryDBs(db)), tenantModule)
 
-	return pgTenant{id: id, dbName: name, db: db, ctx: ctx}
+	return pgTenant{tenantRef: tenantRef{id: id, dbName: name, ctx: ctx}, db: db}
 }
 
-// seed writes value for the key straight into the tenant's database and
-// returns the row as a read should report it.
-func (p pgTenant) seed(t *testing.T, value string) client.Entry {
+// writeRow upserts value on q as the store does, behind the Client's back,
+// and returns the row a read should report; the trigger draws the revision.
+func writeRow(t *testing.T, q interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}, value string,
+) client.Entry {
 	t.Helper()
 
 	raw, err := json.Marshal(value)
@@ -361,17 +500,41 @@ func (p pgTenant) seed(t *testing.T, value string) client.Entry {
 		t.Fatalf("marshal %q: %v", value, err)
 	}
 
-	want := client.Entry{Value: value, UpdatedBy: "seed"}
+	want := client.Entry{Value: value, UpdatedBy: "direct"}
 
-	if err := p.db.QueryRowContext(t.Context(),
+	if err := q.QueryRowContext(t.Context(),
 		`INSERT INTO systemplane_entries (namespace, "key", value, updated_by) VALUES ($1, $2, $3::jsonb, $4)
+		 ON CONFLICT (namespace, "key") DO UPDATE SET value = EXCLUDED.value, updated_at = now(), updated_by = EXCLUDED.updated_by
 		 RETURNING revision, updated_at`,
 		tenantNS, tenantKey, string(raw), want.UpdatedBy,
 	).Scan(&want.Revision, &want.UpdatedAt); err != nil {
-		t.Fatalf("seed %s: %v", p.dbName, err)
+		t.Fatalf("write %q: %v", value, err)
 	}
 
 	return want
+}
+
+// stored reads the key's row from the tenant's database as a read should report it.
+func (p pgTenant) stored(t *testing.T) client.Entry {
+	t.Helper()
+
+	var (
+		raw []byte
+		e   client.Entry
+	)
+
+	if err := p.db.QueryRowContext(t.Context(),
+		`SELECT value, revision, updated_at, updated_by FROM systemplane_entries WHERE namespace = $1 AND "key" = $2`,
+		tenantNS, tenantKey,
+	).Scan(&raw, &e.Revision, &e.UpdatedAt, &e.UpdatedBy); err != nil {
+		t.Fatalf("read row on %s: %v", p.dbName, err)
+	}
+
+	if err := json.Unmarshal(raw, &e.Value); err != nil {
+		t.Fatalf("decode row on %s: %v", p.dbName, err)
+	}
+
+	return e
 }
 
 // listenBackends counts the LISTEN connections parked on dbName: a feed's
@@ -388,20 +551,4 @@ func listenBackends(t *testing.T, dbName string) int {
 	}
 
 	return n
-}
-
-// requireListenBackends asserts dbName reaches want LISTEN connections and
-// holds that count for censusHold, inside the activation retry cooldown.
-func requireListenBackends(t *testing.T, dbName string, want int) {
-	t.Helper()
-
-	eventually(t, fmt.Sprintf("%d LISTEN connections on %s", want, dbName), func() bool {
-		return listenBackends(t, dbName) == want
-	})
-
-	for deadline := time.Now().Add(censusHold); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
-		if got := listenBackends(t, dbName); got != want {
-			t.Fatalf("%s: %d LISTEN connections during the hold, want %d", dbName, got, want)
-		}
-	}
 }

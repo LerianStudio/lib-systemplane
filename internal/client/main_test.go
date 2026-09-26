@@ -28,8 +28,6 @@ func TestMain(m *testing.M) {
 		if err := goleak.Find(
 			// testcontainers' Reaper lives for the whole process by design.
 			goleak.IgnoreAnyFunction("github.com/testcontainers/testcontainers-go.(*Reaper).connect.func1"),
-			// Pool maintenance of a caller-owned *sql.DB, never closed by the store.
-			goleak.IgnoreAnyFunction("github.com/jackc/pgx/v5/pgxpool.(*Pool).backgroundHealthCheck"),
 			// HTTP keep-alive of testcontainers' Docker client.
 			goleak.IgnoreAnyFunction("net/http.(*persistConn).readLoop"),
 			goleak.IgnoreAnyFunction("net/http.(*persistConn).writeLoop"),
