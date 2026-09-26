@@ -52,7 +52,7 @@ func newMetrics(t store.Telemetry, threshold int, logger log.Logger, scopes func
 	m := &metrics{threshold: int64(threshold)}
 	m.aggregate = m.readOptions(aggregateTenant)
 
-	var errEvents, errDisconnects, errReads, errActivation, errGauges error
+	var errEvents, errDisconnects, errReads, errActivation error
 
 	m.events, errEvents = meter.Int64Counter("systemplane.changefeed_events_total",
 		metric.WithDescription("Changefeed events received, per scope"))
@@ -68,13 +68,16 @@ func newMetrics(t store.Telemetry, threshold int, logger log.Logger, scopes func
 	entries, errEntries := meter.Int64ObservableGauge("systemplane.cache_entries",
 		metric.WithDescription("Entries cached, per scope"))
 
-	m.gauges, errGauges = meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
-		m.observe(o, active, entries, scopes())
+	err = errors.Join(errEvents, errDisconnects, errReads, errActivation, errActive, errEntries)
+	if err == nil {
+		m.gauges, err = meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+			m.observe(o, active, entries, scopes())
 
-		return nil
-	}, active, entries)
+			return nil
+		}, active, entries)
+	}
 
-	if err := errors.Join(errEvents, errDisconnects, errReads, errActivation, errActive, errEntries, errGauges); err != nil {
+	if err != nil {
 		logger.Log(context.Background(), log.LevelDebug, "engine metrics disabled: instrument refused", []log.Field{log.Err(err)})
 
 		return nil
