@@ -258,8 +258,6 @@ func TestIntegration_PostgresSuspendedTenantKeepsNoFeed(t *testing.T) {
 	suspendedTenantKeepsNoFeed(t, pgBackend)
 }
 
-// Only a getMore counts here: a stopped Mongo feed leaves its cursor idle on
-// the server until the cursor times out, a store defect this lane does not own.
 func TestIntegration_MongoSuspendedTenantKeepsNoFeed(t *testing.T) {
-	suspendedTenantKeepsNoFeed(t, backend{open: mongoBackend.open, feeds: inFlightChangeStreams})
+	suspendedTenantKeepsNoFeed(t, mongoBackend)
 }

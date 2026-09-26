@@ -320,9 +320,3 @@ func killChangeStream(t *testing.T, logs *captureLogger, tn tenantRef) {
 func changeStreams(t *testing.T, dbName string) int {
 	return len(changeStreamIDs(t, dbName, true))
 }
-
-// inFlightChangeStreams counts only those in a getMore: a live feed is almost
-// always in one, and a stopped one leaves its cursor idle on the server.
-func inFlightChangeStreams(t *testing.T, dbName string) int {
-	return len(changeStreamIDs(t, dbName, false))
-}
