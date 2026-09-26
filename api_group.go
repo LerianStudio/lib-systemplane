@@ -359,8 +359,8 @@ type Applied[T any] struct {
 // that has accepted nothing, so a function that refused everything can report
 // the very revision the scope desires. Read LastErr for that rejection; with no
 // function registered, nothing applies the document at all. A delivery in
-// flight also leaves Applied behind with no error, because Status is a
-// point-in-time read rather than a transaction.
+// flight also leaves Applied behind without adding an error, because Status is
+// a point-in-time read rather than a transaction.
 type ApplyStatus struct {
 	Tenant  string
 	Desired int64 // latest published revision
