@@ -1727,6 +1727,7 @@ func TestSetThenGetReturnsNewValue(t *testing.T) {
 	// than assumed, so the assertion pins the hand-off and not a literal.
 	s.mu.Lock()
 	wantRevision := s.revision
+	persistedAt := s.entries[memKey("ns", "k")].UpdatedAt
 	s.mu.Unlock()
 
 	got, ok, err := c.Get(context.Background(), "ns", "k")
@@ -1749,6 +1750,15 @@ func TestSetThenGetReturnsNewValue(t *testing.T) {
 
 	if entry.UpdatedBy != "actor" {
 		t.Errorf("UpdatedBy: got %q, want %q", entry.UpdatedBy, "actor")
+	}
+
+	// MongoDB stores milliseconds: a finer stamp is cached but never persisted.
+	if persistedAt.Nanosecond()%int(time.Millisecond) != 0 {
+		t.Errorf("persisted UpdatedAt %v has a sub-millisecond part no backend stores", persistedAt)
+	}
+
+	if !entry.UpdatedAt.Equal(persistedAt) {
+		t.Errorf("UpdatedAt: got %v, want the persisted %v", entry.UpdatedAt, persistedAt)
 	}
 }
 
