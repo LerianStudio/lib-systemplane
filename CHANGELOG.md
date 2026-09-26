@@ -1,5 +1,22 @@
 # Lib-systemplane Changelog
 
+## [4.1.0](https://github.com/LerianStudio/lib-systemplane/releases/tag/v4.1.0)
+
+Features:
+- Introduced a validator that processes write operations exclusively. (@fredcamaral)
+
+Fixes:
+- Corrected the client behavior to ensure a key accepts only one type of validator in refusal scenarios. (@fredcamaral)
+
+Improvements:
+- Enhanced documentation to align the write-only validator details with its actual behavior. (@fredcamaral)
+- Updated documentation to include information about the write-only validator. (@fredcamaral)
+- Recorded the cut of version `v4.0.0` and officially closed the `v4` plan. (@fredcamaral)
+
+[Compare changes](https://github.com/LerianStudio/lib-systemplane/compare/v4.0.0...v4.1.0)
+
+---
+
 ## [3.0.1](https://github.com/LerianStudio/lib-systemplane/releases/tag/v3.0.1)
 
 Fixes:
