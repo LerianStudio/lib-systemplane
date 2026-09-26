@@ -43,7 +43,7 @@ func newMetrics(t store.Telemetry, threshold int, logger log.Logger, scopes func
 	}
 
 	meter, err := t.Meter("systemplane.engine")
-	if err != nil {
+	if err != nil || meter == nil {
 		logger.Log(context.Background(), log.LevelDebug, "engine metrics disabled: no meter", []log.Field{log.Err(err)})
 
 		return nil

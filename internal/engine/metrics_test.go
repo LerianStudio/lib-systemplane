@@ -11,6 +11,7 @@ import (
 	"github.com/LerianStudio/lib-observability/v4/tracing"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
@@ -199,6 +200,11 @@ func TestMetricsCollapseTenantIDAboveTheThreshold(t *testing.T) {
 	}
 }
 
+// nilMeterTelemetry hands out a nil meter without an error.
+type nilMeterTelemetry struct{ store.Telemetry }
+
+func (nilMeterTelemetry) Meter(string) (metric.Meter, error) { return nil, nil }
+
 func TestMetricsWithoutAMeterRecordNothing(t *testing.T) {
 	tenant := store.Scope{Tenant: "t1"}
 
@@ -208,6 +214,7 @@ func TestMetricsWithoutAMeterRecordNothing(t *testing.T) {
 	}{
 		{"no telemetry", nil},
 		{"a telemetry whose Meter fails", (*tracing.Telemetry)(nil)},
+		{"a telemetry whose Meter returns nil", nilMeterTelemetry{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fs := newFakeStore()
