@@ -1,5 +1,7 @@
 # Migrating to lib-systemplane v3
 
+This document covers v2 → v3 only. For v4, see [MIGRATION-v4.md](MIGRATION-v4.md).
+
 v3 has one job: **stop lib-observability's major version from propagating
 through this library's public API.**
 
@@ -60,8 +62,7 @@ around the problem. The replacement interfaces have no such method.
 Nothing else in the public API moved. `NewPostgres`, `NewMongoDB`, `Register`,
 `Start`, `Close`, every typed getter, `Set`, `Delete`, `List`, `Catalog`,
 `OnChange`, the sentinel errors, the key options, `admin.Mount`,
-`admin.MountCatalog`, `SchemaSQL`, `DefaultSeedSQL` and `NewForTesting` are
-untouched.
+`admin.MountCatalog`, `SchemaSQL` and `NewForTesting` are untouched.
 
 ### The two new types
 

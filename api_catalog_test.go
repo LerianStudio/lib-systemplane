@@ -5,21 +5,28 @@ package systemplane
 import (
 	"context"
 	"testing"
+
+	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
 type apiCatalogStore struct{}
 
 func (apiCatalogStore) Start(context.Context) error { return nil }
 func (apiCatalogStore) Close() error                { return nil }
-func (apiCatalogStore) Get(context.Context, string, string) (TestEntry, bool, error) {
+func (apiCatalogStore) Get(context.Context, TestScope, string, string) (TestEntry, bool, error) {
 	return TestEntry{}, false, nil
 }
-func (apiCatalogStore) Set(context.Context, TestEntry) error { return nil }
-func (apiCatalogStore) Delete(context.Context, string, string, string) error {
+func (apiCatalogStore) Set(context.Context, TestScope, TestEntry) (int64, error) { return 0, nil }
+func (apiCatalogStore) Delete(context.Context, TestScope, string, string, string) error {
 	return nil
 }
-func (apiCatalogStore) List(context.Context) ([]TestEntry, error) { return nil, nil }
-func (apiCatalogStore) Subscribe(context.Context, func(TestEvent)) (func(), error) {
+func (apiCatalogStore) List(context.Context, TestScope) ([]TestEntry, error) { return nil, nil }
+func (apiCatalogStore) Subscribe(_ context.Context, _ TestScope, fn func(TestEvent)) (func(), error) {
+	// Announce a connected changefeed (FC-2) so the engine's first reconcile
+	// runs and Start returns. This store holds nothing, so Set stays at
+	// revision 0.
+	fn(TestEvent{Op: store.OpResync})
+
 	return func() {}, nil
 }
 
@@ -31,7 +38,6 @@ func TestPublicCatalogFacade(t *testing.T) {
 
 	if err := c.Register("ns", "k", 1,
 		WithDescription("description"),
-		WithRedaction(RedactFull),
 		WithCatalogMetadata(CatalogKeyMetadata{
 			Kind:         "integer",
 			RuntimeClass: "read_live",
@@ -53,7 +59,7 @@ func TestPublicCatalogFacade(t *testing.T) {
 	if c.CatalogService() != "public-service" {
 		t.Fatalf("CatalogService = %q, want public-service", c.CatalogService())
 	}
-	if len(catalog.Keys) != 1 || catalog.Keys[0].Redaction != RedactFull.String() {
+	if len(catalog.Keys) != 1 {
 		t.Fatalf("catalog keys = %#v", catalog.Keys)
 	}
 

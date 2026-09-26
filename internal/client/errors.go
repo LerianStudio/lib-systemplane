@@ -3,7 +3,8 @@ package client
 import (
 	"errors"
 
-	"github.com/LerianStudio/lib-systemplane/v3/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/engine"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
 // Sentinel errors returned by Client methods.
@@ -11,13 +12,15 @@ var (
 	// ErrClosed is returned when a method is called on a nil or closed Client.
 	ErrClosed = errors.New("systemplane: client is closed or nil")
 
-	// ErrNotStarted is returned when a read/write is attempted before Start.
+	// ErrNotStarted is returned by Set and Delete before Start, and by a
+	// single-tenant write persisted while no scope was up to publish it.
 	ErrNotStarted = errors.New("systemplane: client not started")
 
 	// ErrRegisterAfterStart is returned when Register is called after Start.
 	ErrRegisterAfterStart = errors.New("systemplane: register called after start")
 
-	// ErrUnknownKey is returned when Get or Set references an unregistered key.
+	// ErrUnknownKey is returned by Set, Delete and OnChange for an unregistered
+	// key; a read reports one as ok false.
 	ErrUnknownKey = errors.New("systemplane: unknown key")
 
 	// ErrValidation is returned when a value fails its registered validator,
@@ -36,12 +39,22 @@ var (
 	ErrDuplicateKey = errors.New("systemplane: duplicate key")
 
 	// ErrNotSupportedInMultiTenant is returned by OnChange (and any other
-	// process-wide changefeed primitive) when the Client was constructed with
-	// WithMultiTenantEnabled().
+	// process-wide changefeed primitive) on a multi-tenant Client with no
+	// tenant manager.
 	ErrNotSupportedInMultiTenant = store.ErrNotSupportedInMultiTenant
 
-	// ErrTenantConnectionMissing is returned when a method runs in multi-tenant
-	// mode and the caller's context carries no tenant database for the
-	// configured module.
+	// ErrCloseTimeout is returned by Close when a subscriber callback was
+	// still running after the WithCloseTimeout bound elapsed. Aliased to
+	// engine.ErrCloseTimeout so errors.Is matches the error the engine
+	// actually returns, the same way ErrValidation aliases the store's.
+	ErrCloseTimeout = engine.ErrCloseTimeout
+
+	// ErrTenantConnectionMissing is returned in multi-tenant mode by a call that
+	// reaches the store while ctx carries no tenant database for the configured
+	// module; a read a tenant manager's cache serves needs none.
 	ErrTenantConnectionMissing = store.ErrTenantConnectionMissing
+
+	// ErrTenantManagerBackendMismatch is returned by a constructor handed the
+	// tenant manager of the other backend.
+	ErrTenantManagerBackendMismatch = errors.New("systemplane: tenant manager does not match the client backend")
 )

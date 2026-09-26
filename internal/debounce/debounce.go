@@ -1,15 +1,14 @@
-// Package debounce provides a trailing-edge, per-key debouncer used by the
-// systemplane Client to coalesce rapid change notifications into a single
-// callback invocation.
+// Package debounce provides a trailing-edge, per-key debouncer the engine uses
+// to coalesce a key's rapid changefeed notifications into one re-read of the
+// store.
 //
-// The Debouncer is generic on the key type (any Go comparable). Callers that
-// previously used string keys can continue doing so; callers on the changefeed
-// hot path use a struct key to avoid per-event string-concat allocations (see
-// systemplane/client.go onEvent).
+// The Debouncer is generic on the key type (any Go comparable); the engine's
+// changefeed keys it by a struct of scope, namespace and key, so an event costs
+// no string concatenation.
 package debounce
 
 import (
-	"fmt"
+	"context"
 	"sync"
 	"time"
 
@@ -84,7 +83,7 @@ func (d *Debouncer[K]) Submit(key K, fn func()) {
 
 	// Zero/negative window: synchronous invocation with panic recovery.
 	if d.window <= 0 {
-		d.invokeWithRecover(key, fn)
+		d.invokeWithRecover(fn)
 		return
 	}
 
@@ -107,8 +106,8 @@ func (d *Debouncer[K]) Submit(key K, fn func()) {
 	}
 }
 
-// Close cancels all pending timers and marks the debouncer as closed.
-// Further Submit calls become no-ops. Idempotent. Nil-receiver safe.
+// Close cancels all pending timers; later Submits schedule nothing, but a
+// zero or negative window still runs fn inline. Idempotent. Nil-receiver safe.
 func (d *Debouncer[K]) Close() {
 	if d == nil {
 		return
@@ -150,16 +149,21 @@ func (d *Debouncer[K]) fire(key K, generation uint64, fn func()) {
 
 	d.mu.Unlock()
 
-	d.invokeWithRecover(key, fn)
+	d.invokeWithRecover(fn)
 }
 
-// invokeWithRecover calls fn inside a deferred RecoverAndLog so that a
-// panicking callback cannot crash the process or break the debouncer.
-// The key is rendered with fmt.Sprint into the recovery component name
-// so crash logs identify which key's callback blew up regardless of
-// whether K is a string, struct, or something else.
-func (d *Debouncer[K]) invokeWithRecover(key K, fn func()) {
-	defer runtime.RecoverAndLog(d.logger, fmt.Sprintf("debounce:%v", key))
+// recoveryComponent and recoveryName label every panic this package recovers.
+// They are constants, never the key: deferred arguments are evaluated on every
+// call. A caller needing the key in the report recovers first and logs it.
+const (
+	recoveryComponent = "systemplane.debounce"
+	recoveryName      = "invoke"
+)
+
+// invokeWithRecover calls fn inside a deferred RecoverAndLogWithContext so
+// that a panicking callback cannot crash the process or break the debouncer.
+func (d *Debouncer[K]) invokeWithRecover(fn func()) {
+	defer runtime.RecoverAndLogWithContext(context.Background(), d.logger, recoveryComponent, recoveryName)
 
 	fn()
 }

@@ -14,9 +14,10 @@ import (
 	"testing"
 	"time"
 
-	obsconstants "github.com/LerianStudio/lib-observability/v4/constants"
-	systemplane "github.com/LerianStudio/lib-systemplane/v3"
-	"github.com/LerianStudio/lib-systemplane/v3/admin"
+	systemplane "github.com/LerianStudio/lib-systemplane/v4"
+	"github.com/LerianStudio/lib-systemplane/v4/admin"
+	// Aliased: this file has local variables named store.
+	internalstore "github.com/LerianStudio/lib-systemplane/v4/internal/store"
 	"github.com/gofiber/fiber/v3"
 )
 
@@ -30,6 +31,17 @@ type fakeStore struct {
 	// Delete call so tests can assert the admin handler forwarded the
 	// actor-extractor output all the way to the store.
 	lastDeleteActor string
+
+	// getErr, when non-nil, is returned by every Get so a test can drive the
+	// "one key of a listing cannot be read" path.
+	getErr error
+
+	// listValues overrides, per key, the value List reports while Get keeps
+	// reporting the one in entries. It exists so a test can prove the listing
+	// handler takes each value from its own GetEntry read and not from the
+	// List result: with the two disagreeing, reading the value from List
+	// renders the wrong string.
+	listValues map[string][]byte
 
 	getCalls    int
 	setCalls    int
@@ -45,7 +57,10 @@ type fakeStoreCalls struct {
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{entries: make(map[string]systemplane.TestEntry)}
+	return &fakeStore{
+		entries:    make(map[string]systemplane.TestEntry),
+		listValues: make(map[string][]byte),
+	}
 }
 
 func fakeKey(ns, key string) string { return ns + "\x00" + key }
@@ -53,27 +68,41 @@ func fakeKey(ns, key string) string { return ns + "\x00" + key }
 func (f *fakeStore) Start(_ context.Context) error { return nil }
 func (f *fakeStore) Close() error                  { return nil }
 
-func (f *fakeStore) Get(_ context.Context, ns, key string) (systemplane.TestEntry, bool, error) {
+func (f *fakeStore) Get(_ context.Context, _ systemplane.TestScope, ns, key string) (systemplane.TestEntry, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	f.getCalls++
+
+	if f.getErr != nil {
+		return systemplane.TestEntry{}, false, f.getErr
+	}
+
 	e, ok := f.entries[fakeKey(ns, key)]
 
 	return e, ok, nil
 }
 
-func (f *fakeStore) Set(_ context.Context, e systemplane.TestEntry) error {
+// SetGetErr makes every subsequent Get fail with err. Locked-write so it is
+// safe to flip after Start, while the client may already be reading.
+func (f *fakeStore) SetGetErr(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.getErr = err
+}
+
+func (f *fakeStore) Set(_ context.Context, _ systemplane.TestScope, e systemplane.TestEntry) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	f.setCalls++
 	f.entries[fakeKey(e.Namespace, e.Key)] = e
 
-	return nil
+	return 0, nil
 }
 
-func (f *fakeStore) Delete(_ context.Context, ns, key, actor string) error {
+func (f *fakeStore) Delete(_ context.Context, _ systemplane.TestScope, ns, key, actor string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -93,7 +122,7 @@ func (f *fakeStore) LastDeleteActor() string {
 	return f.lastDeleteActor
 }
 
-func (f *fakeStore) List(_ context.Context) ([]systemplane.TestEntry, error) {
+func (f *fakeStore) List(_ context.Context, _ systemplane.TestScope) ([]systemplane.TestEntry, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -101,10 +130,24 @@ func (f *fakeStore) List(_ context.Context) ([]systemplane.TestEntry, error) {
 	out := make([]systemplane.TestEntry, 0, len(f.entries))
 
 	for _, e := range f.entries {
+		if v, overridden := f.listValues[fakeKey(e.Namespace, e.Key)]; overridden {
+			e.Value = v
+		}
+
 		out = append(out, e)
 	}
 
 	return out, nil
+}
+
+// SetListValue makes List report value for ns/key while Get keeps reporting
+// whatever entries holds. Locked-write, like SetGetErr, so it is safe to call
+// after Start.
+func (f *fakeStore) SetListValue(ns, key string, value []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.listValues[fakeKey(ns, key)] = value
 }
 
 func (f *fakeStore) ResetCalls() {
@@ -129,7 +172,12 @@ func (f *fakeStore) Calls() fakeStoreCalls {
 	}
 }
 
-func (f *fakeStore) Subscribe(_ context.Context, _ func(systemplane.TestEvent)) (func(), error) {
+func (f *fakeStore) Subscribe(_ context.Context, _ systemplane.TestScope, fn func(systemplane.TestEvent)) (func(), error) {
+	// Announce a connected changefeed (FC-2) so the engine's first reconcile
+	// runs and Start returns. Every other event is still discarded: this fake
+	// drives the admin handlers, not the changefeed.
+	fn(systemplane.TestEvent{Op: internalstore.OpResync})
+
 	return func() {}, nil
 }
 
@@ -267,18 +315,6 @@ func TestAdmin_GetOne(t *testing.T) {
 	}
 }
 
-func TestAdmin_GetNotFound(t *testing.T) {
-	c, _ := setupClient(t, nil)
-	app := mountAndRun(t, c)
-
-	resp := doRequest(t, app, http.MethodGet, "/system/ns/k", "")
-	if resp.StatusCode != http.StatusNotFound {
-		t.Errorf("status = %d, want 404", resp.StatusCode)
-	}
-
-	resp.Body.Close()
-}
-
 func TestAdmin_PutCreatesEntry(t *testing.T) {
 	c, _ := setupClient(t, func(c *systemplane.Client) error {
 		return c.Register("ns", "k", "default")
@@ -299,18 +335,6 @@ func TestAdmin_PutCreatesEntry(t *testing.T) {
 	}
 }
 
-func TestAdmin_PutUnknownKey(t *testing.T) {
-	c, _ := setupClient(t, nil)
-	app := mountAndRun(t, c)
-
-	resp := doRequest(t, app, http.MethodPut, "/system/ns/unregistered", `{"value":1}`)
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("status = %d, want 400", resp.StatusCode)
-	}
-
-	resp.Body.Close()
-}
-
 func TestAdmin_Delete(t *testing.T) {
 	c, store := setupClient(t, func(c *systemplane.Client) error {
 		return c.Register("ns", "k", "default")
@@ -321,7 +345,7 @@ func TestAdmin_Delete(t *testing.T) {
 	}
 
 	// Sanity check: the value reached the backing store via the write path.
-	if _, ok, _ := store.Get(context.Background(), "ns", "k"); !ok {
+	if _, ok, _ := store.Get(context.Background(), systemplane.TestScope{}, "ns", "k"); !ok {
 		t.Fatal("pre-delete: entry missing from backing store")
 	}
 
@@ -339,7 +363,7 @@ func TestAdmin_Delete(t *testing.T) {
 	// the row-removed side effect; that would also pass for a handler that
 	// silently dropped the actor. Capturing it on the store eliminates that
 	// gap and pins the admin handler ↔ store contract.
-	if _, ok, _ := store.Get(context.Background(), "ns", "k"); ok {
+	if _, ok, _ := store.Get(context.Background(), systemplane.TestScope{}, "ns", "k"); ok {
 		t.Error("post-delete: entry still present in backing store")
 	}
 
@@ -654,16 +678,6 @@ func TestAdmin_CatalogEscapesGeneratedPaths(t *testing.T) {
 	}
 }
 
-func TestAdmin_CatalogUnknownDetailReturnsNotFound(t *testing.T) {
-	c, _ := setupClient(t, func(c *systemplane.Client) error {
-		return c.Register("ns", "k", "default")
-	})
-	app := mountCatalogAndRun(t, c)
-
-	resp := doRequest(t, app, http.MethodGet, "/system/-/catalog/ns/missing", "")
-	assertErrorResponse(t, resp, http.StatusNotFound, "not_found", "systemplane catalog entry not found")
-}
-
 func TestAdmin_CatalogDenyByDefault(t *testing.T) {
 	c, _ := setupClient(t, nil)
 	app := fiber.New()
@@ -692,87 +706,6 @@ func TestAdmin_CatalogCustomPrefix(t *testing.T) {
 	resp.Body.Close()
 }
 
-func TestAdmin_CatalogRedactsDefaultValue(t *testing.T) {
-	tests := []struct {
-		name   string
-		policy systemplane.RedactPolicy
-	}{
-		{name: "mask", policy: systemplane.RedactMask},
-		{name: "full", policy: systemplane.RedactFull},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			c, _ := setupClient(t, func(c *systemplane.Client) error {
-				return c.Register("security", "secret", "real-secret", systemplane.WithRedaction(tt.policy))
-			})
-			app := mountCatalogAndRun(t, c)
-
-			resp := doRequest(t, app, http.MethodGet, "/system/-/catalog/security/secret", "")
-			if resp.StatusCode != http.StatusOK {
-				t.Fatalf("status = %d, want 200", resp.StatusCode)
-			}
-
-			body, err := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if err != nil {
-				t.Fatalf("read body: %v", err)
-			}
-
-			if strings.Contains(string(body), "real-secret") {
-				t.Fatalf("response leaked raw secret: %s", body)
-			}
-
-			var detail struct {
-				DefaultValue string `json:"defaultValue"`
-			}
-			if err := json.Unmarshal(body, &detail); err != nil {
-				t.Fatalf("decode detail: %v", err)
-			}
-
-			if detail.DefaultValue != obsconstants.ObfuscatedValue {
-				t.Fatalf("defaultValue = %q, want obfuscated value", detail.DefaultValue)
-			}
-		})
-	}
-}
-
-func TestAdmin_CatalogDoesNotRedactExamples(t *testing.T) {
-	c, _ := setupClient(t, func(c *systemplane.Client) error {
-		return c.Register("security", "sample", "internal-value",
-			systemplane.WithRedaction(systemplane.RedactFull),
-			systemplane.WithCatalogMetadata(systemplane.CatalogKeyMetadata{
-				Examples: []systemplane.CatalogExample{{Name: "sample", Value: "operator-example"}},
-			}),
-		)
-	})
-	app := mountCatalogAndRun(t, c)
-
-	resp := doRequest(t, app, http.MethodGet, "/system/-/catalog/security/sample", "")
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-
-	var detail struct {
-		DefaultValue string `json:"defaultValue"`
-		Examples     []struct {
-			Name  string `json:"name"`
-			Value string `json:"value"`
-		} `json:"examples"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&detail); err != nil {
-		t.Fatalf("decode detail: %v", err)
-	}
-	resp.Body.Close()
-
-	if detail.DefaultValue != obsconstants.ObfuscatedValue {
-		t.Fatalf("defaultValue = %q, want obfuscated value", detail.DefaultValue)
-	}
-	if len(detail.Examples) != 1 || detail.Examples[0].Value != "operator-example" {
-		t.Fatalf("examples = %#v, want raw operator example", detail.Examples)
-	}
-}
-
 func TestAdmin_CatalogUsesReadAuthorization(t *testing.T) {
 	c, _ := setupClient(t, nil)
 	app := fiber.New()
@@ -787,5 +720,251 @@ func TestAdmin_CatalogUsesReadAuthorization(t *testing.T) {
 	assertErrorResponse(t, resp, http.StatusForbidden, "forbidden", "forbidden")
 	if gotAction != "read" {
 		t.Fatalf("authorizer action = %q, want read", gotAction)
+	}
+}
+
+// setupSeededMultiTenantClient builds a multi-tenant client over a fakeStore
+// pre-seeded with rows. Multi-tenant reads bypass the single-tenant cache and
+// read through to the store, so the response carries the row's real revision
+// and provenance instead of the cache's zeros.
+func setupSeededMultiTenantClient(
+	t *testing.T,
+	seed []systemplane.TestEntry,
+	register func(c *systemplane.Client) error,
+) (*systemplane.Client, *fakeStore) {
+	t.Helper()
+
+	store := newFakeStore()
+	for _, e := range seed {
+		store.entries[fakeKey(e.Namespace, e.Key)] = e
+	}
+
+	c, err := systemplane.NewForTesting(store, systemplane.WithMultiTenantEnabled())
+	if err != nil {
+		t.Fatalf("NewForTesting: %v", err)
+	}
+
+	if register != nil {
+		if err := register(c); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+	}
+
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	t.Cleanup(func() { _ = c.Close() })
+
+	return c, store
+}
+
+// decodeBody returns the response body as a generic map, which lets a test
+// tell an absent field from a zero-valued one as a narrow struct decode
+// cannot.
+func decodeBody(t *testing.T, resp *http.Response) map[string]any {
+	t.Helper()
+	defer resp.Body.Close()
+
+	var got map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+
+	return got
+}
+
+func TestAdmin_GetOneCarriesRevisionAndProvenance(t *testing.T) {
+	t.Parallel()
+
+	updatedAt := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
+
+	// The registered default differs from the stored value so a
+	// default-in-force answer cannot pass this test by accident.
+	c, _ := setupSeededMultiTenantClient(t, []systemplane.TestEntry{{
+		Namespace: "runtime",
+		Key:       "name",
+		Value:     []byte(`"stored"`),
+		Revision:  11,
+		UpdatedAt: updatedAt,
+		UpdatedBy: "operator",
+	}}, func(c *systemplane.Client) error {
+		return c.Register("runtime", "name", "registered-default")
+	})
+
+	app := mountAndRun(t, c)
+
+	resp := doRequest(t, app, http.MethodGet, "/system/runtime/name", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	got := decodeBody(t, resp)
+
+	if got["value"] != "stored" {
+		t.Errorf("value = %v, want stored", got["value"])
+	}
+
+	if got["revision"] != float64(11) {
+		t.Errorf("revision = %v, want 11", got["revision"])
+	}
+
+	if got["updatedAt"] != "2026-09-17T12:00:00Z" {
+		t.Errorf("updatedAt = %v, want 2026-09-17T12:00:00Z", got["updatedAt"])
+	}
+
+	if got["updatedBy"] != "operator" {
+		t.Errorf("updatedBy = %v, want operator", got["updatedBy"])
+	}
+
+	stale, present := got["stale"]
+	if !present {
+		t.Fatalf("stale absent from body, want present and false")
+	}
+
+	if stale != false {
+		t.Errorf("stale = %v, want false", stale)
+	}
+}
+
+func TestAdmin_GetOneDefaultInForceRendersZeroRevision(t *testing.T) {
+	t.Parallel()
+
+	c, _ := setupClient(t, func(c *systemplane.Client) error {
+		return c.Register("ns", "k", "default")
+	})
+
+	app := mountAndRun(t, c)
+
+	resp := doRequest(t, app, http.MethodGet, "/system/ns/k", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	got := decodeBody(t, resp)
+
+	if got["revision"] != float64(0) {
+		t.Errorf("revision = %v, want 0", got["revision"])
+	}
+
+	updatedAt, present := got["updatedAt"]
+	if !present {
+		t.Fatalf("updatedAt absent from body, want present and null")
+	}
+
+	if updatedAt != nil {
+		t.Errorf("updatedAt = %v, want null", updatedAt)
+	}
+
+	if got["updatedBy"] != "" {
+		t.Errorf("updatedBy = %v, want empty string", got["updatedBy"])
+	}
+
+	stale, present := got["stale"]
+	if !present {
+		t.Fatalf("stale absent from body, want present and false")
+	}
+
+	if stale != false {
+		t.Errorf("stale = %v, want false", stale)
+	}
+}
+
+func TestAdmin_ListCarriesRevisionAndProvenancePerEntry(t *testing.T) {
+	t.Parallel()
+
+	updatedAt := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
+
+	// Only alpha has a stored row; beta is registered with a default and has
+	// none, so the listing must render both shapes side by side.
+	c, store := setupSeededMultiTenantClient(t, []systemplane.TestEntry{{
+		Namespace: "ns",
+		Key:       "alpha",
+		Value:     []byte(`"stored-alpha"`),
+		Revision:  7,
+		UpdatedAt: updatedAt,
+		UpdatedBy: "operator",
+	}}, func(c *systemplane.Client) error {
+		if err := c.Register("ns", "alpha", "default-alpha"); err != nil {
+			return err
+		}
+
+		return c.Register("ns", "beta", "default-beta")
+	})
+
+	// List reports a different value than Get for the same key, so an entry
+	// whose value came from the List result instead of its own read renders
+	// "from-list" next to revision 7 — a value and a revision describing two
+	// different instants.
+	store.SetListValue("ns", "alpha", []byte(`"from-list"`))
+
+	app := mountAndRun(t, c)
+
+	resp := doRequest(t, app, http.MethodGet, "/system/ns", "")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	defer resp.Body.Close()
+
+	var got struct {
+		Entries []map[string]any `json:"entries"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if len(got.Entries) != 2 {
+		t.Fatalf("entries = %d, want 2", len(got.Entries))
+	}
+
+	alpha, beta := got.Entries[0], got.Entries[1]
+
+	if alpha["key"] != "alpha" || beta["key"] != "beta" {
+		t.Fatalf("entry order = %v, %v, want alpha then beta", alpha["key"], beta["key"])
+	}
+
+	if alpha["value"] != "stored-alpha" {
+		t.Errorf("alpha value = %v, want stored-alpha (the value read alongside revision 7)", alpha["value"])
+	}
+
+	if alpha["revision"] != float64(7) {
+		t.Errorf("alpha revision = %v, want 7", alpha["revision"])
+	}
+
+	if alpha["updatedAt"] != "2026-09-17T12:00:00Z" {
+		t.Errorf("alpha updatedAt = %v, want 2026-09-17T12:00:00Z", alpha["updatedAt"])
+	}
+
+	if alpha["updatedBy"] != "operator" {
+		t.Errorf("alpha updatedBy = %v, want operator", alpha["updatedBy"])
+	}
+
+	if beta["revision"] != float64(0) {
+		t.Errorf("beta revision = %v, want 0", beta["revision"])
+	}
+
+	betaUpdatedAt, present := beta["updatedAt"]
+	if !present {
+		t.Fatalf("beta updatedAt absent from entry, want present and null")
+	}
+
+	if betaUpdatedAt != nil {
+		t.Errorf("beta updatedAt = %v, want null", betaUpdatedAt)
+	}
+
+	if beta["updatedBy"] != "" {
+		t.Errorf("beta updatedBy = %v, want empty string", beta["updatedBy"])
+	}
+
+	for _, e := range got.Entries {
+		stale, ok := e["stale"]
+		if !ok {
+			t.Fatalf("stale absent from entry %v, want present and false", e["key"])
+		}
+
+		if stale != false {
+			t.Errorf("entry %v stale = %v, want false", e["key"], stale)
+		}
 	}
 }

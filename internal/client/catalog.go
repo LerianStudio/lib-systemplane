@@ -1,9 +1,12 @@
 package client
 
 import (
+	"fmt"
 	"reflect"
 	"sort"
 	"time"
+
+	"github.com/LerianStudio/lib-systemplane/v4/internal/engine"
 )
 
 const catalogKindUnknown = "unknown"
@@ -26,7 +29,6 @@ type CatalogKeySummary struct {
 	Kind         string `json:"kind,omitempty"`
 	TenantScoped bool   `json:"tenantScoped"`
 	RuntimeClass string `json:"runtimeClass,omitempty"`
-	Redaction    string `json:"redaction"`
 	HasValidator bool   `json:"hasValidator"`
 	Description  string `json:"description,omitempty"`
 	DetailURL    string `json:"detailUrl,omitempty"`
@@ -51,8 +53,7 @@ type CatalogKeyMetadata struct {
 }
 
 // CatalogExample documents one accepted value shape for a registered key.
-// Values are operator-facing examples and are not redacted; never include
-// secrets or credentials.
+// Examples are emitted as provided; never include secrets or credentials.
 type CatalogExample struct {
 	Name  string `json:"name"`
 	Value any    `json:"value"`
@@ -149,7 +150,7 @@ func (c *Client) catalogDetail(nk nskey, def keyDef) CatalogKeyDetail {
 
 	return CatalogKeyDetail{
 		CatalogKeySummary: c.catalogSummary(nk, def),
-		DefaultValue:      cloneValue(def.defaultValue),
+		DefaultValue:      engine.Clone(def.catalogDefault),
 		Schema:            meta.Schema,
 		Rules:             meta.Rules,
 		Examples:          meta.Examples,
@@ -163,7 +164,6 @@ func (c *Client) catalogSummary(nk nskey, def keyDef) CatalogKeySummary {
 		Kind:         catalogKind(def),
 		TenantScoped: c.multiTenant,
 		RuntimeClass: def.catalog.RuntimeClass,
-		Redaction:    def.redaction.String(),
 		HasValidator: def.validator != nil,
 		Description:  def.description,
 	}
@@ -174,7 +174,7 @@ func catalogKind(def keyDef) string {
 		return def.catalog.Kind
 	}
 
-	return inferCatalogKind(def.defaultValue)
+	return inferCatalogKind(def.catalogDefault)
 }
 
 func inferCatalogKind(value any) string {
@@ -241,7 +241,7 @@ func cloneCatalogSchema(schema map[string]any) map[string]any {
 		return nil
 	}
 
-	cloned, ok := cloneValue(schema).(map[string]any)
+	cloned, ok := engine.Clone(schema).(map[string]any)
 	if !ok {
 		return nil
 	}
@@ -258,9 +258,26 @@ func cloneCatalogExamples(examples []CatalogExample) []CatalogExample {
 	for i, example := range examples {
 		out[i] = CatalogExample{
 			Name:  example.Name,
-			Value: cloneValue(example.Value),
+			Value: engine.Clone(example.Value),
 		}
 	}
 
 	return out
+}
+
+// validateCatalogCloneSafe rejects catalog metadata Clone cannot deep-copy.
+// It stays in this package because it names CatalogKeyMetadata; the walk
+// itself belongs to the engine.
+func validateCatalogCloneSafe(meta CatalogKeyMetadata) error {
+	if err := engine.ValidateCloneSafe(meta.Schema); err != nil {
+		return fmt.Errorf("schema: %w", err)
+	}
+
+	for i, example := range meta.Examples {
+		if err := engine.ValidateCloneSafe(example.Value); err != nil {
+			return fmt.Errorf("examples[%d].value: %w", i, err)
+		}
+	}
+
+	return nil
 }

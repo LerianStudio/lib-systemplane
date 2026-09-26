@@ -10,16 +10,33 @@
 //   - Multi-tenant. The constructor receives no db; instead the caller wires
 //     lib-commons tenant-manager middleware so each request context carries
 //     the per-tenant database. resolveDB(ctx) extracts that database and
-//     returns the handle to the CRUD helpers. LISTEN/NOTIFY is disabled in
-//     this mode — Subscribe returns store.ErrNotSupportedInMultiTenant.
+//     returns the handle to the CRUD helpers. The zero scope has no durable
+//     DSN to LISTEN on there, so Subscribe returns
+//     store.ErrNotSupportedInMultiTenant for it; a NAMED tenant scope resolves
+//     its own database and LISTEN DSN through the tenant connector and gets its
+//     own changefeed, in either mode.
 //
 // This package performs NO runtime schema provisioning. The
-// systemplane_entries table, the systemplane_notify_v3() trigger function, and
-// the NOTIFY triggers MUST be provisioned externally (e.g. via the consumer's
-// migration pipeline) using the DDL published by the root package's
-// SchemaSQL() / DefaultSeedSQL(). The store only reads, writes values, and —
-// in single-tenant mode — runs LISTEN/NOTIFY. The runtime database role only
-// needs DML + LISTEN privileges, never CREATE on the schema.
+// systemplane_entries table, its revision column, the revision sequence, the
+// systemplane_bump_revision_v4() and systemplane_notify_v4() trigger
+// functions, and the three triggers that bind them (one BEFORE INSERT OR
+// UPDATE bump, two NOTIFY) MUST be provisioned externally (e.g. via the
+// consumer's migration pipeline) using the DDL published by the root
+// package's SchemaSQL(). The store only reads and writes values and LISTENs
+// on the changefeeds it opens. The runtime database role only
+// needs DML + LISTEN privileges, never CREATE on the schema: no statement
+// this package issues names the revision sequence, and the trigger that
+// advances it is SECURITY DEFINER, so the runtime role needs no grant on it
+// either.
+//
+// # Connection budget
+//
+// Every ACTIVE tenant costs one extra Postgres backend per replica: its
+// changefeed holds a dedicated LISTEN connection that lives outside the
+// tenant-manager pool and is not shared with reads or writes. The budget is
+// therefore active tenants x replicas, on top of whatever the pools hold, and
+// max_connections on each tenant database must be sized against it. A tenant
+// releases its backend when its last subscriber leaves.
 package postgres
 
 import (
@@ -27,14 +44,14 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"regexp"
 	"sync"
 	"time"
 
 	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
+	obsconstants "github.com/LerianStudio/lib-observability/v4/constants"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/tracing"
-	"github.com/LerianStudio/lib-systemplane/v3/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 	"github.com/bxcodec/dbresolver/v2"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -43,28 +60,12 @@ import (
 // Compile-time interface satisfaction check.
 var _ store.Store = (*Store)(nil)
 
-// safeIdentifierRe validates a BARE SQL identifier — one interpolated UNQUOTED
-// into a statement (the table name, e.g. "... FROM <table>"). SQL statements
-// cannot parameterize identifiers, so a bare-interpolated name must pass this
-// strict check first; hyphens/dots are illegal because they would break the
-// unquoted SQL.
-var safeIdentifierRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
-
-// safeChannelRe validates the LISTEN/NOTIFY channel name. Unlike the table, the
-// channel is always DOUBLE-QUOTED at use (LISTEN "<channel>" via quoteIdentifier),
-// so it may safely contain hyphens — the common case for an ApplicationName-prefixed
-// channel such as "my-service_systemplane_changes". It still rejects quotes,
-// whitespace and other breakout characters; quoteIdentifier additionally escapes any
-// embedded double quote, so the quoted channel is injection-safe regardless.
-// Length is enforced separately in normalizeConfig: Postgres truncates identifiers
-// to 63 bytes (NAMEDATALEN-1), so over-length channels are rejected outright.
-var safeChannelRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_-]*$`)
+// channelName is the one LISTEN channel; SchemaSQL's triggers NOTIFY on it.
+const channelName = "systemplane_changes"
 
 const (
-	tracerName     = "systemplane.postgres"
-	defaultChannel = "systemplane_changes"
-	defaultTable   = "systemplane_entries"
-	defaultModule  = "systemplane"
+	tracerName    = "systemplane.postgres"
+	defaultModule = "systemplane"
 )
 
 // dbExecutor is the minimal interface the CRUD helpers need. Both *sql.DB and
@@ -91,33 +92,16 @@ type Config struct {
 	// dedicated LISTEN connection. Required in single-tenant mode.
 	ListenDSN string
 
-	// Channel is the Postgres LISTEN/NOTIFY channel name.
-	// Default: "systemplane_changes". Hyphens are allowed (validated by
-	// safeChannelRe) — the channel is double-quoted at LISTEN time.
-	//
-	// COUPLING: this is only the LISTEN side. The matching NOTIFY side lives in
-	// the trigger DDL the consumer provisions (SchemaSQL() binds the reference
-	// trigger to the default "systemplane_changes" via TG_ARGV[0]). A consumer
-	// that sets a NON-default Channel here MUST bind the SAME name in its trigger
-	// DDL, otherwise the store LISTENs on one channel while the trigger NOTIFYs
-	// on another and no events are delivered.
-	Channel string
-
-	// ChannelExplicit suppresses the default-channel collision warning when
-	// the caller deliberately selected the channel name.
-	ChannelExplicit bool
-
-	// Table is the Postgres table name. Default: "systemplane_entries".
-	Table string
-
 	// MultiTenantEnabled selects the tmcore-driven dispatch path. When true,
-	// DB and ListenDSN may be empty; every method resolves the tenant
+	// DB and ListenDSN may be empty; the zero scope resolves the tenant
 	// database from ctx via tmcore.GetPGContext(ctx, Module).
 	MultiTenantEnabled bool
 
 	// Module is the tenant-manager module name used as the context key for
 	// dispatch. Default: "systemplane".
 	Module string
+
+	Connector Connector // nil in single-tenant mode
 
 	Logger    log.Logger
 	Telemetry store.Telemetry
@@ -127,15 +111,36 @@ type Config struct {
 type Store struct {
 	cfg Config
 
-	// listenerMu / subscribers serve the single-tenant LISTEN/NOTIFY path.
-	listenerMu  sync.Mutex
-	subscribers map[uint64]func(store.Event)
-	nextSubID   uint64
-	listenStop  chan struct{}
-	listenDone  chan struct{}
+	// feedsMu guards feeds, the LISTEN/NOTIFY changefeeds keyed by
+	// scope.Tenant ("" is the zero, single-tenant scope), and every feed's
+	// reference count: a feed's lifetime decision and its map slot change
+	// together, in one lock hold.
+	feedsMu sync.Mutex
+	feeds   map[string]*feed
+
+	// closing is set by Close under feedsMu, and is NOT the per-feed
+	// feed.closing (which only suppresses OpDisconnect on a clean teardown).
+	// A feed is created outside the map lock, so Close cannot stop an
+	// in-flight creator by walking the map alone: it raises this flag instead,
+	// and the creator rechecks it before publishing anything.
+	closing bool
+
+	// startMu serializes Start. The zero-scope feed is shared, so the check
+	// for an existing reader and the launch of a new one must be one decision:
+	// without it two concurrent Starts each open a LISTEN backend on the same
+	// feed and every notification is delivered twice.
+	startMu sync.Mutex
 
 	mu     sync.Mutex
 	closed bool
+
+	// closedCh is closed exactly once, by Close, in the same s.mu hold that
+	// sets closed — the early return above it is what makes that single. It is
+	// the store-wide shutdown signal every subscription's ctx observer selects
+	// on, so a subscriber whose ctx outlives the store does not leave a
+	// goroutine parked forever. Created by New; a Store is not usable without
+	// it.
+	closedCh chan struct{}
 }
 
 // Start opens the single-tenant LISTEN connection. The schema is NOT created
@@ -147,6 +152,13 @@ func (s *Store) Start(ctx context.Context) error {
 		return store.ErrClosed
 	}
 
+	// A nil ctx is normalized rather than dereferenced: the public API refuses
+	// one before the store is reached, but the store is its own unit and the
+	// first thing this path does is derive a timeout from ctx.
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	if s.cfg.MultiTenantEnabled {
 		return nil
 	}
@@ -155,6 +167,13 @@ func (s *Store) Start(ctx context.Context) error {
 }
 
 // Close releases backend resources. Idempotent.
+//
+// It signals every changefeed and then waits for their readers under ONE
+// shared closeTimeout, so shutdown costs a single bound no matter how many
+// tenants the store carries. Called from INSIDE a subscriber callback it costs
+// exactly that bound: the reader it is waiting for is the goroutine running
+// the caller, so the wait can only end at the deadline. Close still returns,
+// and the feeds are still torn down.
 func (s *Store) Close() error {
 	if s == nil {
 		return nil
@@ -169,9 +188,11 @@ func (s *Store) Close() error {
 	}
 
 	s.closed = true
+
+	close(s.closedCh)
 	s.mu.Unlock()
 
-	s.stopListener()
+	s.stopFeeds()
 
 	return nil
 }
@@ -183,43 +204,156 @@ func (s *Store) isClosed() bool {
 	return s.closed
 }
 
+// isClosing reports the shutdown flag Close raises under feedsMu — the one a
+// feed creator rechecks before it publishes anything. It is deliberately the
+// same flag, not the s.mu one: a creator that dialed on one flag and published
+// on the other could still hand a live connection to a shut-down store.
+func (s *Store) isClosing() bool {
+	s.feedsMu.Lock()
+	defer s.feedsMu.Unlock()
+
+	return s.closing
+}
+
 // resolveDB returns the database handle for the current call.
 //
-// Single-tenant mode returns the constructor-supplied *sql.DB unchanged.
-// Multi-tenant mode extracts the dbresolver.DB stored in ctx by tenant-manager
-// middleware. The schema is assumed to be provisioned externally; the store
+// The zero scope keeps today's behavior: single-tenant mode returns the
+// constructor-supplied *sql.DB unchanged, multi-tenant mode extracts the
+// dbresolver.DB stored in ctx by tenant-manager middleware. A named tenant
+// resolves through the connector regardless of MultiTenantEnabled and
+// regardless of whatever tenant ctx carries (an explicitly named scope and a
+// request-scoped ctx tenant must never silently disagree), and is
+// refused with store.ErrTenantConnectorMissing when no connector is
+// configured. The schema is assumed to be provisioned externally; the store
 // does not create it.
-func (s *Store) resolveDB(ctx context.Context) (dbExecutor, error) {
+//
+// Whatever route produced the handle, a resolver that carries read replicas is
+// narrowed to its primaries here — see pinPrimary.
+func (s *Store) resolveDB(ctx context.Context, scope store.Scope) (dbExecutor, error) {
+	if scope.Tenant != "" {
+		if s.cfg.Connector == nil {
+			return nil, store.ErrTenantConnectorMissing
+		}
+
+		db, err := s.cfg.Connector.ResolveDB(ctx, scope.Tenant)
+		if err != nil {
+			return nil, fmt.Errorf("systemplane/postgres: resolve tenant %s: %w", scope.Tenant, err)
+		}
+
+		// A nil handle with a nil error is a connector bug; refuse it here
+		// rather than hand back something that panics on the first query.
+		// log.IsNil, not db == nil: a connector that returns its own concrete
+		// type as the interface hands over a TYPED nil, which is != nil and
+		// panics on the first method call.
+		if log.IsNil(db) {
+			return nil, fmt.Errorf("systemplane/postgres: resolve tenant %s: %w", scope.Tenant, store.ErrTenantConnectorMissing)
+		}
+
+		return pinPrimary(db), nil
+	}
+
 	if !s.cfg.MultiTenantEnabled {
 		return s.cfg.DB, nil
 	}
 
 	db := tmcore.GetPGContext(ctx, s.cfg.Module)
-	if db == nil {
+	if log.IsNil(db) {
 		return nil, store.ErrTenantConnectionMissing
 	}
 
-	return db, nil
+	return pinPrimary(db), nil
+}
+
+// pinPrimary keeps the whole systemplane path on the primary, reads included.
+//
+// dbresolver sends a statement to a replica unless it looks like a write, and
+// its default checker recognizes a write only by the string "RETURNING"
+// (dbresolver/v2 query.go). Set ends in RETURNING revision and Delete goes
+// through ExecContext, so both reach a primary — while the plain SELECTs in
+// Get and List would be served by a standby, and lib-commons registers a
+// replica for every tenant that declares one. A caller could then read back a
+// revision older than the one Set just returned, and older than the NOTIFY the
+// changefeed is reconciling against, since the feed LISTENs on the primary
+// DSN.
+//
+// The pin is the FIRST primary, always, and that is the whole claim: one
+// deterministic node, every standby excluded. Having no replica
+// is NOT a reason to hand the resolver back: dbresolver resolves ReadWrite()
+// AND, with no replica registered, ReadOnly() through its load balancer over
+// the primaries, which is round-robin by default (dbresolver/v2 db.go), so a
+// resolver reporting several primaries would land a Set on one node and the
+// next Get on another — read-your-writes broken with no replica in sight.
+// lib-commons builds every tenant resolver from exactly one primary and one
+// replica (commons/postgres createResolverFn), so the common case has only one
+// primary to pick; a connector of a consumer's own making may report several,
+// and picking deterministically among them is what keeps a value Set returned
+// readable by the next Get. It costs no allocation on a path every query
+// crosses: PrimaryDBs returns the resolver's own slice field.
+//
+// What the pin gives up, stated rather than glossed: spreading, and only on a
+// resolver that reports more than one primary. ReadWrite() is not "the
+// primary" — it is loadBalancer.Resolve(db.primaries) (dbresolver/v2 db.go),
+// so unpinned writes rotate across primaries and pinned ones all land on
+// primaries[0]. No shipped connector pays that, because lib-commons registers
+// exactly one primary and there is no second node to rotate onto.
+//
+// Failover is NOT among the losses: dbresolver never had any between
+// primaries. ExecContext, and every statement its checker reads as a write,
+// goes to ReadWrite() once and is never retried (db.go), so an unreachable
+// primary fails a Set or a Delete with or without the pin. Its ONE retry is a
+// READ: a read whose error is a net.Error falls back from ReadOnly() to
+// ReadWrite(), gated on !writeFlag (db.go, QueryContext and QueryRowContext).
+// The pin makes that rescue moot rather than removing it — no pinned read ever
+// reaches a standby to need rescuing off one. Deterministic read-your-writes
+// for the price of one node's share of a multi-primary resolver nobody ships
+// today.
+func pinPrimary(db dbresolver.DB) dbExecutor {
+	if primaries := db.PrimaryDBs(); len(primaries) > 0 {
+		return primaries[0]
+	}
+
+	// A resolver with no primary at all is a connector bug; there is nothing
+	// better to fall back to than the resolver itself.
+	return db
+}
+
+// scopeAttrs names the database system a CRUD span hit and the tenant it
+// touched, when the call named one. The tenant is a span attribute and never a
+// metric label: a tenant id is unbounded, so it belongs where a trace already
+// costs one entry per call rather than in a time series per tenant. It goes
+// under the fleet-wide constants.AttrKeyTenantID so one trace query selects a
+// tenant across every Lerian service.
+//
+// No db.name: the CRUD path never learns one. The handle arrives from the
+// caller (*sql.DB), from ctx, or from the connector, and none of them carries
+// the database name without an extra round trip this store will not spend.
+func scopeAttrs(scope store.Scope, attrs ...attribute.KeyValue) []attribute.KeyValue {
+	out := make([]attribute.KeyValue, 0, len(attrs)+2)
+	out = append(out, attribute.String(obsconstants.AttrDBSystem, obsconstants.DBSystemPostgreSQL))
+	out = append(out, attrs...)
+
+	if scope.Tenant == "" {
+		return out
+	}
+
+	return append(out, attribute.String(obsconstants.AttrKeyTenantID, scope.Tenant))
 }
 
 // List returns every entry in the resolved database, ordered by (namespace, key).
-func (s *Store) List(ctx context.Context) ([]store.Entry, error) {
+func (s *Store) List(ctx context.Context, scope store.Scope) ([]store.Entry, error) {
 	if s == nil || s.isClosed() {
 		return nil, store.ErrClosed
 	}
 
-	db, err := s.resolveDB(ctx)
+	db, err := s.resolveDB(ctx, scope)
 	if err != nil {
 		return nil, err
 	}
 
-	ctx, span, finish := s.startSpan(ctx, "systemplane.postgres.list")
+	ctx, span, finish := s.startSpan(ctx, "systemplane.postgres.list", scopeAttrs(scope)...)
 	defer finish()
 
-	query := fmt.Sprintf( // #nosec G201 -- table validated as a Postgres identifier
-		`SELECT namespace, key, value, updated_at, updated_by FROM %s ORDER BY namespace, key`,
-		s.cfg.Table,
-	)
+	const query = `SELECT namespace, key, value, revision, updated_at, updated_by FROM systemplane_entries ORDER BY namespace, key`
 
 	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
@@ -234,7 +368,7 @@ func (s *Store) List(ctx context.Context) ([]store.Entry, error) {
 	for rows.Next() {
 		var e store.Entry
 
-		if err := rows.Scan(&e.Namespace, &e.Key, &e.Value, &e.UpdatedAt, &e.UpdatedBy); err != nil {
+		if err := rows.Scan(&e.Namespace, &e.Key, &e.Value, &e.Revision, &e.UpdatedAt, &e.UpdatedBy); err != nil {
 			tracing.HandleSpanError(span, "list scan failed", err)
 
 			return nil, fmt.Errorf("systemplane/postgres: list scan: %w", err)
@@ -253,31 +387,28 @@ func (s *Store) List(ctx context.Context) ([]store.Entry, error) {
 }
 
 // Get returns a single entry by (namespace, key).
-func (s *Store) Get(ctx context.Context, namespace, key string) (store.Entry, bool, error) {
+func (s *Store) Get(ctx context.Context, scope store.Scope, namespace, key string) (store.Entry, bool, error) {
 	if s == nil || s.isClosed() {
 		return store.Entry{}, false, store.ErrClosed
 	}
 
-	db, err := s.resolveDB(ctx)
+	db, err := s.resolveDB(ctx, scope)
 	if err != nil {
 		return store.Entry{}, false, err
 	}
 
-	ctx, span, finish := s.startSpan(ctx, "systemplane.postgres.get",
+	ctx, span, finish := s.startSpan(ctx, "systemplane.postgres.get", scopeAttrs(scope,
 		attribute.String("namespace", namespace),
 		attribute.String("key", key),
-	)
+	)...)
 	defer finish()
 
-	query := fmt.Sprintf( // #nosec G201 -- table validated as a Postgres identifier
-		`SELECT namespace, key, value, updated_at, updated_by FROM %s WHERE namespace = $1 AND key = $2`,
-		s.cfg.Table,
-	)
+	const query = `SELECT namespace, key, value, revision, updated_at, updated_by FROM systemplane_entries WHERE namespace = $1 AND key = $2`
 
 	var e store.Entry
 
 	row := db.QueryRowContext(ctx, query, namespace, key)
-	if err := row.Scan(&e.Namespace, &e.Key, &e.Value, &e.UpdatedAt, &e.UpdatedBy); err != nil {
+	if err := row.Scan(&e.Namespace, &e.Key, &e.Value, &e.Revision, &e.UpdatedAt, &e.UpdatedBy); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return store.Entry{}, false, nil
 		}
@@ -290,54 +421,67 @@ func (s *Store) Get(ctx context.Context, namespace, key string) (store.Entry, bo
 	return e, true, nil
 }
 
-// Set persists an entry using INSERT ... ON CONFLICT (namespace, key) DO UPDATE.
-func (s *Store) Set(ctx context.Context, e store.Entry) error {
+// Set persists an entry using INSERT ... ON CONFLICT (namespace, key) DO UPDATE
+// and returns the revision now stored. The number comes from the table-level
+// systemplane_revision_seq sequence, never from the row, and it is drawn
+// exclusively by systemplane_bump_revision_trigger — this statement names
+// neither the sequence nor the revision column, which is what keeps the
+// runtime role on plain DML: an insert always draws a new revision, a write
+// that changes the value draws one too, and a write of an identical value
+// leaves the revision the row already carried. A key deleted and recreated
+// therefore always exceeds every revision it previously had, and revisions
+// may skip numbers.
+func (s *Store) Set(ctx context.Context, scope store.Scope, e store.Entry) (int64, error) {
 	if s == nil || s.isClosed() {
-		return store.ErrClosed
+		return 0, store.ErrClosed
 	}
 
 	if e.Namespace == "" {
-		return fmt.Errorf("systemplane/postgres: %w: namespace must not be empty", store.ErrValidation)
+		return 0, fmt.Errorf("systemplane/postgres: %w: namespace must not be empty", store.ErrValidation)
 	}
 
 	if e.Key == "" {
-		return fmt.Errorf("systemplane/postgres: %w: key must not be empty", store.ErrValidation)
+		return 0, fmt.Errorf("systemplane/postgres: %w: key must not be empty", store.ErrValidation)
 	}
 
 	if e.UpdatedAt.IsZero() {
 		e.UpdatedAt = time.Now().UTC()
 	}
 
-	db, err := s.resolveDB(ctx)
+	db, err := s.resolveDB(ctx, scope)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
-	ctx, span, finish := s.startSpan(ctx, "systemplane.postgres.set",
+	ctx, span, finish := s.startSpan(ctx, "systemplane.postgres.set", scopeAttrs(scope,
 		attribute.String("namespace", e.Namespace),
 		attribute.String("key", e.Key),
-	)
+	)...)
 	defer finish()
 
-	query := fmt.Sprintf( // #nosec G201 -- table validated as a Postgres identifier
-		`INSERT INTO %s (namespace, key, value, updated_at, updated_by)
+	const query = `INSERT INTO systemplane_entries (namespace, key, value, updated_at, updated_by)
 VALUES ($1, $2, $3, $4, $5)
 ON CONFLICT (namespace, key) DO UPDATE
-SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by`,
-		s.cfg.Table,
-	)
+SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by
+RETURNING revision`
 
-	if _, err := db.ExecContext(ctx, query, e.Namespace, e.Key, e.Value, e.UpdatedAt, e.UpdatedBy); err != nil {
+	var revision int64
+
+	// revision is deliberately absent from the DO UPDATE set-list: the trigger
+	// owns that column, and on an identical value it puts the stored revision
+	// back, so RETURNING reports the revision the row already had. sql.ErrNoRows is not special-cased — an upsert with RETURNING
+	// always yields a row, so its appearance is a real error and must propagate.
+	if err := db.QueryRowContext(ctx, query, e.Namespace, e.Key, e.Value, e.UpdatedAt, e.UpdatedBy).Scan(&revision); err != nil {
 		tracing.HandleSpanError(span, "set upsert failed", err)
 
-		return fmt.Errorf("systemplane/postgres: set: %w", err)
+		return 0, fmt.Errorf("systemplane/postgres: set: %w", err)
 	}
 
-	return nil
+	return revision, nil
 }
 
 // Delete removes a single (namespace, key) row. Idempotent.
-func (s *Store) Delete(ctx context.Context, namespace, key, actor string) error {
+func (s *Store) Delete(ctx context.Context, scope store.Scope, namespace, key, actor string) error {
 	if s == nil || s.isClosed() {
 		return store.ErrClosed
 	}
@@ -350,7 +494,7 @@ func (s *Store) Delete(ctx context.Context, namespace, key, actor string) error 
 		return fmt.Errorf("systemplane/postgres: %w: key must not be empty", store.ErrValidation)
 	}
 
-	db, err := s.resolveDB(ctx)
+	db, err := s.resolveDB(ctx, scope)
 	if err != nil {
 		return err
 	}
@@ -360,16 +504,13 @@ func (s *Store) Delete(ctx context.Context, namespace, key, actor string) error 
 	// Audit trails capture it via the updated_by column on writes.
 	_ = actor
 
-	ctx, span, finish := s.startSpan(ctx, "systemplane.postgres.delete",
+	ctx, span, finish := s.startSpan(ctx, "systemplane.postgres.delete", scopeAttrs(scope,
 		attribute.String("namespace", namespace),
 		attribute.String("key", key),
-	)
+	)...)
 	defer finish()
 
-	query := fmt.Sprintf( // #nosec G201 -- table validated as a Postgres identifier
-		`DELETE FROM %s WHERE namespace = $1 AND key = $2`,
-		s.cfg.Table,
-	)
+	const query = `DELETE FROM systemplane_entries WHERE namespace = $1 AND key = $2`
 
 	if _, err := db.ExecContext(ctx, query, namespace, key); err != nil {
 		tracing.HandleSpanError(span, "delete failed", err)
@@ -414,4 +555,33 @@ func (s *Store) logDebug(ctx context.Context, msg string, fields ...log.Field) {
 	if s.cfg.Logger != nil {
 		s.cfg.Logger.Log(ctx, log.LevelDebug, msg, fields)
 	}
+}
+
+// logStreakFailure narrates a retry loop: the first failure of each DISTINCT
+// cause at WARN, every later one of that same cause at DEBUG. A failure class
+// that never resolves on its own — a feed that dials fine but can never
+// re-install LISTEN (pgbouncer in transaction pooling, a revoked grant) — is
+// otherwise invisible at a production Info level, because the one WARN emitted
+// when the connection was lost says nothing about why every attempt since has
+// failed, and the cache keeps serving stale configuration in the silence.
+// Dropping the repeats to DEBUG keeps that signal at one line per cause per
+// outage.
+//
+// warned is the caller's per-cause flag, and this is the only writer of it:
+// the caller declares one bool per message inside the loop it narrates, so the
+// LOG streak is one entry into that loop and nothing else. It deliberately does
+// NOT read the backoff counter. That counter is only cleared by a connection
+// that was useful, so one unproductive cycle — dial and LISTEN both succeed,
+// the connection dies before carrying a notification — leaves it non-zero for
+// the life of the feed, and a loud line gated on it would never fire again.
+func (s *Store) logStreakFailure(warned *bool, msg string, fields ...log.Field) {
+	if !*warned {
+		*warned = true
+
+		s.logWarn(context.Background(), msg, fields...)
+
+		return
+	}
+
+	s.logDebug(context.Background(), msg, fields...)
 }

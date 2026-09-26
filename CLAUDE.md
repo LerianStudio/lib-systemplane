@@ -4,16 +4,15 @@ This file provides repository-specific guidance for coding agents working on `li
 
 ## Project snapshot
 
-- Module: `github.com/LerianStudio/lib-systemplane/v3`
+- Module: `github.com/LerianStudio/lib-systemplane/v4`
 - Language: Go
 - Go version: `1.26.3` (see `go.mod`)
-- Current API generation: v3.x Fiber v3 stack (extracted from `lib-commons/v5`; built on `lib-commons/v6`, `lib-observability/v4`, and `gofiber/fiber/v3`)
-- Observability boundary: the public API accepts `systemplane.Logger` and `systemplane.Telemetry`, interfaces declared in this module from stdlib + `go.opentelemetry.io/otel` types only. `lib-observability` must never appear in an exported PARAMETER — `boundary_test.go` fails the build if it does. Returns may stay rich (`(*Client).Logger()` returns `log.Logger`). Internal packages use `lib-observability/v4` freely. See [`MIGRATION-v3.md`](MIGRATION-v3.md).
+- Current API generation: v4.x Fiber v3 stack (extracted from `lib-commons/v5`; built on `lib-commons/v7`, `lib-observability/v4`, and `gofiber/fiber/v3`)
+- Observability boundary: the public API accepts `systemplane.Logger` and `systemplane.Telemetry`, interfaces declared in this module from stdlib + `go.opentelemetry.io/otel` types only. `lib-observability` must never appear in an exported PARAMETER — `boundary_test.go` fails the build if it does. Returns may stay rich (`(*Client).Logger()` returns `log.Logger`). Internal packages use `lib-observability/v4` freely. See [`MIGRATION-v3.md`](MIGRATION-v3.md) for the v2 -> v3 hop and [`MIGRATION-v4.md`](MIGRATION-v4.md) for the v3 -> v4 one.
 
 ## Primary objective for changes
 
 - Preserve the public API contracts unless a task explicitly asks for breaking changes.
-- The current observability migration is an approved breaking change: logging, tracing, telemetry, span helpers, redaction, and panic recovery belong to `lib-observability`, not `lib-commons`.
 - Prefer explicit error returns over panic paths in production code.
 - Keep behavior nil-safe and concurrency-safe by default.
 
@@ -22,18 +21,28 @@ This file provides repository-specific guidance for coding agents working on `li
 Root (package `systemplane`):
 - Small public API facade: `api_*.go` plus `doc.go`. Public types are aliases to
   `internal/client` where practical so the root import path remains
-  `github.com/LerianStudio/lib-systemplane/v3`.
+  `github.com/LerianStudio/lib-systemplane/v4`.
 
 Subpackages:
 - `admin/` — Fiber HTTP handlers for the admin surface
 - `systemplanetest/` — contract suite shared by both backend implementations
-- `internal/client/` — Client implementation: lifecycle, registration, reads,
-  writes, subscriptions, telemetry, tenant cache/lazy/hydration, value cloning,
-  and unit tests that need implementation-private access
+- `internal/client/` — Client implementation: lifecycle, registration, the key
+  registry, options, catalog, the read/write facade over the engine,
+  telemetry, and unit tests that need implementation-private access
+- `internal/engine/` — the convergent engine the Client reads and writes through:
+  the per-scope cache, the single decode-and-validate ingress, the reconcile that
+  follows every changefeed (re)connect, the per-(scope, key) revision publish
+  fence, the coalescing dispatch to subscribers, and value cloning
+- `internal/group/` — the typed-group coordinator behind `Bind`/`OnApply`/`Status`:
+  the per-scope publication cache, the decode, and the fan-out to apply functions
 - `internal/store/` — backend-agnostic `Store` interface (stays private)
 - `internal/postgres/` — pgx/v5 + LISTEN/NOTIFY
 - `internal/mongodb/` — mongo-driver/v2 + change streams (polling fallback)
 - `internal/debounce/` — trailing-edge coalescer used on the changefeed hot path
+- `internal/safelog/` — the tenant stamp for an unresolved tenant and the swallow
+  for a panicking consumer logger, shared by `internal/engine` and
+  `internal/group`
+- `internal/testsupport/` — test-only helpers shared across packages
 
 Scaffolding:
 - `Makefile`, `.golangci.yml`, `.goreleaser.yml`, `.releaserc.yml`, `.gitignore`
@@ -45,9 +54,9 @@ Scaffolding:
 
 Lerian shared-library boundaries are now split across four libraries:
 
-- `github.com/LerianStudio/lib-commons/v6` — non-observability shared primitives used here: `commons/tenant-manager/core`, `commons/net/http`, and `commons/backoff`.
-- `github.com/LerianStudio/lib-observability/v4` — canonical observability stack: `log`, `tracing`, redaction helpers, span helpers, telemetry lifecycle, and `runtime` panic recovery. Used **internally only**; it must not appear in an exported parameter (see the observability boundary above).
-- `github.com/LerianStudio/lib-systemplane/v3` — this module; runtime-mutable configuration with Postgres/MongoDB backends.
+- `github.com/LerianStudio/lib-commons/v7` — non-observability shared primitives used here: `commons/tenant-manager/{core,postgres,mongo}`, `commons/net/http`, and `commons/backoff`.
+- `github.com/LerianStudio/lib-observability/v4` — canonical observability stack: `log`, `tracing`, span helpers, telemetry lifecycle, and `runtime` panic recovery. Used **internally only**; it must not appear in an exported parameter (see the observability boundary above).
+- `github.com/LerianStudio/lib-systemplane/v4` — this module; runtime-mutable configuration with Postgres/MongoDB backends.
 - `github.com/LerianStudio/lib-streaming` — tenant-scoped event streaming; do not introduce it here unless a task explicitly asks for streaming integration.
 
 These are external module imports. Do not rewrite them to in-repo paths. Do not reintroduce observability imports from `lib-commons`; observability has moved to `lib-observability`.
@@ -56,35 +65,40 @@ These are external module imports. Do not rewrite them to in-repo paths. Do not 
 
 ### Operating modes
 
-The Client runs in one of two modes selected at construction:
+The Client runs in one of three shapes selected at construction:
 
-- **Single-tenant** (default). The constructor receives a non-nil `*sql.DB` / `*mongo.Client`. Reads serve from an in-process cache; writes upsert through the store and update the cache. The backend's changefeed (LISTEN/NOTIFY on Postgres, change stream on MongoDB) drives invalidation and fires `OnChange` subscribers.
-- **Multi-tenant** (opt-in via `WithMultiTenantEnabled()`). DB/client may be nil. Every read/write resolves the tenant database from `ctx` via `tmcore.GetPGContext(ctx, module)` / `tmcore.GetMBContext(ctx, module)` (`lib-commons/v6/commons/tenant-manager/core`). For Postgres the lib performs NO runtime schema provisioning — `systemplane_entries` plus its NOTIFY trigger function/triggers must be created externally via `SchemaSQL()` / `DefaultSeedSQL()` (e.g. the consumer's migration pipeline); the runtime role only needs DML. (MongoDB still bootstraps its collection/indexes lazily once per resolved tenant database via a `sync.Map`-backed `sync.Once` cache.) No in-process cache. No LISTEN/NOTIFY. `OnChange` returns `ErrNotSupportedInMultiTenant`. Callers wire `tenant-manager/middleware.TenantMiddleware` (with `WithPG(...)` or `WithMB(...)` and a matching module name) before the lib's handlers.
+- **Single-tenant** (default). The constructor receives a non-nil `*sql.DB` / `*mongo.Client`. Reads serve from the engine's cache, and a write publishes into it before returning. The changefeed (LISTEN/NOTIFY on Postgres, change stream on MongoDB) drives invalidation, and every (re)connect reconciles the whole scope. `Start`'s first reconcile announces every registered key to subscribers registered before it, the default at revision 0 for a key with no row; delivery is asynchronous and coalesced. Consumer-facing semantics: [MIGRATION-v4.md § Behaviour changes](MIGRATION-v4.md#behaviour-changes).
+- **Multi-tenant, per request** (opt-in via `WithMultiTenantEnabled()`). DB/client may be nil. Every read/write resolves the tenant database from `ctx` via `tmcore.GetPGContext(ctx, module)` / `tmcore.GetMBContext(ctx, module)` (`lib-commons/v7/commons/tenant-manager/core`). For Postgres the lib performs NO runtime schema provisioning — `systemplane_entries` plus its NOTIFY trigger function/triggers must be created externally via `SchemaSQL()` (new install) or `MigrationV3ToV4SQL()` (v3 install), e.g. in the consumer's migration pipeline; the runtime role only needs DML. (MongoDB still bootstraps its collection (and polling indexes) lazily once per resolved tenant database via a `sync.Map`-backed `sync.Once` cache.) No in-process cache. No LISTEN/NOTIFY. `OnChange` returns `ErrNotSupportedInMultiTenant`. Callers wire `tenant-manager/middleware.TenantMiddleware` (with `WithPG(...)` or `WithMB(...)` and a matching module name) before the lib's handlers.
+- **Multi-tenant with a tenant manager** (`WithPostgresTenantManager(mgr)` / `WithMongoTenantManager(mgr)`; each implies `WithMultiTenantEnabled()`, and the other backend's constructor refuses it with `ErrTenantManagerBackendMismatch`). The middleware stays: writes and uncached reads use the database it resolved, so `mgr` must be the Manager it registers under the `WithModule` name. `Start` activates nothing. A tenant's first read (tenant from `tmcore.GetTenantIDContext`) activates that tenant's scope in the background; once it is up its reads serve from the engine's cache, fed by the tenant's own changefeed. `OnChange` covers every tenant with `Change.Tenant` set, and every activation announces every registered key. `HandleTenantLifecycle` (the `tmevent.EventHandler` signature, chained after the dispatcher's `HandleEvent`) routes the four tenant-level events and returns only `ErrClosed` and `ErrValidation`; what each event does: [MIGRATION-v4.md § notifications](MIGRATION-v4.md#notifications). Connection sizing and the shared-database refusal: [MIGRATION-v4.md § The database and operator contract](MIGRATION-v4.md#the-database-and-operator-contract).
 
 ### Storage shape
 
-- **Postgres** table `systemplane_entries`:
-  - Columns: `namespace`, `key`, `value JSONB`, `updated_at TIMESTAMPTZ`, `updated_by TEXT`.
+- **Postgres** table `systemplane_entries`, NOTIFY channel `systemplane_changes` (both fixed names):
+  - Columns: `namespace`, `key`, `value JSONB`, `revision BIGINT NOT NULL`, `updated_at TIMESTAMPTZ`, `updated_by TEXT`.
   - Primary key: `(namespace, key)`. **No `tenant_id` column.**
-  - Trigger function `systemplane_notify_v3` emits a NOTIFY with payload `{namespace, key, op}` where `op` is `"upsert"` (INSERT/UPDATE) or `"delete"`.
-  - Two triggers: one for INSERT/DELETE (fires unconditionally) and one for UPDATE (gated by `WHEN (OLD IS DISTINCT FROM NEW)`).
+  - Trigger function `systemplane_notify_v4` emits a NOTIFY with payload `{namespace, key, op, revision}` where `op` is `"upsert"` (INSERT/UPDATE) or `"delete"`.
+  - Trigger function `systemplane_bump_revision_v4` draws every revision from the table-level sequence `systemplane_revision_seq` on insert and on every value change, so it is the only caller of `nextval` and the runtime role stays DML-only.
+  - Three triggers: the BEFORE INSERT OR UPDATE revision bump, one notify for INSERT/DELETE (fires unconditionally) and one notify for UPDATE (gated by `WHEN (OLD IS DISTINCT FROM NEW)`).
 - **MongoDB** collection `systemplane_entries`:
   - Document `_id` is the compound sub-document `{namespace, key}`. No `tenant_id` field.
-  - Top-level mirrors: `namespace`, `key`, `value`, `updated_at`, `updated_by`.
+  - Top-level mirrors: `namespace`, `key`, `value`, `revision`, `updated_at`, `updated_by`, plus `deleted` on a tombstone.
+  - `Delete` rewrites the document as a tombstone rather than removing it, so a key deleted and recreated always comes back above every revision it ever had.
 
 ### Public API (root `systemplane` package)
 
 - Construction: `NewPostgres(db *sql.DB, listenDSN string, opts ...Option) (*Client, error)` or `NewMongoDB(client *mongo.Client, database string, opts ...Option) (*Client, error)`. In multi-tenant mode (`WithMultiTenantEnabled()`) the `db` / `client` MAY be nil and `listenDSN` / `database` MAY be empty.
 - Lifecycle: construct → `Register(ns, key, default, opts...)` for each known key → `Start(ctx)` → runtime operations → `Close()`. `Register` after `Start` returns `ErrRegisterAfterStart`. Nil-receiver safe on reads.
-- Reads (all take `ctx`): `Get`, `GetString`, `GetInt`, `GetBool`, `GetFloat64`, `GetDuration` — return `(value, ok, err)`.
+- Reads (all take `ctx`): `Get`, `GetString`, `GetInt`, `GetBool`, `GetFloat64`, `GetDuration` — return `(value, ok, err)`. `GetEntry` returns `Entry{Value, Revision, UpdatedAt, UpdatedBy, Stale}`; the provenance fields are zero while the registered default is in force. `Stale` is per key, and false on every read that goes through to the tenant database: every multi-tenant read without a tenant manager, and a tenant-managed read while that tenant's scope is not up. Semantics: [MIGRATION-v4.md § `GetEntry`](MIGRATION-v4.md#getentry-reports-revision-provenance-and-freshness).
 - Writes: `Set(ctx, ns, key, value, actor)`, `Delete(ctx, ns, key, actor)`. Last-write-wins; idempotent delete.
-- Listing/metadata: `List(ctx, namespace) ([]ListEntry, error)`, `KeyDescription`, `KeyRedaction`, `IsRegistered`, `Logger()`.
-- Subscriptions: `OnChange(ns, key, fn) (unsubscribe func(), error)`. Returns `ErrNotSupportedInMultiTenant` in multi-tenant mode. Callbacks invoked serially with panic recovery via `lib-observability/runtime.RecoverAndLog`.
-- Registered keys carry: default value, description, validator func, redaction policy (`RedactNone | RedactMask | RedactFull`). Options: `WithDescription`, `WithValidator`, `WithRedaction`.
-- Client options: `WithLogger` (takes [`Logger`](api_boundary.go)), `WithTelemetry` (takes [`Telemetry`](api_boundary.go)), `WithDebounce` (default 100ms), `WithListenChannel` (Postgres default `"systemplane_changes"`), `WithTable` (Postgres default `"systemplane_entries"`), `WithCollection` (MongoDB default `"systemplane_entries"`), `WithPollInterval` (MongoDB — switches to polling), `WithMultiTenantEnabled()`, `WithModule(name)` (default `"systemplane"`).
-- Admin HTTP surface (`admin` subpackage): `Mount(router, client, opts...)` registers four routes at a configurable prefix (default `/system`): `GET :prefix/:namespace`, `GET :prefix/:namespace/:key`, `PUT :prefix/:namespace/:key`, `DELETE :prefix/:namespace/:key`. Options: `WithPathPrefix`, `WithAuthorizer(fn func(fiber.Ctx, action string) error)` — default-deny — and `WithActorExtractor`. The `action` argument is `"read"` (GET) or `"write"` (PUT/DELETE). In multi-tenant mode the caller MUST mount tenant-manager middleware before `admin.Mount` so handler `c.Context()` carries the resolved tenant database.
-- Internal `Store` interface (`internal/store`): `Start`, `Close`, `Get`, `Set`, `Delete`, `List`, `Subscribe`. Implemented by `internal/postgres` and `internal/mongodb`. Backend-agnostic contract suite lives in `systemplanetest.Run(t, factory, RunOptions{SkipSubscribe: ...})` — multi-tenant modes pass `SkipSubscribe: true`.
-- Sentinel errors: `ErrClosed`, `ErrNotStarted`, `ErrRegisterAfterStart`, `ErrUnknownKey`, `ErrValidation`, `ErrDuplicateKey`, `ErrNilContext`, `ErrNotSupportedInMultiTenant`, `ErrTenantConnectionMissing`.
+- Listing/metadata: `List(ctx, namespace) ([]ListEntry, error)`, `KeyDescription`, `IsRegistered`, `Logger()`.
+- Subscriptions: `OnChange(ns, key, fn) (unsubscribe func(), error)`. Returns `ErrUnknownKey` for an unregistered key in both modes, and `ErrNotSupportedInMultiTenant` on a multi-tenant Client without a tenant manager. Deliveries are serialized and coalesced per (scope, key), independent across keys and tenants, and within one activation of a scope never repeat a non-zero revision with the same decoded value. A callback panic is recovered per subscriber and reported through `lib-observability/runtime.HandlePanicValue` (component `systemplane.engine`, name `onchange`), with the value it was raised with. Every recovered panic logs at ERROR, records a span event and counts in `panic_recovered_total` once the host calls `runtime.InitPanicMetrics` ([README § Panic recovery](README.md#panic-recovery)). Semantics: [MIGRATION-v4.md § Deliveries](MIGRATION-v4.md#deliveries-are-coalesced-per-key-and-independent-across-keys).
+- Registered keys carry: default value, description, validator. Options: `WithDescription`, `WithCatalogMetadata`, `WithValidator` (`func(any) error`), `WithContextValidator` (`func(context.Context, any) error`, handed the `Set` context; the default is validated with `context.Background()`). Both validator options set the one validator: nil is ignored, the last non-nil wins. Every ingress runs it: `Set`, each reconcile and changefeed re-read, and every multi-tenant per-request `Get`/`List`. A refusal or panic keeps the last valid value, or the default (always the default on a per-request read), and logs a WARN that never carries the value. Semantics: [MIGRATION-v4.md § Validators](MIGRATION-v4.md#a-stored-row-your-validator-rejects-no-longer-reaches-a-read).
+- Typed groups: `Bind[T](c, ns, key, defaults, validate, opts...)` binds a JSON document of `T` to exactly ONE registered key, so a group is atomic as one row. The handle gives `Snapshot(ctx)`, `Set(ctx, value, actor)` (whole-document last-write-wins), `OnApply(fn)` (the current document, then every later revision, serialized and coalesced per scope; an `fn` error rejects that revision, a panic becomes `ErrApplyPanicked`; on a tenant-managed Client nothing at registration, then each tenant's document as its scope comes up, with `Applied.Tenant`) and `Status()`. `Bind`, `Snapshot` and `Set` work in both modes; on a multi-tenant Client without a tenant manager `OnApply` returns `ErrNotSupportedInMultiTenant`, and `Snapshot` reads through graded like `Get` (a refused row, a stored null included, reads as the defaults, unless the zero `T` is nil — pointer, map, slice or interface — where the null is the document and `Snapshot` returns it). `Bind` must run before `Start`; a group has no `Close`.
+- Schema artifacts: `SchemaSQL()` returns the full DDL (table, revision sequence, both trigger functions, three triggers); `MigrationV3ToV4SQL()` returns the v3 -> v4 delta — that same artifact minus the fork guard and the `CREATE TABLE`, behind a guard of its own that refuses a second install on `search_path`, so it upgrades one schema's install per run. Both are artifacts for the consumer's migration pipeline, with one database per tenant; the runtime executes neither.
+- Client options: `WithLogger` (takes [`Logger`](api_boundary.go)), `WithTelemetry` (takes [`Telemetry`](api_boundary.go); backend traces and the engine metrics, meter `systemplane.engine`), `WithDebounce` (default 100ms), `WithCloseTimeout` (default 30s — how long `Close` waits for subscriber callbacks after cancelling their context), `WithPollInterval` (MongoDB — switches to polling), `WithMultiTenantEnabled()`, `WithPostgresTenantManager(mgr)` / `WithMongoTenantManager(mgr)` (see Operating modes), `WithAggregateTenantThreshold(n)` (default `DefaultAggregateTenantThreshold`, 1000: above n active tenant scopes the metrics' `tenant_id` reads `aggregate`; non-positive keeps per-tenant ids), `WithModule(name)` (default `"systemplane"`), `WithCatalogService(name)`. The table, channel and collection names are fixed; no option overrides them.
+- Admin HTTP surface (`admin` subpackage): `Mount(router, client, opts...)` registers four value routes at a configurable prefix (default `/system`): `GET :prefix/:namespace`, `GET :prefix/:namespace/:key`, `PUT :prefix/:namespace/:key`, `DELETE :prefix/:namespace/:key`; the three key-scoped ones each register a `/*` twin as well, so a key containing `/` still resolves. `MountCatalog(router, client, opts...)` registers two read-only registry routes under the same prefix: `GET :prefix/-/catalog` and `GET :prefix/-/catalog/:namespace/*`. Options (both): `WithPathPrefix`, `WithAuthorizer(fn func(fiber.Ctx, action string) error)` — default-deny — `WithActorExtractor`, and `WithReturnedErrors()` (every error answer is returned to the app's ErrorHandler unwritten, as `*fiber.Error` + `commons.Response` via `errors.As`). The `action` argument is `"read"` (GET) or `"write"` (PUT/DELETE). `MountCatalog` MUST be registered before `Mount`, in both modes, or `Mount`'s `:namespace/:key` and `:namespace/*` routes shadow the catalog routes. In multi-tenant mode tenant-manager middleware goes between the two, so value handlers' `c.Context()` carries the resolved tenant database.
+- Internal `Store` interface (`internal/store`): `Start`, `Close`, `Get`, `Set`, `Delete`, `List`, `Subscribe`. Implemented by `internal/postgres` and `internal/mongodb`. Backend-agnostic contract suite lives in `systemplanetest.Run(t, factory, RunOptions{...})`; a scope whose `Subscribe` is refused with `ErrNotSupportedInMultiTenant` (the zero scope under multi-tenant mode) makes the Subscribe sub-tests skip themselves.
+- Sentinel errors: `ErrClosed`, `ErrNotStarted`, `ErrRegisterAfterStart`, `ErrUnknownKey`, `ErrValidation`, `ErrDuplicateKey`, `ErrNilContext`, `ErrCloseTimeout`, `ErrApplyPanicked`, `ErrNotSupportedInMultiTenant`, `ErrTenantConnectionMissing`, `ErrTenantManagerBackendMismatch`.
 - `NewForTesting(s TestStore, opts ...Option) (*Client, error)` is an explicit out-of-package test helper. Build-tag gated (`unit`/`integration`); not a promised production API.
 - Scope: runtime-mutable knobs only. Bootstrap-only config (DSNs, secrets, TLS) belongs in env-vars/secret manager.
 

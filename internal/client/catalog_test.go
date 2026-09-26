@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/LerianStudio/lib-systemplane/v3/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
 type catalogSpyStore struct {
@@ -23,31 +23,36 @@ type catalogSpyStore struct {
 func (s *catalogSpyStore) Start(context.Context) error { return nil }
 func (s *catalogSpyStore) Close() error                { return nil }
 
-func (s *catalogSpyStore) Get(context.Context, string, string) (store.Entry, bool, error) {
+func (s *catalogSpyStore) Get(context.Context, store.Scope, string, string) (store.Entry, bool, error) {
 	s.getCalls.Add(1)
 
 	return store.Entry{}, false, nil
 }
 
-func (s *catalogSpyStore) Set(context.Context, store.Entry) error {
+func (s *catalogSpyStore) Set(context.Context, store.Scope, store.Entry) (int64, error) {
 	s.setCalls.Add(1)
 
-	return nil
+	return 0, nil
 }
 
-func (s *catalogSpyStore) Delete(context.Context, string, string, string) error {
+func (s *catalogSpyStore) Delete(context.Context, store.Scope, string, string, string) error {
 	s.deleteCalls.Add(1)
 
 	return nil
 }
 
-func (s *catalogSpyStore) List(context.Context) ([]store.Entry, error) {
+func (s *catalogSpyStore) List(context.Context, store.Scope) ([]store.Entry, error) {
 	s.listCalls.Add(1)
 
 	return nil, nil
 }
 
-func (s *catalogSpyStore) Subscribe(context.Context, func(store.Event)) (func(), error) {
+func (s *catalogSpyStore) Subscribe(_ context.Context, _ store.Scope, fn func(store.Event)) (func(), error) {
+	// Announce a connected changefeed (FC-2) so the engine's first reconcile
+	// runs and Start returns. This store persists nothing, so Set keeps
+	// reporting revision 0.
+	fn(store.Event{Op: store.OpResync})
+
 	return func() {}, nil
 }
 
@@ -93,7 +98,6 @@ func TestCatalogReturnsRegisteredMetadataBeforeStart(t *testing.T) {
 
 	if err := c.Register("runtime", "z", map[string]any{"nested": map[string]any{"value": "default"}},
 		WithDescription("runtime key"),
-		WithRedaction(RedactMask),
 		WithValidator(func(any) error { return nil }),
 		WithCatalogMetadata(meta),
 	); err != nil {
@@ -132,8 +136,8 @@ func TestCatalogReturnsRegisteredMetadataBeforeStart(t *testing.T) {
 	if summary.Namespace != "runtime" || summary.Key != "z" {
 		t.Fatalf("second key = %s/%s, want runtime/z", summary.Namespace, summary.Key)
 	}
-	if summary.Kind != "json" || summary.RuntimeClass != "read_live" || summary.Redaction != "mask" {
-		t.Fatalf("summary metadata = kind %q runtime %q redaction %q", summary.Kind, summary.RuntimeClass, summary.Redaction)
+	if summary.Kind != "json" || summary.RuntimeClass != "read_live" {
+		t.Fatalf("summary metadata = kind %q runtime %q", summary.Kind, summary.RuntimeClass)
 	}
 	if !summary.HasValidator {
 		t.Fatal("summary HasValidator = false, want true")

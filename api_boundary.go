@@ -51,8 +51,13 @@ type Logger interface {
 //
 // Both methods may return an error; this library then falls back to a no-op
 // tracer or leaves the affected instruments disabled. A nil Telemetry is
-// accepted, disables tracing and metrics entirely, and clears a provider set
-// by an earlier option.
+// accepted, disables tracing entirely, and clears a provider set by an earlier
+// option.
+//
+// The engine asks Meter for meter systemplane.engine, which reports tracked
+// scopes, cached entries, changefeed events and disconnects, cache reads (hit or
+// miss) and how long a tenant scope takes to come up after the read that
+// activates it; a nil Telemetry records none.
 type Telemetry interface {
 	Tracer(name string) (trace.Tracer, error)
 	Meter(name string) (metric.Meter, error)
