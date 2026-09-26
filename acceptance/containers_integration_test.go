@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -54,7 +55,13 @@ func TestMain(m *testing.M) {
 	terminateMu.Unlock()
 
 	if code == 0 {
-		if err := goleak.Find(goleakOptions()...); err != nil {
+		if err := goleak.Find(
+			// testcontainers' Reaper is process-lifetime by design; the rest is
+			// the Docker client's HTTP keep-alive.
+			goleak.IgnoreAnyFunction("github.com/testcontainers/testcontainers-go.(*Reaper).connect.func1"),
+			goleak.IgnoreAnyFunction("net/http.(*persistConn).readLoop"),
+			goleak.IgnoreAnyFunction("net/http.(*persistConn).writeLoop"),
+		); err != nil {
 			fmt.Fprintf(os.Stderr, "goroutine leak after acceptance suite: %v\n", err)
 
 			code = 1
@@ -62,17 +69,6 @@ func TestMain(m *testing.M) {
 	}
 
 	os.Exit(code)
-}
-
-// goleakOptions pins the third-party goroutines that outlive the tests.
-func goleakOptions() []goleak.Option {
-	return []goleak.Option{
-		// testcontainers' Reaper is process-lifetime by design.
-		goleak.IgnoreAnyFunction("github.com/testcontainers/testcontainers-go.(*Reaper).connect.func1"),
-		// HTTP keep-alive of the Docker client.
-		goleak.IgnoreAnyFunction("net/http.(*persistConn).readLoop"),
-		goleak.IgnoreAnyFunction("net/http.(*persistConn).writeLoop"),
-	}
 }
 
 func registerTerminator(fn func()) {
@@ -86,7 +82,7 @@ func registerTerminator(fn func()) {
 func startPostgresContainer() (string, error) {
 	ctx := context.Background()
 
-	container, err := pgcontainer.Run(ctx, "postgres:17-alpine",
+	container, err := pgcontainer.Run(ctx, "postgres:16-alpine",
 		pgcontainer.WithDatabase("postgres"),
 		pgcontainer.WithUsername("postgres"),
 		pgcontainer.WithPassword("postgres"),
@@ -139,9 +135,15 @@ func freshPostgres(t *testing.T) (dsn string, db *sql.DB) {
 		t.Fatalf("create database %s: %v", name, err)
 	}
 
-	dsn = replaceDatabase(base, name)
+	u, err := url.Parse(base)
+	if err != nil {
+		t.Fatalf("parse postgres url: %v", err)
+	}
 
-	db, err := sql.Open("pgx", dsn)
+	u.Path = "/" + name
+	dsn = u.String()
+
+	db, err = sql.Open("pgx", dsn)
 	if err != nil {
 		t.Fatalf("open %s: %v", name, err)
 	}
@@ -155,88 +157,20 @@ func freshPostgres(t *testing.T) (dsn string, db *sql.DB) {
 	return dsn, db
 }
 
-// replaceDatabase swaps the database segment of a testcontainers Postgres URL.
-func replaceDatabase(base, name string) string {
-	slash := strings.LastIndex(base, "/")
-	if slash < 0 {
-		return base
-	}
-
-	head, tail := base[:slash+1], base[slash+1:]
-	if q := strings.Index(tail, "?"); q >= 0 {
-		return head + name + tail[q:]
-	}
-
-	return head + name
-}
-
-// holdFeedGap closes foreign's database to new connections and terminates its
-// LISTEN backend, so the feed stays down until reopen; writes inside the gap go
-// through the returned connection, opened before the door closed.
-func holdFeedGap(t *testing.T, foreign *sql.DB) (held *sql.Conn, reopen func()) {
-	t.Helper()
-
-	held, err := foreign.Conn(t.Context())
-	if err != nil {
-		t.Fatalf("hold a connection: %v", err)
-	}
-
-	t.Cleanup(func() { _ = held.Close() })
-
-	var name string
-	if err := held.QueryRowContext(t.Context(), "SELECT current_database()").Scan(&name); err != nil {
-		t.Fatalf("read the database name: %v", err)
-	}
-
-	admin, _ := pgAdmin(t)
-	allow := func(ctx context.Context, open bool) error {
-		_, err := admin.ExecContext(ctx, fmt.Sprintf("ALTER DATABASE %s ALLOW_CONNECTIONS %t", name, open))
-
-		return err
-	}
-
-	// Registered last, so it runs first: a failed test cannot leave teardown locked out.
-	t.Cleanup(func() {
-		if err := allow(context.Background(), true); err != nil {
-			t.Errorf("reopen %s: %v", name, err)
-		}
-	})
-
-	if err := allow(t.Context(), false); err != nil {
-		t.Fatalf("close %s to new connections: %v", name, err)
-	}
-
-	var killed int
-	if err := admin.QueryRowContext(t.Context(),
-		`SELECT count(*) FILTER (WHERE pg_terminate_backend(pid)) FROM pg_stat_activity WHERE datname = $1 AND query LIKE 'LISTEN%'`,
-		name,
-	).Scan(&killed); err != nil || killed != 1 {
-		t.Fatalf("terminate the LISTEN backend on %s: killed %d, err %v", name, killed, err)
-	}
-
-	return held, func() {
-		if err := allow(t.Context(), true); err != nil {
-			t.Fatalf("reopen %s: %v", name, err)
-		}
-	}
-}
-
-// execer is a pool or the one connection held open across a feed gap.
-type execer interface {
-	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
-}
-
 // writeRowDirect writes a row as something other than the library, so the
 // changefeed is the only way the client can learn of it.
-func writeRowDirect(t *testing.T, foreign execer, key, jsonValue, actor string) {
+func writeRowDirect(t *testing.T, foreign interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}, key, jsonValue string,
+) {
 	t.Helper()
 
 	if _, err := foreign.ExecContext(t.Context(), `
 		INSERT INTO systemplane_entries (namespace, "key", value, updated_at, updated_by)
-		VALUES ($1, $2, $3::jsonb, now(), $4)
+		VALUES ($1, $2, $3::jsonb, now(), 'foreign')
 		ON CONFLICT (namespace, "key") DO UPDATE
 		SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at, updated_by = EXCLUDED.updated_by`,
-		accNS, key, jsonValue, actor); err != nil {
+		accNS, key, jsonValue); err != nil {
 		t.Fatalf("foreign write %s: %v", key, err)
 	}
 }
@@ -300,22 +234,6 @@ func freshMongo(t *testing.T) string {
 
 	return name
 }
-
-// foreignMongoClient opens a client the library does not own.
-func foreignMongoClient(t *testing.T) *mongo.Client {
-	t.Helper()
-
-	c, err := mongo.Connect(options.Client().ApplyURI(mongoContainer(t).uri).SetDirect(true))
-	if err != nil {
-		t.Fatalf("foreign mongo connect: %v", err)
-	}
-
-	t.Cleanup(func() { _ = c.Disconnect(context.Background()) })
-
-	return c
-}
-
-const mongoCollection = "systemplane_entries"
 
 // --------------------------------------------------------------- waiting --
 

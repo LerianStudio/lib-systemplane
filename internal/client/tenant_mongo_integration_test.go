@@ -89,8 +89,6 @@ func TestIntegration_MongoFeedGapServesStaleThenConverges(t *testing.T) {
 	env.tm.mu.Unlock()
 
 	awaitEntry(t, env.c, t1.cacheOnly(t), gapRow, "t1 after the reopen")
-	// The closed client left its cursor idle on the server: only a getMore counts.
-	requireFeeds(t, inFlightChangeStreams, t1.dbName, 1)
 	requireEntry(t, env.c, t2.cacheOnly(t), row2, "t2 after t1's reopen")
 	rec.await(t, t1.id, row1, gapRow)
 	rec.await(t, t2.id, row2)

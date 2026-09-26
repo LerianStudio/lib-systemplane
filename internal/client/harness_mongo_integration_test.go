@@ -259,9 +259,9 @@ func (m mongoTenant) stored(t *testing.T) client.Entry {
 	return e
 }
 
-// changeStreamIDs lists the change-stream cursors open on dbName's collection
-// that are in a getMore, plus, with idle, those between two (P3-6).
-func changeStreamIDs(t *testing.T, dbName string, idle bool) []int64 {
+// countChangeStreams counts the change-stream cursors open on dbName's
+// collection that are in a getMore, plus, with idle, those between two (P3-6).
+func countChangeStreams(t *testing.T, dbName string, idle bool) int {
 	t.Helper()
 
 	cur, err := replicaSet.admin.Database("admin").Aggregate(t.Context(), mongo.Pipeline{
@@ -273,29 +273,22 @@ func changeStreamIDs(t *testing.T, dbName string, idle bool) []int64 {
 		t.Fatalf("$currentOp on %s: %v", dbName, err)
 	}
 
-	var cursors []struct {
-		ID int64 `bson:"_id"`
-	}
+	var cursors []bson.D
 	if err := cur.All(t.Context(), &cursors); err != nil {
 		t.Fatalf("decode $currentOp on %s: %v", dbName, err)
 	}
 
-	ids := make([]int64, 0, len(cursors))
-	for _, c := range cursors {
-		ids = append(ids, c.ID)
-	}
-
-	return ids
+	return len(cursors)
 }
 
 // changeStreams counts dbName's change-stream cursors, idle ones included, so
 // a cursor between two getMores still counts (P3-6).
 func changeStreams(t *testing.T, dbName string) int {
-	return len(changeStreamIDs(t, dbName, true))
+	return countChangeStreams(t, dbName, true)
 }
 
 // inFlightChangeStreams counts only those in a getMore: a live feed is almost
 // always in one, and a stopped one leaves its cursor idle on the server.
 func inFlightChangeStreams(t *testing.T, dbName string) int {
-	return len(changeStreamIDs(t, dbName, false))
+	return countChangeStreams(t, dbName, false)
 }

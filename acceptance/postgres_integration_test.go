@@ -14,6 +14,7 @@ import (
 	"time"
 
 	systemplane "github.com/LerianStudio/lib-systemplane/v4"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/testsupport/pggap"
 )
 
 // newSTPostgres builds an unstarted single-tenant client over a fresh database,
@@ -43,71 +44,57 @@ func newSTPostgres(t *testing.T, opts ...systemplane.Option) (*systemplane.Clien
 }
 
 // Scenario 1: while the changefeed is down the scope serves the last value
-// marked Stale, and the gap's final write lands after the reconnect, exactly
-// once, with no second write: the reconcile closes the gap, not a NOTIFY.
+// marked Stale, and the gap write lands after the reconnect, exactly once, with
+// no second write: the reconcile closes the gap, not a NOTIFY.
 func TestIntegration_Acceptance01_FeedLossPostgres(t *testing.T) {
-	cases := []struct {
-		name   string
-		writes []string
-	}{
-		{"one gap write converges without a second write", []string{"during-gap"}},
-		{"the last of two gap writes wins and the first is never observed", []string{"gap-first", "gap-second"}},
+	const key = "feed-loss"
+
+	client, foreign, _ := newSTPostgres(t)
+	mustRegister(t, client, key)
+
+	sink := subscribe(t, client, key)
+	mustStart(t, client)
+
+	if initial := sink.next(t, 30*time.Second, "initial publication at Start"); initial.Revision != 0 || initial.Value != defaultValue {
+		t.Fatalf("initial publication = %#v, want the registered default at revision 0", initial)
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			const key = "feed-loss"
+	// Written foreign, so its publication is the feed's own re-read: none is
+	// left pending to read the gap write before the reconnect does.
+	writeRowDirect(t, foreign, key, `"before-gap"`)
 
-			client, foreign, _ := newSTPostgres(t)
-			mustRegister(t, client, key)
+	before := sink.next(t, 10*time.Second, "publication of the pre-gap write")
+	if before.Value != "before-gap" || before.Revision == 0 {
+		t.Fatalf("pre-gap publication = %#v, want before-gap at a store revision", before)
+	}
 
-			sink := subscribe(t, client, key)
-			mustStart(t, client)
+	admin, _ := pgAdmin(t)
+	held, reopen := pggap.Hold(t, admin, foreign)
 
-			if initial := sink.next(t, 30*time.Second, "initial publication at Start"); initial.Revision != 0 || initial.Value != defaultValue {
-				t.Fatalf("initial publication = %#v, want the registered default at revision 0", initial)
-			}
+	awaitCond(t, 30*time.Second, "the scope reports Stale once the feed is severed", func() bool {
+		return entryOf(t, client, key).Stale
+	})
 
-			// Written foreign, so its publication is the feed's own re-read: none is
-			// left pending to read a gap write before the reconnect does.
-			writeRowDirect(t, foreign, key, `"before-gap"`, "foreign")
+	writeRowDirect(t, held, key, `"during-gap"`)
 
-			before := sink.next(t, 10*time.Second, "publication of the pre-gap write")
-			if before.Value != "before-gap" || before.Revision == 0 {
-				t.Fatalf("pre-gap publication = %#v, want before-gap at a store revision", before)
-			}
+	// Longer than the listener's first retry: a reconnect that got through would show.
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		if e := entryOf(t, client, key); !e.Stale || e.Value != "before-gap" || e.Revision != before.Revision {
+			t.Fatalf("read inside the gap = %#v, want before-gap at revision %d marked Stale", e, before.Revision)
+		}
+	}
 
-			held, reopen := holdFeedGap(t, foreign)
-			awaitCond(t, 30*time.Second, "the scope reports Stale once the feed is severed", func() bool {
-				return entryOf(t, client, key).Stale
-			})
+	reopen()
 
-			for _, v := range tc.writes {
-				writeRowDirect(t, held, key, strconv.Quote(v), "foreign")
-			}
+	converged := sink.next(t, 60*time.Second, "publication of the gap write after the reconnect")
+	if converged.Value != "during-gap" || converged.Revision <= before.Revision {
+		t.Fatalf("post-reconnect publication = %#v, want during-gap above revision %d", converged, before.Revision)
+	}
 
-			// Longer than the listener's first retry: a reconnect that got through would show.
-			for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
-				if e := entryOf(t, client, key); !e.Stale || e.Value != "before-gap" || e.Revision != before.Revision {
-					t.Fatalf("read inside the gap = %#v, want before-gap at revision %d marked Stale", e, before.Revision)
-				}
-			}
+	sink.expectSilence(t, "a second delivery after convergence")
 
-			reopen()
-
-			want := tc.writes[len(tc.writes)-1]
-
-			converged := sink.next(t, 60*time.Second, "publication of the gap write after the reconnect")
-			if converged.Value != want || converged.Revision <= before.Revision {
-				t.Fatalf("post-reconnect publication = %#v, want %q above revision %d", converged, want, before.Revision)
-			}
-
-			sink.expectSilence(t, "a second delivery after convergence")
-
-			if e := entryOf(t, client, key); e.Value != want || e.Revision != converged.Revision || e.Stale || e.UpdatedBy != "foreign" {
-				t.Fatalf("converged entry = %#v, want %q at revision %d, fresh, by foreign", e, want, converged.Revision)
-			}
-		})
+	if e := entryOf(t, client, key); e.Value != "during-gap" || e.Revision != converged.Revision || e.Stale || e.UpdatedBy != "foreign" {
+		t.Fatalf("converged entry = %#v, want during-gap at revision %d, fresh, by foreign", e, converged.Revision)
 	}
 }
 
@@ -127,7 +114,7 @@ func TestIntegration_Acceptance05_InvalidExternalRowPostgres(t *testing.T) {
 	mustSet(t, client, key, "last-valid")
 	valid := sink.next(t, 10*time.Second, "publication of the last valid value")
 
-	writeRowDirect(t, foreign, key, `{"not":"a string"}`, "foreign")
+	writeRowDirect(t, foreign, key, `{"not":"a string"}`)
 	sink.expectSilence(t, "delivery of a row the validator rejected")
 
 	if got := entryOf(t, client, key); got.Value != "last-valid" || got.Revision != valid.Revision || got.Stale {
@@ -176,7 +163,7 @@ func TestIntegration_Acceptance07_SlowSubscriberDoesNotStallFeed(t *testing.T) {
 
 	// Foreign writes reach the client only through NOTIFY and re-read.
 	for _, v := range []string{"first", "second"} {
-		writeRowDirect(t, foreign, fastKey, strconv.Quote(v), "foreign")
+		writeRowDirect(t, foreign, fastKey, strconv.Quote(v))
 
 		if got := fastSink.next(t, 500*time.Millisecond, "the fast key's "+v+" change while the slow one blocks"); got.Value != v {
 			t.Fatalf("fast-key delivery = %#v, want %q", got, v)

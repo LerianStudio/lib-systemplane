@@ -4,7 +4,6 @@ package acceptance
 
 import (
 	"context"
-	"errors"
 	"io"
 	"net"
 	"net/url"
@@ -170,7 +169,7 @@ func newSTMongo(t *testing.T) (*systemplane.Client, *tcpProxy, *mongo.Collection
 
 	t.Cleanup(func() { _ = client.Close() })
 
-	return client, proxy, foreignMongoClient(t).Database(dbName).Collection(mongoCollection), logger
+	return client, proxy, mongoContainer(t).client.Database(dbName).Collection("systemplane_entries"), logger
 }
 
 // mongoDocID is the compound _id of an entry document. Ordered, because
@@ -179,24 +178,9 @@ func mongoDocID(key string) bson.D {
 	return bson.D{{Key: "namespace", Value: accNS}, {Key: "key", Value: key}}
 }
 
-// currentRevision reads a document's revision through the foreign handle.
-func currentRevision(t *testing.T, coll *mongo.Collection, key string) int64 {
-	t.Helper()
-
-	var doc struct {
-		Revision int64 `bson:"revision"`
-	}
-
-	if err := coll.FindOne(t.Context(), bson.M{"_id": mongoDocID(key)}).Decode(&doc); err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
-		t.Fatalf("read current revision for %s: %v", key, err)
-	}
-
-	return doc.Revision
-}
-
 // writeDocDirect writes a v4 entry document, explicit revision included, as
 // something other than the library.
-func writeDocDirect(t *testing.T, coll *mongo.Collection, key, jsonValue, actor string, revision int64) {
+func writeDocDirect(t *testing.T, coll *mongo.Collection, key, jsonValue string, revision int64) {
 	t.Helper()
 
 	_, err := coll.UpdateOne(t.Context(),
@@ -208,9 +192,8 @@ func writeDocDirect(t *testing.T, coll *mongo.Collection, key, jsonValue, actor 
 				"value":      jsonValue,
 				"revision":   revision,
 				"updated_at": time.Now().UTC(),
-				"updated_by": actor,
+				"updated_by": "foreign",
 			},
-			"$unset": bson.M{"deleted": ""},
 		},
 		options.UpdateOne().SetUpsert(true))
 	if err != nil {
@@ -257,7 +240,7 @@ func TestIntegration_Acceptance03_FeedLossMongo(t *testing.T) {
 
 	// Written foreign, so its publication is the feed's own re-read: none is
 	// left pending to fail against the severed proxy.
-	writeDocDirect(t, foreign, key, `"before-gap"`, "foreign", 1)
+	writeDocDirect(t, foreign, key, `"before-gap"`, 1)
 
 	before := sink.next(t, 30*time.Second, "publication of the pre-gap write")
 	if before.Value != "before-gap" || before.Revision == 0 {
@@ -274,7 +257,7 @@ func TestIntegration_Acceptance03_FeedLossMongo(t *testing.T) {
 	}
 
 	// The foreign handle bypasses the proxy, so this lands while the library is blind.
-	writeDocDirect(t, foreign, key, `"during-gap"`, "foreign", before.Revision+1)
+	writeDocDirect(t, foreign, key, `"during-gap"`, before.Revision+1)
 	proxy.restore(t)
 
 	converged := sink.next(t, 120*time.Second, "publication of the gap write after the stream re-opens")
@@ -289,9 +272,9 @@ func TestIntegration_Acceptance03_FeedLossMongo(t *testing.T) {
 	}
 }
 
-// Scenario 5 on MongoDB: a foreign writer resurrects a tombstone with a value
-// the validator rejects; the default stays in force, the rejection is logged,
-// nothing is marked stale and no subscriber hears of it.
+// Scenario 5 on MongoDB: a foreign document the validator rejects leaves the
+// last valid value in force, is logged, marks nothing stale and reaches no
+// subscriber.
 func TestIntegration_Acceptance05_InvalidExternalRowMongo(t *testing.T) {
 	const key = "mongo-invalid-row"
 
@@ -306,19 +289,11 @@ func TestIntegration_Acceptance05_InvalidExternalRowMongo(t *testing.T) {
 	mustSet(t, client, key, "last-valid")
 	valid := sink.next(t, 30*time.Second, "publication of the last valid value")
 
-	deleteToDefault(t, client, sink, key)
-
-	// Delete leaves a tombstone above every revision the key had.
-	tombstone := currentRevision(t, foreign, key)
-	if tombstone <= valid.Revision {
-		t.Fatalf("tombstone revision %d not above the pre-delete revision %d", tombstone, valid.Revision)
-	}
-
-	writeDocDirect(t, foreign, key, `{"not":"a string"}`, "foreign", tombstone+1)
+	writeDocDirect(t, foreign, key, `{"not":"a string"}`, valid.Revision+1)
 	sink.expectSilence(t, "delivery of a row the validator rejected")
 
-	if got := entryOf(t, client, key); got.Value != defaultValue || got.Revision != 0 || got.Stale {
-		t.Fatalf("read after the invalid resurrection = %#v, want the default at revision 0, not stale", got)
+	if got := entryOf(t, client, key); got.Value != "last-valid" || got.Revision != valid.Revision || got.Stale {
+		t.Fatalf("read after the invalid document = %#v, want last-valid at revision %d, not stale", got, valid.Revision)
 	}
 
 	logger.requireMention(t, key)

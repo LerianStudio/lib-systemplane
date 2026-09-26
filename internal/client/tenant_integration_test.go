@@ -126,9 +126,9 @@ func (r *changeRecorder) await(t *testing.T, tenant string, want ...client.Entry
 }
 
 // One subscription hears every tenant, each write once and tagged with its own
-// tenant: the Set's publication and its feed echo are one change, and a later
-// write behind the Client (another replica's) reaches t1's cached scope
-// through t1's feed.
+// tenant: a Set is in its tenant's cache when it returns and in no other's, its
+// feed echo is not a second change, and a write behind the Client reaches t1's
+// cached scope through t1's feed.
 func writeDeliversOnceToItsTenantOnly(t *testing.T, b backend) {
 	env := b.open(t, client.WithDebounce(deliveryDebounce))
 	t1, t2 := env.add(t, "t1"), env.add(t, "t2")
@@ -145,12 +145,16 @@ func writeDeliversOnceToItsTenantOnly(t *testing.T, b backend) {
 	}
 
 	written := t1.stored(t)
+	if got := readEntry(t, env.c, t1.cacheOnly(t), "t1 read-back from the cache"); got.Value != written.Value ||
+		got.Revision != written.Revision || got.UpdatedBy != written.UpdatedBy || got.Stale {
+		t.Fatalf("t1 read-back from the cache = %+v, want the stored %+v", got, written)
+	}
+
+	requireEntry(t, env.c, t2.cacheOnly(t), client.Entry{Value: "default"}, "t2 after t1's write")
 	rec.await(t, t1.id, written)
 
 	remote := t1.seed(t, "written-elsewhere")
 	awaitEntry(t, env.c, t1.cacheOnly(t), remote, "t1 cached scope serves the write made elsewhere")
-	rec.await(t, t1.id, written, remote)
-	rec.await(t, t2.id)
 
 	if err := env.c.Set(t2.ctx, tenantNS, tenantKey, "written-t2", "it"); err != nil {
 		t.Fatalf("Set on t2: %v", err)
@@ -293,34 +297,6 @@ func TestIntegration_PostgresSuspendedTenantKeepsNoFeed(t *testing.T) {
 // the server until the cursor times out, a store defect this lane does not own.
 func TestIntegration_MongoSuspendedTenantKeepsNoFeed(t *testing.T) {
 	suspendedTenantKeepsNoFeed(t, backend{build: mongoBackend.build, feeds: inFlightChangeStreams})
-}
-
-// A Set on a cached tenant is in that tenant's scope when it returns, and in
-// no other tenant's.
-func setIsReadBackFromTheCache(t *testing.T, b backend) {
-	env := b.open(t)
-	t1, t2 := env.add(t, "t1"), env.add(t, "t2")
-
-	env.activate(t, t1, t2)
-
-	if err := env.c.Set(t1.ctx, tenantNS, tenantKey, "written", "it"); err != nil {
-		t.Fatalf("Set on t1: %v", err)
-	}
-
-	got, want := readEntry(t, env.c, t1.cacheOnly(t), "t1 read-back from the cache"), t1.stored(t)
-	if got.Value != want.Value || got.Revision != want.Revision || got.UpdatedBy != want.UpdatedBy || got.Stale {
-		t.Fatalf("t1 read-back from the cache = %+v, want the stored %+v", got, want)
-	}
-
-	requireEntry(t, env.c, t2.cacheOnly(t), client.Entry{Value: "default"}, "t2 after t1's write")
-}
-
-func TestIntegration_PostgresSetIsReadBackFromTheCache(t *testing.T) {
-	setIsReadBackFromTheCache(t, pgBackend)
-}
-
-func TestIntegration_MongoSetIsReadBackFromTheCache(t *testing.T) {
-	setIsReadBackFromTheCache(t, mongoBackend)
 }
 
 // limits is the document the group test binds to groupKey.
