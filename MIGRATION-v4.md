@@ -28,7 +28,10 @@ read reports whether anything is currently confirming the value it just handed
 back. That is a behaviour upgrade, not only a rename — so § Behaviour changes
 has to be read even where your code compiles unchanged.
 
-<!-- NOT-YET(engine-tenants): the same guarantees per tenant scope -->
+A multi-tenant Client built with `WithPostgresTenantManager` or
+`WithMongoTenantManager` gets the same per tenant: a tenant's first read brings
+up that tenant's own scope, reconciled and fed by its own changefeed, and later
+reads are served in process.
 
 ---
 
@@ -55,6 +58,7 @@ has to be read even where your code compiles unchanged.
 | `GetEntry`, `Entry` | Read the value together with its revision, `UpdatedAt`, `UpdatedBy` and a per-key `Stale` flag. |
 | `Bind`, `Group[T]`, `Snapshot[T]`, `Applied[T]`, `ApplyStatus`, `Group.Snapshot`, `Group.Set`, `Group.OnApply`, `Group.Status`, `ErrApplyPanicked` | Declare a whole typed configuration document as one key, read it as `T`, and apply it through a serialized hook that records what is desired, what is applied and what last failed. `Bind`, `Snapshot` and `Set` work in both modes; on a multi-tenant Client without a tenant manager `OnApply` returns `ErrNotSupportedInMultiTenant`, and `Snapshot` reads through graded like `Get`. |
 | `MigrationV3ToV4SQL()` | The v3 → v4 Postgres delta as an importable artifact for your migration pipeline. See § The database and operator contract. |
+| `WithPostgresTenantManager`, `WithMongoTenantManager`, `ErrTenantManagerBackendMismatch` | Cache and push each tenant's configuration the way the single-tenant scope is: a tenant's first read activates its scope, `OnChange` delivers per tenant with `Change.Tenant` set, and `Client.HandleTenantLifecycle` drops, blocks and rebuilds the scope. Each option implies `WithMultiTenantEnabled`; the constructor of the other backend refuses it with `ErrTenantManagerBackendMismatch`. |
 | `WithContextValidator` | Validate a value against the `Set` caller's context, so a validator can use the tenant that call carried. The registered default is still validated with `context.Background()`. |
 | `TestScope` | The scope every `TestStore` method now takes: `TestScope{Tenant}`, with `Tenant` `""` for the single-tenant scope. |
 
@@ -303,7 +307,8 @@ scope counts nothing, as in v3.
 
 ### Every callback registered before `Start` fires once at `Start`
 
-**Affects:** every single-tenant consumer with an `OnChange` subscriber.
+**Affects:** every `OnChange` subscriber of a single-tenant or tenant-managed
+Client.
 
 `Start` reconciles every registered key against the store and hands the value
 in force to every subscriber registered beforehand — once, per key. Keys the
@@ -322,9 +327,12 @@ side effect now happens on every boot.
 one last applied. A callback that posts a notification, rotates a credential or
 restarts a worker now does it once per process start.
 
-This holds for the single-tenant scope today.
-
-<!-- NOT-YET(engine-tenants): multi-tenant callbacks fire once per tenant at activation -->
+On a Client built with `WithPostgresTenantManager` or `WithMongoTenantManager`
+`Start` announces nothing, because no tenant scope exists yet. Each tenant
+announces every registered key once when its first read activates its scope,
+and again each time that scope is rebuilt: after `tenant.credentials.rotated`,
+and on the first read after a `tenant.activated` that follows a suspension or
+deletion.
 
 ### `OnChange`'s signature changed, and an unregistered key is refused
 
@@ -358,13 +366,14 @@ the one thing to read out of it, and honouring it is what lets `Close` finish.
 `OnChange` for a key nothing registered returns `ErrUnknownKey` in both modes,
 where v3 logged a debug line (single-tenant) and handed back a no-op unsubscribe
 — a subscription that could never deliver anything now surfaces the typo at
-wiring time. In multi-tenant mode a registered key then returns
-`ErrNotSupportedInMultiTenant`: no scope is tracked and no changefeed runs, so
-nothing could fire. For a consumer that only reads per-request configuration
-that refusal is permanent, and reading through on each request is the whole
-design.
-
-<!-- NOT-YET(engine-tenants): multi-tenant OnChange with a tenant manager, Change.Tenant set -->
+wiring time. On a multi-tenant Client without a tenant manager a registered key
+then returns `ErrNotSupportedInMultiTenant`: no scope is tracked and no
+changefeed runs, so nothing could fire. For a consumer that only reads
+per-request configuration that refusal is permanent, and reading through on
+each request is the whole design. With `WithPostgresTenantManager` or
+`WithMongoTenantManager` one subscription covers every tenant: `Change.Tenant`
+names the tenant of each delivery, and deliveries are serialized and coalesced
+per (tenant, key).
 
 **Do:** rewrite the signature, and check the error — v3 callers routinely
 discarded it because it only ever reported a closed Client.
@@ -441,9 +450,11 @@ that nothing is currently confirming **this** key: before `Start`; while the
 changefeed is disconnected, or connected but not yet reconciled; and while this
 key's last change could not be re-read. Reads keep serving the last published
 value throughout — `Stale` is about confidence, not absence — and a sibling key
-that could not be re-read does not make this one stale. In multi-tenant mode
-`Stale` is always false: every read resolves the tenant database and reads
-through, so no cache can lag.
+that could not be re-read does not make this one stale. A read a tenant's
+scope serves reports `Stale` the same way. A read that goes to the tenant
+database reports false, because no cache can lag: every read of a multi-tenant
+Client without a tenant manager, and a tenant-managed read while that tenant's
+scope is not up.
 
 Three rules produce that per-key answer:
 
@@ -580,13 +591,21 @@ one database each receive the other's events; and the unqualified
 `DROP FUNCTION` of the v3 notify function resolves through the applying role's
 whole `search_path`, so applying the DDL in one schema can drop another
 schema's function. Nothing in the database enforces this — it is the
-operator's responsibility.
-<!-- NOT-YET(engine-tenants): the public refusal (root ErrSharedDatabaseUnsupported) when two tenant feeds of one Store resolve to one database; a pinned search_path alone is not refused -->
+operator's responsibility. A Client built with `WithPostgresTenantManager`
+catches one case inside its own process: a tenant whose LISTEN connection
+reaches a database another tenant's feed of that Client already listens on is
+refused when its feed opens. That tenant's activation logs a WARN, its reads
+stay per request and a later read retries; no root error reports it. A pinned
+`search_path` alone is not refused, and two processes sharing one database
+cannot see each other.
 
 A single-tenant Client holds one LISTEN connection, opened from `listenDSN` and
 held for the life of the Client, separate from the `*sql.DB` pool you hand
-`NewPostgres`.
-<!-- NOT-YET(engine-tenants): one extra LISTEN backend per active tenant per replica; size max_connections against active tenants × replicas -->
+`NewPostgres`. A Client built with `WithPostgresTenantManager` holds one per
+active tenant instead, opened from that tenant's primary DSN on top of the
+tenant manager's pools, so size `max_connections` against active tenants ×
+replicas. A tenant is active from the first read that brings its scope up until
+`tenant.suspended`, `tenant.deleted` or `Close` drops it.
 
 **Revisions are opaque and monotonic per `(namespace, key)`**, including across
 a delete and a recreate: the counter is table-level, so a key that comes back
@@ -618,11 +637,14 @@ leaves one document.
 **Change streams need a replica set.** Against a standalone server, pass
 `WithPollInterval`: the fallback reads the same collection on a timer and obeys
 the same resync and revision rules, costing latency rather than correctness. In
-multi-tenant mode the tenant database resolved from the request context is
-materialized on first use with `createCollection`, so the runtime role needs
-that privilege in every tenant database; the single-tenant collection is left
-to be created by its first write.
-<!-- NOT-YET(engine-tenants): the same for a connector-resolved database, and the refusal when two tenants resolve to one database and collection -->
+multi-tenant mode every tenant database — resolved from the request context, or
+by `WithMongoTenantManager` for a tenant's scope — is materialized on first use
+with `createCollection`, so the runtime role needs that privilege in every
+tenant database; the single-tenant collection is left to be created by its
+first write. A tenant-managed Client refuses a tenant's feed when another
+tenant's feed of that Client already watches the same database and collection:
+that tenant's activation logs a WARN and its reads stay per request. Tenants on
+distinct databases of one server are admitted.
 
 ---
 
@@ -707,23 +729,34 @@ Same as br-consignado-gw.
 2. Render `revision`, `updatedAt` (JSON null when no row backs the value) and `updatedBy` from every admin GET and list response as the Console's provenance fields. `stale` is always false on this shape.
 3. Filter `deleted: {$ne: true}` in **every** direct read of `systemplane_entries`. A delete writes a tombstone rather than removing the document; see [§ MongoDB](#mongodb).
 
-<!-- NOT-YET(engine-tenants): WithMongoTenantManager wiring, connector-resolved createCollection, shared-collection refusal -->
-
 The Console's tenant shape is the per-request one: the database resolved from
 the request context on every read and write, no in-process cache, no
-changefeed, and `OnChange` refused with `ErrNotSupportedInMultiTenant`.
+changefeed, and `OnChange` refused with `ErrNotSupportedInMultiTenant`. To cache
+each tenant in process and subscribe per tenant, construct with
+`WithMongoTenantManager(mbMgr)`, passing the `*tmmongo.Manager` the
+tenant-manager middleware registers under the `WithModule` name. Each tenant
+then needs a database of its own and a replica set, or `WithPollInterval`
+([§ MongoDB](#mongodb)); `stale` reports on reads a tenant's scope serves; and
+the lifecycle wiring is the one [§ notifications](#notifications) shows.
 
 ### notifications
 
 **From:** v1.6.1 — unsuffixed module, Fiber v2, lib-commons v5, lib-observability v1, and a `Manager`.
 **Mode:** multi-tenant, Postgres.
-**Breaks:** blocked until engine-tenants if you use tenant lifecycle handling: the four `OnTenant*` handlers have no replacement yet, and a process that depends on them cannot take this upgrade. Beyond that, the v1.6.x row of [§ The module and dependency hop](#the-module-and-dependency-hop), and the `Manager` on top of it: `NewManager`, `WithManagerLogger`, `WithManagerTelemetry`, the four `OnTenant*` handlers and `Drain` all stop existing in the same change. The two cannot be split — one import line cannot be on v1.6.x and on `/v4` at once — which makes this the largest single upgrade in the matrix. Budget it as two.
+**Breaks:** the v1.6.x row of [§ The module and dependency hop](#the-module-and-dependency-hop), and the `Manager` on top of it: `NewManager`, `WithManagerLogger`, `WithManagerTelemetry`, the four `OnTenant*` handlers and `Drain` all stop existing in the same change. The two cannot be split — one import line cannot be on v1.6.x and on `/v4` at once — which makes this the largest single upgrade in the matrix. Budget it as two.
 **Do:**
 
 1. Fiber v2 → v3 first, as its own change, then the observability boundary. Both are in the hop table above.
-2. Delete the `Manager`. One `Client` carries what it configured: `WithMultiTenantEnabled()`, `WithModule(...)`, `WithLogger`, `WithTelemetry`.
-3. Replace `Drain(ctx)` with `Close()`, which takes no context — see [§ `Close` is bounded, and names the callback that would not stop](#close-is-bounded-and-names-the-callback-that-would-not-stop).
-4. Budget for every multi-tenant read reaching the tenant database. The per-tenant cache belonged to the `Manager` and left with it.
+2. Apply `MigrationV3ToV4SQL()` to every tenant database before the new binary boots.
+3. Delete the `Manager` and move what it configured onto one `Client`: `WithPostgresTenantManager(pgMgr)`, which implies `WithMultiTenantEnabled()`, plus `WithModule`, `WithLogger` and `WithTelemetry`. `pgMgr` must be the `*tmpostgres.Manager` the tenant-manager middleware registers under the `WithModule` name: writes and uncached reads use the database the middleware resolved, cached reads use `pgMgr`'s.
+4. Replace the four `OnTenant*` handlers with `c.HandleTenantLifecycle`, chained after the dispatcher's own `HandleEvent`. It returns two errors the handlers never did, `ErrClosed` after `Close` and `ErrValidation` for an event with no `TenantID`, and no longer the one they did: a tenant database that cannot be reached fails that tenant's activation in the background with a WARN, and a later read retries.
+5. Replace `Drain(ctx)` with `Close()`, which takes no context — see [§ `Close` is bounded, and names the callback that would not stop](#close-is-bounded-and-names-the-callback-that-would-not-stop).
+
+| v1.6.1 handler | v4 event through `HandleTenantLifecycle` |
+|---|---|
+| `OnTenantActivated` warmed the tenant | `tenant.activated` clears the tenant's blocked marker and opens nothing: the tenant's next read brings its scope up. |
+| `OnTenantSuspended`, `OnTenantDeleted` | `tenant.suspended` and `tenant.deleted` drop the scope and block the tenant: its reads go to the tenant database per request, and none brings the scope back until the next `tenant.activated`. |
+| `OnTenantCredentialsRotated` | `tenant.credentials.rotated` rebuilds an active tenant's scope on a fresh feed and leaves a blocked tenant blocked. |
 
 ~~~go
 // v1.6.1 — construction, lifecycle registration, shutdown
@@ -734,19 +767,34 @@ m := systemplane.NewManager(c, pgMgr, systemplane.WithManagerLogger(lg))
 defer m.Drain(ctx)
 ~~~
 
-<!-- NOT-YET(engine-tenants): WithPostgresTenantManager construction, HandleTenantLifecycle registration with the tmevent dispatcher, returned handler errors, after-fragment -->
+~~~go
+// v4 — construction, lifecycle registration, shutdown
+c, err := systemplane.NewPostgres(nil, "",
+	systemplane.WithPostgresTenantManager(pgMgr), systemplane.WithLogger(lg))
+if err != nil {
+	return err
+}
+// dispatcher.HandleEvent first: on a rotation it reloads the pools the rebuild resolves
+lifecycle := func(ctx context.Context, evt tmevent.TenantLifecycleEvent) error {
+	return errors.Join(dispatcher.HandleEvent(ctx, evt), c.HandleTenantLifecycle(ctx, evt))
+}
+// lifecycle is the tmevent.EventHandler the tenant event listener is built with
+return c.Close() // at shutdown, in place of m.Drain(ctx)
+~~~
 
 ### plugin-br-pix-jd
 
 **From:** v3.0.0 — `/v3`, already on lib-commons `/v7` and lib-observability `/v4`.
 **Mode:** multi-tenant, Postgres.
-**Breaks:** blocked until engine-tenants if you use tenant lifecycle handling: `HandleTenantLifecycle` has no replacement yet, and a process that depends on it cannot take this upgrade. Beyond that, the `Manager` — `NewManager`, `Drain`, and `HandleTenantLifecycle` as a method on it; the `DefaultSeedSQL()` DDL generator; the channel override.
+**Breaks:** the `Manager` — `NewManager`, `Drain`, and `HandleTenantLifecycle` as a method on it; the `DefaultSeedSQL()` DDL generator; the channel override.
 **Do:**
 
 1. Bump the module path. That is the whole dependency hop for this consumer — the `/v3` row of the hop table, no lib-commons and no lib-observability move.
 2. Delete the seed-DDL generator and the channel override; the name-override row of [§ The surface diff](#the-surface-diff) says what each needs.
 3. Apply `MigrationV3ToV4SQL()` to every tenant database before the new binary boots.
-4. Replace `Drain(ctx)` with `Close()` — the same contrast notifications carries above.
+4. Delete the `Manager` and build the Client with `WithPostgresTenantManager(pgMgr)`, passing the `*tmpostgres.Manager` the tenant-manager middleware registers under the `WithModule` name.
+5. Register `c.HandleTenantLifecycle` where `m.HandleTenantLifecycle` was: same signature, chained after the dispatcher's own `HandleEvent`. What each event now does is the table in [§ notifications](#notifications). `tenant.activated` no longer warms the tenant, and the handler returns `ErrClosed` after `Close` and `ErrValidation` for an event with no `TenantID`, where v3 returned nil for every event.
+6. Replace `Drain(ctx)` with `Close()` — the same contrast notifications carries above.
 
 ~~~go
 // v3.0.0 — construction, lifecycle registration, shutdown
@@ -756,18 +804,32 @@ m := systemplane.NewManager(c, pgMgr)
 defer m.Drain(ctx)
 ~~~
 
-<!-- NOT-YET(engine-tenants): HandleTenantLifecycle moves Manager → Client with the same signature and now returns errors; lazy activation; blocked-marker semantics; after-fragment -->
+~~~go
+// v4 — construction, lifecycle registration, shutdown
+c, err := systemplane.NewPostgres(nil, "", systemplane.WithPostgresTenantManager(pgMgr))
+if err != nil {
+	return err
+}
+// registered as the tmevent handler, where m.HandleTenantLifecycle was
+lifecycle := func(ctx context.Context, evt tmevent.TenantLifecycleEvent) error {
+	return errors.Join(dispatcher.HandleEvent(ctx, evt), c.HandleTenantLifecycle(ctx, evt))
+}
+return c.Close() // at shutdown, in place of m.Drain(ctx)
+~~~
 
 ### br-sfn
 
 **From:** v3.0.0-beta.2 — `/v3`, already on lib-commons `/v7` and lib-observability `/v4`.
 **Mode:** multi-tenant, Postgres, with 17 `OnChange` callbacks registered before `Start`.
-**Breaks:** cannot take this upgrade until engine-tenants lands. v3 dispatched the 17 callbacks through the bound `Manager`, once per NOTIFY across any active tenant, on the LISTEN goroutine's context and never with the tenant on it. v4 has no `Manager`, and multi-tenant `OnChange` returns `ErrNotSupportedInMultiTenant` for every registered key, so on v4 the 17 hot-reloads either fail at boot, where the error is checked, or silently stop, where it is discarded.
-**Do, when engine-tenants lands:**
+**Breaks:** the `Manager`, and when the 17 callbacks fire. v3 dispatched them through the bound `Manager`, once per NOTIFY across any active tenant, on the LISTEN goroutine's context and never with the tenant on it. On v4 they fire only on a Client built with `WithPostgresTenantManager`: without it multi-tenant `OnChange` returns `ErrNotSupportedInMultiTenant` for every registered key, so the 17 hot-reloads either fail at boot, where the error is checked, or silently stop, where it is discarded.
+**Do:**
 
 1. Bump the module path; nothing else in `go.mod`.
 2. Apply `MigrationV3ToV4SQL()` to every tenant database.
-3. Rewrite the 17 callbacks to `func(ctx context.Context, ch Change)`. Namespace, key, revision and value come off `ch`; the ctx is the engine's own lifecycle context and carries no request values and no tenant.
+3. Delete the `Manager` and build the Client with `WithPostgresTenantManager(pgMgr)`, passing the `*tmpostgres.Manager` the tenant-manager middleware registers under the `WithModule` name; `Close()` replaces `Drain(ctx)`.
+4. Rewrite the 17 callbacks to `func(ctx context.Context, ch Change)` and key each reload by `ch.Tenant`: a delivery carries one tenant's value. Namespace, key, revision and value come off `ch`; the ctx is the engine's own lifecycle context and carries no request values and no tenant.
+5. Make each callback idempotent per tenant. `Start` announces nothing on this Client; each tenant instead delivers every registered key once when its first read activates its scope, and again when that scope is rebuilt: 17 deliveries per tenant activation that v3 never made. A tenant this process never reads delivers nothing. Deliveries coalesce per (tenant, key), as [§ Deliveries are coalesced per key and independent across keys](#deliveries-are-coalesced-per-key-and-independent-across-keys) describes.
+6. Register `c.HandleTenantLifecycle` as [§ notifications](#notifications) shows. Without it a suspended or deleted tenant keeps its scope and its LISTEN connection until `Close`.
 
 ~~~go
 // v3.0.0-beta.2 — construction, subscriptions, shutdown
@@ -778,4 +840,19 @@ m := systemplane.NewManager(c, pgMgr)
 defer m.Drain(ctx)
 ~~~
 
-<!-- NOT-YET(engine-tenants): the upgrade itself — the 17 callbacks fire once per tenant at activation, Change.Tenant names the tenant, and deliveries coalesce per key as § Deliveries describes -->
+~~~go
+// v4 — construction, the 17 subscriptions before c.Start(ctx), lifecycle, shutdown
+c, err := systemplane.NewPostgres(nil, "", systemplane.WithPostgresTenantManager(pgMgr))
+if err != nil {
+	return err
+}
+if _, err := c.OnChange(ns, key, func(ctx context.Context, ch systemplane.Change) {
+	reload(ch.Tenant, ch.Value) // once per tenant activation, then that tenant's changes
+}); err != nil {
+	return err
+}
+lifecycle := func(ctx context.Context, evt tmevent.TenantLifecycleEvent) error {
+	return errors.Join(dispatcher.HandleEvent(ctx, evt), c.HandleTenantLifecycle(ctx, evt))
+}
+return c.Close() // at shutdown, in place of m.Drain(ctx)
+~~~

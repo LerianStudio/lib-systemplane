@@ -20,9 +20,14 @@
 // value in force that the write path would refuse. The scope reconciles against
 // the store after every changefeed reconnect, so a value written while the feed
 // was down becomes visible without a second write. [Client.GetEntry] reports
-// the revision, provenance and staleness behind the value it returns. In
-// multi-tenant mode there is no cache: every read resolves the tenant database
-// from ctx and reads through.
+// the revision, provenance and staleness behind the value it returns.
+//
+// In multi-tenant mode ([WithMultiTenantEnabled]) every read resolves the
+// tenant database from ctx and reads through, with no cache.
+// [WithPostgresTenantManager] or [WithMongoTenantManager] adds one: a tenant's
+// first read brings up that tenant's own scope, cached and fed by its own
+// changefeed like the single-tenant one, and [Client.HandleTenantLifecycle]
+// drops, blocks and rebuilds it on the tenant manager's lifecycle events.
 //
 // Settings that imply resource teardown (DB DSNs, secrets, TLS material, listen
 // addresses) belong in environment variables, not in the runtime config plane.
