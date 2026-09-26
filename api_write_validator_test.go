@@ -48,6 +48,10 @@ func TestPublicWriteValidatorGradesWrites(t *testing.T) {
 		}
 	}
 
+	if _, err := Bind(c, "ns", "group", struct{}{}, nil, WithWriteValidator(refuseRefused)); !errors.Is(err, ErrValidation) {
+		t.Errorf("Bind with a write-only validator: err = %v, want ErrValidation", err)
+	}
+
 	if err := c.Register("ns", "k", "ok", WithWriteValidator(refuseRefused)); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
