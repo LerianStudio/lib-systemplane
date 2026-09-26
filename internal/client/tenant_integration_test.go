@@ -95,7 +95,9 @@ func (r *changeRecorder) written(tenant string) []client.Change {
 }
 
 // A write delivers exactly once, to its own tenant: the Set's publication and
-// the feed's echo of the same revision are one change, and t2 hears nothing.
+// the feed's echo of the same revision are one change, and t2 hears nothing. A
+// later write behind the Client, as another replica makes it, reaches t1's
+// cached scope through t1's feed, which carried the Set's echo before it.
 func writeDeliversOnceToItsTenantOnly(t *testing.T, b backend) {
 	env := b.open(t, client.WithDebounce(deliveryDebounce))
 	t1, t2 := env.add(t, "t1"), env.add(t, "t2")
@@ -112,16 +114,21 @@ func writeDeliversOnceToItsTenantOnly(t *testing.T, b backend) {
 	}
 
 	eventually(t, "t1 delivery of the write", func() bool { return len(rec.written(t1.id)) > 0 })
+
+	remote := t1.seed(t, "written-elsewhere")
+	awaitEntry(t, env.c, t1.cacheOnly(t), remote, "t1 cached scope serves the write made elsewhere")
 	time.Sleep(3 * deliveryDebounce) // the no-delivery window: room for an echo to land
 
 	got := rec.written(t1.id)
-	if len(got) != 1 || got[0].Value != "written" {
-		t.Fatalf("t1 deliveries of the write = %+v, want exactly one carrying %q", got, "written")
+	if len(got) != 2 || got[0].Value != "written" || got[1].Value != remote.Value || got[1].Revision != remote.Revision {
+		t.Fatalf("t1 deliveries = %+v, want one carrying %q, then one carrying %+v", got, "written", remote)
 	}
 
 	if leaked := rec.written(t2.id); len(leaked) != 0 {
-		t.Fatalf("t2 received t1's write: %+v", leaked)
+		t.Fatalf("t2 received t1's writes: %+v", leaked)
 	}
+
+	requireEntry(t, env.c, t2.cacheOnly(t), client.Entry{Value: "default"}, "t2 from its cache after t1's writes")
 }
 
 func TestIntegration_PostgresWriteDeliversOnceToItsTenantOnly(t *testing.T) {

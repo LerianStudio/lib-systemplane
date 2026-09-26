@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -16,6 +15,7 @@ import (
 	tmclient "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/client"
 	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
 	tmmongo "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/mongo"
+	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/client"
 	"github.com/testcontainers/testcontainers-go"
 	mongocontainer "github.com/testcontainers/testcontainers-go/modules/mongodb"
@@ -158,7 +158,7 @@ func newMongoTenantEnv(t *testing.T, srv *mongoServer, opts ...client.Option) *m
 	env.add = func(t *testing.T, id string) liveTenant {
 		m := env.tenant(t, id)
 
-		return liveTenant{m.tenantRef, func(t *testing.T, v string) client.Entry { return m.write(t, tenantKey, v, 1) }, m.stored}
+		return liveTenant{m.tenantRef, func(t *testing.T, v string) client.Entry { return m.write(t, tenantKey, v, m.next(t)) }, m.stored}
 	}
 
 	return env
@@ -217,6 +217,25 @@ func (m mongoTenant) write(t *testing.T, key string, value any, revision int64) 
 	return want
 }
 
+// keyFilter selects tenantKey's document in a tenant's collection.
+var keyFilter = bson.D{{Key: "_id", Value: bson.D{{Key: "namespace", Value: tenantNS}, {Key: "key", Value: tenantKey}}}}
+
+// next is the revision a write behind the Client takes, as the store bumps it:
+// one above the stored document's, 1 with none.
+func (m mongoTenant) next(t *testing.T) int64 {
+	t.Helper()
+
+	var doc struct {
+		Revision int64 `bson:"revision"`
+	}
+
+	if err := m.db.Collection(entriesColl).FindOne(t.Context(), keyFilter).Decode(&doc); err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
+		t.Fatalf("read row on %s: %v", m.dbName, err)
+	}
+
+	return doc.Revision + 1
+}
+
 // stored reads the key's document from the tenant's collection as a read reports it.
 func (m mongoTenant) stored(t *testing.T) client.Entry {
 	t.Helper()
@@ -228,9 +247,7 @@ func (m mongoTenant) stored(t *testing.T) client.Entry {
 		UpdatedBy string    `bson:"updated_by"`
 	}
 
-	if err := m.db.Collection(entriesColl).FindOne(t.Context(), bson.D{{Key: "_id", Value: bson.D{
-		{Key: "namespace", Value: tenantNS}, {Key: "key", Value: tenantKey},
-	}}}).Decode(&doc); err != nil {
+	if err := m.db.Collection(entriesColl).FindOne(t.Context(), keyFilter).Decode(&doc); err != nil {
 		t.Fatalf("read row on %s: %v", m.dbName, err)
 	}
 
@@ -271,29 +288,36 @@ func changeStreamIDs(t *testing.T, dbName string, idle bool) []int64 {
 	return ids
 }
 
-// killChangeStream kills dbName's change-stream cursor while a getMore runs on
-// it: the driver silently resumes a cursor killed between two, severing nothing.
-func killChangeStream(t *testing.T, dbName string) {
+// killChangeStream kills tn's in-flight change-stream cursor until the store
+// logs the loss: the driver silently resumes a cursor killed between two getMores.
+func killChangeStream(t *testing.T, logs *captureLogger, tn tenantRef) {
 	t.Helper()
 
-	var ids []int64
+	const lost = "change stream disconnected, reconnecting"
 
-	eventually(t, "one change stream in a getMore on "+dbName, func() bool {
-		ids = changeStreamIDs(t, dbName, false)
+	before := logs.count(log.LevelWarn, lost, tn.id)
 
-		return len(ids) == 1
+	eventually(t, "a change-stream kill on "+tn.dbName+" the store reports", func() bool {
+		ids := changeStreamIDs(t, tn.dbName, false)
+		if len(ids) != 1 {
+			return false
+		}
+
+		if err := replicaSet.admin.Database(tn.dbName).RunCommand(t.Context(), bson.D{
+			{Key: "killCursors", Value: entriesColl},
+			{Key: "cursors", Value: bson.A{ids[0]}},
+		}).Err(); err != nil {
+			t.Fatalf("killCursors %d on %s: %v", ids[0], tn.dbName, err)
+		}
+
+		for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+			if logs.count(log.LevelWarn, lost, tn.id) > before {
+				return true
+			}
+		}
+
+		return false
 	})
-
-	var res struct {
-		CursorsKilled []int64 `bson:"cursorsKilled"`
-	}
-
-	if err := replicaSet.admin.Database(dbName).RunCommand(t.Context(), bson.D{
-		{Key: "killCursors", Value: entriesColl},
-		{Key: "cursors", Value: bson.A{ids[0]}},
-	}).Decode(&res); err != nil || !slices.Contains(res.CursorsKilled, ids[0]) {
-		t.Fatalf("killCursors %d on %s: killed %v, err %v", ids[0], dbName, res.CursorsKilled, err)
-	}
 }
 
 // changeStreams counts dbName's change-stream cursors, idle ones included, so

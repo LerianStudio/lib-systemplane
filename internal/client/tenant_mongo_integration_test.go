@@ -69,9 +69,8 @@ func TestIntegration_MongoCursorLossConverges(t *testing.T) {
 	env.activate(t, t1, t2)
 	requireFeeds(t, changeStreams, t1.dbName, 1)
 
-	killChangeStream(t, t1.dbName)
+	killChangeStream(t, env.log, t1.tenantRef)
 	written := t1.write(t, tenantKey, "written-in-gap", row1.Revision+1)
-	env.log.waitFor(t, log.LevelWarn, "change stream disconnected, reconnecting", t1.id)
 
 	eventually(t, "t1 serves the write made in the gap", func() bool {
 		requireEntry(t, env.c, t2.cacheOnly(t), row2, "t2 while t1's feed recovers")
