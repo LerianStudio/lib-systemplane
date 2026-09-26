@@ -39,12 +39,12 @@ func TestPublicWriteValidatorGradesWrites(t *testing.T) {
 		t.Errorf("Register with a refused default: err = %v, want ErrValidation", err)
 	}
 
-	for name, opts := range map[string][]KeyOption{
-		"WithValidator first":        {WithValidator(refuseRefused), WithWriteValidator(refuseRefused)},
-		"WithContextValidator after": {WithWriteValidator(refuseRefused), WithContextValidator(func(context.Context, any) error { return nil })},
+	for key, opts := range map[string][]KeyOption{
+		"validator-first":         {WithValidator(refuseRefused), WithWriteValidator(refuseRefused)},
+		"context-validator-after": {WithWriteValidator(refuseRefused), WithContextValidator(func(context.Context, any) error { return nil })},
 	} {
-		if err := c.Register("ns", "both", "ok", opts...); !errors.Is(err, ErrValidation) {
-			t.Errorf("%s: Register with both kinds of validator: err = %v, want ErrValidation", name, err)
+		if err := c.Register("ns", key, "ok", opts...); !errors.Is(err, ErrValidation) {
+			t.Errorf("%s: Register with both kinds of validator: err = %v, want ErrValidation", key, err)
 		}
 	}
 
@@ -54,6 +54,10 @@ func TestPublicWriteValidatorGradesWrites(t *testing.T) {
 
 	if err := c.Register("ns", "k", "ok", WithWriteValidator(refuseRefused)); err != nil {
 		t.Fatalf("Register: %v", err)
+	}
+
+	if d, ok := c.CatalogKey("ns", "k"); !ok || !d.HasValidator {
+		t.Errorf("CatalogKey = (%+v, %v), want HasValidator for a write-only key", d, ok)
 	}
 
 	if err := c.Start(ctx); err != nil {
@@ -125,7 +129,10 @@ func TestPublicWriteValidatorServesStoredRowsAsStored(t *testing.T) {
 				t.Fatalf("hydration delivery = %+v, want %+v", got, want)
 			}
 
-			store.writeBehind(TestEntry{Namespace: "ns", Key: "k", Value: []byte(`"refused-2"`), Revision: 2})
+			// Straight into the store, as an older binary or an operator would.
+			if _, err := store.Set(context.Background(), TestScope{Tenant: tc.tenant}, TestEntry{Namespace: "ns", Key: "k", Value: []byte(`"refused-2"`)}); err != nil {
+				t.Fatalf("store.Set: %v", err)
+			}
 
 			want.Revision, want.Value = 2, "refused-2"
 			if got := nextChange(t, changes); got != want {

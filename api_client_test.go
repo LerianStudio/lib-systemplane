@@ -62,26 +62,13 @@ func (s *apiMemoryStore) isClosed() bool {
 }
 
 // seed writes a row straight into the fake, under the same lock its methods
-// take.
+// take, so a later Set is revisioned above it.
 func (s *apiMemoryStore) seed(e TestEntry) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.entries[apiMemoryKey(e.Namespace, e.Key)] = e
-}
-
-// writeBehind writes a row straight into the fake, as an older binary or an
-// operator would, and delivers the changefeed notification for it.
-func (s *apiMemoryStore) writeBehind(e TestEntry) {
-	s.mu.Lock()
-	s.entries[apiMemoryKey(e.Namespace, e.Key)] = e
 	s.revision = max(s.revision, e.Revision)
-	sub, scope := s.sub, s.scope
-	s.mu.Unlock()
-
-	if sub != nil {
-		sub(TestEvent{Scope: scope, Namespace: e.Namespace, Key: e.Key, Op: internalstore.OpUpsert, Revision: e.Revision})
-	}
 }
 
 func (s *apiMemoryStore) Get(_ context.Context, _ TestScope, ns, key string) (TestEntry, bool, error) {
@@ -99,11 +86,11 @@ func (s *apiMemoryStore) Set(_ context.Context, _ TestScope, e TestEntry) (int64
 	rev := s.revision
 	e.Revision = rev
 	s.entries[apiMemoryKey(e.Namespace, e.Key)] = e
-	sub := s.sub
+	sub, scope := s.sub, s.scope
 	s.mu.Unlock()
 
 	if sub != nil {
-		sub(TestEvent{Namespace: e.Namespace, Key: e.Key, Op: internalstore.OpUpsert, Revision: rev})
+		sub(TestEvent{Scope: scope, Namespace: e.Namespace, Key: e.Key, Op: internalstore.OpUpsert, Revision: rev})
 	}
 
 	return rev, nil
