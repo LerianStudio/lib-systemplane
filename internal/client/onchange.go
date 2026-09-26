@@ -1,4 +1,3 @@
-// Change notification dispatch for systemplane Client.
 package client
 
 import (
@@ -21,7 +20,7 @@ import (
 // and one key in different tenants, deliver independently.
 //
 // A subscriber registered before [Client.Start] is handed the value in force
-// once, as the first reconcile publishes every registered key (FC-11). The
+// once, as the first reconcile publishes every registered key. The
 // publication happens while Start is still on the stack; the DELIVERY is
 // queued there and runs on the key's own worker goroutine, so it may land
 // either side of Start's return. That decides what a callback may do:

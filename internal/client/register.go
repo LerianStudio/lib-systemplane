@@ -1,4 +1,3 @@
-// Register and key definition management for systemplane Client.
 package client
 
 import (
@@ -22,7 +21,7 @@ type keyDef struct {
 	// defaultValue is the value in force whenever no row exists, held in the
 	// CANONICAL shape — what the store hands back. Every other ingress serves
 	// that shape, and one key must never deliver two different Go types
-	// depending on whether a row exists (FC-5): a subscriber that type-asserts
+	// depending on whether a row exists: a subscriber that type-asserts
 	// the shape its validator was told to expect would otherwise panic on the
 	// boot announcement and again after every delete.
 	defaultValue any
@@ -41,7 +40,7 @@ type keyDef struct {
 // [ErrRegisterAfterStart] otherwise.
 //
 // The default is kept in its CANONICAL shape, the one a stored row comes back
-// in, so a key answers with one Go type whether a row exists or not (FC-5).
+// in, so a key answers with one Go type whether a row exists or not.
 // Only the catalog keeps the caller's own value, and only to describe it.
 func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOption) error {
 	if c == nil || c.closed.Load() {
@@ -85,7 +84,7 @@ func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOp
 	// refused every read-back of its own key.
 	//
 	// Computed for every key, not only a validated one, because the shape is
-	// what a READER gets: the FC-11 announcement at Start, every read while no
+	// what a READER gets: the Start announcement, every read while no
 	// row exists, and every delete all publish this value.
 	canonical, err := canonicalValue(def.catalogDefault)
 	if err != nil {

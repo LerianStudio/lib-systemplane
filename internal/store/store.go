@@ -108,7 +108,7 @@ type Event struct {
 	Namespace string
 	Key       string
 	Op        string
-	Revision  int64 // revision after the change; 0 for OpDelete, OpResync, or unknown
+	Revision  int64 // 0 for OpDelete, OpResync, OpDisconnect, or unknown
 }
 
 // Store is the contract implemented by internal/postgres and internal/mongodb.

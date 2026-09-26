@@ -349,8 +349,8 @@ func (e *Engine) listSnapshot(ctx context.Context, scope store.Scope) ([]store.E
 // instead of finishing a photograph of a connection that has already dropped.
 //
 // A row the ingress refuses is the one case where "the snapshot carried this
-// key" is not the same as "the engine learned its value"; see the FC-11 note
-// below the publish call.
+// key" is not the same as "the engine learned its value"; see the note below
+// the publish call.
 //
 // Decoding the row and running the registered validator happen BEFORE the
 // lock, for the reason the ingress splits at all: the validator is consumer
@@ -431,7 +431,7 @@ func (e *Engine) applySnapshotRow(ctx context.Context, sc *scopeState, arm recon
 	}
 
 	// The ingress refused the row — undecodable, or refused by the registered
-	// validator — and has already said so at WARN. FC-11 as amended: the first
+	// validator — and has already said so at WARN. Still announced: the first
 	// reconcile that SEES the row, with nothing cached for the key, announces
 	// it with its registered default at Revision 0 exactly like an absent row.
 	// That is the same resolution keepsCachedValue gives an absent-and-unusable
@@ -440,8 +440,8 @@ func (e *Engine) applySnapshotRow(ctx context.Context, sc *scopeState, arm recon
 	//
 	// The empty cache is the whole condition, and "once" needs nothing else:
 	// this announcement caches the default, so a later reconcile over a row
-	// that stays rejected finds the key cached and leaves the value in force
-	// (D-G4). Asking instead whether the scope's FIRST reconcile was still
+	// that stays rejected finds the key cached and leaves the value in force.
+	// Asking instead whether the scope's FIRST reconcile was still
 	// pending silenced the announcement for good whenever that reconcile
 	// failed to list — it completed, with an error, and the row it never saw
 	// was never announced by any reconcile after it.

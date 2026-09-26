@@ -42,8 +42,8 @@ type Decoded[T any] struct {
 	Value    T
 }
 
-// ApplyFunc is what Register takes. previous is nil on the first delivery for
-// the scope and is the last value THIS function accepted otherwise.
+// ApplyFunc is what Register takes. previous is the last document THIS
+// function accepted for the scope, nil until it has accepted one.
 type ApplyFunc[T any] func(ctx context.Context, current Decoded[T], previous *Decoded[T]) error
 
 // Status reports one scope's desired and applied revisions.

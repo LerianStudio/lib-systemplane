@@ -103,7 +103,7 @@ func (w *dispatchWorker) take() (Change, bool) {
 // subscription, not the next subscriber that reused the freed slot.
 //
 // It does not reject an unregistered key — the Client owns the registry and
-// answers FC-4's ErrUnknownKey before delegating here.
+// answers ErrUnknownKey before delegating here.
 //
 // A closed engine accepts no subscription: registering one would hand back a
 // callback nothing can ever invoke.
@@ -157,8 +157,8 @@ func (e *Engine) OnChange(nk NSKey, fn func(ctx context.Context, ch Change)) (un
 // usually costs a mutex and a non-blocking channel send — plus, on a
 // subscribed key's first published change, the launch of that key's worker
 // goroutine in workerFor. Workers are bounded at one per subscribed key per
-// scope, so that launch is a one-off per key, and FC-11 puts almost every one
-// of them in the first reconcile at Start.
+// scope, so that launch is a one-off per key, and almost every one of them
+// lands in the first reconcile at Start.
 //
 // A key nobody subscribes to starts no worker: the delivery would have nowhere
 // to go, and a process registering hundreds of keys should not pay a goroutine
@@ -193,7 +193,7 @@ func (e *Engine) dispatch(sc *scopeState, pub publication) {
 // workerFor returns sc's worker for nk, starting it on first use. Workers live
 // until the lifecycle context is canceled or their scope is dropped, so the
 // goroutine count is one parked worker per subscribed key per tracked scope:
-// FC-11 publishes every registered key at a scope's first reconcile, so from
+// A scope's first reconcile publishes every registered key, so from
 // that moment on every key with a subscriber has a worker, and a key nobody
 // subscribed to never gets one.
 //

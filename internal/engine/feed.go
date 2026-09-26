@@ -542,8 +542,8 @@ func (e *Engine) recordFeedDelete(scope store.Scope, nk NSKey) {
 //
 // The Client's own Delete is its one caller. Leaving Delete to the feed alone
 // would make read-your-writes on a delete wait for a NOTIFY round trip, so the
-// caller's next read could still be answered by the value it just removed
-// (D4). It bumps the key's delete counter through publish, so a changefeed
+// caller's next read could still be answered by the value it just removed.
+// It bumps the key's delete counter through publish, so a changefeed
 // re-read that was already in flight when the caller deleted is refused
 // exactly as it is for a delete the feed reports.
 //
@@ -802,7 +802,7 @@ func (e *Engine) getRow(ctx context.Context, sc *scopeState, nk NSKey) (store.En
 // on the wider question instead: anything at all having landed on the key
 // since the read began means the cache holds a fact this read did not see. The
 // case that matters is the caller's own Set, published for read-your-writes
-// (D4) the moment the store acknowledged it, while this reader was still
+// the moment the store acknowledged it, while this reader was still
 // inside a Store.Get that could not yet see the row — publishing the default
 // on top of it would revert a write the caller has already been told landed.
 // A refusal publishes nothing and records nothing: whatever won recorded

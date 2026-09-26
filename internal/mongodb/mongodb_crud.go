@@ -113,7 +113,7 @@ func upsertPipeline(e store.Entry) mongo.Pipeline {
 				bson.D{{Key: opLiteral, Value: newValue}},
 			}}},
 			bson.D{{Key: opIfNull, Value: bson.A{"$" + fieldRevision, int64(1)}}}, // unchanged value → keep
-			bumpRevisionExpr(), // changed → bump above the old revision AND above the clock floor (D11)
+			bumpRevisionExpr(), // changed → bump above the old revision AND above the clock floor
 		}}}}}}},
 		// Stage 2 — the rest of the document. EVERY caller-supplied string is
 		// wrapped in $literal: in a pipeline $set, a bare string beginning with

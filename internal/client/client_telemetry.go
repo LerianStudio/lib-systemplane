@@ -1,4 +1,3 @@
-// Client telemetry helpers: logger-level shortcuts.
 package client
 
 import (

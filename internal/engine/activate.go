@@ -78,7 +78,7 @@ func (e *Engine) launchActivation(scope store.Scope, rebuild bool) bool {
 
 			up := false
 			defer func() {
-				// FC-12 times a first activation, a superseded one included; never a rebuild.
+				// Metrics time a first activation, a superseded one included; never a rebuild.
 				if e.endActivation(ctx, scope, up) && !rebuild {
 					e.metrics.recordActivation(scope, begun)
 				}
@@ -148,7 +148,7 @@ func (e *Engine) supersede(scope store.Scope) {
 }
 
 // activate brings scope up and waits for its first reconcile. A failure drops
-// the scope whole (D7): unlike Start, a tenant has no caller to hand a stale
+// the scope whole: unlike Start, a tenant has no caller to hand a stale
 // scope to. Close owns the teardown of a scope it interrupts.
 func (e *Engine) activate(ctx context.Context, scope store.Scope) error {
 	sc, err := e.bringUpScope(scope)
