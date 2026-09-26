@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/LerianStudio/lib-commons/v7/commons"
 	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
 	tmmongo "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/mongo"
+	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/client"
 	mongocontainer "github.com/testcontainers/testcontainers-go/modules/mongodb"
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -195,9 +197,23 @@ func (e *mongoTenantEnv) tenant(t *testing.T, id string) mongoTenant {
 	return mongoTenant{id: id, dbName: name, db: db, ctx: ctx}
 }
 
-// seed writes value for the key straight into the tenant's collection, in the
-// document shape the store writes, and returns the row as a read reports it.
+// cacheOnly carries the tenant id and no database: a per-request read through
+// it fails with ErrTenantConnectionMissing, so only the tenant's cached scope answers.
+func (m mongoTenant) cacheOnly(t *testing.T) context.Context {
+	return tmcore.ContextWithTenantID(t.Context(), m.id)
+}
+
+// seed writes value for the key at revision 1; see write.
 func (m mongoTenant) seed(t *testing.T, value string) client.Entry {
+	t.Helper()
+
+	return m.write(t, value, 1)
+}
+
+// write upserts value for the key at revision straight into the tenant's
+// collection, in the document shape the store writes, and returns the row as a
+// read reports it.
+func (m mongoTenant) write(t *testing.T, value string, revision int64) client.Entry {
 	t.Helper()
 
 	raw, err := json.Marshal(value)
@@ -206,30 +222,76 @@ func (m mongoTenant) seed(t *testing.T, value string) client.Entry {
 	}
 
 	// BSON dates carry milliseconds; the read reports what was stored.
-	want := client.Entry{Value: value, Revision: 1, UpdatedAt: time.Now().UTC().Truncate(time.Millisecond), UpdatedBy: "seed"}
+	want := client.Entry{Value: value, Revision: revision, UpdatedAt: time.Now().UTC().Truncate(time.Millisecond), UpdatedBy: "direct"}
 
-	if _, err := m.db.Collection(entriesColl).InsertOne(t.Context(), bson.D{
-		{Key: "_id", Value: bson.D{{Key: "namespace", Value: tenantNS}, {Key: "key", Value: tenantKey}}},
-		{Key: "namespace", Value: tenantNS},
-		{Key: "key", Value: tenantKey},
-		{Key: "value", Value: string(raw)},
-		{Key: "revision", Value: want.Revision},
-		{Key: "updated_at", Value: want.UpdatedAt},
-		{Key: "updated_by", Value: want.UpdatedBy},
-	}); err != nil {
-		t.Fatalf("seed %s: %v", m.dbName, err)
+	if _, err := m.db.Collection(entriesColl).UpdateByID(t.Context(),
+		bson.D{{Key: "namespace", Value: tenantNS}, {Key: "key", Value: tenantKey}},
+		bson.D{{Key: "$set", Value: bson.D{
+			{Key: "namespace", Value: tenantNS},
+			{Key: "key", Value: tenantKey},
+			{Key: "value", Value: string(raw)},
+			{Key: "revision", Value: want.Revision},
+			{Key: "updated_at", Value: want.UpdatedAt},
+			{Key: "updated_by", Value: want.UpdatedBy},
+		}}},
+		options.UpdateOne().SetUpsert(true),
+	); err != nil {
+		t.Fatalf("write %q on %s: %v", value, m.dbName, err)
 	}
 
 	return want
 }
 
-// changeStreams counts the change-stream cursors open on dbName's collection,
-// in a getMore or idle between two, so a live feed never samples as 0 (P3-6).
-func changeStreams(t *testing.T, dbName string) int {
+// stored reads the key's value and revision back from the tenant's collection.
+func (m mongoTenant) stored(t *testing.T) client.Entry {
+	t.Helper()
+
+	var doc struct {
+		Value    string `bson:"value"`
+		Revision int64  `bson:"revision"`
+	}
+
+	if err := m.db.Collection(entriesColl).FindOne(t.Context(), bson.D{{Key: "_id", Value: bson.D{
+		{Key: "namespace", Value: tenantNS}, {Key: "key", Value: tenantKey},
+	}}}).Decode(&doc); err != nil {
+		t.Fatalf("read row on %s: %v", m.dbName, err)
+	}
+
+	e := client.Entry{Revision: doc.Revision}
+	if err := json.Unmarshal([]byte(doc.Value), &e.Value); err != nil {
+		t.Fatalf("decode row on %s: %v", m.dbName, err)
+	}
+
+	return e
+}
+
+// activate reads once through each tenant's ctx and waits for its scope to come up.
+func (e *mongoTenantEnv) activate(t *testing.T, tenants ...mongoTenant) {
+	t.Helper()
+
+	for _, tn := range tenants {
+		if _, _, err := e.c.Get(tn.ctx, tenantNS, tenantKey); err != nil {
+			t.Fatalf("%s first read: %v", tn.id, err)
+		}
+
+		e.log.waitFor(t, log.LevelInfo, msgScopeActivated, tn.id)
+	}
+}
+
+// servesCached reports whether tn's cached scope serves want's value at want's revision.
+func (e *mongoTenantEnv) servesCached(t *testing.T, tn mongoTenant, want client.Entry) bool {
+	got, ok, err := e.c.GetEntry(tn.cacheOnly(t), tenantNS, tenantKey)
+
+	return err == nil && ok && got.Value == want.Value && got.Revision == want.Revision
+}
+
+// changeStreamIDs lists the change-stream cursors open on dbName's collection
+// that are in a getMore, plus, with idle, those between two (P3-6).
+func changeStreamIDs(t *testing.T, dbName string, idle bool) []int64 {
 	t.Helper()
 
 	cur, err := mongoAdmin.Database("admin").Aggregate(t.Context(), mongo.Pipeline{
-		{{Key: "$currentOp", Value: bson.D{{Key: "allUsers", Value: true}, {Key: "idleCursors", Value: true}}}},
+		{{Key: "$currentOp", Value: bson.D{{Key: "allUsers", Value: true}, {Key: "idleCursors", Value: idle}}}},
 		{{Key: "$match", Value: bson.D{{Key: "ns", Value: dbName + "." + entriesColl}, {Key: "cursor.tailable", Value: true}}}},
 		{{Key: "$group", Value: bson.D{{Key: "_id", Value: "$cursor.cursorId"}}}},
 	})
@@ -237,12 +299,44 @@ func changeStreams(t *testing.T, dbName string) int {
 		t.Fatalf("$currentOp on %s: %v", dbName, err)
 	}
 
-	var cursors []bson.D
+	var cursors []struct {
+		ID int64 `bson:"_id"`
+	}
 	if err := cur.All(t.Context(), &cursors); err != nil {
 		t.Fatalf("decode $currentOp on %s: %v", dbName, err)
 	}
 
-	return len(cursors)
+	ids := make([]int64, 0, len(cursors))
+	for _, c := range cursors {
+		ids = append(ids, c.ID)
+	}
+
+	return ids
+}
+
+// killChangeStream kills dbName's change-stream cursor while a getMore runs on
+// it: the driver silently resumes a cursor killed between two, severing nothing.
+func killChangeStream(t *testing.T, dbName string) {
+	t.Helper()
+
+	var ids []int64
+
+	eventually(t, "one change stream in a getMore on "+dbName, func() bool {
+		ids = changeStreamIDs(t, dbName, false)
+
+		return len(ids) == 1
+	})
+
+	var res struct {
+		CursorsKilled []int64 `bson:"cursorsKilled"`
+	}
+
+	if err := mongoAdmin.Database(dbName).RunCommand(t.Context(), bson.D{
+		{Key: "killCursors", Value: entriesColl},
+		{Key: "cursors", Value: bson.A{ids[0]}},
+	}).Decode(&res); err != nil || !slices.Contains(res.CursorsKilled, ids[0]) {
+		t.Fatalf("killCursors %d on %s: killed %v, err %v", ids[0], dbName, res.CursorsKilled, err)
+	}
 }
 
 // requireChangeStreams asserts dbName reaches want change streams and holds
@@ -251,11 +345,11 @@ func requireChangeStreams(t *testing.T, dbName string, want int) {
 	t.Helper()
 
 	eventually(t, fmt.Sprintf("%d change streams on %s", want, dbName), func() bool {
-		return changeStreams(t, dbName) == want
+		return len(changeStreamIDs(t, dbName, true)) == want
 	})
 
 	for deadline := time.Now().Add(censusHold); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
-		if got := changeStreams(t, dbName); got != want {
+		if got := len(changeStreamIDs(t, dbName, true)); got != want {
 			t.Fatalf("%s: %d change streams during the hold, want %d", dbName, got, want)
 		}
 	}
