@@ -53,21 +53,23 @@ func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOp
 // [Client.Set] racing Start writes its row and then reports [ErrNotStarted]
 // rather than being refused before the store is touched.
 //
-// In multi-tenant mode it is a no-op beyond marking the Client started: a
-// tenant's scope is activated by that tenant's first read.
+// In multi-tenant mode it only marks the Client started; with a tenant
+// manager, a tenant's scope comes up on that tenant's first read.
 func (c *Client) Start(ctx context.Context) error {
 	return asInternalClient(c).Start(ctx)
 }
 
-// Close stops change notification processing and releases backend resources.
+// Close cancels the context handed to running callbacks, waits for them up to
+// [WithCloseTimeout] and stops every changefeed; the database handle passed to
+// the constructor stays open. Later calls return the first call's result.
 func (c *Client) Close() error {
 	return asInternalClient(c).Close()
 }
 
 // Get returns the current value for namespace/key.
 //
-// In single-tenant mode reads are served in process from the value last
-// reconciled or written, without touching the database. In multi-tenant mode
+// In single-tenant mode reads are served in process from the cache the
+// changefeed keeps current, without touching the database. In multi-tenant mode
 // the call resolves the per-tenant database from ctx (set by tenant-manager
 // middleware) and reads through, graded by the validator; with
 // [WithPostgresTenantManager] or [WithMongoTenantManager] that read activates
@@ -81,10 +83,11 @@ func (c *Client) Get(ctx context.Context, namespace, key string) (any, bool, err
 // unregistered key. Revision, UpdatedAt and UpdatedBy describe the persisted
 // row behind the value, and are zero when the registered default is in force
 // because no row exists or the stored one was refused. Stale is true while
-// nothing is confirming THIS key: before [Client.Start], while the changefeed
-// is disconnected or has not been reconciled since it connected, and while this
-// key could not be re-read after its last change. A sibling key that could not
-// be re-read does not make this one stale.
+// nothing is confirming THIS key: before a single-tenant [Client.Start], while
+// the changefeed is disconnected or has not been reconciled since it connected,
+// and while this key could not be re-read after its last change. A sibling key
+// that could not be re-read does not make this one stale, and a multi-tenant
+// read served per request is never stale.
 func (c *Client) GetEntry(ctx context.Context, namespace, key string) (e Entry, ok bool, err error) {
 	return asInternalClient(c).GetEntry(ctx, namespace, key)
 }
@@ -181,8 +184,9 @@ func (c *Client) CatalogService() string {
 // tenant — so a callback that needs the tenant reads Change.Tenant, not ctx.
 //
 // With [WithPostgresTenantManager] or [WithMongoTenantManager] one
-// subscription covers every tenant: a tenant announces every registered key
-// once, when its first read activates it, then delivers its own changes,
+// subscription covers every tenant: a tenant's scope announces every
+// registered key each time it comes up (on the read that activates it, and on
+// a rebuild after a credentials rotation), then delivers its own changes,
 // serialized and coalesced per (tenant, key).
 //
 // OnChange returns ErrUnknownKey for a key that was not registered, in both

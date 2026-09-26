@@ -89,7 +89,7 @@ type Snapshot[T any] struct {
 // multi-tenant one without a tenant manager — still yields a working handle: the refusal is recorded and
 // returned by OnApply, while [Group.Snapshot] and [Group.Set] keep working.
 //
-// That subscription is never released. FC-7 gives a group no Close, so nothing
+// That subscription is never released. A group has no Close, so nothing
 // could ever call the unsubscribe, and the subscription therefore lives as long
 // as the Client does; [Client.Close] does not drop subscribers either, it
 // cancels the context they are delivered under.
@@ -315,8 +315,8 @@ func (g *Group[T]) Set(ctx context.Context, value T, actor string) error {
 
 // Applied is delivered to an OnApply function for the newest published
 // revision per scope, serially; revisions published while fn runs are
-// coalesced into the next delivery (FC-4). Previous is the snapshot fn last
-// accepted for that scope, nil on the first delivery.
+// coalesced into the next delivery. Previous is the snapshot fn last accepted
+// for that scope, nil until it has accepted one.
 //
 // A delivered Applied always carries Stale false. Staleness describes a read,
 // while a publication is a value the engine has just observed; a subscriber
@@ -332,11 +332,11 @@ func (g *Group[T]) Set(ctx context.Context, value T, actor string) error {
 // which decodes per call.
 //
 // Value can be nil on a pointer-, map- or slice-shaped T. A JSON null is a
-// legitimate document for such a group, and decoding turns it into the zero T
-// (D-G2), so an applier for one of these types must guard Value rather than
+// legitimate document for such a group, and decoding turns it into the zero T,
+// so an applier for one of these types must guard Value rather than
 // dereference it: a nil dereference panics, and the panic is recovered and
 // recorded as that revision's rejection in [Group.Status]'s LastErr, which
-// leaves the group silently unconverged rather than crashing the process.
+// leaves the group unconverged rather than crashing the process.
 type Applied[T any] struct {
 	Snapshot[T]
 	Previous *Snapshot[T]
@@ -348,22 +348,20 @@ type Applied[T any] struct {
 // coalescing meant no applier saw the intermediate ones. Applied is the revision
 // accepted by the function furthest behind, so it means the document is in force
 // everywhere; with no function registered nothing can lag and the scope reads as
-// converged. LastErr holds the last rejection and survives until every
-// registered function has accepted the newest published revision. It clears
-// when every function still registered has accepted the newest observation: an
-// acceptance, or the departure of the function that was holding the scope back.
-// Unregistering every function never clears it, including the last one
-// unsubscribing from inside its own delivery.
-// So a group nobody applies keeps reporting its last rejection rather than
-// reading healthy while it is being torn down.
+// converged. LastErr holds the last rejection until every function still
+// registered has accepted the newest publication, whether by accepting it or
+// by the one holding the scope back unsubscribing. Unregistering every
+// function never clears it, including the last one unsubscribing from inside
+// its own delivery, so a group nobody applies keeps reporting its last
+// rejection rather than reading healthy while it is being torn down.
 //
-// Desired equal to Applied is not convergence on its own: a delete publishes
-// Revision 0, and until this Client is engine-backed every publication carries
-// Revision 0, so a function that refused everything reports the very revision
-// the scope desires. LastErr is the field that answers "is my configuration
-// actually in force". A delivery in flight also leaves Applied behind with no
-// error at all, because Status is a point-in-time read rather than a
-// transaction.
+// Desired equal to Applied is not convergence on its own: a delete and a key
+// with no row both publish Revision 0, which is also the Applied of a function
+// that has accepted nothing, so a function that refused everything can report
+// the very revision the scope desires. LastErr is the field that answers "is
+// my configuration actually in force". A delivery in flight also leaves
+// Applied behind with no error at all, because Status is a point-in-time read
+// rather than a transaction.
 type ApplyStatus struct {
 	Tenant  string
 	Desired int64 // latest published revision
@@ -372,29 +370,28 @@ type ApplyStatus struct {
 }
 
 // OnApply subscribes first and then delivers the current snapshot of every
-// scope the Client already tracks, so no revision can fall between the
-// initial delivery and the subscription; the same non-zero revision with the
-// same value bytes is never delivered twice (Revision 0 is never deduplicated). Later revisions arrive
-// serialized and coalesced per scope of this group (a group is one key, so
-// this is the per-(scope, key) rule of FC-4); Status.Desired always names the
-// newest published revision even when fn has not seen intermediate ones. fn returning an error records that revision as rejected for the
-// scope (visible in Status) and keeps the previously applied revision as
-// current; the engine does not retry. Before Start, OnApply registers and the
-// initial delivery happens during Start.
+// scope this group has observed, so no revision can fall between the initial
+// delivery and the subscription; the same non-zero revision with the same
+// value bytes is never delivered twice while its scope stays up (Revision 0 is
+// never deduplicated). Later revisions arrive serialized and coalesced per
+// scope; Status.Desired always names the newest published revision even when
+// fn has not seen intermediate ones. fn returning an error records that
+// revision as rejected for the scope (visible in Status) and keeps the
+// previously applied revision as current; the engine does not retry. Before
+// Start, OnApply registers and its initial delivery is Start's announcement,
+// which may land either side of Start's return.
 //
 // fn runs with no lock held and may call [Group.Snapshot], [Group.Status],
 // [Group.Set] or OnApply for its own group. A re-entrant OnApply appends its
-// function and returns without delivering: the initial delivery is deferred to
-// the running fan-out's next iteration, and an unsubscribe called before that
-// iteration cancels it, so the function never runs at all. A re-entrant Set
-// reaches the applier on that same goroutine, after the current delivery
-// returns, only when the Client publishes the write inline from the applier's
-// own goroutine — which is what WithDebounce(0) does; under the default
-// debounce the publication comes from a timer goroutine instead. Either way an
-// applier that writes on every delivery keeps the group reloading forever.
+// function; in the scope being delivered, that function's initial delivery is
+// deferred to the running fan-out's next iteration, and an unsubscribe called
+// before that iteration cancels it, so the function never runs at all. A
+// re-entrant Set that changes the document reaches the applier as a later
+// delivery, after the current one returns, so an applier that changes it on
+// every delivery keeps the group reloading forever.
 // An error fn returns is logged at error level and published in
-// [Group.Status]'s LastErr, where it is held until the next acceptance, so it
-// must name what was refused and must not embed the decoded document.
+// [Group.Status]'s LastErr, held there as [ApplyStatus] describes, so it must
+// name what was refused and must not embed the decoded document.
 //
 // The initial delivery — the replay, or the seeded one — runs on the calling
 // goroutine, before OnApply returns, whenever no fan-out for that scope is in

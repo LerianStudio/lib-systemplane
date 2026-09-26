@@ -56,7 +56,8 @@ type Logger interface {
 //
 // The engine asks Meter for meter systemplane.engine, which reports tracked
 // scopes, cached entries, changefeed events and disconnects, cache reads (hit or
-// miss) and a tenant's first-activation latency; a nil Telemetry records none.
+// miss) and how long a tenant scope takes to come up after the read that
+// activates it; a nil Telemetry records none.
 type Telemetry interface {
 	Tracer(name string) (trace.Tracer, error)
 	Meter(name string) (metric.Meter, error)
