@@ -94,7 +94,7 @@ BEGIN
 		RAISE EXCEPTION
 			'systemplane_entries already exists in schema %, but this role would provision into %; applying the full schema here would fork the install into a second, empty table and orphan the populated one',
 			foreign_schema, current_schema()
-			USING HINT = 'if that is a stray or empty copy, drop it or put the schema holding the real install first in search_path, or upgrade that install with ddl/migrate_v3_to_v4.sql, which creates no table; if instead you are provisioning one schema per tenant in one database, that layout is unsupported because NOTIFY is database-wide and every install listens on the same systemplane_changes channel: give each tenant its own database (the runtime refuses the shared one with ErrSharedDatabaseUnsupported)';
+			USING HINT = 'if that is a stray or empty copy, drop it or put the schema holding the real install first in search_path, or upgrade that install with ddl/migrate_v3_to_v4.sql, which creates no table; if instead you are provisioning one schema per tenant in one database, that layout is unsupported because NOTIFY is database-wide and every install listens on the same systemplane_changes channel: give each tenant its own database (a multi-tenant Client refuses a second tenant feed on one database and logs a WARN)';
 	END IF;
 END
 $$;

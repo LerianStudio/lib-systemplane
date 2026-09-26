@@ -45,7 +45,7 @@ func TestSchemaSQL_ContainsCanonicalStatements(t *testing.T) {
 		// schema, which is the fork the guard exists to prevent.
 		"if that is a stray or empty copy, drop it or put the schema holding the real install first in search_path",
 		"one schema per tenant in one database, that layout is unsupported",
-		"ErrSharedDatabaseUnsupported",
+		"refuses a second tenant feed on one database and logs a WARN",
 		"CREATE TABLE IF NOT EXISTS systemplane_entries (",
 		"namespace   TEXT NOT NULL,",
 		`"key"       TEXT NOT NULL,`,
