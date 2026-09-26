@@ -51,6 +51,10 @@ var (
 	closeTimeout = 5 * time.Second
 )
 
+// stopGrace bounds how long a stopped change-stream reader waits on its read in
+// flight: past the server's 1s getMore await, inside closeTimeout.
+const stopGrace = 2 * time.Second
+
 // pollRoundTimeout bounds ONE poll round trip, the synchronous first one as
 // much as a tick, so an unreachable MongoDB fails Start or Subscribe instead of
 // parking it for the life of the caller's ctx.
@@ -1036,8 +1040,7 @@ func (s *Store) runFeed(f *feed, stream *mongo.ChangeStream) {
 // consumeUntilFailure drains one cursor until it dies or teardown closes
 // f.stop. It never reports the difference between the two: the f.closing check
 // inside beginDisconnect is what keeps a clean shutdown from announcing an
-// outage, and the ctx below is what keeps the shutdown from being logged as a
-// failure.
+// outage, and a stop ends the loop before any read can fail.
 //
 // It DOES report whether the cursor carried at least one event, which is what
 // tells runFeed the stream was worth keeping and its backoff can start over.
@@ -1055,12 +1058,32 @@ func (s *Store) consumeUntilFailure(f *feed, stream *mongo.ChangeStream) (consum
 
 		select {
 		case <-f.stop:
-			cancel()
+			// Cancelling a read drops its cursor id unkilled, so only a read still
+			// hung after stopGrace is cancelled; the loop sees the stop between reads.
+			select {
+			case <-time.After(stopGrace):
+				cancel()
+			case <-ctx.Done():
+			}
 		case <-ctx.Done():
 		}
 	}()
 
-	for stream.Next(ctx) {
+	for {
+		select {
+		case <-f.stop:
+			return consumed
+		default:
+		}
+
+		if !stream.TryNext(ctx) {
+			if stream.Err() == nil && stream.ID() != 0 {
+				continue
+			}
+
+			break
+		}
+
 		// Counted before classification: a cursor that delivered an event this
 		// process could not use still proves the connection carried traffic.
 		consumed = true
@@ -1255,8 +1278,8 @@ func (s *Store) refreshFeedColl(ctx context.Context, f *feed) error {
 	return nil
 }
 
-// closeStream closes a dead or abandoned cursor on a ctx of its own: the one
-// that just died would abandon the server-side cursor instead of closing it.
+// closeStream closes a dead, abandoned or stopped stream on a ctx of its own,
+// so the driver kills the cursor on the server that holds it.
 func closeStream(ctx context.Context, stream *mongo.ChangeStream) {
 	if stream == nil {
 		return
