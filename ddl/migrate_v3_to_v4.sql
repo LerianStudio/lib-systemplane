@@ -12,18 +12,18 @@
 -- install is upgraded. The guard DO block below refuses the two layouts that
 -- make that unsafe: no systemplane_entries visible on search_path at all, where
 -- the first ALTER would fail halfway through an untransacted file; and a SECOND
--- systemplane_entries in another user schema, where the file would upgrade
--- whichever one search_path happens to resolve first and leave the other on v3,
--- reading v3 payloads through a v4 runtime.
+-- systemplane_entries in another schema on search_path, where the file would
+-- upgrade whichever one search_path happens to resolve first and leave the
+-- other on v3, reading v3 payloads through a v4 runtime.
 --
--- ONE DATABASE PER TENANT. This file assumes systemplane_entries is alone in
--- its database, and must never be applied once per schema inside a shared
--- database: NOTIFY is database-wide and every feed listens on the single
--- `systemplane_changes` channel, so two installations in one database would
--- each receive the other's events; and the unqualified DROP FUNCTION below
--- resolves through the applier's whole search_path, so it can drop another
--- schema's v3 function. Upgrading one database per tenant is the only
--- supported layout.
+-- ONE INSTALL PER RUN: THE ONE SEARCH_PATH RESOLVES. A second install on
+-- search_path is refused, since the unqualified statements, the DROP FUNCTION
+-- of the v3 notify function included, could resolve into either. An install
+-- off search_path is untouched, so a consumer that migrates schema-per-tenant
+-- applies this file once per schema, with search_path set to that schema.
+-- Installs in one database share the `systemplane_changes` channel, so a feed
+-- on that database receives every install's events; a multi-tenant Client
+-- refuses a second tenant feed of its own on one database at Subscribe.
 --
 -- The file is idempotent: the column and the sequence are created only when
 -- missing, the two functions are replaced, and the triggers and the v3 notify
@@ -79,6 +79,7 @@ BEGIN
 	WHERE c.relname = 'systemplane_entries'
 	  AND c.relkind IN ('r', 'p')
 	  AND n.nspname <> target_schema
+	  AND n.nspname = ANY (current_schemas(false))
 	  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
 	  AND n.nspname NOT LIKE 'pg_toast%'
 	  AND n.nspname NOT LIKE 'pg_temp%'

@@ -60,9 +60,9 @@ The library runs no DDL. `SchemaSQL()` returns the Postgres DDL for a database
 with no install yet (the table, its revision sequence, two trigger functions and
 three triggers: [`ddl/schema.sql`](ddl/schema.sql), byte for byte);
 `MigrationV3ToV4SQL()` returns the upgrade of a v3 install
-([`ddl/migrate_v3_to_v4.sql`](ddl/migrate_v3_to_v4.sql)). Both are idempotent
-and belong in the service's migration pipeline, applied to one database per
-tenant and never once per schema of a shared database, because NOTIFY is
+([`ddl/migrate_v3_to_v4.sql`](ddl/migrate_v3_to_v4.sql)) and refuses a second
+install on `search_path`. Both are idempotent and belong in the service's
+migration pipeline, with one database per tenant, because NOTIFY is
 database-wide. The runtime role needs DML on `systemplane_entries` and `LISTEN`,
 no `CREATE` and no grant on the sequence. MongoDB needs no DDL: its collection
 is created on first use, and in polling mode the library adds the indexes the

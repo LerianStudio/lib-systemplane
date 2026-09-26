@@ -69,7 +69,7 @@ reads are served in process.
 | `OnChange` callback | `func(ctx context.Context, ns, key string, newValue any)` | `func(ctx context.Context, ch Change)`, where `Change{Tenant, Namespace, Key, Revision, Value}`. `Tenant` is `""` in single-tenant mode; `Revision` is 0 when no row exists and `Value` is then the registered default. |
 | `Close` | `func() error`, returned once the backend was released | Same signature. It now cancels the callback context and waits for callbacks, bounded by `WithCloseTimeout`, before returning. |
 | `SchemaSQL()` | v3 DDL | v4 DDL: the revision column, its sequence and the three triggers. |
-| `TestStore`, the store `NewForTesting` takes | `Get(ctx, ns, key)`, `Set(ctx, e) error`, `Delete(ctx, ns, key, actor)`, `List(ctx)`, `Subscribe(ctx, fn)` | Every method but `Start` and `Close` takes a `TestScope` after `ctx`, and `Set` returns `(int64, error)`: the revision the store assigned. |
+| `TestStore`, the store `NewForTesting` takes | `Get(ctx, ns, key)`, `Set(ctx, e) error`, `Delete(ctx, ns, key, actor)`, `List(ctx)`, `Subscribe(ctx, fn)` | Every method but `Start` and `Close` takes a `TestScope` after `ctx`, and `Set` returns `(int64, error)`: the revision the store assigned. `Subscribe` must emit `TestEvent{Op: "resync"}` once the feed is ready and after every reconnect: a single-tenant `Start` blocks until the first one or its ctx ends. |
 | `TestEntry` | `{Namespace, Key, Value, UpdatedAt, UpdatedBy}` | Gains `Revision`. |
 | `TestEvent` | `{Namespace, Key, Op}` | Gains `Scope` and `Revision`. |
 
@@ -565,10 +565,12 @@ The migration guards itself, because every statement in it names
 `systemplane_entries` unqualified. It refuses when `search_path` reaches no
 `systemplane_entries` at all — put the schema holding the install first in
 `search_path` and re-run — and when a second `systemplane_entries` exists in
-another user schema, where it would upgrade whichever one `search_path`
-resolves first and leave the other on v3, reading v3 payloads through a v4
-runtime; drop or rename the stray table, or narrow `search_path` to the schema
-holding the install you mean.
+another schema on `search_path`, where it would upgrade whichever one
+`search_path` resolves first and leave the other on v3, reading v3 payloads
+through a v4 runtime; drop or rename the stray table, or narrow `search_path` to
+the schema holding the install you mean. An install off `search_path` is
+untouched, so a database holding one install per schema is migrated one schema
+at a time, with `search_path` set to that schema.
 
 `SchemaSQL()` carries the opposite guard, which fires when any non-system
 schema other than `current_schema()` already holds the table:
@@ -586,12 +588,9 @@ install first in `search_path`, or to upgrade that install with
 wherever the table actually is.
 
 **One database per tenant, never one schema per tenant inside a shared
-database.** Two reasons, both structural: NOTIFY is database-wide and every
-feed listens on the single `systemplane_changes` channel, so two installs in
-one database each receive the other's events; and the unqualified
-`DROP FUNCTION` of the v3 notify function resolves through the applying role's
-whole `search_path`, so applying the DDL in one schema can drop another
-schema's function. Nothing in the database enforces this — it is the
+database.** NOTIFY is database-wide and every feed listens on the single
+`systemplane_changes` channel, so two installs in one database each receive the
+other's events. Nothing in the database enforces this — it is the
 operator's responsibility. A Client built with `WithPostgresTenantManager`
 catches one case inside its own process: a tenant whose LISTEN connection
 reaches a database another tenant's feed of that Client already listens on is
