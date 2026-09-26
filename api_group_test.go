@@ -635,37 +635,48 @@ func TestGroupSnapshotDoesNotRunConsumerValidate(t *testing.T) {
 	}
 }
 
-func TestGroupSnapshotCarriesTenantFromContext(t *testing.T) {
+func TestGroupSnapshotReportsTheContextTenantOnlyOnAMultiTenantClient(t *testing.T) {
 	t.Parallel()
 
-	c := newGroupClient(t)
-
-	g, err := systemplane.Bind(c, "runtime", "ingest", groupDefaults(), nil)
-	if err != nil {
-		t.Fatalf("Bind: %v", err)
+	cases := []struct {
+		name string
+		opts []systemplane.Option
+		want string
+	}{
+		{name: "single-tenant", want: ""},
+		{name: "multi-tenant", opts: []systemplane.Option{systemplane.WithMultiTenantEnabled()}, want: "t1"},
 	}
 
-	ctx := context.Background()
-	if err := c.Start(ctx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	snap, err := g.Snapshot(tmcore.ContextWithTenantID(ctx, "t1"))
-	if err != nil {
-		t.Fatalf("Snapshot with a tenant context: %v", err)
-	}
+			c, err := systemplane.NewForTesting(newGroupMemoryStore(), tc.opts...)
+			if err != nil {
+				t.Fatalf("NewForTesting: %v", err)
+			}
 
-	if snap.Tenant != "t1" {
-		t.Fatalf("Snapshot.Tenant = %q, want \"t1\"", snap.Tenant)
-	}
+			t.Cleanup(func() { _ = c.Close() })
 
-	bare, err := g.Snapshot(ctx)
-	if err != nil {
-		t.Fatalf("Snapshot with a bare context: %v", err)
-	}
+			g, err := systemplane.Bind(c, "runtime", "ingest", groupDefaults(), nil)
+			if err != nil {
+				t.Fatalf("Bind: %v", err)
+			}
 
-	if bare.Tenant != "" {
-		t.Fatalf("Snapshot.Tenant = %q on a bare context, want \"\"", bare.Tenant)
+			ctx := context.Background()
+			if err := c.Start(ctx); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+
+			snap, err := g.Snapshot(tmcore.ContextWithTenantID(ctx, "t1"))
+			if err != nil {
+				t.Fatalf("Snapshot with a tenant context: %v", err)
+			}
+
+			if snap.Tenant != tc.want {
+				t.Fatalf("Snapshot.Tenant = %q, want %q", snap.Tenant, tc.want)
+			}
+		})
 	}
 }
 

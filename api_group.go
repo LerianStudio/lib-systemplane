@@ -23,6 +23,10 @@ type Group[T any] struct {
 	namespace string
 	key       string
 
+	// multiTenant is the Client's mode; only a multi-tenant Client reports the
+	// ctx tenant on a Snapshot, a single-tenant one reads the one global scope.
+	multiTenant bool
+
 	// coordinator holds the per-scope publication cache and the registered
 	// apply functions. It is built at Bind, so it is never nil on a group the
 	// caller holds.
@@ -38,7 +42,7 @@ type Group[T any] struct {
 // Snapshot is the state of a group's document in one scope.
 type Snapshot[T any] struct {
 	Value    T
-	Revision int64  // 0 when the row is absent
+	Revision int64  // 0 while the registered defaults are in force
 	Tenant   string // "" in single-tenant mode
 	Stale    bool
 }
@@ -160,14 +164,14 @@ func Bind[T any](c *Client, namespace, key string, defaults T, validate func(T) 
 		return nil, err
 	}
 
-	g := &Group[T]{client: c, namespace: namespace, key: key}
-
-	// The Client's mode decides the tenant stamp on the coordinator's reports.
-	// Register above succeeded, so CatalogKey knows the key and TenantScoped
-	// reports the mode verbatim.
+	// The Client's mode decides the tenant stamp on Snapshot and on the
+	// coordinator's reports. Register above succeeded, so CatalogKey knows the
+	// key and TenantScoped reports the mode verbatim.
 	detail, _ := c.CatalogKey(namespace, key)
 
-	g.coordinator = group.NewCoordinator[T](c.Logger(), g.namespace, g.key, detail.TenantScoped,
+	g := &Group[T]{client: c, namespace: namespace, key: key, multiTenant: detail.TenantScoped}
+
+	g.coordinator = group.NewCoordinator[T](c.Logger(), g.namespace, g.key, g.multiTenant,
 		group.Decode[T], g.seedCurrentEntry)
 
 	// The group's one subscription, taken here — before Start, and therefore
@@ -284,12 +288,12 @@ func (g *Group[T]) Snapshot(ctx context.Context) (Snapshot[T], error) {
 		return Snapshot[T]{}, fmt.Errorf("%w: %s/%s is not a %T: %w", ErrValidation, g.namespace, g.key, value, err)
 	}
 
-	return Snapshot[T]{
-		Value:    value,
-		Revision: entry.Revision,
-		Tenant:   tmcore.GetTenantIDContext(ctx),
-		Stale:    entry.Stale,
-	}, nil
+	snap := Snapshot[T]{Value: value, Revision: entry.Revision, Stale: entry.Stale}
+	if g.multiTenant {
+		snap.Tenant = tmcore.GetTenantIDContext(ctx)
+	}
+
+	return snap, nil
 }
 
 // Set writes value as the group's whole document in the caller's scope,
