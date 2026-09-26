@@ -305,10 +305,11 @@ of an active scope, one made while that scope is still activating included: it
 counts a miss and reads the tenant database. A read of a tenant with no active
 scope counts nothing, as in v3.
 
-### Every callback registered before `Start` fires once at `Start`
+### Every callback registered before `Start` fires once at `Start`, or at each tenant's activation
 
-**Affects:** every `OnChange` subscriber of a single-tenant or tenant-managed
-Client.
+**Affects:** every `OnChange` subscriber. A single-tenant Client announces at
+`Start`; a tenant-managed Client announces per tenant instead, as the last
+paragraph of this section says.
 
 `Start` reconciles every registered key against the store and hands the value
 in force to every subscriber registered beforehand — once, per key. Keys the

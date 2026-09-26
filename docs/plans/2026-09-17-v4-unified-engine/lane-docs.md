@@ -519,7 +519,7 @@ Shape decided now so elaboration does not relitigate it. Each example is a **sin
 
 Cut from the engine-tenants Phase 2 branch at `756efda` (PR #104), where `HandleTenantLifecycle`, the FC-12 metrics and
 `WithAggregateTenantThreshold` are committed, so every symbol these tasks name exists in the
-tree they are written against. Only `NOT-YET(engine-tenants)` markers remain (11 in
+tree they are written against. Only `NOT-YET(engine-tenants)` markers remain (10 in
 `MIGRATION-v4.md`, 1 in `CLAUDE.md`); engine-core Phase 3 and the panic posture merged earlier.
 Epic 2.3 (the godoc sweep) is NOT in this run: it reads `api_*.go`, and it runs after the
 engine-tenants Phase 2 pull request merges.
