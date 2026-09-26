@@ -69,7 +69,7 @@ reads are served in process.
 | `OnChange` callback | `func(ctx context.Context, ns, key string, newValue any)` | `func(ctx context.Context, ch Change)`, where `Change{Tenant, Namespace, Key, Revision, Value}`. `Tenant` is `""` in single-tenant mode; `Revision` is 0 when no row exists and `Value` is then the registered default. |
 | `Close` | `func() error`, returned once the backend was released | Same signature. It now cancels the callback context and waits for callbacks, bounded by `WithCloseTimeout`, before returning. |
 | `SchemaSQL()` | v3 DDL | v4 DDL: the revision column, its sequence and the three triggers. |
-| `TestStore`, the store `NewForTesting` takes | `Get(ctx, ns, key)`, `Set(ctx, e) error`, `Delete(ctx, ns, key, actor)`, `List(ctx)`, `Subscribe(ctx, fn)` | Every method but `Start` and `Close` takes a `TestScope` after `ctx`, and `Set` returns `(int64, error)`: the revision the store assigned. |
+| `TestStore`, the store `NewForTesting` takes | `Get(ctx, ns, key)`, `Set(ctx, e) error`, `Delete(ctx, ns, key, actor)`, `List(ctx)`, `Subscribe(ctx, fn)` | Every method but `Start` and `Close` takes a `TestScope` after `ctx`, and `Set` returns `(int64, error)`: the revision the store assigned. `Subscribe` must emit `TestEvent{Op: "resync"}` once the feed is ready and after every reconnect: a single-tenant `Start` blocks until the first one or its ctx ends. |
 | `TestEntry` | `{Namespace, Key, Value, UpdatedAt, UpdatedBy}` | Gains `Revision`. |
 | `TestEvent` | `{Namespace, Key, Op}` | Gains `Scope` and `Revision`. |
 
