@@ -18,6 +18,7 @@ import (
 	tmmongo "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/mongo"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/client"
+	"github.com/testcontainers/testcontainers-go"
 	mongocontainer "github.com/testcontainers/testcontainers-go/modules/mongodb"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -26,33 +27,40 @@ import (
 
 const entriesColl = "systemplane_entries"
 
-// The one replica set of this binary; each test isolates itself with
-// databases of its own on it (P3-8).
+// mongoServer is one MongoDB container of this binary, started on first use;
+// each test isolates itself with databases of its own on it (P3-8).
+type mongoServer struct {
+	opts  []testcontainers.ContainerCustomizer
+	once  sync.Once
+	admin *mongo.Client
+	uri   string
+	err   error
+}
+
 var (
-	mongoOnce  sync.Once
-	mongoAdmin *mongo.Client
-	mongoURI   string
-	mongoErr   error
+	replicaSet = &mongoServer{opts: []testcontainers.ContainerCustomizer{mongocontainer.WithReplicaSet("rs0")}}
+	// standalone has no oplog, so it serves no change stream: polling only.
+	standalone = &mongoServer{}
 )
 
-func sharedMongo(t *testing.T) {
+func (s *mongoServer) start(t *testing.T) {
 	t.Helper()
 
-	mongoOnce.Do(startSharedMongo)
+	s.once.Do(s.run)
 
-	if mongoErr != nil {
-		t.Fatalf("start shared mongo replica set: %v", mongoErr)
+	if s.err != nil {
+		t.Fatalf("start shared mongo: %v", s.err)
 	}
 }
 
-func startSharedMongo() {
+func (s *mongoServer) run() {
 	ctx := context.Background()
 
-	ctr, err := mongocontainer.Run(ctx, "mongo:7", mongocontainer.WithReplicaSet("rs0"))
+	ctr, err := mongocontainer.Run(ctx, "mongo:7", s.opts...)
 	if ctr != nil {
 		afterRun = append(afterRun, func() {
-			if mongoAdmin != nil {
-				_ = mongoAdmin.Disconnect(context.Background())
+			if s.admin != nil {
+				_ = s.admin.Disconnect(context.Background())
 			}
 
 			terminate(ctr)
@@ -60,14 +68,14 @@ func startSharedMongo() {
 	}
 
 	if err != nil {
-		mongoErr = err
+		s.err = err
 
 		return
 	}
 
 	raw, err := ctr.ConnectionString(ctx)
 	if err != nil {
-		mongoErr = err
+		s.err = err
 
 		return
 	}
@@ -76,7 +84,7 @@ func startSharedMongo() {
 	// connects directly to the mapped port instead of discovering the set.
 	u, err := url.Parse(raw)
 	if err != nil {
-		mongoErr = err
+		s.err = err
 
 		return
 	}
@@ -84,18 +92,18 @@ func startSharedMongo() {
 	q := u.Query()
 	q.Set("directConnection", "true")
 	u.RawQuery = q.Encode()
-	mongoURI = u.String()
+	s.uri = u.String()
 
-	if mongoAdmin, mongoErr = mongo.Connect(options.Client().ApplyURI(mongoURI)); mongoErr != nil {
+	if s.admin, s.err = mongo.Connect(options.Client().ApplyURI(s.uri)); s.err != nil {
 		return
 	}
 
-	mongoErr = awaitWritablePrimary(ctx)
+	s.err = s.awaitWritablePrimary(ctx)
 }
 
 // awaitWritablePrimary waits out the member's SECONDARY-to-PRIMARY step after
 // the container reports ready, where a write fails with NotWritablePrimary.
-func awaitWritablePrimary(ctx context.Context) error {
+func (s *mongoServer) awaitWritablePrimary(ctx context.Context) error {
 	deadline := time.Now().Add(30 * time.Second)
 
 	for {
@@ -103,32 +111,44 @@ func awaitWritablePrimary(ctx context.Context) error {
 			IsWritablePrimary bool `bson:"isWritablePrimary"`
 		}
 
-		err := mongoAdmin.Database("admin").RunCommand(ctx, bson.D{{Key: "hello", Value: 1}}).Decode(&hello)
+		err := s.admin.Database("admin").RunCommand(ctx, bson.D{{Key: "hello", Value: 1}}).Decode(&hello)
 		if err == nil && hello.IsWritablePrimary {
 			return nil
 		}
 
 		if time.Now().After(deadline) {
-			return errors.Join(errors.New("replica set member never became writable primary"), err)
+			return errors.Join(errors.New("mongo member never became writable primary"), err)
 		}
 
 		time.Sleep(100 * time.Millisecond)
 	}
 }
 
-// mongoTenantEnv is a started, tenant-managed MongoDB Client with one
+// mongoTenantEnv is a tenant-managed MongoDB Client on srv with one
 // registered string key, wired to a fake tenant manager through the real
 // lib-commons client and manager.
 type mongoTenantEnv struct {
 	c   *client.Client
+	srv *mongoServer
 	tm  *fakeTenantManager
 	log *captureLogger
 }
 
+// newMongoTenantClient is a started newMongoTenantEnv on the replica set.
 func newMongoTenantClient(t *testing.T, opts ...client.Option) *mongoTenantEnv {
 	t.Helper()
 
-	sharedMongo(t)
+	env := newMongoTenantEnv(t, replicaSet, opts...)
+	env.start(t)
+
+	return env
+}
+
+// newMongoTenantEnv leaves Start to the test, so a group can bind before it.
+func newMongoTenantEnv(t *testing.T, srv *mongoServer, opts ...client.Option) *mongoTenantEnv {
+	t.Helper()
+
+	srv.start(t)
 
 	// lib-commons refuses a plaintext tenant connection unless told otherwise;
 	// the container serves no TLS.
@@ -167,11 +187,15 @@ func newMongoTenantClient(t *testing.T, opts ...client.Option) *mongoTenantEnv {
 		t.Fatalf("Register: %v", err)
 	}
 
-	if err := c.Start(t.Context()); err != nil {
+	return &mongoTenantEnv{c: c, srv: srv, tm: tm, log: logger}
+}
+
+func (e *mongoTenantEnv) start(t *testing.T) {
+	t.Helper()
+
+	if err := e.c.Start(t.Context()); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-
-	return &mongoTenantEnv{c: c, tm: tm, log: logger}
 }
 
 // mongoTenant is one tenant: a database name nothing else uses, the test's
@@ -187,9 +211,9 @@ func (e *mongoTenantEnv) tenant(t *testing.T, id string) mongoTenant {
 	t.Helper()
 
 	name := fmt.Sprintf("sp_%s_%d", id, dbSeq.Add(1))
-	e.tm.put(id, tmcore.DatabaseConfig{MongoDB: &tmcore.MongoDBConfig{URI: mongoURI, Database: name}})
+	e.tm.put(id, tmcore.DatabaseConfig{MongoDB: &tmcore.MongoDBConfig{URI: e.srv.uri, Database: name}})
 
-	db := mongoAdmin.Database(name)
+	db := e.srv.admin.Database(name)
 
 	ctx := tmcore.ContextWithTenantID(t.Context(), id)
 	ctx = tmcore.ContextWithMB(ctx, db, tenantModule)
@@ -203,32 +227,32 @@ func (m mongoTenant) cacheOnly(t *testing.T) context.Context {
 	return tmcore.ContextWithTenantID(t.Context(), m.id)
 }
 
-// seed writes value for the key at revision 1; see write.
+// seed writes value for the knob at revision 1; see write.
 func (m mongoTenant) seed(t *testing.T, value string) client.Entry {
 	t.Helper()
 
-	return m.write(t, value, 1)
+	return m.write(t, tenantKey, value, 1)
 }
 
-// write upserts value for the key at revision straight into the tenant's
+// write upserts value for key at revision straight into the tenant's
 // collection, in the document shape the store writes, and returns the row as a
 // read reports it.
-func (m mongoTenant) write(t *testing.T, value string, revision int64) client.Entry {
+func (m mongoTenant) write(t *testing.T, key string, value any, revision int64) client.Entry {
 	t.Helper()
 
 	raw, err := json.Marshal(value)
 	if err != nil {
-		t.Fatalf("marshal %q: %v", value, err)
+		t.Fatalf("marshal %v: %v", value, err)
 	}
 
 	// BSON dates carry milliseconds; the read reports what was stored.
 	want := client.Entry{Value: value, Revision: revision, UpdatedAt: time.Now().UTC().Truncate(time.Millisecond), UpdatedBy: "direct"}
 
 	if _, err := m.db.Collection(entriesColl).UpdateByID(t.Context(),
-		bson.D{{Key: "namespace", Value: tenantNS}, {Key: "key", Value: tenantKey}},
+		bson.D{{Key: "namespace", Value: tenantNS}, {Key: "key", Value: key}},
 		bson.D{{Key: "$set", Value: bson.D{
 			{Key: "namespace", Value: tenantNS},
-			{Key: "key", Value: tenantKey},
+			{Key: "key", Value: key},
 			{Key: "value", Value: string(raw)},
 			{Key: "revision", Value: want.Revision},
 			{Key: "updated_at", Value: want.UpdatedAt},
@@ -236,7 +260,7 @@ func (m mongoTenant) write(t *testing.T, value string, revision int64) client.En
 		}}},
 		options.UpdateOne().SetUpsert(true),
 	); err != nil {
-		t.Fatalf("write %q on %s: %v", value, m.dbName, err)
+		t.Fatalf("write %v on %s: %v", value, m.dbName, err)
 	}
 
 	return want
@@ -290,7 +314,7 @@ func (e *mongoTenantEnv) servesCached(t *testing.T, tn mongoTenant, want client.
 func changeStreamIDs(t *testing.T, dbName string, idle bool) []int64 {
 	t.Helper()
 
-	cur, err := mongoAdmin.Database("admin").Aggregate(t.Context(), mongo.Pipeline{
+	cur, err := replicaSet.admin.Database("admin").Aggregate(t.Context(), mongo.Pipeline{
 		{{Key: "$currentOp", Value: bson.D{{Key: "allUsers", Value: true}, {Key: "idleCursors", Value: idle}}}},
 		{{Key: "$match", Value: bson.D{{Key: "ns", Value: dbName + "." + entriesColl}, {Key: "cursor.tailable", Value: true}}}},
 		{{Key: "$group", Value: bson.D{{Key: "_id", Value: "$cursor.cursorId"}}}},
@@ -331,7 +355,7 @@ func killChangeStream(t *testing.T, dbName string) {
 		CursorsKilled []int64 `bson:"cursorsKilled"`
 	}
 
-	if err := mongoAdmin.Database(dbName).RunCommand(t.Context(), bson.D{
+	if err := replicaSet.admin.Database(dbName).RunCommand(t.Context(), bson.D{
 		{Key: "killCursors", Value: entriesColl},
 		{Key: "cursors", Value: bson.A{ids[0]}},
 	}).Decode(&res); err != nil || !slices.Contains(res.CursorsKilled, ids[0]) {

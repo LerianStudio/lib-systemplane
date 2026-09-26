@@ -3,6 +3,7 @@
 package client_test
 
 import (
+	"context"
 	"fmt"
 	"slices"
 	"sync"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
+	systemplane "github.com/LerianStudio/lib-systemplane/v4"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/client"
 	"go.mongodb.org/mongo-driver/v2/bson"
 )
@@ -146,7 +148,7 @@ func TestIntegration_MongoCursorLossConverges(t *testing.T) {
 	requireChangeStreams(t, t1.dbName, 1)
 
 	killChangeStream(t, t1.dbName)
-	written := t1.write(t, "written-in-gap", row1.Revision+1)
+	written := t1.write(t, tenantKey, "written-in-gap", row1.Revision+1)
 	env.log.waitFor(t, log.LevelWarn, "change stream disconnected, reconnecting", t1.id)
 
 	eventually(t, "t1 serves the write made in the gap", func() bool {
@@ -220,4 +222,118 @@ func TestIntegration_MongoFailedActivationLeavesNoFeed(t *testing.T) {
 
 	env.log.waitFor(t, log.LevelWarn, "scope activation failed; reads stay per-request until a later attempt", unknown.id)
 	requireChangeStreams(t, unknown.dbName, 0)
+}
+
+// limits is the document the group test binds to groupKey.
+type limits struct {
+	Max int `json:"max"`
+}
+
+const groupKey = "limits"
+
+// applyRecorder keeps every snapshot an OnApply function receives.
+type applyRecorder struct {
+	mu   sync.Mutex
+	seen []systemplane.Snapshot[limits]
+}
+
+func (r *applyRecorder) apply(_ context.Context, a systemplane.Applied[limits]) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.seen = append(r.seen, a.Snapshot)
+
+	return nil
+}
+
+func (r *applyRecorder) of(tenant string) []systemplane.Snapshot[limits] {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var out []systemplane.Snapshot[limits]
+
+	for _, s := range r.seen {
+		if s.Tenant == tenant {
+			out = append(out, s)
+		}
+	}
+
+	return out
+}
+
+// A group applies each tenant's own document at its own revision, and a write
+// through one tenant reaches the applier for that tenant only.
+func TestIntegration_MongoGroupAppliesEachTenant(t *testing.T) {
+	const debounce = 50 * time.Millisecond
+
+	env := newMongoTenantEnv(t, replicaSet, client.WithDebounce(debounce))
+
+	g, err := systemplane.Bind((*systemplane.Client)(env.c), tenantNS, groupKey, limits{}, nil)
+	if err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+
+	var rec applyRecorder
+	if _, err := g.OnApply(rec.apply); err != nil {
+		t.Fatalf("OnApply: %v", err)
+	}
+
+	env.start(t)
+
+	t1, t2 := env.tenant(t, "t1"), env.tenant(t, "t2")
+	row1, row2 := t1.write(t, groupKey, limits{Max: 1}, 5), t2.write(t, groupKey, limits{Max: 2}, 9)
+
+	env.activate(t, t1, t2)
+
+	both := []systemplane.ApplyStatus{
+		{Tenant: t1.id, Desired: row1.Revision, Applied: row1.Revision},
+		{Tenant: t2.id, Desired: row2.Revision, Applied: row2.Revision},
+	}
+	eventually(t, "both tenants applied at their row revisions", func() bool { return slices.Equal(g.Status(), both) })
+
+	first1 := []systemplane.Snapshot[limits]{{Value: limits{Max: 1}, Revision: row1.Revision, Tenant: t1.id}}
+	if got := rec.of(t1.id); !slices.Equal(got, first1) {
+		t.Fatalf("t1 applied %+v, want %+v", got, first1)
+	}
+
+	first2 := []systemplane.Snapshot[limits]{{Value: limits{Max: 2}, Revision: row2.Revision, Tenant: t2.id}}
+
+	if got := rec.of(t2.id); !slices.Equal(got, first2) {
+		t.Fatalf("t2 applied %+v, want %+v", got, first2)
+	}
+
+	if err := g.Set(t1.ctx, limits{Max: 10}, "it"); err != nil {
+		t.Fatalf("group Set on t1: %v", err)
+	}
+
+	eventually(t, "t1 applies its write", func() bool { return len(rec.of(t1.id)) > 1 })
+	time.Sleep(3 * debounce) // the no-delivery window: room for an echo or a leak to land
+
+	got1 := rec.of(t1.id)
+	if len(got1) != 2 || got1[1].Value != (limits{Max: 10}) || got1[1].Revision <= row1.Revision {
+		t.Fatalf("t1 applied %+v, want its write once, above revision %d", got1, row1.Revision)
+	}
+
+	if got := rec.of(t2.id); !slices.Equal(got, first2) {
+		t.Fatalf("t2 applied %+v after t1's write, want only %+v", got, first2)
+	}
+
+	both[0].Desired, both[0].Applied = got1[1].Revision, got1[1].Revision
+	if got := g.Status(); !slices.Equal(got, both) {
+		t.Fatalf("Status after t1's write = %+v, want %+v", got, both)
+	}
+}
+
+// A tenant on a server with no change streams activates through the polling
+// feed, and a write made behind the Client reaches its cached scope.
+func TestIntegration_MongoPollingTenantConverges(t *testing.T) {
+	env := newMongoTenantEnv(t, standalone, client.WithPollInterval(200*time.Millisecond))
+	env.start(t)
+	tn := env.tenant(t, "t1")
+
+	env.activate(t, tn)
+	requireEntry(t, env.c, tn.cacheOnly(t), client.Entry{Value: "default"}, "default from the cache")
+
+	written := tn.write(t, tenantKey, "polled", 1)
+	eventually(t, "t1 serves the polled write", func() bool { return env.servesCached(t, tn, written) })
 }
