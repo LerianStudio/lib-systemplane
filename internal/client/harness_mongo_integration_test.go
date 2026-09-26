@@ -15,7 +15,6 @@ import (
 	tmclient "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/client"
 	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
 	tmmongo "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/mongo"
-	"github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/client"
 	"github.com/testcontainers/testcontainers-go"
 	mongocontainer "github.com/testcontainers/testcontainers-go/modules/mongodb"
@@ -123,10 +122,11 @@ func (s *mongoServer) awaitWritablePrimary(ctx context.Context) error {
 	}
 }
 
-// mongoTenantEnv is a tenant-managed MongoDB Client on srv.
+// mongoTenantEnv is a tenant-managed MongoDB Client on srv; mgr is its tenant manager.
 type mongoTenantEnv struct {
 	*tenantEnv
 	srv *mongoServer
+	mgr *tmmongo.Manager
 }
 
 // newMongoTenantClient is a started newMongoTenantEnv on the replica set.
@@ -145,20 +145,21 @@ func newMongoTenantEnv(t *testing.T, srv *mongoServer, opts ...client.Option) *m
 
 	srv.start(t)
 
-	env := &mongoTenantEnv{srv: srv, tenantEnv: newTenantEnv(t, func(tmc *tmclient.Client, all ...client.Option) (*client.Client, error) {
-		mgr := tmmongo.NewManager(tmc, "systemplane-it",
+	env := &mongoTenantEnv{srv: srv}
+	env.tenantEnv = newTenantEnv(t, func(tmc *tmclient.Client, all ...client.Option) (*client.Client, error) {
+		env.mgr = tmmongo.NewManager(tmc, "systemplane-it",
 			tmmongo.WithModule(tenantModule),
 			tmmongo.WithConnectionsCheckInterval(0),
 		)
-		closeAtEnd(t, mgr)
+		closeAtEnd(t, env.mgr)
 
-		return client.NewMongoDB(nil, "", append(all, client.WithMongoTenantManager(mgr))...)
-	}, opts...)}
+		return client.NewMongoDB(nil, "", append(all, client.WithMongoTenantManager(env.mgr))...)
+	}, opts...)
 
 	env.add = func(t *testing.T, id string) liveTenant {
 		m := env.tenant(t, id)
 
-		return liveTenant{m.tenantRef, func(t *testing.T, v string) client.Entry { return m.write(t, tenantKey, v, m.next(t)) }, m.stored}
+		return liveTenant{m.tenantRef, func(t *testing.T, v string) client.Entry { return m.write(t, v, m.next(t)) }, m.stored}
 	}
 
 	return env
@@ -185,10 +186,10 @@ func (e *mongoTenantEnv) tenant(t *testing.T, id string) mongoTenant {
 	return mongoTenant{tenantRef: tenantRef{id: id, dbName: name, ctx: ctx}, db: db}
 }
 
-// write upserts value for key at revision straight into the tenant's
+// write upserts value for tenantKey at revision straight into the tenant's
 // collection, in the document shape the store writes, and returns the row as a
 // read reports it.
-func (m mongoTenant) write(t *testing.T, key string, value any, revision int64) client.Entry {
+func (m mongoTenant) write(t *testing.T, value string, revision int64) client.Entry {
 	t.Helper()
 
 	raw, err := json.Marshal(value)
@@ -199,11 +200,10 @@ func (m mongoTenant) write(t *testing.T, key string, value any, revision int64) 
 	// BSON dates carry milliseconds; the read reports what was stored.
 	want := client.Entry{Value: value, Revision: revision, UpdatedAt: time.Now().UTC().Truncate(time.Millisecond), UpdatedBy: "direct"}
 
-	if _, err := m.db.Collection(entriesColl).UpdateByID(t.Context(),
-		bson.D{{Key: "namespace", Value: tenantNS}, {Key: "key", Value: key}},
+	if _, err := m.db.Collection(entriesColl).UpdateOne(t.Context(), keyFilter,
 		bson.D{{Key: "$set", Value: bson.D{
 			{Key: "namespace", Value: tenantNS},
-			{Key: "key", Value: key},
+			{Key: "key", Value: tenantKey},
 			{Key: "value", Value: string(raw)},
 			{Key: "revision", Value: want.Revision},
 			{Key: "updated_at", Value: want.UpdatedAt},
@@ -286,33 +286,6 @@ func changeStreamIDs(t *testing.T, dbName string, idle bool) []int64 {
 	}
 
 	return ids
-}
-
-// killChangeStream kills tn's in-flight change-stream cursor until the store
-// logs the loss: the driver silently resumes a cursor killed between two getMores.
-func killChangeStream(t *testing.T, logs *captureLogger, tn tenantRef) {
-	t.Helper()
-
-	const lost = "change stream disconnected, reconnecting"
-
-	before := logs.count(log.LevelWarn, lost, tn.id)
-
-	eventually(t, "a change-stream kill on "+tn.dbName+" the store reports", func() bool {
-		if logs.count(log.LevelWarn, lost, tn.id) > before {
-			return true
-		}
-
-		if ids := changeStreamIDs(t, tn.dbName, false); len(ids) == 1 {
-			if err := replicaSet.admin.Database(tn.dbName).RunCommand(t.Context(), bson.D{
-				{Key: "killCursors", Value: entriesColl},
-				{Key: "cursors", Value: bson.A{ids[0]}},
-			}).Err(); err != nil {
-				t.Fatalf("killCursors %d on %s: %v", ids[0], tn.dbName, err)
-			}
-		}
-
-		return false
-	})
 }
 
 // changeStreams counts dbName's change-stream cursors, idle ones included, so

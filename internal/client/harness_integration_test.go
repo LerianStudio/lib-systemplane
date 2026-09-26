@@ -407,10 +407,21 @@ func requireFeeds(t *testing.T, feeds census, dbName string, want int) {
 	}
 }
 
-// pgTenantEnv is a started tenant-managed Postgres Client.
+// pgTenantEnv is a tenant-managed Postgres Client.
 type pgTenantEnv struct{ *tenantEnv }
 
+// newPGTenantClient is a started newPGTenantEnv.
 func newPGTenantClient(t *testing.T, opts ...client.Option) *pgTenantEnv {
+	t.Helper()
+
+	env := newPGTenantEnv(t, opts...)
+	env.start(t)
+
+	return env
+}
+
+// newPGTenantEnv leaves Start to the test, so a group can bind before it.
+func newPGTenantEnv(t *testing.T, opts ...client.Option) *pgTenantEnv {
 	t.Helper()
 
 	sharedPG(t)
@@ -430,8 +441,6 @@ func newPGTenantClient(t *testing.T, opts ...client.Option) *pgTenantEnv {
 
 		return liveTenant{p.tenantRef, func(t *testing.T, v string) client.Entry { return writeRow(t, p.db, v) }, p.stored}
 	}
-
-	env.start(t)
 
 	return env
 }

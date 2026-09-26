@@ -31,12 +31,17 @@ func alterAllowConnections(ctx context.Context, dbName string, allow bool) error
 }
 
 // While a tenant's feed is down its scope serves the last value marked Stale,
-// and a write made in the gap lands after the reconnect with no second write;
-// the other tenant never notices.
+// and a write made in the gap lands after the reconnect with no second write,
+// delivered once; the other tenant never notices.
 func TestIntegration_PostgresFeedGapServesStaleThenConverges(t *testing.T) {
-	env := newPGTenantClient(t)
+	env := newPGTenantClient(t, client.WithDebounce(deliveryDebounce))
 	t1, t2 := env.tenant(t, "t1"), env.tenant(t, "t2")
 	row1, row2 := writeRow(t, t1.db, "before-gap"), writeRow(t, t2.db, "t2-value")
+
+	var rec changeRecorder
+	if _, err := env.c.OnChange(tenantNS, tenantKey, rec.record); err != nil {
+		t.Fatalf("OnChange: %v", err)
+	}
 
 	env.activate(t, t1, t2)
 	requireFeeds(t, listenBackends, t1.dbName, 1)
@@ -83,6 +88,8 @@ func TestIntegration_PostgresFeedGapServesStaleThenConverges(t *testing.T) {
 	awaitEntry(t, env.c, t1.cacheOnly(t), gapRow, "t1 after the reconnect")
 	requireFeeds(t, listenBackends, t1.dbName, 1)
 	requireEntry(t, env.c, t2.cacheOnly(t), row2, "t2 after t1's reconnect")
+	rec.await(t, t1.id, row1, gapRow)
+	rec.await(t, t2.id, row2)
 }
 
 // A tenant whose first reconcile fails keeps no feed open; the census reading
