@@ -125,10 +125,9 @@ func (r *changeRecorder) await(t *testing.T, tenant string, want ...client.Entry
 	}
 }
 
-// One subscription hears every tenant, each write once and tagged with its own
-// tenant: a Set is in its tenant's cache when it returns and in no other's, its
-// feed echo is not a second change, and a write behind the Client reaches t1's
-// cached scope through t1's feed.
+// One subscription hears each tenant's writes once, tagged with that tenant; a
+// Set is in its own tenant's cache on return and in no other, and a write behind
+// the Client reaches t1 through t1's feed.
 func writeDeliversOnceToItsTenantOnly(t *testing.T, b backend) {
 	env := b.open(t, client.WithDebounce(deliveryDebounce))
 	t1, t2 := env.add(t, "t1"), env.add(t, "t2")

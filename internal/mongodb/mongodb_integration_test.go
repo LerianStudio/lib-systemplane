@@ -7,8 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net"
 	"net/url"
 	"slices"
 	"strings"
@@ -20,6 +18,7 @@ import (
 	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/mongodb"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/testsupport/mongotest"
 	"github.com/LerianStudio/lib-systemplane/v4/systemplanetest"
 	"github.com/testcontainers/testcontainers-go"
 	mongocontainer "github.com/testcontainers/testcontainers-go/modules/mongodb"
@@ -77,7 +76,7 @@ func startContainerAt(t *testing.T) (*mongo.Client, string, func()) {
 	// container reports ready, and a write landing in that window fails with
 	// NotWritablePrimary. The connection is direct, so the driver does no
 	// primary selection of its own: wait here before handing the client out.
-	if err := waitForWritablePrimary(client); err != nil {
+	if err := mongotest.AwaitWritablePrimary(context.Background(), client); err != nil {
 		cleanup()
 
 		t.Fatalf("wait for writable primary: %v", err)
@@ -91,32 +90,6 @@ func startContainerAt(t *testing.T) (*mongo.Client, string, func()) {
 	}
 
 	return client, parsed.Host, cleanup
-}
-
-func waitForWritablePrimary(client *mongo.Client) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	var lastErr error
-
-	for {
-		var hello struct {
-			IsWritablePrimary bool `bson:"isWritablePrimary"`
-		}
-
-		lastErr = client.Database("admin").
-			RunCommand(ctx, bson.D{{Key: "hello", Value: 1}}).
-			Decode(&hello)
-		if lastErr == nil && hello.IsWritablePrimary {
-			return nil
-		}
-
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("node never became writable primary (last error: %v): %w", lastErr, ctx.Err())
-		case <-time.After(100 * time.Millisecond):
-		}
-	}
 }
 
 func TestIntegration_MongoDBSingleTenant(t *testing.T) {
@@ -1660,7 +1633,7 @@ func TestIntegration_MongoStoppedFeedKillsResumedCursor(t *testing.T) {
 	client, endpoint, cleanup := startContainerAt(t)
 	t.Cleanup(cleanup)
 
-	proxy := newTCPProxy(t, endpoint)
+	proxy := mongotest.NewProxy(t, endpoint)
 	s, dbName := proxiedStore(t, proxy, "resumekill", 0)
 
 	if err := s.Start(context.Background()); err != nil {
@@ -1677,9 +1650,9 @@ func TestIntegration_MongoStoppedFeedKillsResumedCursor(t *testing.T) {
 
 	// Shorter than the 2s server-selection bound: the driver resumes inside the
 	// read in flight instead of failing it.
-	proxy.sever()
+	proxy.Sever()
 	time.Sleep(300 * time.Millisecond)
-	proxy.restore(t)
+	proxy.Restore(t)
 
 	awaitCursors(t, client, dbName, "a resumed cursor", resumed)
 	assertNoEvent(t, events, 200*time.Millisecond, "a resume inside one read")
@@ -2183,157 +2156,17 @@ func TestIntegration_MongoDeleteThenRecreateConvergesToLiveValue(t *testing.T) {
 	}
 }
 
-// tcpProxy forwards a local port to the container's MongoDB port so a test can
-// sever the store's connection and restore it on the same address.
-//
-// The proxy exists because it produces a sustained, restorable outage: the
-// address stays dead for as long as a test wants, longer than the store
-// client's 2s server-selection bound, so every reopen attempt fails until the
-// test restores it. TestIntegration_MongoRepeatedReopenFailuresEmitOneDisconnect
-// needs exactly that. A one-shot severance cannot provide it; that is what
-// killChangeStreamCursor does for the contract suite's Reconnect hook, and the
-// feed reopens at once behind it. Dropping the container instead is worse: a
-// plain network error IS resumable, the driver resumes it internally, and a
-// short outage would announce nothing at all — which is why every outage below
-// outlasts the server-selection bound.
-type tcpProxy struct {
-	target string
-	addr   string
-
-	mu      sync.Mutex
-	ln      net.Listener
-	conns   []net.Conn
-	severed bool
-
-	wg sync.WaitGroup
-}
-
-func newTCPProxy(t *testing.T, target string) *tcpProxy {
-	t.Helper()
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen for proxy: %v", err)
-	}
-
-	p := &tcpProxy{target: target, addr: ln.Addr().String()}
-	p.serve(ln)
-
-	t.Cleanup(p.sever)
-
-	return p
-}
-
-func (p *tcpProxy) serve(ln net.Listener) {
-	p.mu.Lock()
-	p.ln = ln
-	p.severed = false
-	p.mu.Unlock()
-
-	p.wg.Add(1)
-
-	go func() {
-		defer p.wg.Done()
-
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-
-			p.handle(conn)
-		}
-	}()
-}
-
-// handle wires one accepted connection to the target. The severed check and the
-// append happen in ONE hold: a connection admitted after sever snapshotted the
-// list would otherwise keep its io.Copy goroutines alive forever, and the
-// package's goleak guard would fail the whole suite over it.
-func (p *tcpProxy) handle(client net.Conn) {
-	upstream, err := net.Dial("tcp", p.target)
-	if err != nil {
-		_ = client.Close()
-
-		return
-	}
-
-	p.mu.Lock()
-
-	if p.severed {
-		p.mu.Unlock()
-
-		_ = client.Close()
-		_ = upstream.Close()
-
-		return
-	}
-
-	p.conns = append(p.conns, client, upstream)
-	p.mu.Unlock()
-
-	p.pipe(client, upstream)
-	p.pipe(upstream, client)
-}
-
-func (p *tcpProxy) pipe(dst, src net.Conn) {
-	p.wg.Add(1)
-
-	go func() {
-		defer p.wg.Done()
-
-		_, _ = io.Copy(dst, src)
-
-		_ = dst.Close()
-		_ = src.Close()
-	}()
-}
-
-// sever takes the proxy down: no new connections, and every live one dropped.
-// It waits for the forwarding goroutines so a severed proxy leaves nothing
-// running, and is safe to call twice — t.Cleanup always calls it once more.
-func (p *tcpProxy) sever() {
-	p.mu.Lock()
-	p.severed = true
-	ln, conns := p.ln, p.conns
-	p.ln, p.conns = nil, nil
-	p.mu.Unlock()
-
-	if ln != nil {
-		_ = ln.Close()
-	}
-
-	for _, conn := range conns {
-		_ = conn.Close()
-	}
-
-	p.wg.Wait()
-}
-
-// restore brings the proxy back on the SAME address, which is what lets the
-// store's own client reconnect without knowing anything happened.
-func (p *tcpProxy) restore(t *testing.T) {
-	t.Helper()
-
-	ln, err := net.Listen("tcp", p.addr)
-	if err != nil {
-		t.Fatalf("restore proxy on %s: %v", p.addr, err)
-	}
-
-	p.serve(ln)
-}
-
 // proxiedStore builds a store whose every connection travels through proxy. The
 // short server-selection bound is what makes the failure fast and the outage
 // deterministic: without it a severed feed would sit in selection for 30s and
 // the test would be timing out rather than observing anything.
 // A positive pollInterval selects the polling fallback instead of a change
 // stream; zero leaves the store on change streams.
-func proxiedStore(t *testing.T, proxy *tcpProxy, prefix string, pollInterval time.Duration) (store.Store, string) {
+func proxiedStore(t *testing.T, proxy *mongotest.Proxy, prefix string, pollInterval time.Duration) (store.Store, string) {
 	t.Helper()
 
 	client, err := mongo.Connect(options.Client().
-		ApplyURI("mongodb://" + proxy.addr).
+		ApplyURI("mongodb://" + proxy.Addr).
 		SetDirect(true).
 		SetServerSelectionTimeout(2 * time.Second))
 	if err != nil {
@@ -2359,13 +2192,13 @@ func proxiedStore(t *testing.T, proxy *tcpProxy, prefix string, pollInterval tim
 // MongoDB only through the proxy, already started and subscribed with its
 // joining OpResync consumed, plus a second store wired DIRECTLY to the
 // container for the write that has to land while the feed is blind.
-func outageHarness(t *testing.T, prefix string) (proxied store.Store, direct store.Store, events <-chan store.Event, proxy *tcpProxy) {
+func outageHarness(t *testing.T, prefix string) (proxied store.Store, direct store.Store, events <-chan store.Event, proxy *mongotest.Proxy) {
 	t.Helper()
 
 	client, endpoint, cleanup := startContainerAt(t)
 	t.Cleanup(cleanup)
 
-	proxy = newTCPProxy(t, endpoint)
+	proxy = mongotest.NewProxy(t, endpoint)
 
 	proxied, dbName := proxiedStore(t, proxy, prefix, 0)
 
@@ -2406,7 +2239,7 @@ func outageHarness(t *testing.T, prefix string) (proxied store.Store, direct sto
 func TestIntegration_MongoResyncAfterCursorKill(t *testing.T) {
 	proxied, direct, events, proxy := outageHarness(t, "resync")
 
-	proxy.sever()
+	proxy.Sever()
 
 	// Through the severed proxy this write would never land at all.
 	gapRev := setEntry(t, direct, "ns", "k", `{"a":2}`)
@@ -2416,7 +2249,7 @@ func TestIntegration_MongoResyncAfterCursorKill(t *testing.T) {
 	// announces nothing.
 	time.Sleep(5 * time.Second)
 
-	proxy.restore(t)
+	proxy.Restore(t)
 
 	narration := collectUntil(t, events, "the OpResync after the reconnect", 60*time.Second,
 		func(evt store.Event) bool { return evt.Op == store.OpResync })
@@ -2453,9 +2286,9 @@ func TestIntegration_MongoResyncAfterCursorKill(t *testing.T) {
 func TestIntegration_MongoRepeatedReopenFailuresEmitOneDisconnect(t *testing.T) {
 	_, _, events, proxy := outageHarness(t, "reopenfail")
 
-	proxy.sever()
+	proxy.Sever()
 	time.Sleep(12 * time.Second)
-	proxy.restore(t)
+	proxy.Restore(t)
 
 	narration := collectUntil(t, events, "the OpResync after a long outage", 90*time.Second,
 		func(evt store.Event) bool { return evt.Op == store.OpResync })
@@ -2490,7 +2323,7 @@ func TestIntegration_MongoPollingDisconnectAndResyncAroundFailedRound(t *testing
 	client, endpoint, cleanup := startContainerAt(t)
 	t.Cleanup(cleanup)
 
-	proxy := newTCPProxy(t, endpoint)
+	proxy := mongotest.NewProxy(t, endpoint)
 
 	s, dbName := proxiedStore(t, proxy, "pollfail", 200*time.Millisecond)
 
@@ -2514,7 +2347,7 @@ func TestIntegration_MongoPollingDisconnectAndResyncAroundFailedRound(t *testing
 		t.Fatalf("first event after Subscribe = %#v, want %q", evt, store.OpResync)
 	}
 
-	proxy.sever()
+	proxy.Sever()
 
 	// Several round trips must fail inside this window: each one burns the 2s
 	// server-selection bound on top of the 200ms tick.
@@ -2525,7 +2358,7 @@ func TestIntegration_MongoPollingDisconnectAndResyncAroundFailedRound(t *testing
 	// assertion rather than a vacuous one.
 	setEntry(t, direct, "ns", "k", `{"a":1}`)
 
-	proxy.restore(t)
+	proxy.Restore(t)
 
 	narration := collectUntil(t, events, "the upsert the recovering round trip found", 60*time.Second,
 		func(evt store.Event) bool { return evt.Op == store.OpUpsert })

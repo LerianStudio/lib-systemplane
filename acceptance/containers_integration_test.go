@@ -14,6 +14,7 @@ import (
 	"time"
 
 	systemplane "github.com/LerianStudio/lib-systemplane/v4"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/testsupport/mongotest"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/testcontainers/testcontainers-go"
 	mongocontainer "github.com/testcontainers/testcontainers-go/modules/mongodb"
@@ -203,6 +204,13 @@ func startMongoContainer() (mongoHandle, error) {
 		_ = testcontainers.TerminateContainer(container)
 
 		return mongoHandle{}, fmt.Errorf("mongo connect: %w", err)
+	}
+
+	if err := mongotest.AwaitWritablePrimary(ctx, client); err != nil {
+		_ = client.Disconnect(ctx)
+		_ = testcontainers.TerminateContainer(container)
+
+		return mongoHandle{}, err
 	}
 
 	registerTerminator(func() {

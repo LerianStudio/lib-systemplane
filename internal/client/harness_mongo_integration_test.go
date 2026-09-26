@@ -16,6 +16,7 @@ import (
 	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
 	tmmongo "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/mongo"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/client"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/testsupport/mongotest"
 	"github.com/testcontainers/testcontainers-go"
 	mongocontainer "github.com/testcontainers/testcontainers-go/modules/mongodb"
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -96,30 +97,7 @@ func (s *mongoServer) run() {
 		return
 	}
 
-	s.err = s.awaitWritablePrimary(ctx)
-}
-
-// awaitWritablePrimary waits out the member's SECONDARY-to-PRIMARY step after
-// the container reports ready, where a write fails with NotWritablePrimary.
-func (s *mongoServer) awaitWritablePrimary(ctx context.Context) error {
-	deadline := time.Now().Add(30 * time.Second)
-
-	for {
-		var hello struct {
-			IsWritablePrimary bool `bson:"isWritablePrimary"`
-		}
-
-		err := s.admin.Database("admin").RunCommand(ctx, bson.D{{Key: "hello", Value: 1}}).Decode(&hello)
-		if err == nil && hello.IsWritablePrimary {
-			return nil
-		}
-
-		if time.Now().After(deadline) {
-			return errors.Join(errors.New("mongo member never became writable primary"), err)
-		}
-
-		time.Sleep(100 * time.Millisecond)
-	}
+	s.err = mongotest.AwaitWritablePrimary(ctx, s.admin)
 }
 
 // mongoTenantEnv is a tenant-managed MongoDB Client on srv; mgr is its tenant manager.

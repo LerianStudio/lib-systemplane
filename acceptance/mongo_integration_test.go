@@ -4,142 +4,20 @@ package acceptance
 
 import (
 	"context"
-	"io"
-	"net"
 	"net/url"
-	"sync"
 	"testing"
 	"time"
 
 	systemplane "github.com/LerianStudio/lib-systemplane/v4"
+	"github.com/LerianStudio/lib-systemplane/v4/internal/testsupport/mongotest"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
-// tcpProxy fronts the container so a test can sever the library's connection
-// and restore it on the same address; the driver cannot resume a change stream
-// through the outage within its server-selection timeout, so the feed reports it.
-type tcpProxy struct {
-	target, addr string
-
-	mu       sync.Mutex
-	listener net.Listener
-	conns    []net.Conn
-	stopped  bool
-
-	wg sync.WaitGroup
-}
-
-func newTCPProxy(t *testing.T, target string) *tcpProxy {
-	t.Helper()
-
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen for proxy: %v", err)
-	}
-
-	p := &tcpProxy{target: target, addr: listener.Addr().String()}
-	p.serve(listener)
-
-	t.Cleanup(func() {
-		p.mu.Lock()
-		p.stopped = true
-		p.mu.Unlock()
-
-		p.sever()
-		p.wg.Wait()
-	})
-
-	return p
-}
-
-func (p *tcpProxy) serve(listener net.Listener) {
-	p.mu.Lock()
-	p.listener = listener
-	p.mu.Unlock()
-
-	p.wg.Add(1)
-
-	go func() {
-		defer p.wg.Done()
-
-		for {
-			client, err := listener.Accept()
-			if err != nil {
-				return
-			}
-
-			upstream, err := net.Dial("tcp", p.target)
-			if err != nil {
-				_ = client.Close()
-
-				continue
-			}
-
-			p.mu.Lock()
-			if p.stopped {
-				p.mu.Unlock()
-				_ = client.Close()
-				_ = upstream.Close()
-
-				return
-			}
-
-			p.conns = append(p.conns, client, upstream)
-			p.mu.Unlock()
-
-			p.pipe(client, upstream)
-			p.pipe(upstream, client)
-		}
-	}()
-}
-
-func (p *tcpProxy) pipe(dst, src net.Conn) {
-	p.wg.Add(1)
-
-	go func() {
-		defer p.wg.Done()
-
-		_, _ = io.Copy(dst, src)
-		_ = dst.Close()
-		_ = src.Close()
-	}()
-}
-
-// sever drops the listener and every live connection through it.
-func (p *tcpProxy) sever() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.listener != nil {
-		_ = p.listener.Close()
-		p.listener = nil
-	}
-
-	for _, c := range p.conns {
-		_ = c.Close()
-	}
-
-	p.conns = nil
-}
-
-// restore listens again on the same address, so the library's client
-// reconnects without being told.
-func (p *tcpProxy) restore(t *testing.T) {
-	t.Helper()
-
-	listener, err := net.Listen("tcp", p.addr)
-	if err != nil {
-		t.Fatalf("re-listen on %s: %v", p.addr, err)
-	}
-
-	p.serve(listener)
-}
-
 // newSTMongo builds an unstarted single-tenant client whose connection runs
 // through a severable proxy, plus a foreign collection handle that does not.
-func newSTMongo(t *testing.T) (*systemplane.Client, *tcpProxy, *mongo.Collection, *recordingLogger) {
+func newSTMongo(t *testing.T) (*systemplane.Client, *mongotest.Proxy, *mongo.Collection, *recordingLogger) {
 	t.Helper()
 
 	dbName := freshMongo(t)
@@ -149,10 +27,10 @@ func newSTMongo(t *testing.T) (*systemplane.Client, *tcpProxy, *mongo.Collection
 		t.Fatalf("parse mongo uri: %v", err)
 	}
 
-	proxy := newTCPProxy(t, target.Host)
+	proxy := mongotest.NewProxy(t, target.Host)
 
 	driver, err := mongo.Connect(options.Client().
-		ApplyURI("mongodb://" + proxy.addr + "/?directConnection=true").
+		ApplyURI("mongodb://" + proxy.Addr + "/?directConnection=true").
 		SetServerSelectionTimeout(2 * time.Second))
 	if err != nil {
 		t.Fatalf("mongo connect through proxy: %v", err)
@@ -247,7 +125,7 @@ func TestIntegration_Acceptance03_FeedLossMongo(t *testing.T) {
 		t.Fatalf("pre-gap publication = %#v, want before-gap at a store revision", before)
 	}
 
-	proxy.sever()
+	proxy.Sever()
 	awaitCond(t, 60*time.Second, "the scope reports Stale once the change stream is severed", func() bool {
 		return entryOf(t, client, key).Stale
 	})
@@ -258,7 +136,7 @@ func TestIntegration_Acceptance03_FeedLossMongo(t *testing.T) {
 
 	// The foreign handle bypasses the proxy, so this lands while the library is blind.
 	writeDocDirect(t, foreign, key, `"during-gap"`, before.Revision+1)
-	proxy.restore(t)
+	proxy.Restore(t)
 
 	converged := sink.next(t, 120*time.Second, "publication of the gap write after the stream re-opens")
 	if converged.Value != "during-gap" || converged.Revision != before.Revision+1 {

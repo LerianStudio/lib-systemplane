@@ -50,15 +50,15 @@ No Go consumer uses the MongoDB backend yet; the Console will. Nobody consumes c
 | Lane | Delivers | Depends on | Wave | Worktree / Branch | Plan | Status |
 |------|----------|-----------|------|-------------------|------|--------|
 | contracts | `/v4` module path; `Store` interface with `Scope` + `Revision` + `OpResync` and compiling shims in both backends; connector moved to `internal/postgres`; public `Change`, new `OnChange` signature, `Entry` + `GetEntry` shims; all in-repo callers and tests updated | none | 1 | `/srv/worktrees/v4-contracts` / `feat/v4-contracts` | lane-contracts.md | Merged |
-| engine-core | `internal/engine` replacing Client cache + Manager for the single-tenant scope: ingress, reconcile on `OpResync`, revision dedupe, coalescing dispatch, read-your-writes, delete→default; `internal/manager` and root Manager API deleted; options in D8 removed; Mongo MT rejected at construction | contracts | 2 | `/srv/worktrees/v4-engine-core` / `feat/v4-engine-core` | lane-engine-core.md | Phase 1 Merged (PR #87, develop 56f37b8, 2026-09-23); Phase 2 Merged (PR #93, develop 0ecdf9e, 2026-09-24, tag v4.0.0-beta.13); Phase 3 Epic 3.1 Merged (PR #97, develop 8084607); Epic 3.2 Pending |
+| engine-core | `internal/engine` replacing Client cache + Manager for the single-tenant scope: ingress, reconcile on `OpResync`, revision dedupe, coalescing dispatch, read-your-writes, delete→default; `internal/manager` and root Manager API deleted; options in D8 removed; Mongo MT rejected at construction | contracts | 2 | `/srv/worktrees/v4-engine-core` / `feat/v4-engine-core` | lane-engine-core.md | Merged (Phase 1 PR #87, Phase 2 PR #93, Phase 3 Epic 3.1 PR #97; Epic 3.2, the gate sweep, is covered by the integration lane's `make ci`) |
 | storage | Postgres: scope resolution via connector, `RETURNING revision`, per-tenant `Subscribe(scope)` LISTEN, `OpDisconnect` on loss and `OpResync` after (re)connect, revision in NOTIFY; MongoDB: `revision = max(previous + 1, $toLong($$NOW))` on every value change and tombstone deletes (FC-9, D11), `OpDisconnect` on cursor loss or a failed poll and `OpResync` after every successful (re)open or recovered poll (FC-2), tenant connector + per-tenant `Subscribe(scope)` change stream; DDL v4 + `migrate_v3_to_v4.sql`; `DefaultSeedSQL` removed; contract suite extended and run against both backends in both modes | contracts | 2 | `/srv/worktrees/v4-storage` / `feat/v4-storage` | lane-storage.md | Merged (Phases 1-2 PR #90, develop 79f26e5; Phase 3 PR #91, develop 3c0efa7; 2026-09-23) |
 | groups | `Bind[T]`, `Group[T].Snapshot/Set/OnApply/Status` over the per-key facade | contracts | 2 | `/srv/worktrees/v4-groups` / `feat/v4-groups-hot-reload` (Phase 2) | lane-groups.md | Phase 2 Merged (PR #86, develop e1dd109); Phase 3 replaced by the redaction removal (lane groups-redaction, D12) |
-| engine-tenants | `WithPostgresTenantManager` / `WithMongoTenantManager`, lazy activation, `Client.HandleTenantLifecycle`, per-scope feeds through `Store.Subscribe(scope)` on both backends, stale marking, per-tenant metrics with aggregate threshold | engine-core, storage | 3 | `/srv/worktrees/v4-engine-tenants` / `feat/v4-engine-tenants` | lane-engine-tenants.md | Phase 1 Merged (PR #103, 2026-09-25); Phase 2 Merged (PR #104, develop c344a63, 2026-09-26); Phase 3 In flight (`test/v4-tenants-live-backends`) |
+| engine-tenants | `WithPostgresTenantManager` / `WithMongoTenantManager`, lazy activation, `Client.HandleTenantLifecycle`, per-scope feeds through `Store.Subscribe(scope)` on both backends, stale marking, per-tenant metrics with aggregate threshold | engine-core, storage | 3 | `/srv/worktrees/v4-engine-tenants` / `feat/v4-engine-tenants` | lane-engine-tenants.md | Merged (Phase 1 PR #103; Phase 2 PR #104; Phase 3 PR #108, develop fab8172; cursor fix PR #110, develop e577799; 2026-09-26) |
 | admin | GET responses carry `revision`, `updatedAt`, `updatedBy`, `stale`; list too; handlers read through `GetEntry` | contracts | 2 | `/srv/worktrees/v4-admin` / `feat/v4-admin` | lane-admin.md | Merged |
-| docs | README, CLAUDE.md, `MIGRATION-v4.md`, `.env.reference` deleted, `docs/PROJECT_RULES.md` corrected, three compiled examples (single-tenant, multi-tenant, groups) built in CI, godoc truth sweep | engine-core, storage, groups | 3 | `/srv/worktrees/v4-docs` / `feat/v4-docs` | lane-docs.md | Phase 1 Merged (PR #98, develop 2c9b6ff); Phase 2 Epics 2.1-2.2 Merged (PR #102, #106, develop e91a7352); Epic 2.3 In flight (`docs/v4-lane-docs-godoc-sweep`) |
+| docs | README, CLAUDE.md, `MIGRATION-v4.md`, `.env.reference` deleted, `docs/PROJECT_RULES.md` corrected, three compiled examples (single-tenant, multi-tenant, groups) built in CI, godoc truth sweep | engine-core, storage, groups | 3 | `/srv/worktrees/v4-docs` / `feat/v4-docs` | lane-docs.md | Merged (Phase 1 PR #98; Phase 2 PR #102, #106, #107; handover PR #109, develop ee073c2) |
 | matcher-pilot | matcher on v4 groups: glue deleted, migrated env vars removed from charts, before/after line count reported | engine-core, storage, groups | 3 | repo `matcher`: `/srv/worktrees/matcher-v4-pilot` / `feat/systemplane-v4` | (lives in matcher: `docs/plans/`) | Pending |
 | groups-redaction | redaction removed from the library (groups Phase 3, Epic 3.1, product decision 2026-09-24; replaces the cancelled FC-13 field-level redaction, branch `feat/v4-groups-field-redaction` discarded): no key policy, admin serves values in clear, catalog drops `redaction`, no withheld log line, error or panic report | PR #96, #97, #95 and the docs Phase 1 PR merged | 3 | `/srv/worktrees/v4-drop-redaction` / `refactor/v4-drop-redaction` | lane-groups.md (Phase 3) | Merged (PR #99, develop 7a33f38, 2026-09-25) |
-| integration | audit §10 acceptance suite end to end (feed loss → write → reconnect → converge without a second write, in ST Postgres, MT Postgres, ST Mongo, MT Mongo; two tenants get distinct identity on both backends; invalid external row keeps last valid; activation gap; slow callback does not stall the pump; `-race` + goleak), repo-wide absence checks, manual `v4.0.0` cut | every other lane | 4 | `/srv/worktrees/v4-integration` / `feat/v4-integration` | lane-integration.md | Pending |
+| integration | audit §10 acceptance suite end to end (feed loss → write → reconnect → converge without a second write, in ST Postgres, MT Postgres, ST Mongo, MT Mongo; two tenants get distinct identity on both backends; invalid external row keeps last valid; activation gap; slow callback does not stall the pump; `-race` + goleak), repo-wide absence checks, manual `v4.0.0` cut | every other lane | 4 | `/srv/worktrees/v4-integration` / `feat/v4-acceptance` | index.md (Integration Lane) | In review (acceptance suite); absence check, `make ci` and the `v4.0.0` cut follow the matcher pilot |
 
 `Status` lifecycle: Pending → In flight → In review → Merged | Failed.
 The orchestrator session owns this column. Lanes never write to this file.
@@ -595,7 +595,7 @@ Reason: a group is one row and the v3 per-key redaction is per row, so a group h
 ### Lane: integration
 
 **Goal:** The audit's acceptance criteria hold end to end, and v4.0.0 ships.
-**Scope:** the acceptance suite as package `acceptance/` under build tag `acceptance` (authored ahead of the lanes on `/srv/worktrees/v4-integration` / `feat/v4-acceptance`, red by design until they land; testcontainers Postgres + Mongo replica set), any engine-level integration file it adds under the prefix `internal/engine/acceptance_*_integration_test.go` (the plain names are reserved by engine-tenants), CI workflow adjustments, repo-wide absence checks, release cut.
+**Scope:** the single-tenant acceptance suite as package `acceptance/` under build tag `integration`, run by `make test-integration` in CI (testcontainers Postgres + Mongo replica set, public API only); the multi-tenant scenarios in the `internal/client` live tenant tests; repo-wide absence checks; release cut.
 **Depends on:** every other lane.
 **Done when:** the scenarios in the Integration Lane section below pass under `-race` with goleak; `grep -rn "lib-systemplane/v3\|internal/manager\|Slice 1\|DefaultSeedSQL\|WithTable\|WithListenChannel" --include='*.go' --include='*.md' --exclude-dir=plans --exclude=CHANGELOG.md --exclude='MIGRATION-*.md' .` returns nothing; `make ci` green; `develop → main` promoted and `v4.0.0` cut on `main` by the Merge Order step 4 rule (dry-run first; hand tag plus channel note only if the run would not cut it itself).
 
@@ -616,6 +616,24 @@ Required: `engine-core`, `engine-tenants`, `storage` and `groups` all touch the 
 11. Revision 0 is kept apart per surface: a delete publishes the registered default at Revision 0; a store row that carries no revision (a v3 MongoDB document, or a foreign writer that omitted it) is published with its own value at Revision 0, is never deduplicated, and is superseded by the first real revision; the fence never mistakes one for the other (D3).
 
 Absence checks deferred from lanes under rule 4 live here (see the lane's Done-when).
+
+**Where each scenario runs** (one level per scenario). Single-tenant runs black-box in `acceptance/`; multi-tenant runs in the `internal/client` live tenant tests, which own the tenant-manager harness.
+
+| # | Single-tenant (`acceptance/`) | Multi-tenant (`internal/client`) |
+|---|---|---|
+| 1 | `Acceptance01_FeedLossPostgres` (gap held closed with `ALLOW_CONNECTIONS false`); the reconcile-race variant stays fake-only in `internal/engine/reconcile_test.go` | n/a |
+| 2 | n/a | `PostgresFeedGapServesStaleThenConverges` |
+| 3 | `Acceptance03_FeedLossMongo` (severable proxy) | `MongoFeedGapServesStaleThenConverges` (gap held through the tenant manager) |
+| 4 | n/a | `{Postgres,Mongo}WriteDeliversOnceToItsTenantOnly`, `{Postgres,Mongo}GroupAppliesEachTenant` |
+| 5 | `Acceptance05_InvalidExternalRow{Postgres,Mongo}` | n/a |
+| 6 | n/a | `{Postgres,Mongo}WriteRacingFirstReadSurvivesActivation` |
+| 7 | `Acceptance07_SlowSubscriberDoesNotStallFeed` | n/a |
+| 8 | `Acceptance08_GroupAtomicity` | n/a |
+| 9 | `Acceptance09_ReadYourWritesPostgres` | `{Postgres,Mongo}WriteDeliversOnceToItsTenantOnly` |
+| 10 | `Acceptance10_CloseWaitsForCtxHonouringCallbacks`, `Acceptance10_CloseNamesACallbackThatIgnoresCtx` | n/a |
+| 11 | `Acceptance11_DeletePublishesDefaultAtRevisionZeroPostgres`, `Acceptance11_RevisionZeroKeptApartMongo` | n/a |
+
+Every test name above carries the `TestIntegration_` prefix. The absence grep runs once at the release cut; no test file holds it.
 
 ## Behaviour changes MIGRATION-v4.md must name (collected for the docs lane)
 
