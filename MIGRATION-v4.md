@@ -293,9 +293,13 @@ Client built with `WithTelemetry`, single-tenant ones included.
 On every other instrument a tenant scope's points carry `tenant_id`, which reads
 the literal `aggregate` for every tenant once more than
 `WithAggregateTenantThreshold` tenant scopes are active, and the single-tenant
-scope's points carry no `tenant_id`. `systemplane.cache_reads_total` counts
-reads of an active scope's cache only: a tenant read served per request counts
-nothing, as in v3.
+scope's points carry no `tenant_id`. v3's attribute `outcome` is now `result`;
+`op` on `notify_received_total` and `reason` on `listen_disconnects_total` have
+no replacement, and `systemplane.changefeed_events_total` also counts every
+disconnect and every resync. `systemplane.cache_reads_total` counts every read
+of an active scope, one made while that scope is still activating included: it
+counts a miss and reads the tenant database. A read of a tenant with no active
+scope counts nothing, as in v3.
 
 ### Every callback registered before `Start` fires once at `Start`
 

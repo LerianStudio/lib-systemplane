@@ -45,7 +45,7 @@
 | Phase | Milestone | Epics | Status |
 |-------|-----------|-------|--------|
 | 1 | A multi-tenant Client with a tenant manager configured activates a tenant's scope on that tenant's first read, serves every later read of it from the cached scope with real revision and provenance, fires one `OnChange` per tenant with `Change.Tenant` set, and reads back its own multi-tenant writes — on Postgres and on MongoDB, proven against fakes | 1.0, 1.1, 1.2, 1.3 | Complete |
-| 2 | Tenant-manager lifecycle events drive the same engine: `Client.HandleTenantLifecycle` activates, drops, blocks and rotates, a suspended or deleted tenant never re-activates from a read, and per-tenant metrics carry `tenant_id` up to `WithAggregateTenantThreshold` and `aggregate` above it | 2.1, 2.2 | Detailed |
+| 2 | Tenant-manager lifecycle events drive the same engine: `Client.HandleTenantLifecycle` activates, drops, blocks and rotates, a suspended or deleted tenant never re-activates from a read, and per-tenant metrics carry `tenant_id` up to `WithAggregateTenantThreshold` and `aggregate` above it | 2.1, 2.2 | Complete |
 | 3 | The whole path is proven on live backends: testcontainers Postgres and a Mongo replica set, two tenant databases each, activation gap, feed loss per tenant, tenant isolation, `-race` and goleak clean | 3.1, 3.2, 3.3 | Epic-level |
 
 ---
@@ -744,5 +744,10 @@ Every item above is answered in `index.md`; implementation may start on the affe
 
 - Epic 2.1's Done-when says `EventTenantActivated` "activates idempotently". FC-6 says Activated "clears a blocked marker" and that "lazy activation on first read already covers it". E-1 follows FC-6: the handler only unblocks.
 - `MIGRATION-v4.md` is the `docs` lane's. Its plan lets "the owning lane" replace its own text, so Tasks 2.1.1 and 2.2.2 rewrite the surface-diff rows `:41` and `:44` and add the FC-12 name table (E-9). Every other `NOT-YET(engine-tenants)` line and the per-consumer sections stay for the `docs` lane.
-- `go.mod` changes by one `// indirect` marker (E-8), and `api_boundary.go` gets its `Meter` godoc corrected (Task 2.2.2). The lane owns neither file, and nothing else in either file changes.
+- `go.mod` changes by the `// indirect` marker (E-8) and by three indirect requires (`go-redis/v9`, `amqp091-go`, `go.uber.org/atomic`) that importing `tmevent` pulls in. FC-6 names `tmevent.TenantLifecycleEvent` in the signature, so every consumer binary now links those modules. `api_boundary.go` gets its `Meter` godoc corrected (Task 2.2.2). The lane owns neither file, and nothing else in either file changes.
+- E-6 is amended: `systemplane.scopes_active` is one unlabelled count, as FC-12 ("gauge: tracked scopes") and v3's `tenants_active` have it. Only `cache_entries` is summed per `tenant_id`.
+- A read of an untracked tenant scope records nothing, as in v3; the plan named that branch of `Engine.Lookup` as a record site. Every instrument stays within the FC-10 bound on active scopes.
+- A `Telemetry` whose `Meter` returns `(nil, nil)` disables the metrics, as the backends already do for `Tracer`; without the guard `New` panicked.
+- The lifecycle tests live in `internal/client/lifecycle_test.go`, not `tenant_test.go`, which stays at its 822 lines from `develop`.
+- E-2 stands: the empty-TenantID `ErrValidation` exit stays, though `tmevent.ParseEvent` already refuses an empty `tenant_id` on the listener path.
 - Epic 2.2's Done-when builds the instruments "lazily through `sync.Once`". `engine.Config` is fixed at `New`, so Task 2.2.1 builds them once there; the intent (no telemetry, no instruments, no live `MeterProvider` in a test) is unchanged.
