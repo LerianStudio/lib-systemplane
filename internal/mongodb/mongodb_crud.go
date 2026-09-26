@@ -1,4 +1,3 @@
-// CRUD helpers and schema bootstrap for the MongoDB backend.
 package mongodb
 
 import (
@@ -132,7 +131,7 @@ func upsertPipeline(e store.Entry) mongo.Pipeline {
 			{Key: fieldUpdatedBy, Value: bson.D{{Key: opLiteral, Value: e.UpdatedBy}}},
 		}}},
 		// Stage 3 — a Set on a tombstone brings the key back to life, so the
-		// marker goes (FC-9). No stage reads "deleted", so this one is last by
+		// marker goes. No stage reads "deleted", so this one is last by
 		// choice rather than by necessity. The revision bumped in stage 1 for
 		// free: a tombstone carries no "value", so the $eq there compared BSON
 		// null against a JSON payload, which is always a string.
@@ -146,7 +145,7 @@ func upsertPipeline(e store.Entry) mongo.Pipeline {
 func tombstonePipeline(actor string, now time.Time) mongo.Pipeline {
 	return mongo.Pipeline{
 		// Stage 1 — the revision the deleted key reached must keep climbing, so
-		// a later recreate lands above every revision the key ever had (D11).
+		// a later recreate lands above every revision the key ever had.
 		bson.D{{Key: opSet, Value: bson.D{{Key: fieldRevision, Value: bumpRevisionExpr()}}}},
 		// Stage 2 — the marker and the provenance of the delete. actor is
 		// caller-supplied, so it is wrapped; updated_at is a BSON date and is
@@ -202,7 +201,7 @@ func pollingIndexes() []mongo.IndexModel {
 // document already carried, and never below the server clock in milliseconds.
 // The clock is only a floor for a key's first-ever write; "previous + 1" is
 // what makes the revision strictly increasing across a delete and recreate
-// whatever the clock does (D11).
+// whatever the clock does.
 func bumpRevisionExpr() bson.D {
 	return bson.D{{Key: "$max", Value: bson.A{
 		bson.D{{Key: "$add", Value: bson.A{

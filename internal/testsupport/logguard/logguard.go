@@ -1,13 +1,10 @@
 // Package logguard reads a package's own source and refuses any log field name
 // lib-observability erases.
 //
-// A test that only inspects the lines it happens to drive proves nothing about
-// the sites its suite never reaches, and "key" is an exact entry in the default
-// sensitive-field list: one log.String("key", …) slipping back in publishes
-// namespace=billing key=[REDACTED] to an operator hunting a rejected row — a
-// line that survives review because it reads correctly in the source and is
-// only wrong in production. Both internal/client and internal/engine log from
-// a dozen such sites, so the scan lives here rather than twice.
+// "key" is an exact entry in the default sensitive-field list, and a test that
+// drives some log sites proves nothing about the rest, so the scan reads every
+// site. internal/client, internal/engine and internal/group each log from such
+// sites, so the scan lives here once.
 package logguard
 
 import (

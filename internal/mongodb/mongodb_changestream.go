@@ -78,8 +78,8 @@ type changeEvent struct {
 	// It is kept RAW on purpose. Decoding it into entryDoc here would make the
 	// whole event — identity included — fail on one badly typed foreign field:
 	// an operator who stored the value as a sub-document, or updated_at as a
-	// string, would silently unsubscribe the engine from that key. FC-9 and D3
-	// require the opposite, so classification reads the two fields it needs
+	// string, would silently unsubscribe the engine from that key. Foreign
+	// writers are supported, so classification reads the two fields it needs
 	// out of this, field by field, and tolerates everything else.
 	FullDocument bson.Raw `bson:"fullDocument"`
 }
@@ -1434,10 +1434,11 @@ func newPollState() pollState {
 //
 // It dispatches nothing (nil emit): the feed has announced nothing yet, and a
 // subscriber registered before Start — which is what the engine does — would
-// otherwise receive key events ahead of its first OpResync, breaking FC-2's
-// order. Nothing is lost by the silence: the OpResync pollForever broadcasts
-// immediately after has the engine reload the whole scope, and this round trip
-// still anchors the watermark so the next one is incremental.
+// otherwise receive key events ahead of its first OpResync, breaking the
+// store's event order. Nothing is lost by the silence: the OpResync
+// pollForever broadcasts immediately after has the engine reload the whole
+// scope, and this round trip still anchors the watermark so the next one is
+// incremental.
 func (s *Store) startPolling(ctx context.Context, f *feed) error {
 	st, err := s.pollOnce(ctx, f, newPollState(), nil)
 	if err != nil {
@@ -1535,8 +1536,7 @@ func (s *Store) pollForever(f *feed, st pollState) {
 // the recovery OpResync on the round's FIRST key event, so a subscriber is
 // never told about a key by a feed that has not yet told it the feed is back:
 // the engine answers OpResync by reloading the scope, and a key event applied
-// before that marker is applied into a scope the engine still believes stale
-// (FC-2).
+// before that marker is applied into a scope the engine still believes stale.
 func (s *Store) pollEmitter(f *feed) func(store.Event) {
 	announced := false
 
@@ -1589,7 +1589,7 @@ func (s *Store) pollBackoff(f *feed, attempt *int) bool {
 //     write and IS emitted — otherwise peer caches stay stale until a later,
 //     strictly newer write advances the watermark.
 //   - Emits store.OpDelete at Revision 0 for every TOMBSTONE it reads: the
-//     document Delete rewrote in place (FC-9). The incremental query is
+//     document Delete rewrote in place. The incremental query is
 //     deliberately NOT filtered on "deleted" — the poller has to see the
 //     tombstone in order to announce it.
 //   - Diffs the live key set against the previous round's to catch the one

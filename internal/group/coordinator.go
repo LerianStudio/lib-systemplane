@@ -4,14 +4,12 @@
 // number as it enters Publish, and that sequence — never the revision — drives
 // dedupe, coalescing and convergence. The coordinator can therefore keep what
 // it is handed in order, but it cannot repair a caller that hands it one key's
-// callbacks out of order, which the current Client's debounce dispatch can do
-// from its timer goroutines. The engine-backed Client closes that gap by
-// serializing per scope and key in revision order before it publishes.
+// callbacks out of order; the Client's OnChange never does, because it
+// delivers each (scope, key) serially from one worker.
 //
 // Nothing is pruned. A scope entry and every registered function's bookkeeping
 // for it live as long as the coordinator, so a tenant the Client has stopped
-// serving keeps its row in Status. Releasing a scope needs a DropScope hook
-// called from the Client's tenant teardown, which the engine-tenants lane owns.
+// serving keeps its row in Status.
 package group
 
 import (
@@ -98,9 +96,9 @@ type scope[T any] struct {
 	// observation, not two: a recorded seed arms the watermark, and the next
 	// publication for the scope disarms it, dropped only when it is proven to
 	// be that same document (revision no newer AND equal marshalled bytes).
-	// Bytes as well as revision because the wave-1 facade publishes every
-	// revision as 0, where a revision-only rule would swallow a genuinely
-	// different document.
+	// Bytes as well as revision because Revision 0 repeats and a foreign
+	// writer may change a value without bumping its revision, where a
+	// revision-only rule would swallow a genuinely different document.
 	seedArmed bool
 	seedRev   int64
 	seedBytes []byte
@@ -112,9 +110,9 @@ type scope[T any] struct {
 // last three.
 //
 // acceptedSeq, not appliedRev, is what says how far this applier has got.
-// Revisions cannot: a delete publishes Revision 0, and every publication the
-// wave-1 facade makes carries Revision 0, so an applier that has accepted
-// nothing and one that has accepted everything report the same number.
+// Revisions cannot: Revision 0 repeats (a delete, a key with no row), so an
+// applier that has accepted nothing and one that has accepted the registered
+// default report the same number.
 type applierScope[T any] struct {
 	deliveredSeq uint64
 	acceptedSeq  uint64
@@ -162,8 +160,8 @@ type delivery[T any] struct {
 // unbounded rather than deadlocked: an applier that publishes on EVERY delivery
 // keeps the fan-out looping forever.
 //
-// FC-7's "same non-zero revision with the same value bytes is never delivered
-// twice" is satisfied upstream: the Client's OnChange (FC-4) dedupes by
+// OnApply's "same non-zero revision with the same value bytes is never
+// delivered twice" is satisfied upstream: the Client's OnChange dedupes by
 // revision and bytes before the single subscription a group takes, so the
 // coordinator dedupes only by arrival sequence and owns only the seed
 // watermark.
@@ -475,21 +473,14 @@ func (c *Coordinator[T]) add(fn ApplyFunc[T]) (uint64, []*scope[T], seedOutcome)
 // rejected at decode. Applied is the revision the applier furthest behind has
 // accepted, so it means the document is in force everywhere; with no applier
 // registered nothing can lag and the scope reads as converged. LastErr holds
-// the last rejection and survives until every registered applier has accepted
-// the scope's newest observation. It clears when every applier still
-// registered has accepted the newest observation: an acceptance, or the
-// departure of the applier that was holding the scope back. Unregistering every
-// applier never clears it, including the last one unsubscribing from inside its
-// own delivery. So a scope nobody applies keeps
-// reporting its last rejection rather than reading healthy while it is being
-// torn down.
+// the last rejection until every applier still registered has accepted the
+// scope's newest observation, by an acceptance or by the departure of the
+// applier holding the scope back. Unregistering every applier never clears it,
+// so a scope nobody applies keeps reporting its last rejection rather than
+// reading healthy while it is torn down.
 //
-// Desired equal to Applied is therefore not convergence on its own: a delete
-// publishes Revision 0 and every publication the wave-1 facade makes carries
-// Revision 0, so an applier that refused everything reports the very revision
-// the scope desires. Read LastErr. A delivery in flight also leaves Applied
-// behind with no error at all, because Status is a point-in-time read rather
-// than a transaction.
+// Desired equal to Applied is not convergence on its own: LastErr reports a
+// rejection, as the root package's ApplyStatus explains.
 func (c *Coordinator[T]) Status() []Status {
 	if c == nil {
 		return nil
@@ -603,7 +594,7 @@ func (c *Coordinator[T]) seedLocked() seedOutcome {
 
 	if decodeErr != nil {
 		// Observed, exactly as commit marks a published document that failed to
-		// decode (A6): the rejection is what the coordinator heard from this
+		// decode: the rejection is what the coordinator heard from this
 		// scope, so anyObservedLocked is the single truth about whether anything
 		// has been heard at all and cannot disagree with the spent-seed flag.
 		// current stays as it was, so the replay this arms finds nothing to
@@ -773,7 +764,7 @@ func (c *Coordinator[T]) pendingLocked(sc *scope[T], observed observation[T]) []
 }
 
 // ErrApplyPanicked is the error an apply function's panic becomes. It carries
-// no part of the recovered value: this sentinel is what FC-7's Status reports
+// no part of the recovered value: this sentinel is what Status reports
 // in LastErr, and where the panic value and the stack go is the panic
 // handler's business, not this error's.
 var ErrApplyPanicked = errors.New("systemplane/group: apply function panicked")
@@ -781,7 +772,7 @@ var ErrApplyPanicked = errors.New("systemplane/group: apply function panicked")
 // invoke runs one applier and turns every failure mode into an error: a
 // returned error passes through, and a panic is recovered into one. The recover
 // is the coordinator's own because the RecoverAndLog family swallows the
-// recovered value and FC-7 needs a rejection in the scope's LastErr; the value
+// recovered value and Status needs a rejection in the scope's LastErr; the value
 // itself never goes into that error — LastErr is a field operators read and
 // log, and where a panic value goes is the panic handler's business. It is
 // handed to runtime.HandlePanicValue, which is built for a panic recovered
@@ -794,7 +785,7 @@ var ErrApplyPanicked = errors.New("systemplane/group: apply function panicked")
 // revision: Status is a surface somebody has to think to read, while a
 // configuration that stopped being applied is something an operator needs told.
 // The line carries the applier's error and nothing this package adds to it;
-// FC-7's Status keeps the same error untouched.
+// Status keeps the same error untouched.
 func (c *Coordinator[T]) invoke(
 	ctx context.Context,
 	fn ApplyFunc[T],
@@ -902,14 +893,14 @@ func (c *Coordinator[T]) recordLocked(sc *scope[T], pending []delivery[T]) {
 
 // clearErrIfConvergedLocked drops the scope's error once every applier still
 // registered has accepted its newest observation. What decides is the
-// observation, never the revisions matching: through the wave-1 facade every
-// publication carries Revision 0, so a revision test would erase each rejection
-// the instant it was recorded and leave a consumer with no error surface at all.
-// The caller holds the state mutex.
+// observation, never the revisions matching: a rejected Revision 0, or a
+// revision a foreign writer reused, matches an earlier acceptance, so a
+// revision test would erase that rejection the instant it was recorded. The
+// caller holds the state mutex.
 func (c *Coordinator[T]) clearErrIfConvergedLocked(sc *scope[T]) {
 	// With nobody registered the loop below is vacuously true, and clearing on
-	// it would erase a rejection nothing ever applied (A12: LastErr clears when
-	// an applier ACCEPTS). The error waits for the next acceptance instead.
+	// it would erase a rejection nothing ever applied. The error waits for the
+	// next acceptance instead.
 	// Both entry points reach this — an unsubscribe, and a delivery whose
 	// applier unsubscribed itself before rejecting — so the guard lives here.
 	if len(c.appliers) == 0 {

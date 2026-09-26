@@ -7,16 +7,18 @@ var (
 	// ErrClosed is returned when a method is called on a nil or closed Client.
 	ErrClosed = internalclient.ErrClosed
 
-	// ErrNotStarted is returned when a read/write is attempted before Start.
+	// ErrNotStarted is returned by Set and Delete before Start, and by a
+	// single-tenant write persisted while no scope was up to publish it.
 	ErrNotStarted = internalclient.ErrNotStarted
 
 	// ErrRegisterAfterStart is returned when Register is called after Start.
 	ErrRegisterAfterStart = internalclient.ErrRegisterAfterStart
 
-	// ErrUnknownKey is returned when Get or Set references an unregistered key.
+	// ErrUnknownKey is returned by Set, Delete and OnChange for an unregistered
+	// key; a read reports one as ok false.
 	ErrUnknownKey = internalclient.ErrUnknownKey
 
-	// ErrValidation is returned when a value fails its registered validator.
+	// ErrValidation is returned when a value or argument is refused.
 	ErrValidation = internalclient.ErrValidation
 
 	// ErrNilContext is returned when a method that requires a live context is
@@ -36,13 +38,13 @@ var (
 	// context Close canceled. The message names every scope and key still
 	// running, and that goroutine is the subscriber's leak, made visible
 	// rather than hidden. An empty set of keys means no callback was running
-	// and the engine was still inside the store — a reconcile's List or a
-	// debounced re-read that had not answered.
+	// and the engine was still inside a store call, such as a reconcile's List
+	// or a debounced re-read.
 	ErrCloseTimeout = internalclient.ErrCloseTimeout
 
-	// ErrTenantConnectionMissing is returned when a method runs in
-	// multi-tenant mode and the caller's context carries no tenant database
-	// for the configured module.
+	// ErrTenantConnectionMissing is returned in multi-tenant mode by a call that
+	// reaches the store while ctx carries no tenant database for the configured
+	// module; a read a tenant manager's cache serves needs none.
 	ErrTenantConnectionMissing = internalclient.ErrTenantConnectionMissing
 
 	// ErrTenantManagerBackendMismatch is returned by [NewPostgres] handed
