@@ -220,8 +220,8 @@ func (m mongoTenant) write(t *testing.T, key string, value any, revision int64) 
 // keyFilter selects tenantKey's document in a tenant's collection.
 var keyFilter = bson.D{{Key: "_id", Value: bson.D{{Key: "namespace", Value: tenantNS}, {Key: "key", Value: tenantKey}}}}
 
-// next is the revision a write behind the Client takes, as the store bumps it:
-// one above the stored document's, 1 with none.
+// next is the revision a write behind the Client takes: one above the stored
+// document's, 1 with none.
 func (m mongoTenant) next(t *testing.T) int64 {
 	t.Helper()
 
@@ -298,21 +298,16 @@ func killChangeStream(t *testing.T, logs *captureLogger, tn tenantRef) {
 	before := logs.count(log.LevelWarn, lost, tn.id)
 
 	eventually(t, "a change-stream kill on "+tn.dbName+" the store reports", func() bool {
-		ids := changeStreamIDs(t, tn.dbName, false)
-		if len(ids) != 1 {
-			return false
+		if logs.count(log.LevelWarn, lost, tn.id) > before {
+			return true
 		}
 
-		if err := replicaSet.admin.Database(tn.dbName).RunCommand(t.Context(), bson.D{
-			{Key: "killCursors", Value: entriesColl},
-			{Key: "cursors", Value: bson.A{ids[0]}},
-		}).Err(); err != nil {
-			t.Fatalf("killCursors %d on %s: %v", ids[0], tn.dbName, err)
-		}
-
-		for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
-			if logs.count(log.LevelWarn, lost, tn.id) > before {
-				return true
+		if ids := changeStreamIDs(t, tn.dbName, false); len(ids) == 1 {
+			if err := replicaSet.admin.Database(tn.dbName).RunCommand(t.Context(), bson.D{
+				{Key: "killCursors", Value: entriesColl},
+				{Key: "cursors", Value: bson.A{ids[0]}},
+			}).Err(); err != nil {
+				t.Fatalf("killCursors %d on %s: %v", ids[0], tn.dbName, err)
 			}
 		}
 

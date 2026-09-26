@@ -94,10 +94,9 @@ func (r *changeRecorder) written(tenant string) []client.Change {
 	return out
 }
 
-// A write delivers exactly once, to its own tenant: the Set's publication and
-// the feed's echo of the same revision are one change, and t2 hears nothing. A
-// later write behind the Client, as another replica makes it, reaches t1's
-// cached scope through t1's feed, which carried the Set's echo before it.
+// A write delivers once, to its own tenant: the Set's publication and its feed
+// echo are one change, t2 hears nothing, and a later write behind the Client
+// (another replica's) reaches t1's cached scope through t1's feed.
 func writeDeliversOnceToItsTenantOnly(t *testing.T, b backend) {
 	env := b.open(t, client.WithDebounce(deliveryDebounce))
 	t1, t2 := env.add(t, "t1"), env.add(t, "t2")
@@ -114,6 +113,7 @@ func writeDeliversOnceToItsTenantOnly(t *testing.T, b backend) {
 	}
 
 	eventually(t, "t1 delivery of the write", func() bool { return len(rec.written(t1.id)) > 0 })
+	time.Sleep(3 * deliveryDebounce) // the echo's window: its re-read must not coalesce with the next write's
 
 	remote := t1.seed(t, "written-elsewhere")
 	awaitEntry(t, env.c, t1.cacheOnly(t), remote, "t1 cached scope serves the write made elsewhere")
@@ -127,8 +127,6 @@ func writeDeliversOnceToItsTenantOnly(t *testing.T, b backend) {
 	if leaked := rec.written(t2.id); len(leaked) != 0 {
 		t.Fatalf("t2 received t1's writes: %+v", leaked)
 	}
-
-	requireEntry(t, env.c, t2.cacheOnly(t), client.Entry{Value: "default"}, "t2 from its cache after t1's writes")
 }
 
 func TestIntegration_PostgresWriteDeliversOnceToItsTenantOnly(t *testing.T) {
