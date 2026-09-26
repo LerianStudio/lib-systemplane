@@ -83,8 +83,9 @@ type Snapshot[T any] struct {
 // [WithContextValidator] passed in opts is ignored: both set the same single
 // validator, and Bind appends its own [WithValidator] after opts, so whichever
 // of the two a caller passes is replaced and cannot disable the type check on
-// their own group. Every other key option in opts is forwarded to
-// [Client.Register] unchanged.
+// their own group. A [WithWriteValidator] in opts makes Bind fail with
+// [ErrValidation], because the group grades every read. Every other key
+// option in opts is forwarded to [Client.Register] unchanged.
 //
 // Bind also takes the group's one subscription to (namespace, key). It is taken
 // here, before c.Start and therefore before any publication can exist, which is

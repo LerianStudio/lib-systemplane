@@ -33,7 +33,8 @@ func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOp
 //
 // A stored value a key's validator refuses never comes into force: the
 // registered default stays in force and a WARN naming the key and the
-// validator's error is logged. The refused value itself is never logged.
+// validator's error is logged. The refused value itself is never logged. A
+// [WithWriteValidator] grades writes only, so it refuses no stored value.
 //
 // Every subscriber registered before Start is handed the value in force once,
 // including the keys the store had no row for and the keys whose row was
@@ -67,7 +68,8 @@ func (c *Client) Close() error {
 // In single-tenant mode reads are served in process from the cache the
 // changefeed keeps current, without touching the database. In multi-tenant mode
 // the call resolves the per-tenant database from ctx (set by tenant-manager
-// middleware) and reads through, graded by the validator; with
+// middleware) and reads through, graded by the validator unless it was
+// registered [WithWriteValidator]; with
 // [WithPostgresTenantManager] or [WithMongoTenantManager] that read activates
 // the tenant's scope and later reads are served in process like single-tenant
 // ones.
