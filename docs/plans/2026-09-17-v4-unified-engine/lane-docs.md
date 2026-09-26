@@ -95,7 +95,7 @@ Three narrowings are deliberate and must not be widened. **`NewManager` and `sys
 
 | Phase | Milestone | Epics | Status |
 |-------|-----------|-------|--------|
-| 1 | Every document whose content the merged code determines is written and true against `develop` `0ecdf9e`: `MIGRATION-v4.md` (surface diff, behaviour changes, database/operator contract, one section per consumer), `CLAUDE.md` finished, `docs/PROJECT_RULES.md` corrected, `doc.go` rewritten. Behaviour still owned by engine-tenants, engine-core Phase 3 or the panic-posture branch is a `NOT-YET(<lane>)` placeholder, never a claim. No example, no README rewrite, no deletion. | 1.1, 1.2 | Detailed |
+| 1 | Every document whose content the merged code determines is written and true against `develop` `0ecdf9e`: `MIGRATION-v4.md` (surface diff, behaviour changes, database/operator contract, one section per consumer), `CLAUDE.md` finished, `docs/PROJECT_RULES.md` corrected, `doc.go` rewritten. Behaviour still owned by engine-tenants, engine-core Phase 3 or the panic-posture branch is a `NOT-YET(<lane>)` placeholder, never a claim. No example, no README rewrite, no deletion. | 1.1, 1.2 | Complete |
 | 2 | The three examples exist and compile in CI; the README is rebuilt around them; `.env.reference` is gone; the godoc truth sweep is run and its findings are either fixed here or handed to the owning lane | 2.1, 2.2, 2.3 | Detailed |
 
 **Why the split falls here.** Phase 1 writes only what FC-1 through FC-11 and decisions D1–D11 already determine: which symbols exist, which are gone, what a delete publishes, what `Start` announces, what the DDL does. Re-elaborated 2026-09-24 against `develop` `0ecdf9e`, after engine-core Phase 2, storage and groups Phase 2 merged: every claim now cites the tree, and what is still frozen-but-unbuilt is marked (§ Phase 1, The NOT-YET convention). Phase 2 needs the real thing: an example cannot be compiled against a `WithCloseTimeout` that has not landed, the README cannot stop showing `DefaultSeedSQL()` until `storage` Epic 3.2 removes it, and a godoc sweep over a surface still carrying `Manager` reports the pre-v4 world.
@@ -145,7 +145,7 @@ grep -nE 'internal/safelog|safelog\.Guard|RecoverAndLog|changes an import line a
 **Scope:** `MIGRATION-v4.md` (new), one pointer line in `MIGRATION-v3.md`.
 **Dependencies:** none for Tasks 1.1.1-1.1.4; Task 1.1.5 is finished after engine-tenants merges.
 **Done when:** `MIGRATION-v4.md` exists with six `##` sections (Task 1.1.1's seven minus § Why the module path moved, deleted in review); every FC-10 removed symbol appears with its replacement or its placeholder; every entry of `index.md` § "Behaviour changes MIGRATION-v4.md must name" is covered by Task 1.1.2a, 1.1.2b, 1.1.3 or (as a placeholder) 1.1.5; nine matrix rows each have a `###` section and plugin-br-pix-lerian is one line in the § Per consumer intro; both § Phase 1 checks and § The link check pass.
-**Status:** Pending
+**Status:** Done
 
 #### Task 1.1.1: Create `MIGRATION-v4.md` — framing, surface diff, module hop
 
@@ -362,7 +362,7 @@ grep -c 'NOT-YET(' MIGRATION-v4.md    # expected: 12
 
 #### Task 1.1.5: Write the per-consumer sections for the three Manager users
 
-- [ ] Done
+- [x] Done
 
 **Context:** notifications (v1.6.1: Fiber v2, lib-commons v5, lib-observability v1; `NewManager`, `WithManagerLogger`, `OnTenantActivated`, `Drain`), plugin-br-pix-jd (v3.0.0: already `lib-commons/v7`, so its module hop is `/v3` → `/v4` only; `HandleTenantLifecycle`, `Drain`, `WithListenChannel`, a `DefaultSeedSQL()` generator), br-sfn (v3.0.0-beta.2: already `lib-commons/v7`; 17 `OnChange` calls before `Start`). All three are multi-tenant and all three depend on engine-tenants for the replacement of the Manager: no tenant-manager option, no `Client.HandleTenantLifecycle`, no multi-tenant `OnChange` exists on `develop` (`go doc -short .`; `api_client.go:179-183`). What is true today: the Manager is gone (`v3.0.0:manager.go:36-72` has no v4 counterpart), `DefaultSeedSQL` is gone, `Drain(ctx)` took a ctx (`v3.0.0:manager_methods.go:71`) while `Close()` takes none and is bounded by `WithCloseTimeout` (`api_constructors.go:76`), the callback ctx carries no tenant (`api_client.go:175-177`). `Client.HandleTenantLifecycle` will return errors where v3 logged and swallowed them (index § Behaviour changes, engine-tenants D-T5).
 
@@ -499,7 +499,7 @@ Everything here needs landed code. Elaborate it against the tree, not against th
 **Scope:** `examples/single-tenant/main.go`, `examples/multi-tenant/main.go`, `examples/groups/main.go`.
 **Dependencies:** `engine-core` Task 2.1.4 (`WithCloseTimeout`, `ErrCloseTimeout`) and Epic 3.1 (the removed name options) for the single-tenant example; `groups` Phase 2 Epic 2.2 (`OnApply`, `Status`) for the groups example; `engine-tenants` (`WithPostgresTenantManager`, `Client.HandleTenantLifecycle`) for the multi-tenant example — see § DEVIATIONS items 1 and 3.
 **Done when:** `go build ./examples/...`, `go vet ./examples/...` and `gofmt -l examples` are all clean; each program registers a key, starts, observes a change through `OnChange` or `OnApply`, and closes; none of the three references a symbol in FC-10's removed list; `examples/manager/` does not exist.
-**Status:** Doing
+**Status:** Done
 
 **Progress 2026-09-25 (branch `docs/v4-examples`).** Two of the three examples exist. `examples/single-tenant` is Postgres: its usage block applies `ddl/schema.sql` once with `psql` (a service does that in its migrations, never at boot), then the program registers `payments/fee_bps` with a validator, subscribes with `OnChange`, raises the value by one and waits for the revision that write produced. `examples/groups` is MongoDB on a replica set: it binds a `Limits` struct, applies each revision through `OnApply` and waits until `Status` reports the new revision in force. The single-tenant one ends in a `Close` that names `ErrCloseTimeout`. Each ran twice against a real database (first run and rerun); CI builds and lints them, and nothing runs them. `examples/multi-tenant` waits for `engine-tenants` Phase 2, because the example exists to show `HandleTenantLifecycle`, which that phase lands.
 
@@ -511,7 +511,7 @@ Shape decided now so elaboration does not relitigate it. Each example is a **sin
 **Scope:** `README.md`, `.env.reference` (deleted).
 **Dependencies:** Epic 2.1; `storage` Epic 3.2 (`DefaultSeedSQL` removed) and Epic 1.1 (`MigrationV3ToV4SQL`); `engine-core` Epic 3.1.
 **Done when:** no README code block is a complete program — every one is a call shape of at most five lines, or a link to `examples/<name>`; § Schema provisioning names `SchemaSQL()` and `MigrationV3ToV4SQL()` and no longer names `DefaultSeedSQL()`; the operating-modes table has three rows (single-tenant, multi-tenant per request, multi-tenant with a connector); the admin section shows the `{value, revision, updatedAt, updatedBy, stale}` response shape; `.env.reference` is deleted and its one still-true statement — that this library reads zero environment variables, and the names it once listed were conventions for the *consumer's* bootstrap — survives as a short README paragraph; the scoped absence grep over `README.md` returns nothing.
-**Status:** Pending
+**Status:** Done
 
 `.env.reference` is deleted rather than corrected because more than half of it documents things that do not exist: `WithTable`, `WithListenChannel` and `WithCollection` are removed by D8, and `WithLazyTenantLoad`, `WithTenantAuthorizer`, `WithTenantSchemaEnabled`, `RegisterTenantScoped`, `SetForTenant`, the "six admin routes" and `MIGRATION_TENANT_SCOPED.md` never shipped in any major this repository supports — the file even links to a document that does not exist in the tree. What remains true after removing all of that is one paragraph, and one paragraph does not need a file.
 
@@ -526,7 +526,7 @@ engine-tenants Phase 2 pull request merges.
 
 #### Task 2.1.3: `examples/multi-tenant`
 
-- [ ] Done
+- [x] Done
 
 **Context:** `examples/single-tenant/main.go` (134 lines, Postgres) and `examples/groups/main.go`
 (129 lines, MongoDB) fix the shape: one `main.go`, a usage block in the package comment, the handle
@@ -559,7 +559,7 @@ handler chain and a checked `Close`.
 
 #### Task 2.2.1: Rebuild the README around the three examples; delete `.env.reference`
 
-- [ ] Done
+- [x] Done
 
 **Depends on:** Task 2.1.3 (the README links `examples/multi-tenant`).
 
@@ -599,7 +599,7 @@ the names it once listed were conventions for the consumer's bootstrap); Scope; 
 
 #### Task 1.1.5 (finish) and every remaining `NOT-YET(engine-tenants)` marker
 
-- [ ] Done
+- [x] Done
 
 **Context:** Task 1.1.5 above left the three Manager-user sections with "before" fragments and
 placeholders, and § Per consumer still says they are blocked: the `**Breaks:**` lines of
