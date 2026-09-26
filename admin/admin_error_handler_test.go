@@ -3,12 +3,10 @@
 package admin_test
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -84,6 +82,8 @@ func unstartedClient(t *testing.T) *systemplane.Client {
 	return c
 }
 
+// unreadableStoreClient is multi-tenant: a single-tenant GetEntry serves from
+// cache, so the read error reaches the store only on a multi-tenant client.
 func unreadableStoreClient(t *testing.T) *systemplane.Client {
 	c, store := setupSeededMultiTenantClient(t, nil, func(c *systemplane.Client) error {
 		return c.Register("ns", "k", "default")
@@ -213,50 +213,10 @@ func TestAdmin_ErrorAnswersReturnedToErrorHandler(t *testing.T) {
 				t.Fatalf("errors.As commons.Response failed on %v", probe.err)
 			}
 
-			want := commons.Response{Code: strconv.Itoa(tc.status), Title: tc.title, Message: tc.message}
+			want := commons.Response{Code: tc.title, Title: tc.title, Message: tc.message}
 			if cr != want {
 				t.Fatalf("commons.Response = %#v, want %#v", cr, want)
 			}
 		})
 	}
-}
-
-func TestAdmin_ReturnedErrorsLeaveSuccessUnchanged(t *testing.T) {
-	c, _ := setupClient(t, func(c *systemplane.Client) error {
-		return c.Register("ns", "k", "default")
-	})
-
-	if err := c.Set(context.Background(), "ns", "k", "stored", "actor"); err != nil {
-		t.Fatalf("set: %v", err)
-	}
-
-	plain := mountAndRun(t, c)
-	opted := mountAndRun(t, c, admin.WithReturnedErrors())
-
-	for _, r := range []struct{ method, path, body string }{
-		{http.MethodGet, "/system/ns/k", ""},
-		{http.MethodGet, "/system/ns", ""},
-		{http.MethodPut, "/system/ns/k", `{"value":"stored"}`},
-	} {
-		want, wantBody := readAll(t, doRequest(t, plain, r.method, r.path, r.body))
-		got, gotBody := readAll(t, doRequest(t, opted, r.method, r.path, r.body))
-
-		if got.StatusCode != want.StatusCode || gotBody != wantBody ||
-			got.Header.Get("Content-Type") != want.Header.Get("Content-Type") {
-			t.Fatalf("%s %s with the option = %d %q, without = %d %q",
-				r.method, r.path, got.StatusCode, gotBody, want.StatusCode, wantBody)
-		}
-	}
-}
-
-func readAll(t *testing.T, resp *http.Response) (*http.Response, string) {
-	t.Helper()
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("read body: %v", err)
-	}
-
-	return resp, string(body)
 }

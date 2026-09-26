@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"strconv"
 	"time"
 
 	"github.com/LerianStudio/lib-commons/v7/commons"
@@ -86,7 +85,7 @@ func (cfg mountConfig) respondError(c fiber.Ctx, status int, title, message stri
 
 	return refusalError{
 		fiberErr: fiber.NewError(status, message),
-		response: commons.Response{Code: strconv.Itoa(status), Title: title, Message: message},
+		response: commons.Response{Code: title, Title: title, Message: message},
 	}
 }
 
