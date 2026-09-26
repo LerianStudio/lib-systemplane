@@ -46,7 +46,7 @@
 |-------|-----------|-------|--------|
 | 1 | A multi-tenant Client with a tenant manager configured activates a tenant's scope on that tenant's first read, serves every later read of it from the cached scope with real revision and provenance, fires one `OnChange` per tenant with `Change.Tenant` set, and reads back its own multi-tenant writes — on Postgres and on MongoDB, proven against fakes | 1.0, 1.1, 1.2, 1.3 | Complete |
 | 2 | Tenant-manager lifecycle events drive the same engine: `Client.HandleTenantLifecycle` activates, drops, blocks and rotates, a suspended or deleted tenant never re-activates from a read, and per-tenant metrics carry `tenant_id` up to `WithAggregateTenantThreshold` and `aggregate` above it | 2.1, 2.2 | Complete |
-| 3 | The whole path is proven on live backends: testcontainers Postgres and a Mongo replica set, two tenant databases each, activation gap, feed loss per tenant, tenant isolation, `-race` and goleak clean | 3.1, 3.2, 3.3 | Detailed |
+| 3 | The whole path is proven on live backends: testcontainers Postgres and a Mongo replica set, two tenant databases each, activation gap, feed loss per tenant, tenant isolation, `-race` and goleak clean | 3.1, 3.2, 3.3 | Complete |
 
 ---
 
@@ -866,4 +866,6 @@ Every item above is answered in `index.md`; implementation may start on the affe
 - D-P3-2: the feed inventory is the backend's own (`pg_stat_activity`, `$currentOp`), not a production hook. `FeedsSnapshot` stays test-only in `internal/postgres` and `internal/mongodb`, which this lane does not touch.
 - D-P3-3: on MongoDB the cursor-loss test asserts convergence and `t2` isolation, not `Stale` on `t1`. The store reopens a killed cursor after a jittered backoff, so holding the gap open needs a TCP proxy between the store and the server; the one that exists is test-only inside `internal/mongodb`. The engine's stale path is backend-agnostic and Task 3.1.2 proves it live on Postgres; the Mongo backend's `OpDisconnect` is proven by the `internal/mongodb` outage tests.
 - D-P3-4: Epic 3.1's Scope named one `tenant_integration_test.go` and Epic 3.2's one `tenant_mongo_integration_test.go`. The files are a shared harness plus one scenario file per backend, and `main_test.go` changes (P3-3).
-- Left for the `docs` lane (Epic 2.3 godoc and CLAUDE.md sweep): CLAUDE.md says `Stale` "is always false in multi-tenant mode", which is false for a tenant-managed Client's cached scope since Phase 1.
+- D-P3-5: `Client.Set` stamps `UpdatedAt` at millisecond precision (fix(client) on this branch). The live racing-write test showed a published timestamp the database did not hold: the publish fence refreshes `UpdatedAt` on an equal revision, so the last of Set and the reconcile won.
+- D-P3-6: a stopped MongoDB feed leaves its server-side change-stream cursor open until the server cursor timeout (10 min by default): `internal/mongodb` cancels the ctx of the blocked `Next`, and mongo-driver v2.9 then closes the cursor with that cancelled ctx, so `killCursors` never goes out. `internal/mongodb` is outside this lane; the fix is a separate `fix(mongodb)` PR. Until it lands, the Mongo suspension census counts only in-flight getMores.
+- Resolved by the `docs` lane (PR #106): CLAUDE.md states `Stale` per key, false only on reads that go through to the tenant database.
