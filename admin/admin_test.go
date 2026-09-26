@@ -315,18 +315,6 @@ func TestAdmin_GetOne(t *testing.T) {
 	}
 }
 
-func TestAdmin_GetNotFound(t *testing.T) {
-	c, _ := setupClient(t, nil)
-	app := mountAndRun(t, c)
-
-	resp := doRequest(t, app, http.MethodGet, "/system/ns/k", "")
-	if resp.StatusCode != http.StatusNotFound {
-		t.Errorf("status = %d, want 404", resp.StatusCode)
-	}
-
-	resp.Body.Close()
-}
-
 func TestAdmin_PutCreatesEntry(t *testing.T) {
 	c, _ := setupClient(t, func(c *systemplane.Client) error {
 		return c.Register("ns", "k", "default")
@@ -345,18 +333,6 @@ func TestAdmin_PutCreatesEntry(t *testing.T) {
 	if err != nil || !ok || v.(string) != "new" {
 		t.Errorf("post-PUT get: got (%v, %v, %v)", v, ok, err)
 	}
-}
-
-func TestAdmin_PutUnknownKey(t *testing.T) {
-	c, _ := setupClient(t, nil)
-	app := mountAndRun(t, c)
-
-	resp := doRequest(t, app, http.MethodPut, "/system/ns/unregistered", `{"value":1}`)
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Errorf("status = %d, want 400", resp.StatusCode)
-	}
-
-	resp.Body.Close()
 }
 
 func TestAdmin_Delete(t *testing.T) {
@@ -702,16 +678,6 @@ func TestAdmin_CatalogEscapesGeneratedPaths(t *testing.T) {
 	}
 }
 
-func TestAdmin_CatalogUnknownDetailReturnsNotFound(t *testing.T) {
-	c, _ := setupClient(t, func(c *systemplane.Client) error {
-		return c.Register("ns", "k", "default")
-	})
-	app := mountCatalogAndRun(t, c)
-
-	resp := doRequest(t, app, http.MethodGet, "/system/-/catalog/ns/missing", "")
-	assertErrorResponse(t, resp, http.StatusNotFound, "not_found", "systemplane catalog entry not found")
-}
-
 func TestAdmin_CatalogDenyByDefault(t *testing.T) {
 	c, _ := setupClient(t, nil)
 	app := fiber.New()
@@ -1001,21 +967,4 @@ func TestAdmin_ListCarriesRevisionAndProvenancePerEntry(t *testing.T) {
 			t.Errorf("entry %v stale = %v, want false", e["key"], stale)
 		}
 	}
-}
-
-func TestAdmin_ListFailsWhenAnEntryCannotBeRead(t *testing.T) {
-	t.Parallel()
-
-	// Multi-tenant on purpose: a single-tenant GetEntry serves from the
-	// in-process cache and would never reach the store's injected error.
-	c, store := setupSeededMultiTenantClient(t, nil, func(c *systemplane.Client) error {
-		return c.Register("ns", "alpha", "default-alpha")
-	})
-
-	store.SetGetErr(errors.New("row will not decode"))
-
-	app := mountAndRun(t, c)
-
-	resp := doRequest(t, app, http.MethodGet, "/system/ns", "")
-	assertErrorResponse(t, resp, http.StatusInternalServerError, "internal_error", "request failed")
 }

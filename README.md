@@ -156,6 +156,14 @@ GET    /system/-/catalog                  every registered key's metadata
 GET    /system/-/catalog/:namespace/*     one key's metadata
 ```
 
+Error answers are written as `{"code", "title", "message"}` JSON. With
+`admin.WithReturnedErrors()` the mount writes nothing and returns the error to
+the app's `ErrorHandler`, which reaches the same status, title and message
+through `errors.As` to `*fiber.Error` and `commons.Response`, so a service
+renders every error in one shape. Only a handler that reads `commons.Response`
+keeps that title: lib-commons' stock `FiberErrorHandler` matches `*fiber.Error`
+first and replaces it with `request_failed`.
+
 A key containing `/` resolves through each key route's `/*` twin, and a path
 beginning with `-/catalog` is reserved for the catalog. A single-key GET
 answers:

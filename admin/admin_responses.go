@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/LerianStudio/lib-commons/v7/commons"
 	commonshttp "github.com/LerianStudio/lib-commons/v7/commons/net/http"
 	systemplane "github.com/LerianStudio/lib-systemplane/v4"
 	"github.com/gofiber/fiber/v3"
@@ -64,24 +65,48 @@ type putRequest struct {
 	Value json.RawMessage `json:"value"`
 }
 
-func mapSentinelErr(c fiber.Ctx, err error) error {
+// refusalError is an error answer handed to the app's ErrorHandler unwritten.
+// It unwraps to the *fiber.Error and commons.Response the body would have held.
+type refusalError struct {
+	fiberErr *fiber.Error
+	response commons.Response
+}
+
+func (e refusalError) Error() string { return e.fiberErr.Message }
+
+func (e refusalError) Unwrap() []error { return []error{e.fiberErr, e.response} }
+
+// respondError is the one writer of an admin error answer: the JSON body, or,
+// under WithReturnedErrors, nothing written and the same answer returned.
+func (cfg mountConfig) respondError(c fiber.Ctx, status int, title, message string) error {
+	if !cfg.returnErrors {
+		return commonshttp.RespondError(c, status, title, message)
+	}
+
+	return refusalError{
+		fiberErr: fiber.NewError(status, message),
+		response: commons.Response{Code: title, Title: title, Message: message},
+	}
+}
+
+func (cfg mountConfig) mapSentinelErr(c fiber.Ctx, err error) error {
 	switch {
 	case errors.Is(err, systemplane.ErrUnknownKey):
-		return commonshttp.RespondError(c, http.StatusBadRequest, "unknown_key", "key is not registered")
+		return cfg.respondError(c, http.StatusBadRequest, "unknown_key", "key is not registered")
 	case errors.Is(err, systemplane.ErrValidation):
-		return commonshttp.RespondError(c, http.StatusBadRequest, "validation_error", "value rejected by validator")
+		return cfg.respondError(c, http.StatusBadRequest, "validation_error", "value rejected by validator")
 	case errors.Is(err, systemplane.ErrTenantConnectionMissing):
-		return commonshttp.RespondError(c, http.StatusBadRequest, "tenant_connection_missing",
+		return cfg.respondError(c, http.StatusBadRequest, "tenant_connection_missing",
 			"tenant database missing from request context")
 	case errors.Is(err, systemplane.ErrNilContext):
-		return commonshttp.RespondError(c, http.StatusBadRequest, "nil_context", "request context is nil")
+		return cfg.respondError(c, http.StatusBadRequest, "nil_context", "request context is nil")
 	case errors.Is(err, systemplane.ErrNotStarted), errors.Is(err, systemplane.ErrClosed):
-		return commonshttp.RespondError(c, http.StatusServiceUnavailable, "service_unavailable",
+		return cfg.respondError(c, http.StatusServiceUnavailable, "service_unavailable",
 			"configuration service is not available")
 	case errors.Is(err, systemplane.ErrNotSupportedInMultiTenant):
-		return commonshttp.RespondError(c, http.StatusBadRequest, "not_supported",
+		return cfg.respondError(c, http.StatusBadRequest, "not_supported",
 			"operation is not supported in multi-tenant mode")
 	default:
-		return commonshttp.RespondError(c, fiber.StatusInternalServerError, "internal_error", "request failed")
+		return cfg.respondError(c, fiber.StatusInternalServerError, "internal_error", "request failed")
 	}
 }
