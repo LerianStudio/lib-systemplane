@@ -5,6 +5,7 @@
 // have one canonical definition. Struct tags (`bson:"namespace"`)
 // intentionally still carry the literal because Go struct tags must be
 // compile-time string literals and cannot reference these constants.
+
 package mongodb
 
 const (

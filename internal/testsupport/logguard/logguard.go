@@ -6,8 +6,8 @@
 // sensitive-field list: one log.String("key", …) slipping back in publishes
 // namespace=billing key=[REDACTED] to an operator hunting a rejected row — a
 // line that survives review because it reads correctly in the source and is
-// only wrong in production. Both internal/client and internal/engine log from
-// a dozen such sites, so the scan lives here rather than twice.
+// only wrong in production. internal/client, internal/engine and internal/group
+// each log from such sites, so the scan lives here once.
 package logguard
 
 import (

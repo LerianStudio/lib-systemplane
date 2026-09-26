@@ -13,11 +13,11 @@ import (
 
 // Connector resolves a tenant's Postgres handle and LISTEN DSN.
 type Connector interface {
-	// ResolveDB returns the tenant's database handle. It is a ROUND TRIP, not
-	// a map lookup: the tenant manager pings the tenant database on every
-	// call, cache hit included. Callers therefore reconcile a scope with ONE
-	// List per scope and never a Get per key — a hundred keys resolved one at
-	// a time is a hundred round trips before the first value is read.
+	// ResolveDB returns the tenant's database handle. It is not a free map
+	// lookup: a miss connects, and a hit health-checks the cached connection
+	// at most once per the tenant manager's health-check interval. Callers
+	// therefore reconcile a scope with ONE List per scope and never a Get per
+	// key.
 	ResolveDB(ctx context.Context, tenantID string) (dbresolver.DB, error)
 
 	// ResolveDSN returns the connection string for the tenant's LISTEN
@@ -79,8 +79,8 @@ var ErrPgMgrUnavailable = errors.New("systemplane/postgres: tenant-manager postg
 //
 // The refusal is PERMANENT for as long as the two scopes resolve to one
 // database: the engine discards a failed activation and retries from scratch
-// on the next read, so such a scope pays a tenant-manager round trip on every
-// read until its configuration is fixed.
+// on the next read, so such a scope dials and drops a LISTEN connection on
+// every read until its configuration is fixed.
 var ErrSharedDatabaseUnsupported = errors.New("systemplane/postgres: two scopes resolve to the same database; systemplane needs one database per scope because NOTIFY is database-wide")
 
 // serverDatabaseKey identifies the physical database an OPEN connection
@@ -184,18 +184,12 @@ func formatServerDatabaseKey(database, addr string, port int32, startedAt, dsn s
 }
 
 // NewTenantManagerConnector wraps a lib-commons tenant-manager Postgres Manager.
-//
-// It has no production caller between wave 2 and wave 3: internal/manager was
-// the only one, and the engine-core lane deleted it. The caller that returns
-// it again is the tenant-manager option in the engine-tenants lane
-// (lane-engine-tenants.md Task 1.2.1), so this adapter stays rather than being
-// cleaned up and written a second time.
 func NewTenantManagerConnector(mgr *tmpostgres.Manager) Connector {
 	return &pgMgrConnector{mgr: mgr}
 }
 
 // pgMgrConnector is the production adapter wrapping a *tmpostgres.Manager.
-// ResolveDB serves warm-load and NOTIFY refresh reads: the schema is
+// ResolveDB serves reconcile and changefeed re-reads: the schema is
 // provisioned externally, so no DDL is ever issued through that handle.
 // ResolveDSN yields the connection string pgx.Connect uses to open the
 // tenant's dedicated LISTEN connection. Tests may substitute a fake Connector

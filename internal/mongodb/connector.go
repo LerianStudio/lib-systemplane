@@ -11,12 +11,11 @@ import (
 
 // Connector resolves a tenant's MongoDB database.
 type Connector interface {
-	// ResolveDatabase returns the tenant's database handle. It is a ROUND
-	// TRIP, not a map lookup: the tenant manager reaches the tenant database
-	// on every call, cache hit included. Callers therefore reconcile a scope
-	// with ONE List per scope and never a Get per key — a hundred keys
-	// resolved one at a time is a hundred round trips before the first value
-	// is read.
+	// ResolveDatabase returns the tenant's database handle. It is not a free
+	// map lookup: a miss connects, and a hit health-checks the cached client
+	// at most once per the tenant manager's health-check interval. Callers
+	// therefore reconcile a scope with ONE List per scope and never a Get per
+	// key.
 	//
 	// The database, not the collection: the collection name is the store's
 	// own constant (collectionName) and a connector must never need
@@ -25,7 +24,7 @@ type Connector interface {
 	// The database MUST be one no other scope of the same Store resolves to.
 	// The Postgres half refuses a feed whose DSN reaches a database another
 	// LIVE feed of that Store already listens on — identity taken from the
-	// open connection (inet_server_addr / port plus current_database, see
+	// open connection (server start time, address, port and database; see
 	// serverDatabaseKey in internal/postgres/connector.go), so a DSN that
 	// merely pins a search_path is admitted; it is the shared DATABASE that is
 	// refused, with that package's ErrSharedDatabaseUnsupported. MongoDB
@@ -68,8 +67,8 @@ type Connector interface {
 //
 // The refusal stands for as long as the two scopes resolve to one collection:
 // the engine discards a failed activation and retries from scratch on the next
-// read, so such a scope pays a tenant-manager round trip on every read until
-// its configuration is fixed.
+// read, so such a scope pays a hello round trip to the server on every read
+// until its configuration is fixed.
 var ErrSharedDatabaseUnsupported = errors.New("systemplane/mongodb: two scopes resolve to the same database and collection; a change stream on a shared collection would deliver every scope's writes to both")
 
 // ErrMongoMgrUnavailable is returned when a connector resolves a tenant

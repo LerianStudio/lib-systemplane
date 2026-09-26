@@ -22,8 +22,8 @@
 // functions, and the three triggers that bind them (one BEFORE INSERT OR
 // UPDATE bump, two NOTIFY) MUST be provisioned externally (e.g. via the
 // consumer's migration pipeline) using the DDL published by the root
-// package's SchemaSQL(). The store only reads, writes values, and — in
-// single-tenant mode — runs LISTEN/NOTIFY. The runtime database role only
+// package's SchemaSQL(). The store only reads and writes values and LISTENs
+// on the changefeeds it opens. The runtime database role only
 // needs DML + LISTEN privileges, never CREATE on the schema: no statement
 // this package issues names the revision sequence, and the trigger that
 // advances it is SECURITY DEFINER, so the runtime role needs no grant on it
@@ -93,7 +93,7 @@ type Config struct {
 	ListenDSN string
 
 	// MultiTenantEnabled selects the tmcore-driven dispatch path. When true,
-	// DB and ListenDSN may be empty; every method resolves the tenant
+	// DB and ListenDSN may be empty; the zero scope resolves the tenant
 	// database from ctx via tmcore.GetPGContext(ctx, Module).
 	MultiTenantEnabled bool
 

@@ -75,7 +75,7 @@ type Config struct {
 	PollInterval time.Duration
 
 	// MultiTenantEnabled selects the tmcore-driven dispatch path. When true,
-	// Client/Database may be empty; every method resolves the per-tenant
+	// Client/Database may be empty; the zero scope resolves the per-tenant
 	// database from ctx via tmcore.GetMBContext(ctx, Module).
 	MultiTenantEnabled bool
 

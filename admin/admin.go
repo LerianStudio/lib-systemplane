@@ -148,10 +148,10 @@ func Mount(router fiber.Router, c *systemplane.Client, opts ...MountOption) {
 // MountCatalog registers read-only catalog metadata routes on router using the
 // given Client. Nil client or router make MountCatalog a no-op (does not panic).
 //
-// In multi-tenant services, run authentication before tenant-manager
-// middleware, mount catalog routes before tenant-manager middleware, and mount
-// value routes with [Mount] after tenant-manager middleware so value
-// reads/writes receive the resolved tenant database.
+// Register it before [Mount] in every mode, or Mount's routes shadow the
+// catalog's. In multi-tenant services the order is authentication,
+// MountCatalog, tenant-manager middleware, then Mount, so value reads and
+// writes receive the resolved tenant database.
 func MountCatalog(router fiber.Router, c *systemplane.Client, opts ...MountOption) {
 	if c == nil || router == nil {
 		return

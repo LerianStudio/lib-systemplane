@@ -7,9 +7,8 @@ import (
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
-// New creates a Postgres-backed Store. Validates the configuration but does
-// not touch the database — schema bootstrap happens lazily on first access
-// (multi-tenant) or eagerly at Start() (single-tenant).
+// New creates a Postgres-backed Store. It validates the configuration and does
+// not touch the database; the schema is provisioned externally.
 func New(cfg Config) (*Store, error) {
 	if err := normalizeConfig(&cfg); err != nil {
 		return nil, err

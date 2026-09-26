@@ -60,14 +60,12 @@ var (
 	// ErrClosed is returned when a method is called on a nil or closed Store.
 	ErrClosed = errors.New("systemplane/store: store is closed or nil")
 
-	// ErrNotSupportedInMultiTenant is returned by methods that have no
-	// sensible per-tenant implementation — currently Subscribe and the
-	// in-process cache primitives. Multi-tenant mode resolves a fresh
-	// tenant database on every call, so there is no shared process-wide
-	// changefeed to subscribe to.
+	// ErrNotSupportedInMultiTenant is returned by Subscribe for the zero scope
+	// of a multi-tenant Store: that scope resolves a fresh tenant database on
+	// every call, so there is no process-wide changefeed to subscribe to.
 	ErrNotSupportedInMultiTenant = errors.New("systemplane/store: operation not supported in multi-tenant mode")
 
-	// ErrTenantConnectionMissing is returned when a method runs in
+	// ErrTenantConnectionMissing is returned when a zero-scope call runs in
 	// multi-tenant mode and the caller's context carries no tenant database
 	// for the configured module. The caller must wire TenantMiddleware (or
 	// an equivalent that calls tmcore.ContextWithPG / ContextWithMB) before

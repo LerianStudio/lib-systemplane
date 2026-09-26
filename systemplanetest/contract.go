@@ -708,8 +708,8 @@ func runRevisionMonotonic(t *testing.T, s store.Store, opts RunOptions) {
 }
 
 // runSubscribeEmitsResyncFirst pins the ordering guarantee the engine relies on
-// to converge by reconciliation: the very first thing a new subscriber hears is
-// store.OpResync for its own scope, carrying no key and no revision.
+// to converge by reconciliation: the first thing a new subscriber of a healthy
+// feed hears is store.OpResync for its own scope, carrying no key or revision.
 func runSubscribeEmitsResyncFirst(t *testing.T, s store.Store, opts RunOptions) {
 	startStore(t, s)
 
@@ -748,9 +748,8 @@ func runSubscribeEmitsResyncFirst(t *testing.T, s store.Store, opts RunOptions) 
 	}
 }
 
-// runEventCarriesScopeAndRevision proves an upsert event is self-describing:
-// the engine can tell which scope it belongs to and which revision it carries
-// without re-reading the row.
+// runEventCarriesScopeAndRevision proves an upsert event names its scope, its
+// key and the revision Set reported.
 func runEventCarriesScopeAndRevision(t *testing.T, s store.Store, opts RunOptions) {
 	startStore(t, s)
 
@@ -794,9 +793,8 @@ func runEventCarriesScopeAndRevision(t *testing.T, s store.Store, opts RunOption
 	}
 }
 
-// runDeleteEventRevisionZero pins revision 0 as "no row": a delete event never
-// carries a revision, which is how the engine knows to publish the registered
-// default instead of a stored value.
+// runDeleteEventRevisionZero pins a delete event's shape: OpDelete for its own
+// scope and key, carrying Revision 0.
 func runDeleteEventRevisionZero(t *testing.T, s store.Store, opts RunOptions) {
 	startStore(t, s)
 
