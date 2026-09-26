@@ -127,6 +127,9 @@ later revision, serialized and coalesced per scope; an error from the applier
 rejects that revision, which `Status` reports in `LastErr` while `Applied` stays
 at the previous one. On a multi-tenant Client without a tenant manager `OnApply`
 returns `ErrNotSupportedInMultiTenant`, and `Snapshot` and `Set` keep working.
+On a tenant-managed Client nothing is delivered at registration: each tenant's
+document arrives when its scope comes up, then that tenant's revisions, with the
+tenant in `Applied.Tenant` (the ctx carries none), so key what `fn` applies by it.
 Runnable: [`examples/groups`](examples/groups/main.go) (MongoDB).
 
 ## Admin HTTP
