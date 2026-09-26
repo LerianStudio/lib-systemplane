@@ -81,13 +81,13 @@ PY
 Also written once. It is the index's forbidden-token list, narrowed so it cannot fire on a legitimate use, and scoped to the product documents this lane owns — never repo-wide, because a lane cannot prove a negative while its siblings are writing (lane-cut rule 4; the repo-wide sweep is the `integration` lane's). `MIGRATION-v4.md` is deliberately excluded: naming a removed symbol as removed is that document's job.
 
 ~~~bash
-ABSENT='lib-commons/v6|lib-systemplane/v3|NewManager|ManagerOption|WithManagerLogger|WithManagerTelemetry|WithManagerAggregateTenantThreshold|systemplane\.Manager|\.Drain\(|OnTenant(Activated|Suspended|Deleted|CredentialsRotated)|DefaultSeedSQL|WithTable\(|WithListenChannel\(|WithCollection\(|WithLazyTenantLoad|WithTenantAuthorizer|WithTenantSchemaEnabled|RegisterTenantScoped|GetForTenant|systemplane_notify_v3'
+ABSENT='lib-commons/v6|lib-systemplane/v3|(^|[^.[:alnum:]])NewManager|systemplane\.NewManager|ManagerOption|WithManagerLogger|WithManagerTelemetry|WithManagerAggregateTenantThreshold|systemplane\.Manager|\.Drain\(|OnTenant(Activated|Suspended|Deleted|CredentialsRotated)|DefaultSeedSQL|WithTable\(|WithListenChannel\(|WithCollection\(|WithLazyTenantLoad|WithTenantAuthorizer|WithTenantSchemaEnabled|RegisterTenantScoped|GetForTenant|systemplane_notify_v3'
 grep -rnE "$ABSENT" README.md CLAUDE.md doc.go docs/PROJECT_RULES.md examples/
 ~~~
 
 A task that touches one file runs `grep -nE "$ABSENT" <file>` with `ABSENT` set exactly as above; expected: no output.
 
-Three narrowings are deliberate and must not be widened. **`NewManager` and `systemplane\.Manager`, never a bare `Manager`** — `docs/PROJECT_RULES.md` uses `Manager` as a naming-convention example and v4's own `WithPostgresTenantManager(mgr *tmpostgres.Manager)` names a lib-commons `Manager` legitimately. **`WithTable\(` with the parenthesis** — the word "table" is ordinary prose. **`Slice N` is absent from this list**: it appears only in `internal/manager/**`, which `engine-core` deletes, so it can never appear in a document this lane owns; the index's repo-wide check covers it in the `integration` lane. Baseline on `develop` `0ecdf9e`: 24 lines (`README.md` 16, `docs/PROJECT_RULES.md` 8, `CLAUDE.md` 0, `doc.go` 0; `examples/` does not exist). Target after Phase 1: `README.md` 16 only. Target after Phase 2: zero.
+Three narrowings are deliberate and must not be widened. **`NewManager` and `systemplane\.Manager`, never a bare `Manager`** — and `NewManager` only unqualified or as `systemplane.NewManager`, because `examples/multi-tenant` builds lib-commons' `*tmpostgres.Manager` with `tmpostgres.NewManager`, its only constructor — `docs/PROJECT_RULES.md` uses `Manager` as a naming-convention example and v4's own `WithPostgresTenantManager(mgr *tmpostgres.Manager)` names a lib-commons `Manager` legitimately. **`WithTable\(` with the parenthesis** — the word "table" is ordinary prose. **`Slice N` is absent from this list**: it appears only in `internal/manager/**`, which `engine-core` deletes, so it can never appear in a document this lane owns; the index's repo-wide check covers it in the `integration` lane. Baseline on `develop` `0ecdf9e`: 24 lines (`README.md` 16, `docs/PROJECT_RULES.md` 8, `CLAUDE.md` 0, `doc.go` 0; `examples/` does not exist). Target after Phase 1: `README.md` 16 only. Target after Phase 2: zero.
 
 ---
 
@@ -95,8 +95,8 @@ Three narrowings are deliberate and must not be widened. **`NewManager` and `sys
 
 | Phase | Milestone | Epics | Status |
 |-------|-----------|-------|--------|
-| 1 | Every document whose content the merged code determines is written and true against `develop` `0ecdf9e`: `MIGRATION-v4.md` (surface diff, behaviour changes, database/operator contract, one section per consumer), `CLAUDE.md` finished, `docs/PROJECT_RULES.md` corrected, `doc.go` rewritten. Behaviour still owned by engine-tenants, engine-core Phase 3 or the panic-posture branch is a `NOT-YET(<lane>)` placeholder, never a claim. No example, no README rewrite, no deletion. | 1.1, 1.2 | Detailed |
-| 2 | The three examples exist and compile in CI; the README is rebuilt around them; `.env.reference` is gone; the godoc truth sweep is run and its findings are either fixed here or handed to the owning lane | 2.1, 2.2, 2.3 | Epic-level |
+| 1 | Every document whose content the merged code determines is written and true against `develop` `0ecdf9e`: `MIGRATION-v4.md` (surface diff, behaviour changes, database/operator contract, one section per consumer), `CLAUDE.md` finished, `docs/PROJECT_RULES.md` corrected, `doc.go` rewritten. Behaviour still owned by engine-tenants, engine-core Phase 3 or the panic-posture branch is a `NOT-YET(<lane>)` placeholder, never a claim. No example, no README rewrite, no deletion. | 1.1, 1.2 | Complete |
+| 2 | The three examples exist and compile in CI; the README is rebuilt around them; `.env.reference` is gone; the godoc truth sweep is run and its findings are either fixed here or handed to the owning lane | 2.1, 2.2, 2.3 | Detailed |
 
 **Why the split falls here.** Phase 1 writes only what FC-1 through FC-11 and decisions D1–D11 already determine: which symbols exist, which are gone, what a delete publishes, what `Start` announces, what the DDL does. Re-elaborated 2026-09-24 against `develop` `0ecdf9e`, after engine-core Phase 2, storage and groups Phase 2 merged: every claim now cites the tree, and what is still frozen-but-unbuilt is marked (§ Phase 1, The NOT-YET convention). Phase 2 needs the real thing: an example cannot be compiled against a `WithCloseTimeout` that has not landed, the README cannot stop showing `DefaultSeedSQL()` until `storage` Epic 3.2 removes it, and a godoc sweep over a surface still carrying `Manager` reports the pre-v4 world.
 
@@ -145,7 +145,7 @@ grep -nE 'internal/safelog|safelog\.Guard|RecoverAndLog|changes an import line a
 **Scope:** `MIGRATION-v4.md` (new), one pointer line in `MIGRATION-v3.md`.
 **Dependencies:** none for Tasks 1.1.1-1.1.4; Task 1.1.5 is finished after engine-tenants merges.
 **Done when:** `MIGRATION-v4.md` exists with six `##` sections (Task 1.1.1's seven minus § Why the module path moved, deleted in review); every FC-10 removed symbol appears with its replacement or its placeholder; every entry of `index.md` § "Behaviour changes MIGRATION-v4.md must name" is covered by Task 1.1.2a, 1.1.2b, 1.1.3 or (as a placeholder) 1.1.5; nine matrix rows each have a `###` section and plugin-br-pix-lerian is one line in the § Per consumer intro; both § Phase 1 checks and § The link check pass.
-**Status:** Pending
+**Status:** Done
 
 #### Task 1.1.1: Create `MIGRATION-v4.md` — framing, surface diff, module hop
 
@@ -362,7 +362,7 @@ grep -c 'NOT-YET(' MIGRATION-v4.md    # expected: 12
 
 #### Task 1.1.5: Write the per-consumer sections for the three Manager users
 
-- [ ] Done
+- [x] Done
 
 **Context:** notifications (v1.6.1: Fiber v2, lib-commons v5, lib-observability v1; `NewManager`, `WithManagerLogger`, `OnTenantActivated`, `Drain`), plugin-br-pix-jd (v3.0.0: already `lib-commons/v7`, so its module hop is `/v3` → `/v4` only; `HandleTenantLifecycle`, `Drain`, `WithListenChannel`, a `DefaultSeedSQL()` generator), br-sfn (v3.0.0-beta.2: already `lib-commons/v7`; 17 `OnChange` calls before `Start`). All three are multi-tenant and all three depend on engine-tenants for the replacement of the Manager: no tenant-manager option, no `Client.HandleTenantLifecycle`, no multi-tenant `OnChange` exists on `develop` (`go doc -short .`; `api_client.go:179-183`). What is true today: the Manager is gone (`v3.0.0:manager.go:36-72` has no v4 counterpart), `DefaultSeedSQL` is gone, `Drain(ctx)` took a ctx (`v3.0.0:manager_methods.go:71`) while `Close()` takes none and is bounded by `WithCloseTimeout` (`api_constructors.go:76`), the callback ctx carries no tenant (`api_client.go:175-177`). `Client.HandleTenantLifecycle` will return errors where v3 logged and swallowed them (index § Behaviour changes, engine-tenants D-T5).
 
@@ -499,7 +499,7 @@ Everything here needs landed code. Elaborate it against the tree, not against th
 **Scope:** `examples/single-tenant/main.go`, `examples/multi-tenant/main.go`, `examples/groups/main.go`.
 **Dependencies:** `engine-core` Task 2.1.4 (`WithCloseTimeout`, `ErrCloseTimeout`) and Epic 3.1 (the removed name options) for the single-tenant example; `groups` Phase 2 Epic 2.2 (`OnApply`, `Status`) for the groups example; `engine-tenants` (`WithPostgresTenantManager`, `Client.HandleTenantLifecycle`) for the multi-tenant example — see § DEVIATIONS items 1 and 3.
 **Done when:** `go build ./examples/...`, `go vet ./examples/...` and `gofmt -l examples` are all clean; each program registers a key, starts, observes a change through `OnChange` or `OnApply`, and closes; none of the three references a symbol in FC-10's removed list; `examples/manager/` does not exist.
-**Status:** Doing
+**Status:** Done
 
 **Progress 2026-09-25 (branch `docs/v4-examples`).** Two of the three examples exist. `examples/single-tenant` is Postgres: its usage block applies `ddl/schema.sql` once with `psql` (a service does that in its migrations, never at boot), then the program registers `payments/fee_bps` with a validator, subscribes with `OnChange`, raises the value by one and waits for the revision that write produced. `examples/groups` is MongoDB on a replica set: it binds a `Limits` struct, applies each revision through `OnApply` and waits until `Status` reports the new revision in force. The single-tenant one ends in a `Close` that names `ErrCloseTimeout`. Each ran twice against a real database (first run and rerun); CI builds and lints them, and nothing runs them. `examples/multi-tenant` waits for `engine-tenants` Phase 2, because the example exists to show `HandleTenantLifecycle`, which that phase lands.
 
@@ -511,9 +511,126 @@ Shape decided now so elaboration does not relitigate it. Each example is a **sin
 **Scope:** `README.md`, `.env.reference` (deleted).
 **Dependencies:** Epic 2.1; `storage` Epic 3.2 (`DefaultSeedSQL` removed) and Epic 1.1 (`MigrationV3ToV4SQL`); `engine-core` Epic 3.1.
 **Done when:** no README code block is a complete program — every one is a call shape of at most five lines, or a link to `examples/<name>`; § Schema provisioning names `SchemaSQL()` and `MigrationV3ToV4SQL()` and no longer names `DefaultSeedSQL()`; the operating-modes table has three rows (single-tenant, multi-tenant per request, multi-tenant with a connector); the admin section shows the `{value, revision, updatedAt, updatedBy, stale}` response shape; `.env.reference` is deleted and its one still-true statement — that this library reads zero environment variables, and the names it once listed were conventions for the *consumer's* bootstrap — survives as a short README paragraph; the scoped absence grep over `README.md` returns nothing.
-**Status:** Pending
+**Status:** Done
 
 `.env.reference` is deleted rather than corrected because more than half of it documents things that do not exist: `WithTable`, `WithListenChannel` and `WithCollection` are removed by D8, and `WithLazyTenantLoad`, `WithTenantAuthorizer`, `WithTenantSchemaEnabled`, `RegisterTenantScoped`, `SetForTenant`, the "six admin routes" and `MIGRATION_TENANT_SCOPED.md` never shipped in any major this repository supports — the file even links to a document that does not exist in the tree. What remains true after removing all of that is one paragraph, and one paragraph does not need a file.
+
+### Phase 2 remainder, elaborated 2026-09-26
+
+Cut from the engine-tenants Phase 2 branch at `756efda` (PR #104), where `HandleTenantLifecycle`, the FC-12 metrics and
+`WithAggregateTenantThreshold` are committed, so every symbol these tasks name exists in the
+tree they are written against. Only `NOT-YET(engine-tenants)` markers remain (10 in
+`MIGRATION-v4.md`, 1 in `CLAUDE.md`); engine-core Phase 3 and the panic posture merged earlier.
+Epic 2.3 (the godoc sweep) is NOT in this run: it reads `api_*.go`, and it runs after the
+engine-tenants Phase 2 pull request merges.
+
+#### Task 2.1.3: `examples/multi-tenant`
+
+- [x] Done
+
+**Context:** `examples/single-tenant/main.go` (134 lines, Postgres) and `examples/groups/main.go`
+(129 lines, MongoDB) fix the shape: one `main.go`, a usage block in the package comment, the handle
+opened from an env var, `run() error`, a `Close` whose error is checked. FC-6 (`index.md` § FC-6)
+freezes `WithPostgresTenantManager` and `Client.HandleTenantLifecycle`; the lane plan
+`lane-engine-tenants.md` § Phase 2 decisions E-1..E-3 state what each lifecycle event does.
+Per-tenant `OnChange` delivers `Change.Tenant`; a tenant's first read activates its scope.
+
+**Implementation vision:** Postgres, tenant-managed. The program builds a `tmpostgres.Manager`
+the way a service does (find the real constructor chain in `lib-commons/v7@v7.0.0/commons/tenant-manager`, the version `go.mod` pins),
+constructs the Client with `NewPostgres(nil, "", systemplane.WithPostgresTenantManager(mgr))`,
+registers one key, subscribes with `OnChange` and prints `Change.Tenant` with the revision, starts,
+and reads the key for one tenant through a context carrying that tenant the way the tenant-manager
+middleware sets it (reuse how `internal/client/tenant_test.go` or the integration tests build that
+context; do not invent a helper). It shows the lifecycle wiring as the one handler a service
+registers: the dispatcher's `HandleEvent` first, then `c.HandleTenantLifecycle`, errors joined, with
+the E-1..E-3 behaviour in at most three comment lines. It ends in a checked `Close`. At most 150
+lines. Imports only modules `go.mod` already requires: `go mod tidy` must leave `go.mod` and
+`go.sum` unchanged.
+
+**Files:**
+- Create: `examples/multi-tenant/main.go`
+
+**Verification:** `go build ./examples/... && go vet ./examples/... && test -z "$(gofmt -l examples)"`,
+`make lint`, and `go mod tidy && git diff --exit-code go.mod go.sum`.
+
+**Done when:** the program compiles, lints clean, references no symbol in FC-10's removed list,
+and demonstrates a tenant read, a per-tenant `OnChange` with `Change.Tenant`, the lifecycle
+handler chain and a checked `Close`.
+
+#### Task 2.2.1: Rebuild the README around the three examples; delete `.env.reference`
+
+- [x] Done
+
+**Depends on:** Task 2.1.3 (the README links `examples/multi-tenant`).
+
+**Context:** `README.md` (401 lines) still describes v3: `go get .../v3` (`:24`), `lib-commons/v6`
+(`:17`, `:36`), a two-row mode table (`:27-38`), `Manager` warm-load (`:55`), four full Quickstart
+programs (`:57-305`), admin routes without the v4 response shape (`:306-375`). `.env.reference`
+(178 lines) documents removed options and APIs that never shipped (Epic 2.2 above). The admin GET
+entry shape is `admin/admin_responses.go:20-39`: `{key, value, description?, revision, updatedAt,
+updatedBy, stale}` (single-key GET adds `namespace`). FC-12 names meter `systemplane.engine` and six
+instruments; FC-10 names `WithAggregateTenantThreshold` and `DefaultAggregateTenantThreshold = 1000`.
+
+**Implementation vision:** rewrite, do not patch. Sections: what it is (two paragraphs, v4, no
+"still describes v3" banner); Requirements (Go 1.26.3, Postgres 13+ or MongoDB 4.4+ replica set,
+lib-commons/v7, lib-observability/v4); Installation (`/v4`); Operating modes, a three-row table
+(single-tenant; multi-tenant per request; multi-tenant with a tenant manager: cached per tenant,
+lazy activation, per-tenant `OnChange`, `HandleTenantLifecycle`); Schema provisioning (`SchemaSQL()`
+fresh install, `MigrationV3ToV4SQL()` upgrade, one database per tenant, runtime role DML only);
+Quickstarts as call shapes of at most five lines each plus a link to `examples/single-tenant`,
+`examples/groups` and `examples/multi-tenant`; Typed groups (`Bind`, `Snapshot`, `Set`, `OnApply`,
+`Status`); Admin HTTP (`Mount`, `MountCatalog` before `Mount`, default-deny authorizer, the response
+shape above as one JSON block); Metrics (the meter, the six instruments, the `tenant_id` /
+`aggregate` rule and the threshold option); Panic recovery (keep what is true); Configuration (the
+one surviving statement of `.env.reference`: this library reads zero environment variables, and
+the names it once listed were conventions for the consumer's bootstrap); Scope; License. Link
+`MIGRATION-v4.md` for upgrades. Delete `.env.reference` and every link to it.
+
+**Files:**
+- Modify: `README.md`
+- Delete: `.env.reference`
+
+**Verification:** the scoped absence grep of § Phase 1 over `README.md` returns nothing;
+`grep -c '^func main' README.md` is 0; every fenced Go block is at most five lines
+(`awk` over the fences); § The link check over `README.md` exits 0;
+`git grep -n 'env.reference' -- ':!docs/plans'` returns nothing.
+
+**Done when:** Epic 2.2's Done-when holds, plus the Metrics section and the three example links.
+
+#### Task 1.1.5 (finish) and every remaining `NOT-YET(engine-tenants)` marker
+
+- [x] Done
+
+**Context:** Task 1.1.5 above left the three Manager-user sections with "before" fragments and
+placeholders, and § Per consumer still says they are blocked: the `**Breaks:**` lines of
+`### notifications`, `### plugin-br-pix-jd` and `### br-sfn` (with its `**Do, when engine-tenants
+lands:**` list). `grep -n 'NOT-YET(' MIGRATION-v4.md CLAUDE.md` lists every marker at `756efda`:
+10 in `MIGRATION-v4.md`, 1 in `CLAUDE.md`. The surface-diff rows for the Manager options and for
+`OnTenant*`/`HandleTenantLifecycle`, and the `### Metrics moved to meter systemplane.engine`
+subsection, were written by engine-tenants Phase 2 (its E-9); do not rewrite them. The
+shared-database refusal is internal: `internal/postgres/connector.go:84` and
+`internal/mongodb/connector.go:73` each declare `ErrSharedDatabaseUnsupported`, and no root alias
+exists (`lane-engine-tenants.md` § Sentinels), so a consumer sees the refusal as a tenant activation
+that fails with a WARN while its reads stay per request; write it that way, never as a root error to
+match on. Anchors are symbols and headings; line numbers drift.
+
+**Implementation vision:** replace each marker with the behaviour the tree now has, citing the
+public symbol; write the three after-fragments (construction with `WithPostgresTenantManager`, the
+lifecycle handler chain from Task 2.1.3's shape, `Close`), each under fifteen lines, no `func main`;
+turn "blocked until engine-tenants" into the steps a consumer takes; br-sfn's 17 callbacks fire
+once per tenant at activation with `Change.Tenant` set. Fix the `CLAUDE.md` multi-tenant bullet
+("No in-process cache. No LISTEN/NOTIFY.") into the two multi-tenant shapes, and the root `doc.go`
+lines that describe multi-tenant mode without the tenant manager.
+
+**Files:**
+- Modify: `MIGRATION-v4.md`, `CLAUDE.md`, `doc.go`
+
+**Verification:** `grep -c 'NOT-YET(' MIGRATION-v4.md CLAUDE.md doc.go` is 0 for each; the § Phase 1
+engine-tenants check without its `grep -v` filter; § The link check over `MIGRATION-v4.md`; `go build
+./... && go vet ./...`.
+
+**Done when:** no placeholder remains, each consumer section says what to do today, and every
+statement matches the code on the branch.
 
 ### Epic 2.3: The godoc truth sweep and the CI examples gate
 
