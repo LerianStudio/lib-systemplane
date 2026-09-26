@@ -63,6 +63,11 @@ func startSharedContainer() {
 	if err != nil {
 		sharedContainerErr = err
 
+		// Run can hand back a started container whose wait strategy failed.
+		if container != nil {
+			terminateContainer(container, "after a failed start")
+		}
+
 		return
 	}
 
