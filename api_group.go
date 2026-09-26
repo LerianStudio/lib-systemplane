@@ -362,10 +362,11 @@ type ApplyStatus struct {
 // may repeat). Later revisions arrive serialized and coalesced per
 // scope; Status.Desired always names the newest published revision even when
 // fn has not seen intermediate ones. fn returning an error records that
-// revision as rejected for the scope (visible in Status) and keeps the
-// previously applied revision as current; the engine does not retry. Before a
-// single-tenant Start, OnApply registers and its initial delivery is Start's
-// announcement, which may land either side of Start's return.
+// revision as rejected for the scope (in Status unless the tenant is suspended
+// or deleted) and keeps the applied revision current; the engine does not
+// retry. Before a single-tenant Start, OnApply registers and its initial
+// delivery is Start's announcement, which may land either side of Start's
+// return.
 //
 // fn runs with no lock held and may call [Group.Snapshot], [Group.Status],
 // [Group.Set] or OnApply for its own group. A re-entrant OnApply appends its
