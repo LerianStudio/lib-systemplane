@@ -616,11 +616,11 @@ Elaborated 2026-09-26 against `develop` `c344a63` (after PR #104). `file:line` r
 **Scope:** `internal/client/main_test.go`, `internal/client/harness_integration_test.go` (new), `internal/client/tenant_postgres_integration_test.go` (new).
 **Dependencies:** Phases 1 and 2.
 **Done when:** the first `Get` for `t1` activates its scope and a later read hits the cache while `t2` is untouched; a write to `t1` delivers exactly one `Change` with `Tenant == "t1"` and none to `t2`; `pg_terminate_backend` on `t1`'s LISTEN connection makes `GetEntry` for `t1` report `Stale: true` and leaves `t2` unaffected, and a value written during the gap is visible after the reconnect with no second write (index Integration Lane scenario 2); a write racing the first read of `t1` is visible after activation without a second write (scenario 6); `HandleTenantLifecycle(Suspended)` drops `t1`'s LISTEN connection and a following read does not re-open it; two concurrent first reads for one tenant open exactly one LISTEN connection; a failed activation leaves exactly zero live subscriptions for that tenant (asserted through the backend's own feed inventory, not inferred); `-race` and goleak clean.
-**Status:** Pending
+**Status:** Done
 
 #### Task 3.1.1: Live Postgres harness, activation, isolation and single-flight
 
-- [ ] Done
+- [x] Done
 
 **Context:** `internal/client` has no integration test and no integration TestMain (`main_test.go` is `//go:build unit`, a bare `goleak.VerifyTestMain`). The only live tenant-manager test is `internal/postgres/connector_pgmgr_integration_test.go`, which seeds the manager's cache with `WithTestConnections` and bypasses the HTTP client. The Client's tenant read is `tenantEntry` (`internal/client/get.go:110`): `engine.Lookup` hit, else `engine.Activate` plus a per-request read of the zero scope.
 
@@ -640,7 +640,7 @@ Elaborated 2026-09-26 against `develop` `c344a63` (after PR #104). `file:line` r
 
 #### Task 3.1.2: Postgres feed loss, racing write, suspension and failed activation
 
-- [ ] Done
+- [x] Done
 
 **Context:** Task 3.1.1's harness. `OpDisconnect` marks the scope stale (`internal/engine/feed.go:100`, `markStale` at `:488`); the reconnect reconciles the whole scope. `activate` drops a scope whose first reconcile fails and logs the P3-7 WARN (`internal/engine/activate.go:152-172`). The Postgres runtime performs no schema provisioning in multi-tenant mode, so a tenant database without `systemplane_entries` fails that reconcile.
 
@@ -663,11 +663,11 @@ Elaborated 2026-09-26 against `develop` `c344a63` (after PR #104). `file:line` r
 **Scope:** `internal/client/harness_mongo_integration_test.go` (new), `internal/client/tenant_mongo_integration_test.go` (new), `internal/client/main_test.go` (ignore entries only).
 **Dependencies:** Epic 3.1.
 **Done when:** every assertion in Epic 3.1 holds with `WithMongoTenantManager` against a replica-set container with two tenant databases, with the change-stream cursor severed instead of the LISTEN backend killed (index Integration Lane scenario 3, multi-tenant half); a tenant database that does not yet hold the collection is materialized at activation rather than silently reading empty; `Group.OnApply` `Status()` shows both tenants applied (scenario 4's Mongo half); a standalone Mongo with `WithPollInterval` activates a tenant and converges the same way; `-race` and goleak clean.
-**Status:** Pending
+**Status:** Done
 
 #### Task 3.2.1: Live MongoDB harness, activation, isolation, single-flight, collection materialized
 
-- [ ] Done
+- [x] Done
 
 **Context:** Task 3.1.1's fake manager, capture logger and TestMain. The tenant connector is `mbMgrConnector.ResolveDatabase` → `tmmongo.Manager.GetDatabaseForTenant` (`internal/mongodb/connector.go`). Every tenant database, ctx-carried or connector-resolved, goes through the lazy bootstrap that materializes the collection (`internal/mongodb/mongodb.go:265-300`).
 
@@ -684,7 +684,7 @@ Elaborated 2026-09-26 against `develop` `c344a63` (after PR #104). `file:line` r
 
 #### Task 3.2.2: MongoDB cursor loss, racing write, suspension and failed activation
 
-- [ ] Done
+- [x] Done
 
 **Context:** Task 3.2.1's harness. `killChangeStreamCursor` (`internal/mongodb/mongodb_integration_test.go:261-283`) kills the feed's cursor with `killCursors`; the store reopens it after a jittered backoff and resyncs, so the gap cannot be held open from outside without a proxy.
 
@@ -703,7 +703,7 @@ Elaborated 2026-09-26 against `develop` `c344a63` (after PR #104). `file:line` r
 
 #### Task 3.2.3: Group `OnApply` across two Mongo tenants and a polling tenant
 
-- [ ] Done
+- [x] Done
 
 **Context:** `systemplane.Bind` must run before `Start`; on a tenant-managed Client `OnApply` is supported and `fn` gets the replay of every tenant the group has observed, with the tenant in `Applied.Tenant` (`api_group.go:431-440`). `WithPollInterval` switches the Mongo feed to polling (`internal/mongodb/mongodb.go:70-75`, passed at `internal/client/client.go:147`).
 
@@ -725,7 +725,7 @@ Elaborated 2026-09-26 against `develop` `c344a63` (after PR #104). `file:line` r
 **Scope:** verification only, plus whatever small fixes the gates demand inside owned files.
 **Dependencies:** Epics 3.1, 3.2.
 **Done when:** `make test-unit`, `make test-integration`, `go vet -tags=unit ./...`, `go vet -tags=integration ./...`, `go test -tags=unit -run=^TestPerf_ ./...`, `go test -tags=unit -run TestExportedBoundary ./...` and `make lint` all pass; `make check-tests` reports coverage for `internal/engine` and `internal/client`; `git diff --stat go.mod go.sum` is empty; the repo-wide absence checks are **not** asserted here — lane-cut rule 4 puts them in the `integration` lane, and this branch cannot prove a negative while `docs` and `matcher-pilot` are writing.
-**Status:** Pending
+**Status:** Done
 
 ---
 
