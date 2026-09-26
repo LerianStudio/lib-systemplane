@@ -25,7 +25,8 @@
 //
 // In multi-tenant mode ([WithMultiTenantEnabled]) every read resolves the
 // tenant database from ctx and reads through, with no cache; the key's
-// validator grades that row too. [WithPostgresTenantManager] or
+// validator grades that row too, unless the key was registered
+// [WithWriteValidator]. [WithPostgresTenantManager] or
 // [WithMongoTenantManager] adds a cache: a tenant's first read brings up that
 // tenant's own scope, cached and fed by its own changefeed like the
 // single-tenant one, and [Client.HandleTenantLifecycle] drops, blocks and

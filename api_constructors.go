@@ -143,7 +143,8 @@ func WithDescription(s string) KeyOption { return internalclient.WithDescription
 // WithValidator sets a validation function invoked on every Set. The function
 // sees the value alone; [WithContextValidator] sees the Set context too. Both
 // set the same single validator: a nil function is ignored, and the last
-// NON-NIL validator option applied to a key wins.
+// NON-NIL of these two wins; combined with [WithWriteValidator],
+// [Client.Register] refuses the key.
 //
 // It always grades the CANONICAL shape — what the store hands back, so float64
 // for every number, map[string]any for an object, []any for an array — on
@@ -177,18 +178,23 @@ func WithValidator(fn func(any) error) KeyOption { return internalclient.WithVal
 // call.
 //
 // Both this and [WithValidator] set the same single validator: a nil function
-// is ignored, and the last NON-NIL validator option applied to a key wins.
+// is ignored, and the last NON-NIL of these two wins; combined with
+// [WithWriteValidator], [Client.Register] refuses the key.
 func WithContextValidator(fn func(ctx context.Context, value any) error) KeyOption {
 	return internalclient.WithContextValidator(fn)
 }
 
 // WithWriteValidator sets a validation function that grades writes only:
-// every [Client.Set] and the registered default at [Client.Register]. A stored
-// row reaches every reader as stored — each reconcile and changefeed re-read, a
-// tenant's activation, a multi-tenant per-request read — for a key whose readers
-// decide for themselves what to do with a row this build would refuse to write.
-// Combined with [WithValidator] or [WithContextValidator] on one key, or passed
-// to [Bind], it is refused with [ErrValidation]. A nil function is ignored.
+// every [Client.Set] and the registered default at [Client.Register], in the
+// same CANONICAL shape [WithValidator] grades. A stored row reaches every
+// reader as stored — each reconcile and changefeed re-read, a tenant's
+// activation, a multi-tenant per-request read — for a key whose readers decide
+// for themselves what to do with a row this build would refuse to write. A row
+// that does not decode is still refused.
+//
+// Combined with [WithValidator] or [WithContextValidator] on one key it is
+// refused with [ErrValidation]; [Bind] installs its own validator, so Bind
+// refuses it too. A nil function is ignored.
 func WithWriteValidator(fn func(any) error) KeyOption { return internalclient.WithWriteValidator(fn) }
 
 // WithCatalogMetadata attaches operator-facing catalog metadata to a key.
