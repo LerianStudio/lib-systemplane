@@ -1,11 +1,10 @@
-// Command multi-tenant reads a key for one tenant on a Postgres Client that
-// caches each tenant it reads: the first read activates the tenant's scope,
-// which announces the key to a subscriber with the tenant's id. Lifecycle events
-// reach the Client through one handler. Every tenant database needs ddl/schema.sql.
+// Command multi-tenant reads a key for one tenant on a Postgres Client that caches
+// each tenant it reads: the first read activates the tenant's scope, which announces
+// the key to a subscriber with the tenant's id. Lifecycle events reach one handler.
 //
 //	export MULTI_TENANT_URL=https://tenant-manager.internal MULTI_TENANT_SERVICE_API_KEY=...
 //	export MULTI_TENANT_REDIS_HOST=localhost ENVIRONMENT_NAME=staging TENANT_ID=...
-//	go run ./examples/multi-tenant
+//	go run ./examples/multi-tenant  # the tenant's database carries ddl/schema.sql
 package main
 
 import (
@@ -20,6 +19,7 @@ import (
 	tmevent "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/event"
 	tmpostgres "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/postgres"
 	tmredis "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/redis"
+	"github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/tenantcache"
 
 	systemplane "github.com/LerianStudio/lib-systemplane/v4"
 )
@@ -42,7 +42,7 @@ func run() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	tmc, err := tmclient.NewClient(os.Getenv("MULTI_TENANT_URL"), nil,
+	tmc, err := tmclient.NewClient(os.Getenv("MULTI_TENANT_URL"), nil, tmclient.WithCircuitBreaker(5, 30*time.Second),
 		tmclient.WithServiceAPIKey(os.Getenv("MULTI_TENANT_SERVICE_API_KEY")))
 	if err != nil {
 		return err
@@ -57,10 +57,10 @@ func run() error {
 	}
 
 	// The Client closes before the pools its tenant scopes resolve through.
-	return errors.Join(serve(ctx, client, mgr), client.Close(), mgr.Close(ctx), tmc.Close())
+	return errors.Join(serve(ctx, client, tmc, mgr), client.Close(), mgr.Close(ctx), tmc.Close())
 }
 
-func serve(ctx context.Context, client *systemplane.Client, mgr *tmpostgres.Manager) error {
+func serve(ctx context.Context, client *systemplane.Client, tmc *tmclient.Client, mgr *tmpostgres.Manager) error {
 	if err := client.Register(namespace, key, 25); err != nil {
 		return err
 	}
@@ -68,32 +68,37 @@ func serve(ctx context.Context, client *systemplane.Client, mgr *tmpostgres.Mana
 	// One subscription covers every tenant; Change.Tenant names whose value it is.
 	changes := make(chan systemplane.Change)
 
-	unsubscribe, err := client.OnChange(namespace, key, func(ctx context.Context, ch systemplane.Change) {
+	if _, err := client.OnChange(namespace, key, func(ctx context.Context, ch systemplane.Change) {
 		select {
 		case changes <- ch:
 		case <-ctx.Done():
 		}
-	})
-	if err != nil {
+	}); err != nil {
 		return err
 	}
-	defer unsubscribe()
 
 	if err := client.Start(ctx); err != nil {
 		return err
 	}
 
+	// What the middleware does per request, with the cache and loader it takes: WithTenantCache
+	// and WithTenantLoader. The dispatcher skips tenant-level events for a tenant not in that cache.
+	cache := tenantcache.NewTenantCache()
+	loader := tenantcache.NewTenantLoader(tmc, cache, service, 0, nil)
 	tenant := os.Getenv("TENANT_ID")
+
+	if _, err := loader.LoadTenant(ctx, tenant); err != nil {
+		return err
+	}
 
 	db, err := mgr.GetDB(ctx, tenant)
 	if err != nil {
 		return err
 	}
 
-	// The context the tenant-manager middleware hands a request handler.
 	tctx := tmcore.ContextWithPG(tmcore.ContextWithTenantID(ctx, tenant), db, module)
 
-	stop, err := listen(ctx, client, mgr)
+	stop, err := listen(ctx, client, tmevent.NewEventDispatcher(cache, loader, service, tmevent.WithPostgres(mgr)))
 	if err != nil {
 		return err
 	}
@@ -101,14 +106,10 @@ func serve(ctx context.Context, client *systemplane.Client, mgr *tmpostgres.Mana
 	return errors.Join(readTenant(tctx, client, changes), stop())
 }
 
-// listen registers the one lifecycle handler a service gives the event listener.
-func listen(ctx context.Context, client *systemplane.Client, mgr *tmpostgres.Manager) (func() error, error) {
-	// A service hands the dispatcher the tenant cache and loader its middleware uses.
-	dispatcher := tmevent.NewEventDispatcher(nil, nil, service, tmevent.WithPostgres(mgr))
-
-	// Dispatcher first: a rotation closes the tenant's pools, then the Client
-	// rebuilds its scope. Activated only unblocks, leaving activation to a read;
-	// suspended and deleted drop and block the scope; the Client ignores the rest.
+// listen starts the event listener with the one lifecycle handler a service registers.
+func listen(ctx context.Context, client *systemplane.Client, dispatcher *tmevent.EventDispatcher) (func() error, error) {
+	// Dispatcher first: a rotation closes the tenant's pools before the Client rebuilds its scope.
+	// Activated only unblocks (a read activates); suspended and deleted drop and block; rest ignored.
 	handle := func(ctx context.Context, evt tmevent.TenantLifecycleEvent) error {
 		return errors.Join(dispatcher.HandleEvent(ctx, evt), client.HandleTenantLifecycle(ctx, evt))
 	}
@@ -142,7 +143,6 @@ func readTenant(ctx context.Context, client *systemplane.Client, changes <-chan 
 	select {
 	case ch := <-changes:
 		fmt.Printf("read %d; tenant %s announced %v at revision %d\n", fee, ch.Tenant, ch.Value, ch.Revision)
-
 		return nil
 	case <-ctx.Done():
 		return fmt.Errorf("tenant %s was not activated: %w", tmcore.GetTenantIDContext(ctx), ctx.Err())

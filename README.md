@@ -50,10 +50,9 @@ lib-commons tenant-manager middleware builds,
 `"systemplane"`). Writes always go to the database that middleware resolved.
 
 With a tenant manager, `mgr` must be the Manager the middleware registers, and
-each tenant needs its own database. An active Postgres tenant holds one LISTEN
-connection per replica on top of `mgr`'s pool. A tenant feed that would share a
-database with another live feed of the Client is refused: that tenant's
-activation logs a WARN and its reads stay per request.
+each tenant needs its own database; connection sizing and what a shared
+database gets are in
+[MIGRATION-v4.md § The database and operator contract](MIGRATION-v4.md#the-database-and-operator-contract).
 
 ## Schema provisioning
 
@@ -95,9 +94,8 @@ across keys
 naming that key. Runnable:
 [`examples/single-tenant`](examples/single-tenant/main.go) (Postgres).
 
-With a tenant manager, one handler takes every lifecycle event. The
-tenant-manager dispatcher goes first, because on a credentials rotation it
-reloads the pools the rebuilt scope resolves through:
+With a tenant manager, one handler takes every lifecycle event, the service's
+tenant-manager dispatcher first:
 
 ```go
 client, err := systemplane.NewPostgres(nil, "", systemplane.WithPostgresTenantManager(mgr))
@@ -106,13 +104,9 @@ handle := func(ctx context.Context, evt tmevent.TenantLifecycleEvent) error {
 }
 ```
 
-`HandleTenantLifecycle` applies the event to that tenant's scope:
-`tenant.activated` clears a block and activates nothing, since the tenant's next
-read does; `tenant.suspended` and `tenant.deleted` drop the scope and block it,
-so its reads go per request until the next `tenant.activated`;
-`tenant.credentials.rotated` rebuilds an active scope on a fresh feed. It
-ignores every other event and returns only `ErrClosed` after `Close` and
-`ErrValidation` for an event with no tenant id. Runnable:
+`HandleTenantLifecycle` drops, blocks and rebuilds that tenant's scope; what
+each event does, how the dispatcher is built and why it goes first:
+[MIGRATION-v4.md § notifications](MIGRATION-v4.md#notifications). Runnable:
 [`examples/multi-tenant`](examples/multi-tenant/main.go) (Postgres).
 
 ## Typed groups

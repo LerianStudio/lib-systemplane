@@ -733,11 +733,11 @@ The Console's tenant shape is the per-request one: the database resolved from
 the request context on every read and write, no in-process cache, no
 changefeed, and `OnChange` refused with `ErrNotSupportedInMultiTenant`. To cache
 each tenant in process and subscribe per tenant, construct with
-`WithMongoTenantManager(mbMgr)`, passing the `*tmmongo.Manager` the
-tenant-manager middleware registers under the `WithModule` name. Each tenant
-then needs a database of its own and a replica set, or `WithPollInterval`
-([§ MongoDB](#mongodb)); `stale` reports on reads a tenant's scope serves; and
-the lifecycle wiring is the one [§ notifications](#notifications) shows.
+`WithMongoTenantManager(mbMgr)`, the MongoDB twin of
+[§ notifications](#notifications) step 3. Each tenant then needs a database of
+its own and a replica set, or `WithPollInterval` ([§ MongoDB](#mongodb));
+`stale` reports on reads a tenant's scope serves; and the lifecycle wiring is
+the one [§ notifications](#notifications) shows.
 
 ### notifications
 
@@ -748,15 +748,25 @@ the lifecycle wiring is the one [§ notifications](#notifications) shows.
 
 1. Fiber v2 → v3 first, as its own change, then the observability boundary. Both are in the hop table above.
 2. Apply `MigrationV3ToV4SQL()` to every tenant database before the new binary boots.
-3. Delete the `Manager` and move what it configured onto one `Client`: `WithPostgresTenantManager(pgMgr)`, which implies `WithMultiTenantEnabled()`, plus `WithModule`, `WithLogger` and `WithTelemetry`. `pgMgr` must be the `*tmpostgres.Manager` the tenant-manager middleware registers under the `WithModule` name: writes and uncached reads use the database the middleware resolved, cached reads use `pgMgr`'s.
-4. Replace the four `OnTenant*` handlers with `c.HandleTenantLifecycle`, chained after the dispatcher's own `HandleEvent`. It returns two errors the handlers never did, `ErrClosed` after `Close` and `ErrValidation` for an event with no `TenantID`, and no longer the one they did: a tenant database that cannot be reached fails that tenant's activation in the background with a WARN, and a later read retries.
+3. Delete the `Manager` and move what it configured onto one `Client`: `WithPostgresTenantManager(pgMgr)`, which implies `WithMultiTenantEnabled()`, plus `WithModule`, `WithLogger` and `WithTelemetry`. `pgMgr` must be the `*tmpostgres.Manager` the tenant-manager middleware registers under the `WithModule` name: writes and uncached reads use the database the middleware resolved, cached reads use `pgMgr`'s. Each active tenant then holds one LISTEN connection per replica on top of `pgMgr`'s pools, and a tenant whose database another tenant's feed already listens on is refused: [§ Postgres](#postgres) sizes the first and describes the second.
+4. Delete the `WithOnTenantAdded` / `WithOnTenantRemoved` dispatcher hooks that called `OnTenantActivated` and `OnTenantDeleted`, and chain `c.HandleTenantLifecycle` after the dispatcher's own `HandleEvent` in the listener's handler, as the fragment below shows. Its errors are the ones [§ The surface diff](#the-surface-diff) lists; a tenant database that cannot be reached no longer returns one: that tenant's activation fails in the background with a WARN, and a later read retries. It routes the four tenant-level events only; the table says what that costs the service-level events the hooks answered.
 5. Replace `Drain(ctx)` with `Close()`, which takes no context — see [§ `Close` is bounded, and names the callback that would not stop](#close-is-bounded-and-names-the-callback-that-would-not-stop).
+6. Rewrite every `OnChange` callback as [§ br-sfn](#br-sfn) steps 4-6 say: a callback now receives each tenant's value in turn, and a tenant delivers nothing until this process reads it.
 
 | v1.6.1 handler | v4 event through `HandleTenantLifecycle` |
 |---|---|
 | `OnTenantActivated` warmed the tenant | `tenant.activated` clears the tenant's blocked marker and opens nothing: the tenant's next read brings its scope up. |
 | `OnTenantSuspended`, `OnTenantDeleted` | `tenant.suspended` and `tenant.deleted` drop the scope and block the tenant: its reads go to the tenant database per request, and none brings the scope back until the next `tenant.activated`. |
 | `OnTenantCredentialsRotated` | `tenant.credentials.rotated` rebuilds an active tenant's scope on a fresh feed and leaves a blocked tenant blocked. |
+| The hooks' `OnTenantDeleted` on `tenant.service.suspended`, `tenant.service.disassociated` and `tenant.service.purged`, and their drop and re-warm on `tenant.cache.invalidate` | Nothing: the scope keeps its LISTEN connection and its cache until `tenant.suspended`, `tenant.deleted` or `Close`. A service reactivation needs no step. |
+
+`dispatcher` is the service's `tmevent.NewEventDispatcher(cache, loader, service, tmevent.WithPostgres(pgMgr))`
+(`tmevent.WithMongo(mbMgr)` on MongoDB), on the same Manager and on the tenant
+cache and loader its middleware takes (`tmmiddleware.WithTenantCache`,
+`WithTenantLoader`): `HandleEvent` skips a tenant-level event for a tenant that
+cache does not hold. It goes first because on a rotation it closes the
+tenant's pools, so the scope rebuilds on the new credentials. The runnable
+wiring is [`examples/multi-tenant`](examples/multi-tenant/main.go).
 
 ~~~go
 // v1.6.1 — construction, lifecycle registration, shutdown
@@ -774,7 +784,6 @@ c, err := systemplane.NewPostgres(nil, "",
 if err != nil {
 	return err
 }
-// dispatcher.HandleEvent first: on a rotation it reloads the pools the rebuild resolves
 lifecycle := func(ctx context.Context, evt tmevent.TenantLifecycleEvent) error {
 	return errors.Join(dispatcher.HandleEvent(ctx, evt), c.HandleTenantLifecycle(ctx, evt))
 }
@@ -792,15 +801,16 @@ return c.Close() // at shutdown, in place of m.Drain(ctx)
 1. Bump the module path. That is the whole dependency hop for this consumer — the `/v3` row of the hop table, no lib-commons and no lib-observability move.
 2. Delete the seed-DDL generator and the channel override; the name-override row of [§ The surface diff](#the-surface-diff) says what each needs.
 3. Apply `MigrationV3ToV4SQL()` to every tenant database before the new binary boots.
-4. Delete the `Manager` and build the Client with `WithPostgresTenantManager(pgMgr)`, passing the `*tmpostgres.Manager` the tenant-manager middleware registers under the `WithModule` name.
-5. Register `c.HandleTenantLifecycle` where `m.HandleTenantLifecycle` was: same signature, chained after the dispatcher's own `HandleEvent`. What each event now does is the table in [§ notifications](#notifications). `tenant.activated` no longer warms the tenant, and the handler returns `ErrClosed` after `Close` and `ErrValidation` for an event with no `TenantID`, where v3 returned nil for every event.
+4. Delete the `Manager` and build the Client with `WithPostgresTenantManager(pgMgr)`, as [§ notifications](#notifications) step 3 says.
+5. Call `c.HandleTenantLifecycle` where `m.HandleTenantLifecycle` was, after the dispatcher's `HandleEvent`: same signature. What each event does is the [§ notifications](#notifications) table.
 6. Replace `Drain(ctx)` with `Close()` — the same contrast notifications carries above.
+7. Rewrite every `OnChange` callback as [§ br-sfn](#br-sfn) steps 4-6 say.
 
 ~~~go
 // v3.0.0 — construction, lifecycle registration, shutdown
 c, err := systemplane.NewPostgres(db, listenDSN, systemplane.WithMultiTenantEnabled()) // plus a WithListenChannel call (set to the default name)
 m := systemplane.NewManager(c, pgMgr)
-// m.HandleTenantLifecycle registered as the tmevent handler
+// m.HandleTenantLifecycle called after dispatcher.HandleEvent in the listener's handler
 defer m.Drain(ctx)
 ~~~
 
@@ -810,7 +820,6 @@ c, err := systemplane.NewPostgres(nil, "", systemplane.WithPostgresTenantManager
 if err != nil {
 	return err
 }
-// registered as the tmevent handler, where m.HandleTenantLifecycle was
 lifecycle := func(ctx context.Context, evt tmevent.TenantLifecycleEvent) error {
 	return errors.Join(dispatcher.HandleEvent(ctx, evt), c.HandleTenantLifecycle(ctx, evt))
 }
@@ -826,10 +835,11 @@ return c.Close() // at shutdown, in place of m.Drain(ctx)
 
 1. Bump the module path; nothing else in `go.mod`.
 2. Apply `MigrationV3ToV4SQL()` to every tenant database.
-3. Delete the `Manager` and build the Client with `WithPostgresTenantManager(pgMgr)`, passing the `*tmpostgres.Manager` the tenant-manager middleware registers under the `WithModule` name; `Close()` replaces `Drain(ctx)`.
-4. Rewrite the 17 callbacks to `func(ctx context.Context, ch Change)` and key each reload by `ch.Tenant`: a delivery carries one tenant's value. Namespace, key, revision and value come off `ch`; the ctx is the engine's own lifecycle context and carries no request values and no tenant.
-5. Make each callback idempotent per tenant. `Start` announces nothing on this Client; each tenant instead delivers every registered key once when its first read activates its scope, and again when that scope is rebuilt: 17 deliveries per tenant activation that v3 never made. A tenant this process never reads delivers nothing. Deliveries coalesce per (tenant, key), as [§ Deliveries are coalesced per key and independent across keys](#deliveries-are-coalesced-per-key-and-independent-across-keys) describes.
-6. Register `c.HandleTenantLifecycle` as [§ notifications](#notifications) shows. Without it a suspended or deleted tenant keeps its scope and its LISTEN connection until `Close`.
+3. Delete the `Manager` and build the Client with `WithPostgresTenantManager(pgMgr)`, as [§ notifications](#notifications) step 3 says; `Close()` replaces `Drain(ctx)`.
+4. Rewrite the 17 callbacks to `func(ctx context.Context, ch Change)` and key each reload by `ch.Tenant`: a delivery carries one tenant's value. Namespace, key, revision and value come off `ch`; the ctx is the engine's own lifecycle context and carries no request values and no tenant. A callback that applies the value to one process-wide setting (a config holder, the DB pool, the log level) now receives every tenant's value in turn, a newly activated tenant's default at revision 0 included, so the setting ends at whichever tenant activated last: keep such a knob on a single-tenant Client, or read it per request with `Get`, which this Client serves from the tenant's cache once its scope is up.
+5. Make each callback idempotent per tenant. `Start` announces nothing on this Client; each tenant instead delivers every registered key once when its scope activates, and again when that scope is rebuilt: 17 deliveries per tenant activation that v3 never made. Deliveries coalesce per (tenant, key), as [§ Deliveries are coalesced per key and independent across keys](#deliveries-are-coalesced-per-key-and-independent-across-keys) describes.
+6. Start each tenant's deliveries with a read. A tenant's scope, and so its deliveries, comes up only on a read through this Client (`Get`, `GetEntry`, a typed getter, `List` or `Group.Snapshot`) whose context carries that tenant's id, as the tenant-manager middleware and consumer set it with `tmcore.ContextWithTenantID`. Until the scope is up the read also needs the module's database on the context, which the middleware sets and a consumer handler adds with `tmcore.ContextWithPG`; without it the read returns `ErrTenantConnectionMissing`. A service that consumes these keys only through callbacks makes that read once for each tenant it serves, for example on the tenant's first request or message; a tenant this process never reads delivers nothing.
+7. Register `c.HandleTenantLifecycle` as [§ notifications](#notifications) shows. Without it a suspended or deleted tenant keeps its scope and its LISTEN connection until `Close`.
 
 ~~~go
 // v3.0.0-beta.2 — construction, subscriptions, shutdown
