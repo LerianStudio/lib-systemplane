@@ -201,7 +201,8 @@ func (c *Client) OnChange(namespace, key string, fn func(ctx context.Context, ch
 //     tenant it never reads.
 //   - tenant.suspended and tenant.deleted drop the tenant's scope and block
 //     it: its reads resolve the tenant database per request, and none brings
-//     the scope back until the next tenant.activated.
+//     the scope back until the next tenant.activated. Every bound group drops
+//     the tenant from [Group.Status].
 //   - tenant.credentials.rotated rebuilds an active tenant's scope on a fresh
 //     feed and leaves a blocked tenant blocked.
 //

@@ -7,9 +7,8 @@
 // callbacks out of order; the Client's OnChange never does, because it
 // delivers each (scope, key) serially from one worker.
 //
-// Nothing is pruned. A scope entry and every registered function's bookkeeping
-// for it live as long as the coordinator, so a tenant the Client has stopped
-// serving keeps its row in Status.
+// A scope entry and its bookkeeping live until the Client stops serving that
+// tenant.
 package group
 
 import (
@@ -74,14 +73,16 @@ type observation[T any] struct {
 }
 
 // scope is the per-tenant publication cache. delivering says a fan-out is
-// running for this scope on some goroutine; it is read and written only under
-// the coordinator's state mutex, which is what makes a publication recorded
-// mid-fan-out impossible to miss.
+// running for this scope on some goroutine, and dropped that DropScope forgot
+// the scope; both are read and written only under the coordinator's state
+// mutex, which is what makes a publication recorded mid-fan-out impossible to
+// miss.
 type scope[T any] struct {
 	tenant     string
 	current    observation[T]
 	observed   bool
 	delivering bool
+	dropped    bool
 	desired    int64
 	lastErr    error
 
@@ -166,8 +167,8 @@ type delivery[T any] struct {
 // coordinator dedupes only by arrival sequence and owns only the seed
 // watermark.
 //
-// A nil *Coordinator is safe: Publish and Register are no-ops and Status
-// returns nil.
+// A nil *Coordinator is safe: Publish, Register and DropScope are no-ops and
+// Status returns nil.
 type Coordinator[T any] struct {
 	logger log.Logger
 	// namespace and key name the group every report below is about: a report
@@ -505,6 +506,31 @@ func (c *Coordinator[T]) Status() []Status {
 	return out
 }
 
+// DropScope forgets tenant's scope and every applier's bookkeeping for it, so
+// its next publication is a first delivery. A fan-out in flight for it finishes
+// and records nothing.
+func (c *Coordinator[T]) DropScope(tenant string) {
+	if c == nil {
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	sc, ok := c.scopes[tenant]
+	if !ok {
+		return
+	}
+
+	sc.dropped = true
+
+	delete(c.scopes, tenant)
+
+	for _, ap := range c.appliers {
+		delete(ap.state, tenant)
+	}
+}
+
 func (c *Coordinator[T]) remove(id uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -673,7 +699,7 @@ func (c *Coordinator[T]) drain(ctx context.Context, sc *scope[T]) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if sc.delivering {
+	if sc.delivering || sc.dropped {
 		return
 	}
 
@@ -690,6 +716,11 @@ func (c *Coordinator[T]) drain(ctx context.Context, sc *scope[T]) {
 		}
 
 		c.deliver(deliveryCtx(ctx, observed), pending)
+
+		if sc.dropped {
+			return
+		}
+
 		c.recordLocked(sc, pending)
 	}
 }

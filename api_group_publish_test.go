@@ -5,8 +5,12 @@ package systemplane
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"testing"
+
+	tmevent "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/event"
+	tmpostgres "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/postgres"
 )
 
 // groupPublishDoc is the document the tenant-hop test binds. It is deliberately
@@ -157,4 +161,61 @@ func (*groupPublishMemoryStore) List(context.Context, TestScope) ([]TestEntry, e
 
 func (*groupPublishMemoryStore) Subscribe(context.Context, TestScope, func(TestEvent)) (func(), error) {
 	return func() {}, nil
+}
+
+// TestGroupStatusForgetsATenantTheClientStopsServing: suspended and deleted
+// drop the tenant's Status row; a credentials rotation or an activation keeps it.
+func TestGroupStatusForgetsATenantTheClientStopsServing(t *testing.T) {
+	t.Parallel()
+
+	for event, want := range map[string][]string{
+		tmevent.EventTenantSuspended:          {"t2"},
+		tmevent.EventTenantDeleted:            {"t2"},
+		tmevent.EventTenantCredentialsRotated: {"t1", "t2"},
+		tmevent.EventTenantActivated:          {"t1", "t2"},
+	} {
+		t.Run(event, func(t *testing.T) {
+			t.Parallel()
+
+			c, err := NewForTesting(newGroupPublishMemoryStore(), WithPostgresTenantManager(tmpostgres.NewManager(nil, "svc")))
+			if err != nil {
+				t.Fatalf("NewForTesting: %v", err)
+			}
+
+			g, err := Bind(c, "billing", "limits", groupPublishDoc{Workers: 1}, nil)
+			if err != nil {
+				t.Fatalf("Bind: %v", err)
+			}
+
+			ctx := context.Background()
+			if err := c.Start(ctx); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+
+			t.Cleanup(func() { _ = c.Close() })
+
+			unsubscribe, err := g.OnApply((&publishRecorder{}).apply)
+			if err != nil {
+				t.Fatalf("OnApply on a tenant-managed Client = %v, want no error", err)
+			}
+
+			t.Cleanup(unsubscribe)
+
+			g.publish(ctx, Change{Namespace: "billing", Key: "limits", Tenant: "t1", Revision: 7, Value: map[string]any{"workers": 4}})
+			g.publish(ctx, Change{Namespace: "billing", Key: "limits", Tenant: "t2", Revision: 9, Value: map[string]any{"workers": 9}})
+
+			if err := c.HandleTenantLifecycle(ctx, tmevent.TenantLifecycleEvent{EventType: event, TenantID: "t1"}); err != nil {
+				t.Fatalf("HandleTenantLifecycle(%s): %v", event, err)
+			}
+
+			var got []string
+			for _, st := range g.Status() {
+				got = append(got, st.Tenant)
+			}
+
+			if !slices.Equal(got, want) {
+				t.Fatalf("Status tenants after %s for t1 = %v, want %v", event, got, want)
+			}
+		})
+	}
 }

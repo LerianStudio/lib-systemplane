@@ -184,6 +184,8 @@ func Bind[T any](c *Client, namespace, key string, defaults T, validate func(T) 
 	_, subscribeErr := c.OnChange(namespace, key, g.publish)
 	g.subscribeErr = subscribeErr
 
+	asInternalClient(c).OnTenantDrop(g.coordinator.DropScope)
+
 	return g, nil
 }
 
@@ -428,12 +430,12 @@ type ApplyStatus struct {
 // ErrNotSupportedInMultiTenant, while [Group.Snapshot] and [Group.Set] keep
 // working. On a tenant-managed Client nothing is seeded, because every
 // document belongs to a tenant: fn gets the replay of every tenant this group
-// has observed, one the Client has since dropped included, then each tenant's
-// publications, the first on the read that activates it, with the tenant in
-// Applied.Tenant, the ONLY tenant identity fn receives. The delivered ctx
-// carries no tenant, so a re-read or a write-back runs under a tenant-scoped
-// context the consumer owns, the one tenant-manager middleware builds. On a nil
-// *Group it returns ErrClosed.
+// has observed and the Client has not since suspended or deleted, then each
+// tenant's publications, the first on the read that activates it, with the
+// tenant in Applied.Tenant, the ONLY tenant identity fn receives. The
+// delivered ctx carries no tenant, so a re-read or a write-back runs under a
+// tenant-scoped context the consumer owns, the one tenant-manager middleware
+// builds. On a nil *Group it returns ErrClosed.
 // unsubscribe is never nil, so a caller may defer it before checking err.
 func (g *Group[T]) OnApply(fn func(ctx context.Context, a Applied[T]) error) (unsubscribe func(), err error) {
 	noop := func() {}
@@ -465,8 +467,9 @@ func (g *Group[T]) OnApply(fn func(ctx context.Context, a Applied[T]) error) (un
 }
 
 // Status reports the desired and applied revisions of every scope the group
-// has observed a publication for, sorted by tenant. Status on a nil *Group
-// returns nil.
+// has observed a publication for, sorted by tenant. A tenant the Client
+// suspends or deletes leaves Status until its next publication. Status on a
+// nil *Group returns nil.
 func (g *Group[T]) Status() []ApplyStatus {
 	if g == nil {
 		return nil

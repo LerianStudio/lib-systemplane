@@ -46,6 +46,8 @@ type Client struct {
 
 	registryMu sync.RWMutex
 	registry   map[nskey]keyDef
+	// dropHooks run for a suspended or deleted tenant; guarded by registryMu.
+	dropHooks []func(tenant string)
 
 	startMu sync.Mutex
 	started atomic.Bool
