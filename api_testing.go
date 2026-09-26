@@ -4,8 +4,9 @@ package systemplane
 
 import internalclient "github.com/LerianStudio/lib-systemplane/v4/internal/client"
 
-// TestStore is the public mirror of the internal store.Store interface,
-// exposed solely for [NewForTesting].
+// TestStore mirrors the internal store.Store interface for [NewForTesting]. Its
+// Subscribe must emit TestEvent{Op: "resync"} when ready and on each reconnect;
+// a single-tenant [Client.Start] blocks until the first one or its ctx ends.
 type TestStore = internalclient.TestStore
 
 // TestScope is the public mirror of internal store.Scope.

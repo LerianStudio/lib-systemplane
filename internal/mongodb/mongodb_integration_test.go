@@ -317,18 +317,34 @@ func awaitSingleChangeStreamCursor(t *testing.T, client *mongo.Client, dbName st
 func inFlightGetMoreCursorIDs(t *testing.T, client *mongo.Client, dbName string) []int64 {
 	t.Helper()
 
+	return currentOpCursorIDs(t, client, dbName, false,
+		bson.E{Key: "type", Value: "op"}, bson.E{Key: "op", Value: "getmore"})
+}
+
+// changeStreamCursorIDs is the idle-inclusive census: every change-stream
+// cursor open on the feed's collection, whether a getMore runs on it or not.
+func changeStreamCursorIDs(t *testing.T, client *mongo.Client, dbName string) []int64 {
+	t.Helper()
+
+	return currentOpCursorIDs(t, client, dbName, true, bson.E{Key: "cursor.tailable", Value: true})
+}
+
+// currentOpCursorIDs returns the ids of the cursors on the feed's collection
+// that $currentOp reports and match narrows.
+func currentOpCursorIDs(t *testing.T, client *mongo.Client, dbName string, idleCursors bool, match ...bson.E) []int64 {
+	t.Helper()
+
 	ctx := context.Background()
 
 	cur, err := client.Database("admin").Aggregate(ctx, mongo.Pipeline{
 		bson.D{{Key: "$currentOp", Value: bson.D{
 			{Key: "allUsers", Value: true},
+			{Key: "idleCursors", Value: idleCursors},
 		}}},
-		bson.D{{Key: "$match", Value: bson.D{
+		bson.D{{Key: "$match", Value: append(bson.D{
 			{Key: "ns", Value: dbName + "." + changefeedCollection},
-			{Key: "type", Value: "op"},
-			{Key: "op", Value: "getmore"},
 			{Key: "cursor.cursorId", Value: bson.D{{Key: "$exists", Value: true}}},
-		}}},
+		}, match...)}},
 		bson.D{{Key: "$project", Value: bson.D{
 			{Key: "cursor.cursorId", Value: 1},
 		}}},
@@ -1602,6 +1618,97 @@ func TestIntegration_MongoTenantFeedTornDownOnLastUnsubscribe(t *testing.T) {
 
 	if calls := conn.resolveCalls(); calls != before+1 {
 		t.Errorf("ResolveDatabase calls = %d, want %d: a re-subscribed tenant must resolve its database again", calls, before+1)
+	}
+}
+
+// TestIntegration_MongoStoppedFeedKillsItsCursor pins that stopping a feed
+// kills its server-side cursor instead of leaving it for the server's cursor
+// timeout (10 minutes by default) to reap.
+func TestIntegration_MongoStoppedFeedKillsItsCursor(t *testing.T) {
+	client, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	for _, tc := range []struct {
+		name string
+		stop func(s *mongodb.Store, unsub func()) error
+	}{
+		{"last unsubscribe", func(_ *mongodb.Store, unsub func()) error { unsub(); return nil }},
+		{"store close", func(s *mongodb.Store, _ func()) error { return s.Close() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conn := newFakeConnector()
+			dbName := tenantDB(t, client, conn, "t1", "cursorkill").Name()
+			s := tenantStore(t, conn)
+
+			events, unsub := subscribeScope(t, s, store.Scope{Tenant: "t1"})
+			recvEvent(t, events, "resync")
+			awaitCursors(t, client, dbName, "1 cursor", func(ids []int64) bool { return len(ids) == 1 })
+
+			if err := tc.stop(s, unsub); err != nil {
+				t.Fatalf("stop: %v", err)
+			}
+
+			awaitCursors(t, client, dbName, "none", func(ids []int64) bool { return len(ids) == 0 })
+		})
+	}
+}
+
+// TestIntegration_MongoStoppedFeedKillsResumedCursor pins that a stop kills the
+// cursor the driver resumed onto inside one read after a network blip, not the
+// cursor the feed opened.
+func TestIntegration_MongoStoppedFeedKillsResumedCursor(t *testing.T) {
+	client, endpoint, cleanup := startContainerAt(t)
+	t.Cleanup(cleanup)
+
+	proxy := newTCPProxy(t, endpoint)
+	s, dbName := proxiedStore(t, proxy, "resumekill", 0)
+
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	events, _ := subscribeScope(t, s, store.Scope{})
+	recvEvent(t, events, "the joining resync")
+
+	opened := awaitSingleChangeStreamCursor(t, client, dbName)
+	resumed := func(ids []int64) bool {
+		return slices.ContainsFunc(ids, func(id int64) bool { return id != opened })
+	}
+
+	// Shorter than the 2s server-selection bound: the driver resumes inside the
+	// read in flight instead of failing it.
+	proxy.sever()
+	time.Sleep(300 * time.Millisecond)
+	proxy.restore(t)
+
+	awaitCursors(t, client, dbName, "a resumed cursor", resumed)
+	assertNoEvent(t, events, 200*time.Millisecond, "a resume inside one read")
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	awaitCursors(t, client, dbName, "no resumed cursor", func(ids []int64) bool { return !resumed(ids) })
+}
+
+// awaitCursors polls the idle-inclusive census of the feed's collection until
+// ok accepts it.
+func awaitCursors(t *testing.T, client *mongo.Client, dbName, want string, ok func(ids []int64) bool) {
+	t.Helper()
+
+	deadline := time.Now().Add(15 * time.Second)
+
+	for {
+		ids := changeStreamCursorIDs(t, client, dbName)
+		if ok(ids) {
+			return
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("change-stream cursors on %s.%s = %v, want %s", dbName, changefeedCollection, ids, want)
+		}
+
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
