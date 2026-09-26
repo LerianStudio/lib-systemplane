@@ -308,8 +308,8 @@ func WithContextValidator(fn func(ctx context.Context, value any) error) KeyOpti
 //
 // A key takes one kind of validator: combined with [WithValidator] or
 // [WithContextValidator] on the same key, [Client.Register] refuses it with
-// [ErrValidation]. [Bind] always installs its own validator, so Bind refuses it
-// too. A nil fn is ignored.
+// [ErrValidation]. systemplane.Bind always installs its own validator, so Bind
+// refuses it too. A nil fn is ignored.
 func WithWriteValidator(fn func(any) error) KeyOption {
 	return func(k *keyDef) {
 		if fn != nil {

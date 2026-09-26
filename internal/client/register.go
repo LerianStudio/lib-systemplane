@@ -87,7 +87,7 @@ func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOp
 
 	if def.writeValidator != nil {
 		if def.validator != nil {
-			return fmt.Errorf("%w: WithWriteValidator cannot be combined with WithValidator or WithContextValidator", ErrValidation)
+			return fmt.Errorf("%w: a key takes one kind of validator: WithWriteValidator cannot join another, and Bind installs its own", ErrValidation)
 		}
 
 		def.validator = def.writeValidator
