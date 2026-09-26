@@ -1,4 +1,3 @@
-// Published-state types for systemplane Client subscribers.
 package client
 
 import "github.com/LerianStudio/lib-systemplane/v4/internal/engine"

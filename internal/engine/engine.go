@@ -46,7 +46,7 @@ type Engine struct {
 
 	// activations is what Activate, Block and Reactivate share (activate.go).
 	activations
-	metrics *metrics // FC-12's instruments (metrics.go); nil records nothing
+	metrics *metrics // the engine metrics (metrics.go); nil records nothing
 
 	// subscribers is keyed by NSKey alone, never by scope: OnChange covers
 	// that key in every scope the engine tracks and Change.Tenant names the
@@ -116,7 +116,7 @@ type Config struct {
 	// ValidatorContext derives a tenant scope's read-back validator context
 	// from the dispatch one. nil, and the zero scope, keep the dispatch one.
 	ValidatorContext func(ctx context.Context, scope store.Scope) context.Context
-	// Telemetry feeds FC-12's instruments, AggregateTenantThreshold FC-10's collapse.
+	// Telemetry feeds the engine metrics; aggregateTenant documents the threshold.
 	Telemetry                store.Telemetry
 	AggregateTenantThreshold int
 }
@@ -130,7 +130,7 @@ type Config struct {
 // idempotent, so a logger the Client already guarded is wrapped once, not twice.
 //
 // It opens no connection and starts no goroutine — Start does that. With a
-// meter it registers FC-12's gauge callback, which Close unregisters.
+// meter it registers the gauge callback, which Close unregisters.
 func New(cfg Config) *Engine {
 	logger := log.Guard(cfg.Logger)
 
@@ -164,14 +164,14 @@ func New(cfg Config) *Engine {
 // Start brings up the single-tenant scope and returns once its first reconcile
 // has completed, so a caller reading afterwards is looking at a cache the
 // store has confirmed and a subscriber registered beforehand cannot have
-// missed the announcement of a key (FC-11).
+// missed the announcement of a key.
 //
 // Start runs NO reconcile of its own. It creates the scope, opens the
 // changefeed, and waits: the store guarantees an OpResync after every
 // (re)connect, and that resync drives the one initial reconcile. Reconciling
 // here as well would publish a registered key's default twice for a key with
 // no row — revision 0 is never deduplicated, so the second publication is
-// accepted and delivered, which is the double delivery FC-11 forbids.
+// accepted and delivered: a double Start announcement.
 //
 // Four failures, four different outcomes:
 //
@@ -209,7 +209,7 @@ func New(cfg Config) *Engine {
 // store's OpResync after the fresh Subscribe drives a fresh first reconcile.
 // Subscriptions survive it: they belong to the engine and are keyed by key,
 // never by scope, so an OnChange registered before the failed Start hears the
-// retry's announcement (FC-11). A ctx expiry needs none of this — the scope is
+// retry's announcement. A ctx expiry needs none of this — the scope is
 // still subscribed and still waiting for its first resync, so the next Start
 // waits on the same channel.
 func (e *Engine) Start(ctx context.Context) error {
@@ -475,7 +475,7 @@ func scopeLabel(scope store.Scope) string {
 
 // Publish takes the row the Client has just persisted and puts it through the
 // engine's ingress, so the caller's own next read sees its write before the
-// changefeed echoes it (D4).
+// changefeed echoes it.
 //
 // It takes a store.Entry — marshaled bytes, the revision the store returned,
 // the provenance — and deliberately NOT an already-decoded Go value: the feed
@@ -599,14 +599,14 @@ func (e *Engine) writeScope(ctx context.Context, scope store.Scope, nk NSKey) (*
 // scopeState.unconfirmed). Both are read under the same lock as the entry, so
 // one Lookup is an atomic read of value and freshness.
 //
-// The second half is per key because what was lost is one row: FC-5 freezes
-// Stale as a field of one key's Entry. A miss inside a tracked scope still
+// The second half is per key because what was lost is one row, and Stale is
+// a field of one key's Entry. A miss inside a tracked scope still
 // carries it, so a default served after a first reconcile that published
 // nothing is never reported as confirmed; only an untracked scope reports the
 // zero Entry.
 //
 // A call on a tracked scope counts one systemplane.cache_reads_total, hit or
-// miss (FC-12); an untracked scope has no cache to read.
+// miss; an untracked scope has no cache to read.
 func (e *Engine) Lookup(scope store.Scope, nk NSKey) (Entry, bool) {
 	if e == nil {
 		return Entry{}, false

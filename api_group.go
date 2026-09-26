@@ -23,6 +23,10 @@ type Group[T any] struct {
 	namespace string
 	key       string
 
+	// multiTenant is the Client's mode: a multi-tenant Client stamps the ctx
+	// tenant on a Snapshot and seeds no OnApply registration.
+	multiTenant bool
+
 	// coordinator holds the per-scope publication cache and the registered
 	// apply functions. It is built at Bind, so it is never nil on a group the
 	// caller holds.
@@ -38,7 +42,7 @@ type Group[T any] struct {
 // Snapshot is the state of a group's document in one scope.
 type Snapshot[T any] struct {
 	Value    T
-	Revision int64  // 0 when the row is absent
+	Revision int64  // 0 while the defaults are in force, or its row has no revision
 	Tenant   string // "" in single-tenant mode
 	Stale    bool
 }
@@ -160,14 +164,14 @@ func Bind[T any](c *Client, namespace, key string, defaults T, validate func(T) 
 		return nil, err
 	}
 
-	g := &Group[T]{client: c, namespace: namespace, key: key}
-
-	// The Client's mode decides the tenant stamp on the coordinator's reports.
-	// Register above succeeded, so CatalogKey knows the key and TenantScoped
-	// reports the mode verbatim.
+	// The Client's mode decides the tenant stamp on Snapshot and on the
+	// coordinator's reports. Register above succeeded, so CatalogKey knows the
+	// key and TenantScoped reports the mode verbatim.
 	detail, _ := c.CatalogKey(namespace, key)
 
-	g.coordinator = group.NewCoordinator[T](c.Logger(), g.namespace, g.key, detail.TenantScoped,
+	g := &Group[T]{client: c, namespace: namespace, key: key, multiTenant: detail.TenantScoped}
+
+	g.coordinator = group.NewCoordinator[T](c.Logger(), g.namespace, g.key, g.multiTenant,
 		group.Decode[T], g.seedCurrentEntry)
 
 	// The group's one subscription, taken here — before Start, and therefore
@@ -208,28 +212,14 @@ func (g *Group[T]) publish(ctx context.Context, ch Change) {
 // The read uses context.Background() because OnApply takes no context, so a
 // seeded snapshot carries the single-tenant scope.
 //
-// A tenant-scoped key is the one case with nothing to seed by construction:
-// its document belongs to a tenant, and every tenant's own arrives as a
-// publication of its scope, so there is no single document in force for a
-// context carrying no tenant to read. Reading anyway would either refuse for
-// want of a tenant database or, worse, deliver the zero scope's document as
-// though it were every tenant's. The registration takes the live deliveries
-// only. CatalogKey is how the facade asks; on a closed Client it reports no
-// key at all, and the read below is then the right answer either way, because
-// it fails with ErrClosed and that travels back to the registrant.
-//
-// The question the gate actually asks is "is this Client multi-tenant".
-// CatalogKey answers it only because TenantScoped is a catalog PRESENTATION
-// field that reports the Client's mode verbatim, and it pays a deep clone of
-// the registered default to return one bool. The gate is still safe on every
-// known=false answer. Bind calls Register before it hands this closure to
-// NewCoordinator, so the key is registered by the time the coordinator can
-// invoke it and an unregistered key never reaches here. And a multi-tenant
-// Client that falls through does not serve the zero scope: its GetEntry fails
-// closed with ErrTenantConnectionMissing, because context.Background()
-// carries no tenant database.
+// A multi-tenant Client has nothing to seed by construction: its document
+// belongs to a tenant, and every tenant's own arrives as a publication of its
+// scope, so there is no single document in force for a context carrying no
+// tenant to read. Reading anyway would either refuse for want of a tenant
+// database or, worse, deliver the zero scope's document as though it were
+// every tenant's. The registration takes the live deliveries only.
 func (g *Group[T]) seedCurrentEntry() (group.Publication, bool, error) {
-	if detail, known := g.client.CatalogKey(g.namespace, g.key); known && detail.TenantScoped {
+	if g.multiTenant {
 		return group.Publication{}, false, nil
 	}
 
@@ -284,12 +274,12 @@ func (g *Group[T]) Snapshot(ctx context.Context) (Snapshot[T], error) {
 		return Snapshot[T]{}, fmt.Errorf("%w: %s/%s is not a %T: %w", ErrValidation, g.namespace, g.key, value, err)
 	}
 
-	return Snapshot[T]{
-		Value:    value,
-		Revision: entry.Revision,
-		Tenant:   tmcore.GetTenantIDContext(ctx),
-		Stale:    entry.Stale,
-	}, nil
+	snap := Snapshot[T]{Value: value, Revision: entry.Revision, Stale: entry.Stale}
+	if g.multiTenant {
+		snap.Tenant = tmcore.GetTenantIDContext(ctx)
+	}
+
+	return snap, nil
 }
 
 // Set writes value as the group's whole document in the caller's scope,
@@ -321,9 +311,6 @@ func (g *Group[T]) Set(ctx context.Context, value T, actor string) error {
 // while a publication is a value the engine has just observed; a subscriber
 // that needs to know whether its scope is currently converged calls
 // [Group.Snapshot].
-//
-// Tenant names the scope that published, which is not the same rule
-// [Snapshot] follows on a read.
 //
 // Value is the one decoded document every applier of the group receives, and
 // is what Previous carries on the next delivery, so an applier must treat it
@@ -375,10 +362,11 @@ type ApplyStatus struct {
 // may repeat). Later revisions arrive serialized and coalesced per
 // scope; Status.Desired always names the newest published revision even when
 // fn has not seen intermediate ones. fn returning an error records that
-// revision as rejected for the scope (visible in Status) and keeps the
-// previously applied revision as current; the engine does not retry. Before a
-// single-tenant Start, OnApply registers and its initial delivery is Start's
-// announcement, which may land either side of Start's return.
+// revision as rejected for the scope (in Status unless the tenant is suspended
+// or deleted) and keeps the applied revision current; the engine does not
+// retry. Before a single-tenant Start, OnApply registers and its initial
+// delivery is Start's announcement, which may land either side of Start's
+// return.
 //
 // fn runs with no lock held and may call [Group.Snapshot], [Group.Status],
 // [Group.Set] or OnApply for its own group. A re-entrant OnApply appends its
@@ -413,7 +401,7 @@ type ApplyStatus struct {
 // instead of running its compiled-in defaults until a write that may never come.
 // Reading after [Client.Close] fails this way. A key with nothing stored is not
 // a failure — the registered defaults are delivered once the Client tracks it.
-// An open multi-tenant Client takes no such read.
+// A multi-tenant Client takes no such read.
 //
 // A nil fn registers nothing and returns no error, matching [Client.OnChange].
 // unsubscribe is idempotent, is safe to call from inside fn itself, and
@@ -461,8 +449,8 @@ func (g *Group[T]) OnApply(fn func(ctx context.Context, a Applied[T]) error) (un
 }
 
 // Status reports the desired and applied revisions of every scope the group
-// has observed a publication for, sorted by tenant. Status on a nil *Group
-// returns nil.
+// has observed a publication for, sorted by tenant, less a suspended or
+// deleted tenant until tenant.activated. Status on a nil *Group returns nil.
 func (g *Group[T]) Status() []ApplyStatus {
 	if g == nil {
 		return nil
@@ -470,12 +458,16 @@ func (g *Group[T]) Status() []ApplyStatus {
 
 	observed := g.coordinator.Status()
 
-	out := make([]ApplyStatus, len(observed))
-	for i, st := range observed {
+	out := make([]ApplyStatus, 0, len(observed))
+	for _, st := range observed {
+		if asInternalClient(g.client).TenantBlocked(st.Tenant) {
+			continue
+		}
+
 		// A struct conversion, not a field-by-field copy: it stops compiling
 		// the moment the two shapes drift, which is the cheapest lock between
 		// the contract here and the aggregation in internal/group.
-		out[i] = ApplyStatus(st)
+		out = append(out, ApplyStatus(st))
 	}
 
 	return out

@@ -7,19 +7,18 @@ type Change struct {
 	Tenant    string // "" in single-tenant mode
 	Namespace string
 	Key       string
-	Revision  int64 // 0 when no row exists: Value is the registered default
+	Revision  int64 // 0 when no row backs Value, or its row has no revision
 	Value     any   // decoded and validated; the receiver owns this copy
 }
 
 // Entry is the published state of one key in the caller's scope.
 type Entry struct {
 	Value     any
-	Revision  int64     // 0 when no row exists (default in force)
+	Revision  int64     // 0 when no row backs Value, or its row has no revision
 	UpdatedAt time.Time // zero when no row exists
 	UpdatedBy string
-	// Stale is true while nothing is confirming THIS key: the scope's
-	// changefeed is disconnected or not yet reconciled since it connected, or
-	// this key could not be re-read after its last change. It describes the key
-	// the Entry was returned for, not every key of the scope (FC-5).
+	// Stale is true while nothing confirms THIS key: before a single-tenant
+	// Start, while the changefeed is down or unreconciled, or while this key
+	// failed its re-read. A per-request read is never stale.
 	Stale bool
 }

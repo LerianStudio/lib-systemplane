@@ -50,7 +50,7 @@ type publication struct {
 //     cached yet, or pub.Revision == 0 (a delete or a reconcile-absent; never
 //     deduplicated, and it resets the cached revision to 0).
 //   - accepted (notify=true): pub.Revision == cached.Revision && != 0 but the
-//     values differ — D3's foreign-writer rule. A writer that changes value
+//     values differ — the foreign-writer rule. A writer that changes value
 //     without bumping revision is observed, not deduplicated away.
 //   - refreshed (notify=false): pub.Revision == cached.Revision && != 0 and
 //     the values are equal — UpdatedAt and UpdatedBy are overwritten so
@@ -145,7 +145,7 @@ func (e *Engine) publish(sc *scopeState, pub publication) (notify bool, err erro
 		// arriving in the store's own spelling rather than this process's.
 		// Equality is on the decoded value, never on raw bytes alone, so that
 		// no-op does not fire a callback. This walk only runs when the bytes
-		// already differ — a reformatted row, a first echo, or D3's foreign
+		// already differ — a reformatted row, a first echo, or a foreign
 		// writer.
 		//
 		// Adopt the new spelling along with the provenance: keeping the old
@@ -166,7 +166,7 @@ func (e *Engine) publish(sc *scopeState, pub publication) (notify bool, err erro
 
 		return false, nil
 	default:
-		// Equal non-zero revision carrying a different value: D3's foreign
+		// Equal non-zero revision carrying a different value: a foreign
 		// writer, which changed value without bumping revision. Observed.
 	}
 
@@ -201,8 +201,8 @@ func (e *Engine) publish(sc *scopeState, pub publication) (notify bool, err erro
 	// non-blocking channel send. It costs one more thing on a subscribed key's
 	// FIRST published change, which starts that key's delivery goroutine under
 	// this lock. Workers are bounded at one per subscribed key per scope, so
-	// this is a one-off per key, and FC-11 concentrates almost every launch in
-	// the first reconcile at Start, where it publishes every registered key.
+	// this is a one-off per key, and almost every launch lands in the first
+	// reconcile at Start, which publishes every registered key.
 	e.dispatch(sc, pub)
 
 	return true, nil

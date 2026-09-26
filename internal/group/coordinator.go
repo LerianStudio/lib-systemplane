@@ -7,9 +7,8 @@
 // callbacks out of order; the Client's OnChange never does, because it
 // delivers each (scope, key) serially from one worker.
 //
-// Nothing is pruned. A scope entry and every registered function's bookkeeping
-// for it live as long as the coordinator, so a tenant the Client has stopped
-// serving keeps its row in Status.
+// Nothing is pruned: a scope entry and its bookkeeping live as long as the
+// coordinator, and the root Group hides a blocked tenant from Status.
 package group
 
 import (
@@ -43,8 +42,8 @@ type Decoded[T any] struct {
 	Value    T
 }
 
-// ApplyFunc is what Register takes. previous is nil on the first delivery for
-// the scope and is the last value THIS function accepted otherwise.
+// ApplyFunc is what Register takes. previous is the last document THIS
+// function accepted for the scope, nil until it has accepted one.
 type ApplyFunc[T any] func(ctx context.Context, current Decoded[T], previous *Decoded[T]) error
 
 // Status reports one scope's desired and applied revisions.

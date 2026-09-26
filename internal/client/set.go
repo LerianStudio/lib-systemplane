@@ -1,4 +1,3 @@
-// Write path for systemplane Client.
 package client
 
 import (
@@ -13,7 +12,7 @@ import (
 )
 
 // Set writes a new value for (namespace, key), then publishes it so the
-// caller's own next read sees its write before the changefeed echoes it (D4).
+// caller's own next read sees its write before the changefeed echoes it.
 //
 // The value is JSON-marshaled and the registered validator grades the CANONICAL
 // decoded shape — what the store will hand back — not the caller's Go value.
@@ -98,11 +97,13 @@ func (c *Client) Set(ctx context.Context, namespace, key string, value any, acto
 		}
 	}
 
+	// Milliseconds, the coarsest precision either backend stores, so the stamp
+	// published below is the stamp persisted and a later echo cannot differ.
 	entry := store.Entry{
 		Namespace: namespace,
 		Key:       key,
 		Value:     jsonBytes,
-		UpdatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC().Truncate(time.Millisecond),
 		UpdatedBy: actor,
 	}
 
@@ -113,7 +114,6 @@ func (c *Client) Set(ctx context.Context, namespace, key string, value any, acto
 
 	// Written through ctx's middleware-resolved database, published into the
 	// connector-resolved scope of the same tenant: one database by construction.
-	// The echo deduplicates by revision and refreshes the UpdatedAt stamped above.
 	entry.Revision = revision
 
 	return c.published(c.engine.Publish(ctx, scope, entry), namespace, key, "written")
@@ -142,7 +142,7 @@ func (c *Client) published(err error, namespace, key, done string) error {
 
 // Delete removes a single (namespace, key) row, then publishes the registered
 // default at revision 0 so the caller's own next read stops serving the value
-// it just removed (D4).
+// it just removed.
 //
 // A nil return means the next read in this process serves the registered
 // default or something newer. Every refusal the publication can still make —

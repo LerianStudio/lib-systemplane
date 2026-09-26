@@ -46,7 +46,7 @@
 |-------|-----------|-------|--------|
 | 1 | A multi-tenant Client with a tenant manager configured activates a tenant's scope on that tenant's first read, serves every later read of it from the cached scope with real revision and provenance, fires one `OnChange` per tenant with `Change.Tenant` set, and reads back its own multi-tenant writes — on Postgres and on MongoDB, proven against fakes | 1.0, 1.1, 1.2, 1.3 | Complete |
 | 2 | Tenant-manager lifecycle events drive the same engine: `Client.HandleTenantLifecycle` activates, drops, blocks and rotates, a suspended or deleted tenant never re-activates from a read, and per-tenant metrics carry `tenant_id` up to `WithAggregateTenantThreshold` and `aggregate` above it | 2.1, 2.2 | Complete |
-| 3 | The whole path is proven on live backends: testcontainers Postgres and a Mongo replica set, two tenant databases each, activation gap, feed loss per tenant, tenant isolation, `-race` and goleak clean | 3.1, 3.2, 3.3 | Epic-level |
+| 3 | The whole path is proven on live backends: testcontainers Postgres and a Mongo replica set, two tenant databases each, activation gap, feed loss per tenant, tenant isolation, `-race` and goleak clean | 3.1, 3.2, 3.3 | Complete |
 
 ---
 
@@ -595,21 +595,129 @@ default threshold is 1000; the public facade exposes both names.
 
 D6 makes MongoDB equal to Postgres, and the index's Done-when for this lane requires testcontainers coverage on both with two tenant databases each. Everything here is integration-tagged; nothing new ships in production code except whatever the container runs expose.
 
+Elaborated 2026-09-26 against `develop` `c344a63` (after PR #104). `file:line` references point at that ref; the symbol is named first, so drift costs a search, not a wrong edit.
+
+**Order:** 3.1.1 → then two chains in parallel: 3.1.2 (main worktree) and 3.2.1 → 3.2.2 → 3.2.3 (side worktree). Epic 3.3 is the harness's close stage.
+
+**Shared decisions (P3-1..P3-8):**
+
+- **P3-1 One level.** Every scenario is tested once, at the Client, against a real tenant-manager-shaped connector and real backends. The planned `internal/engine/tenants_integration_test.go` is dropped: an engine-level live test would re-prove the same path through a thinner door.
+- **P3-2 Package.** Every new file is `//go:build integration`, `package client_test`, in `internal/client/`. The external test package may import the root module (`systemplane.SchemaSQL()`, `systemplane.Bind`) without an import cycle, and needs nothing unexported: `client.NewPostgres`, `client.NewMongoDB`, `WithMultiTenantEnabled`, `WithPostgresTenantManager`, `WithMongoTenantManager`, `WithLogger`, `WithDebounce`, `Register`, `Start`, `Get`, `GetEntry`, `Set`, `OnChange`, `HandleTenantLifecycle` and `Close` are all exported.
+- **P3-3 TestMain.** `internal/client/main_test.go` becomes `//go:build unit || integration` and `package client_test`. It runs `m.Run()`, then every function in a package-level `afterRun []func()` slice (the harness appends container termination to it inside its `sync.Once`), then `goleak.Find` with an ignore list — the `internal/postgres/main_test.go:28-60` shape, not `goleak.VerifyTestMain`. The ignore list starts as that file's entries (testcontainers Reaper, `pgxpool` health check, `net/http` persistConn read/write loops) and grows only by driver or tenant-manager goroutines that a run proves survive `Client.Close` + `Manager.Close` + `tmclient.Close`, each with a one-line reason. Under `unit` the slice is empty and the behaviour is today's.
+- **P3-4 Fake tenant manager.** An `httptest.Server` answers `GET /v1/tenants/{tenantID}/associations/{service}/connections` (lib-commons `commons/tenant-manager/client/client.go:446`) from a mutex-guarded `map[string]core.TenantConfig`, 404 for an unknown tenant. The config's `Databases` map is keyed by module `"systemplane"` and carries `postgresql` (host, port, database, username, password of the shared container) or `mongodb` (the container URI with `directConnection=true`, database). The real client is `tmclient.NewClient(srv.URL, nil, tmclient.WithAllowInsecureHTTP(), tmclient.WithServiceAPIKey("k"))`; the managers are `tmpostgres.NewManager(tmc, "systemplane-it", tmpostgres.WithModule("systemplane"), tmpostgres.WithConnectionsCheckInterval(0))` and the `tmmongo` equivalent. `t.Cleanup` closes the Client, then the manager, then `tmc`. Before writing the JSON, read `core.TenantConfig` in the lib-commons version `go.mod` pins and match its field tags; do not guess them.
+- **P3-5 Request context.** A tenant's request ctx is what the middleware would build: `tmcore.ContextWithTenantID(ctx, id)` plus `tmcore.ContextWithPG(ctx, db, "systemplane")` or `tmcore.ContextWithMB(ctx, mdb, "systemplane")`, where `db`/`mdb` is the test's own handle on that tenant's database. The per-request read path uses it (`internal/client/get.go:110-150`, the zero scope); the tenant scope resolves through the connector.
+- **P3-6 Feed inventory from the backend itself.** Postgres: count `pg_stat_activity` rows with `datname = <tenant db>` and `query LIKE 'LISTEN%'` (copy `listenBackends`/`waitForListenBackends`, `internal/postgres/postgres_integration_test.go:1160-1200`). MongoDB: `$currentOp` with `allUsers: true` matching `ns = <db>.systemplane_entries`, `type = op`, `op = getmore` (copy `inFlightGetMoreCursorIDs`/`awaitSingleChangeStreamCursor`, `internal/mongodb/mongodb_integration_test.go:294-345`). No production file changes and `FeedsSnapshot` stays test-only in its own package. **Every census is proven before a zero is trusted:** each test that asserts zero first shows the same helper reading 1 for an activated tenant. A zero is asserted as "reached, then held for 1s", never as one sample; the 5s activation cooldown (`internal/engine/activate.go`) guarantees no retry inside that window.
+- **P3-7 Signals, not sleeps.** A capture logger passed through `client.WithLogger` records messages; tests wait for `"scope activated"` (INFO, `internal/engine/activate.go:191`) or `"scope activation failed; reads stay per-request until a later attempt"` (WARN, `:169`) carrying the tenant id. Every positive wait is a bounded poll (15s); a fixed sleep appears only as the 1s hold of P3-6 or the no-delivery window of Task 3.1.1 (three debounce periods).
+- **P3-8 Tenants per test.** Each test creates its own tenant databases with unique names (`CREATE DATABASE` + `systemplane.SchemaSQL()` for Postgres; a fresh database name for MongoDB) and registers them in the fake tenant manager, so no test depends on another's state or order. Containers are shared per binary: one `postgres:16-alpine`, one `mongo:7` replica set `rs0`, one standalone `mongo:7` for Task 3.2.3, each started lazily. Docker ports stay on the testcontainers default mapping to localhost.
+
 ### Epic 3.1: Two tenants on live Postgres
 
 **Goal:** The lazy activation, the per-tenant feed and the lifecycle handler work against a real tenant-manager-shaped connector and real LISTEN connections.
-**Scope:** `internal/engine/tenants_integration_test.go` (new), `internal/client/tenant_integration_test.go` (new).
+**Scope:** `internal/client/main_test.go`, `internal/client/harness_integration_test.go` (new), `internal/client/tenant_postgres_integration_test.go` (new).
 **Dependencies:** Phases 1 and 2.
 **Done when:** the first `Get` for `t1` activates its scope and a later read hits the cache while `t2` is untouched; a write to `t1` delivers exactly one `Change` with `Tenant == "t1"` and none to `t2`; `pg_terminate_backend` on `t1`'s LISTEN connection makes `GetEntry` for `t1` report `Stale: true` and leaves `t2` unaffected, and a value written during the gap is visible after the reconnect with no second write (index Integration Lane scenario 2); a write racing the first read of `t1` is visible after activation without a second write (scenario 6); `HandleTenantLifecycle(Suspended)` drops `t1`'s LISTEN connection and a following read does not re-open it; two concurrent first reads for one tenant open exactly one LISTEN connection; a failed activation leaves exactly zero live subscriptions for that tenant (asserted through the backend's own feed inventory, not inferred); `-race` and goleak clean.
-**Status:** Pending
+**Status:** Done
+
+#### Task 3.1.1: Live Postgres harness, activation, isolation and single-flight
+
+- [x] Done
+
+**Context:** `internal/client` has no integration test and no integration TestMain (`main_test.go` is `//go:build unit`, a bare `goleak.VerifyTestMain`). The only live tenant-manager test is `internal/postgres/connector_pgmgr_integration_test.go`, which seeds the manager's cache with `WithTestConnections` and bypasses the HTTP client. The Client's tenant read is `tenantEntry` (`internal/client/get.go:110`): `engine.Lookup` hit, else `engine.Activate` plus a per-request read of the zero scope.
+
+**Implementation vision:** Apply P3-2, P3-3, P3-4, P3-5, P3-7 and P3-8 in `harness_integration_test.go`: the shared Postgres container, `newPGTenant(t, id)` (database + schema + fake-manager entry + the test's own `*sql.DB` on it + the request ctx), `newPGTenantClient(t, opts...)` (fake manager, real `tmclient`, real `tmpostgres.Manager`, `client.NewPostgres(nil, "", WithMultiTenantEnabled(), WithPostgresTenantManager(mgr), WithLogger(capture), ...)`, one registered string key, `Start`), the capture logger, and the LISTEN census of P3-6. Then three tests in `tenant_postgres_integration_test.go`:
+1. `t1` and `t2` each hold a distinct row for the key. The first `GetEntry` on `t1` returns the row value; after `"scope activated"` for `t1`, a second `GetEntry` returns the same value with the row's `Revision`, `UpdatedAt` and `UpdatedBy`; the census reads 1 for `t1`'s database and 0 for `t2`'s. A third read through a ctx that carries only `t1`'s tenant id, with no database handle, still returns the row with its provenance: the per-request path would fail with `ErrTenantConnectionMissing`, so only the cache can answer it. `t2`'s first read afterwards returns `t2`'s own value.
+2. `OnChange` on the key; activate `t1` and `t2` by one read each and wait for both `"scope activated"`; record the deliveries seen so far per tenant (activation announcements are allowed, not asserted); `Set` through `t1`'s ctx; wait for the `t1` delivery; hold three debounce periods (`WithDebounce(50ms)`); assert exactly one new delivery, `Tenant == "t1"`, the new value and a non-zero revision, and zero new deliveries for `t2`. This pins the publish-then-NOTIFY-echo dedupe on a live backend.
+3. Sixteen goroutines released by one channel close each call `Get` on a fresh tenant's ctx; after `"scope activated"` the census reads exactly 1 for that tenant's database, held 1s.
+
+**Files:**
+- Modify: `internal/client/main_test.go`
+- Create: `internal/client/harness_integration_test.go`
+- Create: `internal/client/tenant_postgres_integration_test.go`
+
+**Verification:** `TESTCONTAINERS_RYUK_DISABLED=true go test -tags=integration -race -count=1 -run 'TestIntegration_' ./internal/client/` passes; `go test -tags=unit -race -count=1 ./internal/client/` still passes; `go vet -tags=integration ./internal/client/` is clean. RED: run test 3 with the census expectation set to 2 once and capture the failure, proving the census counts.
+
+**Done when:** the three tests pass under `-race`, goleak reports nothing after the run, and each test owns its tenant databases.
+
+#### Task 3.1.2: Postgres feed loss, racing write, suspension and failed activation
+
+- [x] Done
+
+**Context:** Task 3.1.1's harness. `OpDisconnect` marks the scope stale (`internal/engine/feed.go:100`, `markStale` at `:488`); the reconnect reconciles the whole scope. `activate` drops a scope whose first reconcile fails and logs the P3-7 WARN (`internal/engine/activate.go:152-172`). The Postgres runtime performs no schema provisioning in multi-tenant mode, so a tenant database without `systemplane_entries` fails that reconcile.
+
+**Implementation vision:** Four tests appended to `tenant_postgres_integration_test.go`; do not edit `main_test.go` (chain 3.2 owns further ignore entries):
+1. Gap. Activate `t1` and `t2`. Open a dedicated `*sql.Conn` on `t1`'s database and keep it. From the container's `postgres` database run `ALTER DATABASE <t1> ALLOW_CONNECTIONS false`, then `pg_terminate_backend` on `t1`'s LISTEN backend only. Wait until `GetEntry` on `t1` reports `Stale: true` while `t2` reports `Stale: false`. Write a new value on the held conn with a plain `INSERT ... ON CONFLICT (namespace, key) DO UPDATE` (the trigger bumps the revision). Assert `t1` still serves the old value and `Stale: true`. `ALTER DATABASE <t1> ALLOW_CONNECTIONS true`; wait until `t1` serves the new value with `Stale: false` and the census reads 1 again. No second write. `t.Cleanup` restores `ALLOW_CONNECTIONS true` first, so a failed test cannot wedge teardown. If `datallowconn = false` does not hold the reconnect off (the gap closes before the Stale assertion), stop and report it rather than weaken the assertion.
+2. Racing write (scenario 6), five fresh tenants, one iteration each: a `Set` through the tenant's ctx and its first `Get` start together from one channel close; after `"scope activated"`, `GetEntry` converges to the written value and revision without another write.
+3. Suspension. Activate `t1`; census 1. `HandleTenantLifecycle(ctx, tmevent.TenantLifecycleEvent{EventType: tmevent.EventTenantSuspended, TenantID: t1})` returns nil; census reaches 0. A following `Get` on `t1`'s ctx still answers (per request, through the ctx database) and the census stays 0 for the 1s hold.
+4. Failed activation. A tenant whose database exists with no schema. Its first `Get` returns an error (the per-request read has no table); wait for the P3-7 WARN for that tenant; the census for its database reaches 0 and holds 1s; in the same test the census reads 1 for an activated healthy tenant (P3-6 proof).
+
+**Files:**
+- Modify: `internal/client/tenant_postgres_integration_test.go`
+
+**Verification:** as Task 3.1.1, plus `-count=3` on these four tests passes. RED: comment out the `ALLOW_CONNECTIONS false` statement once and capture the gap test failing on its Stale assertion.
+
+**Done when:** the four tests pass under `-race`, `-count=3` included, and goleak stays clean.
 
 ### Epic 3.2: Two tenants on a live MongoDB replica set
 
 **Goal:** The same, on the backend the Console will actually run (D6), including the polling fallback.
-**Scope:** `internal/client/tenant_mongo_integration_test.go` (new).
+**Scope:** `internal/client/harness_mongo_integration_test.go` (new), `internal/client/tenant_mongo_integration_test.go` (new), `internal/client/main_test.go` (ignore entries only).
 **Dependencies:** Epic 3.1.
 **Done when:** every assertion in Epic 3.1 holds with `WithMongoTenantManager` against a replica-set container with two tenant databases, with the change-stream cursor severed instead of the LISTEN backend killed (index Integration Lane scenario 3, multi-tenant half); a tenant database that does not yet hold the collection is materialized at activation rather than silently reading empty; `Group.OnApply` `Status()` shows both tenants applied (scenario 4's Mongo half); a standalone Mongo with `WithPollInterval` activates a tenant and converges the same way; `-race` and goleak clean.
-**Status:** Pending
+**Status:** Done
+
+#### Task 3.2.1: Live MongoDB harness, activation, isolation, single-flight, collection materialized
+
+- [x] Done
+
+**Context:** Task 3.1.1's fake manager, capture logger and TestMain. The tenant connector is `mbMgrConnector.ResolveDatabase` → `tmmongo.Manager.GetDatabaseForTenant` (`internal/mongodb/connector.go`). Every tenant database, ctx-carried or connector-resolved, goes through the lazy bootstrap that materializes the collection (`internal/mongodb/mongodb.go:265-300`).
+
+**Implementation vision:** `harness_mongo_integration_test.go`: the shared replica-set container (`mongocontainer.Run(ctx, "mongo:7", mongocontainer.WithReplicaSet("rs0"))`, as `internal/mongodb/mongodb_integration_test.go:52`), `newMongoTenant(t, id)` (fake-manager entry with the `mongodb` config, the test's own `*mongo.Database`, the request ctx with `ContextWithMB`), `newMongoTenantClient(t, opts...)` (`client.NewMongoDB(nil, "", WithMultiTenantEnabled(), WithMongoTenantManager(mgr), ...)`), and the cursor census of P3-6. Tests in `tenant_mongo_integration_test.go`: the three tests of Task 3.1.1 with rows written by the test's own collection handle and the census counting in-flight change-stream getMores, plus a fourth: a tenant database with no collection at all; its first `Get` returns the default; after `"scope activated"`, `ListCollectionNames` on that database includes `systemplane_entries`; a `Set` through its ctx is then read back through the cache with its revision. Add `main_test.go` ignore entries only for goroutines a run proves survive every Close, each with its reason.
+
+**Files:**
+- Create: `internal/client/harness_mongo_integration_test.go`
+- Create: `internal/client/tenant_mongo_integration_test.go`
+- Modify: `internal/client/main_test.go` (ignore entries only, if a run demands them)
+
+**Verification:** `TESTCONTAINERS_RYUK_DISABLED=true go test -tags=integration -race -count=1 -run 'TestIntegration_Mongo' ./internal/client/` passes. RED as Task 3.1.1, on the Mongo single-flight census.
+
+**Done when:** the four tests pass under `-race` and goleak stays clean.
+
+#### Task 3.2.2: MongoDB cursor loss, racing write, suspension and failed activation
+
+- [x] Done
+
+**Context:** Task 3.2.1's harness. `killChangeStreamCursor` (`internal/mongodb/mongodb_integration_test.go:261-283`) kills the feed's cursor with `killCursors`; the store reopens it after a jittered backoff and resyncs, so the gap cannot be held open from outside without a proxy.
+
+**Implementation vision:** Four tests appended to `tenant_mongo_integration_test.go`:
+1. Cursor loss. Activate `t1` and `t2`. Kill `t1`'s cursor; immediately write a new value directly into `t1`'s collection (a `$set` upsert that bumps `revision` above the stored one, the shape `internal/mongodb` writes); `t1` converges to the new value with no second write, the census for `t1` returns to 1, and `t2` keeps serving its own value with `Stale: false` throughout. `Stale` is not asserted for `t1` (P3 deviation D-P3-3).
+2. Racing write, as Task 3.1.2 test 2.
+3. Suspension, as Task 3.1.2 test 3, with the cursor census.
+4. Failed activation: a tenant the fake manager answers 404 for, whose request ctx still carries a real database. Its first `Get` answers per request; wait for the WARN; the census for that database reaches 0 and holds 1s; the census reads 1 for a healthy tenant in the same test.
+
+**Files:**
+- Modify: `internal/client/tenant_mongo_integration_test.go`
+
+**Verification:** as Task 3.2.1, plus `-count=3` on these four tests.
+
+**Done when:** the four tests pass under `-race`, `-count=3` included.
+
+#### Task 3.2.3: Group `OnApply` across two Mongo tenants and a polling tenant
+
+- [x] Done
+
+**Context:** `systemplane.Bind` must run before `Start`; on a tenant-managed Client `OnApply` is supported and `fn` gets the replay of every tenant the group has observed, with the tenant in `Applied.Tenant` (`api_group.go:431-440`). `WithPollInterval` switches the Mongo feed to polling (`internal/mongodb/mongodb.go:70-75`, passed at `internal/client/client.go:147`).
+
+**Implementation vision:** Two tests in `tenant_mongo_integration_test.go`:
+1. `systemplane.Bind[T]` on a small JSON struct key, `OnApply` recording `(tenant, revision)`; `Start`; each of `t1` and `t2` holds its own document; one read per tenant activates both; wait until `Status()` reports both tenants applied at their row revisions and `fn` saw both tenants. A `Set` of the group through `t1`'s ctx reaches `fn` for `t1` only.
+2. A standalone `mongo:7` container (no replica set) and a Client built with `WithPollInterval(200ms)`: a tenant activates on first read, and a direct write to its collection reaches the next read within the poll period plus the debounce. If the tenant feed ignores `WithPollInterval` and tries a change stream on the standalone server, stop and report it: that is a production gap, not a test to bend.
+
+**Files:**
+- Modify: `internal/client/tenant_mongo_integration_test.go`
+- Modify: `internal/client/harness_mongo_integration_test.go` (standalone container)
+
+**Verification:** as Task 3.2.1 with `-run 'TestIntegration_Mongo(Group|Polling)'`.
+
+**Done when:** both tests pass under `-race` and goleak stays clean.
 
 ### Epic 3.3: Gate sweep on the lane's final shape
 
@@ -617,7 +725,7 @@ D6 makes MongoDB equal to Postgres, and the index's Done-when for this lane requ
 **Scope:** verification only, plus whatever small fixes the gates demand inside owned files.
 **Dependencies:** Epics 3.1, 3.2.
 **Done when:** `make test-unit`, `make test-integration`, `go vet -tags=unit ./...`, `go vet -tags=integration ./...`, `go test -tags=unit -run=^TestPerf_ ./...`, `go test -tags=unit -run TestExportedBoundary ./...` and `make lint` all pass; `make check-tests` reports coverage for `internal/engine` and `internal/client`; `git diff --stat go.mod go.sum` is empty; the repo-wide absence checks are **not** asserted here — lane-cut rule 4 puts them in the `integration` lane, and this branch cannot prove a negative while `docs` and `matcher-pilot` are writing.
-**Status:** Pending
+**Status:** Done
 
 ---
 
@@ -751,3 +859,13 @@ Every item above is answered in `index.md`; implementation may start on the affe
 - The lifecycle tests live in `internal/client/lifecycle_test.go`, not `tenant_test.go`, which stays at its 822 lines from `develop`.
 - E-2 stands: the empty-TenantID `ErrValidation` exit stays, though `tmevent.ParseEvent` already refuses an empty `tenant_id` on the listener path.
 - Epic 2.2's Done-when builds the instruments "lazily through `sync.Once`". `engine.Config` is fixed at `New`, so Task 2.2.1 builds them once there; the intent (no telemetry, no instruments, no live `MeterProvider` in a test) is unchanged.
+
+## Phase 3 deviations (2026-09-26)
+
+- D-P3-1: `internal/engine/tenants_integration_test.go` is dropped (P3-1). Each scenario is tested once, at the Client, and the Client drives the engine through the real backends.
+- D-P3-2: the feed inventory is the backend's own (`pg_stat_activity`, `$currentOp`), not a production hook. `FeedsSnapshot` stays test-only in `internal/postgres` and `internal/mongodb`, which this lane does not touch.
+- D-P3-3: on MongoDB the cursor-loss test asserts convergence and `t2` isolation, not `Stale` on `t1`. The store reopens a killed cursor after a jittered backoff, so holding the gap open needs a TCP proxy between the store and the server; the one that exists is test-only inside `internal/mongodb`. The engine's stale path is backend-agnostic and Task 3.1.2 proves it live on Postgres; the Mongo backend's `OpDisconnect` is proven by the `internal/mongodb` outage tests.
+- D-P3-4: Epic 3.1's Scope named one `tenant_integration_test.go` and Epic 3.2's one `tenant_mongo_integration_test.go`. The files are a shared harness plus one scenario file per backend, and `main_test.go` changes (P3-3).
+- D-P3-5: `Client.Set` stamps `UpdatedAt` at millisecond precision (fix(client) on this branch). The live racing-write test showed a published timestamp the database did not hold: the publish fence refreshes `UpdatedAt` on an equal revision, so the last of Set and the reconcile won.
+- D-P3-6: a stopped MongoDB feed leaves its server-side change-stream cursor open until the server cursor timeout (10 min by default): `internal/mongodb` cancels the ctx of the blocked `Next`, and mongo-driver v2.9 then closes the cursor with that cancelled ctx, so `killCursors` never goes out. `internal/mongodb` is outside this lane; the fix is a separate `fix(mongodb)` PR. Until it lands, the Mongo suspension census counts only in-flight getMores.
+- Resolved by the `docs` lane (PR #106): CLAUDE.md states `Stale` per key, false only on reads that go through to the tenant database.

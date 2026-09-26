@@ -1,4 +1,3 @@
-// Client lifecycle: construction, start, and close for systemplane.
 package client
 
 import (
@@ -62,9 +61,9 @@ type Client struct {
 
 // NewPostgres creates a Client backed by Postgres.
 //
-// In single-tenant mode both db and listenDSN are required.
-// In multi-tenant mode (see WithMultiTenantEnabled) they MAY be nil/empty —
-// every method resolves the tenant database from ctx.
+// In single-tenant mode db and listenDSN are required. In multi-tenant mode
+// (see WithMultiTenantEnabled) neither is used and both MAY be nil/empty:
+// tenant databases come from ctx or from the tenant manager.
 func NewPostgres(db *sql.DB, listenDSN string, opts ...Option) (*Client, error) {
 	cfg := defaultClientConfig()
 	applyClientOptions(&cfg, opts)
@@ -209,15 +208,15 @@ func newClient(s store.Store, cfg clientConfig) *Client {
 	return c
 }
 
-// Start performs backend bootstrap and, in single-tenant mode, starts the
-// engine: it opens the changefeed and returns once the first reconcile has
+// Start, in single-tenant mode, starts the engine once MongoDB has ensured its
+// collection: it opens the changefeed and returns once the first reconcile has
 // confirmed every registered key against the store, so every read taken after
 // it serves what is stored rather than the registered default. That reconcile
-// also queues the FC-11 announcement for every subscriber registered
+// also queues the Start announcement for every subscriber registered
 // beforehand; the delivery runs on the key's own goroutine, so it may land
 // just after Start returns. In multi-tenant mode it only marks the Client
-// started; schema bootstrap and each tenant's activation happen lazily, on
-// that tenant's first read.
+// started; a tenant's first read activates its scope under a tenant manager,
+// MongoDB bootstraps each tenant database lazily, and Postgres issues no DDL.
 //
 // The Client counts as started from the moment that first reconcile begins
 // rather than from when it ends, so a [Client.Set] racing Start inside that
@@ -258,7 +257,7 @@ func (c *Client) Start(ctx context.Context) error {
 	}
 
 	// Marked started BEFORE the first reconcile, because that reconcile is
-	// what delivers the FC-11 announcement: a subscriber registered before
+	// what delivers the Start announcement: a subscriber registered before
 	// Start is called while Start is still on the stack, and a callback that
 	// answers the announcement by writing must not be refused for a Client the
 	// consumer considers running. The scope exists by then and the write is
@@ -283,12 +282,12 @@ func (c *Client) Start(ctx context.Context) error {
 	return nil
 }
 
-// Close unsubscribes from the changefeed and releases backend resources.
+// Close cancels the context handed to running callbacks, waits for them up to
+// WithCloseTimeout and stops every changefeed; the database handle passed to
+// the constructor stays open. Later calls return the first call's result.
 //
-// Start and Close are mutually exclusive: Close takes startMu so it cannot
-// interleave with a concurrent Start that is mid-wiring. closed is set
-// inside the same lock, and Start re-checks it under startMu before any
-// teardown-visible state mutation.
+// Start and Close are mutually exclusive: both hold startMu, and Close sets
+// closed under it, which Start re-checks before any wiring.
 func (c *Client) Close() error {
 	if c == nil {
 		return nil

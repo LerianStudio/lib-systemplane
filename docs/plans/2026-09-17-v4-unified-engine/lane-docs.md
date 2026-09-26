@@ -690,6 +690,8 @@ One fact to carry into elaboration rather than rediscover: the sweep is a **repo
 
 ## Handover to other lanes (2026-09-26)
 
+Applied on branch fix/v4-docs-handover (2026-09-26): H1, H2, H3; see that PR for any finding skipped and why.
+
 Findings from Epic 2.3 that this lane could not fix under G-1 or in a file it does not own. Each names the file and line, the finding, and the exact replacement.
 
 - `api_group.go:41`: The Snapshot struct field trailing comment "Revision int64 // 0 when the row is absent" is incomplete. Revision is also 0 when the stored row was refused and the defaults are in force. The G-1 filter blocks edits to trailing comments on code lines, so this was not fixed here.

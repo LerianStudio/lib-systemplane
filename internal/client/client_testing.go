@@ -1,6 +1,5 @@
 //go:build unit || integration
 
-// NewForTesting constructor for out-of-package tests.
 package client
 
 import (
