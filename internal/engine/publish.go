@@ -264,7 +264,9 @@ func (e *Engine) scopeFor(scope store.Scope) *scopeState {
 	}
 
 	sc = newScopeState(scope)
+	sc.reads = e.metrics.readOptions(scope.Tenant)
 	e.scopes[scope] = sc
+	e.metrics.countTenant(sc, 1)
 
 	return sc
 }

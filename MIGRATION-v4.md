@@ -38,10 +38,10 @@ has to be read even where your code compiles unchanged.
 
 | Gone in v4 | What to do |
 |---|---|
-| `Manager`, `ManagerOption`, `NewManager`, `WithManagerLogger`, `WithManagerTelemetry`, `WithManagerAggregateTenantThreshold` | The type and its constructor no longer exist. A single-tenant process never needed them. A multi-tenant process configures the one `Client` instead: `WithLogger`, `WithTelemetry`, `WithMultiTenantEnabled`, `WithModule`. |
+| `Manager`, `ManagerOption`, `NewManager`, `WithManagerLogger`, `WithManagerTelemetry`, `WithManagerAggregateTenantThreshold` | The type and its constructor no longer exist. A single-tenant process never needed them. A multi-tenant process configures the one `Client` instead: `WithLogger`, `WithTelemetry`, `WithMultiTenantEnabled`, `WithModule`, and `WithAggregateTenantThreshold` in place of `WithManagerAggregateTenantThreshold`, with the same meaning and default (`DefaultAggregateTenantThreshold`, 1000). The metrics moved: see § Metrics moved to meter `systemplane.engine`. |
 | `(*Manager).Drain` | `Client.Close()`. It now waits, bounded by `WithCloseTimeout`, for subscriber callbacks whose context it has cancelled. |
 | `(*Manager).IsClosed` | No replacement. Calls on a closed `Client` return `ErrClosed`; that is the answer the flag was read for. |
-| `(*Manager).OnTenantActivated`, `OnTenantSuspended`, `OnTenantDeleted`, `OnTenantCredentialsRotated`, `HandleTenantLifecycle` | No replacement yet: tenant lifecycle handling does not exist on the v4 Client, so a process that depends on it cannot take this upgrade. <!-- NOT-YET(engine-tenants): Client.HandleTenantLifecycle, WithAggregateTenantThreshold, tenant-scope teardown in Close --> |
+| `(*Manager).OnTenantActivated`, `OnTenantSuspended`, `OnTenantDeleted`, `OnTenantCredentialsRotated`, `HandleTenantLifecycle` | `Client.HandleTenantLifecycle`, with the same `tmevent.EventHandler` signature, on a Client built with `WithPostgresTenantManager` or `WithMongoTenantManager`. It routes all four events, so the `On*` methods have no replacement of their own; chain it after the dispatcher's own `HandleEvent`. `tenant.activated` no longer warms the tenant: its first read does. It returns `ErrClosed` after `Close` and `ErrValidation` for an event with no `TenantID`, where v3 returned nil: the tenant-manager listener logs the error and moves on, and a dispatcher that stops on an error must handle both. `Client.Close()` tears every tenant scope down: it closes each tenant's feed and waits, bounded by `WithCloseTimeout`, for activations still in flight. |
 | `DefaultSeedSQL` | No replacement. Defaults live in code, at `Register` / `Bind`. A value an operator must be able to override before first boot is a row your own migration pipeline inserts, not something this library seeds. |
 | `RedactPolicy`, `RedactNone`, `RedactMask`, `RedactFull` | No replacement. |
 | `WithRedaction`, `ApplyRedaction`, `(*Client).KeyRedaction` | No replacement; drop the option from every `Register` / `Bind` call, including `WithRedaction(RedactNone)`. |
@@ -274,6 +274,32 @@ hunting a rejected row — a line that reads correctly in the source and is wron
 only in production.
 
 **Do:** re-point any log query, dashboard or alert that matches on field `key`.
+
+### Metrics moved to meter `systemplane.engine`
+
+**Affects:** every dashboard and alert on meter `systemplane.manager`, and every
+Client built with `WithTelemetry`, single-tenant ones included.
+
+| v3, meter `systemplane.manager` | v4, meter `systemplane.engine` |
+|---|---|
+| `systemplane.manager.tenants_active` | `systemplane.scopes_active` |
+| `systemplane.manager.cache_entries` | `systemplane.cache_entries` |
+| `systemplane.manager.notify_received_total` | `systemplane.changefeed_events_total` |
+| `systemplane.manager.listen_disconnects_total` | `systemplane.changefeed_disconnects_total` |
+| `systemplane.manager.warmload_latency_seconds` | `systemplane.activation_latency_seconds` |
+| `systemplane.manager.get_cache_hits_total` | `systemplane.cache_reads_total`, attribute `result` = `hit` \| `miss` |
+
+`systemplane.scopes_active` is one unlabelled count, as `tenants_active` was.
+On every other instrument a tenant scope's points carry `tenant_id`, which reads
+the literal `aggregate` for every tenant once more than
+`WithAggregateTenantThreshold` tenant scopes are active, and the single-tenant
+scope's points carry no `tenant_id`. v3's attribute `outcome` is now `result`;
+`op` on `notify_received_total` and `reason` on `listen_disconnects_total` have
+no replacement, and `systemplane.changefeed_events_total` also counts every
+disconnect and every resync. `systemplane.cache_reads_total` counts every read
+of an active scope, one made while that scope is still activating included: it
+counts a miss and reads the tenant database. A read of a tenant with no active
+scope counts nothing, as in v3.
 
 ### Every callback registered before `Start` fires once at `Start`
 

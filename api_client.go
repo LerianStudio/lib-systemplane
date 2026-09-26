@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	tmevent "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/event"
 	"github.com/LerianStudio/lib-observability/v4/log"
 	internalclient "github.com/LerianStudio/lib-systemplane/v4/internal/client"
 )
@@ -190,6 +191,34 @@ func (c *Client) CatalogService() string {
 // so no callback could ever fire. On a closed Client it returns ErrClosed.
 func (c *Client) OnChange(namespace, key string, fn func(ctx context.Context, ch Change)) (unsubscribe func(), err error) {
 	return asInternalClient(c).OnChange(namespace, key, fn)
+}
+
+// HandleTenantLifecycle applies a tenant-manager lifecycle event to that
+// tenant's scope. It has the tmevent.EventHandler signature, so it registers
+// with the tenant-manager event listener as is:
+//
+//   - tenant.activated clears the tenant's blocked marker and activates
+//     nothing: the tenant's next read does, so a process opens no feed for a
+//     tenant it never reads.
+//   - tenant.suspended and tenant.deleted drop the tenant's scope and block
+//     it: its reads resolve the tenant database per request, and none brings
+//     the scope back until the next tenant.activated.
+//   - tenant.credentials.rotated rebuilds an active tenant's scope on a fresh
+//     feed and leaves a blocked tenant blocked.
+//
+// Every other event type, a nil Client and a Client built without
+// [WithPostgresTenantManager] or [WithMongoTenantManager] return nil. The
+// scope work runs in the background, so the only errors are [ErrClosed] after
+// [Client.Close] and [ErrValidation] for an event with no TenantID; a failed
+// activation is logged and retried by a later read. The tenant-manager
+// listener logs a returned error and moves on; a dispatcher of your own that
+// stops on an error must handle these two.
+//
+// Chain it after the tenant-manager dispatcher's own HandleEvent: on a
+// rotation the dispatcher closes and reloads the tenant's pools, and a rebuild
+// that ran first could resolve a pool about to be closed.
+func (c *Client) HandleTenantLifecycle(ctx context.Context, event tmevent.TenantLifecycleEvent) error {
+	return asInternalClient(c).HandleTenantLifecycle(ctx, event)
 }
 
 // KeyDescription returns the registered human-readable description for a key.

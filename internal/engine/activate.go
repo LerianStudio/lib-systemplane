@@ -70,13 +70,19 @@ func (e *Engine) launchActivation(scope store.Scope, rebuild bool) bool {
 	}
 
 	e.activating[scope] = rebuild
+	begun := time.Now()
 
 	runtime.SafeGoWithContextAndComponent(e.dispatchContext(), e.logger,
 		"systemplane.engine", "activate", runtime.KeepRunning, func(ctx context.Context) {
 			defer e.dispatchWG.Done()
 
 			up := false
-			defer func() { e.endActivation(ctx, scope, up) }()
+			defer func() {
+				// FC-12 times a first activation, a superseded one included; never a rebuild.
+				if e.endActivation(ctx, scope, up) && !rebuild {
+					e.metrics.recordActivation(scope, begun)
+				}
+			}()
 
 			up = !rebuild && e.activate(ctx, scope) == nil
 		})
@@ -167,10 +173,10 @@ func (e *Engine) activate(ctx context.Context, scope store.Scope) error {
 	return err
 }
 
-// endActivation settles scope's activation. While Block or Reactivate has
-// superseded it, the scope is dropped with the slot still held and built again
-// unless it is now blocked or the engine closed.
-func (e *Engine) endActivation(ctx context.Context, scope store.Scope, up bool) {
+// endActivation settles scope's activation and reports whether the scope came
+// up. While Block or Reactivate has superseded it, the scope is dropped with the
+// slot still held and built again unless it is now blocked or the engine closed.
+func (e *Engine) endActivation(ctx context.Context, scope store.Scope, up bool) bool {
 	for !e.releaseActivation(scope, up) {
 		e.dropScope(scope)
 
@@ -184,6 +190,8 @@ func (e *Engine) endActivation(ctx context.Context, scope store.Scope, up bool) 
 	if up {
 		e.logger.Log(ctx, log.LevelInfo, "scope activated", []log.Field{log.String(constants.AttrKeyTenantID, scope.Tenant)})
 	}
+
+	return up
 }
 
 // releaseActivation frees scope's slot and starts or clears its retry cooldown,

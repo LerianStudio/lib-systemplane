@@ -201,6 +201,9 @@ func newClient(s store.Store, cfg clientConfig) *Client {
 		ValidatorContext: func(ctx context.Context, scope store.Scope) context.Context {
 			return tmcore.ContextWithTenantID(ctx, scope.Tenant)
 		},
+
+		Telemetry:                cfg.telemetry,
+		AggregateTenantThreshold: cfg.aggregateTenantThreshold,
 	})
 
 	return c

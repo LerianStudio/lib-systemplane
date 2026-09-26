@@ -88,12 +88,12 @@ type scopeNSKey struct {
 //     empty read is then a non-answer rather than a removal, and the key keeps
 //     the value it holds.
 func (e *Engine) onEvent(evt store.Event) {
-	// An event that arrives while Close is running is dropped whole: there is
-	// nobody left to deliver it to, and answering it would create a scope or
-	// start a reconcile the engine is in the middle of tearing down.
+	// An event during Close is dropped whole, uncounted: answering it rebuilds what Close tears down.
 	if e.closed.Load() {
 		return
 	}
+
+	e.metrics.recordEvent(evt)
 
 	switch evt.Op {
 	case store.OpDisconnect:

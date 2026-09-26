@@ -31,12 +31,19 @@ type clientConfig struct {
 	module             string
 	pgTenantManager    *tmpostgres.Manager
 	mbTenantManager    *tmmongo.Manager
+
+	aggregateTenantThreshold int
 }
+
+// DefaultAggregateTenantThreshold is how many tenant scopes may be active
+// before the engine's metrics report tenant_id=aggregate.
+const DefaultAggregateTenantThreshold = 1000
 
 func defaultClientConfig() clientConfig {
 	return clientConfig{
-		debounce: 100 * time.Millisecond,
-		module:   "systemplane",
+		debounce:                 100 * time.Millisecond,
+		module:                   "systemplane",
+		aggregateTenantThreshold: DefaultAggregateTenantThreshold,
 	}
 }
 
@@ -55,12 +62,21 @@ func WithLogger(l log.Logger) Option {
 	}
 }
 
-// WithTelemetry sets the OpenTelemetry provider the backends trace through.
-// Last-wins, nil included: a nil provider clears one set by an earlier option
-// and disables tracing. No code path asks it for a meter in v4.
+// WithTelemetry sets the OpenTelemetry provider the backends trace through and
+// the engine asks for meter systemplane.engine. Last-wins, nil included: a nil
+// provider clears one set by an earlier option and disables both.
 func WithTelemetry(t store.Telemetry) Option {
 	return func(cfg *clientConfig) {
 		cfg.telemetry = t
+	}
+}
+
+// WithAggregateTenantThreshold makes the engine's metrics report tenant_id as
+// the literal aggregate once more than n tenant scopes are active. Last-wins; a
+// non-positive n keeps per-tenant ids. Default: DefaultAggregateTenantThreshold.
+func WithAggregateTenantThreshold(n int) Option {
+	return func(cfg *clientConfig) {
+		cfg.aggregateTenantThreshold = n
 	}
 }
 

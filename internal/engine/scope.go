@@ -156,6 +156,7 @@ func (sc *scopeState) bumpDeletes(nk NSKey) {
 // scopeState is one tracked scope.
 type scopeState struct {
 	scope store.Scope
+	reads readOptions // cache_reads_total's options, built as it enters e.scopes
 
 	mu      sync.RWMutex
 	entries map[NSKey]entry

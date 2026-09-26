@@ -45,7 +45,7 @@
 | Phase | Milestone | Epics | Status |
 |-------|-----------|-------|--------|
 | 1 | A multi-tenant Client with a tenant manager configured activates a tenant's scope on that tenant's first read, serves every later read of it from the cached scope with real revision and provenance, fires one `OnChange` per tenant with `Change.Tenant` set, and reads back its own multi-tenant writes — on Postgres and on MongoDB, proven against fakes | 1.0, 1.1, 1.2, 1.3 | Complete |
-| 2 | Tenant-manager lifecycle events drive the same engine: `Client.HandleTenantLifecycle` activates, drops, blocks and rotates, a suspended or deleted tenant never re-activates from a read, and per-tenant metrics carry `tenant_id` up to `WithAggregateTenantThreshold` and `aggregate` above it | 2.1, 2.2 | Epic-level |
+| 2 | Tenant-manager lifecycle events drive the same engine: `Client.HandleTenantLifecycle` activates, drops, blocks and rotates, a suspended or deleted tenant never re-activates from a read, and per-tenant metrics carry `tenant_id` up to `WithAggregateTenantThreshold` and `aggregate` above it | 2.1, 2.2 | Complete |
 | 3 | The whole path is proven on live backends: testcontainers Postgres and a Mongo replica set, two tenant databases each, activation gap, feed loss per tenant, tenant isolation, `-race` and goleak clean | 3.1, 3.2, 3.3 | Epic-level |
 
 ---
@@ -417,7 +417,7 @@ Tests in `internal/engine/refresh_bound_test.go` (`//go:build unit`), using a `g
 
 ## Phase 2: Lifecycle events and per-tenant metrics
 
-Phase 1 leaves a tenant's scope alive for the life of the process once a read has opened it. Phase 2 gives the tenant manager control of it and gives the operator the instruments the deleted `internal/manager` used to emit. Tasks are elaborated when execution reaches this phase, against the engine and the Client as Phase 1 actually landed them.
+Phase 1 leaves a tenant's scope alive for the life of the process once a read has opened it. Phase 2 gives the tenant manager control of it and gives the operator the instruments the deleted `internal/manager` used to emit. Elaborated 2026-09-25 against the engine and the Client as Phase 1 landed them.
 
 ### Epic 2.1: `Client.HandleTenantLifecycle` and the blocked tenant
 
@@ -425,7 +425,89 @@ Phase 1 leaves a tenant's scope alive for the life of the process once a read ha
 **Scope:** `internal/client/tenant.go` (the handler and its routing), `internal/client/tenant_test.go`, root `api_client.go` (the public delegation), `api_client_test.go`.
 **Dependencies:** Epic 1.1 (`Block`, `Unblock`, `Reactivate`), Epic 1.2 (the Client knows whether it is tenant-managed).
 **Done when:** `Client.HandleTenantLifecycle` has FC-6's `tmevent.EventHandler` signature so it registers directly with the dispatcher; `EventTenantActivated` clears the marker and activates idempotently; `EventTenantSuspended` and `EventTenantDeleted` drop the scope and block it, and a following read does NOT re-activate it — it falls through to the per-request path; `EventTenantCredentialsRotated` re-activates an active tenant on a fresh connector resolution and is a no-op for a blocked one, leaving the marker in place; a Suspended-then-CredentialsRotated-then-read sequence still ends per-request with no subscription; every other event type is ignored; **errors are returned, not swallowed** (FC-6 says so explicitly, and this is the one behaviour change against `internal/manager.HandleTenantLifecycle`, which logged and returned nil — `MIGRATION-v4.md` must name it, and a consumer whose dispatcher treats a returned error as fatal is the reason it must be named); a FAILED activation leaves no marker and is retried on the next read; the handler is nil-receiver safe and is a no-op on a Client with no tenant manager configured.
-**Status:** Pending
+**Status:** Done
+
+### Phase 2 decisions (elaborated 2026-09-25 against `develop` `58a8125`, PR #103 merged)
+
+Every anchor below is on `develop` `58a8125`. Decisions made at elaboration:
+
+- **E-1. `EventTenantActivated` only unblocks.** FC-6: "Activated is idempotent (lazy activation on
+  first read already covers it) and clears a blocked marker". The handler calls `Engine.Unblock`
+  and never `Engine.Activate`: the dispatcher broadcasts every tenant's events, and an eager
+  activation would open a LISTEN (or change stream) for tenants this process never reads.
+- **E-2. What the handler returns.** Every engine verb is fire-and-forget, so the handler returns
+  only what it can decide synchronously: `ErrClosed` for an event after `Close`, and an
+  `ErrValidation`-wrapped error for an event whose `TenantID` is empty (a malformed event from the
+  dispatcher). Activation failures stay a WARN plus the 5 s cooldown (`activate.go:57,160,207`).
+  Nil receiver, and a Client with no tenant manager, return nil. ctx is not read: no engine verb
+  takes one.
+- **E-3. Routed events are FC-6's four.** `Activated`, `Suspended`, `Deleted`,
+  `CredentialsRotated`; every other type (service-level ones included) returns nil, as v3 did.
+- **E-4. Metrics cost nothing without telemetry.** No meter means nil instruments and one nil
+  check per record site; the AC15 perf gate runs without telemetry and must stay green.
+- **E-5. `cache_reads_total` is recorded inside `Engine.Lookup`** (`engine.go:613`), the one site
+  every cached read passes. A `List` counts one read per key it looks up. Single-tenant reads
+  count too, with no `tenant_id`.
+- **E-6. Gauges are observable.** `scopes_active` and `cache_entries` are `Int64ObservableGauge`s
+  read in one callback over the tracked scopes, summed per attribute set after the aggregate
+  collapse; this avoids v3's delta bug (`recordCacheEntries` added absolute counts). The callback
+  registration is unregistered in `Engine.Close`.
+- **E-7. Active tenant count is an atomic** maintained where a tenant scope enters and leaves
+  `e.scopes` (`publish.go:267`, `engine.go:390`); the label is `tenant_id=<id>` while that count is
+  at most the threshold (or the threshold is non-positive) and `tenant_id=aggregate` above it.
+- **E-8. go.mod.** Tests read instruments through `go.opentelemetry.io/otel/sdk/metric`'s
+  `ManualReader`, already an indirect requirement (`go.mod:102`); `go mod tidy` may drop its
+  `// indirect` marker, which this lane accepts as its one go.mod edit.
+- **E-9. This lane rewrites only the two surface-diff rows its symbols replace.** `MIGRATION-v4.md:41`
+  (`WithManagerAggregateTenantThreshold`) and `:44` (the `OnTenant*` handlers and `HandleTenantLifecycle`)
+  name their replacement, and one new subsection lists FC-12's old-to-new metric names. The
+  per-consumer sections (`:694`, `:711`, `:717`, `:733`, `:739-755`) stay for the `docs` lane's
+  Task 1.1.5, which is sized for them after this lane merges.
+
+#### Task 2.1.1: `Client.HandleTenantLifecycle` routes the four lifecycle events
+
+- [x] Done
+
+**Context:** FC-6 (`index.md:272-280`) freezes the signature
+`func (c *Client) HandleTenantLifecycle(ctx context.Context, event tmevent.TenantLifecycleEvent) error`,
+with `tmevent "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/event"`
+(`EventHandler` at `listener.go:23-25`, constants at `types.go:25-46`, struct at `types.go:64-72`).
+Phase 1 landed the engine verbs: `Engine.Block` (`internal/engine/activate.go:89`), `Unblock` (`:103`,
+does not activate), `Reactivate` (`:117`, no-op when blocked, clears the cooldown when untracked).
+`c.tenantManaged` is `client.go:44`. v3's router is `d42a72e^:internal/manager/handle_lifecycle.go:25-60`.
+
+**Implementation vision:** create `internal/client/tenant.go` with the handler, per E-1..E-3:
+nil receiver or `!c.tenantManaged` → nil; `c.closed.Load()` → `ErrClosed`; empty `TenantID` →
+`fmt.Errorf("%w: lifecycle event %q carries no tenant id", ErrValidation, event.EventType)`; then
+`scope := store.Scope{Tenant: event.TenantID}` and a switch: Activated → `Unblock`; Suspended and
+Deleted → `Block`; CredentialsRotated → `Reactivate`; default → nil. Root `api_client.go` gets the
+one-line delegation with a godoc stating FC-6's behaviour, E-1 and E-2 (the returned-error change
+against v3, which logged and returned nil) and one ordering rule: chain it AFTER the dispatcher's
+own `HandleEvent`, because the dispatcher's rotation handler closes and reloads the tenant's pools
+(`lib-commons/v7@v7.0.0/commons/tenant-manager/event/dispatcher_handlers.go:262-285`), and a rebuild
+that runs first can resolve the pool about to be closed. The lib-commons listener logs a handler
+error at WARN and moves on (`listener.go:199-202`), so a returned error is safe there. Replace the
+`MIGRATION-v4.md:44` row (E-9)
+with the real replacement: `Client.HandleTenantLifecycle`, the returned-error change for a dispatcher
+that treats an error as fatal, and the tenant-scope teardown `Close` already does (confirm it in
+`Engine.Close`, `internal/engine/engine.go:671`, before writing it).
+
+**Files:**
+- Create: `internal/client/tenant.go`
+- Modify: `api_client.go`, `MIGRATION-v4.md`
+- Test: `internal/client/tenant_test.go`, `api_client_test.go:285` (`TestPublicTenantManagerOptionsExist`)
+
+**Verification:** `go test -tags=unit -race -run 'Lifecycle|TenantManager' ./ ./internal/client/`,
+then the full `go test -tags=unit -race ./...` and `make lint`.
+
+**Done when:** one table test drives every row through the public handler on a tenant-managed
+Client (helpers `newTenantClient` `:225`, `waitSettled` `:253`, `mustEntry` `:263`): Suspended and
+Deleted drop the scope and a following read falls through per request with no subscription;
+Activated after Suspended lets the next read activate again; CredentialsRotated rebuilds an active
+scope (a fresh Subscribe) and changes nothing for a blocked one; Suspended → CredentialsRotated →
+read stays per request; an unrouted type, a nil `*Client`, and a Client without a tenant manager
+return nil and change nothing; an empty `TenantID` returns `ErrValidation`; an event after `Close`
+returns `ErrClosed`. RED captured before GREEN.
 
 ### Epic 2.2: Per-tenant metrics with an aggregate threshold
 
@@ -433,7 +515,79 @@ Phase 1 leaves a tenant's scope alive for the life of the process once a read ha
 **Scope:** `internal/engine/metrics.go` (new), `internal/engine/metrics_test.go` (new), `internal/engine/engine.go` (`Config.Telemetry`, `Config.AggregateTenantThreshold`, the record call sites), `internal/client/options.go` (`WithAggregateTenantThreshold`), `internal/client/client.go` (pass both into `engine.Config`), root `api_constructors.go`.
 **Dependencies:** Epic 1.1, Epic 2.1.
 **Done when:** the engine accepts `store.Telemetry` through `Config` — the same interface the Client already carries, declared from `go.opentelemetry.io/otel` types only, so no lib-observability type reaches an exported parameter and `boundary_test.go` stays green; instruments are created lazily through `sync.Once` so an engine built without telemetry is a no-op and no test needs a live `MeterProvider`; the engine records active scopes, cached entries per scope, changefeed disconnects per scope, changefeed events per scope, activation latency and cache hit/miss, each labelled `tenant_id`; the label collapses to the constant `aggregate` once the active-scope count exceeds the threshold, exactly as `metrics.tenantLabel` did; `WithAggregateTenantThreshold(n int) Option` exists on the public Client per FC-10's stated replacement for `WithManagerAggregateTenantThreshold`, defaults to 1000 (`DefaultAggregateTenantThreshold`), and a non-positive value keeps per-tenant labels regardless of cardinality; every `recordXxx` is nil-receiver safe; the metric NAMES are whatever the orchestrator freezes (see § DEVIATIONS — `systemplane.manager.*` names an object that no longer exists, and renaming them breaks every existing dashboard, so it is not this lane's call).
-**Status:** Pending
+**Status:** Done
+
+#### Task 2.2.1: The engine emits FC-12's instruments
+
+- [x] Done
+
+**Context:** FC-12 (`index.md:503-505`) freezes meter `systemplane.engine` and six instruments;
+FC-10 (`index.md:501`) the aggregate rule. `engine.Config` is `engine.go:104-118` (no telemetry
+today); `store.Telemetry` is `internal/store/store.go:28-31`. Record sites: scope insert
+`publish.go:267`, scope delete `engine.go:390`, `onEvent` `feed.go:90` (after the closed check at
+`:94`), disconnect `feed.go:99-100`, `Lookup` `engine.go:613` (untracked `:618-620`, missing key
+`:629-631`), activation start `launchActivation` `activate.go:67` (`!rebuild` path), activation
+finish `endActivation` `activate.go:184-186` when `up`. v3's implementation for reference:
+`d42a72e^:internal/manager/metrics.go` (do not port its `recordCacheEntries` delta bug).
+
+**Implementation vision:** create `internal/engine/metrics.go` holding a `metrics` value on the
+Engine, built once in `New` from `Config.Telemetry.Meter("systemplane.engine")` (Config is fixed at
+construction, so no `sync.Once` is needed); a nil Telemetry, a Meter error or an instrument error
+leaves the instruments nil and logs DEBUG once.
+Instruments, names verbatim from FC-12: `systemplane.scopes_active` and `systemplane.cache_entries`
+(`Int64ObservableGauge`, one callback, E-6), `systemplane.changefeed_events_total`,
+`systemplane.changefeed_disconnects_total`, `systemplane.cache_reads_total` with attribute `result`
+= `hit` | `miss` (`Int64Counter`), `systemplane.activation_latency_seconds` (`Float64Histogram`,
+unit `s`, tenant scopes only, first activation only: rebuilds are not recorded). Attributes per
+E-7; the single-tenant scope carries none. Every record method is nil-receiver safe and a nil
+check when disabled (E-4). Add `Config.Telemetry store.Telemetry` and
+`Config.AggregateTenantThreshold int`; `Engine.Close` unregisters the gauge callback.
+
+**Files:**
+- Create: `internal/engine/metrics.go`, `internal/engine/metrics_test.go`
+- Modify: `internal/engine/engine.go`, `internal/engine/publish.go`, `internal/engine/feed.go`,
+  `internal/engine/activate.go`, `go.mod` (E-8 only)
+
+**Verification:** `go test -tags=unit -race -run 'Metric' ./internal/engine/`, then
+`go test -tags=unit -run=^TestPerf_ ./...` (no `-race`), the full unit suite and `make lint`.
+
+**Done when:** a `ManualReader` test sees each instrument with the right name, kind and attributes
+after the matching engine event (fake store `fakestore_test.go:74`, helpers in `activate_test.go`);
+two tenants under a threshold of 1 report `tenant_id=aggregate` and the gauges sum across them; a
+threshold of 0 keeps per-tenant ids; an engine without telemetry records nothing and never panics;
+the perf gate passes unchanged. RED captured before GREEN.
+
+#### Task 2.2.2: `WithAggregateTenantThreshold` and telemetry reach the engine
+
+- [x] Done
+
+**Depends on:** Task 2.2.1 (the two `engine.Config` fields).
+
+**Context:** `clientConfig.telemetry` (`internal/client/options.go:24`, set at `:61-65`) reaches only
+the stores (`client.go:129`, `:149`); `newClient` builds `engine.Config` at `client.go:190-204`.
+The `WithTelemetry` godoc (`options.go:58-60`, root `api_constructors.go:56`) and the `Telemetry`
+godoc (`api_boundary.go:57-60`) say no code path asks for a meter.
+
+**Implementation vision:** `WithAggregateTenantThreshold(n int) Option` in `internal/client/options.go`
+(last wins, non-positive disables the collapse) and `DefaultAggregateTenantThreshold = 1000` as the
+default in `defaultClientConfig`; root `api_constructors.go` re-exports both. `newClient` passes
+`cfg.telemetry` and the threshold into `engine.Config`. Rewrite the three godocs to say the engine
+asks for meter `systemplane.engine`. In `MIGRATION-v4.md` (E-9), make the `:41` row name
+`WithAggregateTenantThreshold` as the replacement for `WithManagerAggregateTenantThreshold`, and add
+`### Metrics moved to meter systemplane.engine` after `### Operational: primary pinning and the
+keyname log field` (`:256`): a two-column table of FC-12's six v3 names beside their v4 names, plus
+one sentence on the `tenant_id` / `aggregate` attribute.
+
+**Files:**
+- Modify: `internal/client/options.go`, `internal/client/client.go`, `api_constructors.go`,
+  `api_boundary.go`, `MIGRATION-v4.md`
+- Test: `internal/client/client_test.go` (or `tenant_test.go`), `api_client_test.go:285`
+
+**Verification:** `go test -tags=unit -race ./...`, `make lint`, and `boundary_test.go` green.
+
+**Done when:** a Client built with `WithTelemetry` over a `ManualReader` meter provider and
+`WithAggregateTenantThreshold(1)` reports `tenant_id=aggregate` after two tenants activate; the
+default threshold is 1000; the public facade exposes both names.
 
 ---
 
@@ -586,3 +740,14 @@ Every item above is answered in `index.md`; implementation may start on the affe
   multi-tenant bullet ("No in-process cache. No LISTEN/NOTIFY."), `doc.go:23-25` and
   `README.md:34-36` still describe multi-tenant mode without the tenant manager.
 
+## Phase 2 deviations (2026-09-25)
+
+- Epic 2.1's Done-when says `EventTenantActivated` "activates idempotently". FC-6 says Activated "clears a blocked marker" and that "lazy activation on first read already covers it". E-1 follows FC-6: the handler only unblocks.
+- `MIGRATION-v4.md` is the `docs` lane's. Its plan lets "the owning lane" replace its own text, so Tasks 2.1.1 and 2.2.2 rewrite the surface-diff rows `:41` and `:44` and add the FC-12 name table (E-9). Every other `NOT-YET(engine-tenants)` line and the per-consumer sections stay for the `docs` lane.
+- `go.mod` changes by the `// indirect` marker (E-8) and by three indirect requires (`go-redis/v9`, `amqp091-go`, `go.uber.org/atomic`) that importing `tmevent` pulls in. FC-6 names `tmevent.TenantLifecycleEvent` in the signature, so every consumer binary now links those modules. `api_boundary.go` gets its `Meter` godoc corrected (Task 2.2.2). The lane owns neither file, and nothing else in either file changes.
+- E-6 is amended: `systemplane.scopes_active` is one unlabelled count, as FC-12 ("gauge: tracked scopes") and v3's `tenants_active` have it. Only `cache_entries` is summed per `tenant_id`.
+- A read of an untracked tenant scope records nothing, as in v3; the plan named that branch of `Engine.Lookup` as a record site. Every instrument stays within the FC-10 bound on active scopes.
+- A `Telemetry` whose `Meter` returns `(nil, nil)` disables the metrics, as the backends already do for `Tracer`; without the guard `New` panicked.
+- The lifecycle tests live in `internal/client/lifecycle_test.go`, not `tenant_test.go`, which stays at its 822 lines from `develop`.
+- E-2 stands: the empty-TenantID `ErrValidation` exit stays, though `tmevent.ParseEvent` already refuses an empty `tenant_id` on the listener path.
+- Epic 2.2's Done-when builds the instruments "lazily through `sync.Once`". `engine.Config` is fixed at `New`, so Task 2.2.1 builds them once there; the intent (no telemetry, no instruments, no live `MeterProvider` in a test) is unchanged.

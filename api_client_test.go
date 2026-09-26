@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	tmevent "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/event"
 	tmmongo "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/mongo"
 	tmpostgres "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/postgres"
 
@@ -279,21 +280,34 @@ func TestPublicConstructorsAndOptions(t *testing.T) {
 	}
 }
 
-// TestPublicTenantManagerOptionsExist pins FC-6 at the facade: each option
-// constructs its own backend with a nil handle (multi-tenant implied) and is
-// refused with ErrTenantManagerBackendMismatch on the other.
+// TestPublicTenantManagerOptionsExist pins FC-6 and FC-10 at the facade: each
+// option constructs its own backend with a nil handle (multi-tenant implied)
+// and is refused with ErrTenantManagerBackendMismatch on the other, the
+// lifecycle handler registers as a tmevent.EventHandler, and the aggregate
+// threshold option exists with its frozen default of 1000.
 func TestPublicTenantManagerOptionsExist(t *testing.T) {
 	t.Parallel()
+
+	if DefaultAggregateTenantThreshold != 1000 {
+		t.Errorf("DefaultAggregateTenantThreshold = %d, want 1000", DefaultAggregateTenantThreshold)
+	}
 
 	pg := tmpostgres.NewManager(nil, "svc")
 	mb := tmmongo.NewManager(nil, "svc")
 
-	c, err := NewPostgres(nil, "", WithPostgresTenantManager(pg))
+	c, err := NewPostgres(nil, "", WithPostgresTenantManager(pg), WithAggregateTenantThreshold(1))
 	if err != nil {
 		t.Fatalf("NewPostgres with its tenant manager: %v", err)
 	}
 
+	var handle tmevent.EventHandler = c.HandleTenantLifecycle
+
 	_ = c.Close()
+
+	event := tmevent.TenantLifecycleEvent{EventType: tmevent.EventTenantSuspended, TenantID: "t1"}
+	if err := handle(context.Background(), event); !errors.Is(err, ErrClosed) {
+		t.Errorf("HandleTenantLifecycle after Close: err = %v, want ErrClosed", err)
+	}
 
 	c, err = NewMongoDB(nil, "", WithMongoTenantManager(mb))
 	if err != nil {
