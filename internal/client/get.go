@@ -160,7 +160,7 @@ func (c *Client) readThrough(ctx context.Context, scope store.Scope, nk nskey, d
 		return nil, false, decodeErr(ctx, nk.Namespace, nk.Key, err)
 	}
 
-	if err := c.engine.RunValidator(ctx, scope, engine.NSKey(nk), def.validator, decoded); err != nil {
+	if err := c.engine.RunValidator(ctx, scope, engine.NSKey(nk), def.readBackValidator(), decoded); err != nil {
 		c.logRead(ctx, log.LevelWarn, "stored value rejected by validator, serving the registered default",
 			log.String("namespace", nk.Namespace),
 			log.String("keyname", nk.Key),

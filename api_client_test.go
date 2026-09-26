@@ -30,6 +30,7 @@ type apiMemoryStore struct {
 	revision int64
 
 	sub    func(TestEvent)
+	scope  TestScope // the scope sub was opened for, stamped on the events it is handed
 	closed bool
 }
 
@@ -67,6 +68,20 @@ func (s *apiMemoryStore) seed(e TestEntry) {
 	defer s.mu.Unlock()
 
 	s.entries[apiMemoryKey(e.Namespace, e.Key)] = e
+}
+
+// writeBehind writes a row straight into the fake, as an older binary or an
+// operator would, and delivers the changefeed notification for it.
+func (s *apiMemoryStore) writeBehind(e TestEntry) {
+	s.mu.Lock()
+	s.entries[apiMemoryKey(e.Namespace, e.Key)] = e
+	s.revision = max(s.revision, e.Revision)
+	sub, scope := s.sub, s.scope
+	s.mu.Unlock()
+
+	if sub != nil {
+		sub(TestEvent{Scope: scope, Namespace: e.Namespace, Key: e.Key, Op: internalstore.OpUpsert, Revision: e.Revision})
+	}
 }
 
 func (s *apiMemoryStore) Get(_ context.Context, _ TestScope, ns, key string) (TestEntry, bool, error) {
@@ -119,14 +134,14 @@ func (s *apiMemoryStore) List(context.Context, TestScope) ([]TestEntry, error) {
 	return out, nil
 }
 
-func (s *apiMemoryStore) Subscribe(_ context.Context, _ TestScope, fn func(TestEvent)) (func(), error) {
+func (s *apiMemoryStore) Subscribe(_ context.Context, scope TestScope, fn func(TestEvent)) (func(), error) {
 	s.mu.Lock()
-	s.sub = fn
+	s.sub, s.scope = fn, scope
 	s.mu.Unlock()
 
 	// Announce a connected changefeed (FC-2), outside the lock: the engine
 	// reads this store back on the calling goroutine.
-	fn(TestEvent{Op: internalstore.OpResync})
+	fn(TestEvent{Scope: scope, Op: internalstore.OpResync})
 
 	return func() {
 		s.mu.Lock()

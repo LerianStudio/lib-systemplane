@@ -298,6 +298,26 @@ func WithContextValidator(fn func(ctx context.Context, value any) error) KeyOpti
 	}
 }
 
+// WithWriteValidator sets a validation function that grades WRITES only: every
+// [Client.Set] and the registered default at [Client.Register], in the same
+// CANONICAL shape [WithValidator] grades. A stored row is never graded on its
+// way to a reader: every reconcile, changefeed re-read, tenant activation and
+// multi-tenant per-request read serves it as stored, so a reader that decides
+// for itself what a row this build would refuse means gets that row rather than
+// the registered default. A row that does not decode is still refused.
+//
+// A key takes one kind of validator: combined with [WithValidator] or
+// [WithContextValidator] on the same key, [Client.Register] refuses it with
+// [ErrValidation]. [Bind] always installs its own validator, so Bind refuses it
+// too. A nil fn is ignored.
+func WithWriteValidator(fn func(any) error) KeyOption {
+	return func(k *keyDef) {
+		if fn != nil {
+			k.writeValidator = func(_ context.Context, value any) error { return fn(value) }
+		}
+	}
+}
+
 // WithCatalogMetadata attaches operator-facing catalog metadata to a key.
 // Examples are emitted as provided; do not include secrets or credentials.
 func WithCatalogMetadata(meta CatalogKeyMetadata) KeyOption {

@@ -19,7 +19,8 @@ type KeyDef struct {
 	// it receives and clones before caching or delivering; the Registry may
 	// return its stored default directly.
 	Default any
-	// Validate rejects a decoded value at ingress. nil accepts anything.
+	// Validate rejects a decoded value at ingress. nil accepts anything, and is
+	// what a key registered WithWriteValidator reports: the Client grades its writes alone.
 	//
 	// The engine runs it on the READ-BACK paths only: the changefeed re-read
 	// and the reconcile snapshot, both under the engine's dispatch context,

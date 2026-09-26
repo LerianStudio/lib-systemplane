@@ -182,6 +182,15 @@ func WithContextValidator(fn func(ctx context.Context, value any) error) KeyOpti
 	return internalclient.WithContextValidator(fn)
 }
 
+// WithWriteValidator sets a validation function that grades writes only:
+// every [Client.Set] and the registered default at [Client.Register]. A stored
+// row reaches every reader as stored — each reconcile and changefeed re-read, a
+// tenant's activation, a multi-tenant per-request read — for a key whose readers
+// decide for themselves what to do with a row this build would refuse to write.
+// Combined with [WithValidator] or [WithContextValidator] on one key, or passed
+// to [Bind], it is refused with [ErrValidation]. A nil function is ignored.
+func WithWriteValidator(fn func(any) error) KeyOption { return internalclient.WithWriteValidator(fn) }
+
 // WithCatalogMetadata attaches operator-facing catalog metadata to a key.
 // Examples are emitted as provided; do not include secrets or credentials.
 func WithCatalogMetadata(meta CatalogKeyMetadata) KeyOption {
