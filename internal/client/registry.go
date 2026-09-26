@@ -29,7 +29,7 @@ func (c *Client) Lookup(namespace, key string) (engine.KeyDef, bool) {
 
 	return engine.KeyDef{
 		Default:  def.defaultValue,
-		Validate: def.validator,
+		Validate: def.readBackValidator(),
 	}, true
 }
 

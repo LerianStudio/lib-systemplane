@@ -32,7 +32,20 @@ type keyDef struct {
 	catalogDefault any
 	description    string
 	validator      func(context.Context, any) error
+	// writeValidator is WithWriteValidator's function. Register folds it into
+	// validator, which grades every write; its presence says reads go ungraded.
+	writeValidator func(context.Context, any) error
 	catalog        CatalogKeyMetadata
+}
+
+// readBackValidator grades a stored row on its way to a reader: nil for a
+// key registered WithWriteValidator.
+func (d keyDef) readBackValidator() func(context.Context, any) error {
+	if d.writeValidator != nil {
+		return nil
+	}
+
+	return d.validator
 }
 
 // Register declares a configuration key with its default value and optional
@@ -71,6 +84,14 @@ func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOp
 	def := keyDef{catalogDefault: engine.Clone(defaultValue)}
 
 	applyKeyOptions(&def, opts)
+
+	if def.writeValidator != nil {
+		if def.validator != nil {
+			return fmt.Errorf("%w: a key takes one kind of validator: WithWriteValidator cannot join another, and Bind installs its own", ErrValidation)
+		}
+
+		def.validator = def.writeValidator
+	}
 
 	if err := validateCatalogCloneSafe(def.catalog); err != nil {
 		return fmt.Errorf("%w: catalog metadata is not safely cloneable: %w", ErrValidation, err)

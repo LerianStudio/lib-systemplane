@@ -60,6 +60,7 @@ reads are served in process.
 | `MigrationV3ToV4SQL()` | The v3 → v4 Postgres delta as an importable artifact for your migration pipeline. See § The database and operator contract. |
 | `WithPostgresTenantManager`, `WithMongoTenantManager`, `ErrTenantManagerBackendMismatch` | Cache and push each tenant's configuration the way the single-tenant scope is: a tenant's first read activates its scope, `OnChange` delivers per tenant with `Change.Tenant` set, and `Client.HandleTenantLifecycle` drops, blocks and rebuilds the scope. Each option implies `WithMultiTenantEnabled`; the constructor of the other backend refuses it with `ErrTenantManagerBackendMismatch`. |
 | `WithContextValidator` | Validate a value against the `Set` caller's context, so a validator can use the tenant that call carried. The registered default is still validated with `context.Background()`. |
+| `WithWriteValidator` | Grade `Set` and the registered default only, and serve every stored row as stored. See § A stored row your validator rejects no longer reaches a read. |
 | `TestScope` | The scope every `TestStore` method now takes: `TestScope{Tenant}`, with `Tenant` `""` for the single-tenant scope. |
 
 **Changed shape.**
@@ -148,6 +149,14 @@ every such read logs the WARN.
 refuse. Those keys revert to their registered default on the next start, or on
 the first multi-tenant read after the deploy, so fix the rows or widen the
 validator first.
+
+**Or opt the key out:** register its validator with `WithWriteValidator`
+instead. It grades `Set` and the registered default only, and every stored row
+reaches `Get`, `List` and `OnChange` as stored — for a key whose reader makes
+its own decision about a row this build would refuse to write, where the default
+would hide that row. A row that does not decode is still refused. `Register`
+refuses it combined with `WithValidator` or `WithContextValidator` on one key,
+and `Bind` refuses it, with `ErrValidation`.
 
 ### Validators and defaults see the canonical JSON shape
 

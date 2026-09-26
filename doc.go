@@ -17,14 +17,16 @@
 // registered validator before it enters the cache — on the write path for a
 // local write, at the changefeed and reconcile ingress for every other row — so
 // a row written by an older binary, or straight into the table, cannot put a
-// value in force that the write path would refuse. The scope reconciles against
+// value in force that the write path would refuse; a key registered
+// [WithWriteValidator] is graded on writes alone. The scope reconciles against
 // the store after every changefeed reconnect, so a value written while the feed
 // was down becomes visible without a second write. [Client.GetEntry] reports
 // the revision, provenance and staleness behind the value it returns.
 //
 // In multi-tenant mode ([WithMultiTenantEnabled]) every read resolves the
 // tenant database from ctx and reads through, with no cache; the key's
-// validator grades that row too. [WithPostgresTenantManager] or
+// validator grades that row too, unless the key was registered
+// [WithWriteValidator]. [WithPostgresTenantManager] or
 // [WithMongoTenantManager] adds a cache: a tenant's first read brings up that
 // tenant's own scope, cached and fed by its own changefeed like the
 // single-tenant one, and [Client.HandleTenantLifecycle] drops, blocks and

@@ -94,6 +94,14 @@ across keys
 naming that key. Runnable:
 [`examples/single-tenant`](examples/single-tenant/main.go) (Postgres).
 
+A key's validator grades every write and every stored row on its way to a
+reader, so a row it refuses never comes into force. `WithWriteValidator` grades
+writes only — `Set` and the registered default — and serves every stored row as
+stored, for a key whose readers decide for themselves what a row this build
+would refuse to write means. `Register` refuses it combined with
+`WithValidator` or `WithContextValidator` on the same key, and `Bind` refuses
+it, with `ErrValidation`.
+
 With a tenant manager, one handler takes every lifecycle event, the service's
 tenant-manager dispatcher first:
 

@@ -8,7 +8,7 @@ type Change struct {
 	Namespace string
 	Key       string
 	Revision  int64 // 0 when no row backs Value, or its row has no revision
-	Value     any   // decoded and validated; the receiver owns this copy
+	Value     any   // decoded, and graded unless the key's Validate is nil; the receiver owns this copy
 }
 
 // Entry is the published state of one key in the caller's scope.
