@@ -1,4 +1,3 @@
-// The Client's key registry, seen from the engine.
 package client
 
 import "github.com/LerianStudio/lib-systemplane/v4/internal/engine"

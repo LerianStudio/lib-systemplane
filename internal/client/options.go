@@ -1,4 +1,3 @@
-// Package-level option constructors for Client and key registration.
 package client
 
 import (
@@ -108,7 +107,7 @@ func WithDebounce(d time.Duration) Option {
 // store, which this option does not bound; Close returns the engine's timeout
 // joined with the store's own error, so both are visible.
 //
-// Last-wins. A zero or negative value means the engine default.
+// Last-wins. A zero or negative value means the default, 30s.
 func WithCloseTimeout(d time.Duration) Option {
 	return func(cfg *clientConfig) {
 		cfg.closeTimeout = d
@@ -126,8 +125,8 @@ func WithCloseTimeout(d time.Duration) Option {
 //     cache and no changefeed: Get hits the resolved tenant DB on every call
 //     and OnChange returns ErrNotSupportedInMultiTenant. With one, a tenant's
 //     first read activates its cached scope.
-//   - Schema bootstrap runs lazily on first access per resolved tenant
-//     database.
+//   - MongoDB bootstraps each tenant database on first access; Postgres
+//     issues no DDL, so SchemaSQL() is applied externally.
 func WithMultiTenantEnabled() Option {
 	return func(cfg *clientConfig) {
 		cfg.multiTenantEnabled = true

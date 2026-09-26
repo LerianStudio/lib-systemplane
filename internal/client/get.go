@@ -1,4 +1,3 @@
-// Read paths and listing for systemplane Client.
 package client
 
 import (
@@ -36,11 +35,10 @@ func (c *Client) Get(ctx context.Context, namespace, key string) (any, bool, err
 
 // GetEntry resolves the caller's scope like Get. ok is false for an
 // unregistered key. Revision, UpdatedAt and UpdatedBy describe the persisted
-// row backing the value in force, and Stale reports whether anything is
-// currently confirming THIS key: true while the changefeed is disconnected or
-// has not been reconciled since it connected, and true while this key could not
-// be re-read after its last change. A sibling key nobody could re-read leaves
-// this one confirmed (FC-5).
+// row behind the value, zero when the registered default is in force. Stale is
+// true while nothing confirms THIS key: before a single-tenant Start, while the
+// changefeed is down or unreconciled, or while this key failed its re-read. A
+// read served per request is never stale.
 func (c *Client) GetEntry(ctx context.Context, namespace, key string) (e Entry, ok bool, err error) {
 	e, ok, err = c.getEntry(ctx, namespace, key)
 
@@ -61,9 +59,9 @@ func (c *Client) singleTenantEntry(namespace, key string, def keyDef) Entry {
 	// Start, while Start is still bringing the scope up, or after a Start
 	// whose first reconcile confirmed nothing. The registered default is what
 	// reads serve, and it is Stale in every one of those cases — nobody has
-	// confirmed it (FC-5). A completed first reconcile publishes EVERY
-	// registered key (FC-11), so on a started, reconciled Client a registered
-	// key is never a miss and this branch is never the answer.
+	// confirmed it. A completed first reconcile publishes EVERY registered
+	// key, so on a started, reconciled Client a registered key is never a miss
+	// and this branch is never the answer.
 	return Entry{
 		Value: engine.Clone(def.defaultValue),
 		Stale: true,
@@ -119,7 +117,7 @@ func (c *Client) tenantEntry(ctx context.Context, nk nskey, def keyDef) (Entry, 
 
 	// The zero scope, never the tenant's: the middleware-resolved database the
 	// request was authorized (or refused, for a suspended tenant) against, which
-	// the connector behind a named scope would bypass (D7).
+	// the connector behind a named scope would bypass.
 	entry, found, err := c.store.Get(ctx, store.Scope{}, nk.Namespace, nk.Key)
 	if err != nil {
 		return Entry{}, false, fmt.Errorf("systemplane: Get: %w", err)
@@ -355,8 +353,8 @@ type registeredKey struct {
 
 // listFromEngine reads every key of scope through the engine, falling back to
 // the registered default for one the engine has published nothing for, and
-// reports whether every key was cached. ListEntry carries no revision (FC-10),
-// so the provenance the engine holds is dropped here on purpose.
+// reports whether every key was cached. ListEntry carries no revision, so the
+// provenance the engine holds is dropped here on purpose.
 //
 // The engine is read outside registryMu — it takes locks of its own and must
 // never be called under the Client's — which List already guarantees by

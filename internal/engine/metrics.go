@@ -14,10 +14,10 @@ import (
 )
 
 // aggregateTenant is the tenant_id every instrument reports once more tenant
-// scopes are active than a positive threshold allows (FC-10).
+// scopes are active than a positive threshold allows.
 const aggregateTenant = "aggregate"
 
-// metrics holds FC-12's instruments. A nil *metrics records nothing, which is
+// metrics holds the engine's instruments. A nil *metrics records nothing, which is
 // what an engine built without a meter carries.
 type metrics struct {
 	threshold int64

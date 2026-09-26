@@ -8,9 +8,9 @@ import (
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
 
-// HandleTenantLifecycle routes FC-6's four lifecycle events to the tenant's
-// scope. The engine verbs act in the background, so the only errors are the
-// ones decided here: a closed Client and an event naming no tenant.
+// HandleTenantLifecycle routes the four tenant lifecycle events to the
+// tenant's scope. The engine verbs act in the background, so the only errors
+// are the ones decided here: a closed Client and an event naming no tenant.
 func (c *Client) HandleTenantLifecycle(_ context.Context, event tmevent.TenantLifecycleEvent) error {
 	if c == nil || !c.tenantManaged {
 		return nil
@@ -36,4 +36,9 @@ func (c *Client) HandleTenantLifecycle(_ context.Context, event tmevent.TenantLi
 	}
 
 	return nil
+}
+
+// TenantBlocked reports whether a tenant lifecycle event left tenant blocked.
+func (c *Client) TenantBlocked(tenant string) bool {
+	return c != nil && c.engine.Blocked(store.Scope{Tenant: tenant})
 }

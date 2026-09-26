@@ -29,8 +29,8 @@ type entry struct {
 	// Retaining it costs one copy of every key's row JSON, so the engine's
 	// cache holds the registered keys times the tracked scopes in raw bytes on
 	// top of the decoded values. Negligible single-tenant, where there is one
-	// scope; in wave 3 it is multiplied by the number of tenants the process
-	// has activated.
+	// scope; tenant-managed, it is multiplied by the number of tenants the
+	// process has activated.
 	Raw       []byte
 	Revision  int64
 	UpdatedAt time.Time
@@ -47,23 +47,23 @@ type entry struct {
 // the count would put a nil value in force behind every read of that key.
 //
 // deletes is what makes a delete refusable at all. A delete publishes the
-// registered default at Revision 0, which FC-4 and FC-5 require at the public
-// surface, so the revision alone cannot tell a re-read that the row it is
-// holding has since been removed: every revision beats 0. It is bumped the
-// instant the changefeed reports the row gone — at event ARRIVAL, before the
-// key's quiet window, by recordFeedDelete — and by a Client Delete, which
-// publishes on the caller's own goroutine for read-your-writes (D4). The feed
-// bumps it exactly once per event: the re-read that event schedules publishes
-// through the ordinary no-row ingress and counts no second delete.
+// registered default at Revision 0, as the public contract requires, so the
+// revision alone cannot tell a re-read that the row it is holding has since
+// been removed: every revision beats 0. It is bumped the instant the
+// changefeed reports the row gone — at event ARRIVAL, before the key's quiet
+// window, by recordFeedDelete — and by a Client Delete, which publishes on the
+// caller's own goroutine for read-your-writes. The feed bumps it exactly once
+// per event: the re-read that event schedules publishes through the ordinary
+// no-row ingress and counts no second delete.
 //
 // A re-read reads both counters BEFORE its store call and hands them back
 // afterwards. That is causal rather than numeric — it asks "did a delete land
 // while I was reading?", not "is this revision high enough" — so it refuses a
 // row read under a snapshot that predates the DELETE (READ COMMITTED gives a
 // reader exactly that) while still accepting a recreate at any revision,
-// including one below the deleted row's. D11 makes a recreate through the
-// library come back strictly above every earlier revision, but it names a
-// residual where it does not, and the engine does not need to care.
+// including one below the deleted row's. A recreate through the library comes
+// back above every earlier revision unless a foreign delete removed its MongoDB
+// tombstone, and the engine does not need to care.
 //
 // publications counts every publication the revision fence accepted, and is
 // what the OTHER outcome of a delete's re-read is fenced on: a read that comes
