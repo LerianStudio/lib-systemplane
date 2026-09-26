@@ -635,10 +635,52 @@ statement matches the code on the branch.
 ### Epic 2.3: The godoc truth sweep and the CI examples gate
 
 **Goal:** Every exported doc comment describes v4.
-**Scope:** `.github/workflows/go-combined-analysis.yml`; findings inside `doc.go` (fixed here) and findings inside files owned by other lanes (reported, not edited).
+**Scope:** comment lines only, in the root package, `admin/`, `systemplanetest/` and the internal packages listed below (orchestrator resolution 2026-09-26, § Orchestrator resolutions); findings inside `internal/client/**` and `internal/engine/**` are reported, not edited.
 **Dependencies:** Epics 2.1 and 2.2.
 **Done when:** `go doc -all . > /tmp/godoc.txt` plus `go doc -all ./admin` and `go doc -all ./systemplanetest` have been walked against FC-10's kept list (every symbol present and its comment describing v4) and FC-10's removed list (no symbol present); the forbidden-token grep over that output returns nothing; every finding in a file this lane does not own is written into this document's § Handover to other lanes with the exact replacement text and reported to the orchestrator.
 **Status:** Pending
+
+Elaborated 2026-09-26 against `develop` `e91a7352` (after PR #106). Every lane that owns a root, `admin` or `systemplanetest` file is merged (engine-core #87/#93, storage #90/#97, groups #86, groups-redaction #99, engine-tenants #103/#104, the admin work inside those). The one lane in flight, engine-tenants Phase 3, edits only `internal/client/*_integration_test.go`, `internal/client/main_test.go` and `lane-engine-tenants.md`.
+
+**Order:** 2.3.1 and 2.3.2 are independent and run in parallel (disjoint files).
+
+**The sweep's rules (G-1..G-5), shared by both tasks:**
+
+- **G-1 Comment lines only.** A task changes `//` lines and nothing else. `git diff -U0 origin/develop -- '*.go' | grep -E '^[+-][^+-]' | grep -vE '^[+-]\s*(//|$)'` prints nothing. A finding that needs a code change goes to § Handover to other lanes with file:line, the observed behaviour and the proposed change.
+- **G-2 True in all three modes.** A comment is checked against the code it documents, for single-tenant, multi-tenant without a tenant manager, and tenant-managed (`WithPostgresTenantManager` / `WithMongoTenantManager`). A comment that states a mode-specific behaviour names the mode.
+- **G-3 FC-10 and D12.** No removed symbol appears (`index.md:497-501`); every kept symbol is present. No redaction vocabulary survives D12 (`index.md:29`): no `Redact*`, `KeyRedaction`, `ApplyRedaction`, "masked", "withheld" or "redacted" describing a value the library hides.
+- **G-4 Shrink, never grow.** Replace a false sentence rather than qualify it. A task's net comment growth needs one line of reason in its notes. Known suspects from earlier reviews, to verify and not to assume: `api_group.go` around the `OnApply` godoc (`:394-440`) and `internal/group/coordinator.go:116`, `:488`, `:905`.
+- **G-5 Forbidden tokens.** With `ABSENT` exactly as § The absence grep sets it, `go doc -all <pkg> | grep -nE "$ABSENT"` prints nothing for `.`, `./admin` and `./systemplanetest`.
+
+#### Task 2.3.1: Sweep the root package godoc
+
+- [ ] Done
+
+**Context:** The root package is the whole public API: `api_*.go`, `ddl.go`, `doc.go`. `go doc -all .` renders it. FC-10's kept and removed lists are `index.md:497-501`; FC-4 (multi-tenant `OnChange`), FC-6 (`HandleTenantLifecycle`), FC-10 (`WithAggregateTenantThreshold`), FC-11 (initial publication) and FC-12 (metrics) are the contracts the comments must match.
+
+**Implementation vision:** Run `go doc -all . > $TMPDIR/godoc-root.txt`. Walk it symbol by symbol under G-1..G-5, reading the implementation each comment points at (`internal/client`, `internal/engine`, `internal/group`, the backends) rather than trusting another comment. Fix each finding in the root `.go` file that holds the comment. Record every fixed finding in the commit body as `file:line: was / now`. Put every finding that needs a code change, or that lives in `internal/client/**` or `internal/engine/**`, in your notes with file:line and the exact replacement text; the harness writes § Handover to other lanes from them.
+
+**Files:**
+- Modify: root `api_*.go`, `ddl.go`, `doc.go` (comment lines only)
+
+**Verification:** G-1's diff filter prints nothing; G-5 for `.` prints nothing; `go build ./... && go vet -tags=unit ./... && make lint` pass; `go test -tags=unit -run TestExportedBoundary ./...` passes.
+
+**Done when:** every exported symbol of the root package has been walked, each finding is fixed or reported, and the verification passes.
+
+#### Task 2.3.2: Sweep `admin`, `systemplanetest`, the internal package docs, and prove the examples gate
+
+- [ ] Done
+
+**Context:** `admin/` and `systemplanetest/` are importable; their godoc is rendered by `go doc -all ./admin` and `./systemplanetest`. The internal packages are not importable, but their package docs and exported-symbol comments are what the next maintainer reads: `internal/group`, `internal/store`, `internal/postgres`, `internal/mongodb`, `internal/debounce`, `internal/safelog`, `internal/testsupport`. `.github/workflows/go-combined-analysis.yml` runs golangci-lint v2.12.2 over the module, and `.golangci.yml` has no exclusion for `examples` (this plan's § What this lane owns says otherwise and is wrong), so the Lint job already type-checks every example.
+
+**Implementation vision:** Walk `go doc -all ./admin` and `go doc -all ./systemplanetest` under G-1..G-5, then the package doc and every exported-symbol comment of the internal packages listed above (read with `go doc -all -u ./internal/<pkg>`). Fix findings in place. Then prove the examples gate without changing CI: add a deliberate compile error to `examples/groups/main.go`, run `make lint`, capture the typecheck failure line, revert the file, and rerun `make lint` green; commit nothing from that probe. Report the captured line in notes. No workflow change: a separate `go build ./examples/...` step would repeat what the Lint job already fails on.
+
+**Files:**
+- Modify: `admin/*.go`, `systemplanetest/*.go`, `internal/{group,store,postgres,mongodb,debounce,safelog,testsupport}/**/*.go` (comment lines only; `_test.go` files excluded)
+
+**Verification:** G-1's diff filter prints nothing; G-5 for `./admin` and `./systemplanetest` prints nothing; `go build ./... && go vet -tags=unit ./... && go vet -tags=integration ./... && make lint` pass; the probe's failure line is in notes.
+
+**Done when:** both importable packages and the listed internal packages have been walked, each finding is fixed or reported, and the examples gate is proven.
 
 **Review 2026-09-25 (branch `docs/v4-examples`).** No `examples` CI job. The pinned shared workflow already runs `make build` (`go build ./...`) and golangci-lint with govet over `./examples/...`; a separate job would sit under the same `paths-ignore`, and the pin lives in this file. The `examples$` lint exclusion, which matched no file, is deleted. The sweep waits until `engine-tenants` merges, because it reads `api_*.go` and `internal/client/options.go`, which that lane is still writing. Inputs the review already found: `api_group.go:399-402` (every publication carries Revision 0 "until this Client is engine-backed": stale), `:421-422` (the initial delivery "happens during Start", while `OnChange` says either side of its return), `:428-433` (publications "from a timer goroutine" under the default debounce: stale, only the changefeed debounces), and the wave-1 facade claims at `internal/group/coordinator.go:116`, `:488`, `:905`.
 
@@ -726,6 +768,11 @@ notifications (v1.6.1) and finance-hub (v1.6.0) are on the unsuffixed module pat
 - **3** corrected: the Lane Overview marks groups `In flight` (Phase 1 merged as PR #72, Phase 2 with `OnApply`/`Status` being elaborated on `feat/v4-groups-hot-reload`). `examples/groups` and the `doc.go` paragraph that need `OnApply` wait for groups Phase 2; Phase 1 tasks that only cite FC-7 may proceed.
 - **4** frozen in FC-4: multi-tenant `OnChange` with no tenant manager returns `ErrNotSupportedInMultiTenant`. Write it as a documented refusal in behaviour change 6 and in the billing-worker section.
 - **5** accepted: the v1.6.x hops (Fiber v2 to v3, lib-commons v5 to v7, lib-observability v1 to v4) are stated as preconditions; `MIGRATION-v4.md` documents from v3 onward.
+
+## Orchestrator resolutions (2026-09-26)
+
+- **Epic 2.3 edits comments outside the lane's owned list.** Every lane that owns root `api_*.go`, `ddl.go`, `admin/**`, `systemplanetest/**` and the internal packages in Task 2.3.2 is merged, so no concurrent writer exists and a handover would only add a round trip. The sweep fixes comment lines there directly (G-1). `internal/client/**` and `internal/engine/**` stay read-only because engine-tenants Phase 3 is in flight on that tree; findings there are reported to the orchestrator.
+- **No CI examples job.** § What this lane owns lists "one added job" in `go-combined-analysis.yml`. golangci-lint already type-checks `examples/`, since `.golangci.yml` excludes nothing there, so a compile error in an example already fails the Lint job. Task 2.3.2 proves it instead of adding a job.
 
 ## Re-elaboration note (2026-09-24)
 
