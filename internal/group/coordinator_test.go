@@ -664,7 +664,6 @@ func TestCoordinatorNilReceiverIsSafe(t *testing.T) {
 	var c *Coordinator[coordDoc]
 
 	c.Publish(context.Background(), publication("t1", 1, "one"))
-	c.DropScope("t1")
 
 	unsubscribe := mustRegister(t, c, func(context.Context, Decoded[coordDoc], *Decoded[coordDoc]) error { return nil })
 	if unsubscribe == nil {

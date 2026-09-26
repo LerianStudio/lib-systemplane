@@ -85,8 +85,7 @@ func eventFromChange(ce changeEvent) (store.Event, bool) {
 	// the current majority-committed document, not a point-in-time image. That
 	// is the observation model Postgres already has, where NOTIFY carries no
 	// value and the engine re-reads the row, and the store contract on both
-	// backends is final-state convergence rather than point-in-time replay
-	// (FC-9).
+	// backends is final-state convergence rather than point-in-time replay.
 	//
 	// An empty after-image is the one case the lookup cannot fill: a FOREIGN
 	// deleteOne removed the document between the change and the lookup (the

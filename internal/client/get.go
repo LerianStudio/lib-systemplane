@@ -35,11 +35,10 @@ func (c *Client) Get(ctx context.Context, namespace, key string) (any, bool, err
 
 // GetEntry resolves the caller's scope like Get. ok is false for an
 // unregistered key. Revision, UpdatedAt and UpdatedBy describe the persisted
-// row backing the value in force, and Stale reports whether anything is
-// currently confirming THIS key: true while the changefeed is disconnected or
-// has not been reconciled since it connected, and true while this key could not
-// be re-read after its last change. A sibling key nobody could re-read leaves
-// this one confirmed.
+// row behind the value, zero when the registered default is in force. Stale is
+// true while nothing confirms THIS key: before a single-tenant Start, while the
+// changefeed is down or unreconciled, or while this key failed its re-read. A
+// read served per request is never stale.
 func (c *Client) GetEntry(ctx context.Context, namespace, key string) (e Entry, ok bool, err error) {
 	e, ok, err = c.getEntry(ctx, namespace, key)
 

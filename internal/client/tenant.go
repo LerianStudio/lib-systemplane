@@ -31,14 +31,6 @@ func (c *Client) HandleTenantLifecycle(_ context.Context, event tmevent.TenantLi
 		c.engine.Unblock(scope) // a read activates it: no feed for a tenant this process never reads
 	case tmevent.EventTenantSuspended, tmevent.EventTenantDeleted:
 		c.engine.Block(scope)
-
-		c.registryMu.RLock()
-		hooks := c.dropHooks
-		c.registryMu.RUnlock()
-
-		for _, drop := range hooks {
-			drop(event.TenantID)
-		}
 	case tmevent.EventTenantCredentialsRotated:
 		c.engine.Reactivate(scope)
 	}
@@ -46,15 +38,7 @@ func (c *Client) HandleTenantLifecycle(_ context.Context, event tmevent.TenantLi
 	return nil
 }
 
-// OnTenantDrop adds fn to what HandleTenantLifecycle runs, with the tenant id,
-// when that tenant is suspended or deleted. A nil fn is ignored.
-func (c *Client) OnTenantDrop(fn func(tenant string)) {
-	if c == nil || fn == nil {
-		return
-	}
-
-	c.registryMu.Lock()
-	defer c.registryMu.Unlock()
-
-	c.dropHooks = append(c.dropHooks, fn)
+// TenantBlocked reports whether a tenant lifecycle event left tenant blocked.
+func (c *Client) TenantBlocked(tenant string) bool {
+	return c != nil && c.engine.Blocked(store.Scope{Tenant: tenant})
 }

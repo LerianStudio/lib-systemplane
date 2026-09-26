@@ -118,6 +118,20 @@ func (e *Engine) Unblock(scope store.Scope) {
 	delete(e.failedAt, scope)
 }
 
+// Blocked reports whether scope is blocked; it is set before Block returns.
+func (e *Engine) Blocked(scope store.Scope) bool {
+	if e == nil {
+		return false
+	}
+
+	e.activationsMu.Lock()
+	defer e.activationsMu.Unlock()
+
+	_, blocked := e.blocked[scope]
+
+	return blocked
+}
+
 // Reactivate rebuilds a tracked scope on a fresh feed in the background; an
 // untracked scope only loses its retry cooldown, and a blocked one is left alone.
 func (e *Engine) Reactivate(scope store.Scope) {

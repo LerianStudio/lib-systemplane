@@ -61,9 +61,9 @@ type entry struct {
 // while I was reading?", not "is this revision high enough" — so it refuses a
 // row read under a snapshot that predates the DELETE (READ COMMITTED gives a
 // reader exactly that) while still accepting a recreate at any revision,
-// including one below the deleted row's. The store brings a recreate through
-// the library back strictly above every earlier revision, save a residual it
-// documents, and the engine does not need to care.
+// including one below the deleted row's. A recreate through the library comes
+// back above every earlier revision unless a foreign delete removed its MongoDB
+// tombstone, and the engine does not need to care.
 //
 // publications counts every publication the revision fence accepted, and is
 // what the OTHER outcome of a delete's re-read is fenced on: a read that comes

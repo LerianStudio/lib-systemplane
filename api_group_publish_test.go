@@ -163,9 +163,9 @@ func (*groupPublishMemoryStore) Subscribe(context.Context, TestScope, func(TestE
 	return func() {}, nil
 }
 
-// TestGroupStatusForgetsATenantTheClientStopsServing: suspended and deleted
-// drop the tenant's Status row; a credentials rotation or an activation keeps it.
-func TestGroupStatusForgetsATenantTheClientStopsServing(t *testing.T) {
+// TestGroupStatusOmitsABlockedTenant: suspended and deleted hide the tenant from
+// Status, a publication landing after the event included, until tenant.activated.
+func TestGroupStatusOmitsABlockedTenant(t *testing.T) {
 	t.Parallel()
 
 	for event, want := range map[string][]string{
@@ -182,39 +182,44 @@ func TestGroupStatusForgetsATenantTheClientStopsServing(t *testing.T) {
 				t.Fatalf("NewForTesting: %v", err)
 			}
 
+			t.Cleanup(func() { _ = c.Close() })
+
 			g, err := Bind(c, "billing", "limits", groupPublishDoc{Workers: 1}, nil)
 			if err != nil {
 				t.Fatalf("Bind: %v", err)
 			}
 
 			ctx := context.Background()
-			if err := c.Start(ctx); err != nil {
-				t.Fatalf("Start: %v", err)
+			lifecycle := func(eventType string) {
+				t.Helper()
+
+				if err := c.HandleTenantLifecycle(ctx, tmevent.TenantLifecycleEvent{EventType: eventType, TenantID: "t1"}); err != nil {
+					t.Fatalf("HandleTenantLifecycle(%s): %v", eventType, err)
+				}
 			}
+			tenants := func() []string {
+				var got []string
+				for _, st := range g.Status() {
+					got = append(got, st.Tenant)
+				}
 
-			t.Cleanup(func() { _ = c.Close() })
-
-			unsubscribe, err := g.OnApply((&publishRecorder{}).apply)
-			if err != nil {
-				t.Fatalf("OnApply on a tenant-managed Client = %v, want no error", err)
+				return got
 			}
-
-			t.Cleanup(unsubscribe)
 
 			g.publish(ctx, Change{Namespace: "billing", Key: "limits", Tenant: "t1", Revision: 7, Value: map[string]any{"workers": 4}})
 			g.publish(ctx, Change{Namespace: "billing", Key: "limits", Tenant: "t2", Revision: 9, Value: map[string]any{"workers": 9}})
+			lifecycle(event)
+			// A delivery the engine already had under way when the event arrived.
+			g.publish(ctx, Change{Namespace: "billing", Key: "limits", Tenant: "t1", Revision: 8, Value: map[string]any{"workers": 5}})
 
-			if err := c.HandleTenantLifecycle(ctx, tmevent.TenantLifecycleEvent{EventType: event, TenantID: "t1"}); err != nil {
-				t.Fatalf("HandleTenantLifecycle(%s): %v", event, err)
-			}
-
-			var got []string
-			for _, st := range g.Status() {
-				got = append(got, st.Tenant)
-			}
-
-			if !slices.Equal(got, want) {
+			if got := tenants(); !slices.Equal(got, want) {
 				t.Fatalf("Status tenants after %s for t1 = %v, want %v", event, got, want)
+			}
+
+			lifecycle(tmevent.EventTenantActivated)
+
+			if got := tenants(); !slices.Equal(got, []string{"t1", "t2"}) {
+				t.Fatalf("Status tenants after %s then activated = %v, want [t1 t2]", event, got)
 			}
 		})
 	}

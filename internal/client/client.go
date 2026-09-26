@@ -45,8 +45,6 @@ type Client struct {
 
 	registryMu sync.RWMutex
 	registry   map[nskey]keyDef
-	// dropHooks run for a suspended or deleted tenant; guarded by registryMu.
-	dropHooks []func(tenant string)
 
 	startMu sync.Mutex
 	started atomic.Bool
@@ -210,8 +208,8 @@ func newClient(s store.Store, cfg clientConfig) *Client {
 	return c
 }
 
-// Start performs backend bootstrap and, in single-tenant mode, starts the
-// engine: it opens the changefeed and returns once the first reconcile has
+// Start, in single-tenant mode, starts the engine once MongoDB has ensured its
+// collection: it opens the changefeed and returns once the first reconcile has
 // confirmed every registered key against the store, so every read taken after
 // it serves what is stored rather than the registered default. That reconcile
 // also queues the Start announcement for every subscriber registered
