@@ -624,10 +624,9 @@ func runSubscribeThenImmediateWrite(t *testing.T, f Factory, opts RunOptions) {
 	}
 }
 
-// runRevisionMonotonic pins the store's revision rules: a stored value always
-// has a non-zero revision, changing it advances the revision, rewriting the
-// same value does not, and every read path reports the revision the write
-// returned.
+// runRevisionMonotonic pins the store's revision rules for Set: the first Set
+// returns a non-zero revision, changing the value advances it, rewriting the
+// same value does not, and every read path reports the revision Set returned.
 //
 // It also pins the rule across a delete, which is what makes "monotonic per
 // (namespace, key)" true for the whole life of a key and not just the life of

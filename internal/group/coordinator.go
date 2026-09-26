@@ -479,8 +479,8 @@ func (c *Coordinator[T]) add(fn ApplyFunc[T]) (uint64, []*scope[T], seedOutcome)
 // so a scope nobody applies keeps reporting its last rejection rather than
 // reading healthy while it is torn down.
 //
-// Desired equal to Applied is not convergence on its own: read LastErr, as the
-// root package's ApplyStatus explains.
+// Desired equal to Applied is not convergence on its own: LastErr reports a
+// rejection, as the root package's ApplyStatus explains.
 func (c *Coordinator[T]) Status() []Status {
 	if c == nil {
 		return nil

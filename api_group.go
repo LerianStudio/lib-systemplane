@@ -357,10 +357,10 @@ type Applied[T any] struct {
 // Desired equal to Applied is not convergence on its own: a delete and a key
 // with no row both publish Revision 0, which is also the Applied of a function
 // that has accepted nothing, so a function that refused everything can report
-// the very revision the scope desires. LastErr is the field that answers "is
-// my configuration actually in force". A delivery in flight also leaves
-// Applied behind with no error at all, because Status is a point-in-time read
-// rather than a transaction.
+// the very revision the scope desires. Read LastErr for that rejection; with no
+// function registered, nothing applies the document at all. A delivery in
+// flight also leaves Applied behind with no error, because Status is a
+// point-in-time read rather than a transaction.
 type ApplyStatus struct {
 	Tenant  string
 	Desired int64 // latest published revision
