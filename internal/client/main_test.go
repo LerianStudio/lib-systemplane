@@ -1,23 +1,42 @@
-//go:build unit
+//go:build unit || integration
 
-package client
+package client_test
 
 import (
+	"fmt"
+	"os"
 	"testing"
 
 	"go.uber.org/goleak"
 )
 
-// TestMain runs every unit test in this package under goleak.VerifyTestMain so
-// that any goroutine spawned by Client (reconcile, debouncer, refresh, OnChange
-// dispatch) but not cleaned up by Close() fails the package run.
-//
-// No ignore list is needed today: the only goroutines this package launches
-// are the debouncer's worker (Closed by Client.Close → debouncer.Close) and
-// the test-local memStore fire goroutines, both of which complete inline. If
-// a future change introduces a dependency goroutine that legitimately outlives
-// the test process (e.g. an OpenTelemetry exporter), add a
-// goleak.IgnoreAnyFunction("...") entry with a comment explaining why.
+// afterRun holds the teardown of what outlives every test: the integration
+// harness appends each shared container's termination. Empty under unit.
+var afterRun []func()
+
+// TestMain fails an otherwise green run on any goroutine left behind. It
+// inlines goleak.VerifyTestMain because that exits the process itself, which
+// would skip the container teardown the leak check has to wait for.
 func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m)
+	code := m.Run()
+
+	for _, teardown := range afterRun {
+		teardown()
+	}
+
+	if code == 0 {
+		if err := goleak.Find(
+			// testcontainers' Reaper lives for the whole process by design.
+			goleak.IgnoreAnyFunction("github.com/testcontainers/testcontainers-go.(*Reaper).connect.func1"),
+			// HTTP keep-alive of testcontainers' Docker client.
+			goleak.IgnoreAnyFunction("net/http.(*persistConn).readLoop"),
+			goleak.IgnoreAnyFunction("net/http.(*persistConn).writeLoop"),
+		); err != nil {
+			fmt.Fprintf(os.Stderr, "goleak: Errors on successful test run: %v\n", err)
+
+			code = 1
+		}
+	}
+
+	os.Exit(code)
 }
