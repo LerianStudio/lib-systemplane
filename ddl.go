@@ -102,12 +102,11 @@ func SchemaSQL() string {
 // creates and seeds the sequence there rather than in whatever schema the
 // applying role's search_path happens to put first.
 //
-// Apply it to ONE DATABASE PER TENANT. It must never be applied once per
-// schema inside a shared database: NOTIFY is database-wide and every feed
-// listens on the single systemplane_changes channel, so two installations in
-// one database would each receive the other's events, and the unqualified
-// DROP FUNCTION of the v3 notify function resolves through the applying role's
-// whole search_path.
+// It upgrades the ONE install search_path resolves. An install off search_path
+// is untouched, so a database holding one install per schema is migrated once
+// per schema with search_path set to that schema. Installs in one database
+// share the systemplane_changes channel, so a feed on that database receives
+// every install's events.
 //
 // After the upgrade the SECURITY DEFINER bump trigger is the only thing that
 // touches the sequence, so the runtime role needs plain DML on
@@ -122,8 +121,8 @@ func SchemaSQL() string {
 // SchemaSQL() refuses. It opens with a guard of its own instead, because every
 // statement in it names systemplane_entries unqualified: it refuses when
 // search_path reaches no systemplane_entries at all, and when a second one
-// exists in another user schema, where it would otherwise upgrade whichever
-// install search_path resolves first and leave the other on v3. A consumer starting
+// sits in another schema on search_path, where it would otherwise upgrade
+// whichever install search_path resolves first and leave the other on v3. A consumer starting
 // from an empty database applies SchemaSQL() instead, where the first write
 // lands at revision 2 rather than 1. lib-systemplane does not execute it for
 // the caller.

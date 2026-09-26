@@ -950,6 +950,136 @@ func TestIntegration_DDLMigrationRefusesAnInvisibleInstall(t *testing.T) {
 	assertNoRevisionColumn(t, db, "app")
 }
 
+// TestIntegration_DDLMigrationUpgradesEachSchemaInstallInTurn is the
+// schema-per-tenant layout a migration runner produces: one v3 install per
+// schema of one database, each migrated on its own with search_path set to
+// that schema alone. An install off search_path is invisible to every
+// unqualified statement in the file, so the guard must admit the run and the
+// run must leave the other install on v3, then upgrade it the same way.
+func TestIntegration_DDLMigrationUpgradesEachSchemaInstallInTurn(t *testing.T) {
+	dsn, db := newDatabase(t, startContainer(t), "perschema")
+
+	if _, err := db.Exec(`CREATE SCHEMA app; CREATE SCHEMA tenant_b`); err != nil {
+		t.Fatalf("create schemas: %v", err)
+	}
+
+	onPath := map[string]*sql.DB{}
+
+	for _, schema := range []string{"app", "tenant_b"} {
+		onPath[schema] = openDatabase(t, dsn+"&search_path="+schema)
+		t.Cleanup(func() { _ = onPath[schema].Close() })
+
+		if _, err := onPath[schema].Exec(v3SchemaSQL); err != nil {
+			t.Fatalf("apply v3 schema inside %s: %v", schema, err)
+		}
+
+		if _, err := onPath[schema].Exec(`INSERT INTO systemplane_entries (namespace, "key", value, updated_by)
+			VALUES ('runtime_config', 'log_level', '"debug"'::jsonb, 'operator')`); err != nil {
+			t.Fatalf("insert pre-existing row inside %s: %v", schema, err)
+		}
+	}
+
+	migrate := func(schema string) {
+		t.Helper()
+
+		if _, err := onPath[schema].Exec(systemplane.MigrationV3ToV4SQL()); err != nil {
+			t.Fatalf("MigrationV3ToV4SQL() under search_path %q: %v", schema, err)
+		}
+	}
+
+	v3Triggers := func(schema string) string {
+		return fmt.Sprintf("systemplane_notify_trigger -> %[1]s.systemplane_notify_v3, systemplane_notify_update_trigger -> %[1]s.systemplane_notify_v3", schema)
+	}
+
+	v4Triggers := func(schema string) string {
+		return fmt.Sprintf("systemplane_bump_revision_trigger -> %[1]s.systemplane_bump_revision_v4, systemplane_notify_trigger -> %[1]s.systemplane_notify_v4, systemplane_notify_update_trigger -> %[1]s.systemplane_notify_v4", schema)
+	}
+
+	migrate("app")
+
+	assertInstallTriggers(t, db, "app", v4Triggers("app"))
+	assertRelationSchemas(t, db, "systemplane_revision_seq", []string{"app"})
+	appRevision := assertMigratedRowThenWrite(t, db, "app")
+
+	assertNoRevisionColumn(t, db, "tenant_b")
+	assertInstallTriggers(t, db, "tenant_b", v3Triggers("tenant_b"))
+
+	migrate("tenant_b")
+
+	assertInstallTriggers(t, db, "tenant_b", v4Triggers("tenant_b"))
+	assertRelationSchemas(t, db, "systemplane_revision_seq", []string{"app", "tenant_b"})
+	assertMigratedRowThenWrite(t, db, "tenant_b")
+
+	assertInstallTriggers(t, db, "app", v4Triggers("app"))
+	assertRowRevision(t, db, "app", appRevision)
+
+	migrate("app")
+	migrate("tenant_b")
+
+	assertInstallTriggers(t, db, "app", v4Triggers("app"))
+	assertInstallTriggers(t, db, "tenant_b", v4Triggers("tenant_b"))
+}
+
+// assertInstallTriggers pins the triggers on schema.systemplane_entries and the
+// schema-qualified function each runs: a trigger bound to another schema's
+// function is exactly what an upgrade that crossed installs leaves behind.
+func assertInstallTriggers(t *testing.T, db *sql.DB, schema, want string) {
+	t.Helper()
+
+	var got sql.NullString
+
+	if err := db.QueryRow(`SELECT string_agg(t.tgname || ' -> ' || pn.nspname || '.' || p.proname, ', ' ORDER BY t.tgname)
+		FROM pg_trigger t
+		JOIN pg_class c ON c.oid = t.tgrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		JOIN pg_proc p ON p.oid = t.tgfoid
+		JOIN pg_namespace pn ON pn.oid = p.pronamespace
+		WHERE n.nspname = $1 AND c.relname = 'systemplane_entries' AND NOT t.tgisinternal`, schema).Scan(&got); err != nil {
+		t.Fatalf("list triggers on %s.systemplane_entries: %v", schema, err)
+	}
+
+	if got.String != want {
+		t.Fatalf("triggers on %s.systemplane_entries = %q, want %q", schema, got.String, want)
+	}
+}
+
+// assertMigratedRowThenWrite pins that the migrated row carries revision 1 and
+// that the next write draws from the sequence beside the table, above it. It
+// returns the revision that write landed at.
+func assertMigratedRowThenWrite(t *testing.T, db *sql.DB, schema string) int64 {
+	t.Helper()
+
+	assertRowRevision(t, db, schema, 1)
+
+	var written int64
+
+	if err := db.QueryRow(fmt.Sprintf(`UPDATE %s.systemplane_entries SET value = '"warn"'::jsonb
+		WHERE namespace = 'runtime_config' AND "key" = 'log_level' RETURNING revision`, schema)).Scan(&written); err != nil {
+		t.Fatalf("write to %s.systemplane_entries after the upgrade: %v", schema, err)
+	}
+
+	if written < 2 {
+		t.Fatalf("first write to %s.systemplane_entries after the upgrade returned revision %d, want at least 2", schema, written)
+	}
+
+	return written
+}
+
+func assertRowRevision(t *testing.T, db *sql.DB, schema string, want int64) {
+	t.Helper()
+
+	var got int64
+
+	if err := db.QueryRow(fmt.Sprintf(`SELECT revision FROM %s.systemplane_entries
+		WHERE namespace = 'runtime_config' AND "key" = 'log_level'`, schema)).Scan(&got); err != nil {
+		t.Fatalf("read the revision of the row in %s.systemplane_entries: %v", schema, err)
+	}
+
+	if got != want {
+		t.Fatalf("%s.systemplane_entries row revision = %d, want %d", schema, got, want)
+	}
+}
+
 // seedStrayTableBesideTheAppInstall builds the populated v3 install under `app`,
 // adds a SECOND and empty v3-shaped systemplane_entries in `public`, and leaves
 // search_path = public, app so the stray copy is the one search_path resolves.
