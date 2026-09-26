@@ -18,7 +18,7 @@ const (
 	fieldUpdatedBy = "updated_by"
 	// fieldDeleted marks a tombstone. It is present and true only on a
 	// document Delete rewrote; every other document omits it entirely, which
-	// is why the reads guard with $ne rather than $exists (FC-9).
+	// is why the reads guard with $ne rather than $exists.
 	fieldDeleted = "deleted"
 
 	opSet = "$set"

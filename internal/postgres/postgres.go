@@ -221,8 +221,8 @@ func (s *Store) isClosing() bool {
 // constructor-supplied *sql.DB unchanged, multi-tenant mode extracts the
 // dbresolver.DB stored in ctx by tenant-manager middleware. A named tenant
 // resolves through the connector regardless of MultiTenantEnabled and
-// regardless of whatever tenant ctx carries (FC-2: an explicitly named scope
-// and a request-scoped ctx tenant must never silently disagree), and is
+// regardless of whatever tenant ctx carries (an explicitly named scope and a
+// request-scoped ctx tenant must never silently disagree), and is
 // refused with store.ErrTenantConnectorMissing when no connector is
 // configured. The schema is assumed to be provisioned externally; the store
 // does not create it.
@@ -282,7 +282,7 @@ func (s *Store) resolveDB(ctx context.Context, scope store.Scope) (dbExecutor, e
 // AND, with no replica registered, ReadOnly() through its load balancer over
 // the primaries, which is round-robin by default (dbresolver/v2 db.go), so a
 // resolver reporting several primaries would land a Set on one node and the
-// next Get on another — read-your-writes (D4) broken with no replica in sight.
+// next Get on another — read-your-writes broken with no replica in sight.
 // lib-commons builds every tenant resolver from exactly one primary and one
 // replica (commons/postgres createResolverFn), so the common case has only one
 // primary to pick; a connector of a consumer's own making may report several,
@@ -305,8 +305,8 @@ func (s *Store) resolveDB(ctx context.Context, scope store.Scope) (dbExecutor, e
 // ReadWrite(), gated on !writeFlag (db.go, QueryContext and QueryRowContext).
 // The pin makes that rescue moot rather than removing it — no pinned read ever
 // reaches a standby to need rescuing off one. Deterministic read-your-writes
-// (D4) for the price of one node's share of a multi-primary resolver nobody
-// ships today.
+// for the price of one node's share of a multi-primary resolver nobody ships
+// today.
 func pinPrimary(db dbresolver.DB) dbExecutor {
 	if primaries := db.PrimaryDBs(); len(primaries) > 0 {
 		return primaries[0]

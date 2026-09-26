@@ -4,7 +4,7 @@
 //
 // The Debouncer is generic on the key type (any Go comparable); the engine's
 // changefeed keys it by a struct of scope, namespace and key, so an event costs
-// no string concatenation (see onEvent in internal/engine/feed.go).
+// no string concatenation.
 package debounce
 
 import (

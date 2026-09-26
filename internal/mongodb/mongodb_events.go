@@ -73,10 +73,10 @@ func eventFromChange(ce changeEvent) (store.Event, bool) {
 	revision, deleted := afterImage(ce.FullDocument)
 
 	// A tombstone is written as an UPDATE that unsets the value and raises
-	// deleted (FC-9), so the operation type alone cannot tell a delete from a
+	// deleted, so the operation type alone cannot tell a delete from a
 	// write: the after-image decides. A raw delete — a foreign writer removing
 	// the document outright — carries no after-image and is still a delete.
-	// Either way the event carries no revision: FC-2 fixes a delete at 0.
+	// Either way the event carries no revision: a delete is Revision 0.
 	if ce.OperationType == operationTypeDelete || deleted {
 		return store.Event{Namespace: id.Namespace, Key: id.Key, Op: store.OpDelete}, true
 	}
@@ -91,7 +91,7 @@ func eventFromChange(ce changeEvent) (store.Event, bool) {
 	// An empty after-image is the one case the lookup cannot fill: a FOREIGN
 	// deleteOne removed the document between the change and the lookup (the
 	// library's own delete always leaves the tombstone). Revision 0 means
-	// unknown to FC-2 — never fenced, never deduplicated — so the engine
+	// unknown — never fenced, never deduplicated — so the engine
 	// re-reads the row, and the deleteOne's own delete event converges the key
 	// right behind this one. store.Event carries an identity and a revision and
 	// never a value, so the only thing an empty lookup costs is the dedupe hint.
@@ -101,7 +101,7 @@ func eventFromChange(ce changeEvent) (store.Event, bool) {
 // afterImage reads the only two fields classification needs out of a change
 // event's after-image, one lookup each, so a neighbouring field a foreign
 // writer stored with the wrong type costs nothing. An absent or unreadable
-// revision is 0, which FC-2 reads as unknown: the engine re-reads the row
+// revision is 0, which reads as unknown: the engine re-reads the row
 // rather than fencing or deduplicating on it.
 func afterImage(raw bson.Raw) (revision int64, deleted bool) {
 	if len(raw) == 0 {

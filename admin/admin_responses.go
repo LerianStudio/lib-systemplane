@@ -1,4 +1,3 @@
-// Response DTOs and the sentinel-to-HTTP translator for the admin surface.
 package admin
 
 import (

@@ -18,8 +18,7 @@ var (
 	// key; a read reports one as ok false.
 	ErrUnknownKey = internalclient.ErrUnknownKey
 
-	// ErrValidation is returned when a value or argument is refused: a validator's
-	// rejection, a value that is not JSON, a typed getter's value of another type.
+	// ErrValidation is returned when a value or argument is refused.
 	ErrValidation = internalclient.ErrValidation
 
 	// ErrNilContext is returned when a method that requires a live context is

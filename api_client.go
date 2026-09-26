@@ -27,9 +27,9 @@ func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOp
 	return asInternalClient(c).Register(namespace, key, defaultValue, opts...)
 }
 
-// Start subscribes to the backend changefeed, reconciles every registered key
-// against the store and only then returns, so a read taken after Start reports
-// what is actually stored rather than the registered default.
+// Start subscribes a single-tenant Client to the backend changefeed,
+// reconciles every registered key against the store and only then returns, so
+// a read taken after Start reports what is stored, not the registered default.
 //
 // A stored value a key's validator refuses never comes into force: the
 // registered default stays in force and a WARN naming the key and the
@@ -48,10 +48,6 @@ func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOp
 // registered before it survive. After a failed reconcile the next Start
 // reconciles from nothing; after a ctx expiry it waits for the reconcile
 // already pending, and [Client.Register] stays refused.
-//
-// The Client counts as started from the moment that reconcile begins, so a
-// [Client.Set] racing Start writes its row and then reports [ErrNotStarted]
-// rather than being refused before the store is touched.
 //
 // In multi-tenant mode it only marks the Client started; with a tenant
 // manager, a tenant's scope comes up on that tenant's first read.
@@ -185,8 +181,7 @@ func (c *Client) CatalogService() string {
 //
 // With [WithPostgresTenantManager] or [WithMongoTenantManager] one
 // subscription covers every tenant: a tenant's scope announces every
-// registered key each time it comes up (on the read that activates it, and on
-// a rebuild after a credentials rotation), then delivers its own changes,
+// registered key each time it comes up, then delivers its own changes,
 // serialized and coalesced per (tenant, key).
 //
 // OnChange returns ErrUnknownKey for a key that was not registered, in both

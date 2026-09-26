@@ -66,9 +66,9 @@ type Connector interface {
 // than refused on a guess — it fails on the stream open a moment later anyway.
 //
 // The refusal stands for as long as the two scopes resolve to one collection:
-// the engine discards a failed activation and retries from scratch on the next
-// read, so such a scope pays a hello round trip to the server on every read
-// until its configuration is fixed.
+// a read retries the failed activation at most once per retry window, so such
+// a scope pays a hello round trip to the server each window until its
+// configuration is fixed.
 var ErrSharedDatabaseUnsupported = errors.New("systemplane/mongodb: two scopes resolve to the same database and collection; a change stream on a shared collection would deliver every scope's writes to both")
 
 // ErrMongoMgrUnavailable is returned when a connector resolves a tenant

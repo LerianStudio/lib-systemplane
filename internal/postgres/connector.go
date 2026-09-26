@@ -78,9 +78,9 @@ var ErrPgMgrUnavailable = errors.New("systemplane/postgres: tenant-manager postg
 // Store gets no warning, and starts failing the day it subscribes.
 //
 // The refusal is PERMANENT for as long as the two scopes resolve to one
-// database: the engine discards a failed activation and retries from scratch
-// on the next read, so such a scope dials and drops a LISTEN connection on
-// every read until its configuration is fixed.
+// database: a read retries the failed activation at most once per retry
+// window, so such a scope dials and drops a LISTEN connection each window
+// until its configuration is fixed.
 var ErrSharedDatabaseUnsupported = errors.New("systemplane/postgres: two scopes resolve to the same database; systemplane needs one database per scope because NOTIFY is database-wide")
 
 // serverDatabaseKey identifies the physical database an OPEN connection

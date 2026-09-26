@@ -122,10 +122,9 @@ func Bind[T any](c *Client, namespace, key string, defaults T, validate func(T) 
 		// Canonicalize FIRST, so every ingress validates the document that
 		// will actually be persisted rather than the caller's Go value. Two
 		// things ride on it: a field excluded with json:"-" is absent when
-		// validate runs (D-G1's stated semantics), and a typed nil — a nil
-		// pointer, a nil map, a raw JSON null — is unmasked as the null
-		// document it marshals to, which a check against the incoming any
-		// would let straight through.
+		// validate runs, and a typed nil — a nil pointer, a nil map, a raw
+		// JSON null — is unmasked as the null document it marshals to, which
+		// a check against the incoming any would let straight through.
 		document, canonicalErr := group.Canonical(value)
 		if canonicalErr != nil {
 			return canonicalErr
@@ -172,8 +171,8 @@ func Bind[T any](c *Client, namespace, key string, defaults T, validate func(T) 
 		group.Decode[T], g.seedCurrentEntry)
 
 	// The group's one subscription, taken here — before Start, and therefore
-	// before any publication can exist. That is the structural half of FC-7's
-	// "no revision can fall between the initial delivery and the
+	// before any publication can exist. That is the structural half of
+	// OnApply's "no revision can fall between the initial delivery and the
 	// subscription"; the coordinator's seed watermark is the other half.
 	//
 	// The unsubscribe is discarded: a group has no Close, so the subscription
@@ -372,23 +371,23 @@ type ApplyStatus struct {
 // OnApply subscribes first and then delivers the current snapshot of every
 // scope this group has observed, so no revision can fall between the initial
 // delivery and the subscription; the same non-zero revision with the same
-// value bytes is never delivered twice while its scope stays up (Revision 0 is
-// never deduplicated). Later revisions arrive serialized and coalesced per
+// value bytes is never delivered twice while its scope stays up (Revision 0
+// may repeat). Later revisions arrive serialized and coalesced per
 // scope; Status.Desired always names the newest published revision even when
 // fn has not seen intermediate ones. fn returning an error records that
 // revision as rejected for the scope (visible in Status) and keeps the
-// previously applied revision as current; the engine does not retry. Before
-// Start, OnApply registers and its initial delivery is Start's announcement,
-// which may land either side of Start's return.
+// previously applied revision as current; the engine does not retry. Before a
+// single-tenant Start, OnApply registers and its initial delivery is Start's
+// announcement, which may land either side of Start's return.
 //
 // fn runs with no lock held and may call [Group.Snapshot], [Group.Status],
 // [Group.Set] or OnApply for its own group. A re-entrant OnApply appends its
 // function; in the scope being delivered, that function's initial delivery is
 // deferred to the running fan-out's next iteration, and an unsubscribe called
-// before that iteration cancels it, so the function never runs at all. A
-// re-entrant Set that changes the document reaches the applier as a later
-// delivery, after the current one returns, so an applier that changes it on
-// every delivery keeps the group reloading forever.
+// before that iteration cancels it. A re-entrant Set that changes the document
+// reaches the applier as a later delivery, after the current one returns, so
+// an applier that changes it on every delivery keeps the group reloading
+// forever.
 // An error fn returns is logged at error level and published in
 // [Group.Status]'s LastErr, held there as [ApplyStatus] describes, so it must
 // name what was refused and must not embed the decoded document.
@@ -414,10 +413,7 @@ type ApplyStatus struct {
 // instead of running its compiled-in defaults until a write that may never come.
 // Reading after [Client.Close] fails this way. A key with nothing stored is not
 // a failure — the registered defaults are delivered once the Client tracks it.
-// Multi-tenant mode takes no such read while the Client is open, for the
-// reason the next paragraph gives; a CLOSED one falls through to the read and
-// returns ErrClosed, because a closed Client reports no registered key to
-// recognise as tenant-scoped.
+// An open multi-tenant Client takes no such read.
 //
 // A nil fn registers nothing and returns no error, matching [Client.OnChange].
 // unsubscribe is idempotent, is safe to call from inside fn itself, and
@@ -428,8 +424,8 @@ type ApplyStatus struct {
 // ErrNotSupportedInMultiTenant, while [Group.Snapshot] and [Group.Set] keep
 // working. On a tenant-managed Client nothing is seeded, because every
 // document belongs to a tenant: fn gets the replay of every tenant this group
-// has observed, one the Client has since dropped included, then every
-// tenant's publications, with the tenant in
+// has observed, one the Client has since dropped included, then each tenant's
+// publications, the first on the read that activates it, with the tenant in
 // Applied.Tenant, the ONLY tenant identity fn receives. The delivered ctx
 // carries no tenant, so a re-read or a write-back runs under a tenant-scoped
 // context the consumer owns, the one tenant-manager middleware builds. On a nil

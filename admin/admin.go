@@ -22,11 +22,6 @@
 //
 // Authorization is deny-all by default: callers MUST supply WithAuthorizer to
 // enable access.
-//
-// In multi-tenant mode the caller is expected to run authentication before
-// lib-commons tenant-manager middleware, then call Mount so handlers'
-// c.Context() carries the resolved tenant database for the lib's
-// configured module.
 package admin
 
 import (
