@@ -23,11 +23,12 @@
 // the revision, provenance and staleness behind the value it returns.
 //
 // In multi-tenant mode ([WithMultiTenantEnabled]) every read resolves the
-// tenant database from ctx and reads through, with no cache.
-// [WithPostgresTenantManager] or [WithMongoTenantManager] adds one: a tenant's
-// first read brings up that tenant's own scope, cached and fed by its own
-// changefeed like the single-tenant one, and [Client.HandleTenantLifecycle]
-// drops, blocks and rebuilds it on the tenant manager's lifecycle events.
+// tenant database from ctx and reads through, with no cache; the key's
+// validator grades that row too. [WithPostgresTenantManager] or
+// [WithMongoTenantManager] adds a cache: a tenant's first read brings up that
+// tenant's own scope, cached and fed by its own changefeed like the
+// single-tenant one, and [Client.HandleTenantLifecycle] drops, blocks and
+// rebuilds it on the tenant manager's lifecycle events.
 //
 // Settings that imply resource teardown (DB DSNs, secrets, TLS material, listen
 // addresses) belong in environment variables, not in the runtime config plane.
