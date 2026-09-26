@@ -96,7 +96,7 @@ Three narrowings are deliberate and must not be widened. **`NewManager` and `sys
 | Phase | Milestone | Epics | Status |
 |-------|-----------|-------|--------|
 | 1 | Every document whose content the merged code determines is written and true against `develop` `0ecdf9e`: `MIGRATION-v4.md` (surface diff, behaviour changes, database/operator contract, one section per consumer), `CLAUDE.md` finished, `docs/PROJECT_RULES.md` corrected, `doc.go` rewritten. Behaviour still owned by engine-tenants, engine-core Phase 3 or the panic-posture branch is a `NOT-YET(<lane>)` placeholder, never a claim. No example, no README rewrite, no deletion. | 1.1, 1.2 | Complete |
-| 2 | The three examples exist and compile in CI; the README is rebuilt around them; `.env.reference` is gone; the godoc truth sweep is run and its findings are either fixed here or handed to the owning lane | 2.1, 2.2, 2.3 | Detailed |
+| 2 | The three examples exist and compile in CI; the README is rebuilt around them; `.env.reference` is gone; the godoc truth sweep is run and its findings are either fixed here or handed to the owning lane | 2.1, 2.2, 2.3 | Complete |
 
 **Why the split falls here.** Phase 1 writes only what FC-1 through FC-11 and decisions D1–D11 already determine: which symbols exist, which are gone, what a delete publishes, what `Start` announces, what the DDL does. Re-elaborated 2026-09-24 against `develop` `0ecdf9e`, after engine-core Phase 2, storage and groups Phase 2 merged: every claim now cites the tree, and what is still frozen-but-unbuilt is marked (§ Phase 1, The NOT-YET convention). Phase 2 needs the real thing: an example cannot be compiled against a `WithCloseTimeout` that has not landed, the README cannot stop showing `DefaultSeedSQL()` until `storage` Epic 3.2 removes it, and a godoc sweep over a surface still carrying `Manager` reports the pre-v4 world.
 
@@ -638,7 +638,7 @@ statement matches the code on the branch.
 **Scope:** comment lines only, in the root package, `admin/`, `systemplanetest/` and the internal packages listed below (orchestrator resolution 2026-09-26, § Orchestrator resolutions); findings inside `internal/client/**` and `internal/engine/**` are reported, not edited.
 **Dependencies:** Epics 2.1 and 2.2.
 **Done when:** `go doc -all . > /tmp/godoc.txt` plus `go doc -all ./admin` and `go doc -all ./systemplanetest` have been walked against FC-10's kept list (every symbol present and its comment describing v4) and FC-10's removed list (no symbol present); the forbidden-token grep over that output returns nothing; every finding in a file this lane does not own is written into this document's § Handover to other lanes with the exact replacement text and reported to the orchestrator.
-**Status:** Pending
+**Status:** Done
 
 Elaborated 2026-09-26 against `develop` `e91a7352` (after PR #106). Every lane that owns a root, `admin` or `systemplanetest` file is merged (engine-core #87/#93, storage #90/#97, groups #86, groups-redaction #99, engine-tenants #103/#104, the admin work inside those). The one lane in flight, engine-tenants Phase 3, edits only `internal/client/*_integration_test.go`, `internal/client/main_test.go` and `lane-engine-tenants.md`.
 
@@ -654,7 +654,7 @@ Elaborated 2026-09-26 against `develop` `e91a7352` (after PR #106). Every lane t
 
 #### Task 2.3.1: Sweep the root package godoc
 
-- [ ] Done
+- [x] Done
 
 **Context:** The root package is the whole public API: `api_*.go`, `ddl.go`, `doc.go`. `go doc -all .` renders it. FC-10's kept and removed lists are `index.md:497-501`; FC-4 (multi-tenant `OnChange`), FC-6 (`HandleTenantLifecycle`), FC-10 (`WithAggregateTenantThreshold`), FC-11 (initial publication) and FC-12 (metrics) are the contracts the comments must match.
 
@@ -669,7 +669,7 @@ Elaborated 2026-09-26 against `develop` `e91a7352` (after PR #106). Every lane t
 
 #### Task 2.3.2: Sweep `admin`, `systemplanetest`, the internal package docs, and prove the examples gate
 
-- [ ] Done
+- [x] Done
 
 **Context:** `admin/` and `systemplanetest/` are importable; their godoc is rendered by `go doc -all ./admin` and `./systemplanetest`. The internal packages are not importable, but their package docs and exported-symbol comments are what the next maintainer reads: `internal/group`, `internal/store`, `internal/postgres`, `internal/mongodb`, `internal/debounce`, `internal/safelog`, `internal/testsupport`. `.github/workflows/go-combined-analysis.yml` runs golangci-lint v2.12.2 over the module, and `.golangci.yml` has no exclusion for `examples` (this plan's § What this lane owns says otherwise and is wrong), so the Lint job already type-checks every example.
 
@@ -685,6 +685,158 @@ Elaborated 2026-09-26 against `develop` `e91a7352` (after PR #106). Every lane t
 **Review 2026-09-25 (branch `docs/v4-examples`).** No `examples` CI job. The pinned shared workflow already runs `make build` (`go build ./...`) and golangci-lint with govet over `./examples/...`; a separate job would sit under the same `paths-ignore`, and the pin lives in this file. The `examples$` lint exclusion, which matched no file, is deleted. The sweep waits until `engine-tenants` merges, because it reads `api_*.go` and `internal/client/options.go`, which that lane is still writing. Inputs the review already found: `api_group.go:399-402` (every publication carries Revision 0 "until this Client is engine-backed": stale), `:421-422` (the initial delivery "happens during Start", while `OnChange` says either side of its return), `:428-433` (publications "from a timer goroutine" under the default debounce: stale, only the changefeed debounces), and the wave-1 facade claims at `internal/group/coordinator.go:116`, `:488`, `:905`.
 
 One fact to carry into elaboration rather than rediscover: the sweep is a **report** over `api_*.go` and `internal/client/options.go`: `engine-tenants` is writing those files in this same wave, so an edit here collides at merge. Fix only `doc.go`; hand everything else over.
+
+---
+
+## Handover to other lanes (2026-09-26)
+
+Findings from Epic 2.3 that this lane could not fix under G-1 or in a file it does not own. Each names the file and line, the finding, and the exact replacement.
+
+- `api_group.go:41`: The Snapshot struct field trailing comment "Revision int64 // 0 when the row is absent" is incomplete. Revision is also 0 when the stored row was refused and the defaults are in force. The G-1 filter blocks edits to trailing comments on code lines, so this was not fixed here.
+
+  ```text
+  Revision int64 // 0 while the registered defaults are in force
+  ```
+
+- `api_group.go:42`: Tenant string // "" in single-tenant mode, and the Snapshot method doc ("Tenant is the tenant id carried by ctx, "" in single-tenant mode"), are false. Snapshot stamps tmcore.GetTenantIDContext(ctx) in every mode, so a single-tenant Client whose ctx carries a tenant id reports that tenant. The fix is in code: stamp "" when the Client is single-tenant. The comments then become true unchanged. Needs a code change.
+
+  ```text
+  Code: in Group.Snapshot, set Tenant only when the Client is multi-tenant (single-tenant -> ""). Comment stays: Tenant string // "" in single-tenant mode
+  ```
+
+- `internal/engine/change.go:10`: Change.Revision says "0 when no row exists: Value is the registered default". This is false in two cases: a MongoDB document written before v4 with no revision field publishes its stored value at Revision 0, and a refused-row announcement carries the default at Revision 0.
+
+  ```text
+  // 0 when no row backs the value, or the row carries no revision
+  ```
+
+- `internal/engine/change.go:17`: Entry.Revision has the same false "0 when no row exists: Value is the registered default" text as Change.Revision.
+
+  ```text
+  // 0 when no row backs the value, or the row carries no revision
+  ```
+
+- `internal/engine/change.go:20`: The Entry.Stale doc (lines 20-23) carries "(FC-5)" plan jargon. It also omits that a multi-tenant read served per request is never stale.
+
+  ```text
+  // Stale is true while nothing is confirming THIS key in a cached scope: before a single-tenant Start, while the changefeed is disconnected or has not been reconciled since it connected, and while this key could not be re-read after its last change. A multi-tenant read served per request is never stale.
+  ```
+
+- `internal/client/errors.go:15`: ErrNotStarted has the same false text as the old root comment: "returned when a read/write is attempted before Start". Reads never return it.
+
+  ```text
+  // ErrNotStarted is returned by Set and Delete before Start, and by a
+  // single-tenant write persisted while no scope was up to publish it.
+  ```
+
+- `internal/client/errors.go:21`: ErrUnknownKey has the same false text as the old root comment: "when Get or Set references an unregistered key". Get returns ok=false with a nil error, and Delete and OnChange also return the error.
+
+  ```text
+  // ErrUnknownKey is returned by Set, Delete and OnChange for an unregistered
+  // key; a read reports one as ok false.
+  ```
+
+- `internal/client/client.go:219`: The comment says schema bootstrap happens lazily in multi-tenant mode. That is true only for MongoDB. On Postgres the lib does no runtime schema provisioning: SchemaSQL() or MigrationV3ToV4SQL() must be applied externally.
+
+  ```text
+  // In multi-tenant mode the MongoDB collection and its indexes are bootstrapped lazily once per tenant database; Postgres provisions nothing at runtime (apply SchemaSQL or MigrationV3ToV4SQL externally).
+  ```
+
+- `internal/group/coordinator.go:48`: For task 2.3.2: "previous is nil on the first delivery" is false. Previous stays nil until the function has accepted a document, so a function that rejected its first delivery still sees nil. The same package has other stale wave-1 claims: the package comment at :3-14 (facade and debounce statements) and the comments at :115, :488 and :905.
+
+  ```text
+  // previous is nil until this function has accepted a document for the scope
+  ```
+
+- `internal/client/change.go:1`: The file comment "// Published-state types for systemplane Client subscribers." is attached to the package clause. go/doc sorts files by name, and change.go comes before doc.go, so this line becomes the synopsis of package client instead of doc.go's package doc. This is the same defect fixed here in internal/mongodb/fields.go. It is in internal/client/**, which this lane may not touch.
+
+  ```text
+  Put a blank line between line 1 and `package client`, or delete line 1.
+  ```
+
+- `internal/group/coordinator.go:10`: There is no DropScope hook (lane-groups.md A14, assigned to engine-tenants, never landed). A suspended or deleted tenant keeps its Status row and per-applier bookkeeping for the whole lifetime of the coordinator. The package doc now states only that nothing is pruned. The false claim that a lane owns the hook is gone. Needs a code change.
+
+  ```text
+  Add `func (c *Coordinator[T]) DropScope(tenant string)`, deleting the scope entry and every applier's bookkeeping for it, and call it from the Client's tenant teardown in internal/client. Then change the package doc paragraph to: "A scope entry and its bookkeeping live until the Client stops serving that tenant."
+  ```
+
+- `internal/store/store.go:38`: The Event.Revision trailing comment reads "0 for OpDelete, OpResync, or unknown". It omits OpDisconnect, which also carries no revision. The comment sits on the field's code line, so G-1's diff filter flags any edit to it, and this lane could not change it.
+
+  ```text
+  Change the trailing comment to `// 0 for OpDelete, OpResync, OpDisconnect, or unknown`
+  ```
+
+- `internal/client/errors.go:15`: The ErrNotStarted doc says 'returned when a read/write is attempted before Start'. Reads never return it (a read before Start serves the default, marked Stale). The root api_errors.go already carries the corrected text.
+
+  ```text
+  // ErrNotStarted is returned by Set and Delete before Start, and by a
+  // single-tenant write persisted while no scope was up to publish it.
+  ```
+
+- `internal/client/errors.go:21`: The ErrUnknownKey doc says 'Get or Set references an unregistered key'. Get reports an unregistered key as ok=false, not as an error, and Delete and OnChange also return ErrUnknownKey.
+
+  ```text
+  // ErrUnknownKey is returned by Set, Delete and OnChange for an unregistered
+  // key; a read reports one as ok false.
+  ```
+
+- `internal/client/errors.go:50`: The ErrTenantConnectionMissing doc says any method in multi-tenant mode returns it when ctx carries no tenant database. A read that a tenant manager's activated scope serves from cache never reaches the store and needs no tenant database.
+
+  ```text
+  // ErrTenantConnectionMissing is returned in multi-tenant mode by a call that
+  // reaches the store while ctx carries no tenant database for the configured
+  // module; a read a tenant manager's cache serves needs none.
+  ```
+
+- `internal/client/client.go:63`: The NewPostgres doc says that in multi-tenant mode 'every method resolves the tenant database from ctx'. That is false with WithPostgresTenantManager: an activated tenant scope serves reads from cache, and the scope resolves through the manager.
+
+  ```text
+  // NewPostgres creates a Client backed by Postgres.
+  //
+  // In single-tenant mode db and listenDSN are required. In multi-tenant mode
+  // (see WithMultiTenantEnabled) neither is used and both MAY be nil/empty:
+  // tenant databases come from ctx or from the tenant manager.
+  ```
+
+- `internal/client/client.go:286`: The Close doc says 'releases backend resources'. The consumer's *sql.DB / *mongo.Client passed to the constructor stays open. Close cancels the callbacks' context, waits up to WithCloseTimeout, stops the changefeeds and replays the first result (closeOnce). Keep the Start/Close mutual-exclusion paragraph after this replacement.
+
+  ```text
+  // Close cancels the context handed to running callbacks, waits for them up to
+  // WithCloseTimeout and stops every changefeed; the database handle passed to
+  // the constructor stays open. Later calls return the first call's result.
+  ```
+
+- `internal/client/options.go:111`: The WithCloseTimeout doc says 'A zero or negative value means the engine default' without naming it. The default is 30s (internal/engine/engine.go:22 defaultCloseTimeout), and the root doc says so.
+
+  ```text
+  // Last-wins. A zero or negative value means the default, 30s.
+  ```
+
+- `internal/client/options.go:129`: The WithMultiTenantEnabled bullet says 'Schema bootstrap runs lazily on first access per resolved tenant database'. That is false for Postgres: the lib issues no DDL, and SchemaSQL()/MigrationV3ToV4SQL() are applied externally. Only MongoDB bootstraps its collection lazily.
+
+  ```text
+  //   - MongoDB bootstraps its collection lazily on first access per resolved
+  //     tenant database; Postgres issues no DDL, so SchemaSQL() is applied
+  //     externally.
+  ```
+
+- `api_group.go:41`: Snapshot.Tenant is documented as '"" in single-tenant mode', on the struct field (api_group.go:41, a trailing comment on a code line that G-1 forbids editing) and in the Group.Snapshot doc (:262). Group.Snapshot stamps tmcore.GetTenantIDContext(ctx) in every mode. A single-tenant Client read under a ctx that tenant middleware populated therefore reports a tenant id the global value does not belong to. Applied.Tenant, by contrast, is "" there. Needs a code change.
+
+  ```text
+  Code change recommended, so that both comments become true and Snapshot matches Applied: in Group.Snapshot, set Tenant only on a multi-tenant Client, e.g. `if detail, known := g.client.CatalogKey(g.namespace, g.key); known && detail.TenantScoped { snap.Tenant = tmcore.GetTenantIDContext(ctx) }`. If the behaviour should stay as it is, change the field comment to `Tenant string // the tenant id ctx carried, in every mode` and the method doc to 'Tenant is the tenant id carried by ctx, in every mode.'
+  ```
+
+- `internal/mongodb/mongodb_crud.go:116`: A plan-ID token '(D11)' survives in a trailing comment on a code line. G-1 allows only //-leading lines to change, so it is left in place. Low severity. Needs a code change.
+
+  ```text
+  bumpRevisionExpr(), // changed → bump above the old revision AND above the clock floor
+  ```
+
+- `internal/client/register.go:25`: Plan-ID tokens (FC-n, Dn) remain in comments throughout internal/client (register.go:25,44,88; tenant.go:11; client.go:216,261; set.go:16,145; get.go:43,64,65,122,358; onchange.go:24) and internal/engine (activate.go, change.go, dispatch.go, engine.go, errors.go, feed.go, metrics.go, publish.go, reconcile.go, scope.go). The plan they cite gets closed, so they rot. Commit 3681d25 removed them from every other package.
+
+  ```text
+  Delete each parenthetical token ('(FC-5)', '(D4)', '(D7)', ...). Where the token is a sentence subject, reword in plain terms: FC-11 -> 'the Start announcement' / 'the activation announcement'; FC-12 -> 'the engine metrics'; FC-10 -> 'the aggregate tenant threshold' (metrics.go, engine.go) or drop it (get.go:358 ListEntry); FC-6 -> 'the four tenant lifecycle events'; FC-2 -> 'the store contract'; D3 -> 'the foreign-writer rule'; FC-5 -> 'one Go type per key whether a row exists or not' (register.go) or drop it.
+  ```
 
 ---
 
