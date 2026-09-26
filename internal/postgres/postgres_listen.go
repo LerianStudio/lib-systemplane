@@ -736,8 +736,8 @@ func (s *Store) Subscribe(ctx context.Context, scope store.Scope, fn func(store.
 // on. The teardown interlock in publishFeed is only as tight as this bound.
 func (s *Store) openListen(ctx context.Context, f *feed) (*pgx.Conn, string, error) {
 	// Last look before the socket. The shutdown fence in acquireFeed is taken
-	// before the DSN is resolved, and resolving it is a round trip through the
-	// tenant manager: a Close landing in between would otherwise open a
+	// before the DSN is resolved, and resolving it can cost a round trip through
+	// the tenant manager: a Close landing in between would otherwise open a
 	// connection for a store that is already tearing down, and publishFeed
 	// would immediately throw it away. Refusing here keeps a closing store from
 	// dialing at all.
@@ -767,9 +767,8 @@ func (s *Store) openListen(ctx context.Context, f *feed) (*pgx.Conn, string, err
 	// Which database this connection actually reached is a question only the
 	// server can answer, and publishFeed cannot admit the feed without it, so
 	// a failure here is a connect failure like any other. It runs BEFORE the
-	// LISTEN so a refused feed never installs one, and so LISTEN stays the last
-	// statement this connection ever ran — which is how a backend is told from
-	// any other in pg_stat_activity.
+	// LISTEN so LISTEN stays the last statement this connection ever ran —
+	// which is how a backend is told from any other in pg_stat_activity.
 	keyCtx, cancelKey := context.WithTimeout(ctx, listenTimeout)
 	defer cancelKey()
 

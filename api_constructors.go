@@ -14,9 +14,9 @@ import (
 
 // NewPostgres creates a Client backed by Postgres with LISTEN/NOTIFY.
 //
-// In single-tenant mode db and listenDSN are required.
-// In multi-tenant mode (see WithMultiTenantEnabled) they MAY be nil/empty —
-// every method resolves the tenant database from ctx via tenant-manager.
+// In single-tenant mode db and listenDSN are required. In multi-tenant mode
+// (see [WithMultiTenantEnabled]) neither is used and both MAY be nil/empty:
+// tenant databases come from ctx or from the tenant manager.
 func NewPostgres(db *sql.DB, listenDSN string, opts ...Option) (*Client, error) {
 	c, err := internalclient.NewPostgres(db, listenDSN, opts...)
 	if err != nil {
@@ -83,12 +83,12 @@ func WithDebounce(d time.Duration) Option { return internalclient.WithDebounce(d
 // cancelling the context handed to them. It bounds the engine's wait only:
 // closing the backend store is not covered, and Close returns the engine's
 // timeout joined with the store's own error. A zero or negative value means
-// the engine default.
+// the default, 30s.
 func WithCloseTimeout(d time.Duration) Option { return internalclient.WithCloseTimeout(d) }
 
-// WithMultiTenantEnabled enables tenant-manager dispatch: every read/write
-// resolves the per-tenant database from ctx via tmcore.GetPGContext /
-// tmcore.GetMBContext using the configured module name.
+// WithMultiTenantEnabled enables tenant-manager dispatch: every write, and every
+// read no tenant manager's cache serves, resolves the tenant database from ctx
+// via tmcore.GetPGContext / tmcore.GetMBContext under the [WithModule] name.
 func WithMultiTenantEnabled() Option { return internalclient.WithMultiTenantEnabled() }
 
 // WithPostgresTenantManager resolves each tenant's database through mgr, so a
@@ -156,25 +156,25 @@ func WithValidator(fn func(any) error) KeyOption { return internalclient.WithVal
 //
 // [Client.Set] invokes it with the context of that write — once, before the
 // row is persisted, so what Set returns says whether the next read in this
-// process serves that write — and [Client.Register] with context.Background(). It also grades every value
-// read back from the store — the first reconcile at [Client.Start] and every
-// later reconcile and changefeed re-read, and a tenant's own under a tenant
-// manager — with a context derived from the client's lifecycle, which carries
-// no request values and a tenant only for a tenant's scope. A context
-// validator must therefore treat a context that lacks the scope it expects as
-// "cannot verify" and decide by its own policy — accept it, or refuse it with
-// its own error — rather than assume request scope is there to read, and must
-// be deterministic on the same value.
+// process serves that write — and [Client.Register] with context.Background().
+// A multi-tenant read served per request grades the row with the reader's
+// context. Every other value read back from the store — each reconcile and
+// changefeed re-read, a tenant scope's under a tenant manager included — is
+// graded with a context derived from the client's lifecycle, which carries no
+// request values and a tenant only for a tenant's scope. A context validator
+// must therefore treat a context that lacks the scope it expects as "cannot
+// verify" and decide by its own policy — accept it, or refuse it with its own
+// error — rather than assume request scope is there to read, and must be
+// deterministic on the same value.
 //
-// The registered default is validated at [Client.Register] time in the same
-// CANONICAL shape — marshaled and decoded first, so a default of 5 arrives as
-// float64(5) — with a non-nil, empty context.Background(), because registering
-// a default is not a write, and that call runs while the client holds its
-// start lock. For the
-// registered default the function MUST NOT perform I/O or block: a validator
-// that blocks there blocks registration, [Client.Start] and [Client.Close]
-// with it. Recognise the default (or empty) value and return before any
-// external call.
+// The registered default is graded in the same CANONICAL shape — marshaled
+// and decoded first, so a default of 5 arrives as float64(5) — while the
+// client holds its start lock, and so is the single-tenant first reconcile,
+// which [Client.Start] waits for under that lock. There the function MUST NOT
+// perform I/O or block: a validator that blocks there blocks registration,
+// [Client.Start] and [Client.Close] with it. Recognise the default (or empty)
+// value, or a context without request scope, and return before any external
+// call.
 //
 // Both this and [WithValidator] set the same single validator: a nil function
 // is ignored, and the last NON-NIL validator option applied to a key wins.

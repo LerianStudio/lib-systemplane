@@ -1,11 +1,10 @@
-// Package debounce provides a trailing-edge, per-key debouncer used by the
-// systemplane Client to coalesce rapid change notifications into a single
-// callback invocation.
+// Package debounce provides a trailing-edge, per-key debouncer the engine uses
+// to coalesce a key's rapid changefeed notifications into one re-read of the
+// store.
 //
-// The Debouncer is generic on the key type (any Go comparable). Callers that
-// previously used string keys can continue doing so; callers on the changefeed
-// hot path use a struct key to avoid per-event string-concat allocations (see
-// systemplane/client.go onEvent).
+// The Debouncer is generic on the key type (any Go comparable); the engine's
+// changefeed keys it by a struct of scope, namespace and key, so an event costs
+// no string concatenation.
 package debounce
 
 import (
@@ -107,8 +106,8 @@ func (d *Debouncer[K]) Submit(key K, fn func()) {
 	}
 }
 
-// Close cancels all pending timers and marks the debouncer as closed.
-// Further Submit calls become no-ops. Idempotent. Nil-receiver safe.
+// Close cancels all pending timers; later Submits schedule nothing, but a
+// zero or negative window still runs fn inline. Idempotent. Nil-receiver safe.
 func (d *Debouncer[K]) Close() {
 	if d == nil {
 		return

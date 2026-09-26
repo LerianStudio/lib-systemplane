@@ -33,7 +33,8 @@ type Factory func(t *testing.T) (store.Store, func())
 //
 // There is no opt-out for the Subscribe sub-tests: a store that refuses
 // Subscribe in the configured Scope with store.ErrNotSupportedInMultiTenant
-// (the zero scope under multi-tenant mode) makes each of them skip itself.
+// (the zero scope under multi-tenant mode) makes each of them skip itself,
+// provided Reconnect is nil.
 type RunOptions struct {
 	// EventWait is the upper bound the suite waits for changefeed echoes
 	// to arrive. Defaults to 2s when zero.
@@ -623,9 +624,9 @@ func runSubscribeThenImmediateWrite(t *testing.T, f Factory, opts RunOptions) {
 	}
 }
 
-// runRevisionMonotonic pins FC-2's revision rules: a stored value always has a
-// non-zero revision, changing it advances the revision, rewriting the same
-// value does not, and every read path reports the revision the write returned.
+// runRevisionMonotonic pins the store's revision rules for Set: the first Set
+// returns a non-zero revision, changing the value advances it, rewriting the
+// same value does not, and every read path reports the revision Set returned.
 //
 // It also pins the rule across a delete, which is what makes "monotonic per
 // (namespace, key)" true for the whole life of a key and not just the life of
@@ -708,8 +709,8 @@ func runRevisionMonotonic(t *testing.T, s store.Store, opts RunOptions) {
 }
 
 // runSubscribeEmitsResyncFirst pins the ordering guarantee the engine relies on
-// to converge by reconciliation: the very first thing a new subscriber hears is
-// store.OpResync for its own scope, carrying no key and no revision.
+// to converge by reconciliation: the first thing a new subscriber of a healthy
+// feed hears is store.OpResync for its own scope, carrying no key or revision.
 func runSubscribeEmitsResyncFirst(t *testing.T, s store.Store, opts RunOptions) {
 	startStore(t, s)
 
@@ -748,9 +749,8 @@ func runSubscribeEmitsResyncFirst(t *testing.T, s store.Store, opts RunOptions) 
 	}
 }
 
-// runEventCarriesScopeAndRevision proves an upsert event is self-describing:
-// the engine can tell which scope it belongs to and which revision it carries
-// without re-reading the row.
+// runEventCarriesScopeAndRevision proves an upsert event names its scope, its
+// key and the revision Set reported.
 func runEventCarriesScopeAndRevision(t *testing.T, s store.Store, opts RunOptions) {
 	startStore(t, s)
 
@@ -794,9 +794,8 @@ func runEventCarriesScopeAndRevision(t *testing.T, s store.Store, opts RunOption
 	}
 }
 
-// runDeleteEventRevisionZero pins revision 0 as "no row": a delete event never
-// carries a revision, which is how the engine knows to publish the registered
-// default instead of a stored value.
+// runDeleteEventRevisionZero pins a delete event's shape: OpDelete for its own
+// scope and key, carrying Revision 0.
 func runDeleteEventRevisionZero(t *testing.T, s store.Store, opts RunOptions) {
 	startStore(t, s)
 
@@ -854,7 +853,7 @@ func runDeleteEventRevisionZero(t *testing.T, s store.Store, opts RunOptions) {
 // order of magnitude from how fast a healthy feed echoes a write.
 const reconnectRecoveryWait = 60 * time.Second
 
-// runResyncAfterForcedReconnect pins the whole connectivity narration FC-2
+// runResyncAfterForcedReconnect pins the whole connectivity narration a store
 // promises: when a feed loses its connection its subscribers hear exactly one
 // OpDisconnect, then exactly one OpResync once it is back, and only then key
 // events again. The engine marks a scope Stale on the disconnect and has no
@@ -920,9 +919,9 @@ func runResyncAfterForcedReconnect(t *testing.T, f Factory, opts RunOptions) {
 }
 
 // assertReconnectNarration checks seq — everything the feed delivered from the
-// forced connection loss onwards — against FC-2: one OpDisconnect, then one
-// OpResync, both scoped and carrying no key, then key events and no further
-// marker.
+// forced connection loss onwards — against the store contract: one
+// OpDisconnect, then one OpResync, both scoped and carrying no key, then key
+// events and no further marker.
 func assertReconnectNarration(t *testing.T, seq []store.Event, opts RunOptions) {
 	t.Helper()
 

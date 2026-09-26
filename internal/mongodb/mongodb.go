@@ -75,7 +75,7 @@ type Config struct {
 	PollInterval time.Duration
 
 	// MultiTenantEnabled selects the tmcore-driven dispatch path. When true,
-	// Client/Database may be empty; every method resolves the per-tenant
+	// Client/Database may be empty; the zero scope resolves the per-tenant
 	// database from ctx via tmcore.GetMBContext(ctx, Module).
 	MultiTenantEnabled bool
 
@@ -107,7 +107,7 @@ type entryDoc struct {
 	UpdatedAt time.Time  `bson:"updated_at"`
 	UpdatedBy string     `bson:"updated_by"`
 	// Deleted is present and true only on a tombstone: a document Delete
-	// rewrote in place so the revision the key reached survives (FC-9, D11).
+	// rewrote in place so the revision the key reached survives.
 	// Get and List filter these out, so the store surface never shows one.
 	Deleted bool `bson:"deleted"`
 }
@@ -269,8 +269,8 @@ func (s *Store) DroppedEvents() int64 {
 // constructor-supplied collection, multi-tenant mode extracts the
 // *mongo.Database stored in ctx by tenant-manager middleware. A named tenant
 // resolves through the connector regardless of MultiTenantEnabled and
-// regardless of whatever tenant ctx carries (FC-2: an explicitly named scope
-// and a request-scoped ctx tenant must never silently disagree), and is
+// regardless of whatever tenant ctx carries (an explicitly named scope and a
+// request-scoped ctx tenant must never silently disagree), and is
 // refused with store.ErrTenantConnectorMissing when no connector is
 // configured.
 //
@@ -556,7 +556,7 @@ func (s *Store) List(ctx context.Context, scope store.Scope) ([]store.Entry, err
 	// and cursor.All would turn that into an error for the WHOLE scope, so the
 	// engine's reconcile after every OpResync could never converge again. One
 	// bad document costs one key instead: it is skipped with a warning naming
-	// it, and that key falls back to its registered default (FC-11).
+	// it, and that key falls back to its registered default.
 	for cursor.Next(ctx) {
 		var doc entryDoc
 
@@ -629,9 +629,9 @@ func (s *Store) Get(ctx context.Context, scope store.Scope, namespace, key strin
 
 	if err := bson.Unmarshal(raw, &doc); err != nil {
 		// A document this backend cannot decode reads as ABSENT rather than as
-		// an error: the registered default is then what serves the key, which
-		// is what FC-11 prescribes for a stored row the ingress rejects. An
-		// error here would instead fail every read of that key.
+		// an error: the registered default then serves the key, as it does for
+		// a stored row the ingress rejects. An error here would instead fail
+		// every read of that key.
 		s.logWarn(ctx, "get decode error, serving the key as absent",
 			log.Err(err),
 			log.String(fieldNamespace, namespace),
@@ -691,8 +691,8 @@ func (s *Store) Set(ctx context.Context, scope store.Scope, e store.Entry) (int6
 
 // Delete rewrites a single (namespace, key) row as a tombstone: the document
 // stays, carrying deleted: true, no value and a bumped revision, so a key that
-// is deleted and recreated always comes back above every revision it ever had
-// (FC-9, D11). Get and List treat a tombstone as absent.
+// is deleted and recreated always comes back above every revision it ever had.
+// Get and List treat a tombstone as absent.
 //
 // Idempotent: the filter excludes tombstones, so deleting an already-deleted
 // or never-written key matches nothing, writes nothing, emits no change-stream
@@ -728,7 +728,7 @@ func (s *Store) Delete(ctx context.Context, scope store.Scope, namespace, key, a
 	// and an existing tombstone both match nothing, and Delete reports that as
 	// success exactly as Postgres does. Rewriting a tombstone would reach the
 	// change stream as a second delete at revision 0, which nothing
-	// deduplicates, so every subscriber would see a duplicate (FC-9).
+	// deduplicates, so every subscriber would see a duplicate.
 	if _, err := coll.UpdateOne(ctx, filter, tombstonePipeline(actor, time.Now().UTC())); err != nil {
 		tracing.HandleSpanError(span, "delete tombstone failed", err)
 

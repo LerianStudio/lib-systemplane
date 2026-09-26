@@ -19,8 +19,8 @@ func (d entryDoc) toEntry() store.Entry {
 	}
 }
 
-// New creates a MongoDB-backed Store. Validates the config; schema bootstrap
-// is lazy (first access per resolved collection).
+// New creates a MongoDB-backed Store and validates the config. Bootstrap runs
+// at Start (single-tenant) or on first access (each tenant database).
 func New(cfg Config) (*Store, error) {
 	// An interface field holding a nil POINTER is not == nil, so every `== nil`
 	// guard downstream would pass it through and the first call would panic:
