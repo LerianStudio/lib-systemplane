@@ -34,12 +34,12 @@ type KeyDef struct {
 	// key per resync, rather than once for the life of the key.
 	//
 	// A LOCAL write is graded by the Registry's owner instead, once, before
-	// the store is written: Client.Set runs this same function against the
-	// same canonical value under the WRITER's context — the one the consumer
-	// handed to Set — so a validator may still resolve a tenant, a locale or a
-	// policy from the request that is writing. Publish then does not run it
-	// again; see its own documentation for why grading one write twice was a
-	// correctness bug rather than a redundancy.
+	// the store is written: Client.Set runs the key's write validator (this
+	// same function when it is non-nil) against the same canonical value under
+	// the WRITER's context — the one the consumer handed to Set — so a validator
+	// may still resolve a tenant, a locale or a policy from the request that is
+	// writing. Publish then does not run it again; see its own documentation for
+	// why grading one write twice was a correctness bug rather than a redundancy.
 	Validate func(context.Context, any) error
 }
 
