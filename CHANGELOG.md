@@ -1,5 +1,14 @@
 # Lib-systemplane Changelog
 
+## [4.1.1](https://github.com/LerianStudio/lib-systemplane/releases/tag/v4.1.1)
+
+Fixes:
+- Removed semicolons from the DDL comments in the PostgreSQL migration scripts to ensure compatibility. (@fredcamaral)
+
+[Compare changes](https://github.com/LerianStudio/lib-systemplane/compare/v4.1.0...v4.1.1)
+
+---
+
 ## [4.1.0](https://github.com/LerianStudio/lib-systemplane/releases/tag/v4.1.0)
 
 Features:
