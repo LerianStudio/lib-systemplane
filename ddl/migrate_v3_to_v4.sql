@@ -4,14 +4,14 @@
 -- migration pipeline. From its first ALTER TABLE to the end it is byte-identical
 -- to ddl/schema.sql: it is that file minus the schema fork guard and the table
 -- creation, preceded by a guard of its own, so it assumes systemplane_entries
--- already exists and upgrades it wherever search_path finds it; a consumer
+-- already exists and upgrades it wherever search_path finds it. A consumer
 -- starting from an empty database applies ddl/schema.sql instead.
 --
 -- IT ALTERS THE TABLE SEARCH_PATH RESOLVES, AND CREATES NONE. Every statement
 -- here names systemplane_entries unqualified, so search_path alone decides which
 -- install is upgraded. The guard DO block below refuses the two layouts that
 -- make that unsafe: no systemplane_entries visible on search_path at all, where
--- the first ALTER would fail halfway through an untransacted file; and a SECOND
+-- the first ALTER would fail halfway through an untransacted file, and a SECOND
 -- systemplane_entries in another schema on search_path, where the file would
 -- upgrade whichever one search_path happens to resolve first and leave the
 -- other on v3, reading v3 payloads through a v4 runtime.
@@ -22,7 +22,7 @@
 -- off search_path is untouched, so a consumer that migrates schema-per-tenant
 -- applies this file once per schema, with search_path set to that schema.
 -- Installs in one database share the `systemplane_changes` channel, so a feed
--- on that database receives every install's events; a multi-tenant Client
+-- on that database receives every install's events, and a multi-tenant Client
 -- refuses a second tenant feed of its own on one database at Subscribe.
 --
 -- The file is idempotent: the column and the sequence are created only when

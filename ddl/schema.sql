@@ -2,14 +2,14 @@
 --
 -- lib-systemplane never executes this file: consumers fold it into their own
 -- migration pipeline. The table name is fixed to `systemplane_entries` and the
--- NOTIFY channel to `systemplane_changes`; the artifact carries no
+-- NOTIFY channel to `systemplane_changes`, and the artifact carries no
 -- table/channel placeholders.
 --
 -- ONE DATABASE PER TENANT. This file assumes systemplane_entries is alone in
 -- its database, and must never be applied once per schema inside a shared
 -- database: NOTIFY is database-wide and every feed listens on the single
 -- `systemplane_changes` channel, so two installations in one database would
--- each receive the other's events; and the unqualified DROP FUNCTION below
+-- each receive the other's events, and the unqualified DROP FUNCTION below
 -- resolves through the applier's whole search_path, so it can drop another
 -- schema's v3 function. Applying it to a fresh database per tenant is the
 -- only supported layout.
@@ -33,7 +33,7 @@
 -- It scans the catalog for systemplane_entries in every user schema OTHER than
 -- current_schema() instead of resolving it through search_path, because the
 -- install most likely to be forked is precisely the one the applier's
--- search_path cannot reach; and it refuses whether or not current_schema()
+-- search_path cannot reach, and it refuses whether or not current_schema()
 -- already holds a table of its own, because a stray copy elsewhere that slipped
 -- past the guard would simply stay orphaned.
 -- An install that cannot be put first in search_path is upgraded with
@@ -59,7 +59,7 @@
 -- plain DML on systemplane_entries and NO grant on
 -- `systemplane_revision_seq`. Because the counter is table-level rather than
 -- per-row, a key deleted and recreated always comes back ABOVE every revision
--- it ever had, and revisions may skip numbers; on a fresh database the first
+-- it ever had, and revisions may skip numbers. On a fresh database the first
 -- write lands at 2, not 1. On a v3 table the ALTER seeds every existing row at
 -- revision 1 and the setval lifts the sequence past the highest revision
 -- present, so the first post-migration write lands at 2 or higher. The NOTIFY
