@@ -11,8 +11,9 @@
 //	DELETE /<prefix>/:namespace/:key       - delete a single entry
 //	DELETE /<prefix>/:namespace/*          - delete a key that may contain "/"
 //
-// Mount also registers the deletion history route, before the value routes so
-// they cannot shadow it:
+// On a Client built with systemplane.WithDeletionHistory, Mount also registers
+// the deletion history route, before the value routes so they cannot shadow
+// it:
 //
 //	GET    /<prefix>/-/deletions/:namespace/*  - who deleted a key, and when
 //
@@ -22,8 +23,10 @@
 //	GET /<prefix>/-/catalog/:namespace/*    - read metadata for one key
 //
 // The default path prefix is "/system".
-// The namespace/key paths beginning with "-/catalog" and "-/deletions" are
-// reserved for these routes and cannot be used as a runtime configuration key.
+// The namespace/key path beginning with "-/catalog" is reserved for the catalog
+// routes and cannot be used as a runtime configuration key. On a Client built
+// with the deletion history, "-/deletions" is reserved the same way; without
+// it, no route claims that path and such a key stays a value like any other.
 //
 // Authorization is deny-all by default: callers MUST supply WithAuthorizer to
 // enable access.
@@ -127,9 +130,10 @@ func WithReturnedErrors() MountOption {
 // Mount registers the admin HTTP routes on router using the given Client.
 // Nil client or router make Mount a no-op (does not panic).
 //
-// The deletion history route answers 501 deletion_history_disabled unless the
-// Client was built with [systemplane.WithDeletionHistory], and 404 for a key
-// that is not registered.
+// The deletion history route is registered only when the Client was built
+// with [systemplane.WithDeletionHistory]. It answers 404 for a key that is not
+// registered, and 501 deletion_history_disabled when the Client's store keeps
+// no history (a NewForTesting store without the capability).
 func Mount(router fiber.Router, c *systemplane.Client, opts ...MountOption) {
 	if c == nil || router == nil {
 		return
@@ -149,8 +153,12 @@ func Mount(router fiber.Router, c *systemplane.Client, opts ...MountOption) {
 	logger := log.Guard(c.Logger())
 
 	// First, so the "/:namespace/*" routes below cannot read "-" as a
-	// namespace and swallow it.
-	router.Get(deletionsPathPrefix(prefix)+"/:namespace/*", cfg.validateWildcardPathParams, authorize(cfg, logger, "read"), handleDeletions(c, cfg))
+	// namespace and swallow it. Only with the option on: without it the path
+	// belongs to the value routes, as it did before the history existed.
+	if c.DeletionHistoryEnabled() {
+		router.Get(deletionsPathPrefix(prefix)+"/:namespace/*", cfg.validateWildcardPathParams, authorize(cfg, logger, "read"), handleDeletions(c, cfg))
+	}
+
 	router.Get(prefix+"/:namespace", cfg.validateNamespaceParam, authorize(cfg, logger, "read"), handleList(c, cfg))
 	router.Get(prefix+"/:namespace/:key", cfg.validatePathParams, authorize(cfg, logger, "read"), handleGetOne(c, cfg))
 	router.Get(prefix+"/:namespace/*", cfg.validateWildcardPathParams, authorize(cfg, logger, "read"), handleGetOne(c, cfg))

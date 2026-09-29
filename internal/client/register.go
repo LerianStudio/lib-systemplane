@@ -14,6 +14,12 @@ import (
 const (
 	reservedCatalogNamespace = "-"
 	reservedCatalogKey       = "catalog"
+
+	// reservedDeletionsKey is the admin deletion history's path under
+	// reservedCatalogNamespace. It is reserved only on a Client built
+	// WithDeletionHistory, the only one admin.Mount serves that route for, so
+	// a Client without the option keeps every key it could register before.
+	reservedDeletionsKey = "deletions"
 )
 
 // keyDef holds the metadata and default value for a registered configuration key.
@@ -71,8 +77,8 @@ func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOp
 		return fmt.Errorf("%w: namespace and key must be non-empty", ErrValidation)
 	}
 
-	if isReservedCatalogKey(namespace, key) {
-		return fmt.Errorf("%w: namespace/key is reserved for the admin catalog", ErrValidation)
+	if err := c.refuseReservedKey(namespace, key); err != nil {
+		return err
 	}
 
 	if err := engine.ValidateCloneSafe(defaultValue); err != nil {
@@ -146,8 +152,28 @@ func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOp
 	return nil
 }
 
+// refuseReservedKey refuses the namespace/key paths the admin routes claim:
+// -/catalog always, -/deletions only while the deletion history is on.
+func (c *Client) refuseReservedKey(namespace, key string) error {
+	if isReservedCatalogKey(namespace, key) {
+		return fmt.Errorf("%w: namespace/key is reserved for the admin catalog", ErrValidation)
+	}
+
+	if c.deletionHistory && isReservedPath(namespace, key, reservedDeletionsKey) {
+		return fmt.Errorf("%w: namespace/key is reserved for the admin deletion history", ErrValidation)
+	}
+
+	return nil
+}
+
 func isReservedCatalogKey(namespace, key string) bool {
-	return namespace == reservedCatalogNamespace && (key == reservedCatalogKey || strings.HasPrefix(key, reservedCatalogKey+"/"))
+	return isReservedPath(namespace, key, reservedCatalogKey)
+}
+
+// isReservedPath reports whether namespace/key is the admin route root under
+// reservedCatalogNamespace, or a path beneath it.
+func isReservedPath(namespace, key, root string) bool {
+	return namespace == reservedCatalogNamespace && (key == root || strings.HasPrefix(key, root+"/"))
 }
 
 // IsRegistered reports whether (namespace, key) was registered via Register.

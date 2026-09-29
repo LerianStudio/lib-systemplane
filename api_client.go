@@ -129,6 +129,13 @@ func (c *Client) Delete(ctx context.Context, namespace, key, actor string) error
 	return asInternalClient(c).Delete(ctx, namespace, key, actor)
 }
 
+// DeletionHistoryEnabled reports whether the Client was built with
+// [WithDeletionHistory]. It is false on a nil Client. admin.Mount serves the
+// deletion history route only when it is true.
+func (c *Client) DeletionHistoryEnabled() bool {
+	return asInternalClient(c).DeletionHistoryEnabled()
+}
+
 // Deletions returns the recorded deletes of namespace/key, newest first, on a
 // Client built with [WithDeletionHistory]: who removed a stored value, when,
 // and at which revision. A delete that removed nothing — a repeat, or a key

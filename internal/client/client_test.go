@@ -372,6 +372,54 @@ func TestRegisterRejectsReservedCatalogKeys(t *testing.T) {
 	}
 }
 
+// TestRegisterReservesDeletionsKeysUnderDeletionHistory pins the -/deletions
+// reservation (br-sfn BRSFN-14, BRSFN-82): with the option on, admin.Mount
+// serves the deletion history at <prefix>/-/deletions/..., ahead of the value
+// routes, so a key registered there could be written and deleted but never
+// read. Without the option no such route exists, so the key stays valid and a
+// Client that registered it before the history existed keeps working.
+func TestRegisterReservesDeletionsKeysUnderDeletionHistory(t *testing.T) {
+	cfg := defaultClientConfig()
+	applyClientOptions(&cfg, []Option{WithDeletionHistory()})
+	on := newClient(newMemStore(false), cfg)
+
+	for _, key := range []string{"deletions", "deletions/ns/k"} {
+		if err := on.Register("-", key, 1); !errors.Is(err, ErrValidation) {
+			t.Errorf("with the history on, register -/%s: got %v, want ErrValidation", key, err)
+		}
+	}
+
+	if err := on.Register("-", "deletionsx", 1); err != nil {
+		t.Errorf("with the history on, register -/deletionsx: %v, want accepted", err)
+	}
+
+	off := newSingleTenantClient(t, newMemStore(false))
+
+	for _, key := range []string{"deletions", "deletions/ns/k"} {
+		if err := off.Register("-", key, 1); err != nil {
+			t.Errorf("with the history off, register -/%s: %v, want accepted", key, err)
+		}
+	}
+}
+
+func TestDeletionHistoryEnabled(t *testing.T) {
+	cfg := defaultClientConfig()
+	applyClientOptions(&cfg, []Option{WithDeletionHistory()})
+
+	if !newClient(newMemStore(false), cfg).DeletionHistoryEnabled() {
+		t.Error("DeletionHistoryEnabled = false on a Client built WithDeletionHistory")
+	}
+
+	if newSingleTenantClient(t, newMemStore(false)).DeletionHistoryEnabled() {
+		t.Error("DeletionHistoryEnabled = true on a Client built without the option")
+	}
+
+	var nilClient *Client
+	if nilClient.DeletionHistoryEnabled() {
+		t.Error("DeletionHistoryEnabled = true on a nil Client")
+	}
+}
+
 func TestRegisterRejectsDuplicates(t *testing.T) {
 	c := newSingleTenantClient(t, newMemStore(false))
 

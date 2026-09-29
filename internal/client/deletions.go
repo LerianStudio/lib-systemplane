@@ -19,6 +19,12 @@ const (
 	MaxDeletionsLimit = 500
 )
 
+// DeletionHistoryEnabled reports whether the Client was built with
+// WithDeletionHistory. False on a nil Client.
+func (c *Client) DeletionHistoryEnabled() bool {
+	return c != nil && c.deletionHistory
+}
+
 // Deletions returns the recorded deletes of (namespace, key), newest first:
 // who removed a stored value, when, and at which revision. limit <= 0 means
 // DefaultDeletionsLimit; above MaxDeletionsLimit it is capped. A key never

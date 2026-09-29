@@ -199,10 +199,11 @@ func TestAdmin_DeletionsErrorMapping(t *testing.T) {
 		assertErrorResponse(t, resp, http.StatusNotFound, "not_found", "key not found")
 	})
 
-	t.Run("history off is 501", func(t *testing.T) {
-		c, _ := setupClient(t, func(c *systemplane.Client) error {
-			return c.Register("ns", "k", "default")
-		})
+	t.Run("store without the history is 501", func(t *testing.T) {
+		c, _ := setupClientWithOptions(t, []systemplane.Option{systemplane.WithDeletionHistory()},
+			func(c *systemplane.Client) error {
+				return c.Register("ns", "k", "default")
+			})
 		app := mountAndRun(t, c)
 
 		resp := doRequest(t, app, http.MethodGet, "/system/-/deletions/ns/k", "")
@@ -229,4 +230,27 @@ func TestAdmin_DeletionsErrorMapping(t *testing.T) {
 			t.Errorf("mount wrote %q before returning the error", probe.bodyBefore)
 		}
 	})
+}
+
+// TestAdmin_DeletionsRouteNeedsTheOption pins backward compatibility: a Client
+// built without WithDeletionHistory gets no deletion history route, so a key
+// it registered under "-" with a "deletions/" prefix is still read, written
+// and deleted through the value routes exactly as before the history existed.
+func TestAdmin_DeletionsRouteNeedsTheOption(t *testing.T) {
+	c, _ := setupClient(t, func(c *systemplane.Client) error {
+		return c.Register("-", "deletions/ns/k", "default")
+	})
+	app := mountAndRun(t, c)
+
+	put := doRequest(t, app, http.MethodPut, "/system/-/deletions/ns/k", `{"value":"stored"}`)
+	put.Body.Close()
+
+	if put.StatusCode != http.StatusNoContent {
+		t.Fatalf("PUT status = %d, want 204", put.StatusCode)
+	}
+
+	got := decodeBody(t, doRequest(t, app, http.MethodGet, "/system/-/deletions/ns/k", ""))
+	if got["value"] != "stored" || got["key"] != "deletions/ns/k" {
+		t.Fatalf("GET body = %#v, want the stored value of -/deletions/ns/k", got)
+	}
 }
