@@ -175,8 +175,10 @@ func WithModule(name string) Option {
 // pipeline first (one database per tenant, like SchemaSQL()) and grant the
 // runtime role INSERT and SELECT on it. With the table missing every Delete
 // fails and the value stays. On MongoDB the record lands in the
-// systemplane_deletions collection of the same database, whose unique index is
-// created with the rest of the bootstrap.
+// systemplane_deletions collection of the same database, in one transaction
+// with the tombstone (a replica set or a sharded cluster is required), and its
+// unique index is created with the rest of the bootstrap. Register refuses
+// namespace "-" with key "deletions" or "deletions/..." while it is on.
 func WithDeletionHistory() Option {
 	return func(cfg *clientConfig) {
 		cfg.deletionHistory = true

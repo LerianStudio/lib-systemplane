@@ -146,7 +146,14 @@ func WithCatalogService(name string) Option { return internalclient.WithCatalogS
 // database per tenant, like [SchemaSQL]) and grant the runtime role INSERT and
 // SELECT on it. Without the table every Delete fails and the value stays.
 // MongoDB records in the systemplane_deletions collection of the same
-// database and creates its unique index during the bootstrap.
+// database, in one transaction with the tombstone, and creates its unique
+// index during the bootstrap. It needs a replica set or a sharded cluster: on
+// a standalone server every Delete fails and the value stays. On both backends
+// a record that cannot be written fails Delete with the value intact.
+//
+// With the option on, [Client.Register] refuses namespace "-" with key
+// "deletions" or "deletions/..." ([ErrValidation]), the path admin.Mount then
+// serves the history at.
 func WithDeletionHistory() Option { return internalclient.WithDeletionHistory() }
 
 // WithDescription sets a human-readable description for the key.

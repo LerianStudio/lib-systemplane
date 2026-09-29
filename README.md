@@ -93,9 +93,11 @@ Opting in takes two steps per service:
    stays. **MongoDB:** nothing to apply; the records land in the
    `systemplane_deletions` collection of the same database, and the bootstrap
    creates its unique `(namespace, key, revision)` index (a role that may not
-   create it fails the bootstrap). The tombstone and the record are two writes:
-   when the record fails, `Delete` returns the error and a retry records the
-   original actor from the tombstone.
+   create it fails the bootstrap). The tombstone and the record are one
+   transaction, so the option needs a replica set or a sharded cluster: on a
+   standalone server every `Delete` fails, names that requirement and leaves
+   the value live. When the record cannot be written, `Delete` fails with the
+   value intact, as on Postgres.
 2. Pass `WithDeletionHistory()` to the constructor.
 
 `Revision` orders a key's deletions: on Postgres it is the revision the value
@@ -195,7 +197,7 @@ GET    /system/:namespace                 list a namespace's entries
 GET    /system/:namespace/:key            read one entry
 PUT    /system/:namespace/:key            write {"value": ...}, answers 204
 DELETE /system/:namespace/:key            delete, answers 204
-GET    /system/-/deletions/:namespace/*   who deleted a key, and when (Mount)
+GET    /system/-/deletions/:namespace/*   who deleted a key, and when (Mount, with WithDeletionHistory)
 GET    /system/-/catalog                  every registered key's metadata
 GET    /system/-/catalog/:namespace/*     one key's metadata
 ```
@@ -208,8 +210,11 @@ renders every error in one shape. Only a handler that reads `commons.Response`
 keeps that title: lib-commons' stock `FiberErrorHandler` matches `*fiber.Error`
 first and replaces it with `request_failed`.
 
-A key containing `/` resolves through each key route's `/*` twin, and paths
-beginning with `-/catalog` and `-/deletions` are reserved. A single-key GET
+A key containing `/` resolves through each key route's `/*` twin, and a path
+beginning with `-/catalog` is reserved for the catalog. On a Client built
+`WithDeletionHistory()`, a path beginning with `-/deletions` is reserved as well
+and `Register` refuses it; without the option no route claims it. A single-key
+GET
 answers:
 
 ```json
@@ -229,10 +234,12 @@ A list answers `{"namespace": ..., "entries": [...]}` with the same fields per
 entry, `namespace` aside. While the registered default is in force, `revision`
 is 0, `updatedAt` is null and `updatedBy` is empty.
 
-The deletion history route is a `"read"` action for the authorizer. It answers
+The deletion history route exists only on a Client built
+`WithDeletionHistory()` (`Client.DeletionHistoryEnabled()`), and is a `"read"`
+action for the authorizer. It answers
 `{"namespace", "key", "deletions": [{"revision", "deletedAt", "deletedBy"}]}`,
 newest first and at most 50 records; 404 for an unregistered key and 501
-`deletion_history_disabled` for a Client built without `WithDeletionHistory()`.
+`deletion_history_disabled` for a store that keeps no history.
 
 ## Metrics
 
