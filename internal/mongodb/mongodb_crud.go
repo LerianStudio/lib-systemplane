@@ -74,9 +74,11 @@ func (s *Store) runSchema(ctx context.Context, coll *mongo.Collection, tenant st
 	}
 
 	if s.cfg.RecordDeletions {
-		// Unlike the polling indexes this one is load-bearing: it is what
-		// keeps two concurrent retries of one delete to one record, so a role
-		// that may not create it fails the bootstrap rather than run without.
+		// Unlike the polling indexes this one is load-bearing: it serves the
+		// history read's sort, it refuses a second record of one tombstone
+		// revision, and it creates the collection before the first delete's
+		// transaction inserts into it. A role that may not create it fails the
+		// bootstrap rather than run without.
 		if _, err := coll.Database().Collection(deletionsCollectionName).Indexes().CreateOne(ctx, deletionsIndex()); err != nil {
 			return fmt.Errorf("systemplane/mongodb: create deletion history index: %w", err)
 		}

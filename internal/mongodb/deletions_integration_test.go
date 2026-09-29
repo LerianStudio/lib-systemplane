@@ -4,12 +4,16 @@ package mongodb_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/LerianStudio/lib-systemplane/v4/internal/mongodb"
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
+	"github.com/testcontainers/testcontainers-go"
+	mongocontainer "github.com/testcontainers/testcontainers-go/modules/mongodb"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 // recordingTenantStore is tenantStore with RecordDeletions on.
@@ -43,18 +47,19 @@ func setDeletionsValidator(t *testing.T, db *mongo.Database, validator bson.D) {
 	}
 }
 
-// TestIntegration_DeletionHistoryRepairsAMissingRecordOnRetry pins the
-// non-atomic half of the MongoDB recording: the tombstone lands, the record
-// insert fails and Delete reports it. The retry finds no live value, reads the
-// tombstone back and writes the record it was missing, with the ORIGINAL
-// actor — so a failed record is recorded late rather than lost, and the
-// retry's own actor is not credited with a delete it did not make.
-func TestIntegration_DeletionHistoryRepairsAMissingRecordOnRetry(t *testing.T) {
+// TestIntegration_DeletionHistoryFailedRecordKeepsTheValue pins the atomic
+// recording: the tombstone and its record are one transaction, so a record
+// that cannot be written fails Delete with the value still live, exactly as
+// the Postgres table missing does. The case the non-atomic write lost is here
+// too: a Set lands between the failed Delete and its retry, and the retry
+// records its own delete of the new value — no delete ever goes unrecorded,
+// and none is credited to an actor that did not make it.
+func TestIntegration_DeletionHistoryFailedRecordKeepsTheValue(t *testing.T) {
 	client, cleanup := startContainer(t)
 	t.Cleanup(cleanup)
 
 	conn := newFakeConnector()
-	db := tenantDB(t, client, conn, "t1", "del_repair")
+	db := tenantDB(t, client, conn, "t1", "del_atomic")
 	s := recordingTenantStore(t, conn)
 	ctx := context.Background()
 	scope := store.Scope{Tenant: "t1"}
@@ -70,13 +75,17 @@ func TestIntegration_DeletionHistoryRepairsAMissingRecordOnRetry(t *testing.T) {
 		t.Fatal("Delete whose record insert fails succeeded; want the failure reported")
 	}
 
-	tomb := readRaw(t, db.Collection("systemplane_entries"), "ns", "k")
-	if !tomb.Deleted || tomb.UpdatedBy != "alice" {
-		t.Fatalf("after the failed record: tombstone = %+v, want deleted by alice", tomb)
+	if got, found, err := s.Get(ctx, scope, "ns", "k"); err != nil || !found || string(got.Value) != `"v"` {
+		t.Fatalf("after the failed delete: Get = (%+v, %v, %v), want the value still live", got, found, err)
 	}
 
-	if got, err := s.ListDeletions(ctx, scope, "ns", "k", 10); err != nil || len(got) != 0 {
-		t.Fatalf("history before the retry = (%+v, %v), want none", got, err)
+	if raw := readRaw(t, db.Collection("systemplane_entries"), "ns", "k"); raw.Deleted {
+		t.Fatalf("after the failed delete: document = %+v, want no tombstone", raw)
+	}
+
+	// A write lands before the retry.
+	if _, err := s.Set(ctx, scope, store.Entry{Namespace: "ns", Key: "k", Value: []byte(`"v2"`), UpdatedBy: "writer"}); err != nil {
+		t.Fatalf("set between: %v", err)
 	}
 
 	setDeletionsValidator(t, db, bson.D{})
@@ -85,22 +94,93 @@ func TestIntegration_DeletionHistoryRepairsAMissingRecordOnRetry(t *testing.T) {
 		t.Fatalf("retry: %v", err)
 	}
 
+	tomb := readRaw(t, db.Collection("systemplane_entries"), "ns", "k")
+
 	got, err := s.ListDeletions(ctx, scope, "ns", "k", 10)
 	if err != nil {
 		t.Fatalf("list deletions: %v", err)
 	}
 
-	if len(got) != 1 || got[0].DeletedBy != "alice" || got[0].Revision != tomb.Revision {
-		t.Fatalf("history after the retry = %+v, want one record by alice at the tombstone's revision %d", got, tomb.Revision)
+	if len(got) != 1 || got[0].DeletedBy != "bob" || got[0].Revision != tomb.Revision {
+		t.Fatalf("history = %+v, want one record by bob at the tombstone's revision %d", got, tomb.Revision)
+	}
+}
+
+// TestIntegration_DeletionHistoryIgnoresAnUnrecordedTombstone pins that a
+// repeat delete records nothing on MongoDB, as on Postgres, even when the
+// tombstone it finds was written without the history on: the record is taken
+// in the same transaction as the tombstone, never back-filled from one.
+func TestIntegration_DeletionHistoryIgnoresAnUnrecordedTombstone(t *testing.T) {
+	client, cleanup := startContainer(t)
+	t.Cleanup(cleanup)
+
+	conn := newFakeConnector()
+	tenantDB(t, client, conn, "t1", "del_old_tomb")
+	ctx := context.Background()
+	scope := store.Scope{Tenant: "t1"}
+
+	plain := tenantStore(t, conn)
+
+	if _, err := plain.Set(ctx, scope, store.Entry{Namespace: "ns", Key: "k", Value: []byte(`1`)}); err != nil {
+		t.Fatalf("set: %v", err)
 	}
 
-	// A further repeat finds the record already written and adds nothing.
-	if err := s.Delete(ctx, scope, "ns", "k", "carol"); err != nil {
-		t.Fatalf("repeat: %v", err)
+	if err := plain.Delete(ctx, scope, "ns", "k", "before-opt-in"); err != nil {
+		t.Fatalf("delete without the history: %v", err)
 	}
 
-	if again, err := s.ListDeletions(ctx, scope, "ns", "k", 10); err != nil || len(again) != 1 {
-		t.Fatalf("history after a repeat = (%+v, %v), want still one record", again, err)
+	s := recordingTenantStore(t, conn)
+
+	if err := s.Delete(ctx, scope, "ns", "k", "mallory"); err != nil {
+		t.Fatalf("repeat delete with the history: %v", err)
+	}
+
+	if got, err := s.ListDeletions(ctx, scope, "ns", "k", 10); err != nil || len(got) != 0 {
+		t.Fatalf("history = (%+v, %v), want none: the repeat removed nothing", got, err)
+	}
+}
+
+// TestIntegration_DeletionHistoryNeedsTransactions pins the standalone
+// refusal: a server with no replica set cannot run the transaction the record
+// rides in, so Delete fails, names the requirement and leaves the value live.
+func TestIntegration_DeletionHistoryNeedsTransactions(t *testing.T) {
+	ctx := context.Background()
+
+	container, err := mongocontainer.Run(ctx, "mongo:7")
+	if err != nil {
+		t.Fatalf("start standalone container: %v", err)
+	}
+
+	t.Cleanup(func() { _ = testcontainers.TerminateContainer(container) })
+
+	uri, err := container.ConnectionString(ctx)
+	if err != nil {
+		t.Fatalf("connection string: %v", err)
+	}
+
+	client, err := mongo.Connect(options.Client().ApplyURI(uri))
+	if err != nil {
+		t.Fatalf("mongo connect: %v", err)
+	}
+
+	t.Cleanup(func() { _ = client.Disconnect(context.Background()) })
+
+	conn := newFakeConnector()
+	db := tenantDB(t, client, conn, "t1", "del_standalone")
+	s := recordingTenantStore(t, conn)
+	scope := store.Scope{Tenant: "t1"}
+
+	if _, err := s.Set(ctx, scope, store.Entry{Namespace: "ns", Key: "k", Value: []byte(`1`)}); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+
+	err = s.Delete(ctx, scope, "ns", "k", "alice")
+	if err == nil || !strings.Contains(err.Error(), "replica set") {
+		t.Fatalf("Delete on a standalone = %v, want a refusal naming the replica set requirement", err)
+	}
+
+	if raw := readRaw(t, db.Collection("systemplane_entries"), "ns", "k"); raw.Deleted {
+		t.Fatalf("after the refused delete: document = %+v, want the value still live", raw)
 	}
 }
 

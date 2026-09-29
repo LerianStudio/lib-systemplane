@@ -354,6 +354,57 @@ func runDeletionHistory(t *testing.T, s store.Store, opts RunOptions) {
 	if literal := listDeletions(ctx, t, lister, opts.Scope, "literal", 10); len(literal) != 1 || literal[0].DeletedBy != "$value" {
 		t.Errorf("history of literal = %+v, want one record by %q", literal, "$value")
 	}
+
+	runConcurrentDeletes(ctx, t, s, lister, opts.Scope)
+}
+
+// concurrentDeleters is how many Deletes race for one stored value.
+const concurrentDeleters = 8
+
+// runConcurrentDeletes races concurrentDeleters Deletes, each with its own
+// actor, against one stored value. Exactly one of them removes it, so the
+// history holds exactly one record, credited to one of the racing actors, and
+// every loser still reports success: Delete is idempotent.
+func runConcurrentDeletes(ctx context.Context, t *testing.T, s store.Store, lister store.DeletionLister, scope store.Scope) {
+	t.Helper()
+
+	setEntry(ctx, t, s, scope, entry("ns", "raced", 1))
+
+	actors := make(map[string]bool, concurrentDeleters)
+	errs := make(chan error, concurrentDeleters)
+	start := make(chan struct{})
+
+	var wg sync.WaitGroup
+
+	for i := range concurrentDeleters {
+		actor := fmt.Sprintf("deleter-%d", i)
+		actors[actor] = true
+
+		wg.Go(func() {
+			<-start
+
+			errs <- s.Delete(ctx, scope, "ns", "raced", actor)
+		})
+	}
+
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent delete: %v", err)
+		}
+	}
+
+	got := listDeletions(ctx, t, lister, scope, "raced", 10)
+	if len(got) != 1 {
+		t.Fatalf("history after %d concurrent deletes = %+v, want exactly one record", concurrentDeleters, got)
+	}
+
+	if !actors[got[0].DeletedBy] {
+		t.Errorf("history credits %q, want one of the racing actors", got[0].DeletedBy)
+	}
 }
 
 // assertAliceThenBob checks the history of ns/audited after alice's delete and

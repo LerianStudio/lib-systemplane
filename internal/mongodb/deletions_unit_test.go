@@ -5,11 +5,12 @@ package mongodb
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
-	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
 var _ store.DeletionLister = (*Store)(nil)
@@ -47,47 +48,39 @@ func TestListDeletions_PreIOPaths(t *testing.T) {
 	}
 }
 
-// TestDeletionRecordWrite_ShapeAndLiterals pins the record upsert: keyed on
-// (namespace, key, revision) so a retry of the same delete writes nothing new,
-// and the provenance set only on insert. It is a plain update, not a pipeline,
-// so a "$"-leading actor is stored as written with no $literal wrapper.
-func TestDeletionRecordWrite_ShapeAndLiterals(t *testing.T) {
+// TestDeletionRecord_TakenFromTheTombstone pins the record a recording Delete
+// inserts: the tombstone's identity, revision and provenance, with a
+// "$"-leading actor stored as written — a plain insert evaluates nothing.
+func TestDeletionRecord_TakenFromTheTombstone(t *testing.T) {
 	t.Parallel()
 
 	at := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
 	tomb := entryDoc{Namespace: "$ns", Key: "k", Revision: 7, UpdatedAt: at, UpdatedBy: "$value", Deleted: true}
 
-	filter, update := deletionRecordWrite(tomb)
-
-	wantFilter := bson.D{
-		{Key: fieldNamespace, Value: "$ns"},
-		{Key: fieldKey, Value: "k"},
-		{Key: fieldRevision, Value: int64(7)},
+	want := deletionDoc{Namespace: "$ns", Key: "k", Revision: 7, DeletedAt: at, DeletedBy: "$value"}
+	if got := deletionRecord(tomb); got != want {
+		t.Fatalf("deletionRecord = %+v, want %+v", got, want)
 	}
-	if len(filter) != len(wantFilter) {
-		t.Fatalf("filter = %#v, want %#v", filter, wantFilter)
+}
+
+// TestIsTransactionsUnsupported pins which error names the replica set
+// requirement: only the standalone server's refusal of a transaction.
+func TestIsTransactionsUnsupported(t *testing.T) {
+	t.Parallel()
+
+	standalone := mongo.CommandError{Code: 20, Message: "Transaction numbers are only allowed on a replica set member or mongos"}
+	if !isTransactionsUnsupported(fmt.Errorf("tombstone: %w", standalone)) {
+		t.Error("the standalone refusal was not recognised")
 	}
 
-	for i := range wantFilter {
-		if filter[i] != wantFilter[i] {
-			t.Errorf("filter[%d] = %#v, want %#v", i, filter[i], wantFilter[i])
+	for _, err := range []error{
+		nil,
+		errors.New("network"),
+		mongo.CommandError{Code: 20, Message: "some other illegal operation"},
+		mongo.CommandError{Code: 112, Message: "WriteConflict"},
+	} {
+		if isTransactionsUnsupported(err) {
+			t.Errorf("isTransactionsUnsupported(%v) = true, want false", err)
 		}
-	}
-
-	if len(update) != 1 || update[0].Key != "$setOnInsert" {
-		t.Fatalf("update = %#v, want one $setOnInsert", update)
-	}
-
-	set, ok := update[0].Value.(bson.D)
-	if !ok || len(set) != 2 {
-		t.Fatalf("$setOnInsert = %#v, want deleted_at and deleted_by", update[0].Value)
-	}
-
-	if set[0].Key != fieldDeletedAt || set[0].Value != at {
-		t.Errorf("$setOnInsert[0] = %#v, want %s = %v", set[0], fieldDeletedAt, at)
-	}
-
-	if set[1].Key != fieldDeletedBy || set[1].Value != "$value" {
-		t.Errorf("$setOnInsert[1] = %#v, want %s = the actor as written", set[1], fieldDeletedBy)
 	}
 }

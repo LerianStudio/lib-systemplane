@@ -93,7 +93,8 @@ type Config struct {
 	Connector Connector // nil in single-tenant mode
 
 	// RecordDeletions makes every Delete that tombstones a live value also
-	// record the tombstone's actor and time in deletionsCollectionName. The
+	// record the tombstone's actor and time in deletionsCollectionName, in the
+	// same transaction, so it needs a replica set or a sharded cluster. The
 	// collection's unique (namespace, key, revision) index is created with the
 	// rest of the bootstrap, and a failure to create it fails that bootstrap.
 	RecordDeletions bool
@@ -739,7 +740,7 @@ func (s *Store) Delete(ctx context.Context, scope store.Scope, namespace, key, a
 	now := time.Now().UTC()
 
 	if s.cfg.RecordDeletions {
-		if err := s.deleteRecording(ctx, coll, namespace, key, filter, now, actor); err != nil {
+		if err := s.deleteRecording(ctx, coll, filter, now, actor); err != nil {
 			tracing.HandleSpanError(span, "delete failed", err)
 
 			return fmt.Errorf("systemplane/mongodb: delete: %w", err)
@@ -762,69 +763,87 @@ func (s *Store) Delete(ctx context.Context, scope store.Scope, namespace, key, a
 	return nil
 }
 
-// deleteRecording is Delete with RecordDeletions: it writes the tombstone and
-// then records it in deletionsCollectionName. The two writes are not atomic,
-// so the record is taken from the TOMBSTONE rather than from the arguments:
-// when the tombstone lands and the record does not, Delete fails, and a retry
-// finds no live value, reads the tombstone back and writes the missing record
-// with the original actor and time. A key with no tombstone — never written —
-// records nothing, and a record already written is left as it is.
-func (s *Store) deleteRecording(ctx context.Context, coll *mongo.Collection, namespace, key string, filter bson.D, now time.Time, actor string) error {
+// deleteRecording is Delete with RecordDeletions: the tombstone and its
+// record in deletionsCollectionName are written in ONE transaction, so either
+// both land or neither does. A record that cannot be written fails Delete with
+// the value still live, as on Postgres, and a retry deletes and records
+// whatever value is live by then under its own actor. A delete that removes
+// nothing — a repeat, or a key never written — writes and records nothing,
+// whatever tombstone it finds.
+//
+// Transactions need a replica set or a sharded cluster; on a standalone
+// server the first write inside one is refused (IllegalOperation, code 20)
+// and Delete fails with errTransactionsRequired, the value untouched.
+//
+// Concurrent deletes of one value conflict on the entry document: the server
+// aborts all but one with a TransientTransactionError, WithTransaction runs
+// the losers again, and they find no live value, so exactly one records.
+func (s *Store) deleteRecording(ctx context.Context, coll *mongo.Collection, filter bson.D, now time.Time, actor string) error {
+	session, err := coll.Database().Client().StartSession()
+	if err != nil {
+		return fmt.Errorf("start session: %w", err)
+	}
+	defer session.EndSession(context.WithoutCancel(ctx))
+
+	deletions := coll.Database().Collection(deletionsCollectionName)
 	opts := options.FindOneAndUpdate().SetReturnDocument(options.After)
 
-	var tomb entryDoc
+	// The callback's result says whether this attempt recorded a delete;
+	// nothing reads it.
+	_, err = session.WithTransaction(ctx, func(txCtx context.Context) (any, error) {
+		var tomb entryDoc
 
-	err := coll.FindOneAndUpdate(ctx, filter, tombstonePipeline(actor, now), opts).Decode(&tomb)
-	if errors.Is(err, mongo.ErrNoDocuments) {
-		// Nothing live: an existing tombstone is a repeat or a retry, and its
-		// record may be the one a failed attempt left missing.
-		tombFilter := bson.D{
-			{Key: fieldID, Value: compoundID{Namespace: namespace, Key: key}},
-			{Key: fieldDeleted, Value: true},
-		}
-
-		err = coll.FindOne(ctx, tombFilter).Decode(&tomb)
+		err := coll.FindOneAndUpdate(txCtx, filter, tombstonePipeline(actor, now), opts).Decode(&tomb)
 		if errors.Is(err, mongo.ErrNoDocuments) {
-			return nil
+			return false, nil
 		}
+
+		if err != nil {
+			return false, fmt.Errorf("tombstone: %w", err)
+		}
+
+		if _, err := deletions.InsertOne(txCtx, deletionRecord(tomb)); err != nil {
+			return false, fmt.Errorf("record deletion: %w", err)
+		}
+
+		return true, nil
+	})
+	if isTransactionsUnsupported(err) {
+		return fmt.Errorf("%w: %w", errTransactionsRequired, err)
 	}
 
-	if err != nil {
-		return fmt.Errorf("tombstone: %w", err)
-	}
-
-	recFilter, recUpdate := deletionRecordWrite(tomb)
-
-	_, err = coll.Database().Collection(deletionsCollectionName).
-		UpdateOne(ctx, recFilter, recUpdate, options.UpdateOne().SetUpsert(true))
-	if err != nil && !mongo.IsDuplicateKeyError(err) {
-		// A duplicate key is a concurrent retry of the same delete that wrote
-		// this very record first, which is success.
-		return fmt.Errorf("record deletion: %w", err)
-	}
-
-	return nil
+	return err
 }
 
-// deletionRecordWrite is the upsert that records a tombstone: keyed on
-// (namespace, key, revision), so recording the same delete twice writes one
-// document, with the provenance set on insert only. It is a plain update, not
-// an aggregation pipeline, so caller strings are values as written and need
-// no $literal; an upsert copies the filter's equality fields into the new
-// document.
-func deletionRecordWrite(tomb entryDoc) (filter, update bson.D) {
-	filter = bson.D{
-		{Key: fieldNamespace, Value: tomb.Namespace},
-		{Key: fieldKey, Value: tomb.Key},
-		{Key: fieldRevision, Value: tomb.Revision},
+// errTransactionsRequired names why a recording Delete failed on a server that
+// runs no transactions.
+var errTransactionsRequired = errors.New(
+	"the deletion history records each delete in a transaction, which needs a replica set or a sharded cluster")
+
+// isTransactionsUnsupported reports the refusal a standalone server answers
+// the first write of a transaction with.
+func isTransactionsUnsupported(err error) bool {
+	var serverErr mongo.ServerError
+
+	return errors.As(err, &serverErr) &&
+		serverErr.HasErrorCodeWithMessage(codeIllegalOperation, "Transaction numbers are only allowed")
+}
+
+// codeIllegalOperation is the server's IllegalOperation error code.
+const codeIllegalOperation = 20
+
+// deletionRecord is the history record of tomb, the tombstone the same
+// transaction wrote: the delete's actor and time are the tombstone's
+// provenance, and its revision orders the key's deletions. Caller strings are
+// field values of a plain insert, never evaluated, so they need no $literal.
+func deletionRecord(tomb entryDoc) deletionDoc {
+	return deletionDoc{
+		Namespace: tomb.Namespace,
+		Key:       tomb.Key,
+		Revision:  tomb.Revision,
+		DeletedAt: tomb.UpdatedAt,
+		DeletedBy: tomb.UpdatedBy,
 	}
-
-	update = bson.D{{Key: "$setOnInsert", Value: bson.D{
-		{Key: fieldDeletedAt, Value: tomb.UpdatedAt},
-		{Key: fieldDeletedBy, Value: tomb.UpdatedBy},
-	}}}
-
-	return filter, update
 }
 
 // deletionDoc is the BSON shape of one deletion record.
