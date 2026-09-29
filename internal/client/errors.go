@@ -57,4 +57,8 @@ var (
 	// ErrTenantManagerBackendMismatch is returned by a constructor handed the
 	// tenant manager of the other backend.
 	ErrTenantManagerBackendMismatch = errors.New("systemplane: tenant manager does not match the client backend")
+
+	// ErrDeletionHistoryDisabled is returned by Deletions on a Client built
+	// without WithDeletionHistory, or over a store that keeps no history.
+	ErrDeletionHistoryDisabled = errors.New("systemplane: deletion history is not enabled")
 )

@@ -57,8 +57,11 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// Compile-time interface satisfaction check.
-var _ store.Store = (*Store)(nil)
+// Compile-time interface satisfaction checks.
+var (
+	_ store.Store          = (*Store)(nil)
+	_ store.DeletionLister = (*Store)(nil)
+)
 
 // channelName is the one LISTEN channel; SchemaSQL's triggers NOTIFY on it.
 const channelName = "systemplane_changes"
@@ -102,6 +105,13 @@ type Config struct {
 	Module string
 
 	Connector Connector // nil in single-tenant mode
+
+	// RecordDeletions makes every Delete that removes a row also record who
+	// removed it, and when, in systemplane_deletions — in the same statement,
+	// so the record and the removal commit or fail together. The table is
+	// provisioned externally from the root package's DeletionHistorySQL();
+	// with it missing, Delete fails and the row stays.
+	RecordDeletions bool
 
 	Logger    log.Logger
 	Telemetry store.Telemetry
@@ -481,6 +491,12 @@ RETURNING revision`
 }
 
 // Delete removes a single (namespace, key) row. Idempotent.
+//
+// With RecordDeletions it also records actor and the time in
+// systemplane_deletions, through the one statement deleteQuery builds: a
+// delete that removes nothing — a missing key, a repeat, the loser of two
+// concurrent deletes — records nothing, and a record that cannot be written
+// fails the delete with the row still in place.
 func (s *Store) Delete(ctx context.Context, scope store.Scope, namespace, key, actor string) error {
 	if s == nil || s.isClosed() {
 		return store.ErrClosed
@@ -500,25 +516,102 @@ func (s *Store) Delete(ctx context.Context, scope store.Scope, namespace, key, a
 	}
 
 	// actor is intentionally NOT a span attribute: it is unbounded caller
-	// identity and would create a high-cardinality / potentially PII tag.
-	// Audit trails capture it via the updated_by column on writes.
-	_ = actor
-
+	// identity and would create a high-cardinality / potentially PII tag. It
+	// is recorded where audit trails read it: systemplane_deletions, when
+	// RecordDeletions is on.
 	ctx, span, finish := s.startSpan(ctx, "systemplane.postgres.delete", scopeAttrs(scope,
 		attribute.String("namespace", namespace),
 		attribute.String("key", key),
 	)...)
 	defer finish()
 
-	const query = `DELETE FROM systemplane_entries WHERE namespace = $1 AND key = $2`
+	args := []any{namespace, key}
+	if s.cfg.RecordDeletions {
+		args = append(args, time.Now().UTC().Truncate(time.Millisecond), actor)
+	}
 
-	if _, err := db.ExecContext(ctx, query, namespace, key); err != nil {
+	if _, err := db.ExecContext(ctx, deleteQuery(s.cfg.RecordDeletions), args...); err != nil {
 		tracing.HandleSpanError(span, "delete failed", err)
 
 		return fmt.Errorf("systemplane/postgres: delete: %w", err)
 	}
 
 	return nil
+}
+
+// deleteQuery is the statement behind Delete. Recording, it is ONE statement:
+// the data-modifying CTE removes the row and the INSERT records exactly the
+// rows it removed, so both commit or neither does, and the revision recorded is
+// the one the row carried. The NOTIFY trigger fires on the DELETE as before.
+func deleteQuery(record bool) string {
+	if !record {
+		return `DELETE FROM systemplane_entries WHERE namespace = $1 AND key = $2`
+	}
+
+	return `WITH gone AS (DELETE FROM systemplane_entries WHERE namespace = $1 AND key = $2 RETURNING namespace, key, revision)
+INSERT INTO systemplane_deletions (namespace, key, revision, deleted_at, deleted_by)
+SELECT namespace, key, revision, $3, $4 FROM gone`
+}
+
+// ListDeletions returns up to limit records of (namespace, key) from
+// systemplane_deletions, newest first. It reads the table whether or not this
+// Store records deletes; a database without it answers with an error.
+func (s *Store) ListDeletions(ctx context.Context, scope store.Scope, namespace, key string, limit int) ([]store.Deletion, error) {
+	if s == nil || s.isClosed() {
+		return nil, store.ErrClosed
+	}
+
+	if namespace == "" || key == "" {
+		return nil, fmt.Errorf("systemplane/postgres: %w: namespace and key must not be empty", store.ErrValidation)
+	}
+
+	if limit <= 0 {
+		return nil, fmt.Errorf("systemplane/postgres: %w: limit must be positive", store.ErrValidation)
+	}
+
+	db, err := s.resolveDB(ctx, scope)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, span, finish := s.startSpan(ctx, "systemplane.postgres.list_deletions", scopeAttrs(scope,
+		attribute.String("namespace", namespace),
+		attribute.String("key", key),
+	)...)
+	defer finish()
+
+	const query = `SELECT namespace, key, revision, deleted_at, deleted_by FROM systemplane_deletions
+WHERE namespace = $1 AND key = $2 ORDER BY revision DESC LIMIT $3`
+
+	rows, err := db.QueryContext(ctx, query, namespace, key, limit)
+	if err != nil {
+		tracing.HandleSpanError(span, "list deletions query failed", err)
+
+		return nil, fmt.Errorf("systemplane/postgres: list deletions: %w", err)
+	}
+	defer rows.Close()
+
+	out := []store.Deletion{}
+
+	for rows.Next() {
+		var d store.Deletion
+
+		if err := rows.Scan(&d.Namespace, &d.Key, &d.Revision, &d.DeletedAt, &d.DeletedBy); err != nil {
+			tracing.HandleSpanError(span, "list deletions scan failed", err)
+
+			return nil, fmt.Errorf("systemplane/postgres: list deletions scan: %w", err)
+		}
+
+		out = append(out, d)
+	}
+
+	if err := rows.Err(); err != nil {
+		tracing.HandleSpanError(span, "list deletions rows iteration failed", err)
+
+		return nil, fmt.Errorf("systemplane/postgres: list deletions rows: %w", err)
+	}
+
+	return out, nil
 }
 
 // startSpan creates a child span if telemetry is configured.

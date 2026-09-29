@@ -11,14 +11,19 @@
 //	DELETE /<prefix>/:namespace/:key       - delete a single entry
 //	DELETE /<prefix>/:namespace/*          - delete a key that may contain "/"
 //
+// Mount also registers the deletion history route, before the value routes so
+// they cannot shadow it:
+//
+//	GET    /<prefix>/-/deletions/:namespace/*  - who deleted a key, and when
+//
 // MountCatalog registers registry-only metadata routes separately:
 //
 //	GET /<prefix>/-/catalog                 - list registered key metadata
 //	GET /<prefix>/-/catalog/:namespace/*    - read metadata for one key
 //
 // The default path prefix is "/system".
-// The namespace/key path beginning with "-/catalog" is reserved for catalog
-// routes and cannot be used as a runtime configuration key.
+// The namespace/key paths beginning with "-/catalog" and "-/deletions" are
+// reserved for these routes and cannot be used as a runtime configuration key.
 //
 // Authorization is deny-all by default: callers MUST supply WithAuthorizer to
 // enable access.
@@ -43,6 +48,7 @@ const (
 	maxKeyLen            = 512
 	catalogMetaNamespace = "-"
 	catalogKey           = "catalog"
+	deletionsKey         = "deletions"
 
 	// recoveryComponent is the component a panic in a consumer function is
 	// counted under on panic_recovered_total.
@@ -87,8 +93,8 @@ func WithPathPrefix(p string) MountOption {
 }
 
 // WithAuthorizer sets an authorization check called before each handler. The
-// action argument is "read" for GET requests and "write" for PUT/DELETE
-// requests. Return a non-nil error to reject the request with 403 Forbidden.
+// action argument is "read" for GET requests, the deletion history included,
+// and "write" for PUT/DELETE requests. Return a non-nil error to reject the request with 403 Forbidden.
 // A panic in fn is recovered, reported, and answered with 403 as well.
 func WithAuthorizer(fn func(fiber.Ctx, string) error) MountOption {
 	return func(cfg *mountConfig) {
@@ -120,6 +126,10 @@ func WithReturnedErrors() MountOption {
 
 // Mount registers the admin HTTP routes on router using the given Client.
 // Nil client or router make Mount a no-op (does not panic).
+//
+// The deletion history route answers 501 deletion_history_disabled unless the
+// Client was built with [systemplane.WithDeletionHistory], and 404 for a key
+// that is not registered.
 func Mount(router fiber.Router, c *systemplane.Client, opts ...MountOption) {
 	if c == nil || router == nil {
 		return
@@ -138,6 +148,9 @@ func Mount(router fiber.Router, c *systemplane.Client, opts ...MountOption) {
 	prefix := normalizePathPrefix(cfg.pathPrefix)
 	logger := log.Guard(c.Logger())
 
+	// First, so the "/:namespace/*" routes below cannot read "-" as a
+	// namespace and swallow it.
+	router.Get(deletionsPathPrefix(prefix)+"/:namespace/*", cfg.validateWildcardPathParams, authorize(cfg, logger, "read"), handleDeletions(c, cfg))
 	router.Get(prefix+"/:namespace", cfg.validateNamespaceParam, authorize(cfg, logger, "read"), handleList(c, cfg))
 	router.Get(prefix+"/:namespace/:key", cfg.validatePathParams, authorize(cfg, logger, "read"), handleGetOne(c, cfg))
 	router.Get(prefix+"/:namespace/*", cfg.validateWildcardPathParams, authorize(cfg, logger, "read"), handleGetOne(c, cfg))
@@ -346,6 +359,10 @@ func catalogPathPrefix(prefix string) string {
 	return fmt.Sprintf("%s/%s/%s", prefix, catalogMetaNamespace, catalogKey)
 }
 
+func deletionsPathPrefix(prefix string) string {
+	return fmt.Sprintf("%s/%s/%s", prefix, catalogMetaNamespace, deletionsKey)
+}
+
 func catalogDetailPath(prefix, namespace, key string) string {
 	return fmt.Sprintf("%s/%s/%s", catalogPathPrefix(prefix), url.PathEscape(namespace), url.PathEscape(key))
 }
@@ -426,6 +443,40 @@ func handleGetOne(client *systemplane.Client, cfg mountConfig) fiber.Handler {
 			UpdatedBy:   e.UpdatedBy,
 			Stale:       e.Stale,
 		})
+	}
+}
+
+func handleDeletions(client *systemplane.Client, cfg mountConfig) fiber.Handler {
+	return func(c fiber.Ctx) error {
+		namespace, key := registeredPathParams(client, c)
+
+		deletions, err := client.Deletions(c.Context(), namespace, key, 0)
+
+		switch {
+		case errors.Is(err, systemplane.ErrUnknownKey):
+			return cfg.respondError(c, http.StatusNotFound, "not_found", "key not found")
+		case errors.Is(err, systemplane.ErrDeletionHistoryDisabled):
+			return cfg.respondError(c, http.StatusNotImplemented, "deletion_history_disabled",
+				"deletion history is not enabled")
+		case err != nil:
+			return cfg.mapSentinelErr(c, err)
+		}
+
+		resp := deletionsResponse{
+			Namespace: namespace,
+			Key:       key,
+			Deletions: make([]deletionResponse, 0, len(deletions)),
+		}
+
+		for _, d := range deletions {
+			resp.Deletions = append(resp.Deletions, deletionResponse{
+				Revision:  d.Revision,
+				DeletedAt: d.DeletedAt,
+				DeletedBy: d.DeletedBy,
+			})
+		}
+
+		return c.Status(fiber.StatusOK).JSON(resp)
 	}
 }
 

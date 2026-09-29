@@ -47,15 +47,22 @@ import (
 )
 
 const (
-	collectionName     = "systemplane_entries"
-	defaultModule      = "systemplane"
-	reconnectBaseDelay = 500 * time.Millisecond
-	reconnectMaxDelay  = 30 * time.Second
-	tracerName         = "systemplane.mongodb"
+	collectionName = "systemplane_entries"
+	// deletionsCollectionName holds the deletion history Config.RecordDeletions
+	// keeps, one document per recorded delete, in the same database as
+	// collectionName.
+	deletionsCollectionName = "systemplane_deletions"
+	defaultModule           = "systemplane"
+	reconnectBaseDelay      = 500 * time.Millisecond
+	reconnectMaxDelay       = 30 * time.Second
+	tracerName              = "systemplane.mongodb"
 )
 
-// Compile-time interface check.
-var _ store.Store = (*Store)(nil)
+// Compile-time interface checks.
+var (
+	_ store.Store          = (*Store)(nil)
+	_ store.DeletionLister = (*Store)(nil)
+)
 
 // Config holds the parameters needed to construct a MongoDB-backed Store.
 type Config struct {
@@ -84,6 +91,12 @@ type Config struct {
 	Module string
 
 	Connector Connector // nil in single-tenant mode
+
+	// RecordDeletions makes every Delete that tombstones a live value also
+	// record the tombstone's actor and time in deletionsCollectionName. The
+	// collection's unique (namespace, key, revision) index is created with the
+	// rest of the bootstrap, and a failure to create it fails that bootstrap.
+	RecordDeletions bool
 
 	Logger    log.Logger
 	Telemetry store.Telemetry
@@ -723,19 +736,180 @@ func (s *Store) Delete(ctx context.Context, scope store.Scope, namespace, key, a
 	)...)
 
 	filter := bson.D{{Key: fieldID, Value: compoundID{Namespace: namespace, Key: key}}, notDeleted()}
+	now := time.Now().UTC()
+
+	if s.cfg.RecordDeletions {
+		if err := s.deleteRecording(ctx, coll, namespace, key, filter, now, actor); err != nil {
+			tracing.HandleSpanError(span, "delete failed", err)
+
+			return fmt.Errorf("systemplane/mongodb: delete: %w", err)
+		}
+
+		return nil
+	}
 
 	// No upsert, and MatchedCount is deliberately not inspected: a missing key
 	// and an existing tombstone both match nothing, and Delete reports that as
 	// success exactly as Postgres does. Rewriting a tombstone would reach the
 	// change stream as a second delete at revision 0, which nothing
 	// deduplicates, so every subscriber would see a duplicate.
-	if _, err := coll.UpdateOne(ctx, filter, tombstonePipeline(actor, time.Now().UTC())); err != nil {
+	if _, err := coll.UpdateOne(ctx, filter, tombstonePipeline(actor, now)); err != nil {
 		tracing.HandleSpanError(span, "delete tombstone failed", err)
 
 		return fmt.Errorf("systemplane/mongodb: delete: %w", err)
 	}
 
 	return nil
+}
+
+// deleteRecording is Delete with RecordDeletions: it writes the tombstone and
+// then records it in deletionsCollectionName. The two writes are not atomic,
+// so the record is taken from the TOMBSTONE rather than from the arguments:
+// when the tombstone lands and the record does not, Delete fails, and a retry
+// finds no live value, reads the tombstone back and writes the missing record
+// with the original actor and time. A key with no tombstone — never written —
+// records nothing, and a record already written is left as it is.
+func (s *Store) deleteRecording(ctx context.Context, coll *mongo.Collection, namespace, key string, filter bson.D, now time.Time, actor string) error {
+	opts := options.FindOneAndUpdate().SetReturnDocument(options.After)
+
+	var tomb entryDoc
+
+	err := coll.FindOneAndUpdate(ctx, filter, tombstonePipeline(actor, now), opts).Decode(&tomb)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		// Nothing live: an existing tombstone is a repeat or a retry, and its
+		// record may be the one a failed attempt left missing.
+		tombFilter := bson.D{
+			{Key: fieldID, Value: compoundID{Namespace: namespace, Key: key}},
+			{Key: fieldDeleted, Value: true},
+		}
+
+		err = coll.FindOne(ctx, tombFilter).Decode(&tomb)
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return nil
+		}
+	}
+
+	if err != nil {
+		return fmt.Errorf("tombstone: %w", err)
+	}
+
+	recFilter, recUpdate := deletionRecordWrite(tomb)
+
+	_, err = coll.Database().Collection(deletionsCollectionName).
+		UpdateOne(ctx, recFilter, recUpdate, options.UpdateOne().SetUpsert(true))
+	if err != nil && !mongo.IsDuplicateKeyError(err) {
+		// A duplicate key is a concurrent retry of the same delete that wrote
+		// this very record first, which is success.
+		return fmt.Errorf("record deletion: %w", err)
+	}
+
+	return nil
+}
+
+// deletionRecordWrite is the upsert that records a tombstone: keyed on
+// (namespace, key, revision), so recording the same delete twice writes one
+// document, with the provenance set on insert only. It is a plain update, not
+// an aggregation pipeline, so caller strings are values as written and need
+// no $literal; an upsert copies the filter's equality fields into the new
+// document.
+func deletionRecordWrite(tomb entryDoc) (filter, update bson.D) {
+	filter = bson.D{
+		{Key: fieldNamespace, Value: tomb.Namespace},
+		{Key: fieldKey, Value: tomb.Key},
+		{Key: fieldRevision, Value: tomb.Revision},
+	}
+
+	update = bson.D{{Key: "$setOnInsert", Value: bson.D{
+		{Key: fieldDeletedAt, Value: tomb.UpdatedAt},
+		{Key: fieldDeletedBy, Value: tomb.UpdatedBy},
+	}}}
+
+	return filter, update
+}
+
+// deletionDoc is the BSON shape of one deletion record.
+type deletionDoc struct {
+	Namespace string    `bson:"namespace"`
+	Key       string    `bson:"key"`
+	Revision  int64     `bson:"revision"`
+	DeletedAt time.Time `bson:"deleted_at"`
+	DeletedBy string    `bson:"deleted_by"`
+}
+
+// ListDeletions returns up to limit records of (namespace, key), newest first,
+// from the deletion history in the scope's database. It reads the collection
+// whether or not this Store records deletes; a database that never recorded
+// one answers with an empty slice.
+func (s *Store) ListDeletions(ctx context.Context, scope store.Scope, namespace, key string, limit int) ([]store.Deletion, error) {
+	if s == nil || s.isClosed() {
+		return nil, store.ErrClosed
+	}
+
+	if namespace == "" || key == "" {
+		return nil, fmt.Errorf("systemplane/mongodb: %w: namespace and key must be non-empty", store.ErrValidation)
+	}
+
+	if limit <= 0 {
+		return nil, fmt.Errorf("systemplane/mongodb: %w: limit must be positive", store.ErrValidation)
+	}
+
+	coll, err := s.resolveCollection(ctx, scope)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, span := s.tracer.Start(ctx, "systemplane.mongodb.list_deletions")
+	defer span.End()
+
+	deletions := coll.Database().Collection(deletionsCollectionName)
+
+	span.SetAttributes(scopeAttrs(deletions, scope,
+		attribute.String("namespace", namespace),
+		attribute.String("key", key),
+	)...)
+
+	findOpts := options.Find().
+		SetSort(bson.D{{Key: fieldRevision, Value: -1}}).
+		SetLimit(int64(limit))
+
+	cursor, err := deletions.Find(ctx, bson.D{
+		{Key: fieldNamespace, Value: namespace},
+		{Key: fieldKey, Value: key},
+	}, findOpts)
+	if err != nil {
+		tracing.HandleSpanError(span, "list deletions find failed", err)
+
+		return nil, fmt.Errorf("systemplane/mongodb: list deletions: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	out := make([]store.Deletion, 0)
+
+	for cursor.Next(ctx) {
+		var doc deletionDoc
+
+		if err := cursor.Decode(&doc); err != nil {
+			tracing.HandleSpanError(span, "list deletions decode failed", err)
+
+			return nil, fmt.Errorf("systemplane/mongodb: list deletions decode: %w", err)
+		}
+
+		out = append(out, store.Deletion{
+			Namespace: doc.Namespace,
+			Key:       doc.Key,
+			Revision:  doc.Revision,
+			DeletedAt: doc.DeletedAt,
+			DeletedBy: doc.DeletedBy,
+		})
+	}
+
+	if err := cursor.Err(); err != nil {
+		tracing.HandleSpanError(span, "list deletions cursor failed", err)
+
+		return nil, fmt.Errorf("systemplane/mongodb: list deletions cursor: %w", err)
+	}
+
+	return out, nil
 }
 
 func (s *Store) logWarn(ctx context.Context, msg string, fields ...log.Field) {

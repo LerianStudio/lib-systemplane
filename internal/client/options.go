@@ -32,6 +32,8 @@ type clientConfig struct {
 	mbTenantManager    *tmmongo.Manager
 
 	aggregateTenantThreshold int
+
+	deletionHistory bool
 }
 
 // DefaultAggregateTenantThreshold is how many tenant scopes may be active
@@ -161,6 +163,23 @@ func WithModule(name string) Option {
 		if name != "" {
 			cfg.module = name
 		}
+	}
+}
+
+// WithDeletionHistory makes every Delete that removes a stored value also
+// record who removed it and when, and turns on [Client.Deletions] to read
+// those records back. Off by default.
+//
+// On Postgres the record lands in systemplane_deletions, in the same
+// statement as the removal: apply DeletionHistorySQL() in the migration
+// pipeline first (one database per tenant, like SchemaSQL()) and grant the
+// runtime role INSERT and SELECT on it. With the table missing every Delete
+// fails and the value stays. On MongoDB the record lands in the
+// systemplane_deletions collection of the same database, whose unique index is
+// created with the rest of the bootstrap.
+func WithDeletionHistory() Option {
+	return func(cfg *clientConfig) {
+		cfg.deletionHistory = true
 	}
 }
 

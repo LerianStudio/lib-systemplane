@@ -70,6 +70,41 @@ poll queries need.
 [MIGRATION-v4.md § The database and operator contract](MIGRATION-v4.md#the-database-and-operator-contract)
 covers the rollout and the rollback.
 
+## Deletion history (opt-in)
+
+`GetEntry` shows who last wrote a value, but a delete leaves the registered
+default in force and its provenance fields zero, so without this option nothing
+says who deleted a key. `WithDeletionHistory()` records every delete that
+removed a stored value: the actor `Delete` was handed, when, and the revision.
+`Client.Deletions(ctx, namespace, key, limit)` reads them back newest first
+(`limit <= 0` means 50, capped at 500); without the option it returns
+`ErrDeletionHistoryDisabled`. A repeat delete, or a delete of a key never
+written, records nothing. The option is off by default, so a consumer that does
+not opt in needs no new DDL.
+
+Opting in takes two steps per service:
+
+1. **Postgres:** apply `DeletionHistorySQL()`
+   ([`ddl/deletions.sql`](ddl/deletions.sql)) after `SchemaSQL()`, in the same
+   schema and one database per tenant, and grant the runtime role `INSERT` and
+   `SELECT` on `systemplane_deletions`. `SchemaSQL()` does not include it, so a
+   pipeline that vendors `SchemaSQL()` sees no drift. The removal and the record
+   are one statement: with the table missing every `Delete` fails and the value
+   stays. **MongoDB:** nothing to apply; the records land in the
+   `systemplane_deletions` collection of the same database, and the bootstrap
+   creates its unique `(namespace, key, revision)` index (a role that may not
+   create it fails the bootstrap). The tombstone and the record are two writes:
+   when the record fails, `Delete` returns the error and a retry records the
+   original actor from the tombstone.
+2. Pass `WithDeletionHistory()` to the constructor.
+
+`Revision` orders a key's deletions: on Postgres it is the revision the value
+carried, on MongoDB the revision of the tombstone the delete wrote. The history
+is append-only and the library ships no purge; retention is the consumer's
+policy. The library accepts an empty actor, so a service that must always name
+one refuses a missing principal before calling `Delete`. `Deletions` never logs
+`DeletedBy`.
+
 ## Quickstart
 
 Every call below returns an error; the linked examples check each one and end
@@ -160,6 +195,7 @@ GET    /system/:namespace                 list a namespace's entries
 GET    /system/:namespace/:key            read one entry
 PUT    /system/:namespace/:key            write {"value": ...}, answers 204
 DELETE /system/:namespace/:key            delete, answers 204
+GET    /system/-/deletions/:namespace/*   who deleted a key, and when (Mount)
 GET    /system/-/catalog                  every registered key's metadata
 GET    /system/-/catalog/:namespace/*     one key's metadata
 ```
@@ -172,8 +208,8 @@ renders every error in one shape. Only a handler that reads `commons.Response`
 keeps that title: lib-commons' stock `FiberErrorHandler` matches `*fiber.Error`
 first and replaces it with `request_failed`.
 
-A key containing `/` resolves through each key route's `/*` twin, and a path
-beginning with `-/catalog` is reserved for the catalog. A single-key GET
+A key containing `/` resolves through each key route's `/*` twin, and paths
+beginning with `-/catalog` and `-/deletions` are reserved. A single-key GET
 answers:
 
 ```json
@@ -192,6 +228,11 @@ answers:
 A list answers `{"namespace": ..., "entries": [...]}` with the same fields per
 entry, `namespace` aside. While the registered default is in force, `revision`
 is 0, `updatedAt` is null and `updatedBy` is empty.
+
+The deletion history route is a `"read"` action for the authorizer. It answers
+`{"namespace", "key", "deletions": [{"revision", "deletedAt", "deletedBy"}]}`,
+newest first and at most 50 records; 404 for an unregistered key and 501
+`deletion_history_disabled` for a Client built without `WithDeletionHistory()`.
 
 ## Metrics
 

@@ -61,6 +61,12 @@ type RunOptions struct {
 	// Nil means this configuration cannot force a reconnect, and the sub-test
 	// skips.
 	Reconnect func(t *testing.T)
+
+	// DeletionHistory declares that every Store the Factory returns records
+	// its deletes (the backend's RecordDeletions, with the deletion history
+	// provisioned) and implements store.DeletionLister. It runs the
+	// DeletionHistory sub-test, which skips when false.
+	DeletionHistory bool
 }
 
 // Run executes the full contract suite against every Store produced by factory.
@@ -161,6 +167,17 @@ func Run(t *testing.T, f Factory, opts RunOptions) {
 
 	t.Run("ResyncAfterForcedReconnect", func(t *testing.T) {
 		runResyncAfterForcedReconnect(t, f, opts)
+	})
+
+	t.Run("DeletionHistory", func(t *testing.T) {
+		if !opts.DeletionHistory {
+			t.Skip("RunOptions.DeletionHistory is false: this configuration records no deletes")
+		}
+
+		s, cleanup := f(t)
+		t.Cleanup(cleanup)
+
+		runDeletionHistory(t, s, opts)
 	})
 }
 
@@ -290,6 +307,105 @@ func runDelete(t *testing.T, s store.Store, opts RunOptions) {
 	if err := s.Delete(ctx, opts.Scope, "ns", "doomed", "tester"); err != nil {
 		t.Fatalf("idempotent delete: %v", err)
 	}
+}
+
+// runDeletionHistory pins the deletion history every recording backend keeps:
+// one record per delete that removed a live value, carrying the actor that
+// Delete was handed and when, listed newest first. A delete that removes
+// nothing — a repeat, or a key never written — records nothing.
+func runDeletionHistory(t *testing.T, s store.Store, opts RunOptions) {
+	startStore(t, s)
+
+	lister, ok := s.(store.DeletionLister)
+	if !ok {
+		t.Fatalf("%T does not implement store.DeletionLister", s)
+	}
+
+	ctx := context.Background()
+
+	if got := listDeletions(ctx, t, lister, opts.Scope, "audited", 10); len(got) != 0 {
+		t.Fatalf("history before any delete = %+v, want none", got)
+	}
+
+	setEntry(ctx, t, s, opts.Scope, entry("ns", "audited", 1))
+	deleteAs(ctx, t, s, opts.Scope, "audited", "alice")
+	// A repeat delete removes nothing, so it records nothing.
+	deleteAs(ctx, t, s, opts.Scope, "audited", "mallory")
+	setEntry(ctx, t, s, opts.Scope, entry("ns", "audited", 2))
+	deleteAs(ctx, t, s, opts.Scope, "audited", "bob")
+
+	assertAliceThenBob(t, listDeletions(ctx, t, lister, opts.Scope, "audited", 10))
+
+	if limited := listDeletions(ctx, t, lister, opts.Scope, "audited", 1); len(limited) != 1 || limited[0].DeletedBy != "bob" {
+		t.Errorf("history limited to 1 = %+v, want only bob's", limited)
+	}
+
+	// A key never written: the delete removes nothing and records nothing.
+	deleteAs(ctx, t, s, opts.Scope, "ghost", "alice")
+
+	if ghost := listDeletions(ctx, t, lister, opts.Scope, "ghost", 10); len(ghost) != 0 {
+		t.Errorf("history of a key never written = %+v, want none", ghost)
+	}
+
+	// An actor shaped like an expression is stored as written.
+	setEntry(ctx, t, s, opts.Scope, entry("ns", "literal", 1))
+	deleteAs(ctx, t, s, opts.Scope, "literal", "$value")
+
+	if literal := listDeletions(ctx, t, lister, opts.Scope, "literal", 10); len(literal) != 1 || literal[0].DeletedBy != "$value" {
+		t.Errorf("history of literal = %+v, want one record by %q", literal, "$value")
+	}
+}
+
+// assertAliceThenBob checks the history of ns/audited after alice's delete and
+// then bob's: exactly two records, newest first, with strictly descending
+// revisions and a time on each.
+func assertAliceThenBob(t *testing.T, got []store.Deletion) {
+	t.Helper()
+
+	if len(got) != 2 {
+		t.Fatalf("history = %+v, want exactly two records (bob, then alice)", got)
+	}
+
+	if got[0].DeletedBy != "bob" || got[1].DeletedBy != "alice" {
+		t.Errorf("history actors = [%q, %q], want [bob, alice] newest first", got[0].DeletedBy, got[1].DeletedBy)
+	}
+
+	if got[0].Revision <= got[1].Revision {
+		t.Errorf("history revisions = [%d, %d], want strictly descending", got[0].Revision, got[1].Revision)
+	}
+
+	for i, d := range got {
+		if d.Namespace != "ns" || d.Key != "audited" {
+			t.Errorf("history[%d] names %s/%s, want ns/audited", i, d.Namespace, d.Key)
+		}
+
+		if d.DeletedAt.IsZero() {
+			t.Errorf("history[%d].DeletedAt is zero", i)
+		}
+	}
+}
+
+func deleteAs(ctx context.Context, t *testing.T, s store.Store, scope store.Scope, key, actor string) {
+	t.Helper()
+
+	if err := s.Delete(ctx, scope, "ns", key, actor); err != nil {
+		t.Fatalf("delete ns/%s by %q: %v", key, actor, err)
+	}
+}
+
+func listDeletions(ctx context.Context, t *testing.T, lister store.DeletionLister, scope store.Scope, key string, limit int) []store.Deletion {
+	t.Helper()
+
+	got, err := lister.ListDeletions(ctx, scope, "ns", key, limit)
+	if err != nil {
+		t.Fatalf("list deletions of ns/%s: %v", key, err)
+	}
+
+	if got == nil {
+		t.Fatalf("list deletions of ns/%s returned a nil slice, want a non-nil one", key)
+	}
+
+	return got
 }
 
 func runUpsert(t *testing.T, s store.Store, opts RunOptions) {

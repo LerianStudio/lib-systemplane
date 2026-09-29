@@ -132,3 +132,31 @@ type Store interface {
 	// that has no changefeed for that scope.
 	Subscribe(ctx context.Context, scope Scope, fn func(Event)) (unsubscribe func(), err error)
 }
+
+// Deletion is one record of a deletion history: a Delete that removed a live
+// value, with the actor it was handed and when it ran.
+type Deletion struct {
+	Namespace string
+	Key       string
+
+	// Revision orders a key's deletions: a later delete always carries a
+	// greater one. On Postgres it is the revision the row carried when it was
+	// deleted; on MongoDB it is the revision of the tombstone the delete wrote,
+	// which is above the value's.
+	Revision int64
+
+	DeletedAt time.Time
+	DeletedBy string
+}
+
+// DeletionLister is the optional capability of a Store that records its
+// deletes (a backend built with RecordDeletions). It is deliberately not part
+// of Store, so a Store implemented outside this module keeps compiling; the
+// Client type-asserts it.
+type DeletionLister interface {
+	// ListDeletions returns up to limit records for (ns, key), newest first,
+	// and never a nil slice. scope resolves the database exactly as it does
+	// for Store. A non-positive limit, or an empty namespace or key, is
+	// refused with ErrValidation.
+	ListDeletions(ctx context.Context, scope Scope, ns, key string, limit int) ([]Deletion, error)
+}

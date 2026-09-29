@@ -3,6 +3,7 @@
 package systemplane_test
 
 import (
+	"os"
 	"strings"
 	"testing"
 
@@ -313,4 +314,83 @@ func TestMigrationV3ToV4SQL_SharesEverythingFromTheFirstAlter(t *testing.T) {
 		t.Errorf("the two artifacts diverge from the first ALTER TABLE onwards; they must be byte-identical there so both upgrade routes leave the same database\nSchemaSQL() tail (%d bytes):\n%s\nMigrationV3ToV4SQL() tail (%d bytes):\n%s",
 			len(schemaTail), schemaTail, len(migrationTail), migrationTail)
 	}
+}
+
+// TestDeletionHistorySQL_IsTheEmbeddedArtifact pins DeletionHistorySQL() to
+// ddl/deletions.sql byte for byte: consumers vendor the file or the function
+// interchangeably, so the two must never drift.
+func TestDeletionHistorySQL_IsTheEmbeddedArtifact(t *testing.T) {
+	t.Parallel()
+
+	onDisk, err := os.ReadFile("ddl/deletions.sql")
+	if err != nil {
+		t.Fatalf("read ddl/deletions.sql: %v", err)
+	}
+
+	if got := systemplane.DeletionHistorySQL(); got != string(onDisk) {
+		t.Errorf("DeletionHistorySQL() differs from ddl/deletions.sql\ngot:\n%s\nwant:\n%s", got, onDisk)
+	}
+}
+
+// TestDeletionHistorySQL_ShapeAndIdempotence pins the table the stores write:
+// the columns and key they rely on, idempotent re-application, and no sequence
+// or identity column, so the runtime role needs INSERT and SELECT only.
+func TestDeletionHistorySQL_ShapeAndIdempotence(t *testing.T) {
+	t.Parallel()
+
+	sql := systemplane.DeletionHistorySQL()
+
+	for _, frag := range []string{
+		"CREATE TABLE IF NOT EXISTS systemplane_deletions (",
+		"namespace   TEXT NOT NULL,",
+		`"key"       TEXT NOT NULL,`,
+		"revision    BIGINT NOT NULL,",
+		"deleted_at  TIMESTAMPTZ NOT NULL,",
+		"deleted_by  TEXT NOT NULL,",
+		`PRIMARY KEY (namespace, "key", revision)`,
+	} {
+		if !strings.Contains(sql, frag) {
+			t.Errorf("DeletionHistorySQL() missing fragment:\n%q", frag)
+		}
+	}
+
+	upper := strings.ToUpper(withoutComments(sql))
+	for _, forbidden := range []string{"SEQUENCE", "IDENTITY", "SERIAL", "TRIGGER", "DROP "} {
+		if strings.Contains(upper, forbidden) {
+			t.Errorf("DeletionHistorySQL() contains %q; the table must need INSERT and SELECT only and re-apply without loss", forbidden)
+		}
+	}
+}
+
+// TestSchemaSQL_LeavesTheDeletionHistoryOut keeps the opt-in table out of the
+// base artifact: a consumer who does not opt in vendors SchemaSQL() unchanged
+// and its drift checks stay green.
+func TestSchemaSQL_LeavesTheDeletionHistoryOut(t *testing.T) {
+	t.Parallel()
+
+	for name, sql := range map[string]string{
+		"SchemaSQL()":          systemplane.SchemaSQL(),
+		"MigrationV3ToV4SQL()": systemplane.MigrationV3ToV4SQL(),
+	} {
+		if strings.Contains(sql, "systemplane_deletions") {
+			t.Errorf("%s names systemplane_deletions; the deletion history is opt-in and ships only in DeletionHistorySQL()", name)
+		}
+	}
+}
+
+// withoutComments drops every "--" line comment, so a shape assertion reads the
+// statements and not the prose that explains them.
+func withoutComments(sql string) string {
+	lines := strings.Split(sql, "\n")
+	kept := lines[:0]
+
+	for _, line := range lines {
+		if i := strings.Index(line, "--"); i >= 0 {
+			line = line[:i]
+		}
+
+		kept = append(kept, line)
+	}
+
+	return strings.Join(kept, "\n")
 }

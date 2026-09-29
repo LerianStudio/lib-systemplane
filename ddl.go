@@ -20,6 +20,12 @@ var schemaSQL string
 //go:embed ddl/migrate_v3_to_v4.sql
 var migrationV3ToV4SQL string
 
+// deletionHistorySQL is the opt-in deletion history table, embedded
+// byte-faithfully from ddl/deletions.sql.
+//
+//go:embed ddl/deletions.sql
+var deletionHistorySQL string
+
 // SchemaSQL returns the full systemplane schema DDL as an importable artifact.
 //
 // The returned SQL creates the systemplane_entries table, the
@@ -128,4 +134,20 @@ func SchemaSQL() string {
 // the caller.
 func MigrationV3ToV4SQL() string {
 	return migrationV3ToV4SQL
+}
+
+// DeletionHistorySQL returns the DDL of the opt-in deletion history as an
+// importable artifact: the systemplane_deletions table a Postgres Client built
+// with [WithDeletionHistory] records every delete in.
+//
+// It is kept out of SchemaSQL() on purpose, so a consumer who does not opt in
+// vendors an unchanged schema. Apply it after SchemaSQL(), to ONE DATABASE PER
+// TENANT, in the same schema as systemplane_entries. It is idempotent.
+//
+// The table has no sequence, identity column or trigger, so the runtime role
+// needs INSERT and SELECT on it and nothing else. It is append-only and the
+// library never purges it: a retention policy, if one is wanted, is the
+// consumer's own. lib-systemplane does not execute it for the caller.
+func DeletionHistorySQL() string {
+	return deletionHistorySQL
 }

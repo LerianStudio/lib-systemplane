@@ -73,6 +73,15 @@ func (s *Store) runSchema(ctx context.Context, coll *mongo.Collection, tenant st
 		}
 	}
 
+	if s.cfg.RecordDeletions {
+		// Unlike the polling indexes this one is load-bearing: it is what
+		// keeps two concurrent retries of one delete to one record, so a role
+		// that may not create it fails the bootstrap rather than run without.
+		if _, err := coll.Database().Collection(deletionsCollectionName).Indexes().CreateOne(ctx, deletionsIndex()); err != nil {
+			return fmt.Errorf("systemplane/mongodb: create deletion history index: %w", err)
+		}
+	}
+
 	if s.cfg.PollInterval <= 0 {
 		return nil
 	}
@@ -194,6 +203,20 @@ func pollingIndexes() []mongo.IndexModel {
 			{Key: fieldNamespace, Value: 1},
 			{Key: fieldKey, Value: 1},
 		}},
+	}
+}
+
+// deletionsIndex is the unique index of the deletion history: one record per
+// (namespace, key, revision), which is what makes recording a delete
+// idempotent, and in the order ListDeletions reads it.
+func deletionsIndex() mongo.IndexModel {
+	return mongo.IndexModel{
+		Keys: bson.D{
+			{Key: fieldNamespace, Value: 1},
+			{Key: fieldKey, Value: 1},
+			{Key: fieldRevision, Value: -1},
+		},
+		Options: options.Index().SetUnique(true),
 	}
 }
 

@@ -20,6 +20,10 @@ const (
 	// document Delete rewrote; every other document omits it entirely, which
 	// is why the reads guard with $ne rather than $exists.
 	fieldDeleted = "deleted"
+	// fieldDeletedAt and fieldDeletedBy are the provenance of a deletion
+	// record in deletionsCollectionName.
+	fieldDeletedAt = "deleted_at"
+	fieldDeletedBy = "deleted_by"
 
 	opSet = "$set"
 	// opLiteral wraps every caller-supplied STRING written by an

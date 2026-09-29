@@ -107,9 +107,12 @@ func TestIntegration_MongoDBSingleTenant(t *testing.T) {
 
 		dbName := fmt.Sprintf("st_%d", time.Now().UnixNano())
 
+		// This configuration records every delete, so the contract suite's
+		// DeletionHistory sub-test runs against it.
 		s, err := mongodb.New(mongodb.Config{
-			Client:   client,
-			Database: dbName,
+			Client:          client,
+			Database:        dbName,
+			RecordDeletions: true,
 		})
 		if err != nil {
 			t.Fatalf("mongodb.New: %v", err)
@@ -124,8 +127,9 @@ func TestIntegration_MongoDBSingleTenant(t *testing.T) {
 	}
 
 	systemplanetest.Run(t, factory, systemplanetest.RunOptions{
-		EventWait: 5 * time.Second,
-		Reconnect: killChangeStreamCursor(client, &lastDB),
+		EventWait:       5 * time.Second,
+		Reconnect:       killChangeStreamCursor(client, &lastDB),
+		DeletionHistory: true,
 	})
 }
 
@@ -148,7 +152,7 @@ func TestIntegration_MongoDBNamedTenant(t *testing.T) {
 
 		lastDB = db.Name()
 
-		s := tenantStore(t, conn)
+		s := recordingTenantStore(t, conn)
 
 		// Closing and dropping here rather than leaning on the t.Cleanup
 		// tenantDB and tenantStore register: the suite calls one Factory per
@@ -162,9 +166,10 @@ func TestIntegration_MongoDBNamedTenant(t *testing.T) {
 	}
 
 	systemplanetest.Run(t, factory, systemplanetest.RunOptions{
-		EventWait: 5 * time.Second,
-		Scope:     store.Scope{Tenant: "t1"},
-		Reconnect: killChangeStreamCursor(client, &lastDB),
+		EventWait:       5 * time.Second,
+		Scope:           store.Scope{Tenant: "t1"},
+		Reconnect:       killChangeStreamCursor(client, &lastDB),
+		DeletionHistory: true,
 	})
 }
 

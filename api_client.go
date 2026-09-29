@@ -129,6 +129,26 @@ func (c *Client) Delete(ctx context.Context, namespace, key, actor string) error
 	return asInternalClient(c).Delete(ctx, namespace, key, actor)
 }
 
+// Deletions returns the recorded deletes of namespace/key, newest first, on a
+// Client built with [WithDeletionHistory]: who removed a stored value, when,
+// and at which revision. A delete that removed nothing — a repeat, or a key
+// never written — has no record. limit <= 0 means [DefaultDeletionsLimit], and
+// a limit above [MaxDeletionsLimit] is capped. A key never deleted answers with
+// an empty slice.
+//
+// It reads the database the way a write does: in multi-tenant mode, the
+// tenant database ctx carries ([ErrTenantConnectionMissing] without one). It
+// returns [ErrClosed] on a nil or closed Client, [ErrNilContext],
+// [ErrNotStarted] before Start, [ErrDeletionHistoryDisabled] without
+// [WithDeletionHistory], and [ErrUnknownKey] for an unregistered key. It logs
+// nothing: DeletedBy names people.
+//
+// [Client.GetEntry] does not show the delete: while the registered default is
+// in force its provenance fields are zero by contract.
+func (c *Client) Deletions(ctx context.Context, namespace, key string, limit int) ([]Deletion, error) {
+	return asInternalClient(c).Deletions(ctx, namespace, key, limit)
+}
+
 // List returns all registered entries in namespace.
 func (c *Client) List(ctx context.Context, namespace string) ([]ListEntry, error) {
 	entries, err := asInternalClient(c).List(ctx, namespace)

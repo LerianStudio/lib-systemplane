@@ -1,5 +1,14 @@
 # Lib-systemplane Changelog
 
+## [Unreleased]
+
+Features:
+- Added an opt-in deletion history that records who deleted a key and when, for br-sfn BRSFN-14 and BRSFN-82. `WithDeletionHistory()` turns it on, `Client.Deletions(ctx, namespace, key, limit)` reads it back newest first, and `ErrDeletionHistoryDisabled` answers a Client built without it. `Deletion`, `DefaultDeletionsLimit`, `MaxDeletionsLimit` and, for tests, `TestDeletionLister` are new.
+- Added `DeletionHistorySQL()` (`ddl/deletions.sql`), the Postgres `systemplane_deletions` table. It stays out of `SchemaSQL()`, so a consumer who does not opt in sees no drift. An opted-in Postgres consumer applies it after `SchemaSQL()` and grants the runtime role `INSERT` and `SELECT` on `systemplane_deletions`; without the table every `Delete` fails and the value stays. MongoDB records in a `systemplane_deletions` collection and creates its unique index during the bootstrap.
+- `admin.Mount` registers `GET :prefix/-/deletions/:namespace/*` (action `"read"`): 404 for an unregistered key, 501 `deletion_history_disabled` without the option. `-/deletions` is now reserved like `-/catalog`.
+
+---
+
 ## [4.1.1](https://github.com/LerianStudio/lib-systemplane/releases/tag/v4.1.1)
 
 Fixes:

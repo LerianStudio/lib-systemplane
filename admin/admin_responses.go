@@ -38,6 +38,18 @@ type getResponse struct {
 	Stale       bool       `json:"stale"`
 }
 
+type deletionsResponse struct {
+	Namespace string             `json:"namespace"`
+	Key       string             `json:"key"`
+	Deletions []deletionResponse `json:"deletions"`
+}
+
+type deletionResponse struct {
+	Revision  int64     `json:"revision"`
+	DeletedAt time.Time `json:"deletedAt"`
+	DeletedBy string    `json:"deletedBy"`
+}
+
 // nilIfZeroTime renders an absent row's provenance as JSON null instead of
 // "0001-01-01T00:00:00Z".
 func nilIfZeroTime(t time.Time) *time.Time {

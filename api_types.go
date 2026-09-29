@@ -43,3 +43,19 @@ type Option = internalclient.Option
 
 // KeyOption configures a single key at registration time.
 type KeyOption = internalclient.KeyOption
+
+// Deletion is one record of the deletion history [WithDeletionHistory] keeps:
+// a [Client.Delete] that removed a stored value, the actor it was handed and
+// when it ran. Revision orders a key's deletions, a later one always greater:
+// on Postgres it is the revision the value carried when deleted, on MongoDB the
+// revision of the tombstone the delete wrote.
+type Deletion = internalclient.Deletion
+
+const (
+	// DefaultDeletionsLimit is how many records [Client.Deletions] returns for
+	// a non-positive limit.
+	DefaultDeletionsLimit = internalclient.DefaultDeletionsLimit
+
+	// MaxDeletionsLimit caps the records one [Client.Deletions] call returns.
+	MaxDeletionsLimit = internalclient.MaxDeletionsLimit
+)
