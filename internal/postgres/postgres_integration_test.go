@@ -95,6 +95,18 @@ func dsnFor(base, dbName string) string {
 	return base
 }
 
+// writeModes are the two write paths every contract run covers: the default
+// single-statement upsert and delete every consumer without the change history
+// runs, and the recording transaction WithChangeHistory selects. Neither may
+// stand in for the other.
+var writeModes = []struct {
+	name   string
+	record bool
+}{
+	{"Default", false},
+	{"RecordingChanges", true},
+}
+
 func TestIntegration_PostgresSingleTenant(t *testing.T) {
 	dsn := startContainer(t)
 
@@ -110,47 +122,54 @@ func TestIntegration_PostgresSingleTenant(t *testing.T) {
 	// plain variable needs no lock.
 	var lastDB string
 
-	factory := func(t *testing.T) (store.Store, func()) {
-		t.Helper()
+	for _, mode := range writeModes {
+		t.Run(mode.name, func(t *testing.T) {
+			factory := func(t *testing.T) (store.Store, func()) {
+				t.Helper()
 
-		dbName := fmt.Sprintf("st_%d", time.Now().UnixNano())
-		freshDB(t, admin, dbName)
+				dbName := fmt.Sprintf("st_%d", time.Now().UnixNano())
+				freshDB(t, admin, dbName)
 
-		lastDB = dbName
+				lastDB = dbName
 
-		tenantDSN := dsnFor(dsn, dbName)
+				tenantDSN := dsnFor(dsn, dbName)
 
-		db, err := sql.Open("pgx", tenantDSN)
-		if err != nil {
-			t.Fatalf("open: %v", err)
-		}
+				db, err := sql.Open("pgx", tenantDSN)
+				if err != nil {
+					t.Fatalf("open: %v", err)
+				}
 
-		// The Store no longer auto-creates its schema; provision it the way a
-		// consumer's migration pipeline would, change history included,
-		// because this configuration records every write.
-		provisionSchema(t, db)
-		provisionChangeHistory(t, db)
+				// The Store no longer auto-creates its schema; provision it the
+				// way a consumer's migration pipeline would, the change history
+				// only for the configuration that records every write.
+				provisionSchema(t, db)
 
-		s, err := postgres.New(postgres.Config{
-			DB:            db,
-			ListenDSN:     tenantDSN,
-			RecordChanges: true,
+				if mode.record {
+					provisionChangeHistory(t, db)
+				}
+
+				s, err := postgres.New(postgres.Config{
+					DB:            db,
+					ListenDSN:     tenantDSN,
+					RecordChanges: mode.record,
+				})
+				if err != nil {
+					t.Fatalf("postgres.New: %v", err)
+				}
+
+				return s, func() {
+					_ = s.Close()
+					_ = db.Close()
+				}
+			}
+
+			systemplanetest.Run(t, factory, systemplanetest.RunOptions{
+				EventWait:     5 * time.Second,
+				Reconnect:     terminateListenOn(admin, &lastDB),
+				ChangeHistory: mode.record,
+			})
 		})
-		if err != nil {
-			t.Fatalf("postgres.New: %v", err)
-		}
-
-		return s, func() {
-			_ = s.Close()
-			_ = db.Close()
-		}
 	}
-
-	systemplanetest.Run(t, factory, systemplanetest.RunOptions{
-		EventWait:     5 * time.Second,
-		Reconnect:     terminateListenOn(admin, &lastDB),
-		ChangeHistory: true,
-	})
 }
 
 // TestIntegration_PostgresNamedTenant runs the same contract suite against a
@@ -166,44 +185,54 @@ func TestIntegration_PostgresNamedTenant(t *testing.T) {
 
 	var lastDB string
 
-	factory := func(t *testing.T) (store.Store, func()) {
-		t.Helper()
+	for _, mode := range writeModes {
+		t.Run(mode.name, func(t *testing.T) {
+			factory := func(t *testing.T) (store.Store, func()) {
+				t.Helper()
 
-		dbName, tenantDSN, db := provisionTenantDB(t, admin, base, "nt")
+				dbName, tenantDSN, db := provisionTenantDB(t, admin, base, "nt")
 
-		lastDB = dbName
+				lastDB = dbName
 
-		provisionChangeHistory(t, db)
+				conn := newFakeConnector()
+				conn.set("t1", db, tenantDSN)
 
-		conn := newFakeConnector()
-		conn.set("t1", db, tenantDSN)
+				var s *postgres.Store
 
-		s := recordingTenantStore(t, conn)
+				if mode.record {
+					provisionChangeHistory(t, db)
 
-		// Closing the pool and dropping the database here rather than leaning
-		// on the t.Cleanup provisionTenantDB and tenantStore register: the
-		// suite calls one Factory per iteration inside
-		// SubscribeThenImmediateWriteNeverLosesTheEvent, and twenty live pools
-		// and databases queueing up for the end of that sub-test crowd the
-		// container's max_connections. Both closes are idempotent, so the
-		// t.Cleanup closes that run later are no-ops; FORCE ends any backend
-		// the closed store left behind.
-		return s, func() {
-			_ = s.Close()
-			_ = db.Close()
+					s = recordingTenantStore(t, conn)
+				} else {
+					s = tenantStore(t, conn)
+				}
 
-			if _, err := admin.Exec(fmt.Sprintf(`DROP DATABASE IF EXISTS %s WITH (FORCE)`, dbName)); err != nil {
-				t.Errorf("drop database %s: %v", dbName, err)
+				// Closing the pool and dropping the database here rather than
+				// leaning on the t.Cleanup provisionTenantDB and tenantStore
+				// register: the suite calls one Factory per iteration inside
+				// SubscribeThenImmediateWriteNeverLosesTheEvent, and twenty live
+				// pools and databases queueing up for the end of that sub-test
+				// crowd the container's max_connections. Both closes are
+				// idempotent, so the t.Cleanup closes that run later are no-ops;
+				// FORCE ends any backend the closed store left behind.
+				return s, func() {
+					_ = s.Close()
+					_ = db.Close()
+
+					if _, err := admin.Exec(fmt.Sprintf(`DROP DATABASE IF EXISTS %s WITH (FORCE)`, dbName)); err != nil {
+						t.Errorf("drop database %s: %v", dbName, err)
+					}
+				}
 			}
-		}
-	}
 
-	systemplanetest.Run(t, factory, systemplanetest.RunOptions{
-		EventWait:     5 * time.Second,
-		Scope:         store.Scope{Tenant: "t1"},
-		Reconnect:     terminateListenOn(admin, &lastDB),
-		ChangeHistory: true,
-	})
+			systemplanetest.Run(t, factory, systemplanetest.RunOptions{
+				EventWait:     5 * time.Second,
+				Scope:         store.Scope{Tenant: "t1"},
+				Reconnect:     terminateListenOn(admin, &lastDB),
+				ChangeHistory: mode.record,
+			})
+		})
+	}
 }
 
 // TestIntegration_PostgresMultiTenantIsolation verifies that writes against
