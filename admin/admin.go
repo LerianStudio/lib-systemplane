@@ -16,6 +16,10 @@
 //
 //	GET    /<prefix>/-/history/:namespace/*    - every write of a key: what, who, when
 //
+// The history answers one page, newest first: ?limit= sizes it (default 50,
+// capped at 500) and ?before= takes the previous page's "next" to read the
+// older one; "next" is absent on the page holding the oldest record.
+//
 // MountCatalog registers registry-only metadata routes separately:
 //
 //	GET /<prefix>/-/catalog                 - list registered key metadata
@@ -38,6 +42,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/LerianStudio/lib-observability/v4/log"
@@ -493,7 +498,12 @@ func handleHistory(client *systemplane.Client, cfg mountConfig) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		namespace, key := registeredPathParams(client, c)
 
-		records, err := client.ChangeHistory(c.Context(), namespace, key, 0)
+		q, badRequestMsg := historyQuery(c)
+		if badRequestMsg != "" {
+			return cfg.respondError(c, http.StatusBadRequest, "bad_request", badRequestMsg)
+		}
+
+		page, err := client.ChangeHistory(c.Context(), namespace, key, q)
 
 		switch {
 		case errors.Is(err, systemplane.ErrUnknownKey):
@@ -508,11 +518,16 @@ func handleHistory(client *systemplane.Client, cfg mountConfig) fiber.Handler {
 		resp := historyResponse{
 			Namespace: namespace,
 			Key:       key,
-			Changes:   make([]changeResponse, 0, len(records)),
+			Changes:   make([]changeResponse, 0, len(page.Changes)),
 		}
 
-		for _, r := range records {
+		if page.Next != 0 {
+			resp.Next = &page.Next
+		}
+
+		for _, r := range page.Changes {
 			resp.Changes = append(resp.Changes, changeResponse{
+				Position:      r.Position,
 				Operation:     r.Operation,
 				Revision:      r.Revision,
 				PreviousValue: r.PreviousValue,
@@ -524,6 +539,36 @@ func handleHistory(client *systemplane.Client, cfg mountConfig) fiber.Handler {
 
 		return c.Status(fiber.StatusOK).JSON(resp)
 	}
+}
+
+// historyQuery reads the history route's paging: ?limit= (a positive integer,
+// capped by the Client) and ?before= (a positive Position, the previous page's
+// next). Either may be absent; one present but malformed is a bad request,
+// named in the returned message.
+func historyQuery(c fiber.Ctx) (systemplane.ChangeHistoryQuery, string) {
+	var q systemplane.ChangeHistoryQuery
+
+	args := c.Request().URI().QueryArgs()
+
+	if args.Has("limit") {
+		limit, err := strconv.Atoi(string(args.Peek("limit")))
+		if err != nil || limit <= 0 {
+			return q, "limit must be a positive integer"
+		}
+
+		q.Limit = limit
+	}
+
+	if args.Has("before") {
+		before, err := strconv.ParseInt(string(args.Peek("before")), 10, 64)
+		if err != nil || before <= 0 {
+			return q, "before must be a positive integer"
+		}
+
+		q.Before = before
+	}
+
+	return q, ""
 }
 
 func handlePut(client *systemplane.Client, cfg mountConfig, logger log.Logger) fiber.Handler {

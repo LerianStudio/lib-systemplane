@@ -44,6 +44,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -711,9 +712,11 @@ func beginTx(ctx context.Context, db dbExecutor) (txExecutor, error) {
 }
 
 // ListHistory returns up to limit records of (namespace, key) from
-// systemplane_history, newest first. It reads the table whether or not this
-// Store records changes; a database without it answers with an error.
-func (s *Store) ListHistory(ctx context.Context, scope store.Scope, namespace, key string, limit int) ([]store.ChangeRecord, error) {
+// systemplane_history, newest first: the newest for before 0, otherwise those
+// whose id is below before. A record's Position is its id. It reads the table
+// whether or not this Store records changes; a database without it answers
+// with an error.
+func (s *Store) ListHistory(ctx context.Context, scope store.Scope, namespace, key string, limit int, before int64) ([]store.ChangeRecord, error) {
 	if s == nil || s.isClosed() {
 		return nil, store.ErrClosed
 	}
@@ -724,6 +727,16 @@ func (s *Store) ListHistory(ctx context.Context, scope store.Scope, namespace, k
 
 	if limit <= 0 {
 		return nil, fmt.Errorf("systemplane/postgres: %w: limit must be positive", store.ErrValidation)
+	}
+
+	if before < 0 {
+		return nil, fmt.Errorf("systemplane/postgres: %w: before must not be negative", store.ErrValidation)
+	}
+
+	// The newest page reads below every id there can be, so one statement
+	// serves both; the (namespace, key, id DESC) index answers it either way.
+	if before == 0 {
+		before = math.MaxInt64
 	}
 
 	db, err := s.resolveDB(ctx, scope)
@@ -737,10 +750,10 @@ func (s *Store) ListHistory(ctx context.Context, scope store.Scope, namespace, k
 	)...)
 	defer finish()
 
-	const query = `SELECT namespace, "key", operation, revision, previous_value, value, changed_at, changed_by
-FROM systemplane_history WHERE namespace = $1 AND "key" = $2 ORDER BY id DESC LIMIT $3`
+	const query = `SELECT id, namespace, "key", operation, revision, previous_value, value, changed_at, changed_by
+FROM systemplane_history WHERE namespace = $1 AND "key" = $2 AND id < $3 ORDER BY id DESC LIMIT $4`
 
-	rows, err := db.QueryContext(ctx, query, namespace, key, limit)
+	rows, err := db.QueryContext(ctx, query, namespace, key, before, limit)
 	if err != nil {
 		tracing.HandleSpanError(span, "list history query failed", err)
 
@@ -758,7 +771,7 @@ FROM systemplane_history WHERE namespace = $1 AND "key" = $2 ORDER BY id DESC LI
 
 		// Scanning into *[]byte copies, so the slices are the receiver's own,
 		// as store.ChangeRecord requires; a NULL scans to nil.
-		if err := rows.Scan(&r.Namespace, &r.Key, &r.Operation, &r.Revision, &previous, &value, &r.ChangedAt, &r.ChangedBy); err != nil {
+		if err := rows.Scan(&r.Position, &r.Namespace, &r.Key, &r.Operation, &r.Revision, &previous, &value, &r.ChangedAt, &r.ChangedBy); err != nil {
 			tracing.HandleSpanError(span, "list history scan failed", err)
 
 			return nil, fmt.Errorf("systemplane/postgres: list history scan: %w", err)

@@ -339,13 +339,17 @@ func runChangeHistory(t *testing.T, s store.Store, opts RunOptions) {
 	deleteAs(ctx, t, s, scope, "audited", "mallory")
 	setAndMatchLive(ctx, t, s, lister, scope, entryBy("audited", "v3", "erin"))
 
-	assertChanges(t, listHistory(ctx, t, lister, scope, "audited", 10), []wantChange{
+	audited := listHistory(ctx, t, lister, scope, "audited", 10)
+
+	assertChanges(t, audited, []wantChange{
 		{store.ChangeCreate, "erin", nil, "v3"},
 		{store.ChangeDelete, "dave", "v2", nil},
 		{store.ChangeUpdate, "carol", "v2", "v2"},
 		{store.ChangeUpdate, "bob", "v1", "v2"},
 		{store.ChangeCreate, "alice", nil, "v1"},
 	})
+
+	assertPagesCoverTheHistory(ctx, t, lister, scope, "audited", audited)
 
 	if limited := listHistory(ctx, t, lister, scope, "audited", 2); len(limited) != 2 || limited[0].ChangedBy != "erin" || limited[1].ChangedBy != "dave" {
 		t.Errorf("history limited to 2 = %+v, want erin's then dave's", limited)
@@ -450,6 +454,53 @@ func assertChanges(t *testing.T, got []store.ChangeRecord, want []wantChange) {
 		if g.Namespace != "ns" || g.ChangedAt.IsZero() || g.Revision <= 0 {
 			t.Errorf("history[%d] = %+v, want namespace ns, a time and a positive revision", i, g)
 		}
+	}
+}
+
+// assertPagesCoverTheHistory checks the cursor every backend serves: Positions
+// are positive and strictly decreasing newest first, and paging two records at
+// a time, each page below the oldest Position of the one before, yields the
+// whole history once, in order, ending on an empty page below the oldest.
+func assertPagesCoverTheHistory(ctx context.Context, t *testing.T, lister store.HistoryLister, scope store.Scope, key string, full []store.ChangeRecord) {
+	t.Helper()
+
+	for i, r := range full {
+		if r.Position <= 0 || (i > 0 && r.Position >= full[i-1].Position) {
+			t.Fatalf("history of ns/%s positions are not positive and strictly decreasing at %d: %+v", key, i, full)
+		}
+	}
+
+	var (
+		paged  []store.ChangeRecord
+		before int64
+	)
+
+	for range len(full) + 1 {
+		page, err := lister.ListHistory(ctx, scope, "ns", key, 2, before)
+		if err != nil {
+			t.Fatalf("list history of ns/%s before %d: %v", key, before, err)
+		}
+
+		if len(page) == 0 {
+			break
+		}
+
+		paged = append(paged, page...)
+		before = page[len(page)-1].Position
+	}
+
+	if len(paged) != len(full) {
+		t.Fatalf("paging ns/%s by two returned %d records, want the %d of one read", key, len(paged), len(full))
+	}
+
+	for i := range full {
+		if paged[i].Position != full[i].Position || paged[i].ChangedBy != full[i].ChangedBy || paged[i].Operation != full[i].Operation {
+			t.Errorf("paged ns/%s[%d] = %+v, want %+v", key, i, paged[i], full[i])
+		}
+	}
+
+	if _, err := lister.ListHistory(ctx, scope, "ns", key, 2, -1); !errors.Is(err, store.ErrValidation) {
+		t.Errorf("list history of ns/%s before -1: err = %v, want ErrValidation", key, err)
 	}
 }
 
@@ -579,7 +630,7 @@ func deleteAs(ctx context.Context, t *testing.T, s store.Store, scope store.Scop
 func listHistory(ctx context.Context, t *testing.T, lister store.HistoryLister, scope store.Scope, key string, limit int) []store.ChangeRecord {
 	t.Helper()
 
-	got, err := lister.ListHistory(ctx, scope, "ns", key, limit)
+	got, err := lister.ListHistory(ctx, scope, "ns", key, limit, 0)
 	if err != nil {
 		t.Fatalf("list history of ns/%s: %v", key, err)
 	}

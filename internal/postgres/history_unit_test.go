@@ -18,14 +18,14 @@ func TestListHistory_PreIOPaths(t *testing.T) {
 	t.Parallel()
 
 	var nilStore *Store
-	if _, err := nilStore.ListHistory(context.Background(), store.Scope{}, "ns", "k", 1); !errors.Is(err, store.ErrClosed) {
+	if _, err := nilStore.ListHistory(context.Background(), store.Scope{}, "ns", "k", 1, 0); !errors.Is(err, store.ErrClosed) {
 		t.Fatalf("nil ListHistory error = %v, want ErrClosed", err)
 	}
 
 	closed := newSubscribeStore()
 	_ = closed.Close()
 
-	if _, err := closed.ListHistory(context.Background(), store.Scope{}, "ns", "k", 1); !errors.Is(err, store.ErrClosed) {
+	if _, err := closed.ListHistory(context.Background(), store.Scope{}, "ns", "k", 1, 0); !errors.Is(err, store.ErrClosed) {
 		t.Fatalf("closed ListHistory error = %v, want ErrClosed", err)
 	}
 
@@ -34,19 +34,23 @@ func TestListHistory_PreIOPaths(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	if _, err := s.ListHistory(context.Background(), store.Scope{}, "", "k", 1); !errors.Is(err, store.ErrValidation) {
+	if _, err := s.ListHistory(context.Background(), store.Scope{}, "", "k", 1, 0); !errors.Is(err, store.ErrValidation) {
 		t.Fatalf("empty namespace error = %v, want ErrValidation", err)
 	}
 
-	if _, err := s.ListHistory(context.Background(), store.Scope{}, "ns", "", 1); !errors.Is(err, store.ErrValidation) {
+	if _, err := s.ListHistory(context.Background(), store.Scope{}, "ns", "", 1, 0); !errors.Is(err, store.ErrValidation) {
 		t.Fatalf("empty key error = %v, want ErrValidation", err)
 	}
 
-	if _, err := s.ListHistory(context.Background(), store.Scope{}, "ns", "k", 0); !errors.Is(err, store.ErrValidation) {
+	if _, err := s.ListHistory(context.Background(), store.Scope{}, "ns", "k", 0, 0); !errors.Is(err, store.ErrValidation) {
 		t.Fatalf("zero limit error = %v, want ErrValidation", err)
 	}
 
-	if _, err := s.ListHistory(context.Background(), store.Scope{}, "ns", "k", 1); !errors.Is(err, store.ErrTenantConnectionMissing) {
+	if _, err := s.ListHistory(context.Background(), store.Scope{}, "ns", "k", 1, -1); !errors.Is(err, store.ErrValidation) {
+		t.Fatalf("negative before error = %v, want ErrValidation", err)
+	}
+
+	if _, err := s.ListHistory(context.Background(), store.Scope{}, "ns", "k", 1, 0); !errors.Is(err, store.ErrTenantConnectionMissing) {
 		t.Fatalf("ListHistory error = %v, want ErrTenantConnectionMissing", err)
 	}
 

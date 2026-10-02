@@ -86,9 +86,13 @@ removed a stored value. Each record carries:
 - the actor the write was handed;
 - the time.
 
-`Client.ChangeHistory(ctx, namespace, key, limit)` reads the records back
-newest first (`limit <= 0` means 50, capped at 500). Without the option it
-returns `ErrChangeHistoryDisabled`. A repeat delete, or a delete of a key never
+`Client.ChangeHistory(ctx, namespace, key, systemplane.ChangeHistoryQuery{Limit, Before})`
+reads one page of the records, newest first (`Limit <= 0` means 50, capped at
+500). The page's `Next` is the `Before` of the older page, and 0 on the page
+that holds the oldest record, so a caller reaches every record however long
+the history grows. Each record's `Position` is its place in the key's history
+and serves only as a `Before`. Without the option it returns
+`ErrChangeHistoryDisabled`. A repeat delete, or a delete of a key never
 written, records nothing. After every `Set`, the newest record's `ChangedBy` and
 `ChangedAt` equal the live row's `UpdatedBy` and `UpdatedAt`. The option is off
 by default, so a consumer that does not opt in needs no new DDL.
@@ -263,22 +267,27 @@ is 0, `updatedAt` is null and `updatedBy` is empty.
 
 The change history route exists only on a Client built `WithChangeHistory()`
 (`Client.ChangeHistoryEnabled()`), and is a `"read"` action for the authorizer.
-It answers newest first, at most 50 records:
+It answers one page, newest first. `?limit=` sizes the page (default 50,
+capped at 500), and `?before=` takes the previous page's `next` to read the
+older page. `next` is absent on the page that holds the oldest record, so
+following it reaches every record the key has:
 
 ```json
 {
   "namespace": "payments",
   "key": "fee_bps",
   "changes": [
-    {"operation": "update", "revision": 8, "previousValue": 26, "value": 30,
+    {"position": 412, "operation": "update", "revision": 8, "previousValue": 26, "value": 30,
      "changedAt": "2026-09-27T09:00:00Z", "changedBy": "ops@example.com"},
-    {"operation": "create", "revision": 7, "previousValue": null, "value": 26,
+    {"position": 97, "operation": "create", "revision": 7, "previousValue": null, "value": 26,
      "changedAt": "2026-09-26T12:00:00Z", "changedBy": "ops@example.com"}
-  ]
+  ],
+  "next": 97
 }
 ```
 
-It answers 404 for an unregistered key and 501 `change_history_disabled` for a
+It answers 400 `bad_request` for a `limit` or `before` that is not a positive
+integer, 404 for an unregistered key and 501 `change_history_disabled` for a
 store that keeps no history.
 
 ## Metrics

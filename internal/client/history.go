@@ -49,36 +49,58 @@ func (c *Client) requireActor(actor string) error {
 	return nil
 }
 
-// ChangeHistory returns the recorded writes of (namespace, key), newest first:
-// which operation, the value before and after, who wrote it and when. limit
-// <= 0 means DefaultChangeHistoryLimit; above MaxChangeHistoryLimit it is
-// capped. A key never written answers with an empty slice.
+// ChangeHistoryQuery selects one page of a key's change history.
+type ChangeHistoryQuery struct {
+	// Limit is how many records the page holds at most: <= 0 means
+	// DefaultChangeHistoryLimit, and above MaxChangeHistoryLimit it is capped.
+	Limit int
+
+	// Before, when positive, starts the page below that Position: the Next of
+	// the page before it. 0 starts from the newest record; a negative Before is
+	// refused with ErrValidation.
+	Before int64
+}
+
+// ChangeHistoryPage is one page of a key's change history.
+type ChangeHistoryPage struct {
+	// Changes holds the page's records, newest first; never nil.
+	Changes []ChangeRecord
+
+	// Next is the Before of the next, older page, and 0 when no older record
+	// remains.
+	Next int64
+}
+
+// ChangeHistory returns one page of the recorded writes of (namespace, key),
+// newest first: which operation, the value before and after, who wrote it and
+// when. Following Next until it is 0 reaches every record the key has, however
+// many. A key never written answers with an empty page.
 //
 // It reads through to the database the way a write does: the constructor's in
 // single-tenant mode, the tenant database ctx carries in multi-tenant mode
 // ([ErrTenantConnectionMissing] without one). Refusals: [ErrClosed] on a nil or
 // closed Client, [ErrNilContext], [ErrNotStarted] before Start,
-// [ErrChangeHistoryDisabled] without WithChangeHistory, and [ErrUnknownKey]
-// for a key that was not registered.
+// [ErrChangeHistoryDisabled] without WithChangeHistory, [ErrUnknownKey] for a
+// key that was not registered, and [ErrValidation] for a negative Before.
 //
 // Nothing here logs: the records name people and carry values, and the caller
 // decides where they go.
-func (c *Client) ChangeHistory(ctx context.Context, namespace, key string, limit int) ([]ChangeRecord, error) {
+func (c *Client) ChangeHistory(ctx context.Context, namespace, key string, q ChangeHistoryQuery) (ChangeHistoryPage, error) {
 	if c == nil || c.closed.Load() {
-		return nil, ErrClosed
+		return ChangeHistoryPage{}, ErrClosed
 	}
 
 	if ctx == nil {
-		return nil, ErrNilContext
+		return ChangeHistoryPage{}, ErrNilContext
 	}
 
 	if !c.started.Load() {
-		return nil, ErrNotStarted
+		return ChangeHistoryPage{}, ErrNotStarted
 	}
 
 	lister, ok := c.store.(store.HistoryLister)
 	if !c.changeHistory || !ok {
-		return nil, ErrChangeHistoryDisabled
+		return ChangeHistoryPage{}, ErrChangeHistoryDisabled
 	}
 
 	c.registryMu.RLock()
@@ -86,8 +108,14 @@ func (c *Client) ChangeHistory(ctx context.Context, namespace, key string, limit
 	c.registryMu.RUnlock()
 
 	if !registered {
-		return nil, fmt.Errorf("%w: %s/%s", ErrUnknownKey, namespace, key)
+		return ChangeHistoryPage{}, fmt.Errorf("%w: %s/%s", ErrUnknownKey, namespace, key)
 	}
+
+	if q.Before < 0 {
+		return ChangeHistoryPage{}, fmt.Errorf("%w: before must not be negative", ErrValidation)
+	}
+
+	limit := q.Limit
 
 	switch {
 	case limit <= 0:
@@ -96,14 +124,23 @@ func (c *Client) ChangeHistory(ctx context.Context, namespace, key string, limit
 		limit = MaxChangeHistoryLimit
 	}
 
-	records, err := lister.ListHistory(ctx, store.Scope{}, namespace, key, limit)
+	// One record past the page says whether an older page exists, so the last
+	// page reports Next 0 instead of sending the caller to an empty one.
+	records, err := lister.ListHistory(ctx, store.Scope{}, namespace, key, limit+1, q.Before)
 	if err != nil {
-		return nil, err
+		return ChangeHistoryPage{}, err
 	}
 
-	if records == nil {
-		records = []ChangeRecord{}
+	page := ChangeHistoryPage{Changes: records}
+
+	if len(records) > limit {
+		page.Changes = records[:limit:limit]
+		page.Next = page.Changes[limit-1].Position
 	}
 
-	return records, nil
+	if page.Changes == nil {
+		page.Changes = []ChangeRecord{}
+	}
+
+	return page, nil
 }

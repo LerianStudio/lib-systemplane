@@ -20,14 +20,15 @@ import (
 type historyStore struct {
 	*memStore
 
-	mu        sync.Mutex
-	actors    []string
-	history   []store.ChangeRecord
-	listErr   error
-	lastScope store.Scope
-	lastNS    string
-	lastKey   string
-	lastLimit int
+	mu         sync.Mutex
+	actors     []string
+	history    []store.ChangeRecord
+	listErr    error
+	lastScope  store.Scope
+	lastNS     string
+	lastKey    string
+	lastLimit  int
+	lastBefore int64
 }
 
 var _ store.HistoryLister = (*historyStore)(nil)
@@ -52,17 +53,31 @@ func (h *historyStore) Delete(ctx context.Context, scope store.Scope, ns, key, a
 	return h.memStore.Delete(ctx, scope, ns, key, actor)
 }
 
-func (h *historyStore) ListHistory(_ context.Context, scope store.Scope, ns, key string, limit int) ([]store.ChangeRecord, error) {
+// ListHistory serves h.history (newest first) the way a backend does: the
+// records below before (all of them for 0), at most limit.
+func (h *historyStore) ListHistory(_ context.Context, scope store.Scope, ns, key string, limit int, before int64) ([]store.ChangeRecord, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	h.lastScope, h.lastNS, h.lastKey, h.lastLimit = scope, ns, key, limit
+	h.lastScope, h.lastNS, h.lastKey, h.lastLimit, h.lastBefore = scope, ns, key, limit, before
 
 	if h.listErr != nil {
 		return nil, h.listErr
 	}
 
-	return append([]store.ChangeRecord(nil), h.history...), nil
+	out := []store.ChangeRecord{}
+
+	for _, r := range h.history {
+		if len(out) == limit {
+			break
+		}
+
+		if before == 0 || r.Position < before {
+			out = append(out, r)
+		}
+	}
+
+	return out, nil
 }
 
 func (h *historyStore) lastCall() (store.Scope, string, string, int) {
@@ -70,6 +85,13 @@ func (h *historyStore) lastCall() (store.Scope, string, string, int) {
 	defer h.mu.Unlock()
 
 	return h.lastScope, h.lastNS, h.lastKey, h.lastLimit
+}
+
+func (h *historyStore) lastBeforeArg() int64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return h.lastBefore
 }
 
 func (h *historyStore) writeActors() []string {
@@ -95,25 +117,97 @@ func TestChangeHistory_ReturnsWhatTheStoreRecorded(t *testing.T) {
 	s := newHistoryStore()
 	at := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
 	s.history = []store.ChangeRecord{
-		{Namespace: "ns", Key: "k", Operation: ChangeOperationDelete, Revision: 9, PreviousValue: json.RawMessage(`"v2"`), ChangedAt: at, ChangedBy: "bob"},
-		{Namespace: "ns", Key: "k", Operation: ChangeOperationUpdate, Revision: 8, PreviousValue: json.RawMessage(`"v1"`), Value: json.RawMessage(`"v2"`), ChangedAt: at.Add(-time.Minute), ChangedBy: "carol"},
-		{Namespace: "ns", Key: "k", Operation: ChangeOperationCreate, Revision: 4, Value: json.RawMessage(`"v1"`), ChangedAt: at.Add(-time.Hour), ChangedBy: "alice"},
+		{Namespace: "ns", Key: "k", Position: 30, Operation: ChangeOperationDelete, Revision: 9, PreviousValue: json.RawMessage(`"v2"`), ChangedAt: at, ChangedBy: "bob"},
+		{Namespace: "ns", Key: "k", Position: 20, Operation: ChangeOperationUpdate, Revision: 8, PreviousValue: json.RawMessage(`"v1"`), Value: json.RawMessage(`"v2"`), ChangedAt: at.Add(-time.Minute), ChangedBy: "carol"},
+		{Namespace: "ns", Key: "k", Position: 10, Operation: ChangeOperationCreate, Revision: 4, Value: json.RawMessage(`"v1"`), ChangedAt: at.Add(-time.Hour), ChangedBy: "alice"},
 	}
 
 	c := historyClient(t, s, WithChangeHistory())
 
-	got, err := c.ChangeHistory(context.Background(), "ns", "k", 10)
+	got, err := c.ChangeHistory(context.Background(), "ns", "k", ChangeHistoryQuery{Limit: 10})
 	if err != nil {
 		t.Fatalf("ChangeHistory: %v", err)
 	}
 
-	if !reflect.DeepEqual(got, s.history) {
-		t.Fatalf("ChangeHistory = %+v, want %+v", got, s.history)
+	if !reflect.DeepEqual(got.Changes, s.history) || got.Next != 0 {
+		t.Fatalf("ChangeHistory = %+v, want %+v and no next page", got, s.history)
 	}
 
+	// One record beyond the page, so the Client knows whether an older page
+	// exists without a second round trip.
 	scope, ns, key, limit := s.lastCall()
-	if scope != (store.Scope{}) || ns != "ns" || key != "k" || limit != 10 {
-		t.Errorf("ListHistory called with (%+v, %q, %q, %d), want the zero scope, ns, k, 10", scope, ns, key, limit)
+	if scope != (store.Scope{}) || ns != "ns" || key != "k" || limit != 11 {
+		t.Errorf("ListHistory called with (%+v, %q, %q, %d), want the zero scope, ns, k, 11", scope, ns, key, limit)
+	}
+}
+
+// TestChangeHistory_PagesThroughEveryRecord pins the half of BRSFN-14 and
+// BRSFN-82 a capped read left open: however long a key's history grows, every
+// record stays reachable by following Next, oldest page included, with no
+// record repeated or skipped.
+func TestChangeHistory_PagesThroughEveryRecord(t *testing.T) {
+	s := newHistoryStore()
+
+	const total = 7
+
+	for i := total; i >= 1; i-- {
+		s.history = append(s.history, store.ChangeRecord{
+			Namespace: "ns", Key: "k", Position: int64(i * 3), Operation: ChangeOperationUpdate, ChangedBy: "w",
+		})
+	}
+
+	c := historyClient(t, s, WithChangeHistory())
+
+	var (
+		seen   []int64
+		before int64
+		pages  int
+	)
+
+	for {
+		page, err := c.ChangeHistory(context.Background(), "ns", "k", ChangeHistoryQuery{Limit: 3, Before: before})
+		if err != nil {
+			t.Fatalf("ChangeHistory(before %d): %v", before, err)
+		}
+
+		if got := s.lastBeforeArg(); got != before {
+			t.Fatalf("store asked with before %d, want %d", got, before)
+		}
+
+		pages++
+
+		for _, r := range page.Changes {
+			seen = append(seen, r.Position)
+		}
+
+		if page.Next == 0 {
+			break
+		}
+
+		if len(page.Changes) != 3 || page.Next != page.Changes[len(page.Changes)-1].Position {
+			t.Fatalf("page %d = %+v, want 3 records and Next at the oldest of them", pages, page)
+		}
+
+		before = page.Next
+	}
+
+	if want := []int64{21, 18, 15, 12, 9, 6, 3}; !reflect.DeepEqual(seen, want) || pages != 3 {
+		t.Errorf("paged positions = %v over %d pages, want %v over 3", seen, pages, want)
+	}
+
+	// An exact multiple ends on a full page with no Next, never an empty one.
+	exact, err := c.ChangeHistory(context.Background(), "ns", "k", ChangeHistoryQuery{Limit: total})
+	if err != nil || len(exact.Changes) != total || exact.Next != 0 {
+		t.Errorf("ChangeHistory(limit %d) = (%+v, %v), want every record and no next page", total, exact, err)
+	}
+}
+
+func TestChangeHistory_NegativeBeforeIsRefused(t *testing.T) {
+	s := newHistoryStore()
+	c := historyClient(t, s, WithChangeHistory())
+
+	if _, err := c.ChangeHistory(context.Background(), "ns", "k", ChangeHistoryQuery{Before: -1}); !errors.Is(err, ErrValidation) {
+		t.Fatalf("err = %v, want ErrValidation", err)
 	}
 }
 
@@ -131,12 +225,12 @@ func TestChangeHistory_OperationNames(t *testing.T) {
 func TestChangeHistory_NeverReturnsNil(t *testing.T) {
 	c := historyClient(t, newHistoryStore(), WithChangeHistory())
 
-	got, err := c.ChangeHistory(context.Background(), "ns", "k", 0)
+	got, err := c.ChangeHistory(context.Background(), "ns", "k", ChangeHistoryQuery{})
 	if err != nil {
 		t.Fatalf("ChangeHistory: %v", err)
 	}
 
-	if got == nil {
+	if got.Changes == nil || got.Next != 0 {
 		t.Error("ChangeHistory of a key never written = nil, want an empty slice")
 	}
 }
@@ -145,16 +239,16 @@ func TestChangeHistory_LimitDefaultsAndCap(t *testing.T) {
 	for _, tt := range []struct {
 		in, want int
 	}{
-		{0, DefaultChangeHistoryLimit},
-		{-3, DefaultChangeHistoryLimit},
-		{1, 1},
-		{MaxChangeHistoryLimit, MaxChangeHistoryLimit},
-		{MaxChangeHistoryLimit + 1, MaxChangeHistoryLimit},
+		{0, DefaultChangeHistoryLimit + 1},
+		{-3, DefaultChangeHistoryLimit + 1},
+		{1, 2},
+		{MaxChangeHistoryLimit, MaxChangeHistoryLimit + 1},
+		{MaxChangeHistoryLimit + 1, MaxChangeHistoryLimit + 1},
 	} {
 		s := newHistoryStore()
 		c := historyClient(t, s, WithChangeHistory())
 
-		if _, err := c.ChangeHistory(context.Background(), "ns", "k", tt.in); err != nil {
+		if _, err := c.ChangeHistory(context.Background(), "ns", "k", ChangeHistoryQuery{Limit: tt.in}); err != nil {
 			t.Fatalf("ChangeHistory(limit %d): %v", tt.in, err)
 		}
 
@@ -172,7 +266,7 @@ func TestChangeHistory_Refusals(t *testing.T) {
 	t.Run("option off", func(t *testing.T) {
 		c := historyClient(t, newHistoryStore())
 
-		if _, err := c.ChangeHistory(context.Background(), "ns", "k", 0); !errors.Is(err, ErrChangeHistoryDisabled) {
+		if _, err := c.ChangeHistory(context.Background(), "ns", "k", ChangeHistoryQuery{}); !errors.Is(err, ErrChangeHistoryDisabled) {
 			t.Fatalf("err = %v, want ErrChangeHistoryDisabled", err)
 		}
 	})
@@ -180,7 +274,7 @@ func TestChangeHistory_Refusals(t *testing.T) {
 	t.Run("store without the capability", func(t *testing.T) {
 		c := historyClient(t, newMemStore(false), WithChangeHistory())
 
-		if _, err := c.ChangeHistory(context.Background(), "ns", "k", 0); !errors.Is(err, ErrChangeHistoryDisabled) {
+		if _, err := c.ChangeHistory(context.Background(), "ns", "k", ChangeHistoryQuery{}); !errors.Is(err, ErrChangeHistoryDisabled) {
 			t.Fatalf("err = %v, want ErrChangeHistoryDisabled", err)
 		}
 	})
@@ -188,7 +282,7 @@ func TestChangeHistory_Refusals(t *testing.T) {
 	t.Run("unknown key", func(t *testing.T) {
 		c := historyClient(t, newHistoryStore(), WithChangeHistory())
 
-		if _, err := c.ChangeHistory(context.Background(), "ns", "missing", 0); !errors.Is(err, ErrUnknownKey) {
+		if _, err := c.ChangeHistory(context.Background(), "ns", "missing", ChangeHistoryQuery{}); !errors.Is(err, ErrUnknownKey) {
 			t.Fatalf("err = %v, want ErrUnknownKey", err)
 		}
 	})
@@ -197,7 +291,7 @@ func TestChangeHistory_Refusals(t *testing.T) {
 		c := historyClient(t, newHistoryStore(), WithChangeHistory())
 
 		//nolint:staticcheck // SA1012: the nil context is the input under test.
-		if _, err := c.ChangeHistory(nil, "ns", "k", 0); !errors.Is(err, ErrNilContext) {
+		if _, err := c.ChangeHistory(nil, "ns", "k", ChangeHistoryQuery{}); !errors.Is(err, ErrNilContext) {
 			t.Fatalf("err = %v, want ErrNilContext", err)
 		}
 	})
@@ -213,7 +307,7 @@ func TestChangeHistory_Refusals(t *testing.T) {
 			t.Fatalf("register: %v", err)
 		}
 
-		if _, err := c.ChangeHistory(context.Background(), "ns", "k", 0); !errors.Is(err, ErrNotStarted) {
+		if _, err := c.ChangeHistory(context.Background(), "ns", "k", ChangeHistoryQuery{}); !errors.Is(err, ErrNotStarted) {
 			t.Fatalf("err = %v, want ErrNotStarted", err)
 		}
 	})
@@ -222,7 +316,7 @@ func TestChangeHistory_Refusals(t *testing.T) {
 		c := historyClient(t, newHistoryStore(), WithChangeHistory())
 		_ = c.Close()
 
-		if _, err := c.ChangeHistory(context.Background(), "ns", "k", 0); !errors.Is(err, ErrClosed) {
+		if _, err := c.ChangeHistory(context.Background(), "ns", "k", ChangeHistoryQuery{}); !errors.Is(err, ErrClosed) {
 			t.Fatalf("err = %v, want ErrClosed", err)
 		}
 	})
@@ -230,7 +324,7 @@ func TestChangeHistory_Refusals(t *testing.T) {
 	t.Run("nil client", func(t *testing.T) {
 		var c *Client
 
-		if _, err := c.ChangeHistory(context.Background(), "ns", "k", 0); !errors.Is(err, ErrClosed) {
+		if _, err := c.ChangeHistory(context.Background(), "ns", "k", ChangeHistoryQuery{}); !errors.Is(err, ErrClosed) {
 			t.Fatalf("err = %v, want ErrClosed", err)
 		}
 	})
@@ -240,7 +334,7 @@ func TestChangeHistory_Refusals(t *testing.T) {
 		s.listErr = store.ErrTenantConnectionMissing
 		c := historyClient(t, s, WithChangeHistory())
 
-		if _, err := c.ChangeHistory(context.Background(), "ns", "k", 0); !errors.Is(err, ErrTenantConnectionMissing) {
+		if _, err := c.ChangeHistory(context.Background(), "ns", "k", ChangeHistoryQuery{}); !errors.Is(err, ErrTenantConnectionMissing) {
 			t.Fatalf("err = %v, want ErrTenantConnectionMissing", err)
 		}
 	})

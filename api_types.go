@@ -52,8 +52,21 @@ type KeyOption = internalclient.KeyOption
 // row's UpdatedBy and UpdatedAt after a Set). Revision is the key's revision
 // after a create or update — unchanged by an identical value — and, for a
 // delete, the revision the removed value carried on Postgres or the tombstone's
-// on MongoDB.
+// on MongoDB. Position is the record's place in its key's history, greater for
+// every later record of that key; it is not contiguous, means nothing across
+// keys, and serves only as a [ChangeHistoryQuery] Before.
 type ChangeRecord = internalclient.ChangeRecord
+
+// ChangeHistoryQuery selects one page of [Client.ChangeHistory]: Limit records
+// at most (<= 0 means [DefaultChangeHistoryLimit], capped at
+// [MaxChangeHistoryLimit]), starting below the Position Before names, or from
+// the newest record when Before is 0. A negative Before is [ErrValidation].
+type ChangeHistoryQuery = internalclient.ChangeHistoryQuery
+
+// ChangeHistoryPage is one page of [Client.ChangeHistory]: Changes, newest
+// first and never nil, and Next, the Before of the next older page, 0 when no
+// older record remains.
+type ChangeHistoryPage = internalclient.ChangeHistoryPage
 
 const (
 	// ChangeOperationCreate is a [Client.Set] that found no live value: the key

@@ -158,7 +158,7 @@ func TestIntegration_ChangeHistoryDMLOnlyRole(t *testing.T) {
 		t.Fatalf("delete as the DML-only role: %v", err)
 	}
 
-	got, err := s.ListHistory(ctx, store.Scope{}, "ns", "k", 10)
+	got, err := s.ListHistory(ctx, store.Scope{}, "ns", "k", 10, 0)
 	if err != nil {
 		t.Fatalf("list history as the DML-only role: %v", err)
 	}
@@ -198,12 +198,12 @@ func TestIntegration_ChangeHistoryIsTenantScoped(t *testing.T) {
 		t.Fatalf("delete in a: %v", err)
 	}
 
-	gotA, err := s.ListHistory(ctx, store.Scope{Tenant: "a"}, "ns", "k", 10)
+	gotA, err := s.ListHistory(ctx, store.Scope{Tenant: "a"}, "ns", "k", 10, 0)
 	if err != nil || len(gotA) != 2 {
 		t.Fatalf("history in a = (%+v, %v), want a create and a delete", gotA, err)
 	}
 
-	gotB, err := s.ListHistory(ctx, store.Scope{Tenant: "b"}, "ns", "k", 10)
+	gotB, err := s.ListHistory(ctx, store.Scope{Tenant: "b"}, "ns", "k", 10, 0)
 	if err != nil || len(gotB) != 0 {
 		t.Fatalf("history in b = (%+v, %v), want none", gotB, err)
 	}

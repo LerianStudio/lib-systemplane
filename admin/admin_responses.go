@@ -38,15 +38,19 @@ type getResponse struct {
 	Stale       bool       `json:"stale"`
 }
 
+// historyResponse is one page of a key's change history. Next, absent on the
+// page holding the oldest record, is the ?before= of the older page.
 type historyResponse struct {
 	Namespace string           `json:"namespace"`
 	Key       string           `json:"key"`
 	Changes   []changeResponse `json:"changes"`
+	Next      *int64           `json:"next,omitempty"`
 }
 
 // changeResponse is one change history record. An absent value is a nil
 // json.RawMessage, which encodes as JSON null.
 type changeResponse struct {
+	Position      int64           `json:"position"`
 	Operation     string          `json:"operation"`
 	Revision      int64           `json:"revision"`
 	PreviousValue json.RawMessage `json:"previousValue"`

@@ -140,27 +140,29 @@ func (c *Client) ChangeHistoryEnabled() bool {
 	return asInternalClient(c).ChangeHistoryEnabled()
 }
 
-// ChangeHistory returns the recorded writes of namespace/key, newest first, on
-// a Client built with [WithChangeHistory]: every [Client.Set] (an identical
-// value included) and every [Client.Delete] that removed a stored value, each
-// with its operation, the value before and after, the actor and the time. A
-// delete that removed nothing — a repeat, or a key never written — has no
-// record. limit <= 0 means [DefaultChangeHistoryLimit], and a limit above
-// [MaxChangeHistoryLimit] is capped. A key never written answers with an empty
-// slice.
+// ChangeHistory returns one page of the recorded writes of namespace/key,
+// newest first, on a Client built with [WithChangeHistory]: every [Client.Set]
+// (an identical value included) and every [Client.Delete] that removed a
+// stored value, each with its operation, the value before and after, the actor
+// and the time. A delete that removed nothing — a repeat, or a key never
+// written — has no record. q.Limit <= 0 means [DefaultChangeHistoryLimit], and
+// a limit above [MaxChangeHistoryLimit] is capped. q.Before 0 starts from the
+// newest record; passing each page's Next as the following query's Before
+// walks back to the oldest, and Next is 0 on the last page. A key never
+// written answers with an empty page.
 //
 // It reads the database the way a write does: in multi-tenant mode, the
 // tenant database ctx carries ([ErrTenantConnectionMissing] without one), so a
 // tenant's history is the one in its own database. It returns [ErrClosed] on a
 // nil or closed Client, [ErrNilContext], [ErrNotStarted] before Start,
-// [ErrChangeHistoryDisabled] without [WithChangeHistory], and [ErrUnknownKey]
-// for an unregistered key. It logs nothing: records name people and carry
-// values.
+// [ErrChangeHistoryDisabled] without [WithChangeHistory], [ErrUnknownKey]
+// for an unregistered key, and [ErrValidation] for a negative q.Before. It
+// logs nothing: records name people and carry values.
 //
 // [Client.GetEntry] does not show a delete: while the registered default is in
 // force its provenance fields are zero by contract.
-func (c *Client) ChangeHistory(ctx context.Context, namespace, key string, limit int) ([]ChangeRecord, error) {
-	return asInternalClient(c).ChangeHistory(ctx, namespace, key, limit)
+func (c *Client) ChangeHistory(ctx context.Context, namespace, key string, q ChangeHistoryQuery) (ChangeHistoryPage, error) {
+	return asInternalClient(c).ChangeHistory(ctx, namespace, key, q)
 }
 
 // List returns all registered entries in namespace.

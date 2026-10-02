@@ -947,8 +947,8 @@ func isTransactionsUnsupported(err error) bool {
 // codeIllegalOperation is the server's IllegalOperation error code.
 const codeIllegalOperation = 20
 
-// fieldSeq orders a key's change records. It is internal to this backend and
-// never leaves it.
+// fieldSeq orders a key's change records: 1 for a key's first, one more for
+// each after it. It leaves this backend only as a record's Position.
 const fieldSeq = "seq"
 
 // changeRecord is the history record of a write: the operation and the value
@@ -1008,6 +1008,7 @@ func (d historyDoc) toChangeRecord() store.ChangeRecord {
 	return store.ChangeRecord{
 		Namespace:     d.Namespace,
 		Key:           d.Key,
+		Position:      d.Seq,
 		Operation:     d.Operation,
 		Revision:      d.Revision,
 		PreviousValue: rawJSON(d.PreviousValue),
@@ -1028,10 +1029,11 @@ func rawJSON(s *string) json.RawMessage {
 }
 
 // ListHistory returns up to limit records of (namespace, key), newest first,
-// from the change history in the scope's database. It reads the collection
-// whether or not this Store records changes; a database that never recorded
-// one answers with an empty slice.
-func (s *Store) ListHistory(ctx context.Context, scope store.Scope, namespace, key string, limit int) ([]store.ChangeRecord, error) {
+// from the change history in the scope's database: the newest for before 0,
+// otherwise those whose seq is below before. A record's Position is its seq.
+// It reads the collection whether or not this Store records changes; a
+// database that never recorded one answers with an empty slice.
+func (s *Store) ListHistory(ctx context.Context, scope store.Scope, namespace, key string, limit int, before int64) ([]store.ChangeRecord, error) {
 	if s == nil || s.isClosed() {
 		return nil, store.ErrClosed
 	}
@@ -1042,6 +1044,10 @@ func (s *Store) ListHistory(ctx context.Context, scope store.Scope, namespace, k
 
 	if limit <= 0 {
 		return nil, fmt.Errorf("systemplane/mongodb: %w: limit must be positive", store.ErrValidation)
+	}
+
+	if before < 0 {
+		return nil, fmt.Errorf("systemplane/mongodb: %w: before must not be negative", store.ErrValidation)
 	}
 
 	coll, err := s.resolveCollection(ctx, scope)
@@ -1063,7 +1069,12 @@ func (s *Store) ListHistory(ctx context.Context, scope store.Scope, namespace, k
 		SetSort(bson.D{{Key: fieldSeq, Value: -1}}).
 		SetLimit(int64(limit))
 
-	cursor, err := history.Find(ctx, historyFilter(namespace, key), findOpts)
+	filter := historyFilter(namespace, key)
+	if before > 0 {
+		filter = append(filter, bson.E{Key: fieldSeq, Value: bson.D{{Key: "$lt", Value: before}}})
+	}
+
+	cursor, err := history.Find(ctx, filter, findOpts)
 	if err != nil {
 		tracing.HandleSpanError(span, "list history find failed", err)
 

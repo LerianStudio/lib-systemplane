@@ -152,6 +152,12 @@ type ChangeRecord struct {
 	Namespace string
 	Key       string
 
+	// Position is the record's place in its key's history: always positive,
+	// and greater for every later record of the same key. Positions are not
+	// contiguous and mean nothing across keys; one is only ever handed back as
+	// ListHistory's before, to read the records older than it.
+	Position int64
+
 	// Operation is ChangeCreate, ChangeUpdate or ChangeDelete.
 	Operation string
 
@@ -180,8 +186,10 @@ type ChangeRecord struct {
 // type-asserts it.
 type HistoryLister interface {
 	// ListHistory returns up to limit records for (ns, key), newest first, and
-	// never a nil slice. scope resolves the database exactly as it does for
-	// Store. A non-positive limit, or an empty namespace or key, is refused
-	// with ErrValidation.
-	ListHistory(ctx context.Context, scope Scope, ns, key string, limit int) ([]ChangeRecord, error)
+	// never a nil slice: the newest ones for before 0, otherwise those whose
+	// Position is below before, so a caller pages back through the whole
+	// history by handing in the oldest Position it holds. scope resolves the
+	// database exactly as it does for Store. A non-positive limit, a negative
+	// before, or an empty namespace or key, is refused with ErrValidation.
+	ListHistory(ctx context.Context, scope Scope, ns, key string, limit int, before int64) ([]ChangeRecord, error)
 }

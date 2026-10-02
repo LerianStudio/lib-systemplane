@@ -101,7 +101,7 @@ func TestIntegration_ChangeHistoryFailedRecordKeepsTheValue(t *testing.T) {
 
 	tomb := readRaw(t, db.Collection("systemplane_entries"), "ns", "k")
 
-	got, err := s.ListHistory(ctx, scope, "ns", "k", 10)
+	got, err := s.ListHistory(ctx, scope, "ns", "k", 10, 0)
 	if err != nil {
 		t.Fatalf("list history: %v", err)
 	}
@@ -142,7 +142,7 @@ func TestIntegration_ChangeHistoryIgnoresAnUnrecordedTombstone(t *testing.T) {
 		t.Fatalf("repeat delete with the history: %v", err)
 	}
 
-	if got, err := s.ListHistory(ctx, scope, "ns", "k", 10); err != nil || len(got) != 0 {
+	if got, err := s.ListHistory(ctx, scope, "ns", "k", 10, 0); err != nil || len(got) != 0 {
 		t.Fatalf("history = (%+v, %v), want none: the repeat removed nothing", got, err)
 	}
 
@@ -150,7 +150,7 @@ func TestIntegration_ChangeHistoryIgnoresAnUnrecordedTombstone(t *testing.T) {
 		t.Fatalf("set over the tombstone: %v", err)
 	}
 
-	got, err := s.ListHistory(ctx, scope, "ns", "k", 10)
+	got, err := s.ListHistory(ctx, scope, "ns", "k", 10, 0)
 	if err != nil || len(got) != 1 || got[0].Operation != store.ChangeCreate || got[0].PreviousValue != nil || string(got[0].Value) != `2` {
 		t.Fatalf("history = (%+v, %v), want one create of 2 from nothing", got, err)
 	}
@@ -230,12 +230,12 @@ func TestIntegration_ChangeHistoryIsTenantScoped(t *testing.T) {
 		t.Fatalf("delete in a: %v", err)
 	}
 
-	gotA, err := s.ListHistory(ctx, store.Scope{Tenant: "a"}, "ns", "k", 10)
+	gotA, err := s.ListHistory(ctx, store.Scope{Tenant: "a"}, "ns", "k", 10, 0)
 	if err != nil || len(gotA) != 2 || gotA[0].ChangedBy != "alice" {
 		t.Fatalf("history in a = (%+v, %v), want alice's create and delete", gotA, err)
 	}
 
-	gotB, err := s.ListHistory(ctx, store.Scope{Tenant: "b"}, "ns", "k", 10)
+	gotB, err := s.ListHistory(ctx, store.Scope{Tenant: "b"}, "ns", "k", 10, 0)
 	if err != nil || len(gotB) != 0 {
 		t.Fatalf("history in b = (%+v, %v), want none", gotB, err)
 	}

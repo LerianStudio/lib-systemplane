@@ -25,9 +25,11 @@ type TestStore interface {
 // TestHistoryLister is the optional capability a [TestStore] implements to
 // back [Client.ChangeHistory] on a Client built by [NewForTesting] with
 // WithChangeHistory. A TestStore without it answers ChangeHistory with
-// ErrChangeHistoryDisabled.
+// ErrChangeHistoryDisabled. ListHistory returns at most limit records, newest
+// first: the newest for before 0, otherwise those whose Position is below
+// before.
 type TestHistoryLister interface {
-	ListHistory(ctx context.Context, scope TestScope, ns, key string, limit int) ([]ChangeRecord, error)
+	ListHistory(ctx context.Context, scope TestScope, ns, key string, limit int, before int64) ([]ChangeRecord, error)
 }
 
 // TestScope is the public mirror of internal store.Scope.
@@ -112,13 +114,13 @@ func (a *testStoreAdapter) Subscribe(ctx context.Context, scope store.Scope, fn 
 	})
 }
 
-func (a *testStoreAdapter) ListHistory(ctx context.Context, scope store.Scope, ns, key string, limit int) ([]store.ChangeRecord, error) {
+func (a *testStoreAdapter) ListHistory(ctx context.Context, scope store.Scope, ns, key string, limit int, before int64) ([]store.ChangeRecord, error) {
 	lister, ok := a.ts.(TestHistoryLister)
 	if !ok {
 		return nil, ErrChangeHistoryDisabled
 	}
 
-	return lister.ListHistory(ctx, testScope(scope), ns, key, limit)
+	return lister.ListHistory(ctx, testScope(scope), ns, key, limit, before)
 }
 
 func testScope(s store.Scope) TestScope { return TestScope{Tenant: s.Tenant} }
