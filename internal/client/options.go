@@ -179,7 +179,8 @@ func WithModule(name string) Option {
 // collection of the same database, in one transaction with the write (a
 // replica set or a sharded cluster is required), and its unique index is
 // created with the rest of the bootstrap. Register refuses namespace "-" with
-// key "history" or "history/..." while it is on.
+// key "history" or "history/..." while it is on, and Set and Delete refuse an
+// empty or blank actor with ErrValidation.
 func WithChangeHistory() Option {
 	return func(cfg *clientConfig) {
 		cfg.changeHistory = true

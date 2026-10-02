@@ -66,6 +66,10 @@ func (c *Client) Set(ctx context.Context, namespace, key string, value any, acto
 		return fmt.Errorf("%w: %s/%s", ErrUnknownKey, namespace, key)
 	}
 
+	if err := c.requireActor(actor); err != nil {
+		return err
+	}
+
 	jsonBytes, err := json.Marshal(value)
 	if err != nil {
 		return fmt.Errorf("%w: value is not JSON-serializable: %w", ErrValidation, err)
@@ -171,6 +175,10 @@ func (c *Client) Delete(ctx context.Context, namespace, key, actor string) error
 
 	if !registered {
 		return fmt.Errorf("%w: %s/%s", ErrUnknownKey, namespace, key)
+	}
+
+	if err := c.requireActor(actor); err != nil {
+		return err
 	}
 
 	if err := c.store.Delete(ctx, store.Scope{}, namespace, key, actor); err != nil {

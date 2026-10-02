@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/LerianStudio/lib-systemplane/v4/internal/store"
 )
@@ -34,6 +35,18 @@ const (
 // WithChangeHistory. False on a nil Client.
 func (c *Client) ChangeHistoryEnabled() bool {
 	return c != nil && c.changeHistory
+}
+
+// requireActor refuses a write with no actor on a Client that keeps the change
+// history, before the store is touched: the history is append-only, so an
+// unattributed record could never be corrected. A blank actor is no actor.
+// Without the option the actor stays optional.
+func (c *Client) requireActor(actor string) error {
+	if c.changeHistory && strings.TrimSpace(actor) == "" {
+		return fmt.Errorf("%w: the change history records who wrote, and the actor is empty", ErrValidation)
+	}
+
+	return nil
 }
 
 // ChangeHistory returns the recorded writes of (namespace, key), newest first:

@@ -32,6 +32,7 @@
 package admin
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -64,12 +65,24 @@ var (
 	errActorExtractorPanicked = errors.New("admin: actor extractor panicked")
 )
 
+// errActorRequired refuses a write that names no actor on a Client keeping the
+// change history: the history is append-only, so a record without an actor
+// could never be attributed later.
+var errActorRequired = errors.New("admin: the request names no actor")
+
+// warnNoActorExtractor is the WARN Mount logs once for a Client keeping the
+// change history and no WithActorExtractor, whose writes it will all refuse.
+const warnNoActorExtractor = "admin: change history is on and no actor extractor is configured; every PUT and DELETE will be refused"
+
 // mountConfig holds options applied by MountOption functions.
 type mountConfig struct {
 	pathPrefix     string
 	authorizer     func(fiber.Ctx, string) error
 	actorExtractor func(fiber.Ctx) string
-	returnErrors   bool
+	// actorExtractorSet: WithActorExtractor supplied one, so the default that
+	// names nobody is not in force.
+	actorExtractorSet bool
+	returnErrors      bool
 }
 
 func defaultMountConfig() mountConfig {
@@ -110,11 +123,14 @@ func WithAuthorizer(fn func(fiber.Ctx, string) error) MountOption {
 // the request context; the returned string is passed as the actor argument
 // to [systemplane.Client.Set] and [systemplane.Client.Delete]. A panic in fn
 // is recovered and reported; the request is answered with 500 and nothing is
-// written.
+// written. On a Client built with [systemplane.WithChangeHistory], an empty or
+// blank actor is answered with 403 actor_required and nothing is written;
+// without this option every write there is refused that way.
 func WithActorExtractor(fn func(fiber.Ctx) string) MountOption {
 	return func(cfg *mountConfig) {
 		if fn != nil {
 			cfg.actorExtractor = fn
+			cfg.actorExtractorSet = true
 		}
 	}
 }
@@ -150,6 +166,10 @@ func Mount(router fiber.Router, c *systemplane.Client, opts ...MountOption) {
 
 	prefix := normalizePathPrefix(cfg.pathPrefix)
 	logger := log.Guard(c.Logger())
+
+	if c.ChangeHistoryEnabled() && !cfg.actorExtractorSet {
+		logger.Log(context.Background(), log.LevelWarn, warnNoActorExtractor)
+	}
 
 	// First, so the "/:namespace/*" routes below cannot read "-" as a
 	// namespace and swallow it. Only with the option on: without it the path
@@ -237,6 +257,22 @@ func callAuthorizer(c fiber.Ctx, cfg mountConfig, logger log.Logger, action stri
 
 // extractActor runs the consumer's actor extractor. A panic is reported and
 // returned as an error: no write may land without the actor that attributes it.
+// writeActor is the actor a write is attributed to. On a Client keeping the
+// change history an empty or blank one is errActorRequired, refused before the
+// Client is called.
+func writeActor(c fiber.Ctx, client *systemplane.Client, cfg mountConfig, logger log.Logger) (string, error) {
+	actor, err := extractActor(c, cfg, logger)
+	if err != nil {
+		return "", err
+	}
+
+	if client.ChangeHistoryEnabled() && strings.TrimSpace(actor) == "" {
+		return "", errActorRequired
+	}
+
+	return actor, nil
+}
+
 func extractActor(c fiber.Ctx, cfg mountConfig, logger log.Logger) (actor string, err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -499,7 +535,7 @@ func handlePut(client *systemplane.Client, cfg mountConfig, logger log.Logger) f
 			return cfg.respondError(c, http.StatusBadRequest, "bad_request", badRequestMsg)
 		}
 
-		actor, err := extractActor(c, cfg, logger)
+		actor, err := writeActor(c, client, cfg, logger)
 		if err != nil {
 			return cfg.mapSentinelErr(c, err)
 		}
@@ -516,7 +552,7 @@ func handleDelete(client *systemplane.Client, cfg mountConfig, logger log.Logger
 	return func(c fiber.Ctx) error {
 		namespace, key := registeredPathParams(client, c)
 
-		actor, err := extractActor(c, cfg, logger)
+		actor, err := writeActor(c, client, cfg, logger)
 		if err != nil {
 			return cfg.mapSentinelErr(c, err)
 		}

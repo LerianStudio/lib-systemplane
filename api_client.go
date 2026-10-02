@@ -115,7 +115,9 @@ func (c *Client) GetDuration(ctx context.Context, namespace, key string) (time.D
 	return asInternalClient(c).GetDuration(ctx, namespace, key)
 }
 
-// Set persists a new value for namespace/key.
+// Set persists a new value for namespace/key. On a Client built with
+// [WithChangeHistory] an empty or blank actor is refused with [ErrValidation]
+// before anything is written.
 //
 // A Set racing [Client.Start] can persist its row and still report
 // [ErrNotStarted], because the Client counts as started before its first
@@ -124,7 +126,9 @@ func (c *Client) Set(ctx context.Context, namespace, key string, value any, acto
 	return asInternalClient(c).Set(ctx, namespace, key, value, actor)
 }
 
-// Delete removes the row for namespace/key.
+// Delete removes the row for namespace/key. On a Client built with
+// [WithChangeHistory] an empty or blank actor is refused with [ErrValidation]
+// before anything is removed.
 func (c *Client) Delete(ctx context.Context, namespace, key, actor string) error {
 	return asInternalClient(c).Delete(ctx, namespace, key, actor)
 }

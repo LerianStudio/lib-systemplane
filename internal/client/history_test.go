@@ -283,3 +283,42 @@ func TestWithChangeHistory_ReachesBothBackends(t *testing.T) {
 		t.Error("WithChangeHistory did not reach both backends' RecordChanges")
 	}
 }
+
+// TestWrites_RefuseABlankActorUnderChangeHistory pins BRSFN-82's "every write
+// names its actor": a history-enabled Client refuses a Set or Delete whose
+// actor is empty or blank before the store is touched, so the append-only
+// history never gains an unattributed record. Without the option the actor
+// stays optional.
+func TestWrites_RefuseABlankActorUnderChangeHistory(t *testing.T) {
+	for _, actor := range []string{"", "   ", "\t\n"} {
+		s := newHistoryStore()
+		c := historyClient(t, s, WithChangeHistory())
+
+		if err := c.Set(context.Background(), "ns", "k", "v", actor); !errors.Is(err, ErrValidation) {
+			t.Errorf("Set with actor %q = %v, want ErrValidation", actor, err)
+		}
+
+		if err := c.Delete(context.Background(), "ns", "k", actor); !errors.Is(err, ErrValidation) {
+			t.Errorf("Delete with actor %q = %v, want ErrValidation", actor, err)
+		}
+
+		if got := s.writeActors(); len(got) != 0 {
+			t.Errorf("store saw writes %q for actor %q, want none", got, actor)
+		}
+
+		if got, ok, err := c.Get(context.Background(), "ns", "k"); err != nil || !ok || got != "default" {
+			t.Errorf("Get after refused writes = (%v, %v, %v), want the default", got, ok, err)
+		}
+	}
+
+	off := newHistoryStore()
+	c := historyClient(t, off)
+
+	if err := c.Set(context.Background(), "ns", "k", "v", ""); err != nil {
+		t.Fatalf("Set with an empty actor and no change history: %v", err)
+	}
+
+	if err := c.Delete(context.Background(), "ns", "k", ""); err != nil {
+		t.Fatalf("Delete with an empty actor and no change history: %v", err)
+	}
+}

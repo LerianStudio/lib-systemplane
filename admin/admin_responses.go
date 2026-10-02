@@ -108,6 +108,8 @@ func (cfg mountConfig) respondError(c fiber.Ctx, status int, title, message stri
 
 func (cfg mountConfig) mapSentinelErr(c fiber.Ctx, err error) error {
 	switch {
+	case errors.Is(err, errActorRequired):
+		return cfg.respondError(c, http.StatusForbidden, "actor_required", "the request names no actor")
 	case errors.Is(err, systemplane.ErrUnknownKey):
 		return cfg.respondError(c, http.StatusBadRequest, "unknown_key", "key is not registered")
 	case errors.Is(err, systemplane.ErrValidation):

@@ -126,8 +126,13 @@ Things to know before opting in:
   the consumer's policy.
 - **Every writer must opt in.** The history is complete only when every writer
   of a database opts in, because a writer without the option records nothing.
-- **Empty actors.** The library accepts an empty actor, so a service that must
-  always name one refuses a missing principal before calling `Set` or `Delete`.
+- **Every write names its actor.** With the option on, `Set`, `Delete` and a
+  typed group's `Set` refuse an empty or blank actor with `ErrValidation`
+  before touching the store, because an append-only record cannot be
+  attributed later. `admin.Mount` answers such a PUT or DELETE with 403
+  `actor_required`, and logs one WARN at mount time when no
+  `admin.WithActorExtractor` was given, since every write would then be
+  refused. Without the option the actor stays optional.
 
 ## Quickstart
 

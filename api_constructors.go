@@ -154,6 +154,11 @@ func WithCatalogService(name string) Option { return internalclient.WithCatalogS
 // backends a record that cannot be written fails the write with the value
 // intact.
 //
+// Every write must name its actor: [Client.Set], [Client.Delete] and a typed
+// group's Set refuse an empty or blank one with [ErrValidation] before
+// touching the store, because an append-only record could never be attributed
+// later.
+//
 // Values are recorded verbatim, as admin GET serves them, and the history is
 // append-only: the library ships no purge. It is complete only when every
 // writer of a database opts in; a writer without the option records nothing.
