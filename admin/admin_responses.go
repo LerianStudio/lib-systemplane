@@ -38,16 +38,21 @@ type getResponse struct {
 	Stale       bool       `json:"stale"`
 }
 
-type deletionsResponse struct {
-	Namespace string             `json:"namespace"`
-	Key       string             `json:"key"`
-	Deletions []deletionResponse `json:"deletions"`
+type historyResponse struct {
+	Namespace string           `json:"namespace"`
+	Key       string           `json:"key"`
+	Changes   []changeResponse `json:"changes"`
 }
 
-type deletionResponse struct {
-	Revision  int64     `json:"revision"`
-	DeletedAt time.Time `json:"deletedAt"`
-	DeletedBy string    `json:"deletedBy"`
+// changeResponse is one change history record. An absent value is a nil
+// json.RawMessage, which encodes as JSON null.
+type changeResponse struct {
+	Operation     string          `json:"operation"`
+	Revision      int64           `json:"revision"`
+	PreviousValue json.RawMessage `json:"previousValue"`
+	Value         json.RawMessage `json:"value"`
+	ChangedAt     time.Time       `json:"changedAt"`
+	ChangedBy     string          `json:"changedBy"`
 }
 
 // nilIfZeroTime renders an absent row's provenance as JSON null instead of

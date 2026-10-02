@@ -43,9 +43,9 @@ type Client struct {
 	tenantManaged  bool
 	catalogService string
 
-	// deletionHistory: WithDeletionHistory was set, so the store records
-	// every delete and Deletions reads the records back.
-	deletionHistory bool
+	// changeHistory: WithChangeHistory was set, so the store records every
+	// write and ChangeHistory reads the records back.
+	changeHistory bool
 
 	registryMu sync.RWMutex
 	registry   map[nskey]keyDef
@@ -132,7 +132,7 @@ func postgresConfig(db *sql.DB, listenDSN string, cfg clientConfig) postgres.Con
 		Telemetry:          cfg.telemetry,
 		MultiTenantEnabled: cfg.multiTenantEnabled,
 		Module:             cfg.module,
-		RecordDeletions:    cfg.deletionHistory,
+		RecordChanges:      cfg.changeHistory,
 	}
 
 	if cfg.pgTenantManager != nil {
@@ -153,7 +153,7 @@ func mongoConfig(client *mongo.Client, database string, cfg clientConfig) mongoD
 		Telemetry:          cfg.telemetry,
 		MultiTenantEnabled: cfg.multiTenantEnabled,
 		Module:             cfg.module,
-		RecordDeletions:    cfg.deletionHistory,
+		RecordChanges:      cfg.changeHistory,
 	}
 
 	if cfg.mbTenantManager != nil {
@@ -187,7 +187,7 @@ func newClient(s store.Store, cfg clientConfig) *Client {
 		catalogService: cfg.catalogService,
 		registry:       make(map[nskey]keyDef),
 
-		deletionHistory: cfg.deletionHistory,
+		changeHistory: cfg.changeHistory,
 	}
 
 	// Built in both modes so Close stays uniform: engine.New opens no

@@ -20,11 +20,11 @@ var schemaSQL string
 //go:embed ddl/migrate_v3_to_v4.sql
 var migrationV3ToV4SQL string
 
-// deletionHistorySQL is the opt-in deletion history table, embedded
-// byte-faithfully from ddl/deletions.sql.
+// changeHistorySQL is the opt-in change history table, embedded
+// byte-faithfully from ddl/change_history.sql.
 //
-//go:embed ddl/deletions.sql
-var deletionHistorySQL string
+//go:embed ddl/change_history.sql
+var changeHistorySQL string
 
 // SchemaSQL returns the full systemplane schema DDL as an importable artifact.
 //
@@ -136,18 +136,22 @@ func MigrationV3ToV4SQL() string {
 	return migrationV3ToV4SQL
 }
 
-// DeletionHistorySQL returns the DDL of the opt-in deletion history as an
-// importable artifact: the systemplane_deletions table a Postgres Client built
-// with [WithDeletionHistory] records every delete in.
+// ChangeHistorySQL returns the DDL of the opt-in change history as an
+// importable artifact: the systemplane_history table, and the index its read
+// walks, that a Postgres Client built with [WithChangeHistory] records every
+// write in.
 //
 // It is kept out of SchemaSQL() on purpose, so a consumer who does not opt in
 // vendors an unchanged schema. Apply it after SchemaSQL(), to ONE DATABASE PER
-// TENANT, in the same schema as systemplane_entries. It is idempotent.
+// TENANT, in the same schema as systemplane_entries. It is idempotent. The
+// table has no tenant column: the tenant is the database it lives in.
 //
-// The table has no sequence, identity column or trigger, so the runtime role
-// needs INSERT and SELECT on it and nothing else. It is append-only and the
-// library never purges it: a retention policy, if one is wanted, is the
-// consumer's own. lib-systemplane does not execute it for the caller.
-func DeletionHistorySQL() string {
-	return deletionHistorySQL
+// Records are ordered by an identity column, which draws its numbers without
+// any grant on its sequence, so the runtime role needs INSERT and SELECT on
+// the table and nothing else. Values are stored verbatim. The table is
+// append-only and the library never purges it: a retention policy, if one is
+// wanted, is the consumer's own. lib-systemplane does not execute it for the
+// caller.
+func ChangeHistorySQL() string {
+	return changeHistorySQL
 }

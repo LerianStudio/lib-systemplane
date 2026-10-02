@@ -15,11 +15,11 @@ const (
 	reservedCatalogNamespace = "-"
 	reservedCatalogKey       = "catalog"
 
-	// reservedDeletionsKey is the admin deletion history's path under
+	// reservedHistoryKey is the admin change history's path under
 	// reservedCatalogNamespace. It is reserved only on a Client built
-	// WithDeletionHistory, the only one admin.Mount serves that route for, so
-	// a Client without the option keeps every key it could register before.
-	reservedDeletionsKey = "deletions"
+	// WithChangeHistory, the only one admin.Mount serves that route for, so a
+	// Client without the option keeps every key it could register before.
+	reservedHistoryKey = "history"
 )
 
 // keyDef holds the metadata and default value for a registered configuration key.
@@ -153,14 +153,14 @@ func (c *Client) Register(namespace, key string, defaultValue any, opts ...KeyOp
 }
 
 // refuseReservedKey refuses the namespace/key paths the admin routes claim:
-// -/catalog always, -/deletions only while the deletion history is on.
+// -/catalog always, -/history only while the change history is on.
 func (c *Client) refuseReservedKey(namespace, key string) error {
 	if isReservedCatalogKey(namespace, key) {
 		return fmt.Errorf("%w: namespace/key is reserved for the admin catalog", ErrValidation)
 	}
 
-	if c.deletionHistory && isReservedPath(namespace, key, reservedDeletionsKey) {
-		return fmt.Errorf("%w: namespace/key is reserved for the admin deletion history", ErrValidation)
+	if c.changeHistory && isReservedPath(namespace, key, reservedHistoryKey) {
+		return fmt.Errorf("%w: namespace/key is reserved for the admin change history", ErrValidation)
 	}
 
 	return nil

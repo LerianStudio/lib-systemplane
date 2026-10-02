@@ -11,11 +11,10 @@
 //	DELETE /<prefix>/:namespace/:key       - delete a single entry
 //	DELETE /<prefix>/:namespace/*          - delete a key that may contain "/"
 //
-// On a Client built with systemplane.WithDeletionHistory, Mount also registers
-// the deletion history route, before the value routes so they cannot shadow
-// it:
+// On a Client built with systemplane.WithChangeHistory, Mount also registers
+// the change history route, before the value routes so they cannot shadow it:
 //
-//	GET    /<prefix>/-/deletions/:namespace/*  - who deleted a key, and when
+//	GET    /<prefix>/-/history/:namespace/*    - every write of a key: what, who, when
 //
 // MountCatalog registers registry-only metadata routes separately:
 //
@@ -25,8 +24,8 @@
 // The default path prefix is "/system".
 // The namespace/key path beginning with "-/catalog" is reserved for the catalog
 // routes and cannot be used as a runtime configuration key. On a Client built
-// with the deletion history, "-/deletions" is reserved the same way; without
-// it, no route claims that path and such a key stays a value like any other.
+// with the change history, "-/history" is reserved the same way; without it,
+// no route claims that path and such a key stays a value like any other.
 //
 // Authorization is deny-all by default: callers MUST supply WithAuthorizer to
 // enable access.
@@ -51,7 +50,7 @@ const (
 	maxKeyLen            = 512
 	catalogMetaNamespace = "-"
 	catalogKey           = "catalog"
-	deletionsKey         = "deletions"
+	historyKey           = "history"
 
 	// recoveryComponent is the component a panic in a consumer function is
 	// counted under on panic_recovered_total.
@@ -96,7 +95,7 @@ func WithPathPrefix(p string) MountOption {
 }
 
 // WithAuthorizer sets an authorization check called before each handler. The
-// action argument is "read" for GET requests, the deletion history included,
+// action argument is "read" for GET requests, the change history included,
 // and "write" for PUT/DELETE requests. Return a non-nil error to reject the request with 403 Forbidden.
 // A panic in fn is recovered, reported, and answered with 403 as well.
 func WithAuthorizer(fn func(fiber.Ctx, string) error) MountOption {
@@ -130,10 +129,10 @@ func WithReturnedErrors() MountOption {
 // Mount registers the admin HTTP routes on router using the given Client.
 // Nil client or router make Mount a no-op (does not panic).
 //
-// The deletion history route is registered only when the Client was built
-// with [systemplane.WithDeletionHistory]. It answers 404 for a key that is not
-// registered, and 501 deletion_history_disabled when the Client's store keeps
-// no history (a NewForTesting store without the capability).
+// The change history route is registered only when the Client was built with
+// [systemplane.WithChangeHistory]. It answers 404 for a key that is not
+// registered, and 501 change_history_disabled when the Client's store keeps no
+// history (a NewForTesting store without the capability).
 func Mount(router fiber.Router, c *systemplane.Client, opts ...MountOption) {
 	if c == nil || router == nil {
 		return
@@ -155,8 +154,8 @@ func Mount(router fiber.Router, c *systemplane.Client, opts ...MountOption) {
 	// First, so the "/:namespace/*" routes below cannot read "-" as a
 	// namespace and swallow it. Only with the option on: without it the path
 	// belongs to the value routes, as it did before the history existed.
-	if c.DeletionHistoryEnabled() {
-		router.Get(deletionsPathPrefix(prefix)+"/:namespace/*", cfg.validateWildcardPathParams, authorize(cfg, logger, "read"), handleDeletions(c, cfg))
+	if c.ChangeHistoryEnabled() {
+		router.Get(historyPathPrefix(prefix)+"/:namespace/*", cfg.validateWildcardPathParams, authorize(cfg, logger, "read"), handleHistory(c, cfg))
 	}
 
 	router.Get(prefix+"/:namespace", cfg.validateNamespaceParam, authorize(cfg, logger, "read"), handleList(c, cfg))
@@ -367,8 +366,8 @@ func catalogPathPrefix(prefix string) string {
 	return fmt.Sprintf("%s/%s/%s", prefix, catalogMetaNamespace, catalogKey)
 }
 
-func deletionsPathPrefix(prefix string) string {
-	return fmt.Sprintf("%s/%s/%s", prefix, catalogMetaNamespace, deletionsKey)
+func historyPathPrefix(prefix string) string {
+	return fmt.Sprintf("%s/%s/%s", prefix, catalogMetaNamespace, historyKey)
 }
 
 func catalogDetailPath(prefix, namespace, key string) string {
@@ -454,33 +453,36 @@ func handleGetOne(client *systemplane.Client, cfg mountConfig) fiber.Handler {
 	}
 }
 
-func handleDeletions(client *systemplane.Client, cfg mountConfig) fiber.Handler {
+func handleHistory(client *systemplane.Client, cfg mountConfig) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		namespace, key := registeredPathParams(client, c)
 
-		deletions, err := client.Deletions(c.Context(), namespace, key, 0)
+		records, err := client.ChangeHistory(c.Context(), namespace, key, 0)
 
 		switch {
 		case errors.Is(err, systemplane.ErrUnknownKey):
 			return cfg.respondError(c, http.StatusNotFound, "not_found", "key not found")
-		case errors.Is(err, systemplane.ErrDeletionHistoryDisabled):
-			return cfg.respondError(c, http.StatusNotImplemented, "deletion_history_disabled",
-				"deletion history is not enabled")
+		case errors.Is(err, systemplane.ErrChangeHistoryDisabled):
+			return cfg.respondError(c, http.StatusNotImplemented, "change_history_disabled",
+				"change history is not enabled")
 		case err != nil:
 			return cfg.mapSentinelErr(c, err)
 		}
 
-		resp := deletionsResponse{
+		resp := historyResponse{
 			Namespace: namespace,
 			Key:       key,
-			Deletions: make([]deletionResponse, 0, len(deletions)),
+			Changes:   make([]changeResponse, 0, len(records)),
 		}
 
-		for _, d := range deletions {
-			resp.Deletions = append(resp.Deletions, deletionResponse{
-				Revision:  d.Revision,
-				DeletedAt: d.DeletedAt,
-				DeletedBy: d.DeletedBy,
+		for _, r := range records {
+			resp.Changes = append(resp.Changes, changeResponse{
+				Operation:     r.Operation,
+				Revision:      r.Revision,
+				PreviousValue: r.PreviousValue,
+				Value:         r.Value,
+				ChangedAt:     r.ChangedAt,
+				ChangedBy:     r.ChangedBy,
 			})
 		}
 

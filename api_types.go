@@ -44,18 +44,35 @@ type Option = internalclient.Option
 // KeyOption configures a single key at registration time.
 type KeyOption = internalclient.KeyOption
 
-// Deletion is one record of the deletion history [WithDeletionHistory] keeps:
-// a [Client.Delete] that removed a stored value, the actor it was handed and
-// when it ran. Revision orders a key's deletions, a later one always greater:
-// on Postgres it is the revision the value carried when deleted, on MongoDB the
-// revision of the tombstone the delete wrote.
-type Deletion = internalclient.Deletion
+// ChangeRecord is one record of the change history [WithChangeHistory] keeps:
+// a write that changed a key, its Operation ([ChangeOperationCreate],
+// [ChangeOperationUpdate] or [ChangeOperationDelete]), the JSON the key held
+// before and after it (PreviousValue and Value, nil where there was none), and
+// the actor and time it stamped (ChangedBy and ChangedAt, equal to the live
+// row's UpdatedBy and UpdatedAt after a Set). Revision is the key's revision
+// after a create or update — unchanged by an identical value — and, for a
+// delete, the revision the removed value carried on Postgres or the tombstone's
+// on MongoDB.
+type ChangeRecord = internalclient.ChangeRecord
 
 const (
-	// DefaultDeletionsLimit is how many records [Client.Deletions] returns for
-	// a non-positive limit.
-	DefaultDeletionsLimit = internalclient.DefaultDeletionsLimit
+	// ChangeOperationCreate is a [Client.Set] that found no live value: the key
+	// was absent or deleted. PreviousValue is nil.
+	ChangeOperationCreate = internalclient.ChangeOperationCreate
 
-	// MaxDeletionsLimit caps the records one [Client.Deletions] call returns.
-	MaxDeletionsLimit = internalclient.MaxDeletionsLimit
+	// ChangeOperationUpdate is a [Client.Set] over a live value, an identical
+	// one included.
+	ChangeOperationUpdate = internalclient.ChangeOperationUpdate
+
+	// ChangeOperationDelete is a [Client.Delete] that removed a live value.
+	// Value is nil.
+	ChangeOperationDelete = internalclient.ChangeOperationDelete
+
+	// DefaultChangeHistoryLimit is how many records [Client.ChangeHistory]
+	// returns for a non-positive limit.
+	DefaultChangeHistoryLimit = internalclient.DefaultChangeHistoryLimit
+
+	// MaxChangeHistoryLimit caps the records one [Client.ChangeHistory] call
+	// returns.
+	MaxChangeHistoryLimit = internalclient.MaxChangeHistoryLimit
 )

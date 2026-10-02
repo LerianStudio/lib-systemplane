@@ -52,7 +52,7 @@ var (
 	// [WithPostgresTenantManager].
 	ErrTenantManagerBackendMismatch = internalclient.ErrTenantManagerBackendMismatch
 
-	// ErrDeletionHistoryDisabled is returned by [Client.Deletions] on a Client
-	// built without [WithDeletionHistory].
-	ErrDeletionHistoryDisabled = internalclient.ErrDeletionHistoryDisabled
+	// ErrChangeHistoryDisabled is returned by [Client.ChangeHistory] on a
+	// Client built without [WithChangeHistory].
+	ErrChangeHistoryDisabled = internalclient.ErrChangeHistoryDisabled
 )

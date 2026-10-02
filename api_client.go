@@ -129,31 +129,34 @@ func (c *Client) Delete(ctx context.Context, namespace, key, actor string) error
 	return asInternalClient(c).Delete(ctx, namespace, key, actor)
 }
 
-// DeletionHistoryEnabled reports whether the Client was built with
-// [WithDeletionHistory]. It is false on a nil Client. admin.Mount serves the
-// deletion history route only when it is true.
-func (c *Client) DeletionHistoryEnabled() bool {
-	return asInternalClient(c).DeletionHistoryEnabled()
+// ChangeHistoryEnabled reports whether the Client was built with
+// [WithChangeHistory]. It is false on a nil Client. admin.Mount serves the
+// change history route only when it is true.
+func (c *Client) ChangeHistoryEnabled() bool {
+	return asInternalClient(c).ChangeHistoryEnabled()
 }
 
-// Deletions returns the recorded deletes of namespace/key, newest first, on a
-// Client built with [WithDeletionHistory]: who removed a stored value, when,
-// and at which revision. A delete that removed nothing — a repeat, or a key
-// never written — has no record. limit <= 0 means [DefaultDeletionsLimit], and
-// a limit above [MaxDeletionsLimit] is capped. A key never deleted answers with
-// an empty slice.
+// ChangeHistory returns the recorded writes of namespace/key, newest first, on
+// a Client built with [WithChangeHistory]: every [Client.Set] (an identical
+// value included) and every [Client.Delete] that removed a stored value, each
+// with its operation, the value before and after, the actor and the time. A
+// delete that removed nothing — a repeat, or a key never written — has no
+// record. limit <= 0 means [DefaultChangeHistoryLimit], and a limit above
+// [MaxChangeHistoryLimit] is capped. A key never written answers with an empty
+// slice.
 //
 // It reads the database the way a write does: in multi-tenant mode, the
-// tenant database ctx carries ([ErrTenantConnectionMissing] without one). It
-// returns [ErrClosed] on a nil or closed Client, [ErrNilContext],
-// [ErrNotStarted] before Start, [ErrDeletionHistoryDisabled] without
-// [WithDeletionHistory], and [ErrUnknownKey] for an unregistered key. It logs
-// nothing: DeletedBy names people.
+// tenant database ctx carries ([ErrTenantConnectionMissing] without one), so a
+// tenant's history is the one in its own database. It returns [ErrClosed] on a
+// nil or closed Client, [ErrNilContext], [ErrNotStarted] before Start,
+// [ErrChangeHistoryDisabled] without [WithChangeHistory], and [ErrUnknownKey]
+// for an unregistered key. It logs nothing: records name people and carry
+// values.
 //
-// [Client.GetEntry] does not show the delete: while the registered default is
-// in force its provenance fields are zero by contract.
-func (c *Client) Deletions(ctx context.Context, namespace, key string, limit int) ([]Deletion, error) {
-	return asInternalClient(c).Deletions(ctx, namespace, key, limit)
+// [Client.GetEntry] does not show a delete: while the registered default is in
+// force its provenance fields are zero by contract.
+func (c *Client) ChangeHistory(ctx context.Context, namespace, key string, limit int) ([]ChangeRecord, error) {
+	return asInternalClient(c).ChangeHistory(ctx, namespace, key, limit)
 }
 
 // List returns all registered entries in namespace.

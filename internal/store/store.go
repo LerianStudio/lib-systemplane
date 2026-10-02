@@ -8,6 +8,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -133,30 +134,54 @@ type Store interface {
 	Subscribe(ctx context.Context, scope Scope, fn func(Event)) (unsubscribe func(), err error)
 }
 
-// Deletion is one record of a deletion history: a Delete that removed a live
-// value, with the actor it was handed and when it ran.
-type Deletion struct {
+// The operations a ChangeRecord names.
+const (
+	// ChangeCreate is a Set that found no live value: the key was absent, or
+	// deleted. PreviousValue is nil.
+	ChangeCreate = "create"
+	// ChangeUpdate is a Set over a live value, an identical one included.
+	ChangeUpdate = "update"
+	// ChangeDelete is a Delete that removed a live value. Value is nil.
+	ChangeDelete = "delete"
+)
+
+// ChangeRecord is one record of a change history: a write that changed a key,
+// what the key held before and after it, the actor it was handed and when it
+// ran.
+type ChangeRecord struct {
 	Namespace string
 	Key       string
 
-	// Revision orders a key's deletions: a later delete always carries a
-	// greater one. On Postgres it is the revision the row carried when it was
-	// deleted; on MongoDB it is the revision of the tombstone the delete wrote,
-	// which is above the value's.
+	// Operation is ChangeCreate, ChangeUpdate or ChangeDelete.
+	Operation string
+
+	// Revision is the revision the key carries after a create or an update —
+	// unchanged by an update that wrote an identical value. For a delete it is
+	// the revision the removed row carried on Postgres, and the revision of
+	// the tombstone the delete wrote on MongoDB. It does not order a key's
+	// records; the history's own order does.
 	Revision int64
 
-	DeletedAt time.Time
-	DeletedBy string
+	// PreviousValue and Value are the JSON the key held before and after the
+	// write, verbatim, and nil where there was none. Like Entry.Value, both
+	// belong to the receiver.
+	PreviousValue json.RawMessage
+	Value         json.RawMessage
+
+	// ChangedAt and ChangedBy are the provenance the write stamped on the key:
+	// after a Set they equal the live row's UpdatedAt and UpdatedBy.
+	ChangedAt time.Time
+	ChangedBy string
 }
 
-// DeletionLister is the optional capability of a Store that records its
-// deletes (a backend built with RecordDeletions). It is deliberately not part
-// of Store, so a Store implemented outside this module keeps compiling; the
-// Client type-asserts it.
-type DeletionLister interface {
-	// ListDeletions returns up to limit records for (ns, key), newest first,
-	// and never a nil slice. scope resolves the database exactly as it does
-	// for Store. A non-positive limit, or an empty namespace or key, is
-	// refused with ErrValidation.
-	ListDeletions(ctx context.Context, scope Scope, ns, key string, limit int) ([]Deletion, error)
+// HistoryLister is the optional capability of a Store that records its writes
+// (a backend built with RecordChanges). It is deliberately not part of Store,
+// so a Store implemented outside this module keeps compiling; the Client
+// type-asserts it.
+type HistoryLister interface {
+	// ListHistory returns up to limit records for (ns, key), newest first, and
+	// never a nil slice. scope resolves the database exactly as it does for
+	// Store. A non-positive limit, or an empty namespace or key, is refused
+	// with ErrValidation.
+	ListHistory(ctx context.Context, scope Scope, ns, key string, limit int) ([]ChangeRecord, error)
 }

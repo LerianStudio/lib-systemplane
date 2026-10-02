@@ -28,6 +28,7 @@ package mongodb
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -48,20 +49,20 @@ import (
 
 const (
 	collectionName = "systemplane_entries"
-	// deletionsCollectionName holds the deletion history Config.RecordDeletions
-	// keeps, one document per recorded delete, in the same database as
+	// historyCollectionName holds the change history Config.RecordChanges
+	// keeps, one document per recorded write, in the same database as
 	// collectionName.
-	deletionsCollectionName = "systemplane_deletions"
-	defaultModule           = "systemplane"
-	reconnectBaseDelay      = 500 * time.Millisecond
-	reconnectMaxDelay       = 30 * time.Second
-	tracerName              = "systemplane.mongodb"
+	historyCollectionName = "systemplane_history"
+	defaultModule         = "systemplane"
+	reconnectBaseDelay    = 500 * time.Millisecond
+	reconnectMaxDelay     = 30 * time.Second
+	tracerName            = "systemplane.mongodb"
 )
 
 // Compile-time interface checks.
 var (
-	_ store.Store          = (*Store)(nil)
-	_ store.DeletionLister = (*Store)(nil)
+	_ store.Store         = (*Store)(nil)
+	_ store.HistoryLister = (*Store)(nil)
 )
 
 // Config holds the parameters needed to construct a MongoDB-backed Store.
@@ -92,12 +93,13 @@ type Config struct {
 
 	Connector Connector // nil in single-tenant mode
 
-	// RecordDeletions makes every Delete that tombstones a live value also
-	// record the tombstone's actor and time in deletionsCollectionName, in the
-	// same transaction, so it needs a replica set or a sharded cluster. The
-	// collection's unique (namespace, key, revision) index is created with the
-	// rest of the bootstrap, and a failure to create it fails that bootstrap.
-	RecordDeletions bool
+	// RecordChanges makes every Set, and every Delete that tombstones a live
+	// value, also record the operation, the value before and after, the actor
+	// and the time in historyCollectionName, in the same transaction as the
+	// write, so it needs a replica set or a sharded cluster. The collection's
+	// unique (namespace, key, seq) index is created with the rest of the
+	// bootstrap, and a failure to create it fails that bootstrap.
+	RecordChanges bool
 
 	Logger    log.Logger
 	Telemetry store.Telemetry
@@ -686,12 +688,18 @@ func (s *Store) Set(ctx context.Context, scope store.Scope, e store.Entry) (int6
 		attribute.String("key", e.Key),
 	)...)
 
-	revision, err := upsertReturningRevision(ctx, coll, e)
+	write := func() (int64, error) { return upsertReturningRevision(ctx, coll, e) }
+	if s.cfg.RecordChanges {
+		write = func() (int64, error) { return setRecording(ctx, coll, e) }
+	}
+
+	revision, err := write()
 	if err != nil && mongo.IsDuplicateKeyError(err) {
 		// Two concurrent upserts of a not-yet-existing _id can both attempt the
 		// insert and one loses on the unique _id. Retry exactly once: the
-		// document now exists, so the pipeline takes the update path.
-		revision, err = upsertReturningRevision(ctx, coll, e)
+		// document now exists, so the pipeline takes the update path. A
+		// recording write retries its whole transaction.
+		revision, err = write()
 	}
 
 	if err != nil {
@@ -739,8 +747,8 @@ func (s *Store) Delete(ctx context.Context, scope store.Scope, namespace, key, a
 	filter := bson.D{{Key: fieldID, Value: compoundID{Namespace: namespace, Key: key}}, notDeleted()}
 	now := time.Now().UTC()
 
-	if s.cfg.RecordDeletions {
-		if err := s.deleteRecording(ctx, coll, filter, now, actor); err != nil {
+	if s.cfg.RecordChanges {
+		if err := deleteRecording(ctx, coll, compoundID{Namespace: namespace, Key: key}, now, actor); err != nil {
 			tracing.HandleSpanError(span, "delete failed", err)
 
 			return fmt.Errorf("systemplane/mongodb: delete: %w", err)
@@ -763,65 +771,172 @@ func (s *Store) Delete(ctx context.Context, scope store.Scope, namespace, key, a
 	return nil
 }
 
-// deleteRecording is Delete with RecordDeletions: the tombstone and its
-// record in deletionsCollectionName are written in ONE transaction, so either
-// both land or neither does. A record that cannot be written fails Delete with
-// the value still live, as on Postgres, and a retry deletes and records
-// whatever value is live by then under its own actor. A delete that removes
-// nothing — a repeat, or a key never written — writes and records nothing,
-// whatever tombstone it finds.
-//
-// Transactions need a replica set or a sharded cluster; on a standalone
-// server the first write inside one is refused (IllegalOperation, code 20)
-// and Delete fails with errTransactionsRequired, the value untouched.
-//
-// Concurrent deletes of one value conflict on the entry document: the server
-// aborts all but one with a TransientTransactionError, WithTransaction runs
-// the losers again, and they find no live value, so exactly one records.
-func (s *Store) deleteRecording(ctx context.Context, coll *mongo.Collection, filter bson.D, now time.Time, actor string) error {
-	session, err := coll.Database().Client().StartSession()
-	if err != nil {
-		return fmt.Errorf("start session: %w", err)
-	}
-	defer session.EndSession(context.WithoutCancel(ctx))
+// setRecording is Set with RecordChanges: the upsert and its change record are
+// written in ONE transaction (see recordWrite), and the revision returned is
+// the one the upsert left.
+func setRecording(ctx context.Context, coll *mongo.Collection, e store.Entry) (int64, error) {
+	id := compoundID{Namespace: e.Namespace, Key: e.Key}
 
-	deletions := coll.Database().Collection(deletionsCollectionName)
+	after, err := recordWrite(ctx, coll, id, func(txCtx context.Context) (entryDoc, bool, error) {
+		doc, err := upsertReturningDoc(txCtx, coll, e)
+
+		return doc, err == nil, err
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	return after.Revision, nil
+}
+
+// deleteRecording is Delete with RecordChanges: the tombstone and its change
+// record are written in ONE transaction (see recordWrite). A delete that
+// removes nothing — a repeat, or a key never written — writes and records
+// nothing, whatever tombstone it finds.
+func deleteRecording(ctx context.Context, coll *mongo.Collection, id compoundID, now time.Time, actor string) error {
+	filter := bson.D{{Key: fieldID, Value: id}, notDeleted()}
 	opts := options.FindOneAndUpdate().SetReturnDocument(options.After)
 
-	// The callback's result says whether this attempt recorded a delete;
-	// nothing reads it.
-	_, err = session.WithTransaction(ctx, func(txCtx context.Context) (any, error) {
+	_, err := recordWrite(ctx, coll, id, func(txCtx context.Context) (entryDoc, bool, error) {
 		var tomb entryDoc
 
 		err := coll.FindOneAndUpdate(txCtx, filter, tombstonePipeline(actor, now), opts).Decode(&tomb)
 		if errors.Is(err, mongo.ErrNoDocuments) {
-			return false, nil
+			return entryDoc{}, false, nil
 		}
 
 		if err != nil {
-			return false, fmt.Errorf("tombstone: %w", err)
+			return entryDoc{}, false, fmt.Errorf("tombstone: %w", err)
 		}
 
-		if _, err := deletions.InsertOne(txCtx, deletionRecord(tomb)); err != nil {
-			return false, fmt.Errorf("record deletion: %w", err)
-		}
-
-		return true, nil
+		return tomb, true, nil
 	})
-	if isTransactionsUnsupported(err) {
-		return fmt.Errorf("%w: %w", errTransactionsRequired, err)
-	}
 
 	return err
 }
 
-// errTransactionsRequired names why a recording Delete failed on a server that
+// recordWrite runs one recording write in ONE transaction: it reads the entry
+// as it stands (the before-image), runs write, which reports the document it
+// left (the after-image) and whether it wrote at all, and inserts the change
+// record built from the two under the key's next history seq. Either both
+// land or neither does: a record that cannot be written fails the write with
+// the entry untouched, and a retry records whatever it then writes under its
+// own actor.
+//
+// Transactions need a replica set or a sharded cluster; on a standalone
+// server the first operation inside one is refused (IllegalOperation, code 20)
+// and the write fails with errTransactionsRequired, the entry untouched.
+//
+// Concurrent recording writers of one key conflict on the entry document: the
+// server aborts all but one with a TransientTransactionError, WithTransaction
+// runs the losers again on a fresh snapshot, and each then reads the value the
+// winner committed. That is what keeps a key's records one unbroken chain and
+// its seq free of gaps and duplicates; the unique seq index refuses anything
+// else.
+func recordWrite(ctx context.Context, coll *mongo.Collection, id compoundID, write func(context.Context) (entryDoc, bool, error)) (entryDoc, error) {
+	session, err := coll.Database().Client().StartSession()
+	if err != nil {
+		return entryDoc{}, fmt.Errorf("start session: %w", err)
+	}
+	defer session.EndSession(context.WithoutCancel(ctx))
+
+	history := coll.Database().Collection(historyCollectionName)
+
+	var after entryDoc
+
+	// The callback's result says whether this attempt wrote and recorded;
+	// nothing reads it.
+	_, err = session.WithTransaction(ctx, func(txCtx context.Context) (any, error) {
+		before, found, err := findBefore(txCtx, coll, id)
+		if err != nil {
+			return false, err
+		}
+
+		written, wrote, err := write(txCtx)
+		if err != nil || !wrote {
+			after = written
+
+			return false, err
+		}
+
+		seq, err := nextHistorySeq(txCtx, history, id)
+		if err != nil {
+			return false, err
+		}
+
+		var previous *entryDoc
+		if found {
+			previous = &before
+		}
+
+		if _, err := history.InsertOne(txCtx, changeRecord(previous, written, seq)); err != nil {
+			return false, fmt.Errorf("record change: %w", err)
+		}
+
+		after = written
+
+		return true, nil
+	})
+	if isTransactionsUnsupported(err) {
+		return entryDoc{}, fmt.Errorf("%w: %w", errTransactionsRequired, err)
+	}
+
+	if err != nil {
+		return entryDoc{}, err //nolint:wrapcheck // the callers wrap with method context
+	}
+
+	return after, nil
+}
+
+// findBefore reads the entry document as the transaction's snapshot holds it,
+// tombstone included, and reports whether there was one.
+func findBefore(ctx context.Context, coll *mongo.Collection, id compoundID) (entryDoc, bool, error) {
+	var doc entryDoc
+
+	err := coll.FindOne(ctx, bson.D{{Key: fieldID, Value: id}}).Decode(&doc)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return entryDoc{}, false, nil
+	}
+
+	if err != nil {
+		return entryDoc{}, false, fmt.Errorf("read before write: %w", err)
+	}
+
+	return doc, true, nil
+}
+
+// nextHistorySeq is the seq the key's next change record takes: one above the
+// newest, or 1 for its first.
+func nextHistorySeq(ctx context.Context, history *mongo.Collection, id compoundID) (int64, error) {
+	var newest struct {
+		Seq int64 `bson:"seq"`
+	}
+
+	err := history.FindOne(ctx, historyFilter(id.Namespace, id.Key),
+		options.FindOne().SetSort(bson.D{{Key: fieldSeq, Value: -1}}).SetProjection(bson.D{{Key: fieldSeq, Value: 1}}),
+	).Decode(&newest)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return 1, nil
+	}
+
+	if err != nil {
+		return 0, fmt.Errorf("read history seq: %w", err)
+	}
+
+	return newest.Seq + 1, nil
+}
+
+func historyFilter(namespace, key string) bson.D {
+	return bson.D{{Key: fieldNamespace, Value: namespace}, {Key: fieldKey, Value: key}}
+}
+
+// errTransactionsRequired names why a recording write failed on a server that
 // runs no transactions.
 var errTransactionsRequired = errors.New(
-	"the deletion history records each delete in a transaction, which needs a replica set or a sharded cluster")
+	"the change history records each write in a transaction, which needs a replica set or a sharded cluster")
 
 // isTransactionsUnsupported reports the refusal a standalone server answers
-// the first write of a transaction with.
+// the first operation of a transaction with.
 func isTransactionsUnsupported(err error) bool {
 	var serverErr mongo.ServerError
 
@@ -832,34 +947,91 @@ func isTransactionsUnsupported(err error) bool {
 // codeIllegalOperation is the server's IllegalOperation error code.
 const codeIllegalOperation = 20
 
-// deletionRecord is the history record of tomb, the tombstone the same
-// transaction wrote: the delete's actor and time are the tombstone's
-// provenance, and its revision orders the key's deletions. Caller strings are
-// field values of a plain insert, never evaluated, so they need no $literal.
-func deletionRecord(tomb entryDoc) deletionDoc {
-	return deletionDoc{
-		Namespace: tomb.Namespace,
-		Key:       tomb.Key,
-		Revision:  tomb.Revision,
-		DeletedAt: tomb.UpdatedAt,
-		DeletedBy: tomb.UpdatedBy,
+// fieldSeq orders a key's change records. It is internal to this backend and
+// never leaves it.
+const fieldSeq = "seq"
+
+// changeRecord is the history record of a write: the operation and the value
+// it replaced come from before, the document the same transaction read first
+// (nil when there was none), and the revision, value and provenance from
+// after, the document the write left. A tombstone before is no live value, so
+// a Set over it is a create. Caller strings are field values of a plain
+// insert, never evaluated, so they need no $literal.
+func changeRecord(before *entryDoc, after entryDoc, seq int64) historyDoc {
+	rec := historyDoc{
+		Namespace: after.Namespace,
+		Key:       after.Key,
+		Seq:       seq,
+		Revision:  after.Revision,
+		ChangedAt: after.UpdatedAt,
+		ChangedBy: after.UpdatedBy,
+	}
+
+	live := before != nil && !before.Deleted
+	if live {
+		previous := before.Value
+		rec.PreviousValue = &previous
+	}
+
+	switch {
+	case after.Deleted:
+		rec.Operation = store.ChangeDelete
+
+		return rec
+	case live:
+		rec.Operation = store.ChangeUpdate
+	default:
+		rec.Operation = store.ChangeCreate
+	}
+
+	value := after.Value
+	rec.Value = &value
+
+	return rec
+}
+
+// historyDoc is the BSON shape of one change record. Values are the JSON
+// strings the entry document holds, and BSON null where there was none.
+type historyDoc struct {
+	Namespace     string    `bson:"namespace"`
+	Key           string    `bson:"key"`
+	Seq           int64     `bson:"seq"`
+	Operation     string    `bson:"operation"`
+	Revision      int64     `bson:"revision"`
+	PreviousValue *string   `bson:"previous_value"`
+	Value         *string   `bson:"value"`
+	ChangedAt     time.Time `bson:"changed_at"`
+	ChangedBy     string    `bson:"changed_by"`
+}
+
+func (d historyDoc) toChangeRecord() store.ChangeRecord {
+	return store.ChangeRecord{
+		Namespace:     d.Namespace,
+		Key:           d.Key,
+		Operation:     d.Operation,
+		Revision:      d.Revision,
+		PreviousValue: rawJSON(d.PreviousValue),
+		Value:         rawJSON(d.Value),
+		ChangedAt:     d.ChangedAt,
+		ChangedBy:     d.ChangedBy,
 	}
 }
 
-// deletionDoc is the BSON shape of one deletion record.
-type deletionDoc struct {
-	Namespace string    `bson:"namespace"`
-	Key       string    `bson:"key"`
-	Revision  int64     `bson:"revision"`
-	DeletedAt time.Time `bson:"deleted_at"`
-	DeletedBy string    `bson:"deleted_by"`
+// rawJSON is the stored JSON string as memory of the caller's own, nil when
+// absent.
+func rawJSON(s *string) json.RawMessage {
+	if s == nil {
+		return nil
+	}
+
+	return json.RawMessage(*s)
 }
 
-// ListDeletions returns up to limit records of (namespace, key), newest first,
-// from the deletion history in the scope's database. It reads the collection
-// whether or not this Store records deletes; a database that never recorded
+// ListHistory returns up to limit records of (namespace, key), newest first,
+// from the change history in the scope's database. It reads the collection
+// whether or not this Store records changes; a database that never recorded
 // one answers with an empty slice.
-func (s *Store) ListDeletions(ctx context.Context, scope store.Scope, namespace, key string, limit int) ([]store.Deletion, error) {
+func (s *Store) ListHistory(ctx context.Context, scope store.Scope, namespace, key string, limit int) ([]store.ChangeRecord, error) {
 	if s == nil || s.isClosed() {
 		return nil, store.ErrClosed
 	}
@@ -877,55 +1049,46 @@ func (s *Store) ListDeletions(ctx context.Context, scope store.Scope, namespace,
 		return nil, err
 	}
 
-	ctx, span := s.tracer.Start(ctx, "systemplane.mongodb.list_deletions")
+	ctx, span := s.tracer.Start(ctx, "systemplane.mongodb.list_history")
 	defer span.End()
 
-	deletions := coll.Database().Collection(deletionsCollectionName)
+	history := coll.Database().Collection(historyCollectionName)
 
-	span.SetAttributes(scopeAttrs(deletions, scope,
+	span.SetAttributes(scopeAttrs(history, scope,
 		attribute.String("namespace", namespace),
 		attribute.String("key", key),
 	)...)
 
 	findOpts := options.Find().
-		SetSort(bson.D{{Key: fieldRevision, Value: -1}}).
+		SetSort(bson.D{{Key: fieldSeq, Value: -1}}).
 		SetLimit(int64(limit))
 
-	cursor, err := deletions.Find(ctx, bson.D{
-		{Key: fieldNamespace, Value: namespace},
-		{Key: fieldKey, Value: key},
-	}, findOpts)
+	cursor, err := history.Find(ctx, historyFilter(namespace, key), findOpts)
 	if err != nil {
-		tracing.HandleSpanError(span, "list deletions find failed", err)
+		tracing.HandleSpanError(span, "list history find failed", err)
 
-		return nil, fmt.Errorf("systemplane/mongodb: list deletions: %w", err)
+		return nil, fmt.Errorf("systemplane/mongodb: list history: %w", err)
 	}
 	defer cursor.Close(ctx)
 
-	out := make([]store.Deletion, 0)
+	out := make([]store.ChangeRecord, 0)
 
 	for cursor.Next(ctx) {
-		var doc deletionDoc
+		var doc historyDoc
 
 		if err := cursor.Decode(&doc); err != nil {
-			tracing.HandleSpanError(span, "list deletions decode failed", err)
+			tracing.HandleSpanError(span, "list history decode failed", err)
 
-			return nil, fmt.Errorf("systemplane/mongodb: list deletions decode: %w", err)
+			return nil, fmt.Errorf("systemplane/mongodb: list history decode: %w", err)
 		}
 
-		out = append(out, store.Deletion{
-			Namespace: doc.Namespace,
-			Key:       doc.Key,
-			Revision:  doc.Revision,
-			DeletedAt: doc.DeletedAt,
-			DeletedBy: doc.DeletedBy,
-		})
+		out = append(out, doc.toChangeRecord())
 	}
 
 	if err := cursor.Err(); err != nil {
-		tracing.HandleSpanError(span, "list deletions cursor failed", err)
+		tracing.HandleSpanError(span, "list history cursor failed", err)
 
-		return nil, fmt.Errorf("systemplane/mongodb: list deletions cursor: %w", err)
+		return nil, fmt.Errorf("systemplane/mongodb: list history cursor: %w", err)
 	}
 
 	return out, nil

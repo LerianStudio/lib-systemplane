@@ -126,15 +126,15 @@ func TestIntegration_PostgresSingleTenant(t *testing.T) {
 		}
 
 		// The Store no longer auto-creates its schema; provision it the way a
-		// consumer's migration pipeline would, deletion history included,
-		// because this configuration records every delete.
+		// consumer's migration pipeline would, change history included,
+		// because this configuration records every write.
 		provisionSchema(t, db)
-		provisionDeletionHistory(t, db)
+		provisionChangeHistory(t, db)
 
 		s, err := postgres.New(postgres.Config{
-			DB:              db,
-			ListenDSN:       tenantDSN,
-			RecordDeletions: true,
+			DB:            db,
+			ListenDSN:     tenantDSN,
+			RecordChanges: true,
 		})
 		if err != nil {
 			t.Fatalf("postgres.New: %v", err)
@@ -147,9 +147,9 @@ func TestIntegration_PostgresSingleTenant(t *testing.T) {
 	}
 
 	systemplanetest.Run(t, factory, systemplanetest.RunOptions{
-		EventWait:       5 * time.Second,
-		Reconnect:       terminateListenOn(admin, &lastDB),
-		DeletionHistory: true,
+		EventWait:     5 * time.Second,
+		Reconnect:     terminateListenOn(admin, &lastDB),
+		ChangeHistory: true,
 	})
 }
 
@@ -173,7 +173,7 @@ func TestIntegration_PostgresNamedTenant(t *testing.T) {
 
 		lastDB = dbName
 
-		provisionDeletionHistory(t, db)
+		provisionChangeHistory(t, db)
 
 		conn := newFakeConnector()
 		conn.set("t1", db, tenantDSN)
@@ -199,10 +199,10 @@ func TestIntegration_PostgresNamedTenant(t *testing.T) {
 	}
 
 	systemplanetest.Run(t, factory, systemplanetest.RunOptions{
-		EventWait:       5 * time.Second,
-		Scope:           store.Scope{Tenant: "t1"},
-		Reconnect:       terminateListenOn(admin, &lastDB),
-		DeletionHistory: true,
+		EventWait:     5 * time.Second,
+		Scope:         store.Scope{Tenant: "t1"},
+		Reconnect:     terminateListenOn(admin, &lastDB),
+		ChangeHistory: true,
 	})
 }
 

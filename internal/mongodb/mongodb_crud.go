@@ -73,14 +73,14 @@ func (s *Store) runSchema(ctx context.Context, coll *mongo.Collection, tenant st
 		}
 	}
 
-	if s.cfg.RecordDeletions {
+	if s.cfg.RecordChanges {
 		// Unlike the polling indexes this one is load-bearing: it serves the
-		// history read's sort, it refuses a second record of one tombstone
-		// revision, and it creates the collection before the first delete's
-		// transaction inserts into it. A role that may not create it fails the
-		// bootstrap rather than run without.
-		if _, err := coll.Database().Collection(deletionsCollectionName).Indexes().CreateOne(ctx, deletionsIndex()); err != nil {
-			return fmt.Errorf("systemplane/mongodb: create deletion history index: %w", err)
+		// history read's sort and the next-seq lookup, it refuses two records
+		// under one seq, and it creates the collection before the first
+		// write's transaction inserts into it. A role that may not create it
+		// fails the bootstrap rather than run without.
+		if _, err := coll.Database().Collection(historyCollectionName).Indexes().CreateOne(ctx, historyIndex()); err != nil {
+			return fmt.Errorf("systemplane/mongodb: create change history index: %w", err)
 		}
 	}
 
@@ -208,15 +208,14 @@ func pollingIndexes() []mongo.IndexModel {
 	}
 }
 
-// deletionsIndex is the unique index of the deletion history: one record per
-// (namespace, key, revision), which is what makes recording a delete
-// idempotent, and in the order ListDeletions reads it.
-func deletionsIndex() mongo.IndexModel {
+// historyIndex is the unique index of the change history: one record per
+// (namespace, key, seq), in the order ListHistory reads it.
+func historyIndex() mongo.IndexModel {
 	return mongo.IndexModel{
 		Keys: bson.D{
 			{Key: fieldNamespace, Value: 1},
 			{Key: fieldKey, Value: 1},
-			{Key: fieldRevision, Value: -1},
+			{Key: fieldSeq, Value: -1},
 		},
 		Options: options.Index().SetUnique(true),
 	}
@@ -240,6 +239,17 @@ func bumpRevisionExpr() bson.D {
 // upsertReturningRevision writes an entry through upsertPipeline and returns
 // the revision the document carries afterwards.
 func upsertReturningRevision(ctx context.Context, coll *mongo.Collection, e store.Entry) (int64, error) {
+	doc, err := upsertReturningDoc(ctx, coll, e)
+	if err != nil {
+		return 0, err
+	}
+
+	return doc.Revision, nil
+}
+
+// upsertReturningDoc writes an entry through upsertPipeline and returns the
+// document as the write left it.
+func upsertReturningDoc(ctx context.Context, coll *mongo.Collection, e store.Entry) (entryDoc, error) {
 	filter := bson.D{{Key: fieldID, Value: compoundID{Namespace: e.Namespace, Key: e.Key}}}
 
 	opts := options.FindOneAndUpdate().
@@ -253,8 +263,8 @@ func upsertReturningRevision(ctx context.Context, coll *mongo.Collection, e stor
 	// appears it is a real error and must propagate rather than be swallowed
 	// into revision 0.
 	if err := coll.FindOneAndUpdate(ctx, filter, upsertPipeline(e), opts).Decode(&doc); err != nil {
-		return 0, err //nolint:wrapcheck // caller wraps with method context
+		return entryDoc{}, err //nolint:wrapcheck // caller wraps with method context
 	}
 
-	return doc.Revision, nil
+	return doc, nil
 }

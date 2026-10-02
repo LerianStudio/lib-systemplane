@@ -9,10 +9,10 @@ import internalclient "github.com/LerianStudio/lib-systemplane/v4/internal/clien
 // a single-tenant [Client.Start] blocks until the first one or its ctx ends.
 type TestStore = internalclient.TestStore
 
-// TestDeletionLister is the optional capability a [TestStore] implements to
-// back [Client.Deletions] on a Client built with [WithDeletionHistory]; without
-// it Deletions returns [ErrDeletionHistoryDisabled].
-type TestDeletionLister = internalclient.TestDeletionLister
+// TestHistoryLister is the optional capability a [TestStore] implements to
+// back [Client.ChangeHistory] on a Client built with [WithChangeHistory];
+// without it ChangeHistory returns [ErrChangeHistoryDisabled].
+type TestHistoryLister = internalclient.TestHistoryLister
 
 // TestScope is the public mirror of internal store.Scope.
 type TestScope = internalclient.TestScope

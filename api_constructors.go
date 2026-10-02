@@ -137,24 +137,31 @@ func WithModule(name string) Option { return internalclient.WithModule(name) }
 // WithCatalogService sets the service name emitted by catalog snapshots.
 func WithCatalogService(name string) Option { return internalclient.WithCatalogService(name) }
 
-// WithDeletionHistory makes every [Client.Delete] that removes a stored value
-// also record who removed it and when, and turns on [Client.Deletions]. Off by
-// default, so a consumer that does not opt in needs no new DDL.
+// WithChangeHistory makes every [Client.Set] — create, update, or a rewrite of
+// an identical value — and every [Client.Delete] that removes a stored value
+// also record the operation, the value before and after, the actor and the
+// time, and turns on [Client.ChangeHistory]. Off by default, so a consumer
+// that does not opt in needs no new DDL.
 //
-// Postgres records in systemplane_deletions, in the same statement as the
-// removal: apply [DeletionHistorySQL] in the migration pipeline first (one
+// Postgres records in systemplane_history, in the same transaction as the
+// write: apply [ChangeHistorySQL] in the migration pipeline first (one
 // database per tenant, like [SchemaSQL]) and grant the runtime role INSERT and
-// SELECT on it. Without the table every Delete fails and the value stays.
-// MongoDB records in the systemplane_deletions collection of the same
-// database, in one transaction with the tombstone, and creates its unique
-// index during the bootstrap. It needs a replica set or a sharded cluster: on
-// a standalone server every Delete fails and the value stays. On both backends
-// a record that cannot be written fails Delete with the value intact.
+// SELECT on it. Without the table every Set and Delete fails and the value
+// stays. MongoDB records in the systemplane_history collection of the same
+// database, in one transaction with the write, and creates its unique index
+// during the bootstrap. It needs a replica set or a sharded cluster: on a
+// standalone server every Set and Delete fails and the value stays. On both
+// backends a record that cannot be written fails the write with the value
+// intact.
+//
+// Values are recorded verbatim, as admin GET serves them, and the history is
+// append-only: the library ships no purge. It is complete only when every
+// writer of a database opts in; a writer without the option records nothing.
 //
 // With the option on, [Client.Register] refuses namespace "-" with key
-// "deletions" or "deletions/..." ([ErrValidation]), the path admin.Mount then
+// "history" or "history/..." ([ErrValidation]), the path admin.Mount then
 // serves the history at.
-func WithDeletionHistory() Option { return internalclient.WithDeletionHistory() }
+func WithChangeHistory() Option { return internalclient.WithChangeHistory() }
 
 // WithDescription sets a human-readable description for the key.
 func WithDescription(s string) KeyOption { return internalclient.WithDescription(s) }

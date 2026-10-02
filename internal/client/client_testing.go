@@ -22,12 +22,12 @@ type TestStore interface {
 	Subscribe(ctx context.Context, scope TestScope, fn func(TestEvent)) (func(), error)
 }
 
-// TestDeletionLister is the optional capability a [TestStore] implements to
-// back [Client.Deletions] on a Client built by [NewForTesting] with
-// WithDeletionHistory. A TestStore without it answers Deletions with
-// ErrDeletionHistoryDisabled.
-type TestDeletionLister interface {
-	ListDeletions(ctx context.Context, scope TestScope, ns, key string, limit int) ([]Deletion, error)
+// TestHistoryLister is the optional capability a [TestStore] implements to
+// back [Client.ChangeHistory] on a Client built by [NewForTesting] with
+// WithChangeHistory. A TestStore without it answers ChangeHistory with
+// ErrChangeHistoryDisabled.
+type TestHistoryLister interface {
+	ListHistory(ctx context.Context, scope TestScope, ns, key string, limit int) ([]ChangeRecord, error)
 }
 
 // TestScope is the public mirror of internal store.Scope.
@@ -112,13 +112,13 @@ func (a *testStoreAdapter) Subscribe(ctx context.Context, scope store.Scope, fn 
 	})
 }
 
-func (a *testStoreAdapter) ListDeletions(ctx context.Context, scope store.Scope, ns, key string, limit int) ([]store.Deletion, error) {
-	lister, ok := a.ts.(TestDeletionLister)
+func (a *testStoreAdapter) ListHistory(ctx context.Context, scope store.Scope, ns, key string, limit int) ([]store.ChangeRecord, error) {
+	lister, ok := a.ts.(TestHistoryLister)
 	if !ok {
-		return nil, ErrDeletionHistoryDisabled
+		return nil, ErrChangeHistoryDisabled
 	}
 
-	return lister.ListDeletions(ctx, testScope(scope), ns, key, limit)
+	return lister.ListHistory(ctx, testScope(scope), ns, key, limit)
 }
 
 func testScope(s store.Scope) TestScope { return TestScope{Tenant: s.Tenant} }

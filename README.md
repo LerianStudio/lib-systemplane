@@ -70,42 +70,64 @@ poll queries need.
 [MIGRATION-v4.md § The database and operator contract](MIGRATION-v4.md#the-database-and-operator-contract)
 covers the rollout and the rollback.
 
-## Deletion history (opt-in)
+## Change history (opt-in)
 
-`GetEntry` shows who last wrote a value, but a delete leaves the registered
-default in force and its provenance fields zero, so without this option nothing
-says who deleted a key. `WithDeletionHistory()` records every delete that
-removed a stored value: the actor `Delete` was handed, when, and the revision.
-`Client.Deletions(ctx, namespace, key, limit)` reads them back newest first
-(`limit <= 0` means 50, capped at 500); without the option it returns
-`ErrDeletionHistoryDisabled`. A repeat delete, or a delete of a key never
-written, records nothing. The option is off by default, so a consumer that does
-not opt in needs no new DDL.
+`GetEntry` shows who last wrote a value, but every write overwrites that
+provenance, and a delete leaves the registered default in force with its
+provenance fields zero. Without this option nothing says who wrote or deleted
+a key before the latest write, or what the key held. `WithChangeHistory()`
+records every write. That covers every `Set` (a create, an update, or a rewrite
+of an identical value, which still restamps the row) and every `Delete` that
+removed a stored value. Each record carries:
+
+- the operation: `create`, `update` or `delete`;
+- the revision;
+- the value before and after, `nil` where there was none;
+- the actor the write was handed;
+- the time.
+
+`Client.ChangeHistory(ctx, namespace, key, limit)` reads the records back
+newest first (`limit <= 0` means 50, capped at 500). Without the option it
+returns `ErrChangeHistoryDisabled`. A repeat delete, or a delete of a key never
+written, records nothing. After every `Set`, the newest record's `ChangedBy` and
+`ChangedAt` equal the live row's `UpdatedBy` and `UpdatedAt`. The option is off
+by default, so a consumer that does not opt in needs no new DDL.
 
 Opting in takes two steps per service:
 
-1. **Postgres:** apply `DeletionHistorySQL()`
-   ([`ddl/deletions.sql`](ddl/deletions.sql)) after `SchemaSQL()`, in the same
-   schema and one database per tenant, and grant the runtime role `INSERT` and
-   `SELECT` on `systemplane_deletions`. `SchemaSQL()` does not include it, so a
-   pipeline that vendors `SchemaSQL()` sees no drift. The removal and the record
-   are one statement: with the table missing every `Delete` fails and the value
-   stays. **MongoDB:** nothing to apply; the records land in the
-   `systemplane_deletions` collection of the same database, and the bootstrap
-   creates its unique `(namespace, key, revision)` index (a role that may not
-   create it fails the bootstrap). The tombstone and the record are one
-   transaction, so the option needs a replica set or a sharded cluster: on a
-   standalone server every `Delete` fails, names that requirement and leaves
-   the value live. When the record cannot be written, `Delete` fails with the
-   value intact, as on Postgres.
-2. Pass `WithDeletionHistory()` to the constructor.
+1. **Postgres:** apply `ChangeHistorySQL()`
+   ([`ddl/change_history.sql`](ddl/change_history.sql)) after `SchemaSQL()`,
+   in the same schema and one database per tenant. Grant the runtime role
+   `INSERT` and `SELECT` on `systemplane_history`; the identity column that
+   orders the records needs no grant of its own. `SchemaSQL()` does not include
+   the table, so a pipeline that vendors `SchemaSQL()` sees no drift. A write
+   and its record commit together: with the table missing, every `Set` and
+   `Delete` fails and the value stays.
 
-`Revision` orders a key's deletions: on Postgres it is the revision the value
-carried, on MongoDB the revision of the tombstone the delete wrote. The history
-is append-only and the library ships no purge; retention is the consumer's
-policy. The library accepts an empty actor, so a service that must always name
-one refuses a missing principal before calling `Delete`. `Deletions` never logs
-`DeletedBy`.
+   **MongoDB:** nothing to apply. The records land in the `systemplane_history`
+   collection of the same database, and the bootstrap creates its unique index
+   (a role that may not create it fails the bootstrap). Every write and its
+   record are one transaction, so the option needs a replica set or a sharded
+   cluster. On a standalone server every `Set` and `Delete` fails, names that
+   requirement and leaves the value as it was. When the record cannot be
+   written, the write fails with the value intact, as on Postgres.
+2. Pass `WithChangeHistory()` to the constructor.
+
+Things to know before opting in:
+
+- **Tenancy.** There is no tenant column. The history lives in the tenant's own
+  database, and the read resolves it from `ctx` exactly as a write does.
+- **Ordering.** Concurrent writers of one key leave one unbroken chain: each
+  record's previous value is the value the record before it left.
+- **Values in clear.** Values are recorded verbatim, as admin GET already
+  serves them. Nothing is logged or put on a span.
+- **No purge.** The history is append-only and the library ships no purge. A
+  value stored by mistake stays in the history after a `Delete`; retention is
+  the consumer's policy.
+- **Every writer must opt in.** The history is complete only when every writer
+  of a database opts in, because a writer without the option records nothing.
+- **Empty actors.** The library accepts an empty actor, so a service that must
+  always name one refuses a missing principal before calling `Set` or `Delete`.
 
 ## Quickstart
 
@@ -197,7 +219,7 @@ GET    /system/:namespace                 list a namespace's entries
 GET    /system/:namespace/:key            read one entry
 PUT    /system/:namespace/:key            write {"value": ...}, answers 204
 DELETE /system/:namespace/:key            delete, answers 204
-GET    /system/-/deletions/:namespace/*   who deleted a key, and when (Mount, with WithDeletionHistory)
+GET    /system/-/history/:namespace/*     every write of a key (Mount, with WithChangeHistory)
 GET    /system/-/catalog                  every registered key's metadata
 GET    /system/-/catalog/:namespace/*     one key's metadata
 ```
@@ -212,7 +234,7 @@ first and replaces it with `request_failed`.
 
 A key containing `/` resolves through each key route's `/*` twin, and a path
 beginning with `-/catalog` is reserved for the catalog. On a Client built
-`WithDeletionHistory()`, a path beginning with `-/deletions` is reserved as well
+`WithChangeHistory()`, a path beginning with `-/history` is reserved as well
 and `Register` refuses it; without the option no route claims it. A single-key
 GET
 answers:
@@ -234,12 +256,25 @@ A list answers `{"namespace": ..., "entries": [...]}` with the same fields per
 entry, `namespace` aside. While the registered default is in force, `revision`
 is 0, `updatedAt` is null and `updatedBy` is empty.
 
-The deletion history route exists only on a Client built
-`WithDeletionHistory()` (`Client.DeletionHistoryEnabled()`), and is a `"read"`
-action for the authorizer. It answers
-`{"namespace", "key", "deletions": [{"revision", "deletedAt", "deletedBy"}]}`,
-newest first and at most 50 records; 404 for an unregistered key and 501
-`deletion_history_disabled` for a store that keeps no history.
+The change history route exists only on a Client built `WithChangeHistory()`
+(`Client.ChangeHistoryEnabled()`), and is a `"read"` action for the authorizer.
+It answers newest first, at most 50 records:
+
+```json
+{
+  "namespace": "payments",
+  "key": "fee_bps",
+  "changes": [
+    {"operation": "update", "revision": 8, "previousValue": 26, "value": 30,
+     "changedAt": "2026-09-27T09:00:00Z", "changedBy": "ops@example.com"},
+    {"operation": "create", "revision": 7, "previousValue": null, "value": 26,
+     "changedAt": "2026-09-26T12:00:00Z", "changedBy": "ops@example.com"}
+  ]
+}
+```
+
+It answers 404 for an unregistered key and 501 `change_history_disabled` for a
+store that keeps no history.
 
 ## Metrics
 

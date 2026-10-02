@@ -316,64 +316,80 @@ func TestMigrationV3ToV4SQL_SharesEverythingFromTheFirstAlter(t *testing.T) {
 	}
 }
 
-// TestDeletionHistorySQL_IsTheEmbeddedArtifact pins DeletionHistorySQL() to
-// ddl/deletions.sql byte for byte: consumers vendor the file or the function
-// interchangeably, so the two must never drift.
-func TestDeletionHistorySQL_IsTheEmbeddedArtifact(t *testing.T) {
+// TestChangeHistorySQL_IsTheEmbeddedArtifact pins ChangeHistorySQL() to
+// ddl/change_history.sql byte for byte: consumers vendor the file or the
+// function interchangeably, so the two must never drift.
+func TestChangeHistorySQL_IsTheEmbeddedArtifact(t *testing.T) {
 	t.Parallel()
 
-	onDisk, err := os.ReadFile("ddl/deletions.sql")
+	onDisk, err := os.ReadFile("ddl/change_history.sql")
 	if err != nil {
-		t.Fatalf("read ddl/deletions.sql: %v", err)
+		t.Fatalf("read ddl/change_history.sql: %v", err)
 	}
 
-	if got := systemplane.DeletionHistorySQL(); got != string(onDisk) {
-		t.Errorf("DeletionHistorySQL() differs from ddl/deletions.sql\ngot:\n%s\nwant:\n%s", got, onDisk)
+	if got := systemplane.ChangeHistorySQL(); got != string(onDisk) {
+		t.Errorf("ChangeHistorySQL() differs from ddl/change_history.sql\ngot:\n%s\nwant:\n%s", got, onDisk)
 	}
 }
 
-// TestDeletionHistorySQL_ShapeAndIdempotence pins the table the stores write:
-// the columns and key they rely on, idempotent re-application, and no sequence
-// or identity column, so the runtime role needs INSERT and SELECT only.
-func TestDeletionHistorySQL_ShapeAndIdempotence(t *testing.T) {
+// TestChangeHistorySQL_ShapeAndIdempotence pins the table the stores write:
+// the columns they rely on, the identity column that orders a key's changes,
+// the CHECK on the operation, the index the history read walks, idempotent
+// re-application, and no sequence or trigger of its own, so the runtime role
+// needs INSERT and SELECT only.
+func TestChangeHistorySQL_ShapeAndIdempotence(t *testing.T) {
 	t.Parallel()
 
-	sql := systemplane.DeletionHistorySQL()
+	sql := systemplane.ChangeHistorySQL()
 
 	for _, frag := range []string{
-		"CREATE TABLE IF NOT EXISTS systemplane_deletions (",
-		"namespace   TEXT NOT NULL,",
-		`"key"       TEXT NOT NULL,`,
-		"revision    BIGINT NOT NULL,",
-		"deleted_at  TIMESTAMPTZ NOT NULL,",
-		"deleted_by  TEXT NOT NULL,",
-		`PRIMARY KEY (namespace, "key", revision)`,
+		"CREATE TABLE IF NOT EXISTS systemplane_history (",
+		"id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,",
+		"namespace       TEXT NOT NULL,",
+		`"key"           TEXT NOT NULL,`,
+		"operation       TEXT NOT NULL CHECK (operation IN ('create', 'update', 'delete')),",
+		"revision        BIGINT NOT NULL,",
+		"previous_value  JSONB NULL,",
+		"value           JSONB NULL,",
+		"changed_at      TIMESTAMPTZ NOT NULL,",
+		"changed_by      TEXT NOT NULL",
+		`CREATE INDEX IF NOT EXISTS systemplane_history_key_idx ON systemplane_history (namespace, "key", id DESC)`,
 	} {
 		if !strings.Contains(sql, frag) {
-			t.Errorf("DeletionHistorySQL() missing fragment:\n%q", frag)
+			t.Errorf("ChangeHistorySQL() missing fragment:\n%q", frag)
 		}
 	}
 
 	upper := strings.ToUpper(withoutComments(sql))
-	for _, forbidden := range []string{"SEQUENCE", "IDENTITY", "SERIAL", "TRIGGER", "DROP "} {
+	for _, forbidden := range []string{"SEQUENCE", "SERIAL", "TRIGGER", "DROP "} {
 		if strings.Contains(upper, forbidden) {
-			t.Errorf("DeletionHistorySQL() contains %q; the table must need INSERT and SELECT only and re-apply without loss", forbidden)
+			t.Errorf("ChangeHistorySQL() contains %q; the table must need INSERT and SELECT only and re-apply without loss", forbidden)
+		}
+	}
+
+	if strings.Count(upper, "CREATE TABLE IF NOT EXISTS") != 1 || strings.Count(upper, "CREATE INDEX IF NOT EXISTS") != 1 {
+		t.Error("ChangeHistorySQL() must create exactly one table and one index, both IF NOT EXISTS")
+	}
+
+	for i, line := range strings.Split(sql, "\n") {
+		if c := strings.Index(line, "--"); c >= 0 && strings.Contains(line[c:], ";") {
+			t.Errorf("ChangeHistorySQL() line %d has a semicolon inside a comment, which splits a naive migration runner's statement: %q", i+1, line)
 		}
 	}
 }
 
-// TestSchemaSQL_LeavesTheDeletionHistoryOut keeps the opt-in table out of the
+// TestSchemaSQL_LeavesTheChangeHistoryOut keeps the opt-in table out of the
 // base artifact: a consumer who does not opt in vendors SchemaSQL() unchanged
 // and its drift checks stay green.
-func TestSchemaSQL_LeavesTheDeletionHistoryOut(t *testing.T) {
+func TestSchemaSQL_LeavesTheChangeHistoryOut(t *testing.T) {
 	t.Parallel()
 
 	for name, sql := range map[string]string{
 		"SchemaSQL()":          systemplane.SchemaSQL(),
 		"MigrationV3ToV4SQL()": systemplane.MigrationV3ToV4SQL(),
 	} {
-		if strings.Contains(sql, "systemplane_deletions") {
-			t.Errorf("%s names systemplane_deletions; the deletion history is opt-in and ships only in DeletionHistorySQL()", name)
+		if strings.Contains(sql, "systemplane_history") {
+			t.Errorf("%s names systemplane_history; the change history is opt-in and ships only in ChangeHistorySQL()", name)
 		}
 	}
 }
