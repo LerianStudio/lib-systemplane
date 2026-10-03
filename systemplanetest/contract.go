@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"sync"
 	"testing"
@@ -61,6 +62,12 @@ type RunOptions struct {
 	// Nil means this configuration cannot force a reconnect, and the sub-test
 	// skips.
 	Reconnect func(t *testing.T)
+
+	// ChangeHistory declares that every Store the Factory returns records
+	// every write (the backend's RecordChanges, with the change history
+	// provisioned) and implements store.HistoryLister. It runs the
+	// ChangeHistory sub-test, which skips when false.
+	ChangeHistory bool
 }
 
 // Run executes the full contract suite against every Store produced by factory.
@@ -161,6 +168,17 @@ func Run(t *testing.T, f Factory, opts RunOptions) {
 
 	t.Run("ResyncAfterForcedReconnect", func(t *testing.T) {
 		runResyncAfterForcedReconnect(t, f, opts)
+	})
+
+	t.Run("ChangeHistory", func(t *testing.T) {
+		if !opts.ChangeHistory {
+			t.Skip("RunOptions.ChangeHistory is false: this configuration records no writes")
+		}
+
+		s, cleanup := f(t)
+		t.Cleanup(cleanup)
+
+		runChangeHistory(t, s, opts)
 	})
 }
 
@@ -290,6 +308,366 @@ func runDelete(t *testing.T, s store.Store, opts RunOptions) {
 	if err := s.Delete(ctx, opts.Scope, "ns", "doomed", "tester"); err != nil {
 		t.Fatalf("idempotent delete: %v", err)
 	}
+}
+
+// runChangeHistory pins the change history every recording backend keeps:
+// one record per write that changed or rewrote a live value — every Set, an
+// identical value included, and every Delete that removed one — carrying the
+// operation, the value before and after, the actor and the time, listed
+// newest first. A delete that removes nothing records nothing.
+func runChangeHistory(t *testing.T, s store.Store, opts RunOptions) {
+	startStore(t, s)
+
+	lister, ok := s.(store.HistoryLister)
+	if !ok {
+		t.Fatalf("%T does not implement store.HistoryLister", s)
+	}
+
+	ctx := context.Background()
+	scope := opts.Scope
+
+	if got := listHistory(ctx, t, lister, scope, "audited", 10); len(got) != 0 {
+		t.Fatalf("history before any write = %+v, want none", got)
+	}
+
+	setAndMatchLive(ctx, t, s, lister, scope, entryBy("audited", "v1", "alice"))
+	setAndMatchLive(ctx, t, s, lister, scope, entryBy("audited", "v2", "bob"))
+	// An identical value still rewrites the row's provenance, so it is a change.
+	setAndMatchLive(ctx, t, s, lister, scope, entryBy("audited", "v2", "carol"))
+	deleteAs(ctx, t, s, scope, "audited", "dave")
+	// A repeat delete removes nothing, so it records nothing.
+	deleteAs(ctx, t, s, scope, "audited", "mallory")
+	setAndMatchLive(ctx, t, s, lister, scope, entryBy("audited", "v3", "erin"))
+
+	audited := listHistory(ctx, t, lister, scope, "audited", 10)
+
+	assertChanges(t, audited, []wantChange{
+		{store.ChangeCreate, "erin", nil, "v3"},
+		{store.ChangeDelete, "dave", "v2", nil},
+		{store.ChangeUpdate, "carol", "v2", "v2"},
+		{store.ChangeUpdate, "bob", "v1", "v2"},
+		{store.ChangeCreate, "alice", nil, "v1"},
+	})
+
+	assertPagesCoverTheHistory(ctx, t, lister, scope, "audited", audited)
+
+	if limited := listHistory(ctx, t, lister, scope, "audited", 2); len(limited) != 2 || limited[0].ChangedBy != "erin" || limited[1].ChangedBy != "dave" {
+		t.Errorf("history limited to 2 = %+v, want erin's then dave's", limited)
+	}
+
+	// A key never written: the delete removes nothing and records nothing.
+	deleteAs(ctx, t, s, scope, "ghost", "alice")
+
+	if ghost := listHistory(ctx, t, lister, scope, "ghost", 10); len(ghost) != 0 {
+		t.Errorf("history of a key never written = %+v, want none", ghost)
+	}
+
+	// An actor shaped like an expression is stored as written.
+	setEntry(ctx, t, s, scope, entryBy("literal", "x", "$value"))
+	deleteAs(ctx, t, s, scope, "literal", "$value")
+
+	if literal := listHistory(ctx, t, lister, scope, "literal", 10); len(literal) != 2 || literal[0].ChangedBy != "$value" || literal[1].ChangedBy != "$value" {
+		t.Errorf("history of literal = %+v, want two records by %q", literal, "$value")
+	}
+
+	t.Run("ConcurrentSetsKeepTheChain", func(t *testing.T) {
+		setEntry(ctx, t, s, scope, entryBy("chained", "seed", "seeder"))
+		raceSets(ctx, t, s, scope, "chained")
+		assertChain(ctx, t, s, lister, scope, "chained", concurrentWriters+1)
+	})
+
+	t.Run("ConcurrentCreatesRecordOneCreate", func(t *testing.T) {
+		raceSets(ctx, t, s, scope, "born")
+		assertChain(ctx, t, s, lister, scope, "born", concurrentWriters)
+	})
+
+	t.Run("ConcurrentDeletesRecordOneDelete", func(t *testing.T) {
+		runConcurrentDeletes(ctx, t, s, lister, scope)
+	})
+}
+
+// concurrentWriters is how many writers race for one key.
+const concurrentWriters = 8
+
+// wantChange is one expected record: nil for an absent value.
+type wantChange struct {
+	op       string
+	by       string
+	previous any
+	value    any
+}
+
+func entryBy(key string, value any, actor string) store.Entry {
+	e := entry("ns", key, value)
+	e.UpdatedBy = actor
+
+	return e
+}
+
+// setAndMatchLive writes e and checks the invariant every successful write
+// keeps: the newest record names the live row's provenance and revision.
+func setAndMatchLive(ctx context.Context, t *testing.T, s store.Store, lister store.HistoryLister, scope store.Scope, e store.Entry) {
+	t.Helper()
+
+	rev := setEntry(ctx, t, s, scope, e)
+
+	live, found, err := s.Get(ctx, scope, e.Namespace, e.Key)
+	if err != nil || !found {
+		t.Fatalf("get %s/%s after set: found = %v, err = %v", e.Namespace, e.Key, found, err)
+	}
+
+	newest := listHistory(ctx, t, lister, scope, e.Key, 1)
+	if len(newest) != 1 {
+		t.Fatalf("history of %s/%s after set = %+v, want a newest record", e.Namespace, e.Key, newest)
+	}
+
+	got := newest[0]
+	if got.ChangedBy != live.UpdatedBy || !got.ChangedAt.Equal(live.UpdatedAt) || got.Revision != live.Revision || got.Revision != rev {
+		t.Errorf("newest record of %s/%s = {by %q at %v rev %d}, want the live row's {by %q at %v rev %d} (Set returned %d)",
+			e.Namespace, e.Key, got.ChangedBy, got.ChangedAt, got.Revision, live.UpdatedBy, live.UpdatedAt, live.Revision, rev)
+	}
+
+	if !sameJSON(got.Value, live.Value) {
+		t.Errorf("newest record of %s/%s carries value %s, want the live %s", e.Namespace, e.Key, got.Value, live.Value)
+	}
+}
+
+// assertChanges checks a key's history, newest first, against want.
+func assertChanges(t *testing.T, got []store.ChangeRecord, want []wantChange) {
+	t.Helper()
+
+	if len(got) != len(want) {
+		t.Fatalf("history = %+v, want %d records", got, len(want))
+	}
+
+	for i, w := range want {
+		g := got[i]
+
+		if g.Operation != w.op || g.ChangedBy != w.by {
+			t.Errorf("history[%d] = %s by %q, want %s by %q", i, g.Operation, g.ChangedBy, w.op, w.by)
+		}
+
+		if !matchesValue(g.PreviousValue, w.previous) || !matchesValue(g.Value, w.value) {
+			t.Errorf("history[%d] values = (%s -> %s), want (%v -> %v)", i, g.PreviousValue, g.Value, w.previous, w.value)
+		}
+
+		if g.Namespace != "ns" || g.ChangedAt.IsZero() || g.Revision <= 0 {
+			t.Errorf("history[%d] = %+v, want namespace ns, a time and a positive revision", i, g)
+		}
+	}
+}
+
+// assertPagesCoverTheHistory checks the cursor every backend serves: Positions
+// are positive and strictly decreasing newest first, and paging two records at
+// a time, each page below the oldest Position of the one before, yields the
+// whole history once, in order, ending on an empty page below the oldest.
+func assertPagesCoverTheHistory(ctx context.Context, t *testing.T, lister store.HistoryLister, scope store.Scope, key string, full []store.ChangeRecord) {
+	t.Helper()
+
+	for i, r := range full {
+		if r.Position <= 0 || (i > 0 && r.Position >= full[i-1].Position) {
+			t.Fatalf("history of ns/%s positions are not positive and strictly decreasing at %d: %+v", key, i, full)
+		}
+	}
+
+	var (
+		paged  []store.ChangeRecord
+		before int64
+	)
+
+	for range len(full) + 1 {
+		page, err := lister.ListHistory(ctx, scope, "ns", key, 2, before)
+		if err != nil {
+			t.Fatalf("list history of ns/%s before %d: %v", key, before, err)
+		}
+
+		if len(page) == 0 {
+			break
+		}
+
+		paged = append(paged, page...)
+		before = page[len(page)-1].Position
+	}
+
+	if len(paged) != len(full) {
+		t.Fatalf("paging ns/%s by two returned %d records, want the %d of one read", key, len(paged), len(full))
+	}
+
+	for i := range full {
+		if paged[i].Position != full[i].Position || paged[i].ChangedBy != full[i].ChangedBy || paged[i].Operation != full[i].Operation {
+			t.Errorf("paged ns/%s[%d] = %+v, want %+v", key, i, paged[i], full[i])
+		}
+	}
+
+	if _, err := lister.ListHistory(ctx, scope, "ns", key, 2, -1); !errors.Is(err, store.ErrValidation) {
+		t.Errorf("list history of ns/%s before -1: err = %v, want ErrValidation", key, err)
+	}
+}
+
+// raceSets races concurrentWriters Sets of distinct values on one key.
+func raceSets(ctx context.Context, t *testing.T, s store.Store, scope store.Scope, key string) {
+	t.Helper()
+
+	errs := make(chan error, concurrentWriters)
+	start := make(chan struct{})
+
+	var wg sync.WaitGroup
+
+	for i := range concurrentWriters {
+		e := entryBy(key, fmt.Sprintf("w%d", i), fmt.Sprintf("writer-%d", i))
+
+		wg.Go(func() {
+			<-start
+
+			_, err := s.Set(ctx, scope, e)
+			errs <- err
+		})
+	}
+
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent set of ns/%s: %v", key, err)
+		}
+	}
+}
+
+// assertChain checks that a key's history is one unbroken chain: n records,
+// exactly one create (the oldest), each record's previous value the value the
+// record before it left, and the newest value the live one.
+func assertChain(ctx context.Context, t *testing.T, s store.Store, lister store.HistoryLister, scope store.Scope, key string, n int) {
+	t.Helper()
+
+	got := listHistory(ctx, t, lister, scope, key, n+5)
+	if len(got) != n {
+		t.Fatalf("history of ns/%s = %d records, want %d", key, len(got), n)
+	}
+
+	creates := 0
+
+	for _, r := range got {
+		if r.Operation == store.ChangeCreate {
+			creates++
+		}
+	}
+
+	if creates != 1 || got[n-1].Operation != store.ChangeCreate || got[n-1].PreviousValue != nil {
+		t.Errorf("history of ns/%s holds %d creates, oldest %s with previous %s; want exactly one create, the oldest, from nothing",
+			key, creates, got[n-1].Operation, got[n-1].PreviousValue)
+	}
+
+	for i := range n - 1 {
+		newer, older := got[i], got[i+1]
+		if newer.Operation != store.ChangeUpdate || !sameJSON(newer.PreviousValue, older.Value) {
+			t.Errorf("history of ns/%s breaks at %d: %s with previous %s after %s that left %s",
+				key, i, newer.Operation, newer.PreviousValue, older.Operation, older.Value)
+		}
+	}
+
+	live, found, err := s.Get(ctx, scope, "ns", key)
+	if err != nil || !found || !sameJSON(got[0].Value, live.Value) {
+		t.Errorf("newest record of ns/%s = %s, live = (%s, %v, %v); want them equal", key, got[0].Value, live.Value, found, err)
+	}
+}
+
+// runConcurrentDeletes races concurrentWriters Deletes, each with its own
+// actor, against one stored value. Exactly one of them removes it, so the
+// history holds exactly one delete, credited to one of the racing actors, and
+// every loser still reports success: Delete is idempotent.
+func runConcurrentDeletes(ctx context.Context, t *testing.T, s store.Store, lister store.HistoryLister, scope store.Scope) {
+	t.Helper()
+
+	setEntry(ctx, t, s, scope, entryBy("raced", 1, "seeder"))
+
+	actors := make(map[string]bool, concurrentWriters)
+	errs := make(chan error, concurrentWriters)
+	start := make(chan struct{})
+
+	var wg sync.WaitGroup
+
+	for i := range concurrentWriters {
+		actor := fmt.Sprintf("deleter-%d", i)
+		actors[actor] = true
+
+		wg.Go(func() {
+			<-start
+
+			errs <- s.Delete(ctx, scope, "ns", "raced", actor)
+		})
+	}
+
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent delete: %v", err)
+		}
+	}
+
+	got := listHistory(ctx, t, lister, scope, "raced", 10)
+	if len(got) != 2 || got[0].Operation != store.ChangeDelete || got[1].Operation != store.ChangeCreate {
+		t.Fatalf("history after %d concurrent deletes = %+v, want exactly one delete after the create", concurrentWriters, got)
+	}
+
+	if !actors[got[0].ChangedBy] {
+		t.Errorf("history credits %q, want one of the racing actors", got[0].ChangedBy)
+	}
+}
+
+func deleteAs(ctx context.Context, t *testing.T, s store.Store, scope store.Scope, key, actor string) {
+	t.Helper()
+
+	if err := s.Delete(ctx, scope, "ns", key, actor); err != nil {
+		t.Fatalf("delete ns/%s by %q: %v", key, actor, err)
+	}
+}
+
+func listHistory(ctx context.Context, t *testing.T, lister store.HistoryLister, scope store.Scope, key string, limit int) []store.ChangeRecord {
+	t.Helper()
+
+	got, err := lister.ListHistory(ctx, scope, "ns", key, limit, 0)
+	if err != nil {
+		t.Fatalf("list history of ns/%s: %v", key, err)
+	}
+
+	if got == nil {
+		t.Fatalf("list history of ns/%s returned a nil slice, want a non-nil one", key)
+	}
+
+	return got
+}
+
+// matchesValue reports whether raw is the JSON encoding of want, or absent for
+// a nil want. JSON is compared by meaning: JSONB re-renders what it stores.
+func matchesValue(raw json.RawMessage, want any) bool {
+	if want == nil {
+		return raw == nil
+	}
+
+	encoded, err := json.Marshal(want)
+
+	return err == nil && sameJSON(raw, encoded)
+}
+
+// sameJSON reports whether a and b encode the same JSON value; two absent
+// values are the same, an absent and a present one are not.
+func sameJSON(a, b []byte) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+
+	var av, bv any
+
+	if json.Unmarshal(a, &av) != nil || json.Unmarshal(b, &bv) != nil {
+		return false
+	}
+
+	return reflect.DeepEqual(av, bv)
 }
 
 func runUpsert(t *testing.T, s store.Store, opts RunOptions) {

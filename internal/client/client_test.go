@@ -372,6 +372,57 @@ func TestRegisterRejectsReservedCatalogKeys(t *testing.T) {
 	}
 }
 
+// TestRegisterReservesHistoryKeysUnderChangeHistory pins the -/history
+// reservation (br-sfn BRSFN-14, BRSFN-82): with the option on, admin.Mount
+// serves the change history at <prefix>/-/history/..., ahead of the value
+// routes, so a key registered there could be written and deleted but never
+// read. Without the option no such route exists, so the key stays valid and a
+// Client that registered it before the history existed keeps working. The
+// never-released -/deletions path is no longer reserved at all.
+func TestRegisterReservesHistoryKeysUnderChangeHistory(t *testing.T) {
+	cfg := defaultClientConfig()
+	applyClientOptions(&cfg, []Option{WithChangeHistory()})
+	on := newClient(newMemStore(false), cfg)
+
+	for _, key := range []string{"history", "history/ns/k"} {
+		if err := on.Register("-", key, 1); !errors.Is(err, ErrValidation) {
+			t.Errorf("with the history on, register -/%s: got %v, want ErrValidation", key, err)
+		}
+	}
+
+	for _, key := range []string{"historyx", "deletions", "deletions/ns/k"} {
+		if err := on.Register("-", key, 1); err != nil {
+			t.Errorf("with the history on, register -/%s: %v, want accepted", key, err)
+		}
+	}
+
+	off := newSingleTenantClient(t, newMemStore(false))
+
+	for _, key := range []string{"history", "history/ns/k"} {
+		if err := off.Register("-", key, 1); err != nil {
+			t.Errorf("with the history off, register -/%s: %v, want accepted", key, err)
+		}
+	}
+}
+
+func TestChangeHistoryEnabled(t *testing.T) {
+	cfg := defaultClientConfig()
+	applyClientOptions(&cfg, []Option{WithChangeHistory()})
+
+	if !newClient(newMemStore(false), cfg).ChangeHistoryEnabled() {
+		t.Error("ChangeHistoryEnabled = false on a Client built WithChangeHistory")
+	}
+
+	if newSingleTenantClient(t, newMemStore(false)).ChangeHistoryEnabled() {
+		t.Error("ChangeHistoryEnabled = true on a Client built without the option")
+	}
+
+	var nilClient *Client
+	if nilClient.ChangeHistoryEnabled() {
+		t.Error("ChangeHistoryEnabled = true on a nil Client")
+	}
+}
+
 func TestRegisterRejectsDuplicates(t *testing.T) {
 	c := newSingleTenantClient(t, newMemStore(false))
 
