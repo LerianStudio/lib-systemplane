@@ -233,6 +233,11 @@ GET    /system/-/catalog                  every registered key's metadata
 GET    /system/-/catalog/:namespace/*     one key's metadata
 ```
 
+The routes copy the namespace, key and actor out of Fiber's request buffers
+before they reach the Client, so a write stays on its own key and keeps its
+actor however Fiber reuses those buffers for later requests; the app needs no
+`Immutable` setting for that.
+
 Error answers are written as `{"code", "title", "message"}` JSON. With
 `admin.WithReturnedErrors()` the mount writes nothing and returns the error to
 the app's `ErrorHandler`, which reaches the same status, title and message

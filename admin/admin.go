@@ -287,7 +287,10 @@ func extractActor(c fiber.Ctx, cfg mountConfig, logger log.Logger) (actor string
 		}
 	}()
 
-	return cfg.actorExtractor(c), nil
+	// Copied: an extractor typically returns a header, a view of the request
+	// buffer Fiber reuses for the next request, and a write keeps its actor
+	// past this one (the engine caches it as UpdatedBy).
+	return strings.Clone(cfg.actorExtractor(c)), nil
 }
 
 func (cfg mountConfig) validateNamespaceParam(c fiber.Ctx) error {
@@ -323,7 +326,7 @@ func (cfg mountConfig) validateParamLengths(c fiber.Ctx, namespace, key string) 
 
 func handleList(client *systemplane.Client, cfg mountConfig) fiber.Handler {
 	return func(c fiber.Ctx) error {
-		namespace := c.Params("namespace")
+		namespace := pathParam(c, "namespace")
 
 		entries, err := client.List(c.Context(), namespace)
 		if err != nil {
@@ -383,7 +386,7 @@ func handleCatalogList(client *systemplane.Client, prefix string) fiber.Handler 
 
 func handleCatalogDetail(client *systemplane.Client, cfg mountConfig, prefix string) fiber.Handler {
 	return func(c fiber.Ctx) error {
-		detail, namespace, key, ok := catalogDetailFromParams(client, c.Params("namespace"), routeKeyParam(c))
+		detail, namespace, key, ok := catalogDetailFromParams(client, pathParam(c, "namespace"), routeKeyParam(c))
 		if !ok {
 			return cfg.respondError(c, http.StatusNotFound, "not_found", "systemplane catalog entry not found")
 		}
@@ -419,16 +422,24 @@ func valuePath(prefix, namespace, key string) string {
 	return fmt.Sprintf("%s/%s/%s", prefix, url.PathEscape(namespace), url.PathEscape(key))
 }
 
+// pathParam is the named route param, copied. Fiber returns a view of the
+// request path buffer, which the next request served on the same pooled
+// context overwrites; a write hands namespace and key to the engine, which
+// keeps them as cache and fence keys long after this request.
+func pathParam(c fiber.Ctx, name string) string {
+	return strings.Clone(c.Params(name))
+}
+
 func routeKeyParam(c fiber.Ctx) string {
-	if key := c.Params("key"); key != "" {
+	if key := pathParam(c, "key"); key != "" {
 		return key
 	}
 
-	return c.Params("*")
+	return pathParam(c, "*")
 }
 
 func registeredPathParams(client *systemplane.Client, c fiber.Ctx) (string, string) {
-	namespaceParam := c.Params("namespace")
+	namespaceParam := pathParam(c, "namespace")
 	keyParam := routeKeyParam(c)
 
 	for _, namespace := range pathParamCandidates(namespaceParam) {

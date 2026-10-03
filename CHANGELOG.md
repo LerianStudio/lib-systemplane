@@ -11,6 +11,9 @@ Features:
 - Values are recorded in clear, as admin GET already serves them; nothing is logged or put on a span. The history is append-only and the library ships no purge, so a value stored by mistake stays in the history after a `Delete`; retention is the consumer's. The history is complete only when every writer of a database opts in.
 - This change history replaces the deletion history that only ever lived on this unreleased branch. `WithDeletionHistory`, `Client.Deletions`, `Client.DeletionHistoryEnabled`, `Deletion`, `DefaultDeletionsLimit`, `MaxDeletionsLimit`, `TestDeletionLister`, `ErrDeletionHistoryDisabled`, `DeletionHistorySQL` (`ddl/deletions.sql`, table and collection `systemplane_deletions`) and the `-/deletions` admin route are gone, with no alias. A consumer that built against a pre-release pseudo-version switches to the names above, and drops a `systemplane_deletions` table it already applied.
 
+Fixes:
+- The admin surface copies the namespace, key and actor of every request before it calls the Client (br-sfn pentest final wave, F3 review R1). Fiber hands path params and headers out as views of a request buffer it reuses for the next request, and a write's namespace, key and actor outlive the request in the in-process cache, the per-key fence and the cached `UpdatedBy`. A later request could overwrite them, so a written value read back as the registered default with `Stale` set, and its `UpdatedBy` changed. Stored rows and change-history records were never affected: they are written before the handler returns.
+
 ---
 
 ## [4.1.1](https://github.com/LerianStudio/lib-systemplane/releases/tag/v4.1.1)
