@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/LerianStudio/lib-systemplane/v4/internal/engine"
@@ -38,6 +39,10 @@ import (
 // closing Client is [ErrClosed]. A multi-tenant write for a tenant the engine
 // does not track returns nil: that tenant's next read goes to the row.
 //
+// Set copies namespace, key and actor before keeping them: the engine caches
+// them past the call, so a caller may pass strings viewing a buffer it reuses
+// afterwards, such as a Fiber route param or header.
+//
 // [ErrNotStarted] with the row already persisted is reachable by racing Start
 // as well: the Client marks itself started before its first reconcile brings
 // the scope up, so a Set landing in that window is written and then refused,
@@ -54,6 +59,8 @@ func (c *Client) Set(ctx context.Context, namespace, key string, value any, acto
 	if !c.started.Load() {
 		return ErrNotStarted
 	}
+
+	namespace, key, actor = ownedStrings(namespace, key, actor)
 
 	nk := nskey{Namespace: namespace, Key: key}
 	scope := c.scopeFor(ctx)
@@ -123,6 +130,15 @@ func (c *Client) Set(ctx context.Context, namespace, key string, value any, acto
 	return c.published(c.engine.Publish(ctx, scope, entry), namespace, key, "written")
 }
 
+// ownedStrings copies the namespace, key and actor a write hands the engine,
+// which keeps them as cache keys, fence keys and the cached UpdatedBy long
+// after the call returns. A caller's strings may view a buffer it reuses — a
+// Fiber handler's c.Params and c.Get do — and a later overwrite would move the
+// cached value to another key.
+func ownedStrings(namespace, key, actor string) (string, string, string) {
+	return strings.Clone(namespace), strings.Clone(key), strings.Clone(actor)
+}
+
 // published maps the engine's answer to a publication of a row already
 // persisted ("written" or "deleted"). A multi-tenant scope the engine does not
 // track has no cache to update, so the write is complete there.
@@ -154,6 +170,7 @@ func (c *Client) published(err error, namespace, key, done string) error {
 // comes back as an error naming the key, with the row already gone from the
 // store; the single-tenant scope case also matches [ErrNotStarted], since the
 // engine holds no live scope to publish into. Multi-tenant maps it as Set does.
+// Like Set, it copies namespace, key and actor before keeping them.
 func (c *Client) Delete(ctx context.Context, namespace, key, actor string) error {
 	if c == nil || c.closed.Load() {
 		return ErrClosed
@@ -166,6 +183,8 @@ func (c *Client) Delete(ctx context.Context, namespace, key, actor string) error
 	if !c.started.Load() {
 		return ErrNotStarted
 	}
+
+	namespace, key, actor = ownedStrings(namespace, key, actor)
 
 	nk := nskey{Namespace: namespace, Key: key}
 

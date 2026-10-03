@@ -13,6 +13,7 @@ Features:
 
 Fixes:
 - The admin surface copies the namespace, key and actor of every request before it calls the Client (br-sfn pentest final wave, F3 review R1). Fiber hands path params and headers out as views of a request buffer it reuses for the next request, and a write's namespace, key and actor outlive the request in the in-process cache, the per-key fence and the cached `UpdatedBy`. A later request could overwrite them, so a written value read back as the registered default with `Stale` set, and its `UpdatedBy` changed. Stored rows and change-history records were never affected: they are written before the handler returns.
+- `Client.Set` and `Client.Delete` copy the namespace, key and actor they keep (same finding), so a consumer's own Fiber handler that passes `c.Params` or a header straight to them can no longer move a cached value, fence or `UpdatedBy` to another key either.
 
 ---
 
