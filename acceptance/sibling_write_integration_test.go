@@ -18,8 +18,9 @@ import (
 
 // A write to one key through the admin surface must never make a sibling key
 // read back older than its own last acknowledged write: PUT A, PUT B, PUT A
-// again, then every read of A serves the second value of A at a revision no
-// lower than the one read right after it. Fiber hands a handler path
+// again, then every read of A serves the second value of A at a revision above
+// the one read after the first write of A, and no lower than the one read
+// right after the second. Fiber hands a handler path
 // parameters that alias its pooled request buffer, so the keys must reach the
 // Client as strings no later request can rewrite.
 func TestIntegration_AdminSiblingWriteNeverRevertsAKeyPostgres(t *testing.T) {
@@ -92,11 +93,22 @@ func TestIntegration_AdminSiblingWriteNeverRevertsAKeyPostgres(t *testing.T) {
 
 	for i := range iterations {
 		put(keyA, 1)
+
+		beforeFinal := get(keyA)
+		if string(beforeFinal.Value) != "1" {
+			t.Fatalf("iteration %d: read of %s after PUT 1 served %s at revision %d, want 1",
+				i, keyA, beforeFinal.Value, beforeFinal.Revision)
+		}
+
 		put(keyB, 23)
 		put(keyB, 20)
 		put(keyA, 6)
 
 		acked := get(keyA)
+		if string(acked.Value) != "6" || acked.Revision <= beforeFinal.Revision {
+			t.Fatalf("iteration %d: read of %s after PUT 6 served %s at revision %d, want 6 at revision > %d",
+				i, keyA, acked.Value, acked.Revision, beforeFinal.Revision)
+		}
 
 		for r := range reads + 1 {
 			got := acked

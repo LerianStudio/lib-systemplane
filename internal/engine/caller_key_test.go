@@ -42,7 +42,7 @@ func (b borrowedKey) reuse(nk NSKey) {
 // and the next publication of the sibling would land beside it.
 func TestPublishOwnsTheKeyItRetains(t *testing.T) {
 	a := NSKey{Namespace: "tenant_policy", Key: "limits.init"}
-	b := NSKey{Namespace: "tenant_policy", Key: "limits.ends"}
+	b := NSKey{Namespace: "tenant_limits", Key: "limits.ends"}
 	scope := store.Scope{}
 	e := startEngine(t, map[NSKey]KeyDef{a: {Default: float64(6)}, b: {Default: float64(20)}}, newFakeStore())
 
@@ -79,7 +79,7 @@ func TestPublishOwnsTheKeyItRetains(t *testing.T) {
 
 func TestPublishDeleteOwnsTheKeyItRetains(t *testing.T) {
 	a := NSKey{Namespace: "tenant_policy", Key: "limits.init"}
-	b := NSKey{Namespace: "tenant_policy", Key: "limits.ends"}
+	b := NSKey{Namespace: "tenant_limits", Key: "limits.ends"}
 	scope := store.Scope{}
 	e := startEngine(t, map[NSKey]KeyDef{a: {Default: float64(6)}, b: {Default: float64(20)}}, newFakeStore())
 
