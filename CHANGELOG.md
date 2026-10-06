@@ -1,5 +1,17 @@
 # Lib-systemplane Changelog
 
+## [4.1.2](https://github.com/LerianStudio/lib-systemplane/releases/tag/v4.1.2)
+
+Fixes:
+
+- Resolved an issue where a stale read could occur after a sibling write, ensuring data consistency in the system. (@jeffersonrodrigues92)
+- Addressed a problem by anchoring the sibling-write read and taking ownership of the namespace in key tests, improving test reliability. (@jeffersonrodrigues92)
+- Fixed the handling of keys in the `Publish` and `PublishDelete` functions by ensuring the caller owns the key, preventing potential data mishandling. (@jeffersonrodrigues92)
+
+[Compare changes](https://github.com/LerianStudio/lib-systemplane/compare/v4.1.1...v4.1.2)
+
+---
+
 ## [4.1.1](https://github.com/LerianStudio/lib-systemplane/releases/tag/v4.1.1)
 
 Fixes:
