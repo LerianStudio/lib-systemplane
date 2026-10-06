@@ -548,7 +548,10 @@ func (e *Engine) Publish(ctx context.Context, scope store.Scope, se store.Entry)
 		return ErrClosed
 	}
 
-	sc, err := e.writeScope(ctx, scope, NSKey{Namespace: se.Namespace, Key: se.Key})
+	nk := NSKey{Namespace: se.Namespace, Key: se.Key}.owned()
+	se.Namespace, se.Key = nk.Namespace, nk.Key
+
+	sc, err := e.writeScope(ctx, scope, nk)
 	if err != nil {
 		return err
 	}

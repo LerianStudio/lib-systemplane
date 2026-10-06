@@ -582,6 +582,8 @@ func (e *Engine) PublishDelete(ctx context.Context, scope store.Scope, nk NSKey)
 		return ErrClosed
 	}
 
+	nk = nk.owned()
+
 	sc, err := e.writeScope(ctx, scope, nk)
 	if err != nil {
 		return err
