@@ -397,6 +397,23 @@ func TestAdmin_HistoryDefaultsToTheNewestPage(t *testing.T) {
 	}
 }
 
+// TestAdmin_HistoryEmptyBeforeIsTheNewestPage: a client that echoes the
+// previous page's next builds its first request with an empty cursor, and gets
+// the newest page rather than a 400.
+func TestAdmin_HistoryEmptyBeforeIsTheNewestPage(t *testing.T) {
+	c, s := setupHistoryClient(t, fiveRecords(), [2]string{"ns", "k"})
+	app := mountAndRun(t, c)
+
+	got := decodeHistory(t, doRequest(t, app, http.MethodGet, "/system/-/history/ns/k?limit=2&before=", ""))
+	if len(got.Changes) != 2 || got.Changes[0].Position != 50 || got.Next == nil {
+		t.Errorf("body = %+v, want the newest two records and a next", got)
+	}
+
+	if limit, before := s.lastPaging(); limit != 3 || before != 0 {
+		t.Errorf("store asked for (limit %d, before %d), want (3, 0)", limit, before)
+	}
+}
+
 func TestAdmin_HistoryRefusesMalformedPaging(t *testing.T) {
 	c, _ := setupHistoryClient(t, fiveRecords(), [2]string{"ns", "k"})
 	app := mountAndRun(t, c)

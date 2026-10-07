@@ -554,8 +554,10 @@ func handleHistory(client *systemplane.Client, cfg mountConfig) fiber.Handler {
 
 // historyQuery reads the history route's paging: ?limit= (a positive integer,
 // capped by the Client) and ?before= (a positive Position, the previous page's
-// next). Either may be absent; one present but malformed is a bad request,
-// named in the returned message.
+// next). Either may be absent, and an empty before is absent too: a client
+// echoing the previous page's next starts with an empty cursor. A limit given
+// empty, or either given malformed, is a bad request, named in the returned
+// message.
 func historyQuery(c fiber.Ctx) (systemplane.ChangeHistoryQuery, string) {
 	var q systemplane.ChangeHistoryQuery
 
@@ -570,8 +572,8 @@ func historyQuery(c fiber.Ctx) (systemplane.ChangeHistoryQuery, string) {
 		q.Limit = limit
 	}
 
-	if args.Has("before") {
-		before, err := strconv.ParseInt(string(args.Peek("before")), 10, 64)
+	if raw := args.Peek("before"); len(raw) > 0 {
+		before, err := strconv.ParseInt(string(raw), 10, 64)
 		if err != nil || before <= 0 {
 			return q, "before must be a positive integer"
 		}
