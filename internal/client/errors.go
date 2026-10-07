@@ -57,4 +57,8 @@ var (
 	// ErrTenantManagerBackendMismatch is returned by a constructor handed the
 	// tenant manager of the other backend.
 	ErrTenantManagerBackendMismatch = errors.New("systemplane: tenant manager does not match the client backend")
+
+	// ErrChangeHistoryDisabled is returned by ChangeHistory on a Client built
+	// without WithChangeHistory, or over a store that keeps no history.
+	ErrChangeHistoryDisabled = errors.New("systemplane: change history is not enabled")
 )

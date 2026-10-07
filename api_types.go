@@ -43,3 +43,49 @@ type Option = internalclient.Option
 
 // KeyOption configures a single key at registration time.
 type KeyOption = internalclient.KeyOption
+
+// ChangeRecord is one record of the change history [WithChangeHistory] keeps:
+// a write that changed a key, its Operation ([ChangeOperationCreate],
+// [ChangeOperationUpdate] or [ChangeOperationDelete]), the JSON the key held
+// before and after it (PreviousValue and Value, nil where there was none), and
+// the actor and time it stamped (ChangedBy and ChangedAt, equal to the live
+// row's UpdatedBy and UpdatedAt after a Set). Revision is the key's revision
+// after a create or update — unchanged by an identical value — and, for a
+// delete, the revision the removed value carried on Postgres or the tombstone's
+// on MongoDB. Position is the record's place in its key's history, greater for
+// every later record of that key; it is not contiguous, means nothing across
+// keys, and serves only as a [ChangeHistoryQuery] Before.
+type ChangeRecord = internalclient.ChangeRecord
+
+// ChangeHistoryQuery selects one page of [Client.ChangeHistory]: Limit records
+// at most (<= 0 means [DefaultChangeHistoryLimit], capped at
+// [MaxChangeHistoryLimit]), starting below the Position Before names, or from
+// the newest record when Before is 0. A negative Before is [ErrValidation].
+type ChangeHistoryQuery = internalclient.ChangeHistoryQuery
+
+// ChangeHistoryPage is one page of [Client.ChangeHistory]: Changes, newest
+// first and never nil, and Next, the Before of the next older page, 0 when no
+// older record remains.
+type ChangeHistoryPage = internalclient.ChangeHistoryPage
+
+const (
+	// ChangeOperationCreate is a [Client.Set] that found no live value: the key
+	// was absent or deleted. PreviousValue is nil.
+	ChangeOperationCreate = internalclient.ChangeOperationCreate
+
+	// ChangeOperationUpdate is a [Client.Set] over a live value, an identical
+	// one included.
+	ChangeOperationUpdate = internalclient.ChangeOperationUpdate
+
+	// ChangeOperationDelete is a [Client.Delete] that removed a live value.
+	// Value is nil.
+	ChangeOperationDelete = internalclient.ChangeOperationDelete
+
+	// DefaultChangeHistoryLimit is how many records [Client.ChangeHistory]
+	// returns for a non-positive limit.
+	DefaultChangeHistoryLimit = internalclient.DefaultChangeHistoryLimit
+
+	// MaxChangeHistoryLimit caps the records one [Client.ChangeHistory] call
+	// returns.
+	MaxChangeHistoryLimit = internalclient.MaxChangeHistoryLimit
+)
