@@ -260,8 +260,6 @@ func callAuthorizer(c fiber.Ctx, cfg mountConfig, logger log.Logger, action stri
 	return cfg.authorizer(c, action)
 }
 
-// extractActor runs the consumer's actor extractor. A panic is reported and
-// returned as an error: no write may land without the actor that attributes it.
 // writeActor is the actor a write is attributed to. On a Client keeping the
 // change history an empty or blank one is errActorRequired, refused before the
 // Client is called.
@@ -278,6 +276,8 @@ func writeActor(c fiber.Ctx, client *systemplane.Client, cfg mountConfig, logger
 	return actor, nil
 }
 
+// extractActor runs the consumer's actor extractor. A panic is reported and
+// returned as an error: no write may land without the actor that attributes it.
 func extractActor(c fiber.Ctx, cfg mountConfig, logger log.Logger) (actor string, err error) {
 	defer func() {
 		if r := recover(); r != nil {
