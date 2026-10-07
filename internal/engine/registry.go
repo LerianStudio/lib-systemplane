@@ -1,6 +1,9 @@
 package engine
 
-import "context"
+import (
+	"context"
+	"strings"
+)
 
 // Registry is the engine's read-only view of the Client's key registry.
 // internal/client implements it; the engine never imports internal/client.
@@ -47,6 +50,22 @@ type KeyDef struct {
 type NSKey struct {
 	Namespace string
 	Key       string
+}
+
+// owned returns nk backed by memory the engine alone holds.
+//
+// A key handed in by a consumer's goroutine is retained long after the call
+// returns: as the cache's map key — which a later publication of the same key
+// overwrites with the caller's string, since Go refreshes a string map key on
+// every assignment — and in the fences. A caller may pass bytes it still owns:
+// an HTTP router's path parameter aliases a request buffer it reuses for the
+// next request, so the stored key changes under the map that hashed it. The
+// entry then sits in its bucket reading as another key, a read of it misses or
+// finds that other key's older entry, and the sibling's next write lands beside
+// it. Rows from the store are the engine's already; only Publish and
+// PublishDelete take keys from a caller.
+func (nk NSKey) owned() NSKey {
+	return NSKey{Namespace: strings.Clone(nk.Namespace), Key: strings.Clone(nk.Key)}
 }
 
 // lookup is the registry read every ingress path goes through.

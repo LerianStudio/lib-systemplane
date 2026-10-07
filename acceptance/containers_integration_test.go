@@ -62,6 +62,9 @@ func TestMain(m *testing.M) {
 			goleak.IgnoreAnyFunction("github.com/testcontainers/testcontainers-go.(*Reaper).connect.func1"),
 			goleak.IgnoreAnyFunction("net/http.(*persistConn).readLoop"),
 			goleak.IgnoreAnyFunction("net/http.(*persistConn).writeLoop"),
+			// fasthttp's Date-header ticker, started once per process by the
+			// first request the admin surface serves and never stopped.
+			goleak.IgnoreAnyFunction("github.com/valyala/fasthttp.updateServerDate.func1"),
 		); err != nil {
 			fmt.Fprintf(os.Stderr, "goroutine leak after acceptance suite: %v\n", err)
 
