@@ -16,8 +16,7 @@ func isNamespaceExists(err error) bool {
 		return false
 	}
 
-	var cmdErr mongo.CommandError
-	if errors.As(err, &cmdErr) {
+	if cmdErr, ok := errors.AsType[mongo.CommandError](err); ok {
 		if cmdErr.Code == 48 {
 			return true
 		}
