@@ -20,6 +20,12 @@ var schemaSQL string
 //go:embed ddl/migrate_v3_to_v4.sql
 var migrationV3ToV4SQL string
 
+// changeHistorySQL is the opt-in change history table, embedded
+// byte-faithfully from ddl/change_history.sql.
+//
+//go:embed ddl/change_history.sql
+var changeHistorySQL string
+
 // SchemaSQL returns the full systemplane schema DDL as an importable artifact.
 //
 // The returned SQL creates the systemplane_entries table, the
@@ -128,4 +134,24 @@ func SchemaSQL() string {
 // the caller.
 func MigrationV3ToV4SQL() string {
 	return migrationV3ToV4SQL
+}
+
+// ChangeHistorySQL returns the DDL of the opt-in change history as an
+// importable artifact: the systemplane_history table, and the index its read
+// walks, that a Postgres Client built with [WithChangeHistory] records every
+// write in.
+//
+// It is kept out of SchemaSQL() on purpose, so a consumer who does not opt in
+// vendors an unchanged schema. Apply it after SchemaSQL(), to ONE DATABASE PER
+// TENANT, in the same schema as systemplane_entries. It is idempotent. The
+// table has no tenant column: the tenant is the database it lives in.
+//
+// Records are ordered by an identity column, which draws its numbers without
+// any grant on its sequence, so the runtime role needs INSERT and SELECT on
+// the table and nothing else. Values are stored verbatim. The table is
+// append-only and the library never purges it: a retention policy, if one is
+// wanted, is the consumer's own. lib-systemplane does not execute it for the
+// caller.
+func ChangeHistorySQL() string {
+	return changeHistorySQL
 }

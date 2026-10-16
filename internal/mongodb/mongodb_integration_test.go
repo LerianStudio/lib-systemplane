@@ -92,6 +92,18 @@ func startContainerAt(t *testing.T) (*mongo.Client, string, func()) {
 	return client, parsed.Host, cleanup
 }
 
+// writeModes are the two write paths every replica-set contract run covers:
+// the default non-transactional upsert and tombstone every consumer without
+// the change history runs, and the recording transaction WithChangeHistory
+// selects. Neither may stand in for the other.
+var writeModes = []struct {
+	name   string
+	record bool
+}{
+	{"Default", false},
+	{"RecordingChanges", true},
+}
+
 func TestIntegration_MongoDBSingleTenant(t *testing.T) {
 	client, cleanup := startContainer(t)
 	t.Cleanup(cleanup)
@@ -102,31 +114,39 @@ func TestIntegration_MongoDBSingleTenant(t *testing.T) {
 	// plain variable needs no lock.
 	var lastDB string
 
-	factory := func(t *testing.T) (store.Store, func()) {
-		t.Helper()
+	for _, mode := range writeModes {
+		t.Run(mode.name, func(t *testing.T) {
+			factory := func(t *testing.T) (store.Store, func()) {
+				t.Helper()
 
-		dbName := fmt.Sprintf("st_%d", time.Now().UnixNano())
+				dbName := fmt.Sprintf("st_%d", time.Now().UnixNano())
 
-		s, err := mongodb.New(mongodb.Config{
-			Client:   client,
-			Database: dbName,
+				// The recording configuration runs the contract suite's
+				// ChangeHistory sub-test; the default one skips it.
+				s, err := mongodb.New(mongodb.Config{
+					Client:        client,
+					Database:      dbName,
+					RecordChanges: mode.record,
+				})
+				if err != nil {
+					t.Fatalf("mongodb.New: %v", err)
+				}
+
+				lastDB = dbName
+
+				return s, func() {
+					_ = s.Close()
+					_ = client.Database(dbName).Drop(context.Background())
+				}
+			}
+
+			systemplanetest.Run(t, factory, systemplanetest.RunOptions{
+				EventWait:     5 * time.Second,
+				Reconnect:     killChangeStreamCursor(client, &lastDB),
+				ChangeHistory: mode.record,
+			})
 		})
-		if err != nil {
-			t.Fatalf("mongodb.New: %v", err)
-		}
-
-		lastDB = dbName
-
-		return s, func() {
-			_ = s.Close()
-			_ = client.Database(dbName).Drop(context.Background())
-		}
 	}
-
-	systemplanetest.Run(t, factory, systemplanetest.RunOptions{
-		EventWait: 5 * time.Second,
-		Reconnect: killChangeStreamCursor(client, &lastDB),
-	})
 }
 
 // TestIntegration_MongoDBNamedTenant runs the same contract suite against a
@@ -140,32 +160,44 @@ func TestIntegration_MongoDBNamedTenant(t *testing.T) {
 
 	var lastDB string
 
-	factory := func(t *testing.T) (store.Store, func()) {
-		t.Helper()
+	for _, mode := range writeModes {
+		t.Run(mode.name, func(t *testing.T) {
+			factory := func(t *testing.T) (store.Store, func()) {
+				t.Helper()
 
-		conn := newFakeConnector()
-		db := tenantDB(t, client, conn, "t1", "nt")
+				conn := newFakeConnector()
+				db := tenantDB(t, client, conn, "t1", "nt")
 
-		lastDB = db.Name()
+				lastDB = db.Name()
 
-		s := tenantStore(t, conn)
+				var s *mongodb.Store
 
-		// Closing and dropping here rather than leaning on the t.Cleanup
-		// tenantDB and tenantStore register: the suite calls one Factory per
-		// iteration inside SubscribeThenImmediateWriteNeverLosesTheEvent, and
-		// twenty live stores and databases queueing up for the end of that
-		// sub-test is a different test from the one it means to run.
-		return s, func() {
-			_ = s.Close()
-			_ = db.Drop(context.Background())
-		}
+				if mode.record {
+					s = recordingTenantStore(t, conn)
+				} else {
+					s = tenantStore(t, conn)
+				}
+
+				// Closing and dropping here rather than leaning on the
+				// t.Cleanup tenantDB and tenantStore register: the suite calls
+				// one Factory per iteration inside
+				// SubscribeThenImmediateWriteNeverLosesTheEvent, and twenty live
+				// stores and databases queueing up for the end of that sub-test
+				// is a different test from the one it means to run.
+				return s, func() {
+					_ = s.Close()
+					_ = db.Drop(context.Background())
+				}
+			}
+
+			systemplanetest.Run(t, factory, systemplanetest.RunOptions{
+				EventWait:     5 * time.Second,
+				Scope:         store.Scope{Tenant: "t1"},
+				Reconnect:     killChangeStreamCursor(client, &lastDB),
+				ChangeHistory: mode.record,
+			})
+		})
 	}
-
-	systemplanetest.Run(t, factory, systemplanetest.RunOptions{
-		EventWait: 5 * time.Second,
-		Scope:     store.Scope{Tenant: "t1"},
-		Reconnect: killChangeStreamCursor(client, &lastDB),
-	})
 }
 
 // TestIntegration_MongoDBPolling runs the same contract suite against the

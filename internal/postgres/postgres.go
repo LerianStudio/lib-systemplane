@@ -44,6 +44,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -57,8 +58,11 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// Compile-time interface satisfaction check.
-var _ store.Store = (*Store)(nil)
+// Compile-time interface satisfaction checks.
+var (
+	_ store.Store         = (*Store)(nil)
+	_ store.HistoryLister = (*Store)(nil)
+)
 
 // channelName is the one LISTEN channel; SchemaSQL's triggers NOTIFY on it.
 const channelName = "systemplane_changes"
@@ -102,6 +106,14 @@ type Config struct {
 	Module string
 
 	Connector Connector // nil in single-tenant mode
+
+	// RecordChanges makes every Set, and every Delete that removes a row, also
+	// record the operation, the value before and after, the actor and the time
+	// in systemplane_history, committed with the write: Set runs in one
+	// transaction with its record, Delete in one statement. The table is
+	// provisioned externally from the root package's ChangeHistorySQL(); with
+	// it missing, every Set and Delete fails and the row is untouched.
+	RecordChanges bool
 
 	Logger    log.Logger
 	Telemetry store.Telemetry
@@ -459,6 +471,17 @@ func (s *Store) Set(ctx context.Context, scope store.Scope, e store.Entry) (int6
 	)...)
 	defer finish()
 
+	if s.cfg.RecordChanges {
+		revision, err := setRecording(ctx, db, e)
+		if err != nil {
+			tracing.HandleSpanError(span, "set failed", err)
+
+			return 0, fmt.Errorf("systemplane/postgres: set: %w", err)
+		}
+
+		return revision, nil
+	}
+
 	const query = `INSERT INTO systemplane_entries (namespace, key, value, updated_at, updated_by)
 VALUES ($1, $2, $3, $4, $5)
 ON CONFLICT (namespace, key) DO UPDATE
@@ -481,6 +504,12 @@ RETURNING revision`
 }
 
 // Delete removes a single (namespace, key) row. Idempotent.
+//
+// With RecordChanges it also records the value removed, actor and the time in
+// systemplane_history, through the one statement deleteQuery builds: a delete
+// that removes nothing — a missing key, a repeat, the loser of two concurrent
+// deletes — records nothing, and a record that cannot be written fails the
+// delete with the row still in place.
 func (s *Store) Delete(ctx context.Context, scope store.Scope, namespace, key, actor string) error {
 	if s == nil || s.isClosed() {
 		return store.ErrClosed
@@ -500,25 +529,265 @@ func (s *Store) Delete(ctx context.Context, scope store.Scope, namespace, key, a
 	}
 
 	// actor is intentionally NOT a span attribute: it is unbounded caller
-	// identity and would create a high-cardinality / potentially PII tag.
-	// Audit trails capture it via the updated_by column on writes.
-	_ = actor
-
+	// identity and would create a high-cardinality / potentially PII tag. It
+	// is recorded where audit trails read it: systemplane_history, when
+	// RecordChanges is on.
 	ctx, span, finish := s.startSpan(ctx, "systemplane.postgres.delete", scopeAttrs(scope,
 		attribute.String("namespace", namespace),
 		attribute.String("key", key),
 	)...)
 	defer finish()
 
-	const query = `DELETE FROM systemplane_entries WHERE namespace = $1 AND key = $2`
+	args := []any{namespace, key}
+	if s.cfg.RecordChanges {
+		args = append(args, time.Now().UTC().Truncate(time.Millisecond), actor)
+	}
 
-	if _, err := db.ExecContext(ctx, query, namespace, key); err != nil {
+	if _, err := db.ExecContext(ctx, deleteQuery(s.cfg.RecordChanges), args...); err != nil {
 		tracing.HandleSpanError(span, "delete failed", err)
 
 		return fmt.Errorf("systemplane/postgres: delete: %w", err)
 	}
 
 	return nil
+}
+
+// deleteQuery is the statement behind Delete. Recording, it is ONE statement:
+// the data-modifying CTE removes the row and the INSERT records exactly the
+// rows it removed, with the value each held, so both commit or neither does,
+// and the revision recorded is the one the row carried. The NOTIFY trigger
+// fires on the DELETE as before.
+func deleteQuery(record bool) string {
+	if !record {
+		return `DELETE FROM systemplane_entries WHERE namespace = $1 AND key = $2`
+	}
+
+	return `WITH gone AS (DELETE FROM systemplane_entries WHERE namespace = $1 AND key = $2 RETURNING namespace, key, revision, value)
+INSERT INTO systemplane_history (namespace, "key", operation, revision, previous_value, value, changed_at, changed_by)
+SELECT namespace, key, 'delete', revision, value, NULL, $3, $4 FROM gone`
+}
+
+// maxCreateAttempts bounds how often a recording Set that found no row retries
+// after a concurrent create took the key first. Each retry finds the row the
+// winner committed, so a second attempt already succeeds; the bound only keeps
+// a pathological create-and-delete storm from looping without end.
+const maxCreateAttempts = 3
+
+// errCreateContended is returned when every one of maxCreateAttempts lost the
+// key to a concurrent create that was gone again by the next attempt.
+var errCreateContended = errors.New("the key was created and deleted concurrently on every attempt")
+
+// setRecording is Set with RecordChanges: the write and its record are ONE
+// transaction, so either both commit or neither does, and a record that cannot
+// be written fails Set with the row untouched.
+//
+// Under READ COMMITTED the row is read FOR UPDATE first, which serializes
+// every recording writer of the key and hands each the value the previous one
+// committed, so the records form one unbroken chain. A row found is updated; a
+// row absent is inserted ON CONFLICT DO NOTHING, and a concurrent create that
+// wins the insert sends this one back to the locking read, where it now finds
+// the winner's row. The revision is still drawn by the trigger, exactly as on
+// the unrecorded path.
+func setRecording(ctx context.Context, db dbExecutor, e store.Entry) (int64, error) {
+	tx, err := beginTx(ctx, db)
+	if err != nil {
+		return 0, err
+	}
+
+	// Rollback after a successful Commit is a no-op that reports
+	// sql.ErrTxDone; on every failure path it is the cleanup.
+	defer func() { _ = tx.Rollback() }()
+
+	revision, op, previous, err := writeLocked(ctx, tx, e)
+	if err != nil {
+		return 0, err
+	}
+
+	const record = `INSERT INTO systemplane_history (namespace, "key", operation, revision, previous_value, value, changed_at, changed_by)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
+
+	if _, err := tx.ExecContext(ctx, record, e.Namespace, e.Key, op, revision, previous, e.Value, e.UpdatedAt, e.UpdatedBy); err != nil {
+		return 0, fmt.Errorf("record change: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit: %w", err)
+	}
+
+	return revision, nil
+}
+
+// writeLocked writes e inside tx and reports the revision now stored, the
+// operation it was and the value it replaced (nil for a create).
+func writeLocked(ctx context.Context, tx txExecutor, e store.Entry) (int64, string, []byte, error) {
+	const (
+		lock   = `SELECT value FROM systemplane_entries WHERE namespace = $1 AND key = $2 FOR UPDATE`
+		update = `UPDATE systemplane_entries SET value = $3, updated_at = $4, updated_by = $5
+WHERE namespace = $1 AND key = $2 RETURNING revision`
+		insert = `INSERT INTO systemplane_entries (namespace, key, value, updated_at, updated_by)
+VALUES ($1, $2, $3, $4, $5) ON CONFLICT (namespace, key) DO NOTHING RETURNING revision`
+	)
+
+	args := []any{e.Namespace, e.Key, e.Value, e.UpdatedAt, e.UpdatedBy}
+
+	for range maxCreateAttempts {
+		var (
+			previous []byte
+			revision int64
+		)
+
+		err := tx.QueryRowContext(ctx, lock, e.Namespace, e.Key).Scan(&previous)
+
+		switch {
+		case err == nil:
+			if err := tx.QueryRowContext(ctx, update, args...).Scan(&revision); err != nil {
+				return 0, "", nil, fmt.Errorf("update: %w", err)
+			}
+
+			return revision, store.ChangeUpdate, previous, nil
+		case !errors.Is(err, sql.ErrNoRows):
+			return 0, "", nil, fmt.Errorf("lock: %w", err)
+		}
+
+		err = tx.QueryRowContext(ctx, insert, args...).Scan(&revision)
+		if err == nil {
+			return revision, store.ChangeCreate, nil, nil
+		}
+
+		if !errors.Is(err, sql.ErrNoRows) {
+			return 0, "", nil, fmt.Errorf("insert: %w", err)
+		}
+		// A concurrent create committed the key first: read it again, locked.
+	}
+
+	return 0, "", nil, errCreateContended
+}
+
+// txExecutor is an open transaction on either handle resolveDB returns: a
+// *sql.Tx, or the dbresolver.Tx of a resolver with no primary to pin.
+type txExecutor interface {
+	dbExecutor
+	Commit() error
+	Rollback() error
+}
+
+// Compile-time assertions that both transaction types satisfy txExecutor.
+var (
+	_ txExecutor = (*sql.Tx)(nil)
+	_ txExecutor = (dbresolver.Tx)(nil)
+)
+
+// errNoTransactions is returned when a recording Set is handed a database
+// handle that cannot open a transaction.
+var errNoTransactions = errors.New("the database handle cannot open a transaction, which the change history needs")
+
+// beginTx opens a READ COMMITTED transaction on db. dbExecutor has no BeginTx
+// of its own, so the two handle types resolveDB returns are told apart here;
+// any other handle, or a nil one, is refused with an error rather than a panic.
+func beginTx(ctx context.Context, db dbExecutor) (txExecutor, error) {
+	if log.IsNil(db) {
+		return nil, errNoTransactions
+	}
+
+	opts := &sql.TxOptions{Isolation: sql.LevelReadCommitted}
+
+	switch h := db.(type) {
+	case *sql.DB:
+		tx, err := h.BeginTx(ctx, opts)
+		if err != nil {
+			return nil, fmt.Errorf("begin: %w", err)
+		}
+
+		return tx, nil
+	case dbresolver.DB:
+		tx, err := h.BeginTx(ctx, opts)
+		if err != nil {
+			return nil, fmt.Errorf("begin: %w", err)
+		}
+
+		return tx, nil
+	default:
+		return nil, fmt.Errorf("%w: %T", errNoTransactions, db)
+	}
+}
+
+// ListHistory returns up to limit records of (namespace, key) from
+// systemplane_history, newest first: the newest for before 0, otherwise those
+// whose id is below before. A record's Position is its id. It reads the table
+// whether or not this Store records changes; a database without it answers
+// with an error.
+func (s *Store) ListHistory(ctx context.Context, scope store.Scope, namespace, key string, limit int, before int64) ([]store.ChangeRecord, error) {
+	if s == nil || s.isClosed() {
+		return nil, store.ErrClosed
+	}
+
+	if namespace == "" || key == "" {
+		return nil, fmt.Errorf("systemplane/postgres: %w: namespace and key must not be empty", store.ErrValidation)
+	}
+
+	if limit <= 0 {
+		return nil, fmt.Errorf("systemplane/postgres: %w: limit must be positive", store.ErrValidation)
+	}
+
+	if before < 0 {
+		return nil, fmt.Errorf("systemplane/postgres: %w: before must not be negative", store.ErrValidation)
+	}
+
+	// The newest page reads below every id there can be, so one statement
+	// serves both; the (namespace, key, id DESC) index answers it either way.
+	if before == 0 {
+		before = math.MaxInt64
+	}
+
+	db, err := s.resolveDB(ctx, scope)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, span, finish := s.startSpan(ctx, "systemplane.postgres.list_history", scopeAttrs(scope,
+		attribute.String("namespace", namespace),
+		attribute.String("key", key),
+	)...)
+	defer finish()
+
+	const query = `SELECT id, namespace, "key", operation, revision, previous_value, value, changed_at, changed_by
+FROM systemplane_history WHERE namespace = $1 AND "key" = $2 AND id < $3 ORDER BY id DESC LIMIT $4`
+
+	rows, err := db.QueryContext(ctx, query, namespace, key, before, limit)
+	if err != nil {
+		tracing.HandleSpanError(span, "list history query failed", err)
+
+		return nil, fmt.Errorf("systemplane/postgres: list history: %w", err)
+	}
+	defer rows.Close()
+
+	out := []store.ChangeRecord{}
+
+	for rows.Next() {
+		var (
+			r               store.ChangeRecord
+			previous, value []byte
+		)
+
+		// Scanning into *[]byte copies, so the slices are the receiver's own,
+		// as store.ChangeRecord requires; a NULL scans to nil.
+		if err := rows.Scan(&r.Position, &r.Namespace, &r.Key, &r.Operation, &r.Revision, &previous, &value, &r.ChangedAt, &r.ChangedBy); err != nil {
+			tracing.HandleSpanError(span, "list history scan failed", err)
+
+			return nil, fmt.Errorf("systemplane/postgres: list history scan: %w", err)
+		}
+
+		r.PreviousValue, r.Value = previous, value
+		out = append(out, r)
+	}
+
+	if err := rows.Err(); err != nil {
+		tracing.HandleSpanError(span, "list history rows iteration failed", err)
+
+		return nil, fmt.Errorf("systemplane/postgres: list history rows: %w", err)
+	}
+
+	return out, nil
 }
 
 // startSpan creates a child span if telemetry is configured.

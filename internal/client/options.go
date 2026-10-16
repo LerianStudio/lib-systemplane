@@ -32,6 +32,8 @@ type clientConfig struct {
 	mbTenantManager    *tmmongo.Manager
 
 	aggregateTenantThreshold int
+
+	changeHistory bool
 }
 
 // DefaultAggregateTenantThreshold is how many tenant scopes may be active
@@ -161,6 +163,27 @@ func WithModule(name string) Option {
 		if name != "" {
 			cfg.module = name
 		}
+	}
+}
+
+// WithChangeHistory makes every Set, and every Delete that removes a stored
+// value, also record the operation, the value before and after, who wrote it
+// and when, and turns on [Client.ChangeHistory] to read those records back.
+// Off by default.
+//
+// On Postgres the record lands in systemplane_history, committed with the
+// write: apply ChangeHistorySQL() in the migration pipeline first (one
+// database per tenant, like SchemaSQL()) and grant the runtime role INSERT and
+// SELECT on it. With the table missing every Set and Delete fails and the
+// value stays. On MongoDB the record lands in the systemplane_history
+// collection of the same database, in one transaction with the write (a
+// replica set or a sharded cluster is required), and its unique index is
+// created with the rest of the bootstrap. Register refuses namespace "-" with
+// key "history" or "history/..." while it is on, and Set and Delete refuse an
+// empty or blank actor with ErrValidation.
+func WithChangeHistory() Option {
+	return func(cfg *clientConfig) {
+		cfg.changeHistory = true
 	}
 }
 

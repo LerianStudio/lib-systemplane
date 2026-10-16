@@ -70,6 +70,74 @@ poll queries need.
 [MIGRATION-v4.md § The database and operator contract](MIGRATION-v4.md#the-database-and-operator-contract)
 covers the rollout and the rollback.
 
+## Change history (opt-in)
+
+`GetEntry` shows who last wrote a value, but every write overwrites that
+provenance, and a delete leaves the registered default in force with its
+provenance fields zero. Without this option nothing says who wrote or deleted
+a key before the latest write, or what the key held. `WithChangeHistory()`
+records every write. That covers every `Set` (a create, an update, or a rewrite
+of an identical value, which still restamps the row) and every `Delete` that
+removed a stored value. Each record carries:
+
+- the operation: `create`, `update` or `delete`;
+- the revision;
+- the value before and after, `nil` where there was none;
+- the actor the write was handed;
+- the time.
+
+`Client.ChangeHistory(ctx, namespace, key, systemplane.ChangeHistoryQuery{Limit, Before})`
+reads one page of the records, newest first (`Limit <= 0` means 50, capped at
+500). The page's `Next` is the `Before` of the older page, and 0 on the page
+that holds the oldest record, so a caller reaches every record however long
+the history grows. Each record's `Position` is its place in the key's history
+and serves only as a `Before`. Without the option it returns
+`ErrChangeHistoryDisabled`. A repeat delete, or a delete of a key never
+written, records nothing. After every `Set`, the newest record's `ChangedBy` and
+`ChangedAt` equal the live row's `UpdatedBy` and `UpdatedAt`. The option is off
+by default, so a consumer that does not opt in needs no new DDL.
+
+Opting in takes two steps per service:
+
+1. **Postgres:** apply `ChangeHistorySQL()`
+   ([`ddl/change_history.sql`](ddl/change_history.sql)) after `SchemaSQL()`,
+   in the same schema and one database per tenant. Grant the runtime role
+   `INSERT` and `SELECT` on `systemplane_history`; the identity column that
+   orders the records needs no grant of its own. `SchemaSQL()` does not include
+   the table, so a pipeline that vendors `SchemaSQL()` sees no drift. A write
+   and its record commit together: with the table missing, every `Set` and
+   `Delete` fails and the value stays.
+
+   **MongoDB:** nothing to apply. The records land in the `systemplane_history`
+   collection of the same database, and the bootstrap creates its unique index
+   (a role that may not create it fails the bootstrap). Every write and its
+   record are one transaction, so the option needs a replica set or a sharded
+   cluster. On a standalone server every `Set` and `Delete` fails, names that
+   requirement and leaves the value as it was. When the record cannot be
+   written, the write fails with the value intact, as on Postgres.
+2. Pass `WithChangeHistory()` to the constructor.
+
+Things to know before opting in:
+
+- **Tenancy.** There is no tenant column. The history lives in the tenant's own
+  database, and the read resolves it from `ctx` exactly as a write does.
+- **Ordering.** Concurrent writers of one key leave one unbroken chain: each
+  record's previous value is the value the record before it left.
+- **Values in clear.** Values are recorded verbatim, as admin GET already
+  serves them. Nothing is logged or put on a span.
+- **No purge.** The history is append-only and the library ships no purge. A
+  value stored by mistake stays in the history after a `Delete`; retention is
+  the consumer's policy.
+- **Every writer must opt in.** The history is complete only when every writer
+  of a database opts in, because a writer without the option records nothing.
+- **Every write names its actor.** With the option on, `Set`, `Delete` and a
+  typed group's `Set` refuse an empty or blank actor with `ErrValidation`
+  before touching the store, because an append-only record cannot be
+  attributed later. `admin.Mount` answers such a PUT or DELETE with 403
+  `actor_required`, and logs one WARN at mount time when no
+  `admin.WithActorExtractor` was given, since every write would then be
+  refused. Without the option the actor stays optional.
+
 ## Quickstart
 
 Every call below returns an error; the linked examples check each one and end
@@ -160,9 +228,15 @@ GET    /system/:namespace                 list a namespace's entries
 GET    /system/:namespace/:key            read one entry
 PUT    /system/:namespace/:key            write {"value": ...}, answers 204
 DELETE /system/:namespace/:key            delete, answers 204
+GET    /system/-/history/:namespace/*     every write of a key (Mount, with WithChangeHistory)
 GET    /system/-/catalog                  every registered key's metadata
 GET    /system/-/catalog/:namespace/*     one key's metadata
 ```
+
+The routes copy the namespace, key and actor out of Fiber's request buffers
+before they reach the Client, so a write stays on its own key and keeps its
+actor however Fiber reuses those buffers for later requests; the app needs no
+`Immutable` setting for that.
 
 Error answers are written as `{"code", "title", "message"}` JSON. With
 `admin.WithReturnedErrors()` the mount writes nothing and returns the error to
@@ -173,7 +247,10 @@ keeps that title: lib-commons' stock `FiberErrorHandler` matches `*fiber.Error`
 first and replaces it with `request_failed`.
 
 A key containing `/` resolves through each key route's `/*` twin, and a path
-beginning with `-/catalog` is reserved for the catalog. A single-key GET
+beginning with `-/catalog` is reserved for the catalog. On a Client built
+`WithChangeHistory()`, a path beginning with `-/history` is reserved as well
+and `Register` refuses it; without the option no route claims it. A single-key
+GET
 answers:
 
 ```json
@@ -192,6 +269,31 @@ answers:
 A list answers `{"namespace": ..., "entries": [...]}` with the same fields per
 entry, `namespace` aside. While the registered default is in force, `revision`
 is 0, `updatedAt` is null and `updatedBy` is empty.
+
+The change history route exists only on a Client built `WithChangeHistory()`
+(`Client.ChangeHistoryEnabled()`), and is a `"read"` action for the authorizer.
+It answers one page, newest first. `?limit=` sizes the page (default 50,
+capped at 500), and `?before=` takes the previous page's `next` to read the
+older page. `next` is absent on the page that holds the oldest record, so
+following it reaches every record the key has:
+
+```json
+{
+  "namespace": "payments",
+  "key": "fee_bps",
+  "changes": [
+    {"position": 412, "operation": "update", "revision": 8, "previousValue": 26, "value": 30,
+     "changedAt": "2026-09-27T09:00:00Z", "changedBy": "ops@example.com"},
+    {"position": 97, "operation": "create", "revision": 7, "previousValue": null, "value": 26,
+     "changedAt": "2026-09-26T12:00:00Z", "changedBy": "ops@example.com"}
+  ],
+  "next": 97
+}
+```
+
+It answers 400 `bad_request` for a `limit` or `before` that is not a positive
+integer, 404 for an unregistered key and 501 `change_history_disabled` for a
+store that keeps no history.
 
 ## Metrics
 

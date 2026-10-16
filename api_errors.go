@@ -51,4 +51,8 @@ var (
 	// [WithMongoTenantManager], and by [NewMongoDB] handed
 	// [WithPostgresTenantManager].
 	ErrTenantManagerBackendMismatch = internalclient.ErrTenantManagerBackendMismatch
+
+	// ErrChangeHistoryDisabled is returned by [Client.ChangeHistory] on a
+	// Client built without [WithChangeHistory].
+	ErrChangeHistoryDisabled = internalclient.ErrChangeHistoryDisabled
 )
